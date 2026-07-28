@@ -1,0 +1,98 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance sched_budget -- --test-threads=1 && cargo test --locked --test fault sched_crash -- --test-threads=1 && cargo test --locked --test integration agent_run::agent_run_tests::budget_exhaustion_fails_before_provider_dispatch -- --exact",
+    "evidence_id": "EV-G02-004",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "sched_budget",
+          "--",
+          "--test-threads=1"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 6 tests\ntest sched_budget::bounded_fifo_and_durable_principal_global_caps_gate_run_admission ... ok\ntest sched_budget::durable_reservations_are_atomic_idempotent_and_use_the_persisted_budget ... ok\ntest sched_budget::scheduler_persists_the_exact_effective_snapshot_budget ... ok\ntest sched_budget::statistical_trial_admission_is_verified_and_consumed_once_before_run_admission ... ok\ntest sched_budget::ten_thousand_adversarial_overspend_attempts_have_zero_successes ... ok\ntest sched_budget::trial_binding_is_admitted_once_and_terminal_runs_reject_late_effects ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 443 filtered out; finished in 0.82s\n\n",
+        "output_digest": "cc930a3533e13bbc5a8ccf733d4fdc2270ca5a4fa22fc1d581a26d6c3a9a250c",
+        "proof_kind": null,
+        "test_count": 6
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "sched_crash",
+          "--",
+          "--test-threads=1"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 2 tests\ntest sched_crash::real_sqlite_restart_releases_only_safe_reservations_and_flags_dispatched_unknown ... ok\ntest sched_crash::restart_preserves_attempt_fence_and_prevents_double_debit ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 0.03s\n\n",
+        "output_digest": "10730f10af49bd7fdb97ea3de09e255602c6c2447287cc078c670af274ee286d",
+        "proof_kind": null,
+        "test_count": 2
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "integration",
+          "agent_run::agent_run_tests::budget_exhaustion_fails_before_provider_dispatch",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/integration/main.rs (target/debug/deps/integration-98c754f772d936c1)\n\nrunning 1 test\ntest agent_run::agent_run_tests::budget_exhaustion_fails_before_provider_dispatch ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 1.82s\n\n",
+        "output_digest": "574879a4c157f237ff21be387725b462b2e5092823d0f252b926bf85b3509d83",
+        "proof_kind": null,
+        "test_count": 1
+      }
+    ]
+  },
+  "artifact_digest": "cf7b46face1d5af163b15fbe037aa8e726d190b3c259f83c4326b3584c282703",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G02-004",
+    "evidence_job": "dashboard-g02",
+    "expected_result": "Spend, turn and call reservations remain bounded and are released or reconciled across crash, retry and cancellation.",
+    "requirement_areas": [
+      "KIT-RUNTIME",
+      "KIT-OUTCOME"
+    ],
+    "source_line": 369,
+    "source_ref": "IMPLEMENTATION_PLAN.md:369"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G02",
+  "milestone": "M002",
+  "requirements": [],
+  "run_id": "local-20260728-m002",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m002-worktree-attestation"
+}

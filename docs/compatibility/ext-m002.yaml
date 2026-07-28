@@ -1,0 +1,45 @@
+schema_version: 1
+milestone: M002-W09
+host_contract_version: 1.0.0
+descriptor_schema_version: 1
+effective_config_schema_version: 2
+compatibility_range:
+  minimum: 1.0.0
+  maximum_exclusive: 2.0.0
+
+trust_boundary:
+  in_process: trusted_token_required
+  token_visibility: crate_private
+  dynamic_library_loading: prohibited
+  untrusted_protocols:
+    - mcp
+    - acp
+    - a2a
+    - kit_plugin
+
+vendor_pins:
+  agentkit:
+    version: 0.10.2
+    commit: c3926f1c4f3c945d400c8b6ef039da1f84826fcd
+    snapshot_sha256: 7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a
+    source: vendor/agentkit/SNAPSHOT-METADATA.yaml
+
+built_ins:
+  - extension_point: model_adapter
+    identity: kit.durable-model-adapter
+    version: 0.1.0
+    schema_digest: sha256:e8c7cfcf4cf66cbad65763720f48e1d2c571759fb45585b5cfd1fd3631c35fd1
+    implementation_digest: sha256:b18f3636e34912e12661b480e16580aaa067a88eddabe55b1908f2b5e0f0220b
+    source: src/agent/adapters/model.rs
+  - extension_point: prompt_module
+    identity: kit.prompt-modules
+    version: 3.03.2
+    schema_digest: sha256:cde19ed7558f080ef23e9320bbb4e8cf4db80b9ed323637780a0b43f512c25b5
+    implementation_digest: sha256:ced139107ea4321e3ae12fcac03977b9c60ae533a3e23cdc90ea5fb0b57949bb
+    source: src/agent/prompt/mod.rs
+  - extension_point: cost_table
+    identity: kit.cost-table
+    version: 1.0.0
+    schema_digest: sha256:029feac55865cde7b3d1a725e00427dfc174fb78819e343189f0f0bc96c238c8
+    implementation_digest: sha256:ff8091e07f3a648303c91c4617a21a552d629f8ffea485933b1ff603587fedc3
+    source: src/agent/accounting/cost.rs

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kit.dev/eval/manifests/schema/v1/outcome.schema.json",
+  "title": "Kit evaluation outcome manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "outcome_id",
+    "trial_id",
+    "status",
+    "provider_request_ids"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "kind": { "const": "outcome" },
+    "outcome_id": { "$ref": "#/$defs/id" },
+    "trial_id": { "$ref": "#/$defs/id" },
+    "status": { "enum": ["pending", "completed"] },
+    "provider_request_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "score",
+        "final_tree_digest",
+        "patch_digest",
+        "events_digest",
+        "checks_digest",
+        "grader_result_digest",
+        "usage"
+      ],
+      "properties": {
+        "verdict": { "enum": ["pass", "fail", "error"] },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "final_tree_digest": { "$ref": "#/$defs/digest" },
+        "patch_digest": { "$ref": "#/$defs/digest" },
+        "events_digest": { "$ref": "#/$defs/digest" },
+        "checks_digest": { "$ref": "#/$defs/digest" },
+        "grader_result_digest": { "$ref": "#/$defs/digest" },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["model_tokens", "tool_calls", "dollars_usd"],
+          "properties": {
+            "model_tokens": { "type": "integer", "minimum": 0 },
+            "tool_calls": { "type": "integer", "minimum": 0 },
+            "dollars_usd": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "pending" } }, "required": ["status"] },
+      "then": {
+        "properties": { "provider_request_ids": { "maxItems": 0 } },
+        "not": { "required": ["result"] }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "completed" } }, "required": ["status"] },
+      "then": {
+        "required": ["result"],
+        "properties": { "provider_request_ids": { "minItems": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

@@ -1,0 +1,163 @@
+- id: KIT-API-001
+  record_class: requirement
+  modality: MUST
+  title: Non-idempotent mutations require an idempotency key
+  atomic_text: Non-naturally-idempotent mutations must include Idempotency-Key.
+  source_section: §27.1 Transport
+  source_anchor: RFC.md:1126
+  source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`
+  source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-API
+  applicability: mandatory
+  interpretation: The API rejects any non-naturally-idempotent mutation that omits Idempotency-Key.
+  acceptance_criteria:
+  - cargo test --test conformance http_contract -- idempotency_required exits 0 with 100% of missing-key mutations rejected
+  primary_milestone: M001
+  contributing_milestones:
+  - M003
+  - M004
+  - M010
+  - M011
+  - M012
+  dependencies: []
+  owner: API owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G01
+  - G03
+  - G04
+  - G10
+  - G11
+  - G12
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M001-W11-C-001
+  evidence_job: integration
+  expected_result: cargo test --test conformance http_contract -- idempotency_required exits 0 with 0 accepted missing-key mutations
+  artifact_digest: f7fb1ba6cd4db6a8d632569d39b2f32f58873d830f10632e46d4b61130577d3b
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run on changes to mutation routing, idempotency storage, or the HTTP contract.
+  decision_record: null
+  deviation_record: null
+- id: KIT-API-021
+  record_class: requirement
+  modality: MUST
+  title: Clients ignore unknown additive fields
+  atomic_text: Clients must ignore unknown additive fields.
+  source_section: §27.1 Transport
+  source_anchor: RFC.md:1128
+  source_quote: Clients MUST ignore unknown additive fields and event types.
+  source_fingerprint: 3106fdb870f84b84d8830c239279da84862d1f0a1be3b940a3d4e5b0a95e75c2
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-API
+  applicability: mandatory
+  interpretation: A client continues processing a valid payload when an unrecognized field is added.
+  acceptance_criteria:
+  - cargo test --test conformance http_contract -- additive_fields exits 0 with 100% of additive-field fixtures accepted
+  primary_milestone: M001
+  contributing_milestones: []
+  dependencies: []
+  owner: API owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G01
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M001-W11-C-009
+  evidence_job: integration
+  expected_result: cargo test --test conformance http_contract -- additive_fields exits 0 with 0 additive-field rejections
+  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run on changes to mutation routing, idempotency storage, or the HTTP contract.
+  decision_record: null
+  deviation_record: null
+- id: KIT-API-022
+  record_class: requirement
+  modality: MUST
+  title: Clients ignore unknown additive event types
+  atomic_text: Clients must ignore unknown additive event types.
+  source_section: §27.1 Transport
+  source_anchor: RFC.md:1128
+  source_quote: Clients MUST ignore unknown additive fields and event types.
+  source_fingerprint: 3106fdb870f84b84d8830c239279da84862d1f0a1be3b940a3d4e5b0a95e75c2
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-API
+  applicability: mandatory
+  interpretation: A client continues its stream when it receives an unrecognized additive event type.
+  acceptance_criteria:
+  - cargo test --test conformance sse_cursor -- additive_events exits 0 with 100% of additive-event fixtures accepted
+  primary_milestone: M001
+  contributing_milestones: []
+  dependencies: []
+  owner: API owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G01
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M001-W11-C-010
+  evidence_job: integration
+  expected_result: cargo test --test conformance sse_cursor -- additive_events exits 0 with 0 additive-event stream failures
+  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run on changes to mutation routing, idempotency storage, or the HTTP contract.
+  decision_record: null
+  deviation_record: null

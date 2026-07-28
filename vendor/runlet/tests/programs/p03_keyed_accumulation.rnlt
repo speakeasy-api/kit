@@ -1,0 +1,9 @@
+#! expect: { "groups": { "Globex": ["CT-1", "CT-2"], "Initech": ["CT-3"] }, "counts": { "Globex": 2, "Initech": 1 } }
+contacts = data.contacts()
+groups = fold acc = {} for c in contacts {
+    return acc + { [c.company]: (acc[c.company] if c.company in acc else []) + [c.id] }
+}
+counts = fold acc = {} for c in contacts {
+    return acc + { [c.company]: (acc[c.company] if c.company in acc else 0) + 1 }
+}
+return { groups: groups, counts: counts }

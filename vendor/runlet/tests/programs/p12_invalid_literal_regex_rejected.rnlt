@@ -1,0 +1,4 @@
+#! expect_error: RL2316
+# Lookahead is not in the linear-time dialect; literal patterns fail at
+# compile time with a span.
+return regex.test("abc", "(?=abc)")

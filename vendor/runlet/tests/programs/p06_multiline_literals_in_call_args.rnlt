@@ -1,0 +1,9 @@
+#! expect: { "d-2026-06-15": 1 }
+# Multi-line object literal inside call parentheses, computed key from a
+# tool result.
+r = data.availability({
+    user_id: 1,
+    date: "2026-06-15"
+})
+key = "d-" + r.date
+return { [key]: list.length(r.busy) }

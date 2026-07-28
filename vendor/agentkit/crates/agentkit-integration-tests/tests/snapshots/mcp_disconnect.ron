@@ -1,0 +1,304 @@
+SessionRecording(
+    session_id: "mcp-disconnect",
+    initial_items: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Report which remote tools are currently visible.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "What tools are connected?",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+    ],
+    turns: [
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Report which remote tools are currently visible.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "What tools are connected?",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("mcp_alpha_only_alpha"),
+                    description: "alpha-only tool.",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "properties": {},
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("mcp_beta_only_beta"),
+                    description: "beta-only tool.",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "properties": {},
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "I see only_alpha and only_beta.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Report which remote tools are currently visible.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "What tools are connected?",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "I see only_alpha and only_beta.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: Some(Completed),
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "anything else?",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("mcp_beta_only_beta"),
+                    description: "beta-only tool.",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "properties": {},
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "Only only_beta is left now.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+    ],
+    final_transcript: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Report which remote tools are currently visible.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "What tools are connected?",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "I see only_alpha and only_beta.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(Completed),
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "anything else?",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "Only only_beta is left now.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(Completed),
+            created_at: None,
+        ),
+    ],
+)

@@ -1,0 +1,13 @@
+/target/
+/dogfood-harness/target/
+/.kit/
+/.kit.backups/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.evidence-tmp/
+/.tools/

@@ -1,0 +1,78 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test fault model_intent_outcome::crash_windows_reconcile_without_duplicate_dispatch_or_invented_success -- --exact",
+    "evidence_id": "EV-G02-002",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "model_intent_outcome::crash_windows_reconcile_without_duplicate_dispatch_or_invented_success",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 1 test\ntest model_intent_outcome::crash_windows_reconcile_without_duplicate_dispatch_or_invented_success ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 77 filtered out; finished in 0.12s\n\n",
+        "output_digest": "f339ed01ca8e3b3a182fa23fb30628948438d7ae11e34e5be69f1b5069befdf0",
+        "proof_kind": null,
+        "test_count": 1
+      }
+    ]
+  },
+  "artifact_digest": "f30f39155b0d2db4895722d733dd654b8fcdf6ff59430c44f188080915c99a57",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G02-002",
+    "evidence_job": "dashboard-g02",
+    "expected_result": "Crash injection around each intent, dispatch and outcome boundary never duplicates an effect or invents success.",
+    "requirement_areas": [
+      "KIT-CAP",
+      "KIT-RUNTIME"
+    ],
+    "source_line": 367,
+    "source_ref": "IMPLEMENTATION_PLAN.md:367"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G02",
+  "milestone": "M002",
+  "requirements": [
+    {
+      "evidence_id": "EV-M002-W03-C-001",
+      "evidence_job": "fault",
+      "record_id": "KIT-AGENTKIT-006"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-002",
+      "evidence_job": "fault",
+      "record_id": "KIT-AGENTKIT-007"
+    },
+    {
+      "evidence_id": "EV-13.11-E-101",
+      "evidence_job": "integration",
+      "record_id": "KIT-PROMPT-980"
+    }
+  ],
+  "run_id": "local-20260728-m002",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m002-worktree-attestation"
+}

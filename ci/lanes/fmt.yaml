@@ -1,0 +1,5 @@
+schema_version: 1
+name: fmt
+commands:
+  # Path dependencies are verified separately by snapshot manifests and vendor suites.
+  - cargo fmt --package kit -- --check

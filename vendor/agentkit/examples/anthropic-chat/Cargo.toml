@@ -1,0 +1,14 @@
+[package]
+name = "anthropic-chat"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentkit-core = { path = "../../crates/agentkit-core" }
+agentkit-loop = { path = "../../crates/agentkit-loop" }
+agentkit-provider-anthropic = { path = "../../crates/agentkit-provider-anthropic" }
+dotenvy.workspace = true
+tokio = { workspace = true, features = ["signal"] }

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kit.dev/eval/manifests/schema/v1/grader.schema.json",
+  "title": "Kit evaluation grader manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "grader_id",
+    "grader_version",
+    "image_digest",
+    "harness_commit",
+    "hidden_tests_digest",
+    "acceptance_digest",
+    "gold_patch_digest",
+    "harness_config_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "kind": { "const": "grader" },
+    "grader_id": { "$ref": "#/$defs/id" },
+    "grader_version": { "$ref": "#/$defs/id" },
+    "image_digest": { "$ref": "#/$defs/digest" },
+    "harness_commit": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "hidden_tests_digest": { "$ref": "#/$defs/digest" },
+    "acceptance_digest": { "$ref": "#/$defs/digest" },
+    "gold_patch_digest": { "$ref": "#/$defs/digest" },
+    "harness_config_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

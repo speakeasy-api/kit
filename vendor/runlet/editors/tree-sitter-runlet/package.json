@@ -1,0 +1,18 @@
+{
+  "name": "tree-sitter-runlet",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for Runlet",
+  "license": "MIT OR Apache-2.0",
+  "main": "bindings/node",
+  "keywords": ["incremental", "parsing", "tree-sitter", "runlet"],
+  "tree-sitter": [
+    {
+      "scope": "source.runlet",
+      "file-types": ["rnlt"]
+    }
+  ],
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test"
+  }
+}

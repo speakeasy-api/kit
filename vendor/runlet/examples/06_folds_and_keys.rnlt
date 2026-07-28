@@ -1,0 +1,37 @@
+# fold is the single way to reduce; skip drops an element from the iteration.
+orders = [
+    { id: "o1", region: "eu", status: "completed", amount: 40 },
+    { id: "o2", region: "us", status: "pending", amount: 99 },
+    { id: "o3", region: "eu", status: "completed", amount: 60 },
+    { id: "o4", region: "apac", status: "completed", amount: 25 }
+]
+
+total = fold acc = 0 for order in orders {
+    skip if order.status != "completed"
+    return acc + order.amount
+}
+
+# Computed keys plus the right-biased `+` merge express keyed accumulation.
+by_region = fold acc = {} for order in orders {
+    existing = acc[order.region] if order.region in acc else []
+    return acc + { [order.region]: existing + [order.id] }
+}
+
+# Block-bodied if is an expression: each branch is a block ending in return.
+tier = if total >= 100 {
+    return "gold"
+} else if total >= 50 {
+    return "silver"
+} else {
+    return "bronze"
+}
+
+# Intrinsics cover data shaping; boundary turns a raised failure into a value.
+summary = boundary {
+    checked = total if total > 0 else fail("EMPTY", "no completed orders")
+    return text.join(["tier", tier, "total", "" + checked], "/")
+} catch err {
+    return "unavailable: " + err.code
+}
+
+return { total, by_region, tier, summary }

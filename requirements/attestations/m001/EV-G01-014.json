@@ -1,0 +1,208 @@
+{
+  "artifact": {
+    "command": "python3 -m openapi_spec_validator docs/api/openapi.yaml && cargo test --locked --test conformance cli_parity && cargo test --locked --test conformance handler_parity && cargo test --locked --test conformance http_contract",
+    "evidence_id": "EV-G01-014",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "python3",
+          "-m",
+          "openapi_spec_validator",
+          "docs/api/openapi.yaml"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "docs/api/openapi.yaml: OK\n",
+        "output_digest": "23031625a88fa7a66e6d5ac319913274f1e8eb0e660f82b90bf78a603c935747",
+        "proof_kind": "openapi_schema",
+        "test_count": null
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "cli_parity"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 7 tests\ntest cli_parity::follow_and_page_cursors_are_distinct_cli_contracts ... ok\ntest cli_parity::discovery_rejects_group_readable_credentials ... ok\ntest cli_parity::representative_rfc_commands_parse_to_registered_operations ... ok\ntest cli_parity::cli_service_and_openapi_have_zero_uncovered_operations ... ok\ntest cli_parity::mutation_retry_retains_one_idempotency_key ... ok\ntest cli_parity::json_output_uses_openapi_component_envelopes ... ok\ntest cli_parity::prompt_retry_retains_one_idempotency_key ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 442 filtered out; finished in 0.07s\n\n",
+        "output_digest": "becb10bcfc77e5c3c5183c35e40fffd4497fc296b3d83811346f72607a42a693",
+        "proof_kind": null,
+        "test_count": 7
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "handler_parity"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 1 test\ntest handler_parity::handler_parity ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 448 filtered out; finished in 0.00s\n\n",
+        "output_digest": "60f91242348d31c4f74fe9a59ffd750b9c5af5308d959ff5138d81ed7c574d44",
+        "proof_kind": null,
+        "test_count": 1
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "http_contract"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 8 tests\ntest http_contract::long_running_commands_return_an_existing_resource ... ok\ntest http_contract::parity_adapters_dispatch_the_registered_service_operation ... ok\ntest http_contract::openapi_routes_match_authenticated_router_inventory ... ok\ntest http_contract::openapi_run_config_and_failure_match_service_serde ... ok\ntest http_contract::auth_precedes_dispatch_and_existence_is_not_leaked ... ok\ntest http_contract::every_mutation_rejects_a_missing_idempotency_key_before_dispatch ... ok\ntest http_contract::every_transport_error_is_rfc_9457_problem_details ... ok\ntest http_contract::prompt_publishes_bytes_before_one_idempotent_run_event ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 441 filtered out; finished in 0.18s\n\n",
+        "output_digest": "1e4570acd4e7fd6356021f1a74f873bc7150dcd2dd3ac80a45ca0ef36684dfba",
+        "proof_kind": null,
+        "test_count": 8
+      }
+    ]
+  },
+  "artifact_digest": "4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked",
+    "evidence_id": "EV-G01-014",
+    "evidence_job": "dashboard-g01",
+    "expected_result": "CLI/API parity is generated or tested for every exposed command and query.",
+    "requirement_areas": [
+      "KIT-API"
+    ],
+    "source_line": 335,
+    "source_ref": "IMPLEMENTATION_PLAN.md:335"
+  },
+  "disposition": "blocked_external",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "EXT-05"
+  ],
+  "gate": "G01",
+  "milestone": "M001",
+  "requirements": [
+    {
+      "evidence_id": "EV-M001-W11-C-009",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-021"
+    },
+    {
+      "evidence_id": "EV-M001-W11-C-010",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-022"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1234",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-800"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1241",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-807"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1247",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-813"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1248",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-814"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1249",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-815"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1250",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-816"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1254",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-820"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1255",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-821"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1256",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-822"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1257",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-823"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1258",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-824"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1259",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-825"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1260",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-826"
+    },
+    {
+      "evidence_id": "EV-2.21-C-001",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-950"
+    },
+    {
+      "evidence_id": "EV-M001-W11-C-011",
+      "evidence_job": "integration",
+      "record_id": "KIT-ARCH-003"
+    },
+    {
+      "evidence_id": "EV-M001-W12-C-001",
+      "evidence_job": "integration",
+      "record_id": "KIT-ARCH-004"
+    },
+    {
+      "evidence_id": "EV-2.17-C-201",
+      "evidence_job": "integration",
+      "record_id": "KIT-ARCH-800"
+    },
+    {
+      "evidence_id": "EV-2.17-C-001",
+      "evidence_job": "integration",
+      "record_id": "KIT-ARCH-950"
+    }
+  ],
+  "run_id": "local-20260728-m001",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m001-worktree-attestation"
+}

@@ -1,0 +1,4 @@
+#! expect_error: RL5201
+# Mixed scalar kinds must fail catchably, not order arbitrarily.
+xs = json.parse("[1, \"a\"]")
+return list.sort(xs)

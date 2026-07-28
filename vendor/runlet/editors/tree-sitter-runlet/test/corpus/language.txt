@@ -1,0 +1,70 @@
+==================
+Values and calls
+==================
+
+profile = {name: "Ada", active: true, scores: [91, 97]}
+customer = crm.customer(profile.name)
+return {profile, customer: customer.email}
+
+---
+
+(source_file
+  (binding_statement
+    name: (identifier)
+    value: (object
+      (object_item key: (field_name (identifier)) value: (string))
+      (object_item key: (field_name (identifier)) value: (boolean))
+      (object_item key: (field_name (identifier)) value: (list (integer) (integer)))))
+  (binding_statement
+    name: (identifier)
+    value: (call_expression
+      function: (member_expression object: (identifier) property: (field_name (identifier)))
+      (member_expression object: (identifier) property: (field_name (identifier)))))
+  (return_statement
+    (object
+      (object_item shorthand: (identifier))
+      (object_item
+        key: (field_name (identifier))
+        value: (member_expression object: (identifier) property: (field_name (identifier)))))))
+
+==================
+Control expressions
+==================
+
+rows = for item in items { return item.value * 2 }
+assert(rows != [], "expected rows")
+safe = boundary retry 2 { return 1 / divisor } catch err { return err.code }
+return safe if enabled and true else rows
+
+---
+
+(source_file
+  (binding_statement
+    name: (identifier)
+    value: (for_expression
+      binding: (identifier)
+      collection: (identifier)
+      body: (block
+        (return_statement
+          (binary_expression
+            left: (member_expression object: (identifier) property: (field_name (identifier)))
+            right: (integer))))))
+  (assert_statement
+    condition: (binary_expression left: (identifier) right: (list))
+    message: (string))
+  (binding_statement
+    name: (identifier)
+    value: (boundary_expression
+      retries: (integer)
+      body: (block
+        (return_statement
+          (binary_expression left: (integer) right: (identifier))))
+      error: (identifier)
+      handler: (block
+        (return_statement
+          (member_expression object: (identifier) property: (field_name (identifier)))))))
+  (return_statement
+    (conditional_expression
+      consequence: (identifier)
+      condition: (binary_expression left: (identifier) right: (boolean))
+      alternative: (identifier))))

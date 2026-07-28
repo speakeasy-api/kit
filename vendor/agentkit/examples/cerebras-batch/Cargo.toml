@@ -1,0 +1,16 @@
+[package]
+name = "cerebras-batch"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentkit-core = { path = "../../crates/agentkit-core" }
+agentkit-loop = { path = "../../crates/agentkit-loop" }
+agentkit-provider-cerebras = { path = "../../crates/agentkit-provider-cerebras", features = ["batch", "compression", "predicted-outputs", "service-tiers"] }
+dotenvy.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal"] }

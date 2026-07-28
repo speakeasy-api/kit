@@ -1,0 +1,11 @@
+id = "runlet"
+name = "Runlet"
+description = "Syntax highlighting and editor configuration for Runlet"
+version = "0.1.0"
+schema_version = 1
+authors = ["Daniel Kovacs"]
+repository = "https://github.com/danielkov/runlet"
+
+[grammars.runlet]
+repository = "https://github.com/danielkov/runlet"
+rev = "ea324398fd595caa21758a17d3a4c6c3877c3cdd"

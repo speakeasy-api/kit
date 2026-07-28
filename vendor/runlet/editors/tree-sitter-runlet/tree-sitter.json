@@ -1,0 +1,26 @@
+{
+  "grammars": [
+    {
+      "name": "runlet",
+      "camelcase": "Runlet",
+      "scope": "source.runlet",
+      "path": ".",
+      "file-types": ["rnlt"],
+      "injection-regex": "^runlet$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT OR Apache-2.0",
+    "description": "Runlet grammar for tree-sitter",
+    "authors": [
+      { "name": "Daniel Kovacs" }
+    ],
+    "links": {
+      "repository": "https://github.com/danielkov/runlet"
+    }
+  },
+  "bindings": {
+    "c": true
+  }
+}

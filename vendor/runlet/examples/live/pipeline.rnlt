@@ -1,0 +1,67 @@
+# A miniature multi-region data pipeline. There is deliberately no `async` or
+# `await`: dependencies come from ordinary value references. The host limits
+# how many iteration subgraphs may run concurrently.
+
+regions = [
+    { name: "eu-west", sources: ["accounts", "orders", "events"] },
+    { name: "us-east", sources: ["accounts", "orders", "events"] },
+    { name: "ap-south", sources: ["accounts", "orders", "events"] },
+    { name: "sa-east", sources: ["accounts", "orders", "events"] },
+    { name: "ca-central", sources: ["accounts", "orders", "events"] },
+    { name: "eu-north", sources: ["accounts", "orders", "events"] }
+]
+
+# Three regions are active at once. Within each region all three source chains
+# fan out. Every chain is long and sequential, but independent chains overlap.
+regional_snapshots = for region in regions {
+    source_snapshots = for source in region.sources {
+        fetched = demo.task(
+            "fetch " + region.name + "/" + source,
+            1800 if source == "events" else 1400,
+            { region: region.name, source }
+        )
+        validated = demo.task("validate " + region.name + "/" + source, 900, fetched)
+        normalized = demo.task("normalize " + region.name + "/" + source, 1200, validated)
+
+        # Every source has its own error boundary. Orders fail once and recover
+        # on attempt 2. sa-east/events fails all three attempts and visibly
+        # takes the catch path, producing a degraded fallback instead.
+        failures_before_success = (
+            99 if region.name == "sa-east" and source == "events" else
+            1 if source == "orders" else
+            0
+        )
+        enriched = boundary retry 2 {
+            return demo.unstable(
+                "enrich " + region.name + "/" + source,
+                1600,
+                failures_before_success,
+                normalized
+            )
+        } catch err {
+            return demo.task(
+                "FALLBACK degraded " + region.name + "/" + source,
+                1400,
+                { source: normalized, error: err }
+            )
+        }
+
+        scored = demo.task("score " + region.name + "/" + source, 1000, enriched)
+        return scored
+    }
+
+    # This is a fan-in: it cannot start until all source chains for the region
+    # have completed, while other regions continue independently.
+    return demo.task("assemble regional snapshot " + region.name, 1400, source_snapshots)
+}
+
+# A final dependency chain starts only after every bounded region batch joins.
+global_index = demo.task("build global index", 2200, regional_snapshots)
+quality_report = demo.task("run cross-region quality checks", 1800, global_index)
+published = demo.task("publish immutable release", 1400, quality_report)
+
+return {
+    status: "published",
+    release: published,
+    regions: regional_snapshots
+}

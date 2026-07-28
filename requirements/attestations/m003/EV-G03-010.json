@@ -1,0 +1,132 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance exec_contracts && cargo test --locked --test conformance exec_api && cargo test --locked --test adversarial trial_grader_access && cargo test --locked --test fault exec_cancel",
+    "evidence_id": "EV-G03-010",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "exec_contracts"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 5 tests\ntest exec_contracts::exec_contracts_overlay_schema_is_canonical_versioned_and_fail_closed ... ok\ntest exec_contracts::exec_contracts_overlay_paths_are_cross_platform_canonical ... ok\ntest exec_contracts::exec_contracts_vm_fake_requires_termination_quiescence_exact_attestation_and_freshness ... ok\ntest exec_contracts::exec_contracts_vm_schema_is_canonical_versioned_and_has_no_ambient_authority ... ok\ntest exec_contracts::exec_contracts_overlay_fake_fences_finalization_and_reuse ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 444 filtered out; finished in 0.00s\n\n",
+        "output_digest": "23cfeec6320ba3a42e5adaffe77f062667d3e4fbb1ebe09addf0815b588ee321",
+        "proof_kind": null,
+        "test_count": 5
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "exec_api"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 21 tests\ntest exec_api::core_parser_reaches_every_executor_command ... ok\ntest exec_api::cross_principal_and_cross_project_are_byte_identical_to_missing ... ok\ntest exec_api::cancellation_replays_without_a_second_coordinator_call_and_emits_an_event ... ok\ntest exec_api::raw_input_debug_is_redacted ... ok\ntest exec_api::openapi_cli_routes_and_sdk_builders_have_zero_uncovered_operations ... ok\ntest exec_api::terminal_input_commands_require_and_reuse_an_explicit_key ... ok\ntest exec_api::terminal_input_rejects_direct_values_and_accepts_stdin_or_file_descriptors ... ok\ntest exec_api::executor_transport_returns_documented_body_and_timeout_errors ... ok\ntest exec_api::unavailable_pty_driver_returns_documented_501_without_existence_leak ... ok\ntest exec_api::openapi_input_is_write_only_and_hidden_not_found_contains_no_identifier ... ok\ntest exec_api::observed_process_lifecycle_is_api_visible_and_durable ... ok\ntest exec_api::durable_startup_marks_prepared_and_started_processes_outcome_unknown ... ok\ntest exec_api::process_events_and_idempotency_survive_service_restart ... ok\ntest exec_api::cancellation_unknown_stays_unknown_until_quiescence_and_completes_once ... ok\ntest exec_api::input_resolution_uses_exact_durable_ownership_after_attachment_invalidation ... ok\ntest exec_api::raw_input_is_absent_from_durable_executor_state ... ok\ntest exec_api::ambiguous_terminal_mutations_never_reconcile_from_matching_live_state ... ok\ntest exec_api::attachment_endpoints_hide_every_unauthorized_or_invalidated_target_without_effects ... ok\ntest exec_api::executor_event_pruning_keeps_global_rowid_order_across_feeds_and_restarts ... ok\ntest exec_api::pruned_cursor_recovery_includes_interrupted_history_and_filters_invalidated_attachments ... ok\ntest exec_api::idempotency_capacity_rejects_4097th_and_restart_replays_oldest ... ok\n\ntest result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 428 filtered out; finished in 11.77s\n\n",
+        "output_digest": "f3a3cb562b8b20d113e49386547e804ab80ccb8fe1242699863665a3a260140b",
+        "proof_kind": null,
+        "test_count": 21
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "trial_grader_access"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 16 tests\ntest trial_grader_access::agent_cannot_read_or_write_any_grader_material ... ok\ntest trial_grader_access::one_thousand_production_helper_trials_have_fresh_attested_writable_leases ... ignored, requires KIT_TRIAL_AGENT_IMAGE, KIT_TRIAL_GRADER_IMAGE, and the trusted helper\ntest trial_grader_access::production_core_harness_calibrates_and_reproduces_through_trusted_helper ... ignored, requires pinned trial images, trusted helper, and persistent external evidence root\ntest trial_grader_access::production_grader_probe_rejects_every_channel_and_encoding_before_persistence ... ignored, requires pinned trial images, trusted helper, and persistent external evidence root\ntest trial_grader_access::production_helper_denies_agent_grader_input_reads_and_writes ... ignored, requires KIT_TRIAL_AGENT_IMAGE, KIT_TRIAL_GRADER_IMAGE, and the trusted helper\ntest trial_grader_access::production_protocol_rejects_all_canary_encodings_before_persistence ... ignored, requires KIT_TRIAL_AGENT_IMAGE, KIT_TRIAL_GRADER_IMAGE, and the trusted helper\ntest trial_grader_access::phase0_loader_rejects_missing_required_grader_pins ... ok\ntest trial_grader_access::full_manifest_digest_changes_when_a_component_pin_changes ... ok\ntest trial_grader_access::reported_image_must_exactly_match_the_manifest_pin ... ok\ntest trial_grader_access::agent_and_grader_exit_or_signal_outcomes_fail_the_trial ... ok\ntest trial_grader_access::semantics_only_fake_models_distinct_trial_identities ... ok\ntest trial_grader_access::cleanup_permission_failure_is_returned ... ok\ntest trial_grader_access::cleanup_refuses_an_unowned_directory_replacement ... ok\ntest trial_grader_access::cleanup_refuses_a_symlink_replacement_without_removing_its_target ... ok\ntest trial_grader_access::unsupported_host_is_typed_unavailable_before_trial_allocation ... ok\ntest trial_grader_access::one_thousand_filesystem_allocations_are_reserved_and_fresh ... ok\n\ntest result: ok. 11 passed; 0 failed; 5 ignored; 0 measured; 84 filtered out; finished in 28.52s\n\n",
+        "output_digest": "a4a90de4026fc1fb57f7e8becc4fe04d8d7b500f55487a2e60942e6b1018fa1e",
+        "proof_kind": null,
+        "test_count": 11
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "exec_cancel"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 11 tests\ntest exec_cancel::escaped_or_reused_boundary_is_never_targeted_or_marked_quiescent ... ok\ntest exec_cancel::stale_attempts_and_fences_publish_nothing_and_keep_the_workspace_held ... ok\ntest exec_cancel::successor_fence_finishes_cleanup_without_stale_publications ... ok\ntest exec_cancel::unknown_is_reinspectable_and_a_matching_zero_survivor_scan_resolves_it ... ok\ntest exec_cancel::survivors_and_uninspectable_boundaries_become_unknown_and_never_reassign ... ok\ntest exec_cancel::grace_kill_and_reap_errors_are_durable_and_do_not_stop_escalation ... ok\ntest exec_cancel::published_effects_have_the_exact_order_and_request_ids_are_idempotent ... ok\ntest exec_cancel::effect_before_commit_crashes_repeat_only_the_idempotent_operation ... ok\ntest exec_cancel::reconciliation_resumes_after_a_crash_at_every_durable_phase ... ok\ntest exec_cancel::grace_kill_reap_inspect_order_and_fenced_completion_hold_100_of_100 ... ok\ntest exec_cancel::grace_deadline_is_observed_before_kill_escalation ... ok\n\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.04s\n\n",
+        "output_digest": "2c83fa911f4b54bdfe46aae50e39f315f507339c022b391b7d537e4e20e5e813",
+        "proof_kind": null,
+        "test_count": 11
+      }
+    ]
+  },
+  "artifact_digest": "6853d0d289a24fb13ef100ef50d570cc795fc1ccc92f27aa20084f757186137a",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked_transitive",
+    "evidence_id": "EV-G03-010",
+    "evidence_job": "dashboard-g03",
+    "expected_result": "Applicable `KIT-EXEC`, `KIT-RUNTIME`, `KIT-SEC`, `KIT-DOMAIN`, `KIT-STORE`, `KIT-API` and `KIT-EVAL` evidence is green.",
+    "requirement_areas": [
+      "KIT-EXEC",
+      "KIT-RUNTIME",
+      "KIT-SEC",
+      "KIT-DOMAIN",
+      "KIT-STORE",
+      "KIT-API",
+      "KIT-EVAL"
+    ],
+    "source_line": 416,
+    "source_ref": "IMPLEMENTATION_PLAN.md:416"
+  },
+  "disposition": "blocked_transitive",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "G01",
+    "G02",
+    "EXT-01",
+    "EXT-04",
+    "EXT-19",
+    "EXT-20",
+    "EXT-22"
+  ],
+  "gate": "G03",
+  "milestone": "M003",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-1193",
+      "evidence_job": "evidence-report",
+      "record_id": "KIT-SEC-800"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1194",
+      "evidence_job": "evidence-report",
+      "record_id": "KIT-SEC-801"
+    }
+  ],
+  "run_id": "local-20260728-m003",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m003-worktree-source-conformance"
+}

@@ -1,0 +1,39 @@
+- id: KIT-GOV-901
+  record_class: requirement
+  modality: MUST
+  title: Preserve registered behavior
+  atomic_text: The fixture implementation must preserve every registered behavior.
+  source_section: §1 Fixture
+  source_anchor: RFC.md:1
+  source_quote: The fixture implementation MUST preserve every registered behavior.
+  source_fingerprint: ff5f6e5ec8d0d5a019abded2759a3d81ca3752c2e3f68ac0553658bd892043c3
+  introduced_revision: abcdef0
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-GOV
+  applicability: mandatory
+  interpretation: Preserve the behavior asserted by the fixture RFC.
+  acceptance_criteria: ['`rustc --test tests/conformance/req_lint.rs` exits 0.']
+  primary_milestone: PHASE0
+  contributing_milestones: []
+  dependencies: []
+  owner: Governance owner
+  criticality: blocking
+  platforms: [all]
+  deployment_tiers: [local]
+  release_gates: [G00]
+  implementation_links: [scripts/req_lint.py]
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-1.12-C-901
+  evidence_job: req-lint
+  expected_result: '`rustc --test tests/conformance/req_lint.rs` exits 0.'
+  artifact_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  environment_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  versions: {python: '3'}
+  latest_result: pass
+  revalidation_rule: Re-run when the fixture or requirement linter changes.
+  decision_record: null
+  deviation_record: null

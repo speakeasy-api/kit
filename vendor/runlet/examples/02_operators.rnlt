@@ -1,0 +1,15 @@
+# Arithmetic, comparison, membership, and conditional expressions.
+unit_price = 19
+quantity = 3
+subtotal = unit_price * quantity
+shipping = 0 if subtotal >= 50 else 5
+total = subtotal + shipping
+
+return {
+    subtotal,
+    shipping,
+    total,
+    label: "Total: " + total,
+    qualifies_for_free_shipping: total >= 50,
+    category: "large" if quantity >= 10 else "standard"
+}

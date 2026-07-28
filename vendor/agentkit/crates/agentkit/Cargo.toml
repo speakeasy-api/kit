@@ -1,0 +1,61 @@
+[package]
+description = "Feature-gated umbrella crate for building agent applications with agentkit."
+homepage.workspace = true
+name = "agentkit"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities", optional = true }
+agentkit-acp = { version = "0.10.2", path = "../agentkit-acp", optional = true }
+agentkit-compaction = { version = "0.10.2", path = "../agentkit-compaction", optional = true }
+agentkit-context = { version = "0.10.2", path = "../agentkit-context", optional = true }
+agentkit-core = { version = "0.10.2", path = "../agentkit-core", optional = true }
+agentkit-loop = { version = "0.10.2", path = "../agentkit-loop", optional = true }
+agentkit-mcp = { version = "0.10.2", path = "../agentkit-mcp", optional = true }
+agentkit-adapter-completions = { version = "0.10.2", path = "../agentkit-adapter-completions", optional = true }
+agentkit-provider-anthropic = { version = "0.10.2", path = "../agentkit-provider-anthropic", optional = true }
+agentkit-provider-cerebras = { version = "0.10.2", path = "../agentkit-provider-cerebras", optional = true }
+agentkit-provider-groq = { version = "0.10.2", path = "../agentkit-provider-groq", optional = true }
+agentkit-provider-mistral = { version = "0.10.2", path = "../agentkit-provider-mistral", optional = true }
+agentkit-provider-ollama = { version = "0.10.2", path = "../agentkit-provider-ollama", optional = true }
+agentkit-provider-openai = { version = "0.10.2", path = "../agentkit-provider-openai", optional = true }
+agentkit-provider-openrouter = { version = "0.10.2", path = "../agentkit-provider-openrouter", optional = true }
+agentkit-provider-vllm = { version = "0.10.2", path = "../agentkit-provider-vllm", optional = true }
+agentkit-reporting = { version = "0.10.2", path = "../agentkit-reporting", optional = true }
+agentkit-task-manager = { version = "0.10.2", path = "../agentkit-task-manager", optional = true }
+agentkit-tool-compose = { version = "0.10.2", path = "../agentkit-tool-compose", optional = true }
+agentkit-tool-fs = { version = "0.10.2", path = "../agentkit-tool-fs", optional = true }
+agentkit-tool-shell = { version = "0.10.2", path = "../agentkit-tool-shell", optional = true }
+agentkit-tool-skills = { version = "0.10.2", path = "../agentkit-tool-skills", optional = true }
+agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core", optional = true }
+
+[features]
+default = ["core", "capabilities", "tools", "loop", "reporting"]
+core = ["dep:agentkit-core"]
+acp = ["dep:agentkit-acp", "loop"]
+compaction = ["dep:agentkit-compaction", "core"]
+capabilities = ["dep:agentkit-capabilities", "core"]
+context = ["dep:agentkit-context", "core"]
+tools = ["dep:agentkit-tools-core", "capabilities"]
+task-manager = ["dep:agentkit-task-manager", "tools"]
+loop = ["dep:agentkit-loop", "tools", "task-manager"]
+mcp = ["dep:agentkit-mcp", "capabilities", "tools"]
+adapter-completions = ["dep:agentkit-adapter-completions", "loop"]
+provider-anthropic = ["dep:agentkit-provider-anthropic", "loop"]
+provider-cerebras = ["dep:agentkit-provider-cerebras", "loop"]
+provider-groq = ["dep:agentkit-provider-groq", "adapter-completions"]
+provider-mistral = ["dep:agentkit-provider-mistral", "adapter-completions"]
+provider-ollama = ["dep:agentkit-provider-ollama", "adapter-completions"]
+provider-openai = ["dep:agentkit-provider-openai", "adapter-completions"]
+provider-openrouter = ["dep:agentkit-provider-openrouter", "adapter-completions"]
+provider-vllm = ["dep:agentkit-provider-vllm", "adapter-completions"]
+reporting = ["dep:agentkit-reporting", "loop"]
+tool-fs = ["dep:agentkit-tool-fs", "tools"]
+tool-compose = ["dep:agentkit-tool-compose", "tools"]
+tool-shell = ["dep:agentkit-tool-shell", "tools"]
+tool-skills = ["dep:agentkit-tool-skills", "tools"]

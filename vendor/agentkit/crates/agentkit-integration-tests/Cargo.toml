@@ -1,0 +1,34 @@
+[package]
+description = "End-to-end integration tests for agentkit (no public API; not published)."
+name = "agentkit-integration-tests"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+agentkit-loop = { version = "0.10.2", path = "../agentkit-loop" }
+agentkit-mcp = { version = "0.10.2", path = "../agentkit-mcp" }
+agentkit-task-manager = { version = "0.10.2", path = "../agentkit-task-manager" }
+agentkit-tool-compose = { version = "0.10.2", path = "../agentkit-tool-compose" }
+agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core", features = ["schemars"] }
+agentkit-tools-derive = { version = "0.10.2", path = "../agentkit-tools-derive" }
+async-trait.workspace = true
+schemars = { workspace = true, features = ["derive"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+pretty_assertions = "1.4"
+rmcp = { version = "1.5.0", default-features = false, features = ["client", "server", "transport-async-rw", "transport-streamable-http-server", "macros"] }
+ron = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "io-util", "net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "net"] }

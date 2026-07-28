@@ -1,0 +1,3 @@
+schema_version: 1
+decision_record: docs/decisions/DR-0006-empty-area-na.md
+areas: []

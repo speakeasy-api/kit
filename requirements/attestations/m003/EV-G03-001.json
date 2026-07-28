@@ -1,0 +1,123 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test adversarial local_sandbox && cargo test --locked --test adversarial container_fs && cargo test --locked --test adversarial container_net",
+    "evidence_id": "EV-G03-001",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "local_sandbox"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 6 tests\ntest local_sandbox::structural_policy_exposes_arguments_but_not_execution ... ok\ntest local_sandbox::local_secret_custody_is_explicitly_unavailable ... ok\ntest local_sandbox::finite_limits_and_additional_requirements_are_typed_as_unavailable ... ok\ntest local_sandbox::local_backend_rejects_noncanonical_mount_targets ... ok\ntest local_sandbox::compatibility_has_zero_implicit_selection_paths_and_truthful_label ... ok\ntest local_sandbox::restricted_hostile_and_mislabeled_isolation_never_use_local_compatibility ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 94 filtered out; finished in 0.02s\n\n",
+        "output_digest": "73945351337cbc06c3fdc5289a9062f14f3e494fe5fbf7bf381731148ac2197a",
+        "proof_kind": null,
+        "test_count": 6
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "container_fs"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 7 tests\ntest container_fs::profile_mount_target_delimiters_are_rejected_before_argv_construction ... ok\ntest container_fs::unsupported_profile_primitives_fail_closed_before_a_plan_exists ... ok\ntest container_fs::this_host_returns_a_typed_not_available_record ... ok\ntest container_fs::duplicate_display_names_get_distinct_internal_boundary_ownership ... ok\ntest container_fs::one_non_runnable_preview_contains_the_entire_execution_contract ... ok\ntest container_fs::invalid_digest_shared_git_and_overlapping_writable_paths_are_refused ... ok\ntest container_fs::source_escape_corpus_is_refused_before_any_plan_exists ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 93 filtered out; finished in 1.35s\n\n",
+        "output_digest": "85ea99626da49355b88098a8844e0ae92eab0e3f12ca3cf0c35d96c662b889ea",
+        "proof_kind": null,
+        "test_count": 7
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "container_net"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 4 tests\ntest container_net::metadata_private_and_local_destinations_cannot_be_granted ... ok\ntest container_net::proxy_evidence_must_prove_direct_peer_gateway_udp_and_rebinding_denials ... ok\ntest container_net::udp_grants_fail_typed_unavailable_instead_of_bypassing_the_http_proxy ... ok\ntest container_net::granted_network_uses_an_operational_proxy_only_contract_not_just_environment_hints ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.32s\n\n",
+        "output_digest": "e254936160052dd682d42d2f0cb3674875953552434efc0db2af820e4416c8af",
+        "proof_kind": null,
+        "test_count": 4
+      }
+    ]
+  },
+  "artifact_digest": "839d2b4a5afbb3e5edc256fec7545352323699d78c2d1cd3241b572631cfa918",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked_external",
+    "evidence_id": "EV-G03-001",
+    "evidence_job": "dashboard-g03",
+    "expected_result": "Adversarial filesystem, symlink, hard-link, traversal, mount, socket, metadata-service and network escape suites pass.",
+    "requirement_areas": [
+      "KIT-EXEC",
+      "KIT-SEC"
+    ],
+    "source_line": 407,
+    "source_ref": "IMPLEMENTATION_PLAN.md:407"
+  },
+  "disposition": "blocked_external",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "EXT-01",
+    "EXT-04",
+    "EXT-19",
+    "EXT-20"
+  ],
+  "gate": "G03",
+  "milestone": "M003",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-1203",
+      "evidence_job": "adversarial",
+      "record_id": "KIT-EXEC-805"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1204",
+      "evidence_job": "adversarial",
+      "record_id": "KIT-EXEC-806"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1206",
+      "evidence_job": "adversarial",
+      "record_id": "KIT-EXEC-808"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1209",
+      "evidence_job": "adversarial",
+      "record_id": "KIT-EXEC-811"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1197",
+      "evidence_job": "adversarial",
+      "record_id": "KIT-SEC-804"
+    }
+  ],
+  "run_id": "local-20260728-m003",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m003-worktree-source-conformance"
+}

@@ -1,0 +1,134 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Runlet",
+  "scopeName": "source.runlet",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#bindings" },
+    { "include": "#calls" },
+    { "include": "#properties" },
+    { "include": "#constants" },
+    { "include": "#keywords" },
+    { "include": "#word-operators" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.runlet",
+          "match": "#.*$"
+        },
+        {
+          "name": "comment.line.double-slash.runlet",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.runlet",
+      "begin": "\"",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.runlet" }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.runlet" }
+      },
+      "patterns": [
+        {
+          "name": "constant.character.escape.runlet",
+          "match": "\\\\(?:[\"\\\\/bfnrt]|u[0-9A-Fa-f]{4})"
+        },
+        {
+          "name": "invalid.illegal.escape.runlet",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.runlet",
+          "match": "(?<![\\p{L}\\p{N}\\p{M}_])(?:[0-9]+\\.[0-9]+(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+)(?![\\p{L}\\p{N}\\p{M}_])"
+        },
+        {
+          "name": "constant.numeric.integer.runlet",
+          "match": "(?<![\\p{L}\\p{N}\\p{M}_])[0-9]+(?![\\p{L}\\p{N}\\p{M}_])"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.runlet",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.runlet",
+          "match": "\\bnull\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "name": "keyword.control.runlet",
+      "match": "\\b(?:return|for|in|boundary|retry|catch|if|else|fold|skip|assert|fail)\\b"
+    },
+    "word-operators": {
+      "name": "keyword.operator.logical.runlet",
+      "match": "\\b(?:and|or|not)\\b"
+    },
+    "bindings": {
+      "match": "(?m)^\\s*([\\p{L}_][\\p{L}\\p{N}\\p{M}_]*)(?=\\s*=)(?!=)",
+      "captures": {
+        "1": { "name": "variable.other.assignment.runlet" }
+      }
+    },
+    "calls": {
+      "match": "(?!fail\\b)([\\p{L}_][\\p{L}\\p{N}\\p{M}_]*(?:\\s*\\.\\s*[\\p{L}_][\\p{L}\\p{N}\\p{M}_]*)*)(?=\\s*\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.runlet" }
+      }
+    },
+    "properties": {
+      "patterns": [
+        {
+          "match": "(\\.)([\\p{L}_][\\p{L}\\p{N}\\p{M}_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.runlet" },
+            "2": { "name": "variable.other.property.runlet" }
+          }
+        },
+        {
+          "match": "([\\p{L}_][\\p{L}\\p{N}\\p{M}_]*)(?=\\s*:)",
+          "captures": {
+            "1": { "name": "support.type.property-name.runlet" }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "name": "keyword.operator.runlet",
+      "match": "==|!=|<=|>=|=|<|>|\\+|-|\\*|/|%"
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.runlet",
+          "match": "[,;:]"
+        },
+        {
+          "name": "punctuation.section.group.begin.runlet",
+          "match": "[({\\[]"
+        },
+        {
+          "name": "punctuation.section.group.end.runlet",
+          "match": "[)}\\]]"
+        }
+      ]
+    }
+  }
+}

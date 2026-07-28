@@ -1,0 +1,17 @@
+[package]
+description = "Capability abstractions shared by tools, MCP, and agentkit hosts."
+homepage.workspace = true
+name = "agentkit-capabilities"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

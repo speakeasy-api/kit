@@ -1,0 +1,341 @@
+SessionRecording(
+    session_id: "mcp-progress",
+    initial_items: [
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "multiply 6 and 7",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+    ],
+    turns: [
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "multiply 6 and 7",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("mcp_demo_echo"),
+                    description: "Echoes the supplied text back as the tool result.",
+                    input_schema: {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                            },
+                        },
+                        "required": [
+                            "text",
+                        ],
+                        "title": "EchoArgs",
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("mcp_demo_multiply"),
+                    description: "Multiplies two integers and returns the product as text.",
+                    input_schema: {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "properties": {
+                            "a": {
+                                "format": "int64",
+                                "type": "integer",
+                            },
+                            "b": {
+                                "format": "int64",
+                                "type": "integer",
+                            },
+                        },
+                        "required": [
+                            "a",
+                            "b",
+                        ],
+                        "title": "MultiplyArgs",
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-mul"),
+                    name: "multiply",
+                    input: {
+                        "a": 6,
+                        "b": 7,
+                    },
+                    metadata: {},
+                )),
+                Finished(ModelTurnResult(
+                    finish_reason: ToolCall,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                ToolCall(ToolCallPart(
+                                    id: ToolCallId("call-mul"),
+                                    name: "multiply",
+                                    input: {
+                                        "a": 6,
+                                        "b": 7,
+                                    },
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "multiply 6 and 7",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-mul"),
+                            name: "multiply",
+                            input: {
+                                "a": 6,
+                                "b": 7,
+                            },
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: Some(ToolCall),
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-mul"),
+                            output: Text("tool not found: multiply"),
+                            is_error: true,
+                            metadata: {
+                                "agentkit.tool.not_started": true,
+                            },
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("mcp_demo_echo"),
+                    description: "Echoes the supplied text back as the tool result.",
+                    input_schema: {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                            },
+                        },
+                        "required": [
+                            "text",
+                        ],
+                        "title": "EchoArgs",
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("mcp_demo_multiply"),
+                    description: "Multiplies two integers and returns the product as text.",
+                    input_schema: {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "properties": {
+                            "a": {
+                                "format": "int64",
+                                "type": "integer",
+                            },
+                            "b": {
+                                "format": "int64",
+                                "type": "integer",
+                            },
+                        },
+                        "required": [
+                            "a",
+                            "b",
+                        ],
+                        "title": "MultiplyArgs",
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "the answer is 42",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+    ],
+    final_transcript: [
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "multiply 6 and 7",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-mul"),
+                    name: "multiply",
+                    input: {
+                        "a": 6,
+                        "b": 7,
+                    },
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(ToolCall),
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Tool,
+            parts: [
+                ToolResult(ToolResultPart(
+                    call_id: ToolCallId("call-mul"),
+                    output: Text("tool not found: multiply"),
+                    is_error: true,
+                    metadata: {
+                        "agentkit.tool.not_started": true,
+                    },
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "the answer is 42",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(Completed),
+            created_at: None,
+        ),
+    ],
+)

@@ -1,0 +1,62 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test fault edit_recovery::cancellation -- --test-threads=1",
+    "evidence_id": "EV-G04-004",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "edit_recovery::cancellation",
+          "--",
+          "--test-threads=1"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 3 tests\ntest edit_recovery::cancellation_after_recovery_prepare_rolls_back_materialization ... ok\ntest edit_recovery::cancellation_after_revision_commit_reports_committed_race ... ok\ntest edit_recovery::cancellation_before_materialization_leaves_base_content_and_revision ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 75 filtered out; finished in 3.73s\n\n",
+        "output_digest": "7e77862e93449480f0f415c6699afd33814ac02c3dcb615d7f80aafe7e16c652",
+        "proof_kind": null,
+        "test_count": 3
+      }
+    ]
+  },
+  "artifact_digest": "2d6d5edf76fa9c913f71c54242ba3f2ed89d689cd50c14b8874cd2fbfc7ef69b",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G04-004",
+    "evidence_job": "dashboard-g04",
+    "expected_result": "Cancellation before and after prepare obeys recovery semantics.",
+    "requirement_areas": [
+      "KIT-EDIT",
+      "KIT-EXEC"
+    ],
+    "source_line": 452,
+    "source_ref": "IMPLEMENTATION_PLAN.md:452"
+  },
+  "disposition": "passed",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G04",
+  "milestone": "M004",
+  "requirements": [],
+  "run_id": "local-20260728-m004",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m004-worktree-source-conformance"
+}

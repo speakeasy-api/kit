@@ -1,0 +1,28 @@
+[package]
+description = "HTTP client abstraction used across agentkit. Default reqwest-backed implementation behind an opt-out feature; BYO impls plug in via the HttpClient trait."
+homepage.workspace = true
+name = "agentkit-http"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["reqwest-client"]
+reqwest-client = ["dep:reqwest"]
+reqwest-middleware-client = ["dep:reqwest", "dep:reqwest-middleware"]
+
+[dependencies]
+async-trait.workspace = true
+bytes = "1"
+futures-util.workspace = true
+http = "1"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest = { workspace = true, optional = true }
+reqwest-middleware = { version = "0.5", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

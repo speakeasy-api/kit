@@ -1,0 +1,62 @@
+[package]
+name = "kit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+publish = false
+
+[dependencies]
+agentkit-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-core" }
+agentkit-loop = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-loop" }
+agentkit-provider-anthropic = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-anthropic" }
+agentkit-provider-ollama = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-ollama" }
+agentkit-provider-openai = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-openai" }
+agentkit-provider-openrouter = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-openrouter" }
+agentkit-tools-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-tools-core" }
+axum = { version = "=0.8.8", default-features = false, features = ["http1", "json", "tokio"] }
+blake3 = "=1.8.2"
+chacha20poly1305 = "=0.10.1"
+clap = { version = "=4.6.4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+getrandom = "0.3.4"
+futures-util = "=0.3.32"
+hmac = "=0.12.1"
+jsonwebtoken = { version = "10.1.0", default-features = false, features = ["aws_lc_rs"] }
+jsonschema = { version = "0.48.2", default-features = false }
+reqwest = { version = "=0.13.2", default-features = false, features = ["blocking"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+rustls = { version = "0.23.32", default-features = false, features = ["aws_lc_rs", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.141"
+sha2 = "=0.10.9"
+subtle = "=2.6.1"
+syn = { version = "=2.0.119", features = ["full"] }
+tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "=0.1.17"
+unicode-normalization = "=0.1.25"
+x509-parser = "0.18.0"
+zeroize = "1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+jsonwebtoken = { version = "10.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+rcgen = "0.14.3"
+serde_yaml = "=0.9.34"
+tower = { version = "=0.5.3", features = ["util"] }
+url = "2.5.7"

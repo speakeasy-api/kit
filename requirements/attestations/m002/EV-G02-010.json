@@ -1,0 +1,148 @@
+{
+  "artifact": {
+    "command": "sh scripts/verify_pins.sh && cargo test --locked --test conformance ext_m002 && python3 scripts/req_lint.py --aggregate",
+    "evidence_id": "EV-G02-010",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "sh",
+          "scripts/verify_pins.sh"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "pin manifest verified (normal mode): /Users/danielkov/projects/kit/docs/compatibility/build-manifest.yaml\nunpinned.mutable_protocols=0\nunpinned.mutable_datasets=0\nunpinned.mutable_models=0\nunpinned.mutable_harnesses=0\n",
+        "output_digest": "ff68b3ac02f97859f3eeed5157a270c6fb84e683e218d2375371bb0eb903df81",
+        "proof_kind": "pin_check",
+        "test_count": null
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "ext_m002"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 6 tests\ntest ext_m002::duplicate_identity_version_and_schema_drift_fail_closed ... ok\ntest ext_m002::untrusted_in_process_registration_is_rejected_with_protocol_route ... ok\ntest ext_m002::extension_config_rejects_newer_schema_unknown_selection_and_point_mismatch ... ok\ntest ext_m002::every_m002_extension_point_has_a_versioned_compatible_pin ... ok\ntest ext_m002::newer_contract_versions_fail_closed_and_additive_fields_roundtrip ... ok\ntest ext_m002::effective_extension_selection_is_immutable_digest_bound_and_provenanced ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 443 filtered out; finished in 0.01s\n\n",
+        "output_digest": "5d55ee7349c0c6b159086161fd4c6196bbb7d2f5531c50ef463fd7800053e164",
+        "proof_kind": null,
+        "test_count": 6
+      },
+      {
+        "argv": [
+          "python3",
+          "scripts/req_lint.py",
+          "--aggregate"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "1038 record(s) across 32 shard(s), 0 finding(s)\n",
+        "output_digest": "4c9e0fe92f0fd95ef999829c433687f23db12256f0cac5b4a493ce10052332c0",
+        "proof_kind": "requirement_lint",
+        "test_count": null
+      }
+    ]
+  },
+  "artifact_digest": "6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G02-010",
+    "evidence_job": "dashboard-g02",
+    "expected_result": "Applicable `KIT-AGENTKIT`, `KIT-PROMPT`, `KIT-CONTEXT`, `KIT-CONFIG`, `KIT-CAP`, `KIT-RUNTIME`, `KIT-SEC`, `KIT-OUTCOME` and `KIT-OBS` evidence is green.",
+    "requirement_areas": [
+      "KIT-AGENTKIT",
+      "KIT-PROMPT",
+      "KIT-CONTEXT",
+      "KIT-CONFIG",
+      "KIT-CAP",
+      "KIT-RUNTIME",
+      "KIT-SEC",
+      "KIT-OUTCOME",
+      "KIT-OBS"
+    ],
+    "source_line": 375,
+    "source_ref": "IMPLEMENTATION_PLAN.md:375"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G02",
+  "milestone": "M002",
+  "requirements": [
+    {
+      "evidence_id": "EV-M002-W01-C-001",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-001"
+    },
+    {
+      "evidence_id": "EV-M002-W01-C-002",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-002"
+    },
+    {
+      "evidence_id": "EV-M002-W01-C-003",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-003"
+    },
+    {
+      "evidence_id": "EV-M002-W01-C-004",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-004"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-009",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-009"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-010",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-010"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-011",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-011"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-012",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-012"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-013",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-013"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-014",
+      "evidence_job": "reproducible-build",
+      "record_id": "KIT-AGENTKIT-014"
+    },
+    {
+      "evidence_id": "EV-3.02-C-201",
+      "evidence_job": "integration",
+      "record_id": "KIT-ARCH-801"
+    }
+  ],
+  "run_id": "local-20260728-m002",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m002-worktree-attestation"
+}

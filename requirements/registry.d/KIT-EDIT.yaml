@@ -1,0 +1,152 @@
+- id: KIT-EDIT-001
+  record_class: requirement
+  modality: MUST
+  title: Reject low-confidence fuzzy edits
+  atomic_text: Kit MUST reject low-confidence fuzzy application rather than edit a possibly wrong duplicate.
+  source_section: §18.3 Edit transaction
+  source_anchor: RFC.md:747
+  source_quote: Kit MUST reject low-confidence fuzzy application rather than silently editing the wrong duplicate. An enclosing symbol can disambiguate an otherwise exact repeated anchor.
+  source_fingerprint: 866783bb0bb495707bba1046ff9cf37346c3f0e7c9aed03f9005850ff44eecf4
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-EDIT
+  applicability: mandatory
+  interpretation: An ambiguous or below-threshold anchor fails without materializing any source change.
+  acceptance_criteria:
+  - cargo test --locked --test conformance edit_validate && cargo test --locked --test adversarial path_escape exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M004
+  contributing_milestones: []
+  dependencies: []
+  owner: Editing owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  implementation_links:
+  - src/workspace/edit/validate.rs
+  - tests/conformance/edit_validate.rs
+  - docs/operations/edit-validation.md
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M004-W05-C-001
+  evidence_job: evidence-report
+  expected_result: cargo test --locked --test conformance edit_validate && cargo test --locked --test adversarial path_escape exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: 0d68230d9be9e7b209d51a2b4768960de0fa55ac94c2bef5457eb6a25bc19351
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when anchor matching, confidence thresholds, or materialization changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-EDIT-002
+  record_class: requirement
+  modality: MUST NOT
+  title: Isolate staged LSP buffers
+  atomic_text: Kit MUST NOT expose staged edit buffers to the live workspace LSP.
+  source_section: §18.3 Edit transaction
+  source_anchor: RFC.md:749
+  source_quote: For staged diagnostics, Kit sends versioned staged buffers to an isolated LSP session or shadow workspace using `didOpen`/`didChange`, collects responses tied to those document versions, then closes or discards the shadow state. It MUST NOT expose staged buffers to the live workspace LSP. If a language server cannot diagnose shadow content safely, pre-commit LSP diagnostics are unavailable for that adapter; compiler checks run in the copy-on-write execution view and live diagnostics are collected only after commit.
+  source_fingerprint: 30596e2199dcbcc0c6f5c53ba3ab2a2a6bfe674e25fb465be727778ed43be401
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-EDIT
+  applicability: mandatory
+  interpretation: Pre-commit buffers use an isolated LSP session or shadow workspace and never mutate the live session.
+  acceptance_criteria:
+  - cargo test --test conformance staged_lsp_isolation -- --exact exits 0 with 1 passed and 0 failed
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Editing owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  implementation_links:
+  - src/workspace/edit/stage/
+  - src/workspace/edit/format/
+  - tests/conformance/edit_format.rs
+  - docs/operations/edit-staging.md
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W04-C-001
+  evidence_job: integration
+  expected_result: cargo test --test conformance staged_lsp_isolation -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when staged diagnostics, LSP sessions, or shadow workspace handling changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-EDIT-003
+  record_class: requirement
+  modality: MAY
+  title: Permit model-specific edit formats
+  atomic_text: Edit formats may vary by model.
+  source_section: §7.6 Model-specific, evidence-driven policy
+  source_anchor: RFC.md:162
+  source_quote: Tool descriptions, prompt modules, edit formats, reasoning levels, compaction policy, composition backends, and result encodings MAY vary by model.
+  source_fingerprint: 0f9282147e41a992ea1e3f1969cff5d3622d30197ccb47cb36bae98b22bd64bd
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-EDIT
+  applicability: pending_voi
+  interpretation: A pinned model can use a measured edit-format variant that still normalizes through the canonical edit IR.
+  acceptance_criteria:
+  - '`cargo test --test conformance ablation_portfolio -- model_edit_formats` exits 0 with 1 accepted disposition.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W10-E-003
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance ablation_portfolio -- model_edit_formats` exits 0 with 1 accepted disposition.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for each edit-format policy, model snapshot, or task corpus change.
+  decision_record: null
+  deviation_record: null

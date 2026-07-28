@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.1",
+  "kind": "trial",
+  "trial_id": "empty-trial-0001",
+  "identity": {
+    "canonical_digest": "sha256:c53474572bac821ded8397c0863aa26b5c415ab34ec6e9bfc1098713da6c67b5",
+    "randomization_id": "phase0-block-0001",
+    "attempt": 0,
+    "task_id": "kit-empty-task",
+    "environment_id": "kit-linux-model-snapshot",
+    "budget_id": "empty-trial-budget",
+    "cache_condition_id": "cold-caches",
+    "grader_id": "kit-empty-grader",
+    "config_id": "phase0-default-config"
+  },
+  "task": {
+    "schema_version": "1.0",
+    "kind": "task",
+    "task_id": "kit-empty-task",
+    "task_version": "1",
+    "repository": {
+      "source": "https",
+      "url": "https://example.com/kit-fixture.git",
+      "commit": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "specification_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "scaffold_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "environment": {
+    "schema_version": "1.1",
+    "kind": "environment",
+    "environment_id": "kit-linux-model-snapshot",
+    "image_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "architecture": "x86_64",
+    "model": {
+      "provider": "fixture-provider",
+      "name": "fixture-model",
+      "snapshot": "2026-07-21",
+      "reasoning_effort": "medium",
+      "model_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "settings_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "provider_capability_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    "components": {
+      "prompt_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "tools_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "router_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "retry_policy_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+      "verifier_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    }
+  },
+  "budget": {
+    "schema_version": "1.0",
+    "kind": "budget",
+    "budget_id": "empty-trial-budget",
+    "limits": {
+      "cpu_seconds": 3600,
+      "memory_bytes": 8589934592,
+      "disk_bytes": 21474836480,
+      "network_bytes": 0,
+      "processes": 256,
+      "wall_seconds": 1800,
+      "turns": 100,
+      "tokens": 200000,
+      "dollars_usd": 25
+    }
+  },
+  "cache_condition": {
+    "schema_version": "1.0",
+    "kind": "cache_condition",
+    "cache_condition_id": "cold-caches",
+    "prompt": { "state": "cold" },
+    "infrastructure": { "state": "cold" }
+  },
+  "grader": {
+    "schema_version": "1.0",
+    "kind": "grader",
+    "grader_id": "kit-empty-grader",
+    "grader_version": "1",
+    "image_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    "harness_commit": "89abcdef0123456789abcdef0123456789abcdef",
+    "hidden_tests_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "acceptance_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "gold_patch_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "harness_config_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

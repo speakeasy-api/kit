@@ -1,0 +1,11 @@
+schema_version: 1
+name: evidence-report
+commands:
+  - python3 scripts/generate_registry.py --check
+  - python3 scripts/validate_g00_attestations.py
+  - python3 scripts/validate_milestone.py M001
+  - python3 scripts/validate_milestone.py M002
+  - python3 scripts/validate_milestone.py M003
+  - python3 scripts/validate_milestone.py M004
+  - python3 scripts/dashboard_lint.py
+  - python3 scripts/req_lint.py --aggregate

@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "kind": "budget",
+  "budget_id": "empty-trial-budget",
+  "limits": {
+    "cpu_seconds": 3600,
+    "memory_bytes": 8589934592,
+    "disk_bytes": 21474836480,
+    "network_bytes": 0,
+    "processes": 256,
+    "wall_seconds": 1800,
+    "turns": 100,
+    "tokens": 200000,
+    "dollars_usd": 25
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "artifact": {
+    "command": "sh scripts/verify_pins.sh",
+    "evidence_id": "EV-1.09-C-004",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "sh",
+          "scripts/verify_pins.sh"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "pin manifest verified (normal mode): /Users/danielkov/projects/kit/docs/compatibility/build-manifest.yaml\nunpinned.mutable_protocols=0\nunpinned.mutable_datasets=0\nunpinned.mutable_models=0\nunpinned.mutable_harnesses=0\n",
+        "output_digest": "ff68b3ac02f97859f3eeed5157a270c6fb84e683e218d2375371bb0eb903df81",
+        "proof_kind": "pin_check",
+        "test_count": null
+      }
+    ]
+  },
+  "artifact_digest": "f02fb17a40c458adfcdcc097917ebc099bddb4a6d00f877acee8ff6d0a1835e7",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "evidence_id": "EV-1.09-C-004",
+  "evidence_job": "schema-compat",
+  "record_id": "KIT-VERSION-004",
+  "run_id": "local-20260728-g00",
+  "schema_version": 3,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_g00_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://g00-worktree-attestation"
+}

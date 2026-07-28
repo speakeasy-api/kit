@@ -1,0 +1,40 @@
+- id: KIT-A2A-001
+  record_class: requirement
+  modality: MUST NOT
+  title: Preserve A2A protocol boundaries
+  atomic_text: A2A MUST NOT be flattened with ACP and MCP into one generic protocol merely because they share JSON-RPC-like concepts.
+  source_section: §23.1 Protocol roles
+  source_anchor: RFC.md:958
+  source_quote: 'They MUST NOT be flattened into one generic protocol merely because they share JSON-RPC-like concepts.'
+  source_fingerprint: 3ece858336efe6ef661e683c20565fbb13f949576ecc1a84bf04aa0eb527d675
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-A2A
+  applicability: mandatory
+  interpretation: A2A task, message, artifact, and authentication states remain represented by A2A-specific contracts rather than a generic protocol lifecycle.
+  acceptance_criteria:
+    - 'cargo test --test conformance a2a_protocol_boundary -- --exact exits 0 with 1 passed and 0 failed'
+  primary_milestone: M010
+  contributing_milestones: []
+  dependencies: []
+  owner: Protocol owner
+  criticality: blocking
+  platforms: [all]
+  deployment_tiers: [local, restricted, clustered, hostile]
+  release_gates: [G10]
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M010-W09-C-002
+  evidence_job: integration
+  expected_result: 'cargo test --test conformance a2a_protocol_boundary -- --exact exits 0 with 1 passed and 0 failed'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when A2A adapters, lifecycle mappings, or shared protocol abstractions change.
+  decision_record: null
+  deviation_record: null

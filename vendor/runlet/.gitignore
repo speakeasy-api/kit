@@ -1,0 +1,5 @@
+/target/
+*.profraw
+/editors/zed/.dev-extension/
+/editors/tree-sitter-runlet/src/
+.DS_Store

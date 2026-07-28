@@ -1,0 +1,86 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance workspace_acquire",
+    "evidence_id": "EV-G03-005",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "workspace_acquire"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 24 tests\ntest workspace_acquire::restricted_and_hostile_writers_fail_closed_for_shared_worktrees ... ok\ntest workspace_acquire::hostile_snapshot_rejects_hardlinks_and_fifos ... ok\ntest workspace_acquire::split_index_is_rejected_before_allocation ... ok\ntest workspace_acquire::concurrent_source_replacement_never_copies_outside_bytes ... ok\ntest workspace_acquire::failed_acquisition_cleans_its_reserved_allocation ... ok\ntest workspace_acquire::unsafe_ids_paths_and_symlink_roots_are_rejected ... ok\ntest workspace_acquire::cleanup_rejects_symlink_markers_and_swapped_allocations_without_removing_them ... ok\ntest workspace_acquire::cleanup_refuses_boundary_changes_and_marker_mismatch ... ok\ntest workspace_acquire::cow_snapshot_excludes_ignored_files ... ok\ntest workspace_acquire::cleanup_removes_worktree_metadata_when_worktree_directory_is_gone ... ok\ntest workspace_acquire::cleanup_resumes_owned_quarantine_after_removal_failure ... ok\ntest workspace_acquire::untrusted_snapshot_rejects_git_objects_and_indexed_symlink_ancestors ... ok\ntest workspace_acquire::untrusted_snapshot_rejects_symlinks_without_copying_their_targets ... ok\ntest workspace_acquire::dirty_state_hash_binds_content_not_only_status_shape ... ok\ntest workspace_acquire::irrelevant_untracked_permissions_do_not_change_hashes ... ok\ntest workspace_acquire::tracked_executable_changes_dirty_and_revision_hashes ... ok\ntest workspace_acquire::tracked_executable_is_hashed_when_core_filemode_is_false ... ok\ntest workspace_acquire::untrusted_acquisition_does_not_spawn_setsid_background_helpers ... ok\ntest workspace_acquire::untracked_executable_changes_dirty_and_revision_hashes ... ok\ntest workspace_acquire::unsupported_index_flags_and_gitlinks_are_typed_rejections ... ok\ntest workspace_acquire::one_thousand_atomic_reservations_have_no_path_collisions ... ok\ntest workspace_acquire::untrusted_acquisition_never_loads_source_git_commands ... ok\ntest workspace_acquire::acquisition_does_not_run_checkout_hooks_or_recursive_submodules ... ok\ntest workspace_acquire::all_modes_preserve_dirty_source_and_report_snapshot_truthfully ... ok\n\ntest result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 425 filtered out; finished in 1.86s\n\n",
+        "output_digest": "0d01a4b335ede17c8f16f7061ffc12b398e9a0a3b85698f626e58721c1bae6e4",
+        "proof_kind": null,
+        "test_count": 24
+      }
+    ]
+  },
+  "artifact_digest": "b03f10f5ace4c4eeadcf553c15d0a2a4563c066b3de9d1dfcc74ff64c79463f3",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "in_progress",
+    "evidence_id": "EV-G03-005",
+    "evidence_job": "dashboard-g03",
+    "expected_result": "Workspace records and preserves pre-existing user changes.",
+    "requirement_areas": [
+      "KIT-EXEC",
+      "KIT-STORE"
+    ],
+    "source_line": 411,
+    "source_ref": "IMPLEMENTATION_PLAN.md:411"
+  },
+  "disposition": "in_progress",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G03",
+  "milestone": "M003",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-1211",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-813"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1212",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-814"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1213",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-815"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1214",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-816"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1215",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-817"
+    }
+  ],
+  "run_id": "local-20260728-m003",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m003-worktree-source-conformance"
+}

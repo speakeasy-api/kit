@@ -1,0 +1,90 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test fault artifact_crash",
+    "evidence_id": "EV-G01-008",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "artifact_crash"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 4 tests\ntest artifact_crash::corruption_after_upload_is_refused_before_reference ... ok\ntest artifact_crash::authorized_ledger_id_repairs_a_legacy_partial_final_lease ... ok\ntest artifact_crash::every_lease_publication_crash_recovers_by_exact_ledger_id_and_gcs ... ok\ntest artifact_crash::every_artifact_state_has_zero_committed_references_to_missing_bytes ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.94s\n\n",
+        "output_digest": "4e40587ff76b101477193bc7ff515edcb6a270095a0a3962727bfabf012e719d",
+        "proof_kind": null,
+        "test_count": 4
+      }
+    ]
+  },
+  "artifact_digest": "b54c37bc629c69a4953bc193cdf2a084416458e69b5a091f8cd6d00138b88eea",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G01-008",
+    "evidence_job": "dashboard-g01",
+    "expected_result": "Artifact crash points never produce referenced missing bytes.",
+    "requirement_areas": [
+      "KIT-STORE"
+    ],
+    "source_line": 329,
+    "source_ref": "IMPLEMENTATION_PLAN.md:329"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G01",
+  "milestone": "M001",
+  "requirements": [
+    {
+      "evidence_id": "EV-M001-W09-C-001",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-002"
+    },
+    {
+      "evidence_id": "EV-1.04-C-913",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-803"
+    },
+    {
+      "evidence_id": "EV-1.04-C-925",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-815"
+    },
+    {
+      "evidence_id": "EV-1.04-C-926",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-816"
+    },
+    {
+      "evidence_id": "EV-1.04-C-927",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-817"
+    },
+    {
+      "evidence_id": "EV-1.04-C-928",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-818"
+    }
+  ],
+  "run_id": "local-20260728-m001",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m001-worktree-attestation"
+}

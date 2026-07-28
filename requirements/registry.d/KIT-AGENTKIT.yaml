@@ -1,0 +1,711 @@
+- id: KIT-AGENTKIT-001
+  record_class: requirement
+  modality: MUST
+  title: Pin the agentkit source
+  atomic_text: Reproducible builds must pin the reviewed agentkit commit or tree digest.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:216
+  source_quote: Reproducible builds MUST pin its commit or tree digest, Cargo lockfile, enabled feature set, and exact Runlet dependency revision.
+  source_fingerprint: 32e9d2e6e4ebdbbd93e712361cf9ed189b22d5f5d8b24285054901a96d349e79
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: The build manifest identifies immutable agentkit source bytes by commit or tree digest.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W01-C-001
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-002
+  record_class: requirement
+  modality: MUST
+  title: Pin the Cargo lockfile
+  atomic_text: Reproducible builds must pin the Cargo lockfile.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:216
+  source_quote: Reproducible builds MUST pin its commit or tree digest, Cargo lockfile, enabled feature set, and exact Runlet dependency revision.
+  source_fingerprint: 32e9d2e6e4ebdbbd93e712361cf9ed189b22d5f5d8b24285054901a96d349e79
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Reproducible builds consume the committed Cargo.lock without dependency re-resolution.
+  acceptance_criteria:
+  - '`cargo build --locked` exits 0 without modifying `Cargo.lock`.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W01-C-002
+  evidence_job: reproducible-build
+  expected_result: '`cargo build --locked` exits 0 and the pre/post `Cargo.lock` SHA-256 digests are equal.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-003
+  record_class: requirement
+  modality: MUST
+  title: Pin enabled agentkit features
+  atomic_text: Reproducible builds must pin the enabled agentkit feature set.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:216
+  source_quote: Reproducible builds MUST pin its commit or tree digest, Cargo lockfile, enabled feature set, and exact Runlet dependency revision.
+  source_fingerprint: 32e9d2e6e4ebdbbd93e712361cf9ed189b22d5f5d8b24285054901a96d349e79
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: The build manifest records the exact enabled agentkit feature names.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit feature-set entries.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W01-C-003
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit feature-set entries.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-004
+  record_class: requirement
+  modality: MUST
+  title: Pin the Runlet revision
+  atomic_text: Reproducible builds must pin the exact Runlet dependency revision.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:216
+  source_quote: Reproducible builds MUST pin its commit or tree digest, Cargo lockfile, enabled feature set, and exact Runlet dependency revision.
+  source_fingerprint: 32e9d2e6e4ebdbbd93e712361cf9ed189b22d5f5d8b24285054901a96d349e79
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: A selected Runlet dependency resolves to one immutable revision recorded in build provenance.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the selected Runlet revision nonempty.'
+  primary_milestone: M002
+  contributing_milestones:
+  - M007
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  - G07
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W01-C-004
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty selected Runlet revision fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-005
+  record_class: requirement
+  modality: MUST NOT
+  title: Keep agentkit loop state non-authoritative
+  atomic_text: Kit must not use agentkit's in-memory loop as the durable source of truth.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:232
+  source_quote: Kit MUST NOT turn agentkit’s in-memory loop into the durable source of truth.
+  source_fingerprint: aee31e17fced5e9323d805be429b3f48492407b5384270090ffd71d0d7e7cbdf
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Durable recovery derives from Kit events and snapshots rather than retained LoopDriver memory.
+  acceptance_criteria:
+  - '`cargo test --test fault agentkit_restart` exits 0 after process loss at every persisted safe-boundary fixture.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W02-C-001
+  evidence_job: fault
+  expected_result: '`cargo test --test fault agentkit_restart` exits 0 with 0 failed restart fixtures.'
+  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when LoopDriver ownership, snapshots, or restart behavior changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-006
+  record_class: requirement
+  modality: MUST
+  title: Commit model-adapter intent before dispatch
+  atomic_text: A Kit-owned ModelAdapter must commit intent before dispatch.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned model adapter durably records intent before invoking its provider operation.
+  acceptance_criteria:
+  - '`cargo test --test fault agentkit_effect_boundaries` exits 0 with intent ordered before dispatch in every crash-point fixture.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-001
+  evidence_job: fault
+  expected_result: '`cargo test --test fault agentkit_effect_boundaries` exits 0 with 0 intent-order violations.'
+  artifact_digest: f30f39155b0d2db4895722d733dd654b8fcdf6ff59430c44f188080915c99a57
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when an agentkit effect wrapper or dispatch path changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-007
+  record_class: requirement
+  modality: MUST
+  title: Commit model-adapter outcome before loop return
+  atomic_text: A Kit-owned ModelAdapter must commit outcome before returning to the loop.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned model adapter durably records its outcome or explicit unknown outcome before control returns to LoopDriver.
+  acceptance_criteria:
+  - '`cargo test --test fault agentkit_effect_boundaries` exits 0 with outcome ordered before loop return in every crash-point fixture.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-002
+  evidence_job: fault
+  expected_result: '`cargo test --test fault agentkit_effect_boundaries` exits 0 with 0 outcome-order violations.'
+  artifact_digest: f30f39155b0d2db4895722d733dd654b8fcdf6ff59430c44f188080915c99a57
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when an agentkit effect wrapper or return path changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-009
+  record_class: requirement
+  modality: MUST
+  title: Commit tool-executor intent before dispatch
+  atomic_text: A Kit-owned ToolExecutor must commit intent before dispatch.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned tool executor durably records intent before invoking a tool operation.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-009
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-010
+  record_class: requirement
+  modality: MUST
+  title: Commit mutator intent before dispatch
+  atomic_text: A Kit-owned mutator must commit intent before dispatch.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned mutator durably records intent before applying a transcript mutation.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-010
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-011
+  record_class: requirement
+  modality: MUST
+  title: Commit capability-wrapper intent before dispatch
+  atomic_text: A Kit-owned capability wrapper must commit intent before dispatch.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned capability wrapper durably records intent before broker dispatch.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-011
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-012
+  record_class: requirement
+  modality: MUST
+  title: Commit tool-executor outcome before loop return
+  atomic_text: A Kit-owned ToolExecutor must commit outcome before returning to the loop.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned tool executor durably records its outcome or explicit unknown outcome before loop return.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-012
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-013
+  record_class: requirement
+  modality: MUST
+  title: Commit mutator outcome before loop return
+  atomic_text: A Kit-owned mutator must commit outcome before returning to the loop.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned mutator durably records its outcome before loop return.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-013
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-014
+  record_class: requirement
+  modality: MUST
+  title: Commit capability-wrapper outcome before loop return
+  atomic_text: A Kit-owned capability wrapper must commit outcome before returning to the loop.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:234
+  source_quote: Kit-owned `ModelAdapter`, `ToolExecutor`, mutator, and capability wrappers MUST commit intent before dispatch, then commit outcome before returning to the loop.
+  source_fingerprint: 19ccc49d8414a2bb36eb5373eb278cfcc4599b66d81cbb814641b0c307aa5037
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Every Kit-owned capability wrapper durably records its outcome or explicit unknown outcome before loop return.
+  acceptance_criteria:
+  - '`scripts/verify_pins.sh` exits 0 with the agentkit commit or tree digest nonempty.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W03-C-014
+  evidence_job: reproducible-build
+  expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
+  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-AGENTKIT-008
+  record_class: requirement
+  modality: SHOULD
+  title: Upstream product-neutral improvements
+  atomic_text: Kit should upstream reusable agentkit improvements when they are product-neutral.
+  source_section: §9 Relationship to Agentkit
+  source_anchor: RFC.md:242
+  source_quote: Kit SHOULD upstream reusable improvements to agentkit when they are product-neutral.
+  source_fingerprint: a072331d496bc2fa107546ebb045e46b8a59afd0a3538b7b9a92ad66492e8634
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-AGENTKIT
+  applicability: mandatory
+  interpretation: Each reusable product-neutral agentkit patch receives an upstream submission or a documented deviation.
+  acceptance_criteria:
+  - '`cargo test --test conformance agentkit_audit` exits 0 with every product-neutral patch row carrying an upstream reference or deviation record.'
+  primary_milestone: M009
+  contributing_milestones: []
+  dependencies: []
+  owner: Agent integration owner
+  criticality: medium
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G09
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: manual_review
+  evidence_id: EV-M009-W01-M-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance agentkit_audit` exits 0 with 0 unreviewed product-neutral patches.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when the pinned agentkit patch set changes.
+  decision_record: null
+  deviation_record: null

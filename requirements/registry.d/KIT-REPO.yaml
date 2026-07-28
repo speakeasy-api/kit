@@ -1,0 +1,2221 @@
+- id: KIT-REPO-001
+  record_class: requirement
+  modality: MUST
+  title: Discover code with lexical evidence
+  atomic_text: Kit must discover relevant code with lexical evidence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:56
+  source_quote: '- discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;'
+  source_fingerprint: 2ace75f012b828c6af28cd6e8c1bf6a4e096c87d9071d31f56dcc53ac28c1308
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Repository discovery includes exact lexical search results.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-002
+  record_class: requirement
+  modality: MUST
+  title: Discover code with syntactic evidence
+  atomic_text: Kit must discover relevant code with syntactic evidence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:56
+  source_quote: '- discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;'
+  source_fingerprint: 2ace75f012b828c6af28cd6e8c1bf6a4e096c87d9071d31f56dcc53ac28c1308
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Repository discovery includes parser-derived syntactic evidence.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-003
+  record_class: requirement
+  modality: MUST
+  title: Discover code with semantic evidence
+  atomic_text: Kit must discover relevant code with semantic evidence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:56
+  source_quote: '- discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;'
+  source_fingerprint: 2ace75f012b828c6af28cd6e8c1bf6a4e096c87d9071d31f56dcc53ac28c1308
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Repository discovery includes available compiler or language-server semantic evidence.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-004
+  record_class: requirement
+  modality: MUST
+  title: Discover code with graph evidence
+  atomic_text: Kit must discover relevant code with graph evidence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:56
+  source_quote: '- discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;'
+  source_fingerprint: 2ace75f012b828c6af28cd6e8c1bf6a4e096c87d9071d31f56dcc53ac28c1308
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Repository discovery includes bounded relationship-graph evidence.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-005
+  record_class: requirement
+  modality: MUST
+  title: Discover code with historical evidence
+  atomic_text: Kit must discover relevant code with historical evidence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:56
+  source_quote: '- discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;'
+  source_fingerprint: 2ace75f012b828c6af28cd6e8c1bf6a4e096c87d9071d31f56dcc53ac28c1308
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Repository discovery includes version-control history evidence.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-006
+  record_class: requirement
+  modality: MUST
+  title: Budget repository discovery
+  atomic_text: Kit must discover relevant code under explicit token budgets.
+  source_section: §3 Goals
+  source_anchor: RFC.md:56
+  source_quote: '- discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;'
+  source_fingerprint: 2ace75f012b828c6af28cd6e8c1bf6a4e096c87d9071d31f56dcc53ac28c1308
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Every discovery request and response carries and enforces a finite token or item budget.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-007
+  record_class: requirement
+  modality: SHOULD
+  title: Record repository revision on symbols
+  atomic_text: Symbol records should contain the repository revision.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:463-466
+  source_quote: repository revision
+  source_fingerprint: d0876104bce4e5840782ae9a852519802bbc9a4d6c3481dc7b4d3c5dc6c43d54
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record identifies the repository revision from which its facts were derived.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-008
+  record_class: requirement
+  modality: SHOULD
+  title: Record symbol path
+  atomic_text: Symbol records should contain the source path.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:467
+  source_quote: path and language
+  source_fingerprint: e934560461edf35a2b0ae453d8c8b86b76c4cfc2466eca71dc118757f30fdc03
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record identifies its repository-relative source path.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-009
+  record_class: requirement
+  modality: SHOULD
+  title: Record symbol language
+  atomic_text: Symbol records should contain the source language.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:467
+  source_quote: path and language
+  source_fingerprint: e934560461edf35a2b0ae453d8c8b86b76c4cfc2466eca71dc118757f30fdc03
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record identifies its source language.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-010
+  record_class: requirement
+  modality: SHOULD
+  title: Record qualified symbol names
+  atomic_text: Symbol records should contain qualified names.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:468
+  source_quote: qualified and display names
+  source_fingerprint: c42bd03abc5dacc4944dbd7cfe27f1b524c0115f48af7610d7fe5a9576263101
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record includes its available scope-qualified identity.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-011
+  record_class: requirement
+  modality: SHOULD
+  title: Record display symbol names
+  atomic_text: Symbol records should contain display names.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:468
+  source_quote: qualified and display names
+  source_fingerprint: c42bd03abc5dacc4944dbd7cfe27f1b524c0115f48af7610d7fe5a9576263101
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record includes a concise human- and model-facing display name.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-012
+  record_class: requirement
+  modality: SHOULD
+  title: Record symbol kind
+  atomic_text: Symbol records should contain symbol kind.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:469
+  source_quote: kind and signature
+  source_fingerprint: 1baa22afea30705aac78910812d66ac05707609386d35d50b10302be6e542830
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record identifies its normalized declaration kind.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-013
+  record_class: requirement
+  modality: SHOULD
+  title: Record symbol signature
+  atomic_text: Symbol records should contain the symbol signature.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:469
+  source_quote: kind and signature
+  source_fingerprint: 1baa22afea30705aac78910812d66ac05707609386d35d50b10302be6e542830
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record includes its compact declaration signature.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-014
+  record_class: requirement
+  modality: SHOULD
+  title: Record source byte range
+  atomic_text: Symbol records should contain the source byte range.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:470
+  source_quote: source byte range
+  source_fingerprint: aa75035a65925ba09563ec70719d2d3daf72733fc316878e0c43a3b62eb6e6ed
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record contains start and end byte offsets in its revision-tagged source.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-015
+  record_class: requirement
+  modality: SHOULD
+  title: Record enclosing symbol
+  atomic_text: Symbol records should contain the enclosing symbol.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:471
+  source_quote: enclosing symbol
+  source_fingerprint: f42ed921ea6b23a03032e4ea82bf3c8eab2c83aef8df5eef71ba359b49257eac
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each nested symbol record links to its enclosing symbol when present.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-016
+  record_class: requirement
+  modality: SHOULD
+  title: Record imports
+  atomic_text: Symbol records should contain imports.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:472
+  source_quote: imports and exports
+  source_fingerprint: 835df024c1f1d05b934c89ff318ad393252e31a4dd7ab396f2a44bb9d1b59d37
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record links imported names or modules known at its revision.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-017
+  record_class: requirement
+  modality: SHOULD
+  title: Record exports
+  atomic_text: Symbol records should contain exports.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:472
+  source_quote: imports and exports
+  source_fingerprint: 835df024c1f1d05b934c89ff318ad393252e31a4dd7ab396f2a44bb9d1b59d37
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record links exported names known at its revision.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-018
+  record_class: requirement
+  modality: SHOULD
+  title: Record definitions
+  atomic_text: Symbol records should contain definitions.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:473
+  source_quote: definitions and references
+  source_fingerprint: f06c3d5f8a843e0226e3b08ace5c6bd50f1b5963b852d1a6c7e582e61b1c35ee
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record links known definition locations.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-019
+  record_class: requirement
+  modality: SHOULD
+  title: Record references
+  atomic_text: Symbol records should contain references.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:473
+  source_quote: definitions and references
+  source_fingerprint: f06c3d5f8a843e0226e3b08ace5c6bd50f1b5963b852d1a6c7e582e61b1c35ee
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record links known reference locations.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-020
+  record_class: requirement
+  modality: SHOULD
+  title: Record callers when known
+  atomic_text: Symbol records should contain callers where known.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:474
+  source_quote: callers/callees where known
+  source_fingerprint: 73dc6814e0bffee0883a43f0d493474b7cb0740c2b1863ddef0d50131142e199
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Callable symbol records link known callers without inventing unresolved relationships.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-021
+  record_class: requirement
+  modality: SHOULD
+  title: Record callees when known
+  atomic_text: Symbol records should contain callees where known.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:474
+  source_quote: callers/callees where known
+  source_fingerprint: 73dc6814e0bffee0883a43f0d493474b7cb0740c2b1863ddef0d50131142e199
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Callable symbol records link known callees without inventing unresolved relationships.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-022
+  record_class: requirement
+  modality: SHOULD
+  title: Record associated tests
+  atomic_text: Symbol records should contain associated tests.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:475
+  source_quote: associated tests
+  source_fingerprint: 7752b0dc6513406615b67000a8f48fca9e37e6f7e08d672296f3a8318ed691d9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record links tests associated by declared repository evidence.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-023
+  record_class: requirement
+  modality: SHOULD
+  title: Record documentation excerpts
+  atomic_text: Symbol records should contain a documentation excerpt.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:476
+  source_quote: documentation excerpt
+  source_fingerprint: 0d36dd5e7765822800c15fb914efc617556e4bfb1e5d8fc464a7cfdbd8fac205
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each symbol record can include a bounded excerpt from attached documentation.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-024
+  record_class: requirement
+  modality: SHOULD
+  title: Record fact sources
+  atomic_text: Symbol records should contain the source of each fact.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:477
+  source_quote: source and confidence of each fact
+  source_fingerprint: bdde924c8e3813b68ef7f6baea44270af799713dc499c4e689d818693b225a6f
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Every symbol fact identifies the adapter or artifact that produced it.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-025
+  record_class: requirement
+  modality: SHOULD
+  title: Record fact confidence
+  atomic_text: Symbol records should contain the confidence of each fact.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:477
+  source_quote: source and confidence of each fact
+  source_fingerprint: bdde924c8e3813b68ef7f6baea44270af799713dc499c4e689d818693b225a6f
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Every symbol fact includes a normalized confidence value or exact-fact marker.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-026
+  record_class: requirement
+  modality: MUST
+  title: Preserve syntactic and semantic distinction
+  atomic_text: Kit must preserve the distinction between syntactic Tree-sitter facts and semantic LSP or SCIP facts.
+  source_section: §13.2 Canonical indexed unit
+  source_anchor: RFC.md:480
+  source_quote: Kit MUST preserve that distinction rather than silently treating same-spelling identifiers as resolved references.
+  source_fingerprint: 31a3b65d455297295a9e0c504ade9b3517cde4de8f3d1ee8e6b5c28555c00ddf
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Fact records retain provenance and never promote spelling equality to semantic resolution.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-027
+  record_class: requirement
+  modality: MUST
+  title: Default discover to a terse view
+  atomic_text: The discover call must default to a terse view.
+  source_section: §13.5 Targeted tree output
+  source_anchor: RFC.md:501
+  source_quote: It MUST default to a terse, ranked view rather than an exhaustive dump.
+  source_fingerprint: d82555ba3464048bc9510b1bc541c81e0e380863dbe50c675c5df1ce97bacf87
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A discover request without presentation overrides returns the bounded terse representation.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-028
+  record_class: requirement
+  modality: MUST
+  title: Default discover to a ranked view
+  atomic_text: The discover call must default to a ranked view.
+  source_section: §13.5 Targeted tree output
+  source_anchor: RFC.md:501
+  source_quote: It MUST default to a terse, ranked view rather than an exhaustive dump.
+  source_fingerprint: d82555ba3464048bc9510b1bc541c81e0e380863dbe50c675c5df1ce97bacf87
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Default discover entries are ordered by their declared ranking policy.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-029
+  record_class: requirement
+  modality: MUST NOT
+  title: Do not default discover to exhaustive output
+  atomic_text: The discover call must not default to an exhaustive dump.
+  source_section: §13.5 Targeted tree output
+  source_anchor: RFC.md:501
+  source_quote: It MUST default to a terse, ranked view rather than an exhaustive dump.
+  source_fingerprint: d82555ba3464048bc9510b1bc541c81e0e380863dbe50c675c5df1ce97bacf87
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Default discover output stops at its finite budget and reports omissions.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-030
+  record_class: requirement
+  modality: SHOULD
+  title: Batch independent search queries
+  atomic_text: One batched search call should support multiple independent queries.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:518-522
+  source_quote: 'queries: [{text, mode: lexical|structural|symbol|semantic}],'
+  source_fingerprint: 3672f09eb16bdafd9d5924017399197a89c39f92898a28eb0cd1bc6b386435c6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: One search request accepts an array containing more than one independent query.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-031
+  record_class: requirement
+  modality: SHOULD
+  title: Support lexical search mode
+  atomic_text: One batched search call should support lexical mode.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:518-522
+  source_quote: 'queries: [{text, mode: lexical|structural|symbol|semantic}],'
+  source_fingerprint: 3672f09eb16bdafd9d5924017399197a89c39f92898a28eb0cd1bc6b386435c6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each query can select exact lexical matching.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-032
+  record_class: requirement
+  modality: SHOULD
+  title: Support structural search mode
+  atomic_text: One batched search call should support structural mode.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:518-522
+  source_quote: 'queries: [{text, mode: lexical|structural|symbol|semantic}],'
+  source_fingerprint: 3672f09eb16bdafd9d5924017399197a89c39f92898a28eb0cd1bc6b386435c6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each query can select syntax-aware structural matching.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-033
+  record_class: requirement
+  modality: SHOULD
+  title: Support symbol search mode
+  atomic_text: One batched search call should support symbol mode.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:518-522
+  source_quote: 'queries: [{text, mode: lexical|structural|symbol|semantic}],'
+  source_fingerprint: 3672f09eb16bdafd9d5924017399197a89c39f92898a28eb0cd1bc6b386435c6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each query can select indexed symbol matching.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-034
+  record_class: requirement
+  modality: SHOULD
+  title: Support semantic search mode
+  atomic_text: One batched search call should support semantic mode.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:518-522
+  source_quote: 'queries: [{text, mode: lexical|structural|symbol|semantic}],'
+  source_fingerprint: 3672f09eb16bdafd9d5924017399197a89c39f92898a28eb0cd1bc6b386435c6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Each query can select an available semantic retrieval adapter.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-035
+  record_class: requirement
+  modality: SHOULD
+  title: Filter search by path
+  atomic_text: One batched search call should support an optional paths filter.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:523
+  source_quote: paths?, languages?, limit?, context_lines?, group_by?
+  source_fingerprint: c5c1539b53241bc65d383c9e1ccd9fa29b4a8d8a18ea95e368941b99f9c4b3da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A search request can restrict every query to declared repository paths.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-036
+  record_class: requirement
+  modality: SHOULD
+  title: Filter search by language
+  atomic_text: One batched search call should support an optional languages filter.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:523
+  source_quote: paths?, languages?, limit?, context_lines?, group_by?
+  source_fingerprint: c5c1539b53241bc65d383c9e1ccd9fa29b4a8d8a18ea95e368941b99f9c4b3da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A search request can restrict every query to declared source languages.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-037
+  record_class: requirement
+  modality: SHOULD
+  title: Limit search results
+  atomic_text: One batched search call should support an optional result limit.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:523
+  source_quote: paths?, languages?, limit?, context_lines?, group_by?
+  source_fingerprint: c5c1539b53241bc65d383c9e1ccd9fa29b4a8d8a18ea95e368941b99f9c4b3da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A search request can set a finite maximum returned-item count.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-038
+  record_class: requirement
+  modality: SHOULD
+  title: Configure search context lines
+  atomic_text: One batched search call should support an optional context-lines value.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:523
+  source_quote: paths?, languages?, limit?, context_lines?, group_by?
+  source_fingerprint: c5c1539b53241bc65d383c9e1ccd9fa29b4a8d8a18ea95e368941b99f9c4b3da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A search request can set a finite number of surrounding lines for each match.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-039
+  record_class: requirement
+  modality: SHOULD
+  title: Group search results
+  atomic_text: One batched search call should support an optional grouping selector.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:523
+  source_quote: paths?, languages?, limit?, context_lines?, group_by?
+  source_fingerprint: c5c1539b53241bc65d383c9e1ccd9fa29b4a8d8a18ea95e368941b99f9c4b3da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A search request can select a supported result-grouping dimension.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-040
+  record_class: requirement
+  modality: SHOULD
+  title: Return ranked search matches
+  atomic_text: One batched search call should return ranked matches.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:524
+  source_quote: ) -> ranked matches + omitted counts + expansion cursor
+  source_fingerprint: 96425c413f7987abc59837fe6a4c1ccfd642c6ff199af696dcfb8e7f9f26a8b6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Search results order returned matches under the declared ranking policy.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-041
+  record_class: requirement
+  modality: SHOULD
+  title: Return omitted search counts
+  atomic_text: One batched search call should return omitted counts.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:524
+  source_quote: ) -> ranked matches + omitted counts + expansion cursor
+  source_fingerprint: 96425c413f7987abc59837fe6a4c1ccfd642c6ff199af696dcfb8e7f9f26a8b6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A bounded search result states how many matching entries were omitted.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-042
+  record_class: requirement
+  modality: SHOULD
+  title: Return a search expansion cursor
+  atomic_text: One batched search call should return an expansion cursor.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:524
+  source_quote: ) -> ranked matches + omitted counts + expansion cursor
+  source_fingerprint: 96425c413f7987abc59837fe6a4c1ccfd642c6ff199af696dcfb8e7f9f26a8b6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: A truncated search result provides a revision-scoped opaque cursor for expansion.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-043
+  record_class: requirement
+  modality: MUST
+  title: Bound search results
+  atomic_text: Search results must be bounded.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:527
+  source_quote: Results MUST be bounded, deduplicated, revision-tagged, and addressable for focused reads.
+  source_fingerprint: 5ff840ef30dd49ca810e059e7e3c20402864a25c1de0f423a2f51679985f7343
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Every search response enforces a finite item or token bound.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-044
+  record_class: requirement
+  modality: MUST
+  title: Deduplicate search results
+  atomic_text: Search results must be deduplicated.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:527
+  source_quote: Results MUST be bounded, deduplicated, revision-tagged, and addressable for focused reads.
+  source_fingerprint: 5ff840ef30dd49ca810e059e7e3c20402864a25c1de0f423a2f51679985f7343
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Equivalent result identities appear at most once in a search response.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-045
+  record_class: requirement
+  modality: MUST
+  title: Revision-tag search results
+  atomic_text: Search results must be revision-tagged.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:527
+  source_quote: Results MUST be bounded, deduplicated, revision-tagged, and addressable for focused reads.
+  source_fingerprint: 5ff840ef30dd49ca810e059e7e3c20402864a25c1de0f423a2f51679985f7343
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Every search response and cursor identifies the workspace revision searched.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-046
+  record_class: requirement
+  modality: MUST
+  title: Address search results for focused reads
+  atomic_text: Search results must be addressable for focused reads.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:527
+  source_quote: Results MUST be bounded, deduplicated, revision-tagged, and addressable for focused reads.
+  source_fingerprint: 5ff840ef30dd49ca810e059e7e3c20402864a25c1de0f423a2f51679985f7343
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Focused reads use bounded revision-native byte/line streaming, require the indexed workspace revision and a canonical root-relative path, return stable coordinates and exact bounded metadata, and transactionally publish opaque epoch/revision/path/range/auth-bound artifact envelopes for binary, large, or full-log content. Resolution requires the principal and project context and returns only a streamed, digest-verified payload.
+  acceptance_criteria:
+  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M004
+  contributing_milestones:
+  - M005
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - macos-arm64
+  - linux-x86_64
+  - linux-aarch64
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  - G05
+  implementation_links:
+  - src/workspace/read/mod.rs
+  - src/workspace/revision/supported.rs
+  - src/store/artifacts/mod.rs
+  - tests/conformance/repo_discover.rs
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M004-W02-C-002
+  evidence_job: evidence-report
+  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when focused read ranges, coordinates, revision checks, output bounds, artifact envelopes, or authorization binding changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-REPO-047
+  record_class: requirement
+  modality: SHOULD
+  title: Accept text for each search query
+  atomic_text: Each query in a batched search call should contain query text.
+  source_section: §13.6 Search contract
+  source_anchor: RFC.md:518-522
+  source_quote: 'queries: [{text, mode: lexical|structural|symbol|semantic}],'
+  source_fingerprint: 3672f09eb16bdafd9d5924017399197a89c39f92898a28eb0cd1bc6b386435c6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-REPO
+  applicability: mandatory
+  interpretation: Every search query object carries the text interpreted by its selected mode.
+  acceptance_criteria:
+  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Repository intelligence owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M005-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
+  decision_record: null
+  deviation_record: null

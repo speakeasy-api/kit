@@ -1,0 +1,41 @@
+{
+  "name": "runlet-language",
+  "displayName": "Runlet Language Support",
+  "description": "Syntax highlighting and editor configuration for Runlet programs.",
+  "version": "0.1.0",
+  "publisher": "runlet-lang",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "files": [
+    "language-configuration.json",
+    "syntaxes/runlet.tmLanguage.json",
+    "README.md"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "runlet",
+        "aliases": [
+          "Runlet",
+          "runlet"
+        ],
+        "extensions": [
+          ".rnlt"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "runlet",
+        "scopeName": "source.runlet",
+        "path": "./syntaxes/runlet.tmLanguage.json"
+      }
+    ]
+  }
+}

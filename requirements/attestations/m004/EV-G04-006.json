@@ -1,0 +1,92 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance verify_profiles && cargo test --locked --test conformance verify_feedback",
+    "evidence_id": "EV-G04-006",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "verify_profiles"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 2 tests\ntest verify_profiles::public_profile_matrix_is_ten_for_ten ... ok\ntest verify_profiles::downstream_debug_api_cannot_forge_checks_bindings_evidence_or_passes ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 447 filtered out; finished in 12.34s\n\n",
+        "output_digest": "fd6e306acb0a01a826f7e231052b01f4fc474a972ffe194110ae094dcd184898",
+        "proof_kind": null,
+        "test_count": 2
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "verify_feedback"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 6 tests\ntest verify_feedback::hostile_logs_are_bounded_and_malformed_records_are_counted ... ok\ntest verify_feedback::secret_canaries_in_plain_url_base64_split_and_binary_forms_never_reach_feedback ... ok\ntest verify_feedback::unavailable_or_incompatible_baseline_never_claims_a_new_edit_failure ... ok\ntest verify_feedback::red_baseline_delta_is_complete_and_moved_lines_are_attributed ... ok\ntest verify_feedback::bounded_feedback_keeps_required_failure_and_full_canonical_report ... ok\ntest verify_feedback::downstream_cannot_mint_feedback_authority_or_append_events ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 443 filtered out; finished in 0.88s\n\n",
+        "output_digest": "d6b85521a634ad28c516c28d5c42f399fe5ad8a54578f9d5770f6fc3dd4b5d19",
+        "proof_kind": null,
+        "test_count": 6
+      }
+    ]
+  },
+  "artifact_digest": "028a8fb7d25a3d96ab36af19a480bafb0bb1f0fba7428a5699e0043f110e073a",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G04-006",
+    "evidence_job": "dashboard-g04",
+    "expected_result": "`commit|abort` and diagnostic-delta behavior matches every verification profile.",
+    "requirement_areas": [
+      "KIT-VERIFY",
+      "KIT-EDIT"
+    ],
+    "source_line": 454,
+    "source_ref": "IMPLEMENTATION_PLAN.md:454"
+  },
+  "disposition": "passed",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G04",
+  "milestone": "M004",
+  "requirements": [
+    {
+      "evidence_id": "EV-M004-W08-C-001",
+      "evidence_job": "evidence-report",
+      "record_id": "KIT-VERIFY-001"
+    },
+    {
+      "evidence_id": "EV-M004-W08-C-002",
+      "evidence_job": "evidence-report",
+      "record_id": "KIT-VERIFY-002"
+    },
+    {
+      "evidence_id": "EV-M004-W07-C-001",
+      "evidence_job": "evidence-report",
+      "record_id": "KIT-VERIFY-801"
+    }
+  ],
+  "run_id": "local-20260728-m004",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m004-worktree-source-conformance"
+}

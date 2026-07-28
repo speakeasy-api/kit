@@ -1,0 +1,2919 @@
+- id: KIT-OUTCOME-001
+  record_class: requirement
+  modality: MUST
+  title: Produce correct code changes
+  atomic_text: Kit must produce correct code changes.
+  source_section: §3 Goals
+  source_anchor: RFC.md:49-51
+  source_quote: '- produce correct, scoped, maintainable code changes with executable evidence;'
+  source_fingerprint: d71a7ec4426c1179a5c31cf38dc68f028eb97b4295fe205820bbfb586e35eb36
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Accepted patches satisfy their fixed external acceptance rule.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-002
+  record_class: requirement
+  modality: MUST
+  title: Keep code changes scoped
+  atomic_text: Kit must produce scoped code changes.
+  source_section: §3 Goals
+  source_anchor: RFC.md:49-51
+  source_quote: '- produce correct, scoped, maintainable code changes with executable evidence;'
+  source_fingerprint: d71a7ec4426c1179a5c31cf38dc68f028eb97b4295fe205820bbfb586e35eb36
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Accepted patches contain no unauthorized or task-unrelated changes.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-003
+  record_class: requirement
+  modality: MUST
+  title: Produce maintainable code changes
+  atomic_text: Kit must produce maintainable code changes.
+  source_section: §3 Goals
+  source_anchor: RFC.md:49-51
+  source_quote: '- produce correct, scoped, maintainable code changes with executable evidence;'
+  source_fingerprint: d71a7ec4426c1179a5c31cf38dc68f028eb97b4295fe205820bbfb586e35eb36
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Accepted patches pass the predeclared maintainability review rule.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-004
+  record_class: requirement
+  modality: MUST
+  title: Provide executable evidence
+  atomic_text: Kit must produce code changes with executable evidence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:49-51
+  source_quote: '- produce correct, scoped, maintainable code changes with executable evidence;'
+  source_fingerprint: d71a7ec4426c1179a5c31cf38dc68f028eb97b4295fe205820bbfb586e35eb36
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Every claimed code-change result links to an executed acceptance check.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-005
+  record_class: requirement
+  modality: MUST
+  title: Minimize cost per verified result
+  atomic_text: Kit must minimize cost per independently verified result rather than cost per attempt.
+  source_section: §3 Goals
+  source_anchor: RFC.md:52
+  source_quote: '- minimize cost per independently verified result rather than cost per attempt;'
+  source_fingerprint: 73286e0a0382df8885de07f5679c99591b5e59e5721b840e9a8c763ec823919c
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Optimization decisions use ratio-of-totals cost per externally accepted result as the cost objective.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-006
+  record_class: requirement
+  modality: MUST
+  title: Minimize time to verified completion
+  atomic_text: Kit must minimize end-to-end time to verified completion, including queueing, setup, tools, builds, and retries.
+  source_section: §3 Goals
+  source_anchor: RFC.md:53
+  source_quote: '- minimize time to verified completion, including queueing, setup, tools, builds, and retries;'
+  source_fingerprint: 32cc88963badfe7199262d6c7ed6fa3ee560f06a38dc3f3120a39e2e1ac5d434
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Latency measurement spans request admission through external verification and includes all named phases.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-007
+  record_class: requirement
+  modality: MUST
+  title: Account for uncached input separately
+  atomic_text: Kit must account for uncached input separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose uncached input as its own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-008
+  record_class: requirement
+  modality: MUST
+  title: Account for cache writes separately
+  atomic_text: Kit must account for cache writes separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose cache writes as their own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-009
+  record_class: requirement
+  modality: MUST
+  title: Account for cache reads separately
+  atomic_text: Kit must account for cache reads separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose cache reads as their own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-010
+  record_class: requirement
+  modality: MUST
+  title: Account for visible output separately
+  atomic_text: Kit must account for visible output separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose visible output as its own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-011
+  record_class: requirement
+  modality: MUST
+  title: Account for reasoning tokens separately
+  atomic_text: Kit must account for reasoning tokens separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose reasoning tokens as their own category when available.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-012
+  record_class: requirement
+  modality: MUST
+  title: Account for tools separately
+  atomic_text: Kit must account for tool usage separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose tool consumption as its own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-013
+  record_class: requirement
+  modality: MUST
+  title: Account for compute separately
+  atomic_text: Kit must account for compute separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose non-model compute as its own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-014
+  record_class: requirement
+  modality: MUST
+  title: Account for failed speculation separately
+  atomic_text: Kit must account for failed speculation separately.
+  source_section: §3 Goals
+  source_anchor: RFC.md:54
+  source_quote: '- account separately for uncached input, cache writes, cache reads, visible output, reasoning tokens, tools, compute, and failed speculation;'
+  source_fingerprint: 4bed78f610183e28fbbe55484126b58121a85e1deefb65fe1ce90389df378f4d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Usage records expose canceled or unused speculative work as its own category.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-015
+  record_class: requirement
+  modality: MUST
+  title: Expose concise tools
+  atomic_text: Kit must expose concise model-facing tools.
+  source_section: §3 Goals
+  source_anchor: RFC.md:57
+  source_quote: '- expose concise, model-legible tools that can batch work and return bounded output;'
+  source_fingerprint: 856fd02a63164c1b487c0a428908d490601d24354c5b516d023569f0a69e13c3
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Eager model-facing tool definitions satisfy the measured concise-schema threshold.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-016
+  record_class: requirement
+  modality: MUST
+  title: Expose model-legible tools
+  atomic_text: Kit must expose model-legible tools.
+  source_section: §3 Goals
+  source_anchor: RFC.md:57
+  source_quote: '- expose concise, model-legible tools that can batch work and return bounded output;'
+  source_fingerprint: 856fd02a63164c1b487c0a428908d490601d24354c5b516d023569f0a69e13c3
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Tool selection evaluation meets its preregistered model-legibility threshold.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-017
+  record_class: requirement
+  modality: MUST
+  title: Batch tool work
+  atomic_text: Kit's model-facing tools must be able to batch work.
+  source_section: §3 Goals
+  source_anchor: RFC.md:57
+  source_quote: '- expose concise, model-legible tools that can batch work and return bounded output;'
+  source_fingerprint: 856fd02a63164c1b487c0a428908d490601d24354c5b516d023569f0a69e13c3
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: A single supported tool invocation can carry multiple independent compatible operations.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-018
+  record_class: requirement
+  modality: MUST
+  title: Bound tool output
+  atomic_text: Kit's model-facing tools must return bounded output.
+  source_section: §3 Goals
+  source_anchor: RFC.md:57
+  source_quote: '- expose concise, model-legible tools that can batch work and return bounded output;'
+  source_fingerprint: 856fd02a63164c1b487c0a428908d490601d24354c5b516d023569f0a69e13c3
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Every model-facing tool result enforces a finite item or token bound.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-019
+  record_class: requirement
+  modality: MUST
+  title: Apply edits transactionally
+  atomic_text: Kit must apply edits transactionally against a known workspace revision.
+  source_section: §3 Goals
+  source_anchor: RFC.md:58
+  source_quote: '- apply edits transactionally against a known workspace revision and optionally verify them in the same call;'
+  source_fingerprint: 78bb1c8edc1adcdd4c1dd521de4d5c07a888a6033a0756ab8cc30f3b11eb7fb8
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: An edit call validates its base revision and commits all requested file effects or none.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-020
+  record_class: requirement
+  modality: MUST
+  title: Offer same-call edit verification
+  atomic_text: Kit must offer optional verification in the same transactional edit call.
+  source_section: §3 Goals
+  source_anchor: RFC.md:58
+  source_quote: '- apply edits transactionally against a known workspace revision and optionally verify them in the same call;'
+  source_fingerprint: 78bb1c8edc1adcdd4c1dd521de4d5c07a888a6033a0756ab8cc30f3b11eb7fb8
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: The edit contract accepts a verification profile and returns its result with transaction disposition.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-021
+  record_class: requirement
+  modality: MUST
+  title: Discover changing tool catalogs lazily
+  atomic_text: Kit must discover large and changing tool catalogs without loading every schema into model context.
+  source_section: §3 Goals
+  source_anchor: RFC.md:59
+  source_quote: '- discover large and changing tool catalogs without loading every schema into context;'
+  source_fingerprint: a0a45f8a660f3c08cc7dfae2c2182606036e4c15aabe588b47578d21c6fa9535
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Catalog discovery returns bounded summaries and defers full schema loading until selection.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-022
+  record_class: requirement
+  modality: MUST
+  title: Compose tools including MCP
+  atomic_text: Kit must compose tools, including MCP tools.
+  source_section: §3 Goals
+  source_anchor: RFC.md:60
+  source_quote: '- compose tools, including MCP tools, while retaining normal permission, tracing, cancellation, and resource controls;'
+  source_fingerprint: bbc5ed82c1ed08a314cc2752d29aea67452b9a2686b6862bfe15c24d9b128eae
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Composition can invoke native and MCP capabilities through the common invocation authority.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-023
+  record_class: requirement
+  modality: MUST
+  title: Retain permissions during composition
+  atomic_text: Composed tools must retain normal permission controls.
+  source_section: §3 Goals
+  source_anchor: RFC.md:60
+  source_quote: '- compose tools, including MCP tools, while retaining normal permission, tracing, cancellation, and resource controls;'
+  source_fingerprint: bbc5ed82c1ed08a314cc2752d29aea67452b9a2686b6862bfe15c24d9b128eae
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Every nested invocation passes through the same permission decision path as a direct invocation.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-024
+  record_class: requirement
+  modality: MUST
+  title: Retain tracing during composition
+  atomic_text: Composed tools must retain normal tracing controls.
+  source_section: §3 Goals
+  source_anchor: RFC.md:60
+  source_quote: '- compose tools, including MCP tools, while retaining normal permission, tracing, cancellation, and resource controls;'
+  source_fingerprint: bbc5ed82c1ed08a314cc2752d29aea67452b9a2686b6862bfe15c24d9b128eae
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Every nested invocation is linked into the parent trace.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-025
+  record_class: requirement
+  modality: MUST
+  title: Retain cancellation during composition
+  atomic_text: Composed tools must retain normal cancellation controls.
+  source_section: §3 Goals
+  source_anchor: RFC.md:60
+  source_quote: '- compose tools, including MCP tools, while retaining normal permission, tracing, cancellation, and resource controls;'
+  source_fingerprint: bbc5ed82c1ed08a314cc2752d29aea67452b9a2686b6862bfe15c24d9b128eae
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Parent cancellation propagates to every active nested invocation.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-026
+  record_class: requirement
+  modality: MUST
+  title: Retain resource controls during composition
+  atomic_text: Composed tools must retain normal resource controls.
+  source_section: §3 Goals
+  source_anchor: RFC.md:60
+  source_quote: '- compose tools, including MCP tools, while retaining normal permission, tracing, cancellation, and resource controls;'
+  source_fingerprint: bbc5ed82c1ed08a314cc2752d29aea67452b9a2686b6862bfe15c24d9b128eae
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Nested invocations consume and cannot exceed the parent resource budget.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-027
+  record_class: requirement
+  modality: MUST
+  title: Use compact type projections when measured
+  atomic_text: Kit must use compact type projections where they measurably help.
+  source_section: §3 Goals
+  source_anchor: RFC.md:63
+  source_quote: '- use compact type projections and adaptive TOON where they measurably help;'
+  source_fingerprint: 9bb99afbf3434e924be2553e0aae02de7005036e85480381ac31f697a09724da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: A compact type projection is enabled only after its preregistered trial meets the value gate.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-028
+  record_class: requirement
+  modality: MUST
+  title: Use adaptive TOON when measured
+  atomic_text: Kit must use adaptive TOON where it measurably helps.
+  source_section: §3 Goals
+  source_anchor: RFC.md:63
+  source_quote: '- use compact type projections and adaptive TOON where they measurably help;'
+  source_fingerprint: 9bb99afbf3434e924be2553e0aae02de7005036e85480381ac31f697a09724da
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Adaptive TOON is selected only for model/task cells whose preregistered trial meets the value gate.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-029
+  record_class: requirement
+  modality: MUST
+  title: Evaluate every optimization reproducibly
+  atomic_text: Kit must evaluate every optimization with reproducible experiments.
+  source_section: §3 Goals
+  source_anchor: RFC.md:67
+  source_quote: '- evaluate every optimization with reproducible, statistically credible experiments.'
+  source_fingerprint: 54a75ee2f164afdd77d105d696ee52f7f8f9814f96b1006d7e482ffd5754d868
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each optimization decision references a pinned trial manifest that can be rerun.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-030
+  record_class: requirement
+  modality: MUST
+  title: Evaluate every optimization credibly
+  atomic_text: Kit must evaluate every optimization with statistically credible experiments.
+  source_section: §3 Goals
+  source_anchor: RFC.md:67
+  source_quote: '- evaluate every optimization with reproducible, statistically credible experiments.'
+  source_fingerprint: 54a75ee2f164afdd77d105d696ee52f7f8f9814f96b1006d7e482ffd5754d868
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each optimization decision satisfies the preregistered statistical design and uncertainty rules.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-031
+  record_class: requirement
+  modality: MUST
+  title: Derive defaults from measurement
+  atomic_text: Model-specific defaults must come from measured behavior rather than aesthetic preference.
+  source_section: §7.6 Model-specific, evidence-driven policy
+  source_anchor: RFC.md:162
+  source_quote: Defaults MUST come from measured behavior, not aesthetic preference.
+  source_fingerprint: 0f9282147e41a992ea1e3f1969cff5d3622d30197ccb47cb36bae98b22bd64bd
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Every model-specific default links to a preregistered accepted measurement or conservative fallback decision.
+  acceptance_criteria:
+  - '`cargo test --test conformance ablation_portfolio -- measured_defaults` exits 0 with 7 of 7 policy groups resolved.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M002
+  - M004
+  - M006
+  - M007
+  - M008
+  - M009
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W10-E-008
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance ablation_portfolio -- measured_defaults` exits 0 with 7 of 7 policy groups resolved.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when any model-specific default, model snapshot, task corpus, or policy group changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-032
+  record_class: requirement
+  modality: MUST
+  title: Report resolution rate
+  atomic_text: Every benchmark or optimization result must report resolution rate.
+  source_section: §6.1 Primary outcomes
+  source_anchor: RFC.md:109-111
+  source_quote: '- resolution rate and confidence interval,'
+  source_fingerprint: c773177cadeaae509cff31b2d0641ad4b66e8666df8285eaa4b2ee0ba34678c9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes accepted tasks divided by attempted tasks for the declared population.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-033
+  record_class: requirement
+  modality: MUST
+  title: Report resolution confidence interval
+  atomic_text: Every benchmark or optimization result must report a confidence interval for resolution rate.
+  source_section: §3 Goals
+  source_anchor: RFC.md:109-111
+  source_quote: '- resolution rate and confidence interval,'
+  source_fingerprint: c773177cadeaae509cff31b2d0641ad4b66e8666df8285eaa4b2ee0ba34678c9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each reported resolution rate includes its preregistered confidence interval.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-034
+  record_class: requirement
+  modality: MUST
+  title: Report FAIL_TO_PASS outcomes
+  atomic_text: Every benchmark or optimization result must report FAIL_TO_PASS outcomes where applicable.
+  source_section: §3 Goals
+  source_anchor: RFC.md:112
+  source_quote: '- `FAIL_TO_PASS` and `PASS_TO_PASS` outcomes where applicable,'
+  source_fingerprint: 7eb48ad89fbbb83733d7a46164e2e9dbb9f2087cb835e9291ac0bd8e54240a6a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Applicable patch benchmarks include the FAIL_TO_PASS outcome count and rate.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-035
+  record_class: requirement
+  modality: MUST
+  title: Report PASS_TO_PASS outcomes
+  atomic_text: Every benchmark or optimization result must report PASS_TO_PASS outcomes where applicable.
+  source_section: §3 Goals
+  source_anchor: RFC.md:112
+  source_quote: '- `FAIL_TO_PASS` and `PASS_TO_PASS` outcomes where applicable,'
+  source_fingerprint: 7eb48ad89fbbb83733d7a46164e2e9dbb9f2087cb835e9291ac0bd8e54240a6a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Applicable patch benchmarks include the PASS_TO_PASS outcome count and rate.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-036
+  record_class: requirement
+  modality: MUST
+  title: Report regression rate
+  atomic_text: Every benchmark or optimization result must report regression rate.
+  source_section: §3 Goals
+  source_anchor: RFC.md:113
+  source_quote: '- regression, security, and unauthorized-effect rate,'
+  source_fingerprint: aebd1915f3d278cf83d9512b8cd3248b56c5a416e9c8b3a008ff72c6c7bb9318
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the fraction of trials introducing a regression.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-037
+  record_class: requirement
+  modality: MUST
+  title: Report security failure rate
+  atomic_text: Every benchmark or optimization result must report security failure rate.
+  source_section: §3 Goals
+  source_anchor: RFC.md:113
+  source_quote: '- regression, security, and unauthorized-effect rate,'
+  source_fingerprint: aebd1915f3d278cf83d9512b8cd3248b56c5a416e9c8b3a008ff72c6c7bb9318
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the fraction of trials violating a security acceptance rule.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-038
+  record_class: requirement
+  modality: MUST
+  title: Report unauthorized-effect rate
+  atomic_text: Every benchmark or optimization result must report unauthorized-effect rate.
+  source_section: §3 Goals
+  source_anchor: RFC.md:113
+  source_quote: '- regression, security, and unauthorized-effect rate,'
+  source_fingerprint: aebd1915f3d278cf83d9512b8cd3248b56c5a416e9c8b3a008ff72c6c7bb9318
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the fraction of trials producing an unauthorized external effect.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-039
+  record_class: requirement
+  modality: MUST
+  title: Report p50 time to first useful action
+  atomic_text: Every benchmark or optimization result must report p50 time to first useful action.
+  source_section: §3 Goals
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p50 latency from request to first useful action.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-040
+  record_class: requirement
+  modality: MUST
+  title: Report p50 time to first edit
+  atomic_text: Every benchmark or optimization result must report p50 time to first edit.
+  source_section: §3 Goals
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p50 latency from request to first edit.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-041
+  record_class: requirement
+  modality: MUST
+  title: Report p50 time to targeted-test pass
+  atomic_text: Every benchmark or optimization result must report p50 time to targeted-test pass.
+  source_section: §3 Goals
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p50 latency from request to the first targeted-test pass.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-042
+  record_class: requirement
+  modality: MUST
+  title: Report p50 time to verified completion
+  atomic_text: Every benchmark or optimization result must report p50 time to verified completion.
+  source_section: §3 Goals
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p50 latency from request to verified completion.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-043
+  record_class: requirement
+  modality: MUST
+  title: Report logical tokens by category
+  atomic_text: Every benchmark or optimization result must report logical tokens by category.
+  source_section: §3 Goals
+  source_anchor: RFC.md:115
+  source_quote: '- logical and billed tokens by category,'
+  source_fingerprint: aec0086e13a192934c500edba0b56b80b9deb0a810b473ad73c8cf1ecb3954de
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report groups logical token counts by the declared accounting categories.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-044
+  record_class: requirement
+  modality: MUST
+  title: Report billed tokens by category
+  atomic_text: Every benchmark or optimization result must report billed tokens by category.
+  source_section: §3 Goals
+  source_anchor: RFC.md:115
+  source_quote: '- logical and billed tokens by category,'
+  source_fingerprint: aec0086e13a192934c500edba0b56b80b9deb0a810b473ad73c8cf1ecb3954de
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report groups provider-billed token counts by the declared accounting categories.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-045
+  record_class: requirement
+  modality: MUST
+  title: Report cost per attempt
+  atomic_text: Every benchmark or optimization result must report fully loaded cost per attempt.
+  source_section: §3 Goals
+  source_anchor: RFC.md:116
+  source_quote: '- fully loaded cost per attempt and per verified result,'
+  source_fingerprint: a956a717279eba14b45cd4b576d09f1e84f480a2c9dfc53d77126d5f577b4ad6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report divides total loaded trajectory cost by attempted task count.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-046
+  record_class: requirement
+  modality: MUST
+  title: Report cost per verified result
+  atomic_text: Every benchmark or optimization result must report fully loaded cost per verified result.
+  source_section: §3 Goals
+  source_anchor: RFC.md:116
+  source_quote: '- fully loaded cost per attempt and per verified result,'
+  source_fingerprint: a956a717279eba14b45cd4b576d09f1e84f480a2c9dfc53d77126d5f577b4ad6
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report divides total loaded trajectory cost by externally accepted result count.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-047
+  record_class: requirement
+  modality: MUST
+  title: Report model turns
+  atomic_text: Every benchmark or optimization result must report model turns.
+  source_section: §3 Goals
+  source_anchor: RFC.md:117
+  source_quote: '- model turns, tool calls, nested tool calls, and repair loops,'
+  source_fingerprint: e04f2213ac26cc3faffc4a59131439a930cece61eb233cc0d6806ee705e83412
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the model-turn count.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-048
+  record_class: requirement
+  modality: MUST
+  title: Report tool calls
+  atomic_text: Every benchmark or optimization result must report direct tool calls.
+  source_section: §3 Goals
+  source_anchor: RFC.md:117
+  source_quote: '- model turns, tool calls, nested tool calls, and repair loops,'
+  source_fingerprint: e04f2213ac26cc3faffc4a59131439a930cece61eb233cc0d6806ee705e83412
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the direct tool-call count.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-049
+  record_class: requirement
+  modality: MUST
+  title: Report nested tool calls
+  atomic_text: Every benchmark or optimization result must report nested tool calls.
+  source_section: §3 Goals
+  source_anchor: RFC.md:117
+  source_quote: '- model turns, tool calls, nested tool calls, and repair loops,'
+  source_fingerprint: e04f2213ac26cc3faffc4a59131439a930cece61eb233cc0d6806ee705e83412
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes nested capability invocations separately from direct calls.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-050
+  record_class: requirement
+  modality: MUST
+  title: Report repair loops
+  atomic_text: Every benchmark or optimization result must report repair loops.
+  source_section: §3 Goals
+  source_anchor: RFC.md:117
+  source_quote: '- model turns, tool calls, nested tool calls, and repair loops,'
+  source_fingerprint: e04f2213ac26cc3faffc4a59131439a930cece61eb233cc0d6806ee705e83412
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the count of edit-and-recheck repair loops.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-051
+  record_class: requirement
+  modality: MUST
+  title: Report cache hit ratio
+  atomic_text: Every benchmark or optimization result must report cache hit ratio.
+  source_section: §3 Goals
+  source_anchor: RFC.md:118
+  source_quote: '- cache hit/write/read ratios and prefix divergence,'
+  source_fingerprint: 27fffc576308046df5cc1946e2909770fc220dd3b17fe1ee3a017665f6f99ad4
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes cache hits divided by eligible cache lookups.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-052
+  record_class: requirement
+  modality: MUST
+  title: Report cache write ratio
+  atomic_text: Every benchmark or optimization result must report cache write ratio.
+  source_section: §3 Goals
+  source_anchor: RFC.md:118
+  source_quote: '- cache hit/write/read ratios and prefix divergence,'
+  source_fingerprint: 27fffc576308046df5cc1946e2909770fc220dd3b17fe1ee3a017665f6f99ad4
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes cache-write tokens divided by eligible input tokens.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-053
+  record_class: requirement
+  modality: MUST
+  title: Report cache read ratio
+  atomic_text: Every benchmark or optimization result must report cache read ratio.
+  source_section: §3 Goals
+  source_anchor: RFC.md:118
+  source_quote: '- cache hit/write/read ratios and prefix divergence,'
+  source_fingerprint: 27fffc576308046df5cc1946e2909770fc220dd3b17fe1ee3a017665f6f99ad4
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes cache-read tokens divided by eligible input tokens.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-054
+  record_class: requirement
+  modality: MUST
+  title: Report prefix divergence
+  atomic_text: Every benchmark or optimization result must report prefix divergence.
+  source_section: §3 Goals
+  source_anchor: RFC.md:118
+  source_quote: '- cache hit/write/read ratios and prefix divergence,'
+  source_fingerprint: 27fffc576308046df5cc1946e2909770fc220dd3b17fe1ee3a017665f6f99ad4
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes the first divergent token or byte for compared stable prefixes.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-055
+  record_class: requirement
+  modality: MUST
+  title: Report human intervention
+  atomic_text: Every benchmark or optimization result must report human intervention.
+  source_section: §3 Goals
+  source_anchor: RFC.md:119
+  source_quote: '- human intervention, review, rework, and rollback.'
+  source_fingerprint: 662fea013a3ba8e9ae5ed2a5bcf7e9482efab8886be22cafaa25fa3468ab56f0
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes intervention count and declared intervention units.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-056
+  record_class: requirement
+  modality: MUST
+  title: Report human review
+  atomic_text: Every benchmark or optimization result must report human review.
+  source_section: §3 Goals
+  source_anchor: RFC.md:119
+  source_quote: '- human intervention, review, rework, and rollback.'
+  source_fingerprint: 662fea013a3ba8e9ae5ed2a5bcf7e9482efab8886be22cafaa25fa3468ab56f0
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes review occurrence and outcome.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-057
+  record_class: requirement
+  modality: MUST
+  title: Report rework
+  atomic_text: Every benchmark or optimization result must report rework.
+  source_section: §3 Goals
+  source_anchor: RFC.md:119
+  source_quote: '- human intervention, review, rework, and rollback.'
+  source_fingerprint: 662fea013a3ba8e9ae5ed2a5bcf7e9482efab8886be22cafaa25fa3468ab56f0
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes whether accepted work required later rework.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-058
+  record_class: requirement
+  modality: MUST
+  title: Report rollback
+  atomic_text: Every benchmark or optimization result must report rollback.
+  source_section: §3 Goals
+  source_anchor: RFC.md:119
+  source_quote: '- human intervention, review, rework, and rollback.'
+  source_fingerprint: 662fea013a3ba8e9ae5ed2a5bcf7e9482efab8886be22cafaa25fa3468ab56f0
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes whether the delivered result was rolled back.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-059
+  record_class: requirement
+  modality: MUST
+  title: Report p95 time to first useful action
+  atomic_text: Every benchmark or optimization result must report p95 time to first useful action.
+  source_section: §6.1 Primary outcomes
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p95 latency from request to first useful action.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-060
+  record_class: requirement
+  modality: MUST
+  title: Report p95 time to first edit
+  atomic_text: Every benchmark or optimization result must report p95 time to first edit.
+  source_section: §6.1 Primary outcomes
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p95 latency from request to first edit.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-061
+  record_class: requirement
+  modality: MUST
+  title: Report p95 time to targeted-test pass
+  atomic_text: Every benchmark or optimization result must report p95 time to targeted-test pass.
+  source_section: §6.1 Primary outcomes
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p95 latency from request to the first targeted-test pass.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-OUTCOME-062
+  record_class: requirement
+  modality: MUST
+  title: Report p95 time to verified completion
+  atomic_text: Every benchmark or optimization result must report p95 time to verified completion.
+  source_section: §6.1 Primary outcomes
+  source_anchor: RFC.md:114
+  source_quote: '- p50/p95 time to first useful action, first edit, targeted-test pass, and verified completion,'
+  source_fingerprint: d9a533012af85327ee2576503e3573f91578d55a25c9874f26a4cb2b7a5c574e
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-OUTCOME
+  applicability: mandatory
+  interpretation: Each report includes p95 latency from request to verified completion.
+  acceptance_criteria:
+  - '`cargo test --test conformance outcome_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Evaluation owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W06-E-001
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance outcome_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every release candidate and when outcome reporting changes.
+  decision_record: null
+  deviation_record: null

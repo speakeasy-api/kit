@@ -1,0 +1,4 @@
+schema_version: 1
+name: lint
+commands:
+  - cargo clippy --locked --all-targets -- -D warnings

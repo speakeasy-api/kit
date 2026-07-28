@@ -1,0 +1,18 @@
+#! expect: { "open_total": 350, "guard": "EMPTY" }
+orders = data.orders()
+open_amounts = for o in orders {
+    skip if o.status != "open"
+    return o.amount_cents
+}
+open_total = fold acc = 0 for a in open_amounts { return acc + a }
+guard = boundary retry 2 {
+    voided = for o in orders {
+        skip if o.status != "void"
+        return o
+    }
+    first = voided[0] if voided != [] else fail("EMPTY", "no voided orders", { hint: "expected" })
+    return first.id
+} catch err {
+    return err.code
+}
+return { open_total: open_total, guard: guard }

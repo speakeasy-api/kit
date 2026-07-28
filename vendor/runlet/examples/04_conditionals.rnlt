@@ -1,0 +1,16 @@
+# Conditions are Boolean and only the selected expression is evaluated.
+enabled = true
+safe_value = 42 if enabled else 1 / 0
+
+temperature = 18
+description = (
+    "hot" if temperature >= 30 else
+    "mild" if temperature >= 15 else
+    "cold"
+)
+
+return {
+    safe_value,
+    description,
+    message: "Temperature: " + temperature
+}

@@ -1,0 +1,800 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Kit Executor HTTP API
+  version: 1.0.0
+  description: >-
+    Authorized process, terminal, and terminal-attachment API fragment. Identifiers
+    and cursors are opaque. Clients must ignore unknown response fields. Linux and
+    macOS provide native PTY primitives, but no production attempt-owned executor
+    profile currently exposes them. Linux helper integration is blocked by EXT-22.
+    Terminal allocation returns a typed platform_unavailable or profile_unavailable
+    problem when the selected platform or production profile cannot supply an owned
+    process PTY. Windows PTY parity is not claimed. Authorized replacement viewers
+    can still read retained history for exited or interrupted terminals.
+servers:
+  - url: http://localhost
+security:
+  - bearerAuth: []
+tags:
+  - name: Processes
+  - name: Terminals
+  - name: ExecutorEvents
+paths:
+  /v1/projects/{project_id}/processes:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      operationId: listProcesses
+      x-kit-operation: process.list
+      tags: [Processes]
+      responses:
+        '200':
+          description: Authorized processes in the project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessList'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/processes/{process_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProcessId'
+    get:
+      operationId: getProcess
+      x-kit-operation: process.get
+      tags: [Processes]
+      responses:
+        '200':
+          description: Authorized process metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Process'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/processes/{process_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ProcessId'
+    post:
+      operationId: cancelProcess
+      x-kit-operation: process.cancel
+      tags: [Processes]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/EmptyMutation'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/Unsupported' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/processes/{process_id}/terminals:
+    parameters:
+      - $ref: '#/components/parameters/ProcessId'
+    post:
+      operationId: allocateTerminal
+      x-kit-operation: terminal.allocate
+      tags: [Terminals]
+      description: >-
+        Reveals the terminal that was requested and PTY-bound before the owned process spawned.
+        This operation never retroactively attaches a PTY to a running process; it returns a
+        conflict when no matching pre-spawn binding exists.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AllocateTerminal'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/PtyUnavailable' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminals/{terminal_id}:
+    parameters:
+      - $ref: '#/components/parameters/TerminalId'
+    get:
+      operationId: getTerminal
+      x-kit-operation: terminal.get
+      tags: [Terminals]
+      responses:
+        '200':
+          description: Authorized terminal metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Terminal'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminals/{terminal_id}/attachments:
+    parameters:
+      - $ref: '#/components/parameters/TerminalId'
+    post:
+      operationId: attachTerminalViewer
+      x-kit-operation: terminal.viewer.attach
+      tags: [Terminals]
+      description: >-
+        Creates a read-only viewer. Replacement viewers may attach to an interrupted terminal to
+        read retained output, resize events, and retention gaps after daemon restart.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/EmptyMutation'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminals/{terminal_id}/writer-claims:
+    parameters:
+      - $ref: '#/components/parameters/TerminalId'
+    post:
+      operationId: claimTerminalWriter
+      x-kit-operation: terminal.writer.claim
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/WriterLease'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    get:
+      operationId: getTerminalAttachment
+      x-kit-operation: terminal.attachment.get
+      tags: [Terminals]
+      responses:
+        '200':
+          description: Authorized attachment metadata. Secret lease tokens are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Attachment'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/renew:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    post:
+      operationId: renewTerminalWriter
+      x-kit-operation: terminal.writer.renew
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/WriterLease'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/release:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    post:
+      operationId: releaseTerminalWriter
+      x-kit-operation: terminal.writer.release
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/EmptyMutation'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/input:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    post:
+      operationId: writeTerminalInput
+      x-kit-operation: terminal.input
+      description: Raw input is sent directly to the PTY driver and is never echoed or retained.
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TerminalInput'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/input-resolution:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    post:
+      operationId: resolveTerminalInput
+      x-kit-operation: terminal.input.resolve
+      description: Resolves an explicit unknown input outcome without repeating terminal input.
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TerminalInputResolution'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/resize:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    post:
+      operationId: resizeTerminal
+      x-kit-operation: terminal.resize
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TerminalResize'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/output:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+      - $ref: '#/components/parameters/OutputCursor'
+    get:
+      operationId: readTerminalOutput
+      x-kit-operation: terminal.output
+      tags: [Terminals]
+      responses:
+        '200':
+          description: Retained sanitized output after the cursor, or an explicit retention gap.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutputPage'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/resizes:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+      - $ref: '#/components/parameters/ResizeCursor'
+    get:
+      operationId: readTerminalResizes
+      x-kit-operation: terminal.resizes
+      tags: [Terminals]
+      responses:
+        '200':
+          description: Resize events after the cursor, or an explicit retention gap.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResizePage'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/terminal-attachments/{attachment_id}/detach:
+    parameters:
+      - $ref: '#/components/parameters/AttachmentId'
+    post:
+      operationId: detachTerminal
+      x-kit-operation: terminal.detach
+      tags: [Terminals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        $ref: '#/components/requestBodies/EmptyMutation'
+      responses:
+        '200': { $ref: '#/components/responses/Mutation' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+  /v1/projects/{project_id}/executor/events:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/EventCursor'
+    get:
+      operationId: listExecutorEvents
+      x-kit-operation: executor.events
+      tags: [ExecutorEvents]
+      responses:
+        '200':
+          description: Authorized executor events after the opaque cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutorEventPage'
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/HiddenNotFound' }
+        '410':
+          description: Cursor expired; includes an authorized projection snapshot and recovery cursor.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/CursorExpired' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/ExecutorUnavailable' }
+        '504': { $ref: '#/components/responses/Problem' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ProjectId' }
+    ProcessId:
+      name: process_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ProcessId' }
+    TerminalId:
+      name: terminal_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/TerminalId' }
+    AttachmentId:
+      name: attachment_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/AttachmentId' }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[!-~]+$'
+    OutputCursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        pattern: '^output_[0-9a-f]{16}$'
+        default: output_0000000000000001
+    ResizeCursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        pattern: '^resize_[0-9a-f]{16}$'
+        default: resize_0000000000000001
+    EventCursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        pattern: '^exec_[0-9a-f]{16}$'
+        default: exec_0000000000000000
+  requestBodies:
+    EmptyMutation:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            maxProperties: 0
+    WriterLease:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/WriterLease'
+  responses:
+    Mutation:
+      description: Idempotent mutation receipt.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MutationReceipt'
+    Problem:
+      description: RFC 9457 problem details.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Unauthenticated:
+      description: Authentication is required.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ExecutorUnavailable:
+      description: The executor owner service is temporarily unavailable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Unsupported:
+      description: The authorized daemon service exposes this resource read-only.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    PtyUnavailable:
+      description: >-
+        An owned process PTY is unavailable on the current platform or in the
+        selected production executor profile.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            platform_unavailable:
+              value:
+                type: https://kit.dev/problems/platform_unavailable
+                title: Platform unavailable
+                status: 501
+                detail: Native PTY execution is unavailable on this platform.
+                instance: /v1/executor
+                code: platform_unavailable
+            profile_unavailable:
+              value:
+                type: https://kit.dev/problems/profile_unavailable
+                title: Executor profile unavailable
+                status: 501
+                detail: Attempt-owned PTY execution is unavailable in this executor profile.
+                instance: /v1/executor
+                code: profile_unavailable
+    HiddenNotFound:
+      description: >-
+        Generic response for missing, cross-project, cross-principal, and otherwise
+        unauthorized resources. The body is byte-identical for all such cases.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://kit.dev/problems/not_found
+            title: Resource not found
+            status: 404
+            detail: The requested resource was not found.
+            instance: /v1/executor
+            code: not_found
+  schemas:
+    SchemaVersion:
+      type: integer
+      const: 1
+    ProjectId:
+      type: string
+      pattern: '^project_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    ProcessId:
+      type: string
+      pattern: '^process_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    TerminalId:
+      type: string
+      pattern: '^terminal_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    AttachmentId:
+      type: string
+      pattern: '^attachment_[0-9a-f]{32}$'
+    ProcessState:
+      oneOf:
+        - type: object
+          required: [status]
+          properties:
+            status: { const: prepared }
+          additionalProperties: true
+        - type: object
+          required: [status]
+          properties:
+            status: { const: started }
+          additionalProperties: true
+        - type: object
+          required: [status]
+          properties:
+            status: { const: outcome_unknown }
+          additionalProperties: true
+        - type: object
+          required: [status, success, code, signal]
+          properties:
+            status: { const: exited }
+            success: { type: boolean }
+            code: { type: [integer, 'null'] }
+            signal: { type: [integer, 'null'] }
+          additionalProperties: true
+    Process:
+      type: object
+      required: [schema_version, process_id, project_id, owner_kind, execution_id, state, terminal_transport]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        process_id: { $ref: '#/components/schemas/ProcessId' }
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        owner_kind: { type: string, enum: [attempt, daemon_service] }
+        execution_id: { type: [integer, 'null'], minimum: 0 }
+        state: { $ref: '#/components/schemas/ProcessState' }
+        terminal_transport: { type: string, enum: [pipes, pty] }
+      additionalProperties: true
+    ProcessList:
+      type: object
+      required: [schema_version, items]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Process' }
+      additionalProperties: true
+    Terminal:
+      type: object
+      required: [schema_version, terminal_id, process_id, project_id, lifecycle, columns, rows, next_output_cursor, next_resize_cursor, retained_output_bytes, writer_epoch]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        terminal_id: { $ref: '#/components/schemas/TerminalId' }
+        process_id: { $ref: '#/components/schemas/ProcessId' }
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        lifecycle: { enum: [allocating, active, exited, interrupted] }
+        columns: { type: integer, minimum: 1, maximum: 65535 }
+        rows: { type: integer, minimum: 1, maximum: 65535 }
+        next_output_cursor: { type: string, pattern: '^output_[0-9a-f]{16}$' }
+        next_resize_cursor: { type: string, pattern: '^resize_[0-9a-f]{16}$' }
+        retained_output_bytes: { type: integer, minimum: 0 }
+        writer_epoch: { type: [integer, 'null'], minimum: 1 }
+      additionalProperties: true
+    Attachment:
+      type: object
+      required: [schema_version, attachment_id, terminal_id, role, writer_epoch]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        attachment_id: { $ref: '#/components/schemas/AttachmentId' }
+        terminal_id: { $ref: '#/components/schemas/TerminalId' }
+        role: { enum: [viewer, writer] }
+        writer_epoch: { type: [integer, 'null'], minimum: 1 }
+        expires_at_millis: { type: integer, minimum: 1 }
+      additionalProperties: true
+    MutationReceipt:
+      type: object
+      required: [schema_version, operation, changed, replayed]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        operation: { type: string }
+        changed: { type: boolean }
+        replayed: { type: boolean }
+        resource: { type: [object, 'null'], additionalProperties: true }
+      additionalProperties: true
+    AllocateTerminal:
+      type: object
+      required: [columns, rows, max_output_bytes, max_output_age_millis]
+      properties:
+        columns: { type: integer, minimum: 1, maximum: 65535 }
+        rows: { type: integer, minimum: 1, maximum: 65535 }
+        max_output_bytes: { type: integer, minimum: 1 }
+        max_output_age_millis: { type: integer, minimum: 1 }
+      additionalProperties: false
+    WriterLease:
+      type: object
+      required: [lease_millis]
+      properties:
+        lease_millis: { type: integer, minimum: 1 }
+      additionalProperties: false
+    TerminalInput:
+      type: object
+      required: [bytes]
+      properties:
+        bytes:
+          type: array
+          writeOnly: true
+          minItems: 1
+          maxItems: 16384
+          items: { type: integer, minimum: 0, maximum: 255 }
+      additionalProperties: false
+    TerminalInputResolution:
+      type: object
+      required: [outcome]
+      properties:
+        outcome: { type: string, enum: [applied, not_applied] }
+      additionalProperties: false
+    TerminalResize:
+      type: object
+      required: [columns, rows]
+      properties:
+        columns: { type: integer, minimum: 1, maximum: 65535 }
+        rows: { type: integer, minimum: 1, maximum: 65535 }
+      additionalProperties: false
+    OutputChunk:
+      type: object
+      required: [sequence, recorded_at_millis, bytes]
+      properties:
+        sequence: { type: integer, minimum: 1 }
+        recorded_at_millis: { type: integer, minimum: 0 }
+        bytes:
+          type: array
+          items: { type: integer, minimum: 0, maximum: 255 }
+      additionalProperties: true
+    OutputPage:
+      type: object
+      required: [schema_version, gap, next_cursor, chunks]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        gap: { type: boolean }
+        next_cursor: { type: string, pattern: '^output_[0-9a-f]{16}$' }
+        chunks:
+          type: array
+          items: { $ref: '#/components/schemas/OutputChunk' }
+      additionalProperties: true
+    ResizeEvent:
+      type: object
+      required: [sequence, recorded_at_millis, size, writer_epoch]
+      properties:
+        sequence: { type: integer, minimum: 1 }
+        recorded_at_millis: { type: integer, minimum: 0 }
+        size:
+          type: object
+          required: [columns, rows]
+          properties:
+            columns: { type: integer, minimum: 1, maximum: 65535 }
+            rows: { type: integer, minimum: 1, maximum: 65535 }
+          additionalProperties: true
+        writer_epoch: { type: integer, minimum: 1 }
+      additionalProperties: true
+    ResizePage:
+      type: object
+      required: [schema_version, gap, next_cursor, events]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        gap: { type: boolean }
+        next_cursor: { type: string, pattern: '^resize_[0-9a-f]{16}$' }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/ResizeEvent' }
+      additionalProperties: true
+    ExecutorEvent:
+      type: object
+      required: [schema_version, cursor, event_type, project_id, resource_id]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        cursor: { type: string, pattern: '^exec_[0-9a-f]{16}$' }
+        event_type: { type: string }
+        project_id: { $ref: '#/components/schemas/ProjectId' }
+        resource_id: { type: string }
+      additionalProperties: true
+    ExecutorEventPage:
+      type: object
+      required: [schema_version, gap, next_cursor, items]
+      properties:
+        schema_version: { $ref: '#/components/schemas/SchemaVersion' }
+        gap: { type: boolean }
+        next_cursor: { type: string, pattern: '^exec_[0-9a-f]{16}$' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ExecutorEvent' }
+      additionalProperties: true
+    CursorExpired:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          required: [snapshot, new_cursor]
+          properties:
+            snapshot: { type: object }
+            new_cursor: { type: string, pattern: '^exec_[0-9a-f]{16}$' }
+    InvalidParameter:
+      type: object
+      required: [name, reason]
+      properties:
+        name: { type: string }
+        reason: { type: string }
+      additionalProperties: false
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail, instance, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        invalid_parameters:
+          type: array
+          items: { $ref: '#/components/schemas/InvalidParameter' }
+      additionalProperties: true

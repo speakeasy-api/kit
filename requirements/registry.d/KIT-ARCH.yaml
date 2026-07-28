@@ -1,0 +1,713 @@
+- id: KIT-ARCH-001
+  record_class: requirement
+  modality: SHOULD
+  title: Prefer deterministic authorities
+  atomic_text: Kit should use exact deterministic systems before asking a model to infer facts those systems can determine.
+  source_section: §7.1 Deterministic before generative
+  source_anchor: RFC.md:137
+  source_quote: Kit SHOULD use parsers, compilers, formatters, codemods, hashes, search indexes, dependency graphs, version control, and tests before asking a model to infer facts those systems can determine exactly.
+  source_fingerprint: 4520d0ba581ff1d939064db9d6a87a724acd7a1f22b0236f04815ac46f8b852a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: Product flows route exactly answerable work to deterministic repository and build authorities before model inference.
+  acceptance_criteria:
+  - cargo test --locked --test adversarial native_tool_bypass && cargo test --locked --test conformance native_tools exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M004
+  contributing_milestones:
+  - M005
+  dependencies: []
+  owner: Architecture owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  - G05
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M004-W10-C-016
+  evidence_job: evidence-report
+  expected_result: cargo test --locked --test adversarial native_tool_bypass && cargo test --locked --test conformance native_tools exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: 14c5c6be8397f49234cd1b9e272f9916fe98d861e72105c80baa63a71fc5189f
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when command routing or deterministic authority selection changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-002
+  record_class: requirement
+  modality: MUST
+  title: Support ACP subagents
+  atomic_text: Kit must support ACP subagents.
+  source_section: §3 Goals
+  source_anchor: RFC.md:61
+  source_quote: '- support ACP subagents and clients, A2A peer collaboration, and MCP capabilities without conflating their roles;'
+  source_fingerprint: 9c68affb85b6bc8aefae7712445ac4a68727771b7f400f7ae804f8d3eb786932
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: The architecture exposes an ACP subagent role and adapter.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-002` reported as passing.'
+  primary_milestone: M010
+  contributing_milestones:
+  - M006
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G06
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M010-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when ACP, A2A, or MCP domain boundaries change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-003
+  record_class: requirement
+  modality: MUST
+  title: Expose one public API
+  atomic_text: Kit must expose one public API.
+  source_section: §3 Goals
+  source_anchor: RFC.md:65
+  source_quote: '- expose one public API with CLI parity and resumable event streams;'
+  source_fingerprint: a1f549f8eaa20e61c6c9650659de4324672f2d199025b3b3cbe29369c11b6a5b
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: All first-party clients share one public command and query contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-003` reported as passing.'
+  primary_milestone: M001
+  contributing_milestones:
+  - M010
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G01
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M001-W11-C-011
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when a public client or command/query entry point changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-004
+  record_class: requirement
+  modality: MUST
+  title: Maintain CLI parity
+  atomic_text: Kit's CLI must have parity with the public API.
+  source_section: §3 Goals
+  source_anchor: RFC.md:65
+  source_quote: '- expose one public API with CLI parity and resumable event streams;'
+  source_fingerprint: a1f549f8eaa20e61c6c9650659de4324672f2d199025b3b3cbe29369c11b6a5b
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: Every supported CLI operation routes through and is representable by the public API contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-004` reported as passing.'
+  primary_milestone: M001
+  contributing_milestones:
+  - M010
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G01
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M001-W12-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when CLI commands or public API operations change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-005
+  record_class: requirement
+  modality: MUST
+  title: Provide resumable event streams
+  atomic_text: Kit must expose resumable event streams.
+  source_section: §3 Goals
+  source_anchor: RFC.md:65
+  source_quote: '- expose one public API with CLI parity and resumable event streams;'
+  source_fingerprint: a1f549f8eaa20e61c6c9650659de4324672f2d199025b3b3cbe29369c11b6a5b
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: Public event consumers can resume from an opaque committed cursor without semantic gaps.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-005` reported as passing.'
+  primary_milestone: M001
+  contributing_milestones:
+  - M005
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G01
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M001-W11-C-002
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: 9de562f48a7882964d6171b6d6d87d8a72b37a3d2d816b8593d7cd9020f57ae5
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when event cursor or stream semantics change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-006
+  record_class: requirement
+  modality: MUST
+  title: Operate without a sophisticated UI
+  atomic_text: Kit must remain useful without a sophisticated first-party UI.
+  source_section: §3 Goals
+  source_anchor: RFC.md:66
+  source_quote: '- remain useful without a sophisticated first-party UI;'
+  source_fingerprint: de4dab7a852edf2760aed8e1d719fb44e854925aa9d1aeb4a515faa856b2e32f
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: active
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: Headless API and CLI workflows provide the product's required capabilities independently of the web application.
+  acceptance_criteria:
+  - python3 scripts/check_dogfood_harness.py && cargo test --locked --manifest-path dogfood-harness/Cargo.toml local_mechanical_provider_conformance_uses_public_cli_and_http -- --exact && cargo test --locked --manifest-path dogfood-harness/Cargo.toml direct_public_edit_failure_approval_and_artifact_contracts -- --exact exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M004
+  contributing_milestones:
+  - M010
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  - G10
+  implementation_links:
+  - src/api/http/repo.rs
+  - src/cli/repo.rs
+  - src/runtime/daemon.rs
+  public_contract_links:
+  - docs/api/openapi.yaml
+  - docs/operations/repository-api.md
+  - dogfood-harness/Cargo.toml
+  - dogfood-harness/tests/dogfood.rs
+  - scripts/check_dogfood_harness.py
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M004-W11-C-001
+  evidence_job: evidence-report
+  expected_result: python3 scripts/check_dogfood_harness.py && cargo test --locked --manifest-path dogfood-harness/Cargo.toml local_mechanical_provider_conformance_uses_public_cli_and_http -- --exact && cargo test --locked --manifest-path dogfood-harness/Cargo.toml direct_public_edit_failure_approval_and_artifact_contracts -- --exact exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when a required workflow gains a web-only dependency.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-007
+  record_class: requirement
+  modality: SHOULD
+  title: Initially ship one binary
+  atomic_text: Kit should initially ship as one binary.
+  source_section: §8 System Architecture
+  source_anchor: RFC.md:196
+  source_quote: Kit SHOULD initially ship as one binary with modular internal boundaries.
+  source_fingerprint: d8305e1e326deed2e2bc48374136f12d5c159fec96f7ecde2e0e0a2d9f8b9255
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: The initial release produces one Kit product binary.
+  acceptance_criteria:
+  - '`cargo build --locked --bins` exits 0 and Cargo metadata lists exactly 1 Kit binary target.'
+  primary_milestone: PHASE0
+  contributing_milestones:
+  - M001
+  dependencies: []
+  owner: Architecture owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G00
+  - G01
+  implementation_links:
+  - Cargo.toml
+  - src/main.rs
+  - scripts/check_architecture.py
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-1.04-C-003
+  evidence_job: req-lint
+  expected_result: '`python3 scripts/check_architecture.py binary` exits 0 and Cargo metadata reports exactly 1 Kit binary target.'
+  artifact_digest: 06ab5be73dd433acef5ca010a55e9eb8fd04dcdbc669b0eafdf0a5e9b05c1be4
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when Cargo targets change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-008
+  record_class: requirement
+  modality: SHOULD
+  title: Keep modular internal boundaries
+  atomic_text: Kit should initially have modular internal boundaries.
+  source_section: §8 System Architecture
+  source_anchor: RFC.md:196
+  source_quote: Kit SHOULD initially ship as one binary with modular internal boundaries.
+  source_fingerprint: d8305e1e326deed2e2bc48374136f12d5c159fec96f7ecde2e0e0a2d9f8b9255
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: The one binary preserves the RFC module boundaries inside the Cargo workspace.
+  acceptance_criteria:
+  - '`cargo test --locked --no-run --all-targets` exits 0 with all 13 modules declared by `src/lib.rs` compiled.'
+  primary_milestone: PHASE0
+  contributing_milestones:
+  - M001
+  dependencies: []
+  owner: Architecture owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G00
+  - G01
+  implementation_links:
+  - src/lib.rs
+  - src/
+  - scripts/check_architecture.py
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-1.04-C-004
+  evidence_job: req-lint
+  expected_result: '`cargo test --locked --no-run --all-targets` exits 0 with all declared modules compiled.'
+  artifact_digest: ce1233184ee73c31174394d961926dad65c2624d99bc26749e0e468cbe06e805
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when top-level module boundaries change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-009
+  record_class: requirement
+  modality: MAY
+  title: Permit later service separation
+  atomic_text: Kit may split control-plane and executor services after the initial version.
+  source_section: §8 System Architecture
+  source_anchor: RFC.md:196
+  source_quote: It MAY split control-plane and executor services later without changing public semantics.
+  source_fingerprint: d8305e1e326deed2e2bc48374136f12d5c159fec96f7ecde2e0e0a2d9f8b9255
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: pending_voi
+  interpretation: Clustered deployment may separate services while preserving the same domain contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-009` reported as passing.'
+  primary_milestone: M012
+  contributing_milestones: []
+  dependencies: []
+  owner: Architecture owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G12
+  - G12-CLUSTERED
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M012-W01-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when control-plane or executor deployment topology changes.
+  decision_record: docs/decisions/DR-0001-m012-modality.md
+  deviation_record: null
+- id: KIT-ARCH-010
+  record_class: requirement
+  modality: MAY
+  title: Preserve public semantics across service separation
+  atomic_text: Any later control-plane and executor service split may occur only without changing public semantics.
+  source_section: §8 System Architecture
+  source_anchor: RFC.md:196
+  source_quote: It MAY split control-plane and executor services later without changing public semantics.
+  source_fingerprint: d8305e1e326deed2e2bc48374136f12d5c159fec96f7ecde2e0e0a2d9f8b9255
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: pending_voi
+  interpretation: Local and split deployments expose behaviorally compatible public contracts.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-010` reported as passing.'
+  primary_milestone: M012
+  contributing_milestones: []
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G12
+  - G12-CLUSTERED
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M012-W01-C-002
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when local or clustered public semantics change.
+  decision_record: docs/decisions/DR-0001-m012-modality.md
+  deviation_record: null
+- id: KIT-ARCH-011
+  record_class: requirement
+  modality: MUST
+  title: Support ACP clients
+  atomic_text: Kit must support ACP clients.
+  source_section: §3 Goals
+  source_anchor: RFC.md:61
+  source_quote: '- support ACP subagents and clients, A2A peer collaboration, and MCP capabilities without conflating their roles;'
+  source_fingerprint: 9c68affb85b6bc8aefae7712445ac4a68727771b7f400f7ae804f8d3eb786932
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: The architecture exposes an ACP client role and adapter.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-011` reported as passing.'
+  primary_milestone: M010
+  contributing_milestones:
+  - M006
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G06
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M010-W01-C-002
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when ACP client boundaries change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-012
+  record_class: requirement
+  modality: MUST
+  title: Support A2A peer collaboration
+  atomic_text: Kit must support A2A peer collaboration.
+  source_section: §3 Goals
+  source_anchor: RFC.md:61
+  source_quote: '- support ACP subagents and clients, A2A peer collaboration, and MCP capabilities without conflating their roles;'
+  source_fingerprint: 9c68affb85b6bc8aefae7712445ac4a68727771b7f400f7ae804f8d3eb786932
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: The architecture exposes an A2A peer-collaboration role and adapter.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-012` reported as passing.'
+  primary_milestone: M010
+  contributing_milestones:
+  - M006
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G06
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M010-W01-C-003
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when A2A peer boundaries change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-013
+  record_class: requirement
+  modality: MUST
+  title: Support MCP capabilities
+  atomic_text: Kit must support MCP capabilities.
+  source_section: §3 Goals
+  source_anchor: RFC.md:61
+  source_quote: '- support ACP subagents and clients, A2A peer collaboration, and MCP capabilities without conflating their roles;'
+  source_fingerprint: 9c68affb85b6bc8aefae7712445ac4a68727771b7f400f7ae804f8d3eb786932
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: The architecture exposes MCP capabilities through a protocol adapter.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-013` reported as passing.'
+  primary_milestone: M006
+  contributing_milestones:
+  - M010
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G06
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M006-W01-C-007
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when MCP capability boundaries change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ARCH-014
+  record_class: requirement
+  modality: MUST NOT
+  title: Do not conflate protocol roles
+  atomic_text: Kit must not conflate ACP subagent/client, A2A peer, and MCP capability roles.
+  source_section: §3 Goals
+  source_anchor: RFC.md:61
+  source_quote: '- support ACP subagents and clients, A2A peer collaboration, and MCP capabilities without conflating their roles;'
+  source_fingerprint: 9c68affb85b6bc8aefae7712445ac4a68727771b7f400f7ae804f8d3eb786932
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ARCH
+  applicability: mandatory
+  interpretation: ACP, A2A, and MCP use distinct domain relationships and wire adapters.
+  acceptance_criteria:
+  - '`cargo test --test conformance architecture_requirements` exits 0 with `KIT-ARCH-014` reported as passing.'
+  primary_milestone: M010
+  contributing_milestones:
+  - M006
+  dependencies: []
+  owner: Architecture owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G06
+  - G10
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M010-W01-C-004
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance architecture_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when ACP, A2A, or MCP domain boundaries change.
+  decision_record: null
+  deviation_record: null

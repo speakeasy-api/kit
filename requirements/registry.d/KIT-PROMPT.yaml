@@ -1,0 +1,2536 @@
+- id: KIT-PROMPT-001
+  record_class: requirement
+  modality: MUST
+  title: Make stable prompt prefixes intentional
+  atomic_text: Kit must make stable prompt prefixes intentional.
+  source_section: §3 Goals
+  source_anchor: RFC.md:55
+  source_quote: '- make stable prompt prefixes and dynamic context intentional and observable;'
+  source_fingerprint: 6bf1370bb2b255f8954285ba588d5b7eabb2521b4cf72766fc136b248950aaec
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Prompt compilation explicitly classifies and versions the stable prefix.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-002
+  record_class: requirement
+  modality: MUST
+  title: Make stable prompt prefixes observable
+  atomic_text: Kit must make stable prompt prefixes observable.
+  source_section: §3 Goals
+  source_anchor: RFC.md:55
+  source_quote: '- make stable prompt prefixes and dynamic context intentional and observable;'
+  source_fingerprint: 6bf1370bb2b255f8954285ba588d5b7eabb2521b4cf72766fc136b248950aaec
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Each model request records the stable-prefix version and digest.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-003
+  record_class: requirement
+  modality: SHOULD
+  title: Minimize prompt content
+  atomic_text: Prompts should contain only the information needed for the next correct decision.
+  source_section: §7.3 Smallest sufficient interaction
+  source_anchor: RFC.md:145
+  source_quote: Prompts, schemas, results, edits, and final answers SHOULD contain the minimum information needed for the next correct decision.
+  source_fingerprint: 7b68ec934a6ad805a7f1267de9e83463fb6f33b4e741d065eb0b7b8d8995773a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Prompt modules exclude content not required by the current decision contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-004
+  record_class: requirement
+  modality: SHOULD
+  title: Minimize schema content
+  atomic_text: Model-facing schemas should contain only the information needed for the next correct decision.
+  source_section: §7.3 Smallest sufficient interaction
+  source_anchor: RFC.md:145
+  source_quote: Prompts, schemas, results, edits, and final answers SHOULD contain the minimum information needed for the next correct decision.
+  source_fingerprint: 7b68ec934a6ad805a7f1267de9e83463fb6f33b4e741d065eb0b7b8d8995773a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Model-facing schema projections exclude information not required by the current decision contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-005
+  record_class: requirement
+  modality: SHOULD
+  title: Minimize result content
+  atomic_text: Model-facing results should contain only the information needed for the next correct decision.
+  source_section: §7.3 Smallest sufficient interaction
+  source_anchor: RFC.md:145
+  source_quote: Prompts, schemas, results, edits, and final answers SHOULD contain the minimum information needed for the next correct decision.
+  source_fingerprint: 7b68ec934a6ad805a7f1267de9e83463fb6f33b4e741d065eb0b7b8d8995773a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Tool-result projections exclude content not required by the current decision contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-006
+  record_class: requirement
+  modality: SHOULD
+  title: Minimize edit content
+  atomic_text: Model-facing edits should contain only the information needed for the next correct decision.
+  source_section: §7.3 Smallest sufficient interaction
+  source_anchor: RFC.md:145
+  source_quote: Prompts, schemas, results, edits, and final answers SHOULD contain the minimum information needed for the next correct decision.
+  source_fingerprint: 7b68ec934a6ad805a7f1267de9e83463fb6f33b4e741d065eb0b7b8d8995773a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Edit representations exclude content not required to validate and apply the intended change.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-007
+  record_class: requirement
+  modality: SHOULD
+  title: Minimize final-answer content
+  atomic_text: Final answers should contain only the information needed for the next correct decision.
+  source_section: §7.3 Smallest sufficient interaction
+  source_anchor: RFC.md:145
+  source_quote: Prompts, schemas, results, edits, and final answers SHOULD contain the minimum information needed for the next correct decision.
+  source_fingerprint: 7b68ec934a6ad805a7f1267de9e83463fb6f33b4e741d065eb0b7b8d8995773a
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Final answers omit narration not needed to understand outcome, evidence, or a blocker.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-008
+  record_class: requirement
+  modality: MAY
+  title: Permit model-specific prompt modules
+  atomic_text: Prompt modules may vary by model.
+  source_section: §7.6 Model-specific, evidence-driven policy
+  source_anchor: RFC.md:162
+  source_quote: Tool descriptions, prompt modules, edit formats, reasoning levels, compaction policy, composition backends, and result encodings MAY vary by model.
+  source_fingerprint: 0f9282147e41a992ea1e3f1969cff5d3622d30197ccb47cb36bae98b22bd64bd
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: pending_voi
+  interpretation: The compiler can select a measured prompt-module variant for a pinned model snapshot.
+  acceptance_criteria:
+  - '`cargo test --test conformance ablation_portfolio -- model_prompt_modules` exits 0 with 1 accepted disposition.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M002
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W10-E-002
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance ablation_portfolio -- model_prompt_modules` exits 0 with 1 accepted disposition.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for each prompt-module policy, model snapshot, or task corpus change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-009
+  record_class: requirement
+  modality: MUST
+  title: Put stable modules before dynamic modules
+  atomic_text: Stable prompt modules must precede dynamic prompt modules.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Stable modules MUST precede dynamic modules to maximize exact-prefix caching.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Canonical prompt assembly emits every stable module before the first dynamic module.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-010
+  record_class: requirement
+  modality: MUST
+  title: Canonicalize serialization
+  atomic_text: Prompt serialization must be canonical.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Serialization, whitespace, tool order, and key order MUST be canonical.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Equal prompt inputs produce byte-identical serialized content.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-011
+  record_class: requirement
+  modality: MUST
+  title: Canonicalize whitespace
+  atomic_text: Prompt whitespace must be canonical.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Serialization, whitespace, tool order, and key order MUST be canonical.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Equal prompt inputs produce byte-identical whitespace.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-012
+  record_class: requirement
+  modality: MUST
+  title: Canonicalize tool order
+  atomic_text: Prompt tool order must be canonical.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Serialization, whitespace, tool order, and key order MUST be canonical.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Equal tool sets appear in one deterministic prompt order.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-013
+  record_class: requirement
+  modality: MUST
+  title: Canonicalize key order
+  atomic_text: Prompt key order must be canonical.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Serialization, whitespace, tool order, and key order MUST be canonical.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Equal structured prompt values serialize keys in one deterministic order.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-014
+  record_class: requirement
+  modality: MUST NOT
+  title: Exclude timestamps from stable prefixes
+  atomic_text: Timestamps must not appear in the stable prompt prefix.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Timestamps and run-specific IDs MUST NOT appear in the stable prefix.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Stable modules contain no request-time or wall-clock timestamp value.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-015
+  record_class: requirement
+  modality: MUST NOT
+  title: Exclude run IDs from stable prefixes
+  atomic_text: Run-specific identifiers must not appear in the stable prompt prefix.
+  source_section: §11.1 Prompt compiler
+  source_anchor: RFC.md:347
+  source_quote: Timestamps and run-specific IDs MUST NOT appear in the stable prefix.
+  source_fingerprint: 4319d77591a1a78a58cccd530e8bef937f19509e7ff88d33de1b439113963e58
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Stable modules contain no run, attempt, turn, call, or task identifier scoped to one run.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-016
+  record_class: requirement
+  modality: MUST
+  title: Compile the measured core policy by default
+  atomic_text: The measured core behavioral policy must be compiled by default.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:359
+  source_quote: The measured core policy MUST be compiled by default and encode the following in the shortest model-effective wording.
+  source_fingerprint: 4774ed144a9e9f6698fda585f85b6878ab6cefb27654be0f212425cd34dbc4e9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Default prompt assembly includes the measured core policy module.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-017
+  record_class: requirement
+  modality: MUST
+  title: Act instead of proposing
+  atomic_text: The default policy must tell the model to act on the task rather than describe a proposed solution.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:359-361
+  source_quote: '- act on the task rather than describing a proposed solution;'
+  source_fingerprint: fce31ef241d436b845ef763be4171d0c3941f41ec4251f48aeb6100838039810
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the act-not-propose behavior constraint.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-018
+  record_class: requirement
+  modality: MUST
+  title: Inspect relevant code before editing
+  atomic_text: The default policy must tell the model to inspect relevant code before editing.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:362
+  source_quote: '- inspect relevant code before editing;'
+  source_fingerprint: 43934b3a7e3f130644f361cea31dffa2bc1c686afde6b36b1228fd04bfc92676
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the inspect-before-edit behavior constraint.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-019
+  record_class: requirement
+  modality: MUST
+  title: Limit progress communication
+  atomic_text: The default policy must limit progress communication to discoveries, decisions, blockers, and final evidence.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:363
+  source_quote: '- communicate only discoveries, decisions, blockers, and final evidence;'
+  source_fingerprint: 5aebc1ca2ceb5df0071ad50cf7732cb3d64c8aeed841e2e5ae55e3a600eb8838
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy enumerates exactly the allowed progress-update categories.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-020
+  record_class: requirement
+  modality: MUST
+  title: Prohibit routine tool narration
+  atomic_text: The default policy must tell the model not to narrate routine tool calls.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:364
+  source_quote: '- do not narrate routine tool calls or restate the user’s request;'
+  source_fingerprint: e89dc92d72f78f05d924e2f537f5954667429574aa17cf4cec7886f9d281dcac
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the no-routine-tool-narration constraint.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-021
+  record_class: requirement
+  modality: MUST
+  title: Prohibit request restatement
+  atomic_text: The default policy must tell the model not to restate the user's request.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:364
+  source_quote: '- do not narrate routine tool calls or restate the user’s request;'
+  source_fingerprint: e89dc92d72f78f05d924e2f537f5954667429574aa17cf4cec7886f9d281dcac
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the no-request-restatement constraint.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-022
+  record_class: requirement
+  modality: MUST
+  title: Prefer the smallest correct change
+  atomic_text: The default policy must tell the model to prefer the smallest correct change.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:365
+  source_quote: '- prefer the smallest correct change and existing abstractions;'
+  source_fingerprint: 3c6a48ff8960940c569737183b2023a324fefbd2f83c002a0cb930c57b858794
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the smallest-correct-change preference.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-023
+  record_class: requirement
+  modality: MUST
+  title: Prefer existing abstractions
+  atomic_text: The default policy must tell the model to prefer existing abstractions.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:365
+  source_quote: '- prefer the smallest correct change and existing abstractions;'
+  source_fingerprint: 3c6a48ff8960940c569737183b2023a324fefbd2f83c002a0cb930c57b858794
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the existing-abstraction preference.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-024
+  record_class: requirement
+  modality: MUST
+  title: Avoid unneeded compatibility paths
+  atomic_text: The default policy must tell the model not to add a compatibility path without a concrete need.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:366
+  source_quote: '- do not add compatibility paths, helpers, dependencies, or configuration without a concrete need;'
+  source_fingerprint: c5e2c6e837588eb5675fd3907d8fcee1c6f3212fae78d88ae2a89bc88744a896
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy conditions new compatibility paths on a concrete need.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-025
+  record_class: requirement
+  modality: MUST
+  title: Avoid unneeded helpers
+  atomic_text: The default policy must tell the model not to add a helper without a concrete need.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:366
+  source_quote: '- do not add compatibility paths, helpers, dependencies, or configuration without a concrete need;'
+  source_fingerprint: c5e2c6e837588eb5675fd3907d8fcee1c6f3212fae78d88ae2a89bc88744a896
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy conditions new helpers on a concrete need.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-026
+  record_class: requirement
+  modality: MUST
+  title: Avoid unneeded dependencies
+  atomic_text: The default policy must tell the model not to add a dependency without a concrete need.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:366
+  source_quote: '- do not add compatibility paths, helpers, dependencies, or configuration without a concrete need;'
+  source_fingerprint: c5e2c6e837588eb5675fd3907d8fcee1c6f3212fae78d88ae2a89bc88744a896
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy conditions new dependencies on a concrete need.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-027
+  record_class: requirement
+  modality: MUST
+  title: Avoid unneeded configuration
+  atomic_text: The default policy must tell the model not to add configuration without a concrete need.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:366
+  source_quote: '- do not add compatibility paths, helpers, dependencies, or configuration without a concrete need;'
+  source_fingerprint: c5e2c6e837588eb5675fd3907d8fcee1c6f3212fae78d88ae2a89bc88744a896
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy conditions new configuration on a concrete need.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-028
+  record_class: requirement
+  modality: MUST
+  title: Parallelize independent discovery
+  atomic_text: The default policy must tell the model to parallelize independent discovery.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:367
+  source_quote: '- parallelize independent discovery and checks;'
+  source_fingerprint: d9817b7344ada6b66916a09dcb1930abc37705f4fde86f5651da86b94a8264e2
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the independent-discovery parallelism rule.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-029
+  record_class: requirement
+  modality: MUST
+  title: Parallelize independent checks
+  atomic_text: The default policy must tell the model to parallelize independent checks.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:367
+  source_quote: '- parallelize independent discovery and checks;'
+  source_fingerprint: d9817b7344ada6b66916a09dcb1930abc37705f4fde86f5651da86b94a8264e2
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy contains the independent-check parallelism rule.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-030
+  record_class: requirement
+  modality: MUST
+  title: Continue through implementation
+  atomic_text: The default policy must tell the model to continue through implementation unless genuinely blocked.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:368
+  source_quote: '- continue through implementation and verification unless genuinely blocked;'
+  source_fingerprint: b8ea17eed8028749d400efb2e1a7db5d551aed4fbb9205abc784f7b79051f314
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy does not stop at planning when implementation is possible.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-031
+  record_class: requirement
+  modality: MUST
+  title: Continue through verification
+  atomic_text: The default policy must tell the model to continue through verification unless genuinely blocked.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:368
+  source_quote: '- continue through implementation and verification unless genuinely blocked;'
+  source_fingerprint: b8ea17eed8028749d400efb2e1a7db5d551aed4fbb9205abc784f7b79051f314
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy does not stop before available verification runs.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-032
+  record_class: requirement
+  modality: MUST
+  title: Comment only non-obvious intent
+  atomic_text: The default policy must tell the model to write comments only for non-obvious intent.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:369
+  source_quote: '- write comments only for non-obvious intent, never as a narration of code;'
+  source_fingerprint: 6a043ade97e15adf0045b1b72bad50bee5ce4e082058e7c3e4f0a10f02d68662
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy limits comments to non-obvious rationale or constraints.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-033
+  record_class: requirement
+  modality: MUST
+  title: Prohibit narrating comments
+  atomic_text: The default policy must tell the model never to narrate code with comments.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:369
+  source_quote: '- write comments only for non-obvious intent, never as a narration of code;'
+  source_fingerprint: 6a043ade97e15adf0045b1b72bad50bee5ce4e082058e7c3e4f0a10f02d68662
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy prohibits comments that merely restate code operations.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-034
+  record_class: requirement
+  modality: MUST
+  title: Name tests after enduring behavior
+  atomic_text: The default policy must tell the model to name tests after enduring behavior.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:370
+  source_quote: '- name tests after enduring behavior, not the bug, ticket, or recent implementation change;'
+  source_fingerprint: 33f7685f114608551ebfcf2d3defaac516d1fbc16882380d0b7ba13cae6862b1
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy requires behavior-oriented test names.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-035
+  record_class: requirement
+  modality: MUST
+  title: Avoid transient test names
+  atomic_text: The default policy must tell the model not to name tests after a bug, ticket, or recent implementation change.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:370
+  source_quote: '- name tests after enduring behavior, not the bug, ticket, or recent implementation change;'
+  source_fingerprint: 33f7685f114608551ebfcf2d3defaac516d1fbc16882380d0b7ba13cae6862b1
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy prohibits transient incident and implementation labels in test names.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-036
+  record_class: requirement
+  modality: MUST
+  title: Test observable behavior
+  atomic_text: The default policy must tell the model to test externally observable behavior rather than mirror implementation steps.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:371
+  source_quote: '- test externally observable behavior rather than mirroring implementation steps;'
+  source_fingerprint: 8cdb4da7ed66044569f92b04b2bc936390f7da596745858076da81e76f10601d
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy directs tests toward public effects and contracts.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-037
+  record_class: requirement
+  modality: MUST
+  title: Preserve unrelated work
+  atomic_text: The default policy must tell the model to preserve unrelated work.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:372
+  source_quote: '- preserve unrelated work and never discard uncommitted changes without explicit authority;'
+  source_fingerprint: f678ea1f41555fb4c4775ba1957bfd455b4c706b93345aa0abfc71da46bd71b8
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy protects task-unrelated workspace changes.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-038
+  record_class: requirement
+  modality: MUST
+  title: Protect uncommitted changes
+  atomic_text: The default policy must tell the model never to discard uncommitted changes without explicit authority.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:372
+  source_quote: '- preserve unrelated work and never discard uncommitted changes without explicit authority;'
+  source_fingerprint: f678ea1f41555fb4c4775ba1957bfd455b4c706b93345aa0abfc71da46bd71b8
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy requires explicit authority before a destructive workspace operation.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-039
+  record_class: requirement
+  modality: MUST
+  title: Claim completion from evidence
+  atomic_text: The default policy must tell the model to use executable evidence rather than confidence to claim completion.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:373
+  source_quote: '- use executable evidence, not confidence, to claim completion;'
+  source_fingerprint: 5419fb9a56a899211f0257feb2989452e96f58ff7e8bb090302d7911325a0bc0
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy ties completion claims to run checks or inspected state.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-040
+  record_class: requirement
+  modality: MUST
+  title: Return a concise outcome
+  atomic_text: The default policy must tell the model to return a concise outcome.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:374
+  source_quote: '- return a concise outcome, changed areas, and checks run;'
+  source_fingerprint: 97684b72b3c5d37cf5a18dbdc3887a4a5a632dcaff4c1df56866689039df7181
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy requires a concise outcome field in final communication.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-041
+  record_class: requirement
+  modality: MUST
+  title: Return changed areas
+  atomic_text: The default policy must tell the model to return changed areas.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:374
+  source_quote: '- return a concise outcome, changed areas, and checks run;'
+  source_fingerprint: 97684b72b3c5d37cf5a18dbdc3887a4a5a632dcaff4c1df56866689039df7181
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy requires final communication to identify changed areas.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-042
+  record_class: requirement
+  modality: MUST
+  title: Return checks run
+  atomic_text: The default policy must tell the model to return the checks run.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:374
+  source_quote: '- return a concise outcome, changed areas, and checks run;'
+  source_fingerprint: 97684b72b3c5d37cf5a18dbdc3887a4a5a632dcaff4c1df56866689039df7181
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy requires final communication to enumerate executed checks.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-043
+  record_class: requirement
+  modality: MUST
+  title: Prohibit private reasoning disclosure
+  atomic_text: The default policy must tell the model not to reveal private reasoning.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:375
+  source_quote: '- do not reveal private reasoning; provide decisions and evidence when explanation is needed.'
+  source_fingerprint: 615c93b89a9172f1b988affc7b412756c516b862e9ba752330b431c6212aa7a9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy prohibits exposing hidden reasoning content.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: 3781cdc501ab89f30a696122427cb3e3f019922415ba6cfbdf959c8333037b5c
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-044
+  record_class: requirement
+  modality: MUST
+  title: Explain with decisions and evidence
+  atomic_text: The default policy must tell the model to provide decisions and evidence when explanation is needed.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:375
+  source_quote: '- do not reveal private reasoning; provide decisions and evidence when explanation is needed.'
+  source_fingerprint: 615c93b89a9172f1b988affc7b412756c516b862e9ba752330b431c6212aa7a9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The compiled default policy substitutes concise decisions and evidence for private reasoning.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-045
+  record_class: requirement
+  modality: MAY
+  title: Permit evaluated policy-rule removal
+  atomic_text: Evaluated model-specific policy variants may remove default behavioral rules only when security, authority, and workspace-safety requirements are not weakened.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:359
+  source_quote: 'Evaluated model-specific variants MAY remove or rewrite rules but cannot weaken security, authority, or workspace-safety requirements:'
+  source_fingerprint: 4774ed144a9e9f6698fda585f85b6878ab6cefb27654be0f212425cd34dbc4e9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: pending_voi
+  interpretation: A pinned model variant can omit a rule only after an accepted evaluation proves all three protected requirement classes remain at least as strong.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-046
+  record_class: requirement
+  modality: MAY
+  title: Permit evaluated policy-rule rewriting
+  atomic_text: Evaluated model-specific policy variants may rewrite default behavioral rules only when security, authority, and workspace-safety requirements are not weakened.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:359
+  source_quote: 'Evaluated model-specific variants MAY remove or rewrite rules but cannot weaken security, authority, or workspace-safety requirements:'
+  source_fingerprint: 4774ed144a9e9f6698fda585f85b6878ab6cefb27654be0f212425cd34dbc4e9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: pending_voi
+  interpretation: A pinned model variant can replace rule wording only after an accepted evaluation proves all three protected requirement classes remain at least as strong.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-050
+  record_class: requirement
+  modality: SHOULD
+  title: Ask only material questions
+  atomic_text: The model should ask a question only when uncertainty materially changes implementation or safety.
+  source_section: §11.3 Task normalization
+  source_anchor: RFC.md:393
+  source_quote: The model SHOULD ask a question only when uncertainty materially changes implementation or safety.
+  source_fingerprint: 3a74a9cc1a348abd1eca1eb4a47ab8eac4c8740044705bf49a956cea569fd275
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The task policy permits a user question only for implementation-changing or safety-changing uncertainty.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-051
+  record_class: requirement
+  modality: SHOULD
+  title: Avoid requesting visible chain-of-thought
+  atomic_text: Kit should avoid requesting visible chain-of-thought.
+  source_section: §11.4 Output control
+  source_anchor: RFC.md:397
+  source_quote: Kit SHOULD avoid requesting visible chain-of-thought.
+  source_fingerprint: 5a081b2f74fdd556a9f213d49e503a874d08a756e4062a2ce2a3be649cdb7fb8
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Prompt and provider request templates do not ask for visible private reasoning.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-052
+  record_class: requirement
+  modality: SHOULD
+  title: Constrain machine-consumed responses
+  atomic_text: Machine-consumed responses should use constrained structured output or tool calls.
+  source_section: §11.4 Output control
+  source_anchor: RFC.md:399
+  source_quote: Machine-consumed responses SHOULD use constrained structured output or tool calls.
+  source_fingerprint: 46ca7af5ce6dbeea81e97fa02d94d33bf3fea3c711e873e0a286e187d6883660
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: Machine-consumed model turns select a supported schema-constrained response or capability call contract.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-PROMPT-053
+  record_class: requirement
+  modality: MUST
+  title: Encode core policy in shortest effective wording
+  atomic_text: The measured core policy must encode its rules in the shortest model-effective wording.
+  source_section: §11.2 Default behavioral policy
+  source_anchor: RFC.md:359
+  source_quote: The measured core policy MUST be compiled by default and encode the following in the shortest model-effective wording.
+  source_fingerprint: 4774ed144a9e9f6698fda585f85b6878ab6cefb27654be0f212425cd34dbc4e9
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-PROMPT
+  applicability: mandatory
+  interpretation: The accepted default policy wording is the shortest tested variant that preserves measured behavior.
+  acceptance_criteria:
+  - '`cargo test --test conformance prompt_requirements` exits 0 with this requirement ID reported as passing.'
+  primary_milestone: M002
+  contributing_milestones: []
+  dependencies: []
+  owner: Prompt owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G02
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M002-W04-C-001
+  evidence_job: integration
+  expected_result: '`cargo test --test conformance prompt_requirements` exits 0 with 0 failed assertions.'
+  artifact_digest: f4a34d963d68bafce52a8e0ba137056a40e36c361ac655804d1f9d3a668707da
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when prompt compilation, policy modules, or output controls change.
+  decision_record: null
+  deviation_record: null

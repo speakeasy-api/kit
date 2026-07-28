@@ -1,0 +1,29 @@
+schema_version: 1
+tool: act
+version: "0.2.89"
+release_url: https://github.com/nektos/act/releases/tag/v0.2.89
+checksums_url: https://github.com/nektos/act/releases/download/v0.2.89/checksums.txt
+platforms:
+  - platform: Darwin/arm64
+    source_url: https://github.com/nektos/act/releases/download/v0.2.89/act_Darwin_arm64.tar.gz
+    sha256: 48ae218af96725f7635a66de2b87e1e346893b02add0f16b92f560296b2151fc
+  - platform: Darwin/x86_64
+    source_url: https://github.com/nektos/act/releases/download/v0.2.89/act_Darwin_x86_64.tar.gz
+    sha256: 41b31488e7c254baec31cce12c7dade3e35973b8a31b9486206ad43f233d814e
+  - platform: Linux/arm64
+    source_url: https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_arm64.tar.gz
+    sha256: daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb
+  - platform: Linux/x86_64
+    source_url: https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_x86_64.tar.gz
+    sha256: 0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0
+verification:
+  date: "2026-07-21"
+  host: Darwin/arm64
+  command: .tools/bin/act -l
+  exit_code: 0
+  output: |
+    Stage  Job ID  Job name            Workflow name  Workflow file  Events
+    0      lane    ${{ matrix.name }}  CI             ci.yaml        push,pull_request,release
+  stderr_notes:
+    - Docker host unix:///var/run/docker.sock was auto-detected.
+    - act warned that no container architecture was specified on Apple M-series.

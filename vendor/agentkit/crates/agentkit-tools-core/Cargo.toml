@@ -1,0 +1,28 @@
+[package]
+description = "Tool traits, registry, execution, permissions, approvals, and auth for agentkit."
+homepage.workspace = true
+name = "agentkit-tools-core"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+schemars = ["dep:schemars"]
+
+[dependencies]
+agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+async-trait.workspace = true
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+schemars = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }

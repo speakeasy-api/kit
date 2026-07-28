@@ -1,0 +1,100 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance exec_api && cargo test --locked --test conformance terminal_lease",
+    "evidence_id": "EV-G03-008",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "exec_api"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 21 tests\ntest exec_api::core_parser_reaches_every_executor_command ... ok\ntest exec_api::openapi_cli_routes_and_sdk_builders_have_zero_uncovered_operations ... ok\ntest exec_api::cross_principal_and_cross_project_are_byte_identical_to_missing ... ok\ntest exec_api::raw_input_debug_is_redacted ... ok\ntest exec_api::cancellation_replays_without_a_second_coordinator_call_and_emits_an_event ... ok\ntest exec_api::terminal_input_commands_require_and_reuse_an_explicit_key ... ok\ntest exec_api::terminal_input_rejects_direct_values_and_accepts_stdin_or_file_descriptors ... ok\ntest exec_api::openapi_input_is_write_only_and_hidden_not_found_contains_no_identifier ... ok\ntest exec_api::unavailable_pty_driver_returns_documented_501_without_existence_leak ... ok\ntest exec_api::executor_transport_returns_documented_body_and_timeout_errors ... ok\ntest exec_api::observed_process_lifecycle_is_api_visible_and_durable ... ok\ntest exec_api::process_events_and_idempotency_survive_service_restart ... ok\ntest exec_api::durable_startup_marks_prepared_and_started_processes_outcome_unknown ... ok\ntest exec_api::cancellation_unknown_stays_unknown_until_quiescence_and_completes_once ... ok\ntest exec_api::input_resolution_uses_exact_durable_ownership_after_attachment_invalidation ... ok\ntest exec_api::raw_input_is_absent_from_durable_executor_state ... ok\ntest exec_api::ambiguous_terminal_mutations_never_reconcile_from_matching_live_state ... ok\ntest exec_api::attachment_endpoints_hide_every_unauthorized_or_invalidated_target_without_effects ... ok\ntest exec_api::executor_event_pruning_keeps_global_rowid_order_across_feeds_and_restarts ... ok\ntest exec_api::pruned_cursor_recovery_includes_interrupted_history_and_filters_invalidated_attachments ... ok\ntest exec_api::idempotency_capacity_rejects_4097th_and_restart_replays_oldest ... ok\n\ntest result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 428 filtered out; finished in 9.05s\n\n",
+        "output_digest": "5296d08534b81677e686784d8bdc5dbb5cf18ce47727688884ceaf78796ef85c",
+        "proof_kind": null,
+        "test_count": 21
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "terminal_lease"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 11 tests\ntest terminal_lease::terminal_uses_auth_boundary_and_denies_cross_project_authority ... ok\ntest terminal_lease::pipes_are_default_and_require_spawn_authority_without_allocating_a_pty ... ok\ntest terminal_lease::stale_attempt_fence_denies_every_terminal_operation_before_driver_writes ... ok\ntest terminal_lease::viewers_are_read_only_and_output_and_resize_retention_report_gaps ... ok\ntest terminal_lease::empty_output_flood_is_rejected_without_retained_metadata_growth ... ok\ntest terminal_lease::restored_local_pty_is_interrupted_and_records_attempt_interruption ... ok\ntest terminal_lease::daemon_death_wins_a_concurrent_allocation_and_blocks_future_allocations ... ok\ntest terminal_lease::secret_absent_terminal_history ... ok\ntest terminal_lease::detach_reclaims_viewer_slots_and_writer_lease ... ok\ntest terminal_lease::one_writer_survives_one_thousand_concurrent_claims ... ok\ntest terminal_lease::output_and_resize_event_counts_are_bounded_and_report_count_gaps ... ok\n\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 438 filtered out; finished in 0.13s\n\n",
+        "output_digest": "0c68447f865469691455cfd657414a5d7c0af0784af27fe854af897b3485b208",
+        "proof_kind": null,
+        "test_count": 11
+      }
+    ]
+  },
+  "artifact_digest": "6ac69a1483af0f9598384547c3bdaadb14e90e452a395b4892d853a0c882bca6",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked_external",
+    "evidence_id": "EV-G03-008",
+    "evidence_job": "dashboard-g03",
+    "expected_result": "Process and terminal API resources enforce ownership, viewer/writer leases, retention and CLI/SDK parity.",
+    "requirement_areas": [
+      "KIT-API",
+      "KIT-EXEC"
+    ],
+    "source_line": 414,
+    "source_ref": "IMPLEMENTATION_PLAN.md:414"
+  },
+  "disposition": "blocked_external",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "EXT-19",
+    "EXT-22"
+  ],
+  "gate": "G03",
+  "milestone": "M003",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-1216",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-818"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1217",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-819"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1218",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-820"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1219",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-821"
+    }
+  ],
+  "run_id": "local-20260728-m003",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m003-worktree-source-conformance"
+}

@@ -1,0 +1,13 @@
+gate: G06
+milestone: KIT-MILESTONE-006
+source_range: {source: IMPLEMENTATION_PLAN.md, start_line: 530, end_line: 537}
+current_status: pending
+evidence:
+  - {source_line: 530, source_ref: "IMPLEMENTATION_PLAN.md:530", requirement_areas: [KIT-CAP, KIT-SEC, KIT-TOOL], evidence_id: EV-G06-001, evidence_job: dashboard-g06, expected_result: "Unauthorized capabilities are absent from search and inspection, not merely blocked at invocation.", current_status: pending}
+  - {source_line: 531, source_ref: "IMPLEMENTATION_PLAN.md:531", requirement_areas: [KIT-TOOL, KIT-CAP, KIT-VERSION], evidence_id: EV-G06-002, evidence_job: dashboard-g06, expected_result: "Schema round-trip and provider projection tests reject unsupported constraints rather than dropping them.", current_status: pending}
+  - {source_line: 532, source_ref: "IMPLEMENTATION_PLAN.md:532", requirement_areas: [KIT-CAP, KIT-SEC], evidence_id: EV-G06-003, evidence_job: dashboard-g06, expected_result: "Existing bindings remain immutable through schema and list-change races; changed grants expire them.", current_status: pending}
+  - {source_line: 533, source_ref: "IMPLEMENTATION_PLAN.md:533", requirement_areas: [KIT-CAP, KIT-OBS], evidence_id: EV-G06-004, evidence_job: dashboard-g06, expected_result: "Direct and generic invocation produce equivalent policy, events, traces and results.", current_status: pending}
+  - {source_line: 534, source_ref: "IMPLEMENTATION_PLAN.md:534", requirement_areas: [KIT-MCP, KIT-CAP], evidence_id: EV-G06-005, evidence_job: dashboard-g06, expected_result: "MCP restart, auth interruption, list-change storms and malformed server behavior are bounded and recoverable.", current_status: pending}
+  - {source_line: 535, source_ref: "IMPLEMENTATION_PLAN.md:535", requirement_areas: [KIT-SEC, KIT-MCP, KIT-OBS], evidence_id: EV-G06-006, evidence_job: dashboard-g06, expected_result: "Secret and prompt-injection suites cover prompts, events, traces, composition inputs, terminal history and workspace metadata.", current_status: pending}
+  - {source_line: 536, source_ref: "IMPLEMENTATION_PLAN.md:536", requirement_areas: [KIT-SEC, KIT-MCP], evidence_id: EV-G06-007, evidence_job: dashboard-g06, expected_result: "URL adversarial tests cover redirects, rebinding, local services and unauthorized destinations.", current_status: pending}
+  - {source_line: 537, source_ref: "IMPLEMENTATION_PLAN.md:537", requirement_areas: [KIT-TOOL, KIT-CAP, KIT-MCP, KIT-SEC, KIT-VERSION, KIT-OBS], evidence_id: EV-G06-008, evidence_job: dashboard-g06, expected_result: "Applicable `KIT-TOOL`, `KIT-CAP`, `KIT-MCP`, `KIT-SEC`, `KIT-VERSION` and `KIT-OBS` evidence is green.", current_status: pending}

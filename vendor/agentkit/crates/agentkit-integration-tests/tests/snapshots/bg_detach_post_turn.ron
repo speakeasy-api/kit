@@ -1,0 +1,464 @@
+SessionRecording(
+    session_id: "detach-post",
+    initial_items: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Long-running tools may detach and finish later — react to the notification when it arrives.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "Install the dependency.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+    ],
+    turns: [
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to the notification when it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Install the dependency.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("detach-tool"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-d"),
+                    name: "detach-tool",
+                    input: {},
+                    metadata: {},
+                )),
+                Finished(ModelTurnResult(
+                    finish_reason: ToolCall,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                ToolCall(ToolCallPart(
+                                    id: ToolCallId("call-d"),
+                                    name: "detach-tool",
+                                    input: {},
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to the notification when it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Install the dependency.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-d"),
+                            name: "detach-tool",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: Some(ToolCall),
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-d"),
+                            output: Text("Tool detach-tool is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("detach-tool"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "Kicked off, will let you know when it\'s done.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to the notification when it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Install the dependency.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-d"),
+                            name: "detach-tool",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: Some(ToolCall),
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-d"),
+                            output: Text("Tool detach-tool is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "Kicked off, will let you know when it\'s done.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: Some(Completed),
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Notification,
+                    parts: [
+                        Text(TextPart(
+                            text: "Background tool call call-d completed: detach-output",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("detach-tool"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "Install completed.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                    model: None,
+                    response_id: None,
+                )),
+            ],
+        ),
+    ],
+    final_transcript: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Long-running tools may detach and finish later — react to the notification when it arrives.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "Install the dependency.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-d"),
+                    name: "detach-tool",
+                    input: {},
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(ToolCall),
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Tool,
+            parts: [
+                ToolResult(ToolResultPart(
+                    call_id: ToolCallId("call-d"),
+                    output: Text("Tool detach-tool is now running in the background. The result will be delivered when it completes."),
+                    is_error: false,
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "Kicked off, will let you know when it\'s done.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(Completed),
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Notification,
+            parts: [
+                Text(TextPart(
+                    text: "Background tool call call-d completed: detach-output",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "Install completed.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: Some(Completed),
+            created_at: None,
+        ),
+    ],
+)

@@ -1,0 +1,64 @@
+schema_version: 1
+snapshot_root: "vendor/runlet"
+source:
+  repository: "https://github.com/danielkov/runlet"
+  base_commit: "188688891499386d19d225676d80a2274213f27f"
+  base_tree: "b71cc1a1298a9f08697495f415a1563a74f60c3f"
+  tracked_entry_count: 71
+dirty_overlay:
+  format: "git diff HEAD --binary --no-ext-diff"
+  sha256: "1a5ef63c2c4c1774425415fa807f3b6b8ef184c9fb6c5f1d18f2caedbad8cec5"
+  modified_entry_count: 27
+  materialized_non_gitlink_sha256: "3a458b0a0d01f4814092105c63b7ba74b84522e363521f84a10b15c46cbe3cdd"
+gitlink_expansion:
+  path: "editors/zed/grammars/runlet"
+  base_commit: "bad1c07973884c2d46675e3ebff4a70c322b0e14"
+  base_tree: "0bfeebce27528bf8cf0a40313712817b92702ccd"
+  tracked_file_count: 10
+  dirty_overlay_sha256: "78e5eef79df8e645e8b798db53bf4e354bbd87839622e43002ec53710b3c5f70"
+  modified_file_count: 6
+  representation: "tracked files expanded without nested .git metadata"
+exclusions:
+  untracked_file_count: 0
+  ignored_generated_files:
+    root: "editors/tree-sitter-runlet/src"
+    reason: "ignored generated tree-sitter parser output duplicated by the tracked grammar gitlink"
+    file_count: 6
+    sorted_path_list_sha256: "dd404aeb0b02394d2b7dc5c562df84a1a41c8b5cf40af05770f54a6498b5ca3e"
+  repository_metadata: ".git directories excluded"
+normalization:
+  path: "tests/programs/p08_json_time_pipeline.rnlt"
+  captured_sha256: "6c3bfe73aa2618db4b70cecc760f096fa736c66536329c05ef4f4e3ca5fe1441"
+  normalized_sha256: "a09be0f77bb15d197487a294b31c6bf4ae11cb4606f54225c68853911c5735c1"
+  exact_change: "expected timestamp 2026-06-14T12:00:00.000Z -> 2026-06-14T12:00:00Z"
+  rationale: "time.format canonically omits a zero fractional part; RFC 3339 makes time-secfrac optional and the semantic-model test pins Z for whole seconds"
+  formatting:
+    toolchain: "Rust 1.94.0; rustfmt 1.8.0-stable (4a4ef493e3 2026-03-02)"
+    patch_sha256: "da354fef9418f6f54bcb95349e7f5da6da92d2970e2ae8620a1a9a9ca14ad12e"
+    proof: "rustfmt --edition 2024 --config skip_children=true over the reconstructed recorded files produced the normalized payload files byte-for-byte"
+    rationale: "canonical rustfmt line wrapping only; tokens, behavior, schemas, and public API are unchanged"
+    files:
+      - path: "src/analyzer.rs"
+        recorded_sha256: "82d1be8f8bd5a7b7e083c1d8dc2eb7c22a6e411c367808f069ec9b9ffb3e5a55"
+        normalized_sha256: "6d55a96c7981a543509ea8aed718e735631994ef35975d20b7750de0abe49e82"
+      - path: "tests/semantic_model.rs"
+        recorded_sha256: "0a6dfebc3671ad96420f55eb9eba5a435b74c78651dcd20cca6ca80bdfab4eca"
+        normalized_sha256: "d75c0044d6c9bc7160c214f18c22e643eabdddc0650863a4fd3e0d2aa2a1a774"
+verification:
+  test_command: "CARGO_TARGET_DIR=/tmp/kit-runlet-target cargo test --locked --workspace"
+final_snapshot:
+  package: "runlet"
+  version: "0.1.0"
+  payload_file_count: 80
+  manifest: "SNAPSHOT-MANIFEST.sha256"
+  manifest_sha256: "fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef"
+  aggregate_sha256: "fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef"
+  aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
+  attestation_files_excluded_from_payload_digest:
+    - "SNAPSHOT-MANIFEST.sha256"
+    - "SNAPSHOT-METADATA.yaml"
+  generated_target_roots_excluded:
+    - "target"
+  licenses_preserved:
+    - "LICENSE-APACHE"
+    - "LICENSE-MIT"

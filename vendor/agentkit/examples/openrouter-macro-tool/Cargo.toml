@@ -1,0 +1,19 @@
+[package]
+name = "openrouter-macro-tool"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentkit-core = { path = "../../crates/agentkit-core" }
+agentkit-loop = { path = "../../crates/agentkit-loop" }
+agentkit-provider-openrouter = { path = "../../crates/agentkit-provider-openrouter" }
+agentkit-tools-core = { path = "../../crates/agentkit-tools-core", features = ["schemars"] }
+agentkit-tools-derive = { path = "../../crates/agentkit-tools-derive" }
+dotenvy.workspace = true
+schemars = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,114 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test integration agent_run::agent_run_tests::loopdriver_commits_completion_progress_usage_and_cost -- --exact && cargo test --locked --test integration provider_stream::durable_stream_suppresses_reasoning_and_redacts_secret_forms_and_headers -- --exact && cargo test --locked --test conformance run_telemetry::private_reasoning_has_no_schema_path_and_summary_requires_retention -- --exact",
+    "evidence_id": "EV-G02-008",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "integration",
+          "agent_run::agent_run_tests::loopdriver_commits_completion_progress_usage_and_cost",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/integration/main.rs (target/debug/deps/integration-98c754f772d936c1)\n\nrunning 1 test\ntest agent_run::agent_run_tests::loopdriver_commits_completion_progress_usage_and_cost ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 1.90s\n\n",
+        "output_digest": "b4a69507843f4c9ed04897f302bb4ab4bd2dc9ee8d629f526652150d779a92df",
+        "proof_kind": null,
+        "test_count": 1
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "integration",
+          "provider_stream::durable_stream_suppresses_reasoning_and_redacts_secret_forms_and_headers",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/integration/main.rs (target/debug/deps/integration-98c754f772d936c1)\n\nrunning 1 test\ntest provider_stream::durable_stream_suppresses_reasoning_and_redacts_secret_forms_and_headers ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 71 filtered out; finished in 0.01s\n\n",
+        "output_digest": "1873db69fb33016bbb63d41b486aa067658b4dded81726f18f9d04b9bc6a6d36",
+        "proof_kind": null,
+        "test_count": 1
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "run_telemetry::private_reasoning_has_no_schema_path_and_summary_requires_retention",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 1 test\ntest run_telemetry::private_reasoning_has_no_schema_path_and_summary_requires_retention ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 448 filtered out; finished in 0.00s\n\n",
+        "output_digest": "0126aa39cdc1721aac688f4477e33355327cc3c07ee1adb551165202b15f19ce",
+        "proof_kind": null,
+        "test_count": 1
+      }
+    ]
+  },
+  "artifact_digest": "3781cdc501ab89f30a696122427cb3e3f019922415ba6cfbdf959c8333037b5c",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G02-008",
+    "evidence_job": "dashboard-g02",
+    "expected_result": "Hidden chain-of-thought is absent from events, artifacts, logs and traces.",
+    "requirement_areas": [
+      "KIT-SEC",
+      "KIT-CONTEXT"
+    ],
+    "source_line": 373,
+    "source_ref": "IMPLEMENTATION_PLAN.md:373"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G02",
+  "milestone": "M002",
+  "requirements": [
+    {
+      "evidence_id": "EV-M002-W04-C-001",
+      "evidence_job": "integration",
+      "record_id": "KIT-PROMPT-043"
+    },
+    {
+      "evidence_id": "EV-M002-W03-C-003",
+      "evidence_job": "adversarial",
+      "record_id": "KIT-STORE-018"
+    },
+    {
+      "evidence_id": "EV-1.04-C-940",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-830"
+    }
+  ],
+  "run_id": "local-20260728-m002",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m002-worktree-attestation"
+}

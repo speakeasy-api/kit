@@ -1,0 +1,579 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kit.dev/eval/preregistration/schema/v1/components.schema.json",
+  "title": "Kit evaluation authority schema components v1.1",
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:(?!0{64}$)[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^20[2-9][0-9]-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+    },
+    "count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "finite": { "type": "number", "minimum": -1000000000000, "maximum": 1000000000000 },
+    "metric": {
+      "enum": [
+        "success_rate",
+        "intervention_rate",
+        "mean_cost_usd",
+        "mean_latency_ms",
+        "verification_rate"
+      ]
+    },
+    "direction": { "enum": ["higher_is_better", "lower_is_better"] },
+    "arm": { "enum": ["baseline", "candidate"] },
+    "authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "tag"],
+      "properties": {
+        "algorithm": { "const": "hmac-sha256" },
+        "key_id": { "$ref": "#/$defs/id" },
+        "tag": { "type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "digests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "experiment",
+        "task_set",
+        "harness",
+        "dataset"
+      ],
+      "properties": {
+        "experiment": { "$ref": "#/$defs/digest" },
+        "task_set": { "$ref": "#/$defs/digest" },
+        "harness": { "$ref": "#/$defs/digest" },
+        "dataset": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "production_evaluation_pins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "harness",
+        "grader_manifest",
+        "helper",
+        "runtime",
+        "agent_image",
+        "grader_image"
+      ],
+      "properties": {
+        "harness": { "$ref": "#/$defs/digest" },
+        "grader_manifest": { "$ref": "#/$defs/digest" },
+        "helper": { "$ref": "#/$defs/digest" },
+        "runtime": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[!-~]+$" },
+        "agent_image": { "$ref": "#/$defs/digest" },
+        "grader_image": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "production_execution_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "pins"],
+      "properties": {
+        "digest": { "$ref": "#/$defs/digest" },
+        "pins": { "$ref": "#/$defs/production_evaluation_pins" }
+      }
+    },
+    "roster_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schedule_index",
+        "trial_id",
+        "pair_id",
+        "task_id",
+        "dataset_member_id",
+        "task_manifest_digest",
+        "model_digest",
+        "model_settings_digest",
+        "config_digest",
+        "provider_capability_digest",
+        "seed",
+        "arm"
+      ],
+      "properties": {
+        "schedule_index": { "$ref": "#/$defs/count" },
+        "trial_id": { "$ref": "#/$defs/id" },
+        "pair_id": { "$ref": "#/$defs/id" },
+        "task_id": { "$ref": "#/$defs/id" },
+        "dataset_member_id": { "$ref": "#/$defs/id" },
+        "task_manifest_digest": { "$ref": "#/$defs/digest" },
+        "model_digest": { "$ref": "#/$defs/digest" },
+        "model_settings_digest": { "$ref": "#/$defs/digest" },
+        "config_digest": { "$ref": "#/$defs/digest" },
+        "provider_capability_digest": { "$ref": "#/$defs/digest" },
+        "seed": { "type": "integer", "minimum": 0 },
+        "arm": { "$ref": "#/$defs/arm" }
+      }
+    },
+    "hypothesis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "metric", "direction", "statement"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "role": { "const": "confirmatory" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "direction": { "$ref": "#/$defs/direction" },
+        "statement": { "$ref": "#/$defs/text" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "metric": { "enum": ["success_rate", "verification_rate"] } }, "required": ["metric"] },
+          "then": { "properties": { "direction": { "const": "higher_is_better" } } }
+        },
+        {
+          "if": { "properties": { "metric": { "enum": ["intervention_rate", "mean_cost_usd", "mean_latency_ms"] } }, "required": ["metric"] },
+          "then": { "properties": { "direction": { "const": "lower_is_better" } } }
+        }
+      ]
+    },
+    "metric_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "role", "unit", "estimand"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/metric" },
+        "role": { "enum": ["confirmatory", "exploratory"] },
+        "unit": { "enum": ["proportion", "usd", "milliseconds"] },
+        "estimand": { "$ref": "#/$defs/text" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "metric": { "enum": ["success_rate", "intervention_rate", "verification_rate"] } }, "required": ["metric"] },
+          "then": { "properties": { "unit": { "const": "proportion" } } }
+        },
+        {
+          "if": { "properties": { "metric": { "const": "mean_cost_usd" } }, "required": ["metric"] },
+          "then": { "properties": { "unit": { "const": "usd" } } }
+        },
+        {
+          "if": { "properties": { "metric": { "const": "mean_latency_ms" } }, "required": ["metric"] },
+          "then": { "properties": { "unit": { "const": "milliseconds" } } }
+        }
+      ]
+    },
+    "noninferiority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "margin", "scientific_max_margin", "direction"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/metric" },
+        "margin": { "type": "number", "exclusiveMinimum": 0 },
+        "scientific_max_margin": { "type": "number", "exclusiveMinimum": 0 },
+        "direction": { "$ref": "#/$defs/direction" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "metric": { "enum": ["success_rate", "verification_rate"] } }, "required": ["metric"] },
+          "then": {
+            "properties": {
+              "margin": { "exclusiveMinimum": 0, "maximum": 0.25 },
+              "scientific_max_margin": { "exclusiveMinimum": 0, "maximum": 0.25 },
+              "direction": { "const": "higher_is_better" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "metric": { "const": "intervention_rate" } }, "required": ["metric"] },
+          "then": {
+            "properties": {
+              "margin": { "exclusiveMinimum": 0, "maximum": 0.25 },
+              "scientific_max_margin": { "exclusiveMinimum": 0, "maximum": 0.25 },
+              "direction": { "const": "lower_is_better" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "metric": { "const": "mean_cost_usd" } }, "required": ["metric"] },
+          "then": {
+            "properties": {
+              "margin": { "exclusiveMinimum": 0, "maximum": 1000000 },
+              "scientific_max_margin": { "exclusiveMinimum": 0, "maximum": 1000000 },
+              "direction": { "const": "lower_is_better" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "metric": { "const": "mean_latency_ms" } }, "required": ["metric"] },
+          "then": {
+            "properties": {
+              "margin": { "exclusiveMinimum": 0, "maximum": 86400000 },
+              "scientific_max_margin": { "exclusiveMinimum": 0, "maximum": 86400000 },
+              "direction": { "const": "lower_is_better" }
+            }
+          }
+        }
+      ]
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stopping", "exclusion", "failure", "error_imputation"],
+      "properties": {
+        "stopping": { "const": "fixed_roster" },
+        "exclusion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unlisted", "allowed_reasons"],
+          "properties": {
+            "unlisted": { "const": "reject" },
+            "allowed_reasons": {
+              "type": "array",
+              "maxItems": 64,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/id" }
+            }
+          }
+        },
+        "failure": { "enum": ["include_as_observed", "fail_analysis"] },
+        "error_imputation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_cost_usd", "max_latency_ms"],
+          "properties": {
+            "max_cost_usd": { "type": "number", "minimum": 0.000001, "maximum": 1000000 },
+            "max_latency_ms": { "type": "integer", "minimum": 1, "maximum": 86400000 }
+          }
+        }
+      }
+    },
+    "preregistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "experiment_id",
+        "digests",
+        "execution_environment",
+        "roster",
+        "primary_hypothesis",
+        "primary_metric",
+        "exploratory_metrics",
+        "sample_size",
+        "alpha",
+        "ci_method",
+        "noninferiority",
+        "policies"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.1" },
+        "kind": { "const": "preregistration" },
+        "experiment_id": { "$ref": "#/$defs/id" },
+        "digests": { "$ref": "#/$defs/digests" },
+        "execution_environment": { "$ref": "#/$defs/production_execution_environment" },
+        "roster": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/roster_entry" }
+        },
+        "primary_hypothesis": { "$ref": "#/$defs/hypothesis" },
+        "primary_metric": {
+          "allOf": [
+            { "$ref": "#/$defs/metric_spec" },
+            { "properties": { "role": { "const": "confirmatory" } } }
+          ]
+        },
+        "exploratory_metrics": {
+          "type": "array",
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/metric_spec" },
+              { "properties": { "role": { "const": "exploratory" } } }
+            ]
+          }
+        },
+        "sample_size": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["complete_pairs", "power_rationale"],
+          "properties": {
+            "complete_pairs": { "type": "integer", "minimum": 3, "maximum": 5000 },
+            "power_rationale": { "$ref": "#/$defs/text" }
+          }
+        },
+        "alpha": { "const": 0.05 },
+        "ci_method": { "const": "finite_sample_paired_v1" },
+        "noninferiority": { "$ref": "#/$defs/noninferiority" },
+        "policies": { "$ref": "#/$defs/policies" }
+      }
+    },
+    "registration_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_id",
+        "authority_epoch",
+        "genesis_digest",
+        "sequence",
+        "authority_position",
+        "attempt_ordinal",
+        "registered_at",
+        "previous_entry_digest",
+        "authentication"
+      ],
+      "properties": {
+        "authority_id": { "$ref": "#/$defs/id" },
+        "authority_epoch": { "$ref": "#/$defs/timestamp" },
+        "genesis_digest": { "$ref": "#/$defs/digest" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "authority_position": { "type": "integer", "minimum": 1 },
+        "attempt_ordinal": { "const": 0 },
+        "registered_at": { "$ref": "#/$defs/timestamp" },
+        "previous_entry_digest": { "$ref": "#/$defs/digest" },
+        "authentication": { "$ref": "#/$defs/authentication" }
+      }
+    },
+    "registered_preregistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "preregistration", "preregistration_digest", "registration"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "kind": { "const": "registered_preregistration" },
+        "preregistration": { "$ref": "#/$defs/preregistration" },
+        "preregistration_digest": { "$ref": "#/$defs/digest" },
+        "registration": { "$ref": "#/$defs/registration_receipt" }
+      }
+    },
+    "trial_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_position",
+        "schedule_index",
+        "attempt_ordinal",
+        "trial_id",
+        "pair_id",
+        "task_id",
+        "dataset_member_id",
+        "seed",
+        "arm",
+        "status",
+        "measured_receipt_digest",
+        "evidence_source",
+        "outcome",
+        "failure_reason",
+        "exclusion_reason"
+      ],
+      "properties": {
+        "authority_position": { "type": ["integer", "null"], "minimum": 1 },
+        "schedule_index": { "$ref": "#/$defs/count" },
+        "attempt_ordinal": { "type": ["integer", "null"], "minimum": 0 },
+        "trial_id": { "$ref": "#/$defs/id" },
+        "pair_id": { "$ref": "#/$defs/id" },
+        "task_id": { "$ref": "#/$defs/id" },
+        "dataset_member_id": { "$ref": "#/$defs/id" },
+        "seed": { "type": "integer", "minimum": 0 },
+        "arm": { "$ref": "#/$defs/arm" },
+        "status": { "enum": ["included", "failed", "excluded_preregistered", "incomplete", "missing"] },
+        "measured_receipt_digest": {
+          "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+        },
+        "evidence_source": { "type": ["string", "null"], "enum": ["production_trusted", "conformance_source_semantics", null] },
+        "outcome": { "type": ["string", "null"], "enum": ["success", "failure", "error", null] },
+        "failure_reason": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "exclusion_reason": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["incomplete", "missing"] } }, "required": ["status"] },
+          "then": { "properties": { "authority_position": { "type": "null" }, "attempt_ordinal": { "type": "null" }, "measured_receipt_digest": { "type": "null" }, "evidence_source": { "type": "null" }, "outcome": { "type": "null" } } },
+          "else": { "properties": { "authority_position": { "type": "integer", "minimum": 1 }, "attempt_ordinal": { "const": 1 }, "measured_receipt_digest": { "$ref": "#/$defs/digest" }, "evidence_source": { "enum": ["production_trusted", "conformance_source_semantics"] }, "outcome": { "enum": ["success", "failure", "error"] } } }
+        }
+      ]
+    },
+    "confidence_interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "confidence_level", "sample_count", "degrees_of_freedom", "estimate", "lower", "upper"],
+      "properties": {
+        "method": { "enum": ["paired_t_finite_sample_v1", "unconditional_bonferroni_clopper_pearson_v1"] },
+        "confidence_level": { "const": 0.95 },
+        "sample_count": { "$ref": "#/$defs/count" },
+        "degrees_of_freedom": { "type": ["integer", "null"], "minimum": 2 },
+        "estimate": { "$ref": "#/$defs/finite" },
+        "lower": { "$ref": "#/$defs/finite" },
+        "upper": { "$ref": "#/$defs/finite" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "method": { "const": "paired_t_finite_sample_v1" } }, "required": ["method"] },
+          "then": { "properties": { "degrees_of_freedom": { "type": "integer", "minimum": 2 } } },
+          "else": { "properties": { "degrees_of_freedom": { "type": "null" }, "lower": { "minimum": -1, "maximum": 1 }, "upper": { "minimum": -1, "maximum": 1 } } }
+        }
+      ]
+    },
+    "noninferiority_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "direction", "margin", "benefit_estimate", "one_sided_lower_bound", "passed"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/metric" },
+        "direction": { "$ref": "#/$defs/direction" },
+        "margin": { "type": "number", "exclusiveMinimum": 0 },
+        "benefit_estimate": { "$ref": "#/$defs/finite" },
+        "one_sided_lower_bound": { "$ref": "#/$defs/finite" },
+        "passed": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "metric": { "enum": ["success_rate", "verification_rate"] } }, "required": ["metric"] },
+          "then": { "properties": { "direction": { "const": "higher_is_better" }, "margin": { "maximum": 0.25 } } }
+        },
+        {
+          "if": { "properties": { "metric": { "const": "intervention_rate" } }, "required": ["metric"] },
+          "then": { "properties": { "direction": { "const": "lower_is_better" }, "margin": { "maximum": 0.25 } } }
+        },
+        {
+          "if": { "properties": { "metric": { "enum": ["mean_cost_usd", "mean_latency_ms"] } }, "required": ["metric"] },
+          "then": { "properties": { "direction": { "const": "lower_is_better" } } }
+        }
+      ]
+    },
+    "confirmatory_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "metric", "aggregation", "sample_count", "baseline_mean", "candidate_mean", "paired_delta", "confidence_interval", "noninferiority"],
+      "properties": {
+        "role": { "const": "confirmatory" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "aggregation": { "enum": ["rate", "mean"] },
+        "sample_count": { "$ref": "#/$defs/count" },
+        "baseline_mean": { "$ref": "#/$defs/finite" },
+        "candidate_mean": { "$ref": "#/$defs/finite" },
+        "paired_delta": { "$ref": "#/$defs/finite" },
+        "confidence_interval": { "$ref": "#/$defs/confidence_interval" },
+        "noninferiority": { "$ref": "#/$defs/noninferiority_decision" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "metric": { "enum": ["success_rate", "intervention_rate", "verification_rate"] } }, "required": ["metric"] },
+          "then": { "properties": { "aggregation": { "const": "rate" }, "confidence_interval": { "properties": { "method": { "const": "unconditional_bonferroni_clopper_pearson_v1" } } } } }
+        },
+        {
+          "if": { "properties": { "metric": { "enum": ["mean_cost_usd", "mean_latency_ms"] } }, "required": ["metric"] },
+          "then": { "properties": { "aggregation": { "const": "mean" }, "confidence_interval": { "properties": { "method": { "const": "paired_t_finite_sample_v1" } } } } }
+        }
+      ]
+    },
+    "exploratory_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "metric", "aggregation", "sample_count", "baseline_mean", "candidate_mean", "paired_delta"],
+      "properties": {
+        "role": { "const": "exploratory" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "aggregation": { "enum": ["rate", "mean"] },
+        "sample_count": { "$ref": "#/$defs/count" },
+        "baseline_mean": { "$ref": "#/$defs/finite" },
+        "candidate_mean": { "$ref": "#/$defs/finite" },
+        "paired_delta": { "$ref": "#/$defs/finite" }
+      }
+    },
+    "statistical_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "preregistration",
+        "preregistration_digest",
+        "registration",
+        "evidence_source",
+        "first_measured_run",
+        "sample_counts",
+        "trials",
+        "analysis_status",
+        "metrics"
+      ],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "kind": { "const": "core_statistical_report" },
+        "preregistration": { "$ref": "#/$defs/preregistration" },
+        "preregistration_digest": { "$ref": "#/$defs/digest" },
+        "registration": { "$ref": "#/$defs/registration_receipt" },
+        "evidence_source": { "enum": ["production_trusted", "conformance_source_semantics"] },
+        "first_measured_run": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["timestamp", "trial_digest"],
+              "properties": {
+                "timestamp": { "$ref": "#/$defs/timestamp" },
+                "trial_digest": { "$ref": "#/$defs/digest" }
+              }
+            }
+          ]
+        },
+        "sample_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["roster_trials", "attempted_trials", "included_trials", "failed_trials", "excluded_trials", "incomplete_trials", "missing_trials"],
+          "properties": {
+            "roster_trials": { "$ref": "#/$defs/count" },
+            "attempted_trials": { "$ref": "#/$defs/count" },
+            "included_trials": { "$ref": "#/$defs/count" },
+            "failed_trials": { "$ref": "#/$defs/count" },
+            "excluded_trials": { "$ref": "#/$defs/count" },
+            "incomplete_trials": { "$ref": "#/$defs/count" },
+            "missing_trials": { "$ref": "#/$defs/count" }
+          }
+        },
+        "trials": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 20000,
+          "items": { "$ref": "#/$defs/trial_record" }
+        },
+        "analysis_status": { "enum": ["complete", "incomplete_roster", "failed_by_policy", "excluded_by_policy", "confirmatory_metric_unavailable"] },
+        "metrics": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/confirmatory_metric" },
+              { "$ref": "#/$defs/exploratory_metric" }
+            ]
+          }
+        }
+      }
+    },
+    "statistical_report_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "authority_id", "registration_sequence", "preregistration_digest", "report_digest", "evidence_source", "ledger_cutoff", "freeze_position", "ledger_position", "previous_entry_digest", "ledger_head_digest", "recorded_at", "authentication"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "kind": { "const": "statistical_report_receipt" },
+        "authority_id": { "$ref": "#/$defs/id" },
+        "registration_sequence": { "type": "integer", "minimum": 1 },
+        "preregistration_digest": { "$ref": "#/$defs/digest" },
+        "report_digest": { "$ref": "#/$defs/digest" },
+        "evidence_source": { "enum": ["production_trusted", "conformance_source_semantics"] },
+        "ledger_cutoff": { "type": "integer", "minimum": 1 },
+        "freeze_position": { "type": "integer", "minimum": 2 },
+        "ledger_position": { "type": "integer", "minimum": 1 },
+        "previous_entry_digest": { "$ref": "#/$defs/digest" },
+        "ledger_head_digest": { "$ref": "#/$defs/digest" },
+        "recorded_at": { "$ref": "#/$defs/timestamp" },
+        "authentication": { "$ref": "#/$defs/authentication" }
+      }
+    }
+  }
+}

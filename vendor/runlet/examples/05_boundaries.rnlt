@@ -1,0 +1,16 @@
+# Runtime compute failures can be caught without any host-provided tools.
+divisor = 0
+
+outcome = boundary retry 2 {
+    quotient = 100 / divisor
+    return { ok: true, quotient }
+} catch err {
+    return {
+        ok: false,
+        code: err.code,
+        message: err.message,
+        attempts_used: err.attempt + 1
+    }
+}
+
+return outcome

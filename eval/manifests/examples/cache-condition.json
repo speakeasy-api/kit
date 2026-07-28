@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0",
+  "kind": "cache_condition",
+  "cache_condition_id": "cold-caches",
+  "prompt": { "state": "cold" },
+  "infrastructure": { "state": "cold" }
+}

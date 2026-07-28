@@ -1,0 +1,8 @@
+#! input: { "defaults": { "tier": 1, "region": "us" }, "overrides": [{ "id": "a", "tier": 3 }, { "id": "b" }] }
+#! expect: { "a": { "id": "a", "region": "us", "tier": 3 }, "b": { "id": "b", "region": "us", "tier": 1 } }
+# Object merge chains over Any-schema input, indexed into a map by fold.
+merged = fold acc = {} for o in input.overrides {
+    combined = input.defaults + o
+    return acc + { [combined.id]: combined }
+}
+return merged

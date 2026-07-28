@@ -1,0 +1,4 @@
+schema_version: 1
+name: schema-compat
+commands:
+  - cargo test --locked --test conformance eval_manifest

@@ -1,0 +1,4 @@
+schema_version: 1
+name: adversarial
+commands:
+  - cargo test --locked --test adversarial

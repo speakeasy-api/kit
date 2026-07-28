@@ -1,0 +1,20 @@
+[package]
+description = "Context loading for AGENTS.md files in agentkit."
+homepage.workspace = true
+name = "agentkit-context"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+async-fs = "2.2.0"
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

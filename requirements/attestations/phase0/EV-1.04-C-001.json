@@ -1,0 +1,44 @@
+{
+  "artifact": {
+    "command": "python3 scripts/req_lint.py --coverage 8-1597",
+    "evidence_id": "EV-1.04-C-001",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "python3",
+          "scripts/req_lint.py",
+          "--coverage",
+          "8-1597"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "0 unmapped\n",
+        "output_digest": "a98bcd47726d312953ddfdd78c8913fa7b67825af33b8d72604e4a8a15066dda",
+        "proof_kind": "requirement_lint",
+        "test_count": null
+      }
+    ]
+  },
+  "artifact_digest": "11fc57facaf5eefb62a81d424c68c1843cd27d10e09cd03ccca77732d2b239b0",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "evidence_id": "EV-1.04-C-001",
+  "evidence_job": "req-lint",
+  "record_id": "KIT-GOV-001",
+  "run_id": "local-20260728-g00",
+  "schema_version": 3,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_g00_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://g00-worktree-attestation"
+}

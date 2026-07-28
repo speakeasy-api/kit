@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kit.dev/eval/manifests/schema/v1/trial.schema.json",
+  "title": "Kit evaluation trial manifest v1.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "trial_id",
+    "identity",
+    "task",
+    "environment",
+    "budget",
+    "cache_condition",
+    "grader"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.1" },
+    "kind": { "const": "trial" },
+    "trial_id": { "$ref": "#/$defs/id" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_digest",
+        "randomization_id",
+        "attempt",
+        "task_id",
+        "environment_id",
+        "budget_id",
+        "cache_condition_id",
+        "grader_id",
+        "config_id"
+      ],
+      "properties": {
+        "canonical_digest": { "$ref": "#/$defs/digest" },
+        "randomization_id": { "$ref": "#/$defs/id" },
+        "attempt": { "type": "integer", "minimum": 0 },
+        "task_id": { "$ref": "#/$defs/id" },
+        "environment_id": { "$ref": "#/$defs/id" },
+        "budget_id": { "$ref": "#/$defs/id" },
+        "cache_condition_id": { "$ref": "#/$defs/id" },
+        "grader_id": { "$ref": "#/$defs/id" },
+        "config_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "task": { "$ref": "task.schema.json" },
+    "environment": { "$ref": "environment.schema.json" },
+    "budget": { "$ref": "budget.schema.json" },
+    "cache_condition": { "$ref": "cache-condition.schema.json" },
+    "grader": { "$ref": "grader.schema.json" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

@@ -1,0 +1,2397 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Kit HTTP API
+  version: 1.0.0
+  description: >-
+    Authenticated M001 command/query API. Clients must ignore unknown response
+    fields. Identifiers and cursors are opaque and must not be parsed. Executor
+    mutation outcomes are retained for the declared retry window. Executor cursor
+    recovery snapshots contain authorized processes, terminals, and current
+    attachments, including replacement history viewers on exited or interrupted
+    terminals; detached, stale, and restart-invalidated attachments are omitted.
+    Native PTY primitives do not imply that a production attempt-owned executor
+    profile can expose a PTY.
+x-kit-executor-idempotency:
+  retry-window-millis: 86400000
+  maximum-records: 4096
+  capacity-policy: reject-new
+x-kit-executor-cursor-recovery:
+  attachment-policy: current-authorized-history-viewers
+  invalidated-attachment-policy: excluded
+x-kit-executor-pty:
+  native-primitive:
+    linux: available
+    macos: available
+    windows: platform_unavailable
+  production-attempt-owned-profile:
+    linux: profile_unavailable
+    macos: profile_unavailable
+    windows: platform_unavailable
+  unavailable-problem-codes: [platform_unavailable, profile_unavailable]
+  external-register:
+    linux: EXT-22
+    windows: EXT-19
+  windows-external-blockers: [ConPTY, Job Objects, Windows container/Hyper-V boundary]
+  windows-parity: false
+x-kit-provider-correction:
+  status: blocked
+  dependency: M004
+  reason: No provider correction mutation has an exact real capability and public API path.
+servers:
+  - url: http://localhost
+security:
+  - bearerAuth: []
+tags:
+  - name: Projects
+  - name: Threads
+  - name: Runs
+  - name: Events
+  - name: Approvals
+  - name: Auth
+  - name: Artifacts
+  - name: Retention
+  - name: Terminals
+  - name: Processes
+  - name: ExecutorEvents
+  - name: Repository
+paths:
+  /v1/projects:
+    post:
+      operationId: createProject
+      tags: [Projects]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProject'
+      responses:
+        '201':
+          $ref: '#/components/responses/ResourceCreated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '413':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getProject
+      tags: [Projects]
+      responses:
+        '200':
+          description: Project projection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/threads:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: listThreads
+      tags: [Threads]
+      responses:
+        '200':
+          description: Thread projections.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Thread'
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+    post:
+      operationId: createThread
+      tags: [Threads]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateThread'
+      responses:
+        '201':
+          $ref: '#/components/responses/ResourceCreated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '413':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/threads/{thread_id}:
+    parameters:
+      - $ref: '#/components/parameters/ThreadId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getThread
+      tags: [Threads]
+      responses:
+        '200':
+          description: Thread projection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Thread'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/threads/{thread_id}/archive:
+    parameters:
+      - $ref: '#/components/parameters/ThreadId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: setThreadArchived
+      tags: [Threads]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetThreadArchived'
+      responses:
+        '200':
+          $ref: '#/components/responses/ResourceUpdated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/threads/{thread_id}/deletion:
+    parameters:
+      - $ref: '#/components/parameters/ThreadId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: initiateThreadDeletion
+      tags: [Threads]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpectedVersion'
+      responses:
+        '202':
+          $ref: '#/components/responses/ResourceAccepted'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '423':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/deletion-jobs/{deletion_job_id}:
+    parameters:
+      - $ref: '#/components/parameters/DeletionJobId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getDeletionJob
+      tags: [Retention]
+      responses:
+        '200':
+          description: Current auditable deletion-job state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeletionJob'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/threads/{thread_id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/ThreadId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: startRun
+      tags: [Runs]
+      description: >-
+        Durably stores the message artifact, then atomically records the input reference and queued
+        run. Reusing Idempotency-Key with the same request replays the receipt; different input
+        conflicts. A 202 response does not indicate run completion.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRun'
+      responses:
+        '202':
+          $ref: '#/components/responses/ResourceAccepted'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '413':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: listRuns
+      tags: [Runs]
+      responses:
+        '200':
+          description: Run projections.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Run'
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getRun
+      tags: [Runs]
+      responses:
+        '200':
+          description: Run projection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: cancelRun
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpectedVersion'
+      responses:
+        '202':
+          $ref: '#/components/responses/ResourceAccepted'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '413':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/cost:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getRunCost
+      tags: [Runs]
+      responses:
+        '200':
+          description: Durable reconciled run usage and cost, with null values while unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunCost'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/prompts:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getRunPrompts
+      tags: [Runs]
+      responses:
+        '200':
+          description: Canonical prompt digests, stable-prefix boundary, and budget measurement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunPrompts'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/transcript:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getRunTranscript
+      tags: [Runs]
+      responses:
+        '200':
+          description: Public, reasoning-free semantic model and tool transcript.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunTranscript'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/events:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/LastEventId'
+    get:
+      operationId: getRunEvents
+      tags: [Events]
+      description: >-
+        Returns a page by default; with `Accept: text/event-stream`, follows only
+        this run and resumes from `Last-Event-ID`.
+      responses:
+        '200':
+          description: Durable event page or live run-scoped SSE stream.
+          headers:
+            X-Kit-Cursor:
+              schema:
+                $ref: '#/components/schemas/OpaqueStreamCursor'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '410':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/input:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: provideRunInput
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProvideRunInput'
+      responses:
+        '200':
+          $ref: '#/components/responses/ResourceUpdated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/threads/{thread_id}/events:
+    parameters:
+      - $ref: '#/components/parameters/ThreadId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/LastEventId'
+    get:
+      operationId: getThreadEvents
+      tags: [Events]
+      description: >-
+        Returns a page by default; with `Accept: text/event-stream`, follows only
+        this thread and its runs and resumes from `Last-Event-ID`.
+      responses:
+        '200':
+          description: Durable event page or live thread-scoped SSE stream.
+          headers:
+            X-Kit-Cursor:
+              schema:
+                $ref: '#/components/schemas/OpaqueStreamCursor'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '410':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/approvals:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: listPendingApprovals
+      tags: [Approvals]
+      responses:
+        '200':
+          description: Pending approvals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalList'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/approvals/{approval_id}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: resolveApproval
+      tags: [Approvals]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveApproval'
+      responses:
+        '200':
+          $ref: '#/components/responses/ResourceUpdated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/auth-requests:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: listPendingAuthRequests
+      tags: [Auth]
+      responses:
+        '200':
+          description: Pending authorization requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthRequestList'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/runs/{run_id}/auth/resolve:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: resolveAuth
+      tags: [Auth]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveAuth'
+      responses:
+        '200':
+          $ref: '#/components/responses/ResourceUpdated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/artifacts:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: registerArtifactMetadata
+      tags: [Artifacts]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterArtifactMetadata'
+      responses:
+        '201':
+          $ref: '#/components/responses/ResourceCreated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/artifacts/{artifact_id}:
+    parameters:
+      - $ref: '#/components/parameters/ArtifactId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getArtifactMetadata
+      tags: [Artifacts]
+      responses:
+        '200':
+          description: Artifact metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactMetadata'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/retention:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getProjectRetention
+      tags: [Retention]
+      responses:
+        '200':
+          description: Effective project retention policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectRetention'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+    post:
+      operationId: setProjectRetention
+      tags: [Retention]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetProjectRetention'
+      responses:
+        '200':
+          $ref: '#/components/responses/ResourceUpdated'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '409':
+          $ref: '#/components/responses/Problem'
+        '415':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/capabilities:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: listCapabilities
+      tags: [Projects]
+      responses:
+        '200':
+          description: Available capability versions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Capability'
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/events/status:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+      - $ref: '#/components/parameters/RequiredCursor'
+    get:
+      operationId: getEventCursorStatus
+      tags: [Events]
+      responses:
+        '200':
+          description: Projection progress for a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CursorStatus'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/status:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getProjectStatus
+      tags: [Projects]
+      description: Authenticated project status. This is not the daemon liveness endpoint.
+      responses:
+        '200':
+          description: Project service status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectStatus'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/events/stream:
+    $ref: '#/components/pathItems/ProjectEventStream'
+  /v1/terminals/{terminal_id}/attach:
+    $ref: '#/components/pathItems/TerminalAttach'
+  /v1/projects/{project_id}/processes:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1projects~1{project_id}~1processes'
+  /v1/processes/{process_id}:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1processes~1{process_id}'
+  /v1/processes/{process_id}/cancel:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1processes~1{process_id}~1cancel'
+  /v1/processes/{process_id}/terminals:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1processes~1{process_id}~1terminals'
+  /v1/terminals/{terminal_id}:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminals~1{terminal_id}'
+  /v1/terminals/{terminal_id}/attachments:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminals~1{terminal_id}~1attachments'
+  /v1/terminals/{terminal_id}/writer-claims:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminals~1{terminal_id}~1writer-claims'
+  /v1/terminal-attachments/{attachment_id}:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}'
+  /v1/terminal-attachments/{attachment_id}/renew:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1renew'
+  /v1/terminal-attachments/{attachment_id}/release:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1release'
+  /v1/terminal-attachments/{attachment_id}/input:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1input'
+  /v1/terminal-attachments/{attachment_id}/input-resolution:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1input-resolution'
+  /v1/terminal-attachments/{attachment_id}/resize:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1resize'
+  /v1/terminal-attachments/{attachment_id}/output:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1output'
+  /v1/terminal-attachments/{attachment_id}/resizes:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1resizes'
+  /v1/terminal-attachments/{attachment_id}/detach:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1terminal-attachments~1{attachment_id}~1detach'
+  /v1/projects/{project_id}/executor/events:
+    $ref: './openapi.exec.yaml#/paths/~1v1~1projects~1{project_id}~1executor~1events'
+  /v1/projects/{project_id}/repository/revision:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      operationId: getRepositoryRevision
+      tags: [Repository]
+      responses:
+        '200': {description: Current managed-workspace revision, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryRevision'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/repository/status:
+    get:
+      operationId: getRepositoryStatus
+      tags: [Repository]
+      responses:
+        '200': {description: Authenticated repository project identity, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryStatus'}}}}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+  /v1/projects/{project_id}/repository/capabilities:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      operationId: listRepositoryCapabilities
+      tags: [Repository]
+      responses:
+        '200': {description: Authorized native repository capabilities, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryCapabilities'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/projects/{project_id}/repository/discover:
+    $ref: '#/components/pathItems/RepositoryDiscover'
+  /v1/projects/{project_id}/repository/search:
+    $ref: '#/components/pathItems/RepositorySearch'
+  /v1/projects/{project_id}/repository/read:
+    $ref: '#/components/pathItems/RepositoryRead'
+  /v1/projects/{project_id}/repository/edit:
+    $ref: '#/components/pathItems/RepositoryEdit'
+  /v1/projects/{project_id}/repository/run:
+    $ref: '#/components/pathItems/RepositoryRun'
+  /v1/projects/{project_id}/repository/check:
+    $ref: '#/components/pathItems/RepositoryCheck'
+  /v1/repository-results/{result_id}:
+    get:
+      operationId: getRepositoryResult
+      tags: [Repository]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryResultId'
+      responses:
+        '200': {description: Durable repository operation result, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryResult'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/repository-results/{result_id}/events:
+    get:
+      operationId: getRepositoryResultEvents
+      tags: [Repository]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryResultId'
+      responses:
+        '200': {description: 'Durable intent, progress, and outcome events', content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryEvents'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/repository-results/{result_id}/approval:
+    post:
+      operationId: resolveRepositoryApproval
+      tags: [Repository]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryResultId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RepositoryApprovalResolution'}
+      responses:
+        '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/repository-results/{result_id}/cancel:
+    post:
+      operationId: cancelRepositoryOperation
+      tags: [Repository]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryResultId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RepositoryCancellation'}
+      responses:
+        '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/repository-artifacts/{artifact_ref}:
+    get:
+      operationId: getRepositoryArtifact
+      tags: [Repository]
+      parameters:
+        - name: artifact_ref
+          in: path
+          required: true
+          schema: {type: string, pattern: '^(artifact-ref|blake3):[0-9a-f]{64}$'}
+      responses:
+        '200': {description: Authorized artifact bytes, content: {application/octet-stream: {schema: {type: string, contentEncoding: binary}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: Transport-issued bearer credential. Remote deployments validate OIDC or mTLS before routing.
+  parameters:
+    RepositoryResultId:
+      name: result_id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^tool_call_[0-7][0-9a-hjkmnp-tv-z]{25}$'}
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ProjectId'
+    ThreadId:
+      name: thread_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ThreadId'
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/RunId'
+    ApprovalId:
+      name: approval_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ApprovalId'
+    ArtifactId:
+      name: artifact_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ArtifactId'
+    DeletionJobId:
+      name: deletion_job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^deletion_[0-9a-f]{32}$'
+    TerminalId:
+      name: terminal_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/TerminalId'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Retained with the mutation receipt for durable retry and conflict detection.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[!-~]+$'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[!-~]+$'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/PageCursor'
+    RequiredCursor:
+      name: cursor
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/PageCursor'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    StreamCursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        $ref: '#/components/schemas/OpaqueStreamCursor'
+    LastEventId:
+      name: Last-Event-ID
+      in: header
+      required: false
+      schema:
+        $ref: '#/components/schemas/OpaqueStreamCursor'
+  pathItems:
+    RepositoryDiscover:
+      parameters: [{$ref: '#/components/parameters/ProjectId'}]
+      post:
+        operationId: discoverRepository
+        tags: [Repository]
+        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryDiscoverInput'}}}}
+        responses:
+          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+          '400': {$ref: '#/components/responses/Problem'}
+          '401': {$ref: '#/components/responses/Unauthenticated'}
+          '404': {$ref: '#/components/responses/Problem'}
+          '409': {$ref: '#/components/responses/Problem'}
+          '503': {$ref: '#/components/responses/Problem'}
+    RepositorySearch:
+      parameters: [{$ref: '#/components/parameters/ProjectId'}]
+      post:
+        operationId: searchRepository
+        tags: [Repository]
+        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositorySearchInput'}}}}
+        responses:
+          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+          '400': {$ref: '#/components/responses/Problem'}
+          '401': {$ref: '#/components/responses/Unauthenticated'}
+          '404': {$ref: '#/components/responses/Problem'}
+          '409': {$ref: '#/components/responses/Problem'}
+          '503': {$ref: '#/components/responses/Problem'}
+    RepositoryRead:
+      parameters: [{$ref: '#/components/parameters/ProjectId'}]
+      post:
+        operationId: readRepository
+        tags: [Repository]
+        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryReadInput'}}}}
+        responses:
+          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+          '400': {$ref: '#/components/responses/Problem'}
+          '401': {$ref: '#/components/responses/Unauthenticated'}
+          '404': {$ref: '#/components/responses/Problem'}
+          '409': {$ref: '#/components/responses/Problem'}
+          '503': {$ref: '#/components/responses/Problem'}
+    RepositoryEdit:
+      parameters:
+        - {$ref: '#/components/parameters/ProjectId'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      post:
+        operationId: editRepository
+        tags: [Repository]
+        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryEditInput'}}}}
+        responses:
+          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+          '400': {$ref: '#/components/responses/Problem'}
+          '401': {$ref: '#/components/responses/Unauthenticated'}
+          '404': {$ref: '#/components/responses/Problem'}
+          '409': {$ref: '#/components/responses/Problem'}
+          '501': {$ref: '#/components/responses/Problem'}
+          '503': {$ref: '#/components/responses/Problem'}
+    RepositoryRun:
+      parameters:
+        - {$ref: '#/components/parameters/ProjectId'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      post:
+        operationId: runRepositoryCommand
+        tags: [Repository]
+        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryRunInput'}}}}
+        responses:
+          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+          '400': {$ref: '#/components/responses/Problem'}
+          '401': {$ref: '#/components/responses/Unauthenticated'}
+          '404': {$ref: '#/components/responses/Problem'}
+          '409': {$ref: '#/components/responses/Problem'}
+          '501': {$ref: '#/components/responses/Problem'}
+          '503': {$ref: '#/components/responses/Problem'}
+    RepositoryCheck:
+      parameters:
+        - {$ref: '#/components/parameters/ProjectId'}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      post:
+        operationId: checkRepository
+        tags: [Repository]
+        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryCheckInput'}}}}
+        responses:
+          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
+          '400': {$ref: '#/components/responses/Problem'}
+          '401': {$ref: '#/components/responses/Unauthenticated'}
+          '404': {$ref: '#/components/responses/Problem'}
+          '409': {$ref: '#/components/responses/Problem'}
+          '501': {$ref: '#/components/responses/Problem'}
+          '503': {$ref: '#/components/responses/Problem'}
+    ProjectEventStream:
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/StreamCursor'
+        - $ref: '#/components/parameters/LastEventId'
+      get:
+        operationId: streamProjectEvents
+        tags: [Events]
+        description: >-
+          Tails authorized durable project events as SSE. The response remains open,
+          emits a heartbeat at least once per second while idle, and disconnects a
+          persistently backpressured client so it can resume from its last event id.
+          Reconnect with Last-Event-ID or the cursor query parameter; when both are
+          present they must match.
+        responses:
+          '200':
+            description: Live SSE event frames. X-Kit-Cursor is the durable cursor at connection time.
+            headers:
+              X-Kit-Cursor:
+                required: true
+                schema:
+                  $ref: '#/components/schemas/OpaqueStreamCursor'
+            content:
+              text/event-stream:
+                schema:
+                  type: string
+          '400':
+            $ref: '#/components/responses/Problem'
+          '401':
+            $ref: '#/components/responses/Unauthenticated'
+          '404':
+            $ref: '#/components/responses/Problem'
+          '410':
+            $ref: '#/components/responses/Problem'
+          '500':
+            $ref: '#/components/responses/Problem'
+          '503':
+            $ref: '#/components/responses/Problem'
+          '504':
+            $ref: '#/components/responses/Problem'
+    TerminalAttach:
+      parameters:
+        - $ref: '#/components/parameters/TerminalId'
+        - $ref: '#/components/parameters/RequestId'
+      get:
+        operationId: attachTerminal
+        tags: [Terminals]
+        description: >-
+          Reserved authenticated WebSocket attachment surface. Until the terminal
+          owner service is integrated this returns terminal_unavailable after
+          authorization and never returns a WebSocket upgrade.
+        responses:
+          '400':
+            $ref: '#/components/responses/Problem'
+          '401':
+            $ref: '#/components/responses/Unauthenticated'
+          '404':
+            $ref: '#/components/responses/Problem'
+          '500':
+            $ref: '#/components/responses/Problem'
+          '503':
+            $ref: '#/components/responses/Problem'
+          '504':
+            $ref: '#/components/responses/Problem'
+  responses:
+    RepositoryOperationAccepted:
+      description: Repository operation persisted before dispatch.
+      headers:
+        Location:
+          required: true
+          schema: {type: string, pattern: '^/v1/repository-results/tool_call_'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/RepositoryResult'}
+    Problem:
+      description: RFC 9457 problem details.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Unauthenticated:
+      description: Authentication failed before resource dispatch.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ResourceCreated:
+      description: Resource created synchronously.
+      headers:
+        Location:
+          required: true
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ResourceReceipt'
+    ResourceAccepted:
+      description: Existing domain resource accepted for asynchronous work.
+      headers:
+        Location:
+          required: true
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ResourceReceipt'
+    ResourceUpdated:
+      description: Existing resource updated synchronously.
+      headers:
+        Location:
+          required: true
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ResourceReceipt'
+  schemas:
+    RepositoryStatus:
+      type: object
+      required: [schema_version, principal_id, project_id]
+      properties:
+        schema_version: {const: 1}
+        principal_id: {type: string}
+        project_id: {$ref: '#/components/schemas/ProjectId'}
+        available: {type: boolean}
+        unavailable_reason: {type: [string, 'null']}
+      additionalProperties: false
+    RepositoryRevision:
+      type: object
+      required: [schema_version, revision, digest]
+      properties:
+        schema_version: {const: 1}
+        revision: {type: string, pattern: '^r:[0-9a-f]{64}$'}
+        digest: {type: string, pattern: '^blake3:[0-9a-f]{64}$'}
+      additionalProperties: true
+    RepositoryCapabilities:
+      type: object
+      required: [schema_version, items]
+      properties:
+        schema_version: {const: 1}
+        items:
+          type: array
+          minItems: 6
+          maxItems: 6
+          items:
+            type: object
+            required: [name, provider_name, version, effect, input_schema, configured, available, unavailable_reasons, availability]
+            properties:
+              name: {enum: [discover, search, read, edit, run, check]}
+              provider_name: {type: string}
+              version: {type: string}
+              effect: {enum: [workspace_read, workspace_write, process_spawn]}
+              input_schema: {type: object}
+              configured: {type: boolean}
+              available: {type: boolean}
+              unavailable_code: {type: [string, 'null']}
+              unavailable_reasons: {type: array, items: {type: string}}
+              availability:
+                type: object
+                required: [checked_at_unix_micros, expires_at_unix_micros, generation, image]
+                properties:
+                  checked_at_unix_micros: {type: integer}
+                  expires_at_unix_micros: {type: integer}
+                  generation: {type: string, pattern: '^[0-9a-f]{64}$'}
+                  image:
+                    type: [object, 'null']
+                    properties:
+                      reference: {type: [string, 'null']}
+                      resolved_digest: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+                      immutable: {type: boolean}
+                    required: [reference, resolved_digest, immutable]
+                    additionalProperties: false
+                additionalProperties: false
+            additionalProperties: false
+      additionalProperties: false
+    RepositoryResult:
+      type: object
+      required: [schema_version, id, operation, status, replayed, output, error, cost, artifacts]
+      properties:
+        schema_version: {const: 1}
+        id: {$ref: '#/components/schemas/RepositoryResultId'}
+        native_operation_id: {$ref: '#/components/schemas/RepositoryResultId'}
+        native_result_id: {$ref: '#/components/schemas/RepositoryResultId'}
+        operation: {type: string, pattern: '^repo\\.(discover|search|read|edit|run|check)$'}
+        status: {enum: [queued, running, waiting_approval, completed, failed, cancelled, outcome_unknown, denied]}
+        replayed: {type: boolean}
+        approval: {$ref: '#/components/schemas/RepositoryApproval'}
+        owner: {$ref: '#/components/schemas/RepositoryOperationOwner'}
+        cancellation_requested: {type: boolean}
+        output: {type: [object, 'null']}
+        error: {oneOf: [{$ref: '#/components/schemas/RepositoryOperationError'}, {type: 'null'}]}
+        cost: {oneOf: [{$ref: '#/components/schemas/RepositoryCost'}, {type: 'null'}]}
+        artifacts: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifacts'}, {type: 'null'}]}
+        created_at_unix_micros: {type: integer}
+        updated_at_unix_micros: {type: integer}
+      additionalProperties: false
+    RepositoryResultId:
+      type: string
+      pattern: '^tool_call_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    RepositoryEvents:
+      type: object
+      required: [schema_version, result_id, items]
+      properties:
+        schema_version: {const: 1}
+        result_id: {$ref: '#/components/schemas/RepositoryResultId'}
+        items: {type: array, items: {$ref: '#/components/schemas/RepositoryEvent'}}
+      additionalProperties: false
+    RepositoryEvent:
+      type: object
+      required: [cursor, sequence, type, payload, created_at_unix_micros]
+      properties:
+        cursor: {type: string}
+        sequence: {type: integer, minimum: 1}
+        type: {type: string}
+        payload: {type: object}
+        created_at_unix_micros: {type: integer}
+      additionalProperties: false
+    RepositoryApprovalResolution:
+      type: object
+      required: [decision]
+      properties: {decision: {enum: [approved, denied]}}
+      additionalProperties: false
+    RepositoryCancellation:
+      type: object
+      properties: {}
+      additionalProperties: false
+    RepositoryOperationError:
+      type: object
+      required: [code, effect_state, retryable]
+      properties:
+        code: {type: string, pattern: '^[a-z0-9_]+$'}
+        effect_state: {enum: [none, attempted, unknown]}
+        retryable: {type: boolean}
+      additionalProperties: false
+    RepositoryApproval:
+      type: object
+      required: [state]
+      properties:
+        id: {type: [string, 'null']}
+        state: {enum: [not_required, pending, approved, denied]}
+      additionalProperties: false
+    RepositoryOperationOwner:
+      type: object
+      required: [run_id, attempt_id, fence]
+      properties:
+        run_id: {type: string}
+        attempt_id: {type: string}
+        fence: {type: integer, minimum: 1}
+      additionalProperties: false
+    RepositoryArtifact:
+      type: object
+      required: [reference, digest, media_type, size, provenance]
+      properties:
+        reference: {type: string, pattern: '^(artifact-ref|blake3):[0-9a-f]{64}$'}
+        digest: {type: string, pattern: '^blake3:[0-9a-f]{64}$'}
+        media_type: {type: string}
+        size: {type: integer, minimum: 0}
+        provenance:
+          type: object
+          required: [kind, operation_id, native_result_id, principal_id, project_id]
+          properties:
+            kind: {type: string}
+            operation_id: {$ref: '#/components/schemas/RepositoryResultId'}
+            native_result_id: {$ref: '#/components/schemas/RepositoryResultId'}
+            principal_id: {type: string}
+            project_id: {$ref: '#/components/schemas/ProjectId'}
+          additionalProperties: false
+      additionalProperties: false
+    RepositoryArtifacts:
+      type: object
+      required: [repository_result, actual_diff, verification_receipt, verification_logs, feedback_payload, feedback_report, edit_events, cost]
+      properties:
+        repository_result: {$ref: '#/components/schemas/RepositoryArtifact'}
+        actual_diff: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifact'}, {type: 'null'}]}
+        verification_receipt: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifact'}, {type: 'null'}]}
+        verification_logs: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifact'}, {type: 'null'}]}
+        feedback_payload: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifact'}, {type: 'null'}]}
+        feedback_report: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifact'}, {type: 'null'}]}
+        edit_events: {$ref: '#/components/schemas/RepositoryArtifact'}
+        cost: {$ref: '#/components/schemas/RepositoryArtifact'}
+      additionalProperties: false
+    RepositoryCost:
+      type: object
+      required: [schema_version, operation_id, native_result_id, provider, reservations, debited, reserved, released, charged]
+      properties:
+        schema_version: {const: 1}
+        operation_id: {$ref: '#/components/schemas/RepositoryResultId'}
+        native_result_id: {$ref: '#/components/schemas/RepositoryResultId'}
+        provider: {type: object, required: [calls, cost_microusd, reason], properties: {calls: {type: integer}, cost_microusd: {type: integer}, reason: {type: string}}, additionalProperties: false}
+        reservations: {type: array, items: {$ref: '#/components/schemas/RepositorySpend'}}
+        debited: {$ref: '#/components/schemas/RepositorySpend'}
+        reserved: {$ref: '#/components/schemas/RepositorySpend'}
+        released: {$ref: '#/components/schemas/RepositorySpend'}
+        charged: {type: boolean}
+      additionalProperties: false
+    RepositorySpend:
+      type: object
+      required: [cost_microusd, tokens, turns, tools, processes]
+      properties:
+        kind: {type: string}
+        cost_microusd: {type: integer, minimum: 0}
+        tokens: {type: integer, minimum: 0}
+        turns: {type: integer, minimum: 0}
+        tools: {type: integer, minimum: 0}
+        processes: {type: integer, minimum: 0}
+      additionalProperties: false
+    RepositoryRevisionId: {type: string, pattern: '^r:[0-9a-f]{64}$'}
+    RepositoryRelativePath: {type: string, minLength: 1, maxLength: 4096}
+    RepositoryDiscoverInput:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [expected_revision, terms, roots, languages]
+      properties:
+        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        terms: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 256}}
+        roots: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+        languages: {type: array, maxItems: 32, items: {type: string}}
+        cursor: {type: [object, 'null']}
+      additionalProperties: false
+    RepositorySearchInput:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [expected_revision, text, mode, path_prefixes, languages]
+      properties:
+        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        text: {type: string, minLength: 1, maxLength: 4096}
+        mode: {enum: [path, content, path_and_content]}
+        path_prefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+        languages: {type: array, maxItems: 32, items: {type: string}}
+        cursor: {type: [object, 'null']}
+      additionalProperties: false
+    RepositoryReadInput:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [expected_revision, path, range]
+      properties:
+        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+        range:
+          oneOf:
+            - {type: object, required: [kind], properties: {kind: {const: full}}, additionalProperties: false}
+            - {type: object, required: [kind, start, end], properties: {kind: {const: bytes}, start: {type: integer, minimum: 0}, end: {type: integer, minimum: 1}}, additionalProperties: false}
+            - {type: object, required: [kind, start, end], properties: {kind: {const: lines}, start: {type: integer, minimum: 1}, end: {type: integer, minimum: 1}}, additionalProperties: false}
+      additionalProperties: false
+    RepositoryEditInput:
+      $id: kit.native.edit.input.v1
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [version, expected_revision, operations]
+      properties:
+        version: {const: 1}
+        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        operations:
+          type: array
+          maxItems: 1000
+          items:
+            oneOf:
+              - type: object
+                required: [op, path, content, executable]
+                properties: {op: {const: add_file}, path: {type: string, minLength: 1}, content: {$ref: '#/components/schemas/RepositoryTextContent'}, executable: {type: boolean}}
+                additionalProperties: false
+              - type: object
+                required: [op, path, base_digest]
+                properties: {op: {const: delete_file}, path: {type: string, minLength: 1}, base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}}
+                additionalProperties: false
+              - type: object
+                required: [op, from, to, base_digest]
+                properties: {op: {const: move_file}, from: {type: string, minLength: 1}, to: {type: string, minLength: 1}, base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}}
+                additionalProperties: false
+              - type: object
+                required: [op, path, base_digest, range, expected, replacement, executable]
+                properties:
+                  op: {const: replace_range}
+                  path: {type: string, minLength: 1}
+                  base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}
+                  range: {type: object, required: [start, end], properties: {start: {type: integer, minimum: 0}, end: {type: integer, minimum: 0}}, additionalProperties: false}
+                  expected: {$ref: '#/components/schemas/RepositoryTextContent'}
+                  replacement: {$ref: '#/components/schemas/RepositoryTextContent'}
+                  executable: {enum: [preserve, executable, non_executable]}
+                additionalProperties: false
+      additionalProperties: false
+    RepositoryTextContent:
+      type: object
+      required: [encoding, newline, text, final_newline]
+      properties:
+        encoding: {const: utf8}
+        newline: {enum: [lf, crlf]}
+        text: {type: string}
+        final_newline: {type: boolean}
+      additionalProperties: false
+    RepositoryContentDigest: {type: string, pattern: '^(blake3|sha256):[0-9a-f]{64}$'}
+    RepositoryRunInput:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [argv, working_directory, mounts, environment, network, limits, host_compatibility, background]
+      properties:
+        argv: {type: array, minItems: 1, maxItems: 256, items: {type: string, minLength: 1, maxLength: 16384}}
+        working_directory: {const: '.'}
+        mounts: {const: {source: read_only, build: read_write, temp: read_write}}
+        environment: {type: object, maxProperties: 128, additionalProperties: {type: string, maxLength: 16384}}
+        network: {enum: [deny, profile_grants]}
+        limits: {$ref: '#/components/schemas/RepositoryProcessLimits'}
+        host_compatibility: {type: boolean}
+        background: {const: foreground}
+      additionalProperties: false
+    RepositoryProcessLimits:
+      type: object
+      required: [cpu_millis, memory_bytes, pids, file_bytes, disk_bytes, io_bytes, output_bytes, wall_time_millis]
+      properties:
+        cpu_millis: {type: integer, minimum: 1}
+        memory_bytes: {type: integer, minimum: 1}
+        pids: {type: integer, minimum: 1}
+        file_bytes: {type: integer, minimum: 1}
+        disk_bytes: {type: integer, minimum: 1}
+        io_bytes: {type: integer, minimum: 1}
+        output_bytes: {type: integer, minimum: 1, maximum: 1048576}
+        wall_time_millis: {type: integer, minimum: 1}
+      additionalProperties: false
+    RepositoryCheckInput:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      required: [profile, targets]
+      properties:
+        profile: {enum: [syntax, fast, targeted, full]}
+        targets: {type: array, maxItems: 64, items: {type: string, minLength: 1, maxLength: 128}}
+      additionalProperties: false
+    ProcessId:
+      $ref: './openapi.exec.yaml#/components/schemas/ProcessId'
+    AttachmentId:
+      $ref: './openapi.exec.yaml#/components/schemas/AttachmentId'
+    ProcessState:
+      $ref: './openapi.exec.yaml#/components/schemas/ProcessState'
+    Process:
+      $ref: './openapi.exec.yaml#/components/schemas/Process'
+    ProcessList:
+      $ref: './openapi.exec.yaml#/components/schemas/ProcessList'
+    Terminal:
+      $ref: './openapi.exec.yaml#/components/schemas/Terminal'
+    Attachment:
+      $ref: './openapi.exec.yaml#/components/schemas/Attachment'
+    MutationReceipt:
+      $ref: './openapi.exec.yaml#/components/schemas/MutationReceipt'
+    AllocateTerminal:
+      $ref: './openapi.exec.yaml#/components/schemas/AllocateTerminal'
+    WriterLease:
+      $ref: './openapi.exec.yaml#/components/schemas/WriterLease'
+    TerminalInput:
+      $ref: './openapi.exec.yaml#/components/schemas/TerminalInput'
+    TerminalResize:
+      $ref: './openapi.exec.yaml#/components/schemas/TerminalResize'
+    OutputPage:
+      $ref: './openapi.exec.yaml#/components/schemas/OutputPage'
+    ResizePage:
+      $ref: './openapi.exec.yaml#/components/schemas/ResizePage'
+    ExecutorEventPage:
+      $ref: './openapi.exec.yaml#/components/schemas/ExecutorEventPage'
+    OpaqueId:
+      type: string
+      minLength: 28
+      maxLength: 37
+      description: Opaque, case-sensitive identifier. Clients must not parse its prefix or payload.
+    ProjectId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^project_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    ThreadId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^thread_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    RunId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^run_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    ApprovalId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^approval_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    ArtifactId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^artifact_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    TerminalId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^terminal_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    PrincipalId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^principal_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    ArtifactRef:
+      type: string
+      pattern: '^blake3:[0-9a-f]{64}$'
+      description: Content-addressed artifact reference.
+    PageCursor:
+      type: string
+      pattern: '^cursor_[0-9a-f]{16}$'
+      description: Opaque pagination and cursor-status value. It is not an SSE resume cursor.
+    OpaqueStreamCursor:
+      type: string
+      pattern: '^kitc1_[0-9a-f]{48}$'
+      description: Principal-, project-, filter-, and schema-bound durable SSE cursor.
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339 UTC timestamp.
+      examples: ['2026-07-22T12:34:56.123456Z']
+    CreateProject:
+      type: object
+      required: [id]
+      properties:
+        id:
+          $ref: '#/components/schemas/ProjectId'
+      additionalProperties: true
+    CreateThread:
+      type: object
+      required: [id]
+      properties:
+        id:
+          $ref: '#/components/schemas/ThreadId'
+      additionalProperties: true
+    BudgetLayer:
+      type: object
+      properties:
+        max_tokens:
+          type: [integer, 'null']
+          minimum: 0
+        max_cost_microusd:
+          type: [integer, 'null']
+          minimum: 0
+        max_turns:
+          type: [integer, 'null']
+          minimum: 0
+      additionalProperties: false
+    ConcurrencyLayer:
+      type: object
+      properties:
+        max_runs:
+          type: [integer, 'null']
+          minimum: 0
+        max_tools:
+          type: [integer, 'null']
+          minimum: 0
+      additionalProperties: false
+    ConfigRetentionLayer:
+      type: object
+      properties:
+        event_days:
+          type: [integer, 'null']
+          minimum: 0
+        artifact_days:
+          type: [integer, 'null']
+          minimum: 0
+      additionalProperties: false
+    ConfigLayer:
+      type: object
+      required: [schema_version]
+      properties:
+        schema_version:
+          type: integer
+          const: 2
+        budgets:
+          $ref: '#/components/schemas/BudgetLayer'
+        concurrency:
+          $ref: '#/components/schemas/ConcurrencyLayer'
+        retention:
+          $ref: '#/components/schemas/ConfigRetentionLayer'
+        provider:
+          type: [string, 'null']
+          enum: [anthropic, open_ai, open_router, ollama, null]
+        executor:
+          type: [string, 'null']
+          enum: [local, restricted_container, isolated_vm, null]
+        grammar_edit:
+          oneOf:
+            - $ref: '#/components/schemas/GrammarEditExperiment'
+            - type: 'null'
+        grants:
+          oneOf:
+            - type: array
+              uniqueItems: true
+              items:
+                type: string
+                enum: [model_call, workspace_read, workspace_write, process_spawn, network_egress]
+            - type: 'null'
+      additionalProperties: false
+    GrammarEditExperiment:
+      type: object
+      required: [version, enabled, unsupported_provider]
+      properties:
+        version:
+          type: integer
+          const: 1
+        enabled:
+          type: boolean
+        unsupported_provider:
+          type: string
+          enum: [fail, ordinary_output]
+      additionalProperties: false
+    StartRun:
+      type: object
+      oneOf:
+        - required: [message]
+          not:
+            required: [artifact_ref]
+        - required: [artifact_ref]
+          not:
+            required: [message]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 8192
+          description: At most 8192 UTF-8 bytes, stored as a verified content-addressed artifact before the run event.
+        artifact_ref:
+          $ref: '#/components/schemas/ArtifactRef'
+          description: Preverified artifact reference for advanced clients.
+        run_config:
+          oneOf:
+            - $ref: '#/components/schemas/ConfigLayer'
+            - type: 'null'
+        experiment_config:
+          oneOf:
+            - $ref: '#/components/schemas/ConfigLayer'
+            - type: 'null'
+      additionalProperties: true
+    ExpectedVersion:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    SetThreadArchived:
+      type: object
+      required: [archived]
+      properties:
+        archived:
+          type: boolean
+        expected_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    ProvideRunInput:
+      type: object
+      required: [input, expected_version]
+      properties:
+        input:
+          $ref: '#/components/schemas/ArtifactRef'
+        expected_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    ResolveApproval:
+      type: object
+      required: [decision, expected_version]
+      properties:
+        decision:
+          type: string
+          enum: [approved, denied]
+        expected_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    ResolveAuth:
+      type: object
+      required: [granted, expected_version]
+      properties:
+        granted:
+          type: boolean
+        expected_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    RegisterArtifactMetadata:
+      type: object
+      required: [id, reference, media_type, size]
+      properties:
+        id:
+          $ref: '#/components/schemas/ArtifactId'
+        reference:
+          $ref: '#/components/schemas/ArtifactRef'
+        media_type:
+          type: string
+          minLength: 3
+        size:
+          type: integer
+          minimum: 0
+      additionalProperties: true
+    RetentionPeriod:
+      oneOf:
+        - type: string
+          const: forever
+        - type: object
+          required: [for_micros]
+          properties:
+            for_micros:
+              type: integer
+              minimum: 1
+          additionalProperties: false
+    RetentionPolicy:
+      type: object
+      required: [event, transcript, terminal, artifact, experiment, backup]
+      properties:
+        event:
+          $ref: '#/components/schemas/RetentionPeriod'
+        transcript:
+          $ref: '#/components/schemas/RetentionPeriod'
+        terminal:
+          $ref: '#/components/schemas/RetentionPeriod'
+        artifact:
+          $ref: '#/components/schemas/RetentionPeriod'
+        experiment:
+          $ref: '#/components/schemas/RetentionPeriod'
+        backup:
+          $ref: '#/components/schemas/RetentionPeriod'
+      additionalProperties: true
+    SetProjectRetention:
+      type: object
+      required: [policy]
+      properties:
+        policy:
+          $ref: '#/components/schemas/RetentionPolicy'
+        expected_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    Project:
+      type: object
+      required: [id, principal_id, version]
+      properties:
+        id:
+          $ref: '#/components/schemas/ProjectId'
+        principal_id:
+          $ref: '#/components/schemas/PrincipalId'
+        retention:
+          type: [object, 'null']
+        version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    Thread:
+      type: object
+      required: [id, project_id, archived, deletion_requested, version]
+      properties:
+        id:
+          $ref: '#/components/schemas/ThreadId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        archived:
+          type: boolean
+        deletion_requested:
+          type: boolean
+        version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    ArchiveStatus:
+      type: object
+      required: [object_id, archived]
+      properties:
+        object_id:
+          $ref: '#/components/schemas/ThreadId'
+        archived:
+          type: boolean
+      additionalProperties: true
+    EarliestPhysicalDeletion:
+      oneOf:
+        - type: string
+          const: never
+        - type: object
+          required: [at_unix_micros]
+          properties:
+            at_unix_micros:
+              type: integer
+          additionalProperties: false
+    EffectiveRetention:
+      type: object
+      required: [policy, earliest_physical_deletion]
+      properties:
+        policy:
+          $ref: '#/components/schemas/RetentionPolicy'
+        earliest_physical_deletion:
+          $ref: '#/components/schemas/EarliestPhysicalDeletion'
+      additionalProperties: true
+    DeletionAuditEntry:
+      type: object
+      required: [sequence, state, at_unix_micros]
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          enum: [requested, evaluating, waiting_for_policy, physically_deleting, completed, blocked, failed]
+        at_unix_micros:
+          type: integer
+      additionalProperties: true
+    DeletionJob:
+      type: object
+      required: [id, state, blockers, fence, requested_at_unix_micros]
+      properties:
+        id:
+          type: string
+          pattern: '^deletion_[0-9a-f]{32}$'
+        state:
+          type: string
+          enum: [requested, evaluating, waiting_for_policy, physically_deleting, completed, blocked, failed]
+        effective_retention:
+          $ref: '#/components/schemas/EffectiveRetention'
+        blockers:
+          type: array
+          items:
+            type: string
+            enum: [retention_policy, legal_hold, active_reference, backup_generation]
+        fence:
+          type: integer
+          minimum: 1
+        requested_at_unix_micros:
+          type: integer
+        completed_at_unix_micros:
+          type: [integer, 'null']
+        failure:
+          type: [string, 'null']
+        audit:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeletionAuditEntry'
+      additionalProperties: true
+    ThreadList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Thread'
+      additionalProperties: true
+    Run:
+      type: object
+      required: [id, thread_id, state, input, version]
+      properties:
+        id:
+          $ref: '#/components/schemas/RunId'
+        thread_id:
+          $ref: '#/components/schemas/ThreadId'
+        state:
+          type: string
+          enum: [queued, acquiring_workspace, starting, running, waiting_for_input, waiting_for_approval, waiting_for_auth, completed, failed, cancelling, cancelled, interrupted]
+        input:
+          $ref: '#/components/schemas/ArtifactRef'
+        auth_granted:
+          type: [boolean, 'null']
+        version:
+          type: integer
+          minimum: 1
+        output:
+          oneOf:
+            - $ref: '#/components/schemas/RunOutput'
+            - type: 'null'
+        failure:
+          oneOf:
+            - $ref: '#/components/schemas/RunFailure'
+            - type: 'null'
+      additionalProperties: true
+    RunOutput:
+      type: object
+      required: [artifact, preview, status]
+      properties:
+        artifact:
+          $ref: '#/components/schemas/ArtifactRef'
+        preview:
+          type: string
+        status:
+          type: string
+          enum: [complete]
+      additionalProperties: true
+    RunFailure:
+      type: object
+      required: [code, detail]
+      properties:
+        code:
+          type: string
+          enum: [provider_unavailable, execution_failed]
+        detail:
+          type: string
+          maxLength: 512
+      additionalProperties: true
+    RunCost:
+      type: object
+      required: [usage, cost]
+      properties:
+        usage:
+          type: [object, 'null']
+        cost:
+          type: [object, 'null']
+      additionalProperties: true
+    RunPrompts:
+      type: object
+      required: [template_version, prompt_digest, stable_prefix_digest, first_dynamic_byte, context_bytes, estimated_tokens, token_budget]
+      properties:
+        template_version:
+          type: [string, 'null']
+        prompt_digest:
+          type: [string, 'null']
+        stable_prefix_digest:
+          type: [string, 'null']
+        first_dynamic_byte:
+          type: [integer, 'null']
+        context_bytes:
+          type: [integer, 'null']
+        estimated_tokens:
+          type: [integer, 'null']
+        token_budget:
+          type: [integer, 'null']
+      additionalProperties: true
+    RunTranscript:
+      type: object
+      required: [run_id, items]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
+    RunList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Run'
+      additionalProperties: true
+    Approval:
+      type: object
+      required: [id, run_id, decision, version]
+      properties:
+        id:
+          $ref: '#/components/schemas/ApprovalId'
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        decision:
+          type: [string, 'null']
+          enum: [approved, denied, null]
+        version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    ApprovalList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Approval'
+      additionalProperties: true
+    AuthRequest:
+      type: object
+      required: [run_id, granted, version]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/RunId'
+        granted:
+          type: [boolean, 'null']
+        version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    AuthRequestList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuthRequest'
+      additionalProperties: true
+    ArtifactMetadata:
+      type: object
+      required: [id, project_id, reference, media_type, size]
+      properties:
+        id:
+          $ref: '#/components/schemas/ArtifactId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        reference:
+          $ref: '#/components/schemas/ArtifactRef'
+        media_type:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+      additionalProperties: true
+    ProjectRetention:
+      type: object
+      anyOf:
+        - required: [retention]
+        - required: [effective]
+      properties:
+        retention:
+          oneOf:
+            - $ref: '#/components/schemas/RetentionPolicy'
+            - type: 'null'
+        effective:
+          $ref: '#/components/schemas/RetentionPolicy'
+      additionalProperties: true
+    Capability:
+      type: object
+      required: [name, version]
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+      additionalProperties: true
+    CapabilityList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Capability'
+      additionalProperties: true
+    CommandReceipt:
+      type: object
+      required: [operation, commit_positions, replayed]
+      properties:
+        operation:
+          type: string
+        commit_positions:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+        replayed:
+          type: boolean
+      additionalProperties: true
+    ResourceReceipt:
+      type: object
+      required: [resource, receipt]
+      properties:
+        resource:
+          type: object
+          required: [id]
+          properties:
+            id:
+              $ref: '#/components/schemas/OpaqueId'
+          additionalProperties: true
+        receipt:
+          $ref: '#/components/schemas/CommandReceipt'
+      additionalProperties: true
+    Event:
+      type: object
+      required: [cursor, project_id, operation, stream, payload]
+      properties:
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        operation:
+          type: string
+        stream:
+          $ref: '#/components/schemas/OpaqueId'
+        payload:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+    EventPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+      additionalProperties: true
+    EventStreamFrame:
+      type: object
+      required: [cursor, project_id, operation, stream, payload]
+      properties:
+        cursor:
+          $ref: '#/components/schemas/OpaqueStreamCursor'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        operation:
+          type: string
+        stream:
+          $ref: '#/components/schemas/OpaqueId'
+        payload:
+          type: object
+          additionalProperties: true
+        schema_version:
+          type: integer
+          minimum: 1
+      additionalProperties: true
+    CursorStatus:
+      type: object
+      required: [requested, committed, caught_up]
+      properties:
+        requested:
+          $ref: '#/components/schemas/PageCursor'
+        committed:
+          $ref: '#/components/schemas/PageCursor'
+        caught_up:
+          type: boolean
+      additionalProperties: true
+    ProjectStatus:
+      type: object
+      required: [committed, ready]
+      properties:
+        committed:
+          $ref: '#/components/schemas/PageCursor'
+        ready:
+          type: boolean
+      additionalProperties: true
+    InvalidParameter:
+      type: object
+      required: [name, reason]
+      properties:
+        name:
+          type: string
+        reason:
+          type: string
+      additionalProperties: false
+    ProblemDetails:
+      type: object
+      description: RFC 9457 Problem Details with stable Kit extensions.
+      required: [type, title, status, detail, instance, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          pattern: '^https://kit\.dev/problems/[a-z_]+$'
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          minLength: 1
+        code:
+          type: string
+          pattern: '^[a-z_]+$'
+        invalid_parameters:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvalidParameter'
+      additionalProperties: true

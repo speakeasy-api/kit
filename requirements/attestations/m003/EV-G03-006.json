@@ -1,0 +1,89 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test fault exec_cancel && cargo test --locked --test fault fencing",
+    "evidence_id": "EV-G03-006",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "exec_cancel"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 11 tests\ntest exec_cancel::escaped_or_reused_boundary_is_never_targeted_or_marked_quiescent ... ok\ntest exec_cancel::stale_attempts_and_fences_publish_nothing_and_keep_the_workspace_held ... ok\ntest exec_cancel::published_effects_have_the_exact_order_and_request_ids_are_idempotent ... ok\ntest exec_cancel::unknown_is_reinspectable_and_a_matching_zero_survivor_scan_resolves_it ... ok\ntest exec_cancel::successor_fence_finishes_cleanup_without_stale_publications ... ok\ntest exec_cancel::survivors_and_uninspectable_boundaries_become_unknown_and_never_reassign ... ok\ntest exec_cancel::effect_before_commit_crashes_repeat_only_the_idempotent_operation ... ok\ntest exec_cancel::grace_kill_and_reap_errors_are_durable_and_do_not_stop_escalation ... ok\ntest exec_cancel::reconciliation_resumes_after_a_crash_at_every_durable_phase ... ok\ntest exec_cancel::grace_kill_reap_inspect_order_and_fenced_completion_hold_100_of_100 ... ok\ntest exec_cancel::grace_deadline_is_observed_before_kill_escalation ... ok\n\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.02s\n\n",
+        "output_digest": "95364a04deda2801468c1c7a0ef78e42f97783b33877a9e21c0831b69e59475e",
+        "proof_kind": null,
+        "test_count": 11
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "fault",
+          "fencing"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s\n     Running tests/fault/main.rs (target/debug/deps/fault-307652ea23d4ad24)\n\nrunning 5 tests\ntest fencing::graceful_shutdown_closes_admission_before_flush_and_unlock ... ok\ntest fencing::second_daemon_gets_typed_lock_error_one_hundred_times ... ok\ntest fencing::ten_thousand_stale_fence_commits_are_rejected ... ok\ntest fencing::ten_thousand_stale_journal_appends_commit_zero_events ... ok\ntest fencing::startup_reconciliation_only_returns_explicit_safe_actions ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 1.13s\n\n",
+        "output_digest": "86414923a44be61faab48d7f63011d330ace5ef186c944afd063f0bb2d0ca505",
+        "proof_kind": null,
+        "test_count": 5
+      }
+    ]
+  },
+  "artifact_digest": "6f5393e8c413848c677051ccbaca848669bcc722dc3b4ead1c6b0d0b8085181c",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked_external",
+    "evidence_id": "EV-G03-006",
+    "evidence_job": "dashboard-g03",
+    "expected_result": "Stale attempts and escaped-process simulations cannot publish effects or receive reassigned workspaces.",
+    "requirement_areas": [
+      "KIT-EXEC",
+      "KIT-RUNTIME",
+      "KIT-DOMAIN"
+    ],
+    "source_line": 412,
+    "source_ref": "IMPLEMENTATION_PLAN.md:412"
+  },
+  "disposition": "blocked_external",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "EXT-01",
+    "EXT-04",
+    "EXT-19",
+    "EXT-20",
+    "EXT-22"
+  ],
+  "gate": "G03",
+  "milestone": "M003",
+  "requirements": [
+    {
+      "evidence_id": "EV-4.09-C-001",
+      "evidence_job": "fault",
+      "record_id": "KIT-RUNTIME-950"
+    }
+  ],
+  "run_id": "local-20260728-m003",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m003-worktree-source-conformance"
+}

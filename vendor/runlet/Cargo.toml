@@ -1,0 +1,27 @@
+[package]
+name = "runlet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Daniel Kovacs"]
+description = "A semantic executable model for the Runlet orchestration language"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danielkov/runlet"
+homepage = "https://github.com/danielkov/runlet"
+documentation = "https://docs.rs/runlet"
+readme = "README.md"
+keywords = ["agents", "llm", "orchestration", "language", "runtime"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+hex = "0.4"
+regex = "1"
+ryu = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+unicode-ident = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"

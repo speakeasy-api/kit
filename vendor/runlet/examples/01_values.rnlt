@@ -1,0 +1,13 @@
+# Immutable lists and objects are ordinary Runlet values.
+profile = {
+    name: "Ada",
+    active: true,
+    scores: [91, 97, 99]
+}
+
+return {
+    greeting: "Hello, " + profile.name,
+    latest_score: profile.scores[-1],
+    has_perfect_score: 100 in profile.scores,
+    profile
+}

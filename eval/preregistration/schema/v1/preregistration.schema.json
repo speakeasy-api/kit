@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kit evaluation preregistration plan v1.1",
+  "$ref": "components.schema.json#/$defs/preregistration"
+}

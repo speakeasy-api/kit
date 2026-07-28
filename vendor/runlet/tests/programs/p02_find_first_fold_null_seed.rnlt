@@ -1,0 +1,14 @@
+#! expect: { "first_open": "o2", "missing": "none" }
+# Regression (bench v11): a `null` fold seed must widen to `Item | Null`
+# so the found object projects after a null guard.
+orders = data.orders()
+first_open = fold hit = null for o in orders {
+    return o if o.status == "open" and hit == null else hit
+}
+missing = fold hit = null for o in orders {
+    return o if o.status == "void" and hit == null else hit
+}
+return {
+    first_open: first_open.id if first_open != null else "none",
+    missing: missing.id if missing != null else "none"
+}

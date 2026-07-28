@@ -1,0 +1,148 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test integration backup_restore && cargo test --locked --test conformance retention_model && cargo test --locked --test conformance deletion_api",
+    "evidence_id": "EV-G01-011",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "integration",
+          "backup_restore"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/integration/main.rs (target/debug/deps/integration-98c754f772d936c1)\n\nrunning 10 tests\ntest backup_restore::failed_inventory_registration_is_not_published_and_updates_health ... ok\ntest backup_restore::shared_deleted_content_restores_only_before_advertised_expiry ... ok\ntest backup_restore::manager_uses_artifacts_registered_after_open ... ok\ntest backup_restore::corrupt_database_and_artifact_fail_closed_without_publishing_state ... ok\ntest backup_restore::opaque_references_and_verification_reports_restore_with_independent_metadata ... ok\ntest backup_restore::published_generations_remain_in_deletion_inventory_until_expiry ... ok\ntest backup_restore::policy_hold_and_physical_deletion_changes_are_read_per_generation ... ok\ntest backup_restore::startup_verifies_generations_and_reconciles_missing_inventory ... ok\ntest backup_restore::generation_retention_is_exact ... ok\ntest backup_restore::ten_fresh_restores_match_database_projection_and_artifacts ... ok\n\ntest result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 62 filtered out; finished in 3.56s\n\n",
+        "output_digest": "b8c145bb9d7f0a4b2a05ba7ff8e2e4cbdcf7a5e0777567b55029e0b5a1a2b322",
+        "proof_kind": null,
+        "test_count": 10
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "retention_model"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 9 tests\ntest retention_model::shared_and_unshared_artifact_reachability_are_global ... ok\ntest retention_model::archive_is_reversible_visibility_not_deletion_intent ... ok\ntest retention_model::all_retention_classes_are_independently_configurable ... ok\ntest retention_model::hold_add_remove_and_all_scopes_obey_exact_boundaries ... ok\ntest retention_model::shorter_policy_changes_never_override_a_hold ... ok\ntest retention_model::policy_is_deterministic_and_contains_no_wall_clock_reads ... ok\ntest retention_model::perpetual_retention_or_backup_reports_never ... ok\ntest retention_model::backup_generation_blocks_before_but_not_at_or_after_expiry ... ok\ntest retention_model::every_live_restore_path_blocks_and_latest_boundary_wins ... ok\n\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 440 filtered out; finished in 0.00s\n\n",
+        "output_digest": "012e09662165b12951407feb2fc5686b2123a1ad30aed42e2ea177b3ac8379c0",
+        "proof_kind": null,
+        "test_count": 9
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "deletion_api"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 7 tests\ntest deletion_api::backup_inventory_blocks_only_before_advertised_expiry ... ok\ntest deletion_api::deletion_jobs_are_idempotent_asynchronous_and_record_failure ... ok\ntest deletion_api::archive_and_unarchive_are_reversible_visibility_only ... ok\ntest deletion_api::every_retention_class_reports_both_sides_of_its_earliest_boundary ... ok\ntest deletion_api::shared_artifact_waits_for_every_reference_without_disclosing_owners ... ok\ntest deletion_api::legal_hold_is_an_audited_typed_refusal_and_release_requires_a_fresh_fence ... ok\ntest deletion_api::http_returns_jobs_typed_hold_refusal_and_no_cross_principal_details ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 442 filtered out; finished in 0.00s\n\n",
+        "output_digest": "73c23d86eb0bd471143b1c6bba7a9a31d5310f2cd78226953b50c3572af86df3",
+        "proof_kind": null,
+        "test_count": 7
+      }
+    ]
+  },
+  "artifact_digest": "788ebc41bd6243a1296107240ca43213748d7a93e3379d19c9175097a16271e4",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G01-011",
+    "evidence_job": "dashboard-g01",
+    "expected_result": "Backup restore into a fresh state root passes integrity and projection checks; deleted shared/unshared content remains restorable only until the advertised backup-expiry boundary.",
+    "requirement_areas": [
+      "KIT-STORE",
+      "KIT-SEC"
+    ],
+    "source_line": 332,
+    "source_ref": "IMPLEMENTATION_PLAN.md:332"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G01",
+  "milestone": "M001",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-1251",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-817"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1252",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-818"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1253",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-819"
+    },
+    {
+      "evidence_id": "EV-M001-W13-C-001",
+      "evidence_job": "fault",
+      "record_id": "KIT-STORE-010"
+    },
+    {
+      "evidence_id": "EV-M001-W13-C-002",
+      "evidence_job": "fault",
+      "record_id": "KIT-STORE-011"
+    },
+    {
+      "evidence_id": "EV-M001-W13-C-003",
+      "evidence_job": "fault",
+      "record_id": "KIT-STORE-012"
+    },
+    {
+      "evidence_id": "EV-M001-W13-C-004",
+      "evidence_job": "fault",
+      "record_id": "KIT-STORE-013"
+    },
+    {
+      "evidence_id": "EV-M001-W13-C-005",
+      "evidence_job": "fault",
+      "record_id": "KIT-STORE-014"
+    },
+    {
+      "evidence_id": "EV-M001-W13-C-006",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-015"
+    },
+    {
+      "evidence_id": "EV-1.04-C-930",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-820"
+    },
+    {
+      "evidence_id": "EV-2.10-C-101",
+      "evidence_job": "integration",
+      "record_id": "KIT-STORE-981"
+    }
+  ],
+  "run_id": "local-20260728-m001",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m001-worktree-attestation"
+}

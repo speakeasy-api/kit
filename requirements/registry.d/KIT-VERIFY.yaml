@@ -1,0 +1,157 @@
+- id: KIT-VERIFY-001
+  record_class: requirement
+  modality: SHOULD
+  title: Reproduce defects before editing
+  atomic_text: A defect SHOULD be reproduced before editing when feasible.
+  source_section: §19.1 Verification ladder
+  source_anchor: RFC.md:811
+  source_quote: The defect SHOULD be reproduced before editing when feasible. Existing red builds and diagnostics are baselined; decisions use deltas rather than assuming the repository starts clean.
+  source_fingerprint: 060ef19d5f6be790f0c18e21695842477e9f4a2a765b13f3a15d48eb8a86cd85
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-VERIFY
+  applicability: mandatory
+  interpretation: The verification event stream records a failing reproducer before the first edit, or records why reproduction is infeasible.
+  acceptance_criteria:
+  - cargo test --locked --test conformance verify_profiles && cargo test --locked --test conformance verify_feedback exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M004
+  contributing_milestones:
+  - M005
+  dependencies: []
+  owner: Verification owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  implementation_links:
+  - src/verify/feedback/mod.rs
+  - tests/conformance/verify_feedback.rs
+  - docs/operations/verification-feedback.md
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M004-W08-C-001
+  evidence_job: evidence-report
+  expected_result: cargo test --locked --test conformance verify_profiles && cargo test --locked --test conformance verify_feedback exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: 028a8fb7d25a3d96ab36af19a480bafb0bb1f0fba7428a5699e0043f110e073a
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when edit orchestration or verification-event recording changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-VERIFY-002
+  record_class: requirement
+  modality: MUST NOT
+  title: Prevent repeated full-log accumulation
+  atomic_text: Repeated full logs MUST NOT accumulate in model context.
+  source_section: §19.3 Feedback shape
+  source_anchor: RFC.md:838
+  source_quote: Repeated full logs MUST NOT accumulate in context.
+  source_fingerprint: 94dfd908bdff520642c2468d9690b0f09025673cdafd9022ab866f015d1a63ab
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: implemented
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-VERIFY
+  applicability: mandatory
+  interpretation: A repeated check replaces or references prior full logs and model context retains only bounded failure feedback.
+  acceptance_criteria:
+  - cargo test --locked --test conformance verify_profiles && cargo test --locked --test conformance verify_feedback exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M004
+  contributing_milestones:
+  - M009
+  dependencies: []
+  owner: Verification owner
+  criticality: blocking
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G04
+  implementation_links:
+  - src/verify/feedback/mod.rs
+  - tests/conformance/verify_feedback.rs
+  - docs/operations/verification-feedback.md
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M004-W08-C-002
+  evidence_job: evidence-report
+  expected_result: cargo test --locked --test conformance verify_profiles && cargo test --locked --test conformance verify_feedback exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: 028a8fb7d25a3d96ab36af19a480bafb0bb1f0fba7428a5699e0043f110e073a
+  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
+  versions:
+    cargo: 1.94.0
+    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
+    os: Darwin 25.5.0 arm64
+    python: 3.13.11
+    rustc: 1.94.0
+  latest_result: pass
+  revalidation_rule: Re-run when verification feedback, transcript projection, or log artifact handling changes.
+  decision_record: null
+  deviation_record: null
+- id: KIT-VERIFY-003
+  record_class: requirement
+  modality: SHOULD
+  title: Change strategy after repeated failure
+  atomic_text: After two materially identical failures, policy SHOULD trigger re-localization, model escalation, fresh-context review, or user input rather than another equivalent edit.
+  source_section: §19.4 Loop control
+  source_anchor: RFC.md:842
+  source_quote: Each run has budgets for model turns, reasoning, spend, wall time, test time, patch size, repeated failures, and destructive effects. After two materially identical failures, policy SHOULD trigger re-localization, model escalation, a fresh-context reviewer, or user input rather than another equivalent edit.
+  source_fingerprint: 61e22b482796fe9c7b9375007bafe8a709d5a06c02a8f3605bd940d7a7faa25c
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-VERIFY
+  applicability: mandatory
+  interpretation: A third materially identical failure signature cannot dispatch the same edit strategy without first selecting one of the four named interventions.
+  acceptance_criteria:
+  - cargo test --test conformance repeated_failure_strategy -- --exact exits 0 with 1 passed and 0 failed
+  primary_milestone: M008
+  contributing_milestones:
+  - M004
+  dependencies: []
+  owner: Routing owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G08
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-M008-W05-C-001
+  evidence_job: integration
+  expected_result: cargo test --test conformance repeated_failure_strategy -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when failure signatures, intervention policy, or edit retry logic changes.
+  decision_record: null
+  deviation_record: null

@@ -1,0 +1,34 @@
+[package]
+description = "Model Context Protocol integration for agentkit, including transports, auth, and adapters."
+homepage.workspace = true
+name = "agentkit-mcp"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core" }
+async-trait.workspace = true
+futures-util.workspace = true
+http = "1"
+reqwest.workspace = true
+rmcp = { version = "1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
+serde.workspace = true
+serde_json.workspace = true
+sse-stream = "0.2"
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+axum = "0.8"
+rmcp = { version = "1.5.0", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "net"] }

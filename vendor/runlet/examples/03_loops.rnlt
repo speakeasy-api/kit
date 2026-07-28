@@ -1,0 +1,22 @@
+# A for expression returns an ordered list. The host bounds active iterations.
+numbers = [1, 2, 3, 4, 5, 6]
+squares = for number in numbers {
+    return number * number
+}
+
+inventory = {
+    apples: 4,
+    bananas: 7,
+    cherries: 2
+}
+
+# Objects iterate as { key, value } records in sorted key order.
+stock_rows = for entry in inventory {
+    return {
+        item: entry.key,
+        count: entry.value,
+        label: entry.key + ": " + entry.value
+    }
+}
+
+return { squares, stock_rows }

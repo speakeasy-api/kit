@@ -1,0 +1,22 @@
+[package]
+description = "Shell execution tool and shell-oriented safety hooks for agentkit."
+homepage.workspace = true
+name = "agentkit-tool-shell"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
+
+[dev-dependencies]
+agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities" }

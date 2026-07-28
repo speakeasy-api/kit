@@ -1,0 +1,33 @@
+[package]
+description = "Agent Client Protocol integration for agentkit hosts."
+homepage.workspace = true
+name = "agentkit-acp"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["stdio"]
+stdio = ["dep:agent-client-protocol-tokio"]
+unstable-acp = ["agent-client-protocol/unstable"]
+
+[dependencies]
+agent-client-protocol = "1.0.1"
+agent-client-protocol-tokio = { version = "0.11.1", optional = true }
+agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
+agentkit-loop = { version = "0.10.2", path = "../agentkit-loop" }
+agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core" }
+async-trait.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+agentkit-integration-tests = { path = "../agentkit-integration-tests" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -1,0 +1,94 @@
+- id: KIT-ENCODE-001
+  record_class: requirement
+  modality: MAY
+  title: Select compact type notation
+  atomic_text: The model-facing schema projection MAY use compact type notation.
+  source_section: §14.3 Compact tool schemas
+  source_anchor: RFC.md:569
+  source_quote: 'The model-facing projection MAY use compact type notation:'
+  source_fingerprint: 6484f8fb7c76db0b826b366bc4d92576731af3a9df675a207519fc625b174edc
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ENCODE
+  applicability: pending_voi
+  interpretation: Compact type notation is enabled only for model and task cells where preregistered measurements select it over provider-valid JSON Schema.
+  acceptance_criteria:
+  - cargo test --test integration compact_projection_voi -- --exact exits 0 with 1 passed and 0 failed
+  primary_milestone: M007
+  contributing_milestones:
+  - M011
+  dependencies: []
+  owner: Encoding owner
+  criticality: medium
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G07
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M007-W11-E-001
+  evidence_job: integration
+  expected_result: cargo test --test integration compact_projection_voi -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for every projection format, provider schema subset, model snapshot, or tokenizer change.
+  decision_record: null
+  deviation_record: null
+- id: KIT-ENCODE-002
+  record_class: requirement
+  modality: MAY
+  title: Permit model-specific result encodings
+  atomic_text: Result encodings may vary by model.
+  source_section: §7.6 Model-specific, evidence-driven policy
+  source_anchor: RFC.md:162
+  source_quote: Tool descriptions, prompt modules, edit formats, reasoning levels, compaction policy, composition backends, and result encodings MAY vary by model.
+  source_fingerprint: 0f9282147e41a992ea1e3f1969cff5d3622d30197ccb47cb36bae98b22bd64bd
+  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  status: proposed
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-ENCODE
+  applicability: pending_voi
+  interpretation: A pinned model can receive a measured result-encoding variant while canonical structured content remains unchanged.
+  acceptance_criteria:
+  - '`cargo test --test conformance ablation_portfolio -- model_result_encodings` exits 0 with 1 accepted disposition.'
+  primary_milestone: M011
+  contributing_milestones:
+  - M007
+  dependencies: []
+  owner: Evaluation owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G11
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: evaluation
+  evidence_id: EV-M011-W10-E-007
+  evidence_job: evidence-report
+  expected_result: '`cargo test --test conformance ablation_portfolio -- model_result_encodings` exits 0 with 1 accepted disposition.'
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run for each result-encoding policy, model snapshot, tokenizer, or task corpus change.
+  decision_record: null
+  deviation_record: null

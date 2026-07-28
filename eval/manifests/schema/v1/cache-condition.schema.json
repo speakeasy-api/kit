@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kit.dev/eval/manifests/schema/v1/cache-condition.schema.json",
+  "title": "Kit evaluation cache condition manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "cache_condition_id", "prompt", "infrastructure"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "kind": { "const": "cache_condition" },
+    "cache_condition_id": { "$ref": "#/$defs/id" },
+    "prompt": { "$ref": "#/$defs/cache" },
+    "infrastructure": { "$ref": "#/$defs/cache" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "cache": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state"],
+          "properties": { "state": { "const": "cold" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "state_digest"],
+          "properties": {
+            "state": { "const": "warm" },
+            "state_digest": { "$ref": "#/$defs/digest" }
+          }
+        }
+      ]
+    }
+  }
+}

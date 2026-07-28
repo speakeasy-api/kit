@@ -1,0 +1,19 @@
+[package]
+name = "openrouter-parallel-agent"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentkit-core = { path = "../../crates/agentkit-core" }
+agentkit-loop = { path = "../../crates/agentkit-loop" }
+agentkit-provider-openrouter = { path = "../../crates/agentkit-provider-openrouter" }
+agentkit-reporting = { path = "../../crates/agentkit-reporting" }
+agentkit-task-manager = { path = "../../crates/agentkit-task-manager" }
+agentkit-tool-fs = { path = "../../crates/agentkit-tool-fs" }
+agentkit-tool-shell = { path = "../../crates/agentkit-tool-shell" }
+agentkit-tools-core = { path = "../../crates/agentkit-tools-core" }
+dotenvy.workspace = true
+tokio.workspace = true

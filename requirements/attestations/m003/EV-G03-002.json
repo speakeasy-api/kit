@@ -1,0 +1,97 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance container_limits && cargo test --locked --test conformance process_output",
+    "evidence_id": "EV-G03-002",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "container_limits"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 11 tests\ntest container_limits::successful_kill_is_not_a_bound_result_until_inspect_proves_zero_survivors ... ok\ntest container_limits::kill_start_failure_still_kills_cli_and_can_only_return_unknown_or_not_quiescent ... ok\ntest container_limits::timed_out_boundary_control_is_unknown_after_cli_kill_and_inspection ... ok\ntest container_limits::aggregate_quota_io_kill_and_mount_lease_evidence_cannot_be_caller_asserted ... ok\ntest container_limits::unknown_or_unattested_runtime_exit_is_never_typed_success ... ok\ntest container_limits::aggregate_cpu_quota_backed_bind_disk_and_boundary_io_are_in_the_integrated_argv ... ok\ntest container_limits::helper_report_surfaces_and_binds_runtime_storage_evidence ... ok\ntest container_limits::replayed_or_mismatched_monitor_record_is_typed_rejected ... ok\ntest container_limits::formatter_measurements_are_all_or_nothing_helper_evidence ... ok\ntest container_limits::concrete_identity_bound_monitor_record_maps_to_typed_bound_error ... ok\ntest container_limits::attested_nonzero_and_signal_completions_are_not_outcome_unknown ... ok\n\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 438 filtered out; finished in 0.48s\n\n",
+        "output_digest": "98abd8b406965cd9226d21758d39d8b960d8de23e3f1dc481870d064c359a41a",
+        "proof_kind": null,
+        "test_count": 11
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "process_output"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 3 tests\ntest process_output::host_execution_is_explicitly_unavailable_without_a_complete_boundary ... ok\ntest process_output::stdout_and_stderr_are_drained_concurrently ... ok\ntest process_output::excess_output_is_always_bounded_marked_and_accounted ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 446 filtered out; finished in 0.01s\n\n",
+        "output_digest": "fe8e38e53ca343ecae2f1ef73a582ced0eb8780f75b81280ae263274409828a6",
+        "proof_kind": null,
+        "test_count": 3
+      }
+    ]
+  },
+  "artifact_digest": "4e09ae3d464d9605ca08f845794a947417c90a3973b1ae0f7b6f4bd2bfcc8d2b",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked_external",
+    "evidence_id": "EV-G03-002",
+    "evidence_job": "dashboard-g03",
+    "expected_result": "CPU, memory, PID, file, disk, I/O, output and wall-time bounds are enforced.",
+    "requirement_areas": [
+      "KIT-EXEC",
+      "KIT-RUNTIME"
+    ],
+    "source_line": 408,
+    "source_ref": "IMPLEMENTATION_PLAN.md:408"
+  },
+  "disposition": "blocked_external",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "EXT-01",
+    "EXT-04",
+    "EXT-19",
+    "EXT-20"
+  ],
+  "gate": "G03",
+  "milestone": "M003",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-906",
+      "evidence_job": "integration",
+      "record_id": "KIT-DOMAIN-862"
+    },
+    {
+      "evidence_id": "EV-1.04-C-907",
+      "evidence_job": "integration",
+      "record_id": "KIT-DOMAIN-863"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1207",
+      "evidence_job": "integration",
+      "record_id": "KIT-EXEC-809"
+    }
+  ],
+  "run_id": "local-20260728-m003",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m003-worktree-source-conformance"
+}

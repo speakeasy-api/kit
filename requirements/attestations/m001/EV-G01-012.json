@@ -1,0 +1,111 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test adversarial auth_local::exact_seven_required_denial_cases_are_closed -- --exact && cargo test --locked --test adversarial auth_local::readiness_requires_both_components_in_every_boot_order -- --exact && cargo test --locked --test adversarial auth_remote::operational_fake_pki_denies_exactly_seven_required_cases_and_accepts_valid_peers -- --exact",
+    "evidence_id": "EV-G01-012",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "auth_local::exact_seven_required_denial_cases_are_closed",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 1 test\ntest auth_local::exact_seven_required_denial_cases_are_closed ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s\n\n",
+        "output_digest": "ac23f7349f0f1cf58f048f1b63c0de04af23866319a755912f37f7243f8e19dc",
+        "proof_kind": null,
+        "test_count": 1
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "auth_local::readiness_requires_both_components_in_every_boot_order",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 1 test\ntest auth_local::readiness_requires_both_components_in_every_boot_order ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s\n\n",
+        "output_digest": "afe9adf8f394e085d064f5c8473cc3cbff71af1cdada68f940717207928237cc",
+        "proof_kind": null,
+        "test_count": 1
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "auth_remote::operational_fake_pki_denies_exactly_seven_required_cases_and_accepts_valid_peers",
+          "--",
+          "--exact"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 1 test\ntest auth_remote::operational_fake_pki_denies_exactly_seven_required_cases_and_accepts_valid_peers ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.04s\n\n",
+        "output_digest": "067f7853af945690c695e1f69749ec0644e0257d18c9299b346858ba3edcd909",
+        "proof_kind": null,
+        "test_count": 1
+      }
+    ]
+  },
+  "artifact_digest": "685374197b8fa64e2d30f17526c80ec4be7bbd5f215c4f4134023d410ee178a1",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "blocked",
+    "evidence_id": "EV-G01-012",
+    "evidence_job": "dashboard-g01",
+    "expected_result": "Authentication tests cover unauthenticated, cross-principal, Origin/Host, token replay, expiry and revocation cases before readiness.",
+    "requirement_areas": [
+      "KIT-SEC",
+      "KIT-API"
+    ],
+    "source_line": 333,
+    "source_ref": "IMPLEMENTATION_PLAN.md:333"
+  },
+  "disposition": "blocked_external",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": [
+    "EXT-08"
+  ],
+  "gate": "G01",
+  "milestone": "M001",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-1236",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-802"
+    },
+    {
+      "evidence_id": "EV-1.04-C-1237",
+      "evidence_job": "integration",
+      "record_id": "KIT-API-803"
+    }
+  ],
+  "run_id": "local-20260728-m001",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m001-worktree-attestation"
+}

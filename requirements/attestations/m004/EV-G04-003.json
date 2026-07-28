@@ -1,0 +1,83 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance edit_validate && cargo test --locked --test adversarial path_escape",
+    "evidence_id": "EV-G04-003",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "edit_validate"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.40s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 12 tests\ntest edit_validate::validation_contract_documents_the_eight_outcomes_and_opaque_plan_boundary ... ok\ntest edit_validate::validation_read_memory_and_time_bounds_are_typed ... ok\ntest edit_validate::active_ir_policy_and_limits_are_rejected_before_filesystem_authority ... ok\ntest edit_validate::edit_rejects_fuzzy_duplicate ... ok\ntest edit_validate::live_plan_revalidates_exact_descriptor_identity_and_rejects_aba ... ok\ntest edit_validate::zero_length_eof_insertions_validate_directly_and_from_unified_diff ... ok\ntest edit_validate::all_operations_validate_as_one_deterministic_non_mutating_plan ... ok\ntest edit_validate::stale_revision_is_checked_after_waiting_for_the_exclusive_guard ... ok\ntest edit_validate::same_content_inode_aba_after_read_and_finalize_is_rejected ... ok\ntest edit_validate::symlink_special_and_hardlink_sources_fail_as_the_documented_unsafe_outcome ... ok\ntest edit_validate::external_edits_before_and_after_each_authorized_read_are_never_silent ... ok\ntest edit_validate::eight_edge_classes_have_safe_typed_outcomes ... ok\n\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 437 filtered out; finished in 0.37s\n\n",
+        "output_digest": "dedb745ec115fe10f6f6251f4c18ea51e1af24309470bc49ed6881a3f4f2754c",
+        "proof_kind": null,
+        "test_count": 12
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "path_escape"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 16 tests\ntest path_escape::raw_component_opens_are_isolated_and_enforce_required_flags ... ok\ntest path_escape::case_sensitive_policy_fails_closed_without_a_safe_probe ... ok\ntest path_escape::capabilities_are_typed_descriptor_authorizations_without_publication ... ok\ntest path_escape::authorized_reads_precharge_explicit_byte_memory_and_deadline_bounds ... ok\ntest path_escape::destination_parent_swap_never_turns_authorization_into_publication ... ok\ntest path_escape::deadline_is_cooperative_and_checked_before_filesystem_work ... ok\ntest path_escape::lexical_escapes_private_paths_and_alias_components_are_denied ... ok\ntest path_escape::hardlinked_file_at_current_revision_is_rejected_as_hardlink ... ok\ntest path_escape::authorizer_creation_reconciles_mutation_after_guard_acquisition ... ok\ntest path_escape::authorizer_and_read_capability_reject_after_revision_changes ... ok\ntest path_escape::hardlinks_and_special_files_are_rejected_after_guard_acquisition ... ok\ntest path_escape::symlinks_at_every_position_are_denied_without_outside_access ... ok\ntest path_escape::stale_guard_epoch_root_and_cross_root_substitution_are_denied ... ok\ntest path_escape::synchronized_component_and_final_swaps_use_the_original_handle_or_reject ... ok\ntest path_escape::transient_component_and_leaf_aba_during_resolution_is_rejected ... ok\ntest path_escape::directory_and_file_work_are_bounded_by_edit_limits ... ok\n\ntest result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 1.54s\n\n",
+        "output_digest": "42c3f3e5054256d3c25a073507998a666309dc1a7d6bbdaa548407c3d0f57827",
+        "proof_kind": null,
+        "test_count": 16
+      }
+    ]
+  },
+  "artifact_digest": "0d68230d9be9e7b209d51a2b4768960de0fa55ac94c2bef5457eb6a25bc19351",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G04-003",
+    "evidence_job": "dashboard-g04",
+    "expected_result": "Duplicate anchors, stale revisions, external edits, Unicode, CRLF, missing newline, binary and symlink cases are safe.",
+    "requirement_areas": [
+      "KIT-EDIT",
+      "KIT-REPO",
+      "KIT-SEC"
+    ],
+    "source_line": 451,
+    "source_ref": "IMPLEMENTATION_PLAN.md:451"
+  },
+  "disposition": "passed",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G04",
+  "milestone": "M004",
+  "requirements": [
+    {
+      "evidence_id": "EV-M004-W05-C-001",
+      "evidence_job": "evidence-report",
+      "record_id": "KIT-EDIT-001"
+    }
+  ],
+  "run_id": "local-20260728-m004",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m004-worktree-source-conformance"
+}

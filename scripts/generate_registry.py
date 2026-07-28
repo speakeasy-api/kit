@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Generate deterministic requirement registry projections from area shards."""
+
+import argparse
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+from req_lint_lib.governance import identity_digest
+from yaml_utils import YamlLoadError, load_yaml_file
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SHARD_DIR = ROOT / "requirements" / "registry.d"
+AREAS = (
+    "KIT-GOV",
+    "KIT-OUTCOME",
+    "KIT-ARCH",
+    "KIT-AGENTKIT",
+    "KIT-DOMAIN",
+    "KIT-STORE",
+    "KIT-PROMPT",
+    "KIT-CONTEXT",
+    "KIT-REPO",
+    "KIT-TOOL",
+    "KIT-CAP",
+    "KIT-COMPOSE",
+    "KIT-ENCODE",
+    "KIT-EDIT",
+    "KIT-VERIFY",
+    "KIT-ROUTE",
+    "KIT-RUNTIME",
+    "KIT-COMPACT",
+    "KIT-ACP",
+    "KIT-A2A",
+    "KIT-MCP",
+    "KIT-SEC",
+    "KIT-EXEC",
+    "KIT-API",
+    "KIT-OBS",
+    "KIT-EVAL",
+    "KIT-CONFIG",
+    "KIT-VERSION",
+    "KIT-RELEASE",
+)
+SPECIAL_SHARDS = {
+    "_promises": "promise",
+    "_decisions": "decision",
+    "_risks": "risk",
+}
+SOURCE_RE = re.compile(r"^RFC\.md:(\d+)(?:-(\d+))?$")
+EVIDENCE_FIELDS = (
+    "evidence_type",
+    "evidence_id",
+    "evidence_job",
+    "expected_result",
+    "artifact_digest",
+    "environment_digest",
+    "versions",
+    "latest_result",
+    "revalidation_rule",
+)
+
+
+class Dumper(yaml.SafeDumper):
+    def ignore_aliases(self, data):
+        return True
+
+
+def load_yaml(path):
+    try:
+        return load_yaml_file(path)
+    except (OSError, YamlLoadError) as error:
+        raise ValueError(f"{path.relative_to(ROOT)}: {error}") from error
+
+
+def area_na():
+    policy = load_yaml(ROOT / "requirements" / "policy" / "area-na.yaml")
+    return {entry["area"] for entry in policy["areas"]}
+
+
+def source_fingerprint(anchor, rfc_lines):
+    match = SOURCE_RE.fullmatch(anchor) if isinstance(anchor, str) else None
+    if not match:
+        raise ValueError(f"invalid source_anchor {anchor!r}")
+    start = int(match.group(1))
+    end = int(match.group(2) or start)
+    if start < 1 or end < start or end > len(rfc_lines):
+        raise ValueError(f"source_anchor outside RFC.md: {anchor}")
+    text = "".join(rfc_lines[start - 1 : end]).strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def load_records():
+    expected = {f"{area}.yaml" for area in AREAS} | {
+        f"{name}.yaml" for name in SPECIAL_SHARDS
+    }
+    actual = {path.name for path in SHARD_DIR.glob("*.yaml")}
+    if actual != expected:
+        raise ValueError(
+            "shard set mismatch: missing=%s extra=%s"
+            % (sorted(expected - actual), sorted(actual - expected))
+        )
+
+    rfc_lines = (ROOT / "RFC.md").read_text(encoding="utf-8").splitlines(True)
+    allowed_empty = area_na()
+    records = []
+    seen = set()
+    for path in sorted(SHARD_DIR.glob("*.yaml")):
+        shard = path.stem
+        loaded = load_yaml(path)
+        if not isinstance(loaded, list):
+            raise ValueError(f"{path.relative_to(ROOT)}: top level must be a list")
+        if not loaded and shard in AREAS and shard not in allowed_empty:
+            raise ValueError(f"{path.relative_to(ROOT)}: empty area is not registered")
+
+        for record in loaded:
+            if not isinstance(record, dict):
+                raise ValueError(f"{path.relative_to(ROOT)}: record must be a mapping")
+            record_id = record.get("id")
+            area = record.get("area")
+            if not isinstance(record_id, str) or record_id in seen:
+                raise ValueError(f"duplicate or invalid id {record_id!r}")
+            if area not in AREAS or record_id.rsplit("-", 1)[0] != area:
+                raise ValueError(f"{record_id}: id and area do not match")
+            if shard in AREAS and area != shard:
+                raise ValueError(f"{record_id}: area does not match shard {shard}")
+            if shard in SPECIAL_SHARDS and record.get("record_class") != SPECIAL_SHARDS[shard]:
+                raise ValueError(f"{record_id}: record_class does not match shard {shard}")
+            if not record.get("source_quote"):
+                raise ValueError(f"{record_id}: source_quote is empty")
+            tombstoned = record.get("status") == "tombstoned"
+            if not tombstoned:
+                fingerprint = source_fingerprint(record.get("source_anchor"), rfc_lines)
+                if record.get("source_fingerprint") != fingerprint:
+                    raise ValueError(f"{record_id}: source_fingerprint does not match RFC.md")
+                match = SOURCE_RE.fullmatch(record["source_anchor"])
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if record["source_quote"] not in "".join(rfc_lines[start - 1 : end]).strip():
+                    raise ValueError(f"{record_id}: source_quote is not verbatim within source_anchor")
+            seen.add(record_id)
+            records.append(record)
+
+    return sorted(records, key=lambda record: record["id"])
+
+
+def dump(data):
+    return "# Generated by scripts/generate_registry.py; do not edit.\n" + yaml.dump(
+        data,
+        Dumper=Dumper,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+        width=1000,
+    )
+
+
+def id_ledger(records):
+    path = ROOT / "requirements" / "id-ledger.yaml"
+    inventory_path = ROOT / "requirements" / "source-inventory.yaml"
+    inventory = load_yaml(inventory_path)
+    current = {record["id"]: record for record in records}
+    if path.is_file():
+        ledger = load_yaml(path)
+        if not isinstance(ledger, dict) or not isinstance(ledger.get("records"), list):
+            raise ValueError("requirements/id-ledger.yaml: expected a records list")
+        entries = ledger["records"]
+        seen = set()
+        for entry in entries:
+            record_id = entry.get("id") if isinstance(entry, dict) else None
+            if not record_id or record_id in seen:
+                raise ValueError("requirements/id-ledger.yaml: duplicate or invalid id")
+            seen.add(record_id)
+            if record_id not in current:
+                raise ValueError(f"{record_id}: historical id disappeared; retain a tombstoned record")
+            if entry.get("identity_digest") != identity_digest(current[record_id]):
+                raise ValueError(f"{record_id}: historical identity changed")
+        entries.extend(
+            {
+                "id": record_id,
+                "identity_digest": identity_digest(current[record_id]),
+                "introduced_revision": current[record_id]["introduced_revision"],
+            }
+            for record_id in sorted(set(current) - seen)
+        )
+        ledger["bootstrap"] = {
+            "mode": "initial_inventory",
+            "source": inventory["source"],
+            "source_revision": inventory["source_revision"],
+            "record_count": len(records),
+            "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+        }
+        return ledger
+    return {
+        "schema_version": 1,
+        "bootstrap": {
+            "mode": "initial_inventory",
+            "source": inventory["source"],
+            "source_revision": inventory["source_revision"],
+            "record_count": len(records),
+            "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+        },
+        "records": [
+            {
+                "id": record["id"],
+                "identity_digest": identity_digest(record),
+                "introduced_revision": record["introduced_revision"],
+            }
+            for record in records
+        ],
+    }
+
+
+def report(records, inventory, ledger, rfc_lines):
+    def counts(field):
+        values = {}
+        for record in records:
+            value = record[field]
+            values[value] = values.get(value, 0) + 1
+        return values
+
+    classes = counts("record_class")
+    statuses = counts("status")
+    applicability = counts("applicability")
+    evidence = counts("latest_result")
+    sections = {
+        int(match.group(1))
+        for line in rfc_lines
+        if (match := re.match(r"^## (\d+)\.", line)) is not None
+    }
+    promises = [record for record in records if record["record_class"] == "promise"]
+    resolved_promises = sum(
+        record["status"] in {"implemented", "resolved_by_amendment"}
+        for record in promises
+    )
+    lines = [
+        "# Requirement Governance Report",
+        "",
+        "Generated deterministically from `requirements/registry.d/` and `requirements/source-inventory.yaml`.",
+        "",
+        "## Coverage",
+        "",
+        f"- Registry records: {len(records)}",
+        f"- Inventory mappings: {sum(atom.get('record_id') is not None for atom in inventory['atoms'])}",
+        f"- RFC sections: {len(sections)}/{max(sections, default=0)}",
+        f"- Historical IDs: {len(ledger['records'])}",
+        "- Unmapped registry records: 0",
+        f"- Architectural promises resolved: {resolved_promises}/{len(promises)}",
+        "",
+        "## Record Classes",
+        "",
+    ]
+    lines.extend(f"- {key}: {value}" for key, value in sorted(classes.items()))
+    lines.extend(["", "## Lifecycle", ""])
+    lines.extend(f"- {key}: {value}" for key, value in sorted(statuses.items()))
+    lines.extend(["", "## Applicability", ""])
+    lines.extend(f"- {key}: {value}" for key, value in sorted(applicability.items()))
+    lines.extend(["", "## Evidence", ""])
+    lines.extend(f"- {key}: {value}" for key, value in sorted(evidence.items()))
+    release_ready = (
+        evidence == {"pass": len(records)}
+        and applicability.get("pending_voi", 0) == 0
+        and statuses.get("proposed", 0) == 0
+        and statuses.get("active", 0) == 0
+    )
+    lines.extend(
+        [
+            "",
+            "## Release Gate",
+            "",
+            f"- Registry state: {'READY' if release_ready else 'NOT READY'}",
+            "- External trusted attestations are validated only by `req_lint.py --release-candidate`.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def projections(records):
+    lock = load_yaml(ROOT / "requirements" / "merge-lock.yaml")
+    inventory = load_yaml(ROOT / "requirements" / "source-inventory.yaml")
+    rfc_lines = (ROOT / "RFC.md").read_text(encoding="utf-8").splitlines()
+    ledger = id_ledger(records)
+    evidence = {
+        "schema_version": 1,
+        "merge_sequence": lock["sequence"],
+        "records": [
+            {"requirement_id": record["id"]}
+            | {field: record[field] for field in EVIDENCE_FIELDS}
+            for record in records
+        ],
+    }
+    tombstones = {
+        "schema_version": 1,
+        "records": [
+            {
+                "id": record["id"],
+                "supersedes": record["supersedes"],
+                "tombstone_reason": record["tombstone_reason"],
+                "decision_record": record["decision_record"],
+                "deviation_record": record["deviation_record"],
+            }
+            for record in records
+            if record["status"] == "tombstoned"
+        ],
+    }
+    return {
+        ROOT / "requirements" / "registry.yaml": dump(records),
+        ROOT / "requirements" / "evidence.yaml": dump(evidence),
+        ROOT / "requirements" / "tombstones.yaml": dump(tombstones),
+        ROOT / "requirements" / "id-ledger.yaml": dump(ledger),
+        ROOT / "requirements" / "report.md": report(records, inventory, ledger, rfc_lines),
+    }
+
+
+def main():
+    global ROOT, SHARD_DIR
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="fail if generated files differ")
+    parser.add_argument("--root", type=Path, help="candidate source root (release validator use)")
+    args = parser.parse_args()
+    if args.root:
+        ROOT = args.root.resolve()
+        SHARD_DIR = ROOT / "requirements" / "registry.d"
+    try:
+        records = load_records()
+        outputs = projections(records)
+        stale = []
+        for path, content in outputs.items():
+            if args.check:
+                if not path.is_file() or path.read_text(encoding="utf-8") != content:
+                    stale.append(str(path.relative_to(ROOT)))
+            else:
+                path.write_text(content, encoding="utf-8")
+        if stale:
+            print("stale generated files: " + ", ".join(stale), file=sys.stderr)
+            return 1
+        print(f"generated {len(outputs)} projections from {len(records)} records")
+        return 0
+    except (KeyError, OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

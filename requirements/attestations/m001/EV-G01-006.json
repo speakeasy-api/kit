@@ -1,0 +1,87 @@
+{
+  "artifact": {
+    "command": "cargo test --locked --test conformance cap_invoke && cargo test --locked --test adversarial cap_bypass",
+    "evidence_id": "EV-G01-006",
+    "exit_code": 0,
+    "steps": [
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "conformance",
+          "cap_invoke"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/conformance/main.rs (target/debug/deps/conformance-60692e5c88a11222)\n\nrunning 7 tests\ntest cap_invoke::terminal_idempotency_replays_without_dispatch_or_double_charge ... ok\ntest cap_invoke::intent_precedes_dispatch_and_structured_outcome_is_durable ... ok\ntest cap_invoke::stale_fence_never_completes_a_dispatched_effect_as_success ... ok\ntest cap_invoke::panic_after_intent_fences_non_idempotent_recovery_to_unknown ... ok\ntest cap_invoke::schema_arguments_authority_and_budget_fail_before_dispatch ... ok\ntest cap_invoke::approval_and_cancellation_interrupt_before_dispatch_and_release_budget ... ok\ntest cap_invoke::crash_points_never_invent_success_or_blindly_redispatch ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 442 filtered out; finished in 0.03s\n\n",
+        "output_digest": "69b080d7ae643781f43f9ffc0d2dc0a3f6f210f4b4df692ad64ffe79c698a048",
+        "proof_kind": null,
+        "test_count": 7
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "adversarial",
+          "cap_bypass"
+        ],
+        "environment": {},
+        "exit_code": 0,
+        "output": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running tests/adversarial/main.rs (target/debug/deps/adversarial-635c21cef7d85700)\n\nrunning 2 tests\ntest cap_bypass::dispatcher_and_authorized_token_construction_remain_private ... ok\ntest cap_bypass::at_least_twenty_bypass_routes_cannot_reach_dispatch ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.09s\n\n",
+        "output_digest": "958e3519778670152a319669bda1f46ce18305dc116b63150c967805ec27ae76",
+        "proof_kind": null,
+        "test_count": 2
+      }
+    ]
+  },
+  "artifact_digest": "44773245759d3cd494e0c1b164bd215b4e757daf64dcb86c83ab89d7347fa2a7",
+  "base_commit_sha": "0621d6f5a476b9714d606a1ff305592aae301103",
+  "candidate_identity": "worktree:ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "dashboard_row": {
+    "current_status": "passed",
+    "evidence_id": "EV-G01-006",
+    "evidence_job": "dashboard-g01",
+    "expected_result": "Native capability-kernel calls cannot bypass grant, intent/outcome, budget, approval, cancellation or accounting.",
+    "requirement_areas": [
+      "KIT-CAP",
+      "KIT-SEC"
+    ],
+    "source_line": 327,
+    "source_ref": "IMPLEMENTATION_PLAN.md:327"
+  },
+  "disposition": "pass",
+  "environment": "rustc 1.94.0 (4a4ef493e 2026-03-02)\ncargo 1.94.0 (85eff7c80 2026-01-15)\nPython 3.13.11\nDarwin 25.5.0 arm64\nCargo.lock sha256=7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2\n",
+  "environment_digest": "6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2",
+  "external_blocker": null,
+  "gate": "G01",
+  "milestone": "M001",
+  "requirements": [
+    {
+      "evidence_id": "EV-1.04-C-901",
+      "evidence_job": "integration",
+      "record_id": "KIT-DOMAIN-857"
+    },
+    {
+      "evidence_id": "EV-2.15-C-101",
+      "evidence_job": "fault",
+      "record_id": "KIT-STORE-980"
+    }
+  ],
+  "run_id": "local-20260728-m001",
+  "schema_version": 2,
+  "source_tree_digest": "ba08b835fcbb9348cde255d803db050fb56986e61a9366327930a0898be34306",
+  "trust_scope": "local_milestone_only",
+  "trusted_for_release": false,
+  "versions": {
+    "cargo": "1.94.0",
+    "cargo_lock_sha256": "7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2",
+    "os": "Darwin 25.5.0 arm64",
+    "python": "3.13.11",
+    "rustc": "1.94.0"
+  },
+  "workflow_ref": "local://m001-worktree-attestation"
+}

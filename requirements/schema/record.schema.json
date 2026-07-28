@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kit.invalid/requirements/schema/record.schema.json",
+  "title": "Kit RFC Requirement Registry Record",
+  "description": "Machine-readable registry record for one atomic RFC 0001 normative statement, architectural promise, §36 decision, or §33 risk mitigation. See IMPLEMENTATION_PLAN.md:83-134 and requirements/schema/README.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "recordId": {
+      "type": "string",
+      "pattern": "^KIT-(GOV|OUTCOME|ARCH|AGENTKIT|DOMAIN|STORE|PROMPT|CONTEXT|REPO|TOOL|CAP|COMPOSE|ENCODE|EDIT|VERIFY|ROUTE|RUNTIME|COMPACT|ACP|A2A|MCP|SEC|EXEC|API|OBS|EVAL|CONFIG|VERSION|RELEASE)-[0-9]{3,}$"
+    },
+    "nullableRecordId": {
+      "oneOf": [
+        { "$ref": "#/$defs/recordId" },
+        { "type": "null" }
+      ]
+    },
+    "milestoneToken": {
+      "type": "string",
+      "pattern": "^(M0(0[1-9]|1[0-2])|PHASE0)$"
+    },
+    "gateToken": {
+      "type": "string",
+      "pattern": "^G(0[0-9]|1[0-2])(-CLUSTERED)?$"
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableSha256Hex": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256Hex" },
+        { "type": "null" }
+      ]
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nullableNonEmptyString": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonEmptyString" },
+        { "type": "null" }
+      ]
+    },
+    "linkArray": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "machineDecidableStatement": {
+      "description": "A single acceptance criterion or expected result. Banned vague words per IMPLEMENTATION_PLAN.md/plan.md §5 (robust, complete, appropriate, proper, sufficient, good, clean, reasonable, as needed) are rejected; the statement must instead name an exact command/check plus expected exit status, count, or digest.",
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "\\b([Rr]obust|[Cc]omplete|[Aa]ppropriate|[Pp]roper|[Ss]ufficient|[Gg]ood|[Cc]lean|[Rr]easonable|[Aa]s [Nn]eeded)\\b"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "record_class",
+    "modality",
+    "title",
+    "atomic_text",
+    "source_section",
+    "source_anchor",
+    "source_quote",
+    "source_fingerprint",
+    "introduced_revision",
+    "status",
+    "supersedes",
+    "tombstone_reason",
+    "area",
+    "applicability",
+    "interpretation",
+    "acceptance_criteria",
+    "primary_milestone",
+    "contributing_milestones",
+    "dependencies",
+    "owner",
+    "criticality",
+    "platforms",
+    "deployment_tiers",
+    "release_gates",
+    "implementation_links",
+    "public_contract_links",
+    "telemetry_links",
+    "evidence_type",
+    "evidence_id",
+    "evidence_job",
+    "expected_result",
+    "artifact_digest",
+    "environment_digest",
+    "versions",
+    "latest_result",
+    "revalidation_rule",
+    "decision_record",
+    "deviation_record"
+  ],
+  "properties": {
+    "id": {
+      "description": "Stable KIT-<AREA>-NNN identifier (IMPLEMENTATION_PLAN.md completion contract #1). Never reused; the AREA token must equal `area` (enforced by scripts/req_lint.py, not decidable in-schema across two fields).",
+      "$ref": "#/$defs/recordId"
+    },
+    "record_class": {
+      "description": "What kind of registry row this is: a normative RFC statement, a non-normative testable architectural promise (Phase 0 §4.2), an RFC §36 decision registered as an architecture assertion, or an RFC §33 risk registered as an evidence-bearing control.",
+      "type": "string",
+      "enum": ["requirement", "promise", "decision", "risk"]
+    },
+    "modality": {
+      "description": "RFC 2119 keyword governing this record, or `declarative` for promises/decisions/risks that carry no normative keyword (Phase 0 §4.2: \"testable declarative promises even when they lack normative keywords\").",
+      "type": "string",
+      "enum": ["MUST", "MUST NOT", "SHOULD", "SHOULD NOT", "MAY", "declarative"]
+    },
+    "title": {
+      "description": "Short human-readable label for the atomic record.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "atomic_text": {
+      "description": "The single atomic normative statement or declarative promise, split from compound prose or inherited lists per Phase 0 §4.1.",
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "source_section": {
+      "description": "RFC.md section reference in §<n>[.<n>] form, optionally followed by the section title, e.g. `§36 Decisions`.",
+      "type": "string",
+      "pattern": "^§[0-9]{1,3}(\\.[0-9]+)*( .+)?$"
+    },
+    "source_anchor": {
+      "description": "Exact RFC.md line or line range the record was extracted from.",
+      "type": "string",
+      "pattern": "^RFC\\.md:[1-9][0-9]*(-[1-9][0-9]*)?$"
+    },
+    "source_quote": {
+      "description": "Verbatim quoted source text substantiating atomic_text.",
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "source_fingerprint": {
+      "description": "SHA-256 hex digest of the stripped RFC text covered by source_anchor (the complete joined span for a range), used by CI to detect unregistered drift.",
+      "$ref": "#/$defs/sha256Hex"
+    },
+    "introduced_revision": {
+      "description": "Resolvable RFC.md git commit (short or full SHA-1) in which this requirement's cited RFC text was first introduced; this is RFC introduction history, not registry-row creation time.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "status": {
+      "description": "Lifecycle state. `proposed`/`active` are live; `implemented` and `resolved_by_amendment` are the two terminal states counted toward architectural-promise resolution (IMPLEMENTATION_PLAN.md T2); `not_selected` closes an optional mechanism; `tombstoned` retires a record (must carry tombstone_reason plus a replacement or decision record).",
+      "type": "string",
+      "enum": ["proposed", "active", "implemented", "mitigated", "not_selected", "resolved_by_amendment", "tombstoned"]
+    },
+    "supersedes": {
+      "description": "id of the record this one replaces, when status is `tombstoned` and a replacement exists. Null otherwise.",
+      "$ref": "#/$defs/nullableRecordId"
+    },
+    "tombstone_reason": {
+      "description": "Required non-null reason when status is `tombstoned`; must be null otherwise.",
+      "$ref": "#/$defs/nullableNonEmptyString"
+    },
+    "area": {
+      "description": "One of the 29 normalized KIT-<AREA> prefixes (trailing hyphen stripped) of IMPLEMENTATION_PLAN.md:89-117.",
+      "type": "string",
+      "enum": [
+        "KIT-GOV",
+        "KIT-OUTCOME",
+        "KIT-ARCH",
+        "KIT-AGENTKIT",
+        "KIT-DOMAIN",
+        "KIT-STORE",
+        "KIT-PROMPT",
+        "KIT-CONTEXT",
+        "KIT-REPO",
+        "KIT-TOOL",
+        "KIT-CAP",
+        "KIT-COMPOSE",
+        "KIT-ENCODE",
+        "KIT-EDIT",
+        "KIT-VERIFY",
+        "KIT-ROUTE",
+        "KIT-RUNTIME",
+        "KIT-COMPACT",
+        "KIT-ACP",
+        "KIT-A2A",
+        "KIT-MCP",
+        "KIT-SEC",
+        "KIT-EXEC",
+        "KIT-API",
+        "KIT-OBS",
+        "KIT-EVAL",
+        "KIT-CONFIG",
+        "KIT-VERSION",
+        "KIT-RELEASE"
+      ]
+    },
+    "applicability": {
+      "description": "Whether this record is unconditionally binding, an optional-mechanism disposition, or inapplicable to the current deployment scope. `mandatory` covers ordinary MUST/SHOULD requirements; `selected`/`not_selected`/`pending_voi` cover RFC §13/§16/§17/§29 optional mechanisms (Phase 0 completion contract #6); `not_applicable` requires a cited source per §9.3 rule 1.",
+      "type": "string",
+      "enum": ["mandatory", "selected", "not_selected", "pending_voi", "not_applicable"]
+    },
+    "interpretation": {
+      "description": "Operational reading of atomic_text: what must actually hold for this record to be satisfied.",
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "acceptance_criteria": {
+      "description": "Numbered, machine-decidable criteria (exact command + expected exit status/count/digest). Banned vague words are rejected per-item.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/machineDecidableStatement" },
+      "minItems": 1
+    },
+    "primary_milestone": {
+      "description": "The single milestone (M001-M012) or PHASE0 that owns this record's closure.",
+      "$ref": "#/$defs/milestoneToken"
+    },
+    "contributing_milestones": {
+      "description": "Additional milestones that extend or depend on this record, beyond primary_milestone.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/milestoneToken" },
+      "uniqueItems": true
+    },
+    "dependencies": {
+      "description": "ids of other registry records this record depends on.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/recordId" },
+      "uniqueItems": true
+    },
+    "owner": {
+      "description": "Accountable role/team for this record (e.g. \"Governance owner\", \"Program owner\", \"Build owner\", \"Infra owner\").",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "criticality": {
+      "description": "Release-blocking priority of this record.",
+      "type": "string",
+      "enum": ["blocking", "high", "medium", "low"]
+    },
+    "platforms": {
+      "description": "Platform cells this record applies to, per §9.2 of the wave plan.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["macos-arm64", "linux-x86_64", "linux-aarch64", "windows", "all"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "deployment_tiers": {
+      "description": "Deployment modes this record applies to (Objective §1): local, restricted, clustered, hostile multi-tenant.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["local", "restricted", "clustered", "hostile"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "release_gates": {
+      "description": "Milestone gate(s) (G00-G12, optionally -CLUSTERED for the Wave 15 re-execution) this record's evidence feeds.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/gateToken" },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "implementation_links": {
+      "description": "Paths to the implementation(s) satisfying this record (e.g. src/... files). May be empty before implementation lands.",
+      "$ref": "#/$defs/linkArray"
+    },
+    "public_contract_links": {
+      "description": "Paths/identifiers of the public contract surface this record binds (OpenAPI paths, CLI commands, protocol schemas). May be empty before the contract lands.",
+      "$ref": "#/$defs/linkArray"
+    },
+    "telemetry_links": {
+      "description": "Telemetry event/metric/dashboard identifiers sufficient to reproduce the acceptance result. May be empty for records with no telemetry obligation.",
+      "$ref": "#/$defs/linkArray"
+    },
+    "evidence_type": {
+      "description": "Allowed evidence type set (IMPLEMENTATION_PLAN.md:19).",
+      "type": "string",
+      "enum": ["conformance", "evaluation", "operational_assertion", "manual_review"]
+    },
+    "evidence_id": {
+      "description": "Canonical EV-<parent WP>-<C|E|O|M>-<NNN> form (plan.md §5); <parent WP> is either an M0NN-WNN[a-z] work package or, for n/a/gate-evidence units, a <wave>.<n> unit id.",
+      "type": "string",
+      "pattern": "^EV-(M[0-9]{3}-W[0-9]{2}[a-z]?|[0-9]{1,2}\\.(INT-A|INT|[0-9]{2}))-(C|E|O|M)-[0-9]{3,}$"
+    },
+    "evidence_job": {
+      "description": "CI lane name producing evidence for this record; the fixed 12-lane set of unit 1.13.",
+      "type": "string",
+      "enum": [
+        "fmt",
+        "lint",
+        "unit",
+        "integration",
+        "req-lint",
+        "schema-compat",
+        "fault",
+        "adversarial",
+        "reproducible-build",
+        "licenses",
+        "vuln-scan",
+        "evidence-report"
+      ]
+    },
+    "expected_result": {
+      "description": "Exact expected result of evidence_job (exit status, count, or digest). Banned vague words are rejected.",
+      "$ref": "#/$defs/machineDecidableStatement"
+    },
+    "artifact_digest": {
+      "description": "SHA-256 hex digest of the evidence-producing build artifact, recorded by the job. Null until the job has run.",
+      "$ref": "#/$defs/nullableSha256Hex"
+    },
+    "environment_digest": {
+      "description": "SHA-256 hex digest of the evidence-producing execution environment, recorded by the job. Null until the job has run.",
+      "$ref": "#/$defs/nullableSha256Hex"
+    },
+    "versions": {
+      "description": "Pinned tool/dependency versions recorded by the evidence job (e.g. toolchain, agentkit commit). Null until the job has run.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "minProperties": 1
+        },
+        { "type": "null" }
+      ]
+    },
+    "latest_result": {
+      "description": "Outcome of the most recent evidence run. `outcome_unknown` mirrors the program invariant that every effect has a durable outcome or an explicit unknown (IMPLEMENTATION_PLAN.md §3.1); it is never silently treated as a pass.",
+      "type": "string",
+      "enum": ["pending", "pass", "fail", "outcome_unknown"]
+    },
+    "revalidation_rule": {
+      "description": "Condition under which existing evidence goes stale and must be re-run (e.g. \"on any change to source_quote's line range\", \"every release candidate\").",
+      "$ref": "#/$defs/nonEmptyString"
+    },
+    "decision_record": {
+      "description": "Path to the docs/decisions/DR-NNNN-<slug>.md record justifying an RFC-modality override, a not_selected disposition, or a tombstone without replacement. Null when no decision record governs this entry.",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^docs/decisions/DR-[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*\\.md$"
+        },
+        { "type": "null" }
+      ]
+    },
+    "deviation_record": {
+      "description": "Free-text pointer to the documented exception evidencing a SHOULD/SHOULD NOT deviation (completion contract #5). Null when this record has no deviation.",
+      "$ref": "#/$defs/nullableNonEmptyString"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "tombstoned" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "tombstone_reason": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "anyOf": [
+          { "properties": { "supersedes": { "$ref": "#/$defs/recordId" } }, "required": ["supersedes"] },
+          { "properties": { "decision_record": { "type": "string" } }, "required": ["decision_record"] }
+        ]
+      },
+      "else": {
+        "properties": {
+          "tombstone_reason": { "type": "null" },
+          "supersedes": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "record_class": { "const": "promise" } },
+        "required": ["record_class"]
+      },
+      "then": {
+        "properties": { "modality": { "const": "declarative" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "record_class": { "enum": ["decision", "risk"] } },
+        "required": ["record_class"]
+      },
+      "then": {
+        "properties": { "modality": { "const": "declarative" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "record_class": { "const": "requirement" } },
+        "required": ["record_class"]
+      },
+      "then": {
+        "properties": {
+          "modality": { "enum": ["MUST", "MUST NOT", "SHOULD", "SHOULD NOT", "MAY"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "latest_result": { "enum": ["pass", "fail"] } },
+        "required": ["latest_result"]
+      },
+      "then": {
+        "properties": {
+          "artifact_digest": { "$ref": "#/$defs/sha256Hex" },
+          "environment_digest": { "$ref": "#/$defs/sha256Hex" },
+          "versions": { "type": "object", "minProperties": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "status": { "const": "mitigated" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": { "record_class": { "const": "risk" } }
+      }
+    }
+  ]
+}
