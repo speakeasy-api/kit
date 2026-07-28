@@ -20,6 +20,7 @@ pub fn command() -> Command {
                 "daemonize",
                 "Start the daemon in the background",
             )),
+            leaf("ui", "Open the local Kit conversation UI"),
             project(),
             thread(),
             deletion(),

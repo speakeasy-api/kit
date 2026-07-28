@@ -660,12 +660,16 @@ fn guard_driver_claim(
         [],
         |row| row.get(0),
     )?;
+    // A quiescent claim belongs to a driver that parked on a durable wait and
+    // stopped heartbeating, so its lease is expected to lapse; callers that
+    // allow quiescent claims (waiting resolutions) are still fenced by the
+    // fence and lease_version equality checks.
     let owns: bool = transaction.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM attempt_driver_claims
              WHERE run_id = ?1 AND attempt_id = ?2 AND principal_id = ?3
                AND fence = ?4 AND lease_version = ?5
-               AND expires_at_unix_micros > ?6
+               AND (?7 OR expires_at_unix_micros > ?6)
                AND (?7 OR quiescent = 0)
          )",
         params![

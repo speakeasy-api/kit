@@ -85,6 +85,32 @@ const IDENTITY_FILE: &str = "daemon-identity.json";
 const DATABASE_FILE: &str = "state.sqlite3";
 pub const TELEMETRY_FILE: &str = "telemetry.otel.enc";
 
+fn browser_request_origin<'a>(origin: &'a str, fallback: &'a str, fetch_site: &str) -> &'a str {
+    if origin.is_empty() && fetch_site == "same-origin" {
+        fallback
+    } else {
+        origin
+    }
+}
+
+#[cfg(test)]
+mod browser_origin_tests {
+    use super::browser_request_origin;
+
+    #[test]
+    fn browser_origin_fallback_requires_same_origin_fetch_metadata() {
+        assert_eq!(
+            browser_request_origin("http://kit", "ignored", "cross-site"),
+            "http://kit"
+        );
+        assert_eq!(
+            browser_request_origin("", "http://kit", "same-origin"),
+            "http://kit"
+        );
+        assert_eq!(browser_request_origin("", "forged", "cross-site"), "");
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutorRuntimeServices {
     registry: Arc<dyn ProcessRegistry>,
@@ -1131,11 +1157,16 @@ impl Daemon {
                 let Ok(timestamp) = header("x-kit-timestamp").parse::<u64>() else {
                     return Err(crate::api::auth::contract::AuthDenial::Unauthenticated);
                 };
+                let request_origin = browser_request_origin(
+                    header("origin"),
+                    header("x-kit-origin"),
+                    header("sec-fetch-site"),
+                );
                 transport_authenticator.authenticate(&LoopbackObservation::from_transport(
                     peer_ip,
                     header("authorization"),
                     header("host"),
-                    header("origin"),
+                    request_origin,
                     header("x-kit-nonce").as_bytes(),
                     header("x-kit-signature").as_bytes(),
                     LoopbackRequestTime::new(timestamp, now.as_secs()),
@@ -1154,7 +1185,8 @@ impl Daemon {
             stream_cancellation.clone(),
             Some(exec_service),
             Some(repo_service),
-        );
+        )
+        .merge(crate::web::routes());
         let discovery = Discovery {
             endpoint: origin,
             credential: std::str::from_utf8(credential.expose())

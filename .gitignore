@@ -11,3 +11,4 @@ __pycache__/
 /.ruff_cache/
 /.evidence-tmp/
 /.tools/
+/.playwright-mcp/

@@ -40,6 +40,7 @@ pub struct Cli {
 #[derive(Clone, Debug)]
 pub enum Invocation {
     Daemon(DaemonCommand),
+    Ui,
     Provider(crate::cli::provider::ProviderCommand),
     Client(Box<ClientRequest>),
     Exec(Box<crate::cli::exec::ExecRequest>),
@@ -63,6 +64,7 @@ pub struct OperationDescriptor {
 
 pub const CLI_OPERATIONS: &[OperationDescriptor] = &[
     operation("daemon", None, None, None, false, false),
+    operation("ui", None, None, None, false, false),
     operation("provider path", None, None, None, false, false),
     operation("provider list", None, None, None, false, false),
     operation("provider add", None, None, None, false, false),
@@ -515,6 +517,7 @@ fn invocation(
         "daemon" => Ok(Invocation::Daemon(DaemonCommand {
             daemonize: matches.get_flag("daemonize"),
         })),
+        "ui" => Ok(Invocation::Ui),
         "provider" => match subcommand(matches) {
             ("path", _) => Ok(Invocation::Provider(
                 crate::cli::provider::ProviderCommand::Path,

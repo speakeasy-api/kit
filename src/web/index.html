@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Kit Workbench</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/ui/app.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+  <section class="locked" id="locked" hidden>
+    <div class="locked-card">
+      <span class="brand-mark">K</span>
+      <h1>Kit Workbench</h1>
+      <p>Open this page with <code>kit ui</code>. The launcher supplies a short-lived local credential that never appears in server logs.</p>
+    </div>
+  </section>
+
+  <div class="shell" id="app" hidden>
+    <aside class="sidebar">
+      <header class="brand">
+        <span class="brand-mark">K</span>
+        <span class="brand-name">Kit</span>
+        <span class="conn" id="stream-state"><i></i><b>Connecting</b></span>
+      </header>
+
+      <button class="new-thread" id="new-thread" type="button">New thread</button>
+      <nav class="thread-list" id="thread-list" aria-label="Threads"></nav>
+
+      <footer class="sidebar-foot">
+        <span class="foot-row"><i class="status-dot" id="status-dot"></i><span id="repository-state">Connecting</span></span>
+        <code id="project-id" title="Project id">&hellip;</code>
+      </footer>
+    </aside>
+
+    <main class="conversation">
+      <header class="topbar">
+        <h1 id="thread-title">Kit</h1>
+        <div class="topbar-stats">
+          <span class="stat" title="Cost of runs in this thread"><span>Cost</span><b id="total-cost">$0.0000</b></span>
+          <span class="stat" title="Tokens billed in this thread"><span>Tokens</span><b id="total-tokens">0</b></span>
+        </div>
+      </header>
+
+      <div class="notice" id="notice" role="status" hidden></div>
+      <section class="messages" id="messages" aria-live="polite" aria-label="Conversation"></section>
+
+      <form class="composer" id="composer">
+        <textarea id="prompt" rows="1" maxlength="8192" placeholder="Describe a task for this repository&hellip;" required aria-label="Message Kit"></textarea>
+        <div class="composer-foot">
+          <span class="hint"><kbd>Enter</kbd> to send &middot; <kbd>Shift+Enter</kbd> for a new line</span>
+          <button type="submit" id="send">Send</button>
+        </div>
+      </form>
+    </main>
+  </div>
+</body>
+</html>

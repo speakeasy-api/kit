@@ -36,6 +36,7 @@ fn main() -> ExitCode {
                 Invocation::Daemon(command) => {
                     daemon(state_root, command.daemonize, cli.timeout, cli.format)
                 }
+                Invocation::Ui => ui(state_root, cli.auto_start, cli.timeout, cli.format),
                 Invocation::Provider(command) => kit::cli::provider::execute(command, cli.format)
                     .unwrap_or_else(|error| render_error(&error, cli.format)),
                 Invocation::Client(request) => dispatch(
@@ -303,6 +304,72 @@ fn daemon(
             stderr: String::new(),
         },
         Err(error) => render_error(&ClientError::internal(error.to_string()), format),
+    }
+}
+
+fn ui(
+    state_root: PathBuf,
+    auto_start: bool,
+    timeout: std::time::Duration,
+    format: OutputFormat,
+) -> Output {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => return render_error(&ClientError::internal(error.to_string()), format),
+    };
+    let connection = match connect_daemon(
+        &state_root,
+        &AutoStart {
+            enabled: auto_start,
+            executable,
+            timeout,
+        },
+        |discovery| HttpClient::connect(discovery, timeout),
+    ) {
+        Ok(connection) => connection,
+        Err(error) => return render_error(&error.into(), format),
+    };
+    let public_url = format!("{}/ui", connection.discovery.endpoint.trim_end_matches('/'));
+    let launch_url = format!("{public_url}#{}", connection.discovery.credential);
+    if let Err(error) = open_browser(&launch_url) {
+        return render_error(
+            &ClientError::unavailable(format!("could not open the browser: {error}")),
+            format,
+        );
+    }
+    if format == OutputFormat::Human {
+        Output {
+            exit_code: 0,
+            stdout: format!("Opened Kit UI at {public_url}\n"),
+            stderr: String::new(),
+        }
+    } else {
+        Output {
+            exit_code: 0,
+            stdout: format!(
+                "{}\n",
+                serde_json::json!({"opened": true, "url": public_url})
+            ),
+            stderr: String::new(),
+        }
+    }
+}
+
+fn open_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(url).status()?;
+    #[cfg(windows)]
+    let status = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "browser opener exited with {status}"
+        )))
     }
 }
 

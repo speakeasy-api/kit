@@ -802,6 +802,7 @@ fn typed_parse_preserves_exact_values_and_defaults() {
         parse(["daemon"]).unwrap().invocation,
         Invocation::Daemon(_)
     ));
+    assert!(matches!(parse(["ui"]).unwrap().invocation, Invocation::Ui));
 
     let cli = parse([
         "renamed-binary",
@@ -922,6 +923,7 @@ fn typed_parse_preserves_exact_values_and_defaults() {
 fn operation(invocation: &Invocation) -> &str {
     match invocation {
         Invocation::Daemon(_) => "daemon",
+        Invocation::Ui => "ui",
         Invocation::Provider(_) => "provider.local",
         Invocation::Client(request) => request.operation(),
         Invocation::Exec(request) => request.operation,
