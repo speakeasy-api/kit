@@ -431,3 +431,32 @@ pub fn validated_edit_source_identities(
 ) -> Vec<crate::workspace::path_auth::FileIdentity> {
     transaction.capability_source_identities()
 }
+
+#[cfg(debug_assertions)]
+pub fn shadow_adapter_registry_fixture(
+    request: &crate::verify::lsp::shadow::ShadowAdapterRequest,
+    shadow_safe: bool,
+) -> Result<
+    crate::verify::lsp::shadow::ShadowAdapterRegistry,
+    crate::verify::lsp::shadow::ShadowRegistryError,
+> {
+    crate::verify::lsp::shadow::ShadowAdapterRegistry::verified_fixture(request, shadow_safe)
+}
+
+#[cfg(debug_assertions)]
+pub fn receive_current_notification<L, C>(
+    manager: &mut crate::verify::lsp::session::LspSessionManager<L, C>,
+    service_id: crate::domain::ids::DaemonServiceId,
+    deadline_tick: u64,
+) -> Result<
+    crate::verify::lsp::session::NotificationDisposition,
+    crate::verify::lsp::session::SessionError,
+>
+where
+    L: crate::verify::lsp::session::OwnedLspLauncher,
+    C: crate::verify::lsp::session::TickClock,
+{
+    manager
+        .receive_current_notification(service_id, deadline_tick)
+        .map(|received| received.into_disposition())
+}

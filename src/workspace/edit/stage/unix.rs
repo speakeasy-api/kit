@@ -232,13 +232,29 @@ impl<'workspace> StagedEdit<'workspace> {
         path: &RootRelativePath,
         max_bytes: usize,
     ) -> Result<Vec<u8>, StageError> {
+        let deadline = Instant::now()
+            .checked_add(self.limits.max_time)
+            .ok_or(StageError::LimitExceeded(StageLimit::Time))?;
+        self.read_file_before(path, max_bytes, deadline)
+    }
+
+    pub fn read_file_before(
+        &self,
+        path: &RootRelativePath,
+        max_bytes: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StageError> {
+        check_deadline(deadline)?;
         let expected = self
             .final_snapshot
             .entries
             .get(Path::new(path.as_str()))
             .ok_or(StageError::StageChanged)?;
+        check_deadline(deadline)?;
         let file = open_relative_file(&self.allocation.final_view, path, libc::O_RDONLY)?;
+        check_deadline(deadline)?;
         let before = stat_file(&file).map_err(|_| StageError::StageChanged)?;
+        check_deadline(deadline)?;
         if expected.kind != Kind::File
             || before.kind() != libc::S_IFREG as u32
             || before.links != 1
@@ -249,18 +265,17 @@ impl<'workspace> StagedEdit<'workspace> {
         {
             return Err(StageError::StageChanged);
         }
-        let deadline = Instant::now()
-            .checked_add(self.limits.max_time)
-            .ok_or(StageError::LimitExceeded(StageLimit::Time))?;
         let bytes = read_file_checked(
             file,
             before,
             max_bytes.min(self.limits.max_file_bytes),
             deadline,
         )?;
+        check_deadline(deadline)?;
         if expected.digest != *blake3::hash(&bytes).as_bytes() {
             return Err(StageError::StageChanged);
         }
+        check_deadline(deadline)?;
         Ok(bytes)
     }
 

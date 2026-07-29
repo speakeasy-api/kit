@@ -23,7 +23,7 @@ use kit::{
             ExecutionProfileIdentity, LaunchRequest, LspCodec, LspSessionManager,
             NotificationDisposition, OwnedLspLauncher, OwnedLspTransport, PositionEncoding,
             ResponseDisposition, RevisionPolicy, SendContext, ServerIdentity, SessionLimits,
-            SessionScope, TransportError,
+            SessionPurpose, SessionScope, TransportError,
         },
     },
     workspace::{
@@ -189,8 +189,16 @@ impl OwnedLspTransport for Transport {
         Ok(())
     }
 
-    fn close_and_reap(&mut self) -> Result<(), TransportError> {
-        Ok(())
+    fn receive_frame(&mut self, _: CodecLimits, _: SendContext) -> Result<Vec<u8>, TransportError> {
+        Err(TransportError::ReadFailed)
+    }
+
+    fn close_and_reap(&mut self, context: SendContext) -> Result<(), TransportError> {
+        if context.remaining().is_zero() {
+            Err(TransportError::CloseOrReapDeadlineExceeded)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -235,6 +243,7 @@ fn accepted(
                 project_id: ProjectId::generate().unwrap(),
                 workspace_id: WorkspaceId::generate().unwrap(),
                 canonical_root_identity: digest(3),
+                purpose: SessionPurpose::Live,
                 revision_policy: RevisionPolicy::ManagedLive,
                 server: server(),
                 position_encoding: encoding,
@@ -293,6 +302,7 @@ fn accepted_notification(
                 project_id: ProjectId::generate().unwrap(),
                 workspace_id: WorkspaceId::generate().unwrap(),
                 canonical_root_identity: digest(3),
+                purpose: SessionPurpose::Live,
                 revision_policy: RevisionPolicy::ManagedLive,
                 server: server(),
                 position_encoding: encoding,

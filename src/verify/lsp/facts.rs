@@ -244,7 +244,7 @@ impl Default for FactLimits {
 }
 
 impl FactLimits {
-    fn valid(self) -> bool {
+    pub(crate) fn valid(self) -> bool {
         self.max_facts > 0
             && self.max_diagnostics > 0
             && self.max_message_bytes > 0
@@ -1051,6 +1051,50 @@ pub fn normalize_live_diagnostics(
         });
     }
     Ok(diagnostics)
+}
+
+pub(crate) fn extend_bounded_diagnostics(
+    output: &mut Vec<LiveDiagnostic>,
+    retained_bytes: &mut usize,
+    diagnostics: Vec<LiveDiagnostic>,
+    max_diagnostics: usize,
+    max_retained_bytes: usize,
+) -> Result<(), LspNormalizeError> {
+    let count = output
+        .len()
+        .checked_add(diagnostics.len())
+        .filter(|count| *count <= max_diagnostics)
+        .ok_or(LspNormalizeError::LimitExceeded)?;
+    let additional = diagnostics.iter().try_fold(0_usize, |total, diagnostic| {
+        total
+            .checked_add(diagnostic.path.0.as_str().len())
+            .and_then(|value| value.checked_add(diagnostic.message.len()))
+            .and_then(|value| value.checked_add(diagnostic.source.as_ref().map_or(0, String::len)))
+            .and_then(|value| {
+                value.checked_add(match &diagnostic.code {
+                    Some(DiagnosticCode::String(code)) => code.len(),
+                    Some(DiagnosticCode::Integer(_)) => std::mem::size_of::<i64>(),
+                    None => 0,
+                })
+            })
+            .and_then(|value| value.checked_add(diagnostic.provenance.uri.len()))
+            .and_then(|value| {
+                value.checked_add(server_retained_bytes(&diagnostic.provenance.server))
+            })
+            .and_then(|value| value.checked_add(std::mem::size_of::<LiveDiagnostic>()))
+            .and_then(|value| value.checked_add(std::mem::size_of::<DiagnosticProvenance>()))
+            .ok_or(LspNormalizeError::LimitExceeded)
+    })?;
+    let total = (*retained_bytes)
+        .checked_add(additional)
+        .filter(|total| *total <= max_retained_bytes)
+        .ok_or(LspNormalizeError::LimitExceeded)?;
+    output
+        .try_reserve_exact(count - output.len())
+        .map_err(|_| LspNormalizeError::LimitExceeded)?;
+    output.extend(diagnostics);
+    *retained_bytes = total;
+    Ok(())
 }
 
 pub fn normalize_workspace_edit(

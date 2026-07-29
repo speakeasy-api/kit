@@ -1,8 +1,11 @@
-use super::{FormatterCapture, StageChange, StageError, StageLimits, SyntaxRequirements};
+use super::{
+    FormatterCapture, StageChange, StageError, StageLimits, StagedOperation, SyntaxRequirements,
+};
 use crate::workspace::edit::{
     format::FormatterDescriptor, ir::RootRelativePath, validate::ValidatedPlan,
 };
 use crate::workspace::revision::RevisionId;
+use std::time::Instant;
 
 pub struct StagedEdit<'workspace>(std::marker::PhantomData<&'workspace ()>);
 
@@ -46,6 +49,10 @@ impl StagedEdit<'_> {
         unreachable!()
     }
 
+    pub(crate) fn operations(&self) -> &[StagedOperation] {
+        unreachable!()
+    }
+
     pub fn changes(&self) -> &[StageChange] {
         unreachable!()
     }
@@ -62,6 +69,15 @@ impl StagedEdit<'_> {
         &self,
         _path: &RootRelativePath,
         _max_bytes: usize,
+    ) -> Result<Vec<u8>, StageError> {
+        Err(StageError::Unavailable)
+    }
+
+    pub fn read_file_before(
+        &self,
+        _path: &RootRelativePath,
+        _max_bytes: usize,
+        _deadline: Instant,
     ) -> Result<Vec<u8>, StageError> {
         Err(StageError::Unavailable)
     }

@@ -4481,7 +4481,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M005-W04-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance staged_lsp_isolation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test adversarial staged_lsp_isolation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

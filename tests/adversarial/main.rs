@@ -23,10 +23,16 @@ mod providers;
 #[path = "../fixtures/repos/mod.rs"]
 mod repos;
 mod secret_leak;
+mod shadow_leak;
 mod tool_kernel_bypass;
 mod trial_grader_access;
 mod url_policy;
 mod windows_job;
+
+#[test]
+fn staged_lsp_isolation() {
+    shadow_leak::assert_staged_lsp_isolation();
+}
 
 #[test]
 fn secret_absent_terminal_history() {

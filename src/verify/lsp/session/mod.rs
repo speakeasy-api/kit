@@ -45,6 +45,12 @@ pub enum PositionEncoding {
     Utf32,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SessionPurpose {
+    Live,
+    Shadow(ContentDigest),
+}
+
 impl PositionEncoding {
     const fn lsp_name(self) -> &'static str {
         match self {
@@ -96,6 +102,7 @@ pub struct SessionScope {
     pub project_id: ProjectId,
     pub workspace_id: WorkspaceId,
     pub canonical_root_identity: ContentDigest,
+    pub purpose: SessionPurpose,
     pub revision_policy: RevisionPolicy,
     pub server: ServerIdentity,
     pub position_encoding: PositionEncoding,
@@ -359,7 +366,7 @@ impl Default for SessionLimits {
 }
 
 impl SessionLimits {
-    fn valid(self) -> bool {
+    pub(crate) fn valid(self) -> bool {
         self.max_sessions > 0
             && self.max_documents_per_session > 0
             && self.max_document_bytes > 0
@@ -386,7 +393,10 @@ pub enum TransportError {
     LaunchFailed,
     WriteFailed,
     WriteDeadlineExceeded,
+    ReadFailed,
+    ReadDeadlineExceeded,
     CloseOrReapFailed,
+    CloseOrReapDeadlineExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -423,9 +433,10 @@ impl SendContext {
 }
 
 /// The production implementation must own an `OwnedProcess`/`ProcessTree` lifecycle.
-/// `send_frame` must configure its pipe write and flush from `context.remaining()` and either
-/// complete both within that budget or return `WriteDeadlineExceeded`; it may not remain blocked
-/// past the budget. The manager also authoritatively checks its clock before and after each call.
+/// Sends and receives must configure pipe I/O from `context.remaining()` and either complete
+/// within that budget or return the corresponding deadline error. `receive_frame` must reject a
+/// frame larger than `codec_limits.max_frame_bytes` before returning it. The manager also
+/// authoritatively checks its clock before and after every call.
 /// `Drop` must make one bounded best-effort attempt to close the owned process boundary.
 pub trait OwnedLspTransport {
     fn claim(&self) -> ProcessClaim;
@@ -436,8 +447,44 @@ pub trait OwnedLspTransport {
         context: SendContext,
     ) -> Result<(), TransportError>;
     fn send_frame(&mut self, frame: &[u8], context: SendContext) -> Result<(), TransportError>;
+    fn receive_frame(
+        &mut self,
+        codec_limits: CodecLimits,
+        context: SendContext,
+    ) -> Result<Vec<u8>, TransportError>;
     /// Boundedly closes the complete owned process boundary and proves it was reaped.
-    fn close_and_reap(&mut self) -> Result<(), TransportError>;
+    fn close_and_reap(&mut self, context: SendContext) -> Result<(), TransportError>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReceivedNotification {
+    service_id: DaemonServiceId,
+    process_id: ProcessId,
+    generation: u64,
+    frame_bytes: usize,
+    disposition: NotificationDisposition,
+}
+
+impl ReceivedNotification {
+    pub(crate) const fn service_id(&self) -> DaemonServiceId {
+        self.service_id
+    }
+
+    pub(crate) const fn process_id(&self) -> ProcessId {
+        self.process_id
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn frame_bytes(&self) -> usize {
+        self.frame_bytes
+    }
+
+    pub(crate) fn into_disposition(self) -> NotificationDisposition {
+        self.disposition
+    }
 }
 
 pub struct LaunchRequest<'a> {
@@ -1047,7 +1094,20 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         scope: SessionScope,
         workspace_revision: RevisionId,
     ) -> Result<DaemonServiceId, SessionError> {
+        let deadline_tick = self.lifecycle_deadline_tick();
+        self.open_until(scope, workspace_revision, deadline_tick)
+    }
+
+    pub(crate) fn open_until(
+        &mut self,
+        scope: SessionScope,
+        workspace_revision: RevisionId,
+        deadline_tick: u64,
+    ) -> Result<DaemonServiceId, SessionError> {
         self.require_admission()?;
+        if deadline_tick <= self.clock.now_tick() {
+            return Err(SessionError::DeadlineExceeded);
+        }
         self.validate_scope(&scope, workspace_revision)?;
         if let Some(service_id) = self.scopes.get(&scope).copied() {
             self.set_workspace_revision(service_id, workspace_revision)?;
@@ -1069,12 +1129,12 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             let Some(idle) = idle else {
                 return Err(SessionError::CapacityExceeded);
             };
-            self.close_session(idle)?;
+            self.close_session_until(idle, deadline_tick)?;
         }
         let service = DaemonService::new(scope.principal_id, scope.project_id, scope.workspace_id)
             .map_err(|_| SessionError::CapacityExceeded)?;
         let generation = 1;
-        let send_context = self.lifecycle_send_context();
+        let send_context = SendContext::new(&self.clock, deadline_tick);
         let mut transport = self.launch(&service, &scope, generation)?;
         if let Err(error) = send_initialize(
             self.limits,
@@ -1085,7 +1145,12 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             &scope,
             generation,
         ) {
-            let _ = reap_transport(&mut transport, &mut self.process_ids);
+            reap_transport(
+                &mut transport,
+                &mut self.process_ids,
+                &self.clock,
+                send_context,
+            )?;
             return Err(error);
         }
         let service_id = service.id;
@@ -1115,11 +1180,26 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
     pub fn open_document(
         &mut self,
         service_id: DaemonServiceId,
+        uri: String,
+        version: DocumentVersion,
+        text: String,
+    ) -> Result<(), SessionError> {
+        let deadline_tick = self.lifecycle_deadline_tick();
+        self.open_document_until(service_id, uri, version, text, deadline_tick)
+    }
+
+    pub(crate) fn open_document_until(
+        &mut self,
+        service_id: DaemonServiceId,
         mut uri: String,
         version: DocumentVersion,
         mut text: String,
+        deadline_tick: u64,
     ) -> Result<(), SessionError> {
         self.require_admission()?;
+        if deadline_tick <= self.clock.now_tick() {
+            return Err(SessionError::DeadlineExceeded);
+        }
         uri.shrink_to_fit();
         text.shrink_to_fit();
         self.validate_uri(&uri)?;
@@ -1127,7 +1207,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             return Err(SessionError::DocumentTooLarge);
         }
         let limits = self.limits;
-        let context = self.lifecycle_send_context();
+        let context = SendContext::new(&self.clock, deadline_tick);
         let clock = &self.clock;
         let process_ids = &mut self.process_ids;
         let session = self
@@ -1176,15 +1256,29 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         &mut self,
         service_id: DaemonServiceId,
         uri: &str,
+        text: String,
+    ) -> Result<DocumentVersion, SessionError> {
+        let deadline_tick = self.lifecycle_deadline_tick();
+        self.update_document_until(service_id, uri, text, deadline_tick)
+    }
+
+    pub(crate) fn update_document_until(
+        &mut self,
+        service_id: DaemonServiceId,
+        uri: &str,
         mut text: String,
+        deadline_tick: u64,
     ) -> Result<DocumentVersion, SessionError> {
         self.require_admission()?;
+        if deadline_tick <= self.clock.now_tick() {
+            return Err(SessionError::DeadlineExceeded);
+        }
         text.shrink_to_fit();
         if text.len() > self.limits.max_document_bytes {
             return Err(SessionError::DocumentTooLarge);
         }
         let limits = self.limits;
-        let context = self.lifecycle_send_context();
+        let context = SendContext::new(&self.clock, deadline_tick);
         let clock = &self.clock;
         let process_ids = &mut self.process_ids;
         let session = self
@@ -1243,8 +1337,18 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         service_id: DaemonServiceId,
         uri: &str,
     ) -> Result<(), SessionError> {
+        let deadline_tick = self.lifecycle_deadline_tick();
+        self.close_document_until(service_id, uri, deadline_tick)
+    }
+
+    pub(crate) fn close_document_until(
+        &mut self,
+        service_id: DaemonServiceId,
+        uri: &str,
+        deadline_tick: u64,
+    ) -> Result<(), SessionError> {
         let limits = self.limits;
-        let context = self.lifecycle_send_context();
+        let context = SendContext::new(&self.clock, deadline_tick);
         let clock = &self.clock;
         let process_ids = &mut self.process_ids;
         let session = self
@@ -1478,6 +1582,59 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         }))
     }
 
+    pub(crate) fn receive_current_notification(
+        &mut self,
+        service_id: DaemonServiceId,
+        deadline_tick: u64,
+    ) -> Result<ReceivedNotification, SessionError> {
+        let context = SendContext::new(&self.clock, deadline_tick);
+        if context.remaining().is_zero() {
+            self.fence_receive_failure(service_id)?;
+            return Err(TransportError::ReadDeadlineExceeded.into());
+        }
+        let codec_limits = self.limits.codec;
+        let (process_id, generation, frame) = {
+            let session = self.session_mut(service_id)?;
+            require_running(session)?;
+            let transport = session
+                .transport
+                .as_mut()
+                .ok_or(SessionError::AdmissionClosed)?;
+            let process_id = transport.claim().process_id;
+            let generation = session.generation;
+            match transport.receive_frame(codec_limits, context) {
+                Ok(frame) => (process_id, generation, frame),
+                Err(error) => {
+                    self.fence_receive_failure(service_id)?;
+                    return Err(error.into());
+                }
+            }
+        };
+        if self.clock.remaining_until(deadline_tick).is_zero() {
+            self.fence_receive_failure(service_id)?;
+            return Err(TransportError::ReadDeadlineExceeded.into());
+        }
+        if frame.len() > codec_limits.max_frame_bytes {
+            self.fence_receive_failure(service_id)?;
+            return Err(CodecError::FrameTooLarge.into());
+        }
+        let frame_bytes = frame.len();
+        let disposition = match self.receive_notification(service_id, generation, &frame) {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                self.fence_receive_failure(service_id)?;
+                return Err(error);
+            }
+        };
+        Ok(ReceivedNotification {
+            service_id,
+            process_id,
+            generation,
+            frame_bytes,
+            disposition,
+        })
+    }
+
     fn receive_raw(
         &mut self,
         service_id: DaemonServiceId,
@@ -1644,6 +1801,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         service_id: DaemonServiceId,
     ) -> Result<Vec<(PendingToken, PendingTermination)>, SessionError> {
         let limits = self.limits;
+        let context = self.lifecycle_send_context();
         let (service, scope, generation, terminated) = {
             let process_ids = &mut self.process_ids;
             let session = self
@@ -1656,8 +1814,13 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             ) {
                 return Err(SessionError::AdmissionClosed);
             }
-            let (terminated, close_result) =
-                fence_session(session, limits.max_tombstones, process_ids);
+            let (terminated, close_result) = fence_session(
+                session,
+                limits.max_tombstones,
+                process_ids,
+                &self.clock,
+                context,
+            );
             close_result?;
             if session.counters.restarts >= limits.max_restarts {
                 return Err(SessionError::RestartLimitExceeded);
@@ -1680,7 +1843,6 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
                 return Err(error);
             }
         };
-        let context = self.lifecycle_send_context();
         if let Err(error) = send_initialize(
             limits,
             &self.clock,
@@ -1690,7 +1852,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             &scope,
             generation,
         ) {
-            let _ = reap_transport(&mut transport, &mut self.process_ids);
+            reap_transport(&mut transport, &mut self.process_ids, &self.clock, context)?;
             self.session_mut(service_id)?.state = SessionState::Faulted;
             return Err(error);
         }
@@ -1711,7 +1873,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             })
         };
         if let Err(error) = replay {
-            let _ = reap_transport(&mut transport, &mut self.process_ids);
+            reap_transport(&mut transport, &mut self.process_ids, &self.clock, context)?;
             self.session_mut(service_id)?.state = SessionState::Faulted;
             return Err(error);
         }
@@ -1722,6 +1884,15 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
     }
 
     pub fn close_session(&mut self, service_id: DaemonServiceId) -> Result<(), SessionError> {
+        let deadline_tick = self.lifecycle_deadline_tick();
+        self.close_session_until(service_id, deadline_tick)
+    }
+
+    pub(crate) fn close_session_until(
+        &mut self,
+        service_id: DaemonServiceId,
+        deadline_tick: u64,
+    ) -> Result<(), SessionError> {
         let limits = self.limits;
         let max_tombstones = self.limits.max_tombstones;
         let scope = self
@@ -1731,7 +1902,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             .scope
             .clone();
         let result = {
-            let context = self.lifecycle_send_context();
+            let context = SendContext::new(&self.clock, deadline_tick);
             let clock = &self.clock;
             let process_ids = &mut self.process_ids;
             let session = self
@@ -1754,7 +1925,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             }
             session.state = SessionState::ShuttingDown;
             terminate_all(session, PendingTermination::Shutdown, max_tombstones);
-            match close_transport(session, process_ids) {
+            match close_transport(session, process_ids, clock, context) {
                 Ok(()) => (true, notification_error.map_or(Ok(()), Err)),
                 Err(error) => (false, Err(error)),
             }
@@ -1772,6 +1943,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         let mut closed = Vec::new();
         let mut first = None;
         let mut failed_sessions = 0;
+        let context = SendContext::new(&self.clock, self.lifecycle_deadline_tick());
         let process_ids = &mut self.process_ids;
         for service_id in ids {
             let session = self
@@ -1784,7 +1956,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
                 PendingTermination::Shutdown,
                 self.limits.max_tombstones,
             );
-            match close_transport(session, process_ids) {
+            match close_transport(session, process_ids, &self.clock, context) {
                 Ok(()) => closed.push((service_id, session.scope.clone())),
                 Err(SessionError::Transport(error)) => {
                     first.get_or_insert(error);
@@ -1858,6 +2030,10 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         self.clock.now_tick()
     }
 
+    pub(crate) fn remaining_until(&self, deadline_tick: u64) -> Duration {
+        self.clock.remaining_until(deadline_tick)
+    }
+
     pub fn retained_process_id_count(&self) -> usize {
         self.process_ids.retained_len()
     }
@@ -1883,23 +2059,27 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             generation,
             execution_profile: &scope.execution_profile,
         })?;
+        let context = SendContext::new(&self.clock, self.lifecycle_deadline_tick());
         if transport.claim().owner != ownership {
-            let _ = transport.close_and_reap();
+            close_owned_transport(&mut transport, &self.clock, context)?;
             return Err(SessionError::InvalidTransportOwner);
         }
         if !self.process_ids.admit(transport.claim().process_id) {
-            let _ = transport.close_and_reap();
+            close_owned_transport(&mut transport, &self.clock, context)?;
             return Err(SessionError::ProcessIdentityReused);
         }
         Ok(transport)
     }
 
     fn lifecycle_send_context(&self) -> SendContext {
-        let deadline_tick = self
-            .clock
-            .now_tick()
-            .saturating_add(self.limits.lifecycle_send_timeout_ticks);
+        let deadline_tick = self.lifecycle_deadline_tick();
         SendContext::new(&self.clock, deadline_tick)
+    }
+
+    fn lifecycle_deadline_tick(&self) -> u64 {
+        self.clock
+            .now_tick()
+            .saturating_add(self.limits.lifecycle_send_timeout_ticks)
     }
 
     fn session_mut(
@@ -1909,6 +2089,21 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         self.sessions
             .get_mut(&service_id)
             .ok_or(SessionError::SessionNotFound)
+    }
+
+    fn fence_receive_failure(&mut self, service_id: DaemonServiceId) -> Result<(), SessionError> {
+        let context = SendContext::new(&self.clock, self.lifecycle_deadline_tick());
+        if let Some(session) = self.sessions.get_mut(&service_id) {
+            let (_, result) = fence_session(
+                session,
+                self.limits.max_tombstones,
+                &mut self.process_ids,
+                &self.clock,
+                context,
+            );
+            result?;
+        }
+        Ok(())
     }
 
     fn require_admission(&self) -> Result<(), SessionError> {
@@ -1926,6 +2121,11 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
     ) -> Result<(), SessionError> {
         if matches!(scope.revision_policy, RevisionPolicy::Pinned(pinned) if pinned != revision) {
             return Err(SessionError::RevisionMismatch);
+        }
+        if matches!(scope.purpose, SessionPurpose::Shadow(_))
+            && !matches!(scope.revision_policy, RevisionPolicy::Pinned(_))
+        {
+            return Err(SessionError::InvalidScope);
         }
         if !scope.execution_profile.resources().finite() {
             return Err(SessionError::InvalidScope);
@@ -1948,9 +2148,10 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
 impl<L: OwnedLspLauncher, C: TickClock> Drop for LspSessionManager<L, C> {
     fn drop(&mut self) {
         let _ = self.shutdown();
+        let context = SendContext::new(&self.clock, self.lifecycle_deadline_tick());
         let process_ids = &mut self.process_ids;
         for session in self.sessions.values_mut() {
-            let _ = close_transport(session, process_ids);
+            let _ = close_transport(session, process_ids, &self.clock, context);
         }
     }
 }
@@ -1979,6 +2180,12 @@ fn send_initialize<T: OwnedLspTransport, C: TickClock>(
     scope: &SessionScope,
     generation: u64,
 ) -> Result<(), SessionError> {
+    let purpose = match &scope.purpose {
+        SessionPurpose::Live => json!({ "kind": "live" }),
+        SessionPurpose::Shadow(run_digest) => {
+            json!({ "kind": "shadow", "runDigest": run_digest.as_str() })
+        }
+    };
     let initialize = json!({
         "jsonrpc": "2.0",
         "id": 0,
@@ -1994,6 +2201,7 @@ fn send_initialize<T: OwnedLspTransport, C: TickClock>(
                 "kitService": service.id.to_string(),
                 "kitGeneration": generation,
                 "canonicalRootIdentity": scope.canonical_root_identity.as_str(),
+                "sessionPurpose": purpose,
                 "protocolVersion": LSP_PROTOCOL_VERSION
             }
         }
@@ -2049,7 +2257,20 @@ fn send_session<T: OwnedLspTransport, C: TickClock>(
         .ok_or(SessionError::AdmissionClosed)
         .and_then(|transport| send_value(transport, limits, clock, context, value));
     if matches!(result, Err(SessionError::Transport(_))) {
-        let _ = fence_session(session, limits.max_tombstones, process_ids);
+        let reap_context = SendContext::new(
+            clock,
+            clock
+                .now_tick()
+                .saturating_add(limits.lifecycle_send_timeout_ticks),
+        );
+        let (_, close_result) = fence_session(
+            session,
+            limits.max_tombstones,
+            process_ids,
+            clock,
+            reap_context,
+        );
+        close_result?;
     }
     result
 }
@@ -2232,10 +2453,12 @@ fn expire_one<T: OwnedLspTransport, C: TickClock>(
     Ok(false)
 }
 
-fn fence_session<T: OwnedLspTransport>(
+fn fence_session<T: OwnedLspTransport, C: TickClock>(
     session: &mut Session<T>,
     max_tombstones: usize,
     process_ids: &mut ProcessIds,
+    clock: &C,
+    context: SendContext,
 ) -> (
     Vec<(PendingToken, PendingTermination)>,
     Result<(), SessionError>,
@@ -2251,7 +2474,7 @@ fn fence_session<T: OwnedLspTransport>(
         push_tombstone(session, token, *termination, max_tombstones);
     }
     let close_result = match session.transport.take() {
-        Some(mut transport) => match reap_transport(&mut transport, process_ids) {
+        Some(mut transport) => match reap_transport(&mut transport, process_ids, clock, context) {
             Ok(()) => Ok(()),
             Err(error) => {
                 session.transport = Some(transport);
@@ -2263,15 +2486,17 @@ fn fence_session<T: OwnedLspTransport>(
     (terminated, close_result)
 }
 
-fn close_transport<T: OwnedLspTransport>(
+fn close_transport<T: OwnedLspTransport, C: TickClock>(
     session: &mut Session<T>,
     process_ids: &mut ProcessIds,
+    clock: &C,
+    context: SendContext,
 ) -> Result<(), SessionError> {
     let Some(mut transport) = session.transport.take() else {
         session.state = SessionState::Closed;
         return Ok(());
     };
-    match reap_transport(&mut transport, process_ids) {
+    match reap_transport(&mut transport, process_ids, clock, context) {
         Ok(()) => {
             session.state = SessionState::Closed;
             Ok(())
@@ -2283,13 +2508,28 @@ fn close_transport<T: OwnedLspTransport>(
     }
 }
 
-fn reap_transport<T: OwnedLspTransport>(
+fn reap_transport<T: OwnedLspTransport, C: TickClock>(
     transport: &mut T,
     process_ids: &mut ProcessIds,
+    clock: &C,
+    context: SendContext,
 ) -> Result<(), TransportError> {
     let process_id = transport.claim().process_id;
-    transport.close_and_reap()?;
+    close_owned_transport(transport, clock, context)?;
     process_ids.reaped(process_id);
+    Ok(())
+}
+
+fn close_owned_transport<T: OwnedLspTransport, C: TickClock>(
+    transport: &mut T,
+    clock: &C,
+    context: SendContext,
+) -> Result<(), TransportError> {
+    let context = context.refreshed(clock);
+    transport.close_and_reap(context)?;
+    if clock.remaining_until(context.deadline_tick()).is_zero() {
+        return Err(TransportError::CloseOrReapDeadlineExceeded);
+    }
     Ok(())
 }
 

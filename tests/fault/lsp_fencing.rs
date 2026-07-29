@@ -21,8 +21,8 @@ use kit::{
         CodecError, CodecLimits, DiscardReason, DocumentVersion, ExecutionProfileIdentity,
         LaunchRequest, LspCodec, LspSessionManager, NotificationDisposition, OwnedLspLauncher,
         OwnedLspTransport, PendingTermination, PositionEncoding, ResponseDisposition,
-        RevisionPolicy, SendContext, ServerIdentity, SessionError, SessionLimits, SessionScope,
-        SessionState, TickClock, TransportError,
+        RevisionPolicy, SendContext, ServerIdentity, SessionError, SessionLimits, SessionPurpose,
+        SessionScope, SessionState, TickClock, TransportError,
     },
     workspace::revision::RevisionId,
 };
@@ -46,6 +46,9 @@ struct FakeState {
     complete_at_deadline_writes: usize,
     advance_after_writes: u64,
     send_remaining: VecDeque<Duration>,
+    next_received_frames: VecDeque<Result<Vec<u8>, TransportError>>,
+    receive_frame_entries: usize,
+    advance_after_close: u64,
     fail_methods: HashSet<String>,
     clock: Option<ManualClock>,
 }
@@ -80,6 +83,7 @@ struct FakeTransport {
     claim: ProcessClaim,
     generation: u64,
     state: Arc<Mutex<FakeState>>,
+    received_frames: VecDeque<Result<Vec<u8>, TransportError>>,
     live: bool,
 }
 
@@ -103,6 +107,7 @@ impl OwnedLspLauncher for FakeLauncher {
             Ok,
         )?;
         let claim = ProcessClaim::new(process_id, request.ownership);
+        let received_frames = std::mem::take(&mut state.next_received_frames);
         state.launches += 1;
         state.live_transports += 1;
         drop(state);
@@ -110,6 +115,7 @@ impl OwnedLspLauncher for FakeLauncher {
             claim,
             generation: request.generation,
             state: self.0.clone(),
+            received_frames,
             live: true,
         })
     }
@@ -179,14 +185,40 @@ impl OwnedLspTransport for FakeTransport {
         Ok(())
     }
 
-    fn close_and_reap(&mut self) -> Result<(), TransportError> {
+    fn receive_frame(
+        &mut self,
+        limits: CodecLimits,
+        context: SendContext,
+    ) -> Result<Vec<u8>, TransportError> {
+        if context.remaining().is_zero() {
+            return Err(TransportError::ReadDeadlineExceeded);
+        }
+        self.state.lock().unwrap().receive_frame_entries += 1;
+        let frame = self
+            .received_frames
+            .pop_front()
+            .unwrap_or(Err(TransportError::ReadFailed))?;
+        if frame.len() > limits.max_frame_bytes {
+            return Err(TransportError::ReadFailed);
+        }
+        Ok(frame)
+    }
+
+    fn close_and_reap(&mut self, context: SendContext) -> Result<(), TransportError> {
         let mut state = self.state.lock().unwrap();
+        if context.remaining().is_zero() {
+            return Err(TransportError::CloseOrReapDeadlineExceeded);
+        }
         if state.fail_close.remove(&self.claim.process_id) {
             return Err(TransportError::CloseOrReapFailed);
         }
         if self.live {
             self.live = false;
             state.live_transports -= 1;
+        }
+        if state.advance_after_close > 0 {
+            let clock = state.clock.as_ref().unwrap();
+            clock.set(clock.now_tick().saturating_add(state.advance_after_close));
         }
         Ok(())
     }
@@ -299,6 +331,7 @@ fn scope(revision_policy: RevisionPolicy) -> SessionScope {
         project_id: ProjectId::generate().unwrap(),
         workspace_id: WorkspaceId::generate().unwrap(),
         canonical_root_identity: digest(1),
+        purpose: SessionPurpose::Live,
         revision_policy,
         server: ServerIdentity {
             server_artifact: digest(2),
@@ -1183,7 +1216,7 @@ fn send_context_budget_shrinks_and_zero_budget_never_reaches_transport() {
     assert_eq!(
         manager.open(scope(RevisionPolicy::ManagedLive), revision(26)),
         Err(SessionError::Transport(
-            TransportError::WriteDeadlineExceeded
+            TransportError::CloseOrReapDeadlineExceeded
         ))
     );
     let state = state.lock().unwrap();
@@ -1212,12 +1245,28 @@ fn send_context_budget_shrinks_and_zero_budget_never_reaches_transport() {
             "one".to_owned(),
         ),
         Err(SessionError::Transport(
-            TransportError::WriteDeadlineExceeded
+            TransportError::CloseOrReapDeadlineExceeded
         ))
     );
     let state = state.lock().unwrap();
     assert_eq!(state.initialize_entries, 1);
     assert_eq!(state.send_frame_entries, send_frame_entries);
+}
+
+#[test]
+fn manager_rejects_reap_that_returns_at_the_deadline() {
+    let (mut manager, state, _) = manager();
+    let service = manager
+        .open(scope(RevisionPolicy::ManagedLive), revision(35))
+        .unwrap();
+    state.lock().unwrap().advance_after_close = 5_000;
+    assert_eq!(
+        manager.close_session(service),
+        Err(SessionError::Transport(
+            TransportError::CloseOrReapDeadlineExceeded
+        ))
+    );
+    assert!(manager.snapshot(service).is_ok());
 }
 
 #[test]
@@ -1363,7 +1412,7 @@ fn failed_initialization_and_reap_keep_process_identity_accounting_safe() {
     }
     assert_eq!(
         manager.open(scope(RevisionPolicy::ManagedLive), workspace_revision),
-        Err(SessionError::Transport(TransportError::WriteFailed))
+        Err(SessionError::Transport(TransportError::CloseOrReapFailed))
     );
     assert_eq!(manager.retained_process_id_count(), 1);
     assert_eq!(
@@ -1577,4 +1626,63 @@ fn delayed_generation_one_diagnostics_are_rejected_when_version_coincides() {
         Err(SessionError::InvalidNotification)
     );
     manager.shutdown().unwrap();
+}
+
+#[test]
+fn transport_owned_receive_drops_unread_old_generation_frames() {
+    let (mut manager, state, _) = manager();
+    let workspace_revision = revision(33);
+    let notification = |version| {
+        LspCodec::encode(
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/publishDiagnostics",
+                "params":{"uri":URI,"version":version,"diagnostics":[]}
+            }),
+            SessionLimits::default().codec,
+        )
+        .unwrap()
+    };
+    state
+        .lock()
+        .unwrap()
+        .next_received_frames
+        .push_back(Ok(notification(99)));
+    let service = open_document(
+        &mut manager,
+        scope(RevisionPolicy::ManagedLive),
+        workspace_revision,
+    );
+    state
+        .lock()
+        .unwrap()
+        .next_received_frames
+        .push_back(Ok(notification(1)));
+    manager.server_crashed(service).unwrap();
+
+    let received =
+        kit::test_support::receive_current_notification(&mut manager, service, 100).unwrap();
+    assert!(matches!(received, NotificationDisposition::Accepted(_)));
+    assert_eq!(state.lock().unwrap().receive_frame_entries, 1);
+    manager.shutdown().unwrap();
+}
+
+#[test]
+fn expired_receive_deadline_never_enters_transport_and_reaps_it() {
+    let (mut manager, state, clock) = manager();
+    let service = open_document(
+        &mut manager,
+        scope(RevisionPolicy::ManagedLive),
+        revision(34),
+    );
+    clock.set(10);
+    assert_eq!(
+        kit::test_support::receive_current_notification(&mut manager, service, 10),
+        Err(SessionError::Transport(
+            TransportError::ReadDeadlineExceeded
+        ))
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(state.receive_frame_entries, 0);
+    assert_eq!(state.live_transports, 0);
 }
