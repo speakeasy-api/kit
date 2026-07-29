@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -36,7 +37,9 @@ use crate::{
         search::{
             discover::{DiscoverCursor, DiscoverOptions, DiscoverQuery, discover},
             lexical::{SearchCursor, SearchMode, SearchOptions, SearchQuery, search},
+            structural::{StructuralOptions, StructuralQuery, search as structural_search},
         },
+        syntax::SyntaxIndex,
     },
 };
 
@@ -63,8 +66,91 @@ const MAX_RUN_IO_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_RUN_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_RUN_WALL_TIME_MILLIS: u64 = 10 * 60 * 1000;
 const MAX_NATIVE_WORKSPACE_SCAN_TIME: std::time::Duration = std::time::Duration::from_secs(20);
+const STRUCTURAL_PREVIEW_MAX_ENTRIES: usize = 128;
+const STRUCTURAL_PREVIEW_MAX_BYTES: usize = 8 * 1024 * 1024;
+const STRUCTURAL_PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
 pub(crate) const MAX_EDIT_VALIDATION_TIME: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
+
+#[derive(Clone)]
+struct StructuralPreviewRecord {
+    principal: String,
+    project: String,
+    workspace: String,
+    revision: String,
+    index_digest: [u8; 32],
+    workspace_digest: String,
+    canonical_ir: Vec<u8>,
+    ir_digest: String,
+    change_diff_digest: String,
+    created: Instant,
+    expires: Instant,
+    retained_bytes: usize,
+}
+
+#[derive(Default)]
+struct StructuralPreviewRegistry {
+    entries: BTreeMap<[u8; 32], StructuralPreviewRecord>,
+    retained_bytes: usize,
+}
+
+impl StructuralPreviewRegistry {
+    fn prune(&mut self, now: Instant, revision: &str) {
+        let stale = self
+            .entries
+            .iter()
+            .filter_map(|(digest, record)| {
+                (record.expires <= now || record.revision != revision).then_some(*digest)
+            })
+            .collect::<Vec<_>>();
+        for digest in stale {
+            self.remove(&digest);
+        }
+    }
+
+    fn insert(&mut self, mut record: StructuralPreviewRecord) -> Result<String, String> {
+        if record.retained_bytes > STRUCTURAL_PREVIEW_MAX_BYTES {
+            return Err("structural_preview_unavailable".to_owned());
+        }
+        while self.entries.len() >= STRUCTURAL_PREVIEW_MAX_ENTRIES
+            || self.retained_bytes.saturating_add(record.retained_bytes)
+                > STRUCTURAL_PREVIEW_MAX_BYTES
+        {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.created)
+                .map(|(digest, _)| *digest)
+                .ok_or_else(|| "structural_preview_unavailable".to_owned())?;
+            self.remove(&oldest);
+        }
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(|_| "structural_preview_unavailable".to_owned())?;
+        let token = format!("kitsp1_{}", hex(&random));
+        let digest = structural_preview_token_digest(&token);
+        if self.entries.contains_key(&digest) {
+            return Err("structural_preview_unavailable".to_owned());
+        }
+        record.expires = record
+            .created
+            .checked_add(STRUCTURAL_PREVIEW_TTL)
+            .ok_or_else(|| "structural_preview_unavailable".to_owned())?;
+        self.retained_bytes += record.retained_bytes;
+        self.entries.insert(digest, record);
+        Ok(token)
+    }
+
+    fn remove(&mut self, digest: &[u8; 32]) -> Option<StructuralPreviewRecord> {
+        let record = self.entries.remove(digest)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(record.retained_bytes);
+        Some(record)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.retained_bytes = 0;
+    }
+}
 
 pub(crate) struct NativeRuntime {
     pub workspace_id: crate::domain::ids::WorkspaceId,
@@ -88,6 +174,8 @@ pub(crate) struct NativeDispatcher {
     root: PathBuf,
     workspace: Option<ManagedWorkspace>,
     index: Option<MetadataIndex>,
+    syntax_index: SyntaxIndex,
+    structural_previews: StructuralPreviewRegistry,
     build: PathBuf,
     temp: PathBuf,
     artifacts: Arc<ArtifactStore>,
@@ -140,6 +228,8 @@ impl NativeDispatcher {
             root,
             workspace: None,
             index: None,
+            syntax_index: SyntaxIndex::new(),
+            structural_previews: StructuralPreviewRegistry::default(),
             build,
             temp,
             artifacts,
@@ -269,6 +359,8 @@ impl NativeDispatcher {
         if current.id() != expected {
             return Err("stale_revision".to_owned());
         }
+        self.structural_previews
+            .prune(Instant::now(), &current.id().to_string());
         if let Some(index) = &self.index
             && index.revision() == expected
         {
@@ -278,8 +370,13 @@ impl NativeDispatcher {
             max_build_time: std::time::Duration::from_secs(60),
             ..IndexOptions::default()
         };
-        let index = MetadataIndex::build(&workspace, expected, &index_options)
-            .map_err(code("workspace_index_failed"))?;
+        let index = MetadataIndex::build_with_syntax(
+            &workspace,
+            expected,
+            &index_options,
+            &mut self.syntax_index,
+        )
+        .map_err(code("workspace_index_failed"))?;
         self.index = Some(index.clone());
         Ok((workspace, index))
     }
@@ -309,6 +406,63 @@ impl NativeDispatcher {
         self.ensure_not_cancelled()?;
         let input: SearchInput = decode(bytes)?;
         let (workspace, index) = self.workspace_index(&input.expected_revision)?;
+        if matches!(input.mode, SearchModeInput::Structural) {
+            if input.cursor.is_some() && input.rewrite.is_some() {
+                return Err("structural_rewrite_cursor_rejected".to_owned());
+            }
+            if input.cursor.is_some() {
+                return Err("structural_cursor_rejected".to_owned());
+            }
+            let response = structural_search(
+                &workspace,
+                &index,
+                &mut self.syntax_index,
+                &StructuralQuery {
+                    pattern: input.text,
+                    rewrite: input.rewrite,
+                },
+                &StructuralOptions {
+                    path_prefixes: input.path_prefixes.into_iter().map(PathBuf::from).collect(),
+                    languages: input.languages,
+                    max_change_diff_bytes: MAX_NATIVE_OUTPUT_BYTES / 4,
+                    max_output_bytes: MAX_NATIVE_OUTPUT_BYTES / 2,
+                    max_time: std::time::Duration::from_secs(30),
+                    ..StructuralOptions::default()
+                },
+            )
+            .map_err(code("structural_search_failed"))?;
+            let mut value =
+                serde_json::to_value(&response).map_err(code("serialization_failed"))?;
+            if let Some(rewrite) = response.rewrite.as_ref().filter(|rewrite| rewrite.changed) {
+                let canonical_ir = rewrite.ir.canonical_bytes();
+                let retained_bytes = canonical_ir
+                    .len()
+                    .checked_add(rewrite.ir_digest.len())
+                    .and_then(|bytes| bytes.checked_add(rewrite.change_diff_digest.len()))
+                    .and_then(|bytes| bytes.checked_add(512))
+                    .ok_or_else(|| "structural_preview_unavailable".to_owned())?;
+                let token = self.structural_previews.insert(StructuralPreviewRecord {
+                    principal: self.authenticated.principal_id().to_string(),
+                    project: self.config.project_id().to_string(),
+                    workspace: self.workspace_id.to_string(),
+                    revision: index.revision().to_string(),
+                    index_digest: *index.index_digest(),
+                    workspace_digest: index.digest().to_string(),
+                    canonical_ir,
+                    ir_digest: rewrite.ir_digest.clone(),
+                    change_diff_digest: rewrite.change_diff_digest.clone(),
+                    created: Instant::now(),
+                    expires: Instant::now(),
+                    retained_bytes,
+                })?;
+                value["rewrite"]["apply"] = json!({"preview_token": token});
+                settle_result_bytes(&mut value)?;
+            }
+            return Ok((value, Vec::new()));
+        }
+        if input.rewrite.is_some() {
+            return Err("lexical_rewrite_rejected".to_owned());
+        }
         let response = search(
             &workspace,
             &index,
@@ -389,17 +543,41 @@ impl NativeDispatcher {
         {
             return Err("trusted_edit_feedback_unavailable".to_owned());
         }
-        let input: Value = serde_json::from_slice(bytes).map_err(code("invalid_arguments"))?;
-        let expected = input
-            .get("expected_revision")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "invalid_arguments".to_owned())?;
-        let workspace = self.ensure_workspace()?.clone();
         let limits = crate::workspace::edit::ir::EditLimits {
             max_authorization_time: std::time::Duration::from_secs(30),
             max_validation_time: self.edit_validation_time,
             ..crate::workspace::edit::ir::EditLimits::default()
         };
+        let input: Value = serde_json::from_slice(bytes).map_err(code("invalid_arguments"))?;
+        let preview_token = input
+            .get("preview_token")
+            .is_some()
+            .then(|| {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct PreviewInput {
+                    preview_token: String,
+                }
+                serde_json::from_value::<PreviewInput>(input.clone())
+                    .map(|input| input.preview_token)
+                    .map_err(|_| "invalid_arguments".to_owned())
+            })
+            .transpose()?;
+        let ir = preview_token
+            .as_deref()
+            .map(|token| self.resolve_structural_preview(token, limits))
+            .transpose()?;
+        let expected = ir.as_ref().map_or_else(
+            || {
+                input
+                    .get("expected_revision")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "invalid_arguments".to_owned())
+            },
+            |ir| Ok(ir.expected_revision().to_string()),
+        )?;
+        let workspace = self.ensure_workspace()?.clone();
         let context = GrammarEditContext::from_workspace(workspace, self.root.clone(), limits)
             .map_err(code("edit_context_failed"))?;
         if context.expected_revision().as_str() != expected {
@@ -419,30 +597,49 @@ impl NativeDispatcher {
             .formatter
             .as_mut()
             .map(|formatter| (&formatter.descriptor, &mut formatter.executor));
-        let outcome = EditOrchestrator::execute_native(
-            bytes,
-            &context,
-            &self.authenticated,
-            &self.grants,
-            &self.config,
-            &self.artifacts,
-            &self.live_cancellation,
-            &self.verification_registry,
-            runner,
-            &self.secrets,
-            &mut syntax_executors,
-            NativeEditServices {
-                workspace_id: self.workspace_id.to_string(),
-                attempt,
-                feedback_database: &feedback.database,
-                build: &self.build,
-                temp: &self.temp,
-                diagnostic_adapters: &feedback.adapters,
-                feedback_limits: feedback.limits.clone(),
-                formatter,
-            },
-            &mut trace,
-        )
+        let services = NativeEditServices {
+            workspace_id: self.workspace_id.to_string(),
+            attempt,
+            feedback_database: &feedback.database,
+            build: &self.build,
+            temp: &self.temp,
+            diagnostic_adapters: &feedback.adapters,
+            feedback_limits: feedback.limits.clone(),
+            formatter,
+        };
+        let outcome = if let Some(ir) = ir {
+            EditOrchestrator::execute_native_ir(
+                ir,
+                &context,
+                &self.authenticated,
+                &self.grants,
+                &self.config,
+                &self.artifacts,
+                &self.live_cancellation,
+                &self.verification_registry,
+                runner,
+                &self.secrets,
+                &mut syntax_executors,
+                services,
+                &mut trace,
+            )
+        } else {
+            EditOrchestrator::execute_native(
+                bytes,
+                &context,
+                &self.authenticated,
+                &self.grants,
+                &self.config,
+                &self.artifacts,
+                &self.live_cancellation,
+                &self.verification_registry,
+                runner,
+                &self.secrets,
+                &mut syntax_executors,
+                services,
+                &mut trace,
+            )
+        }
         .map_err(native_edit_error)?;
         match outcome {
             NativeEditOutcome::Aborted { receipt, feedback } => {
@@ -469,7 +666,10 @@ impl NativeDispatcher {
             }
             NativeEditOutcome::Committed { edit, feedback } => {
                 self.index = None;
+                self.structural_previews.clear();
                 let receipt = edit.verification_receipt();
+                let change_diff = std::str::from_utf8(edit.change_diff())
+                    .expect("materialized textual change diff is UTF-8");
                 let diff_artifact = json!({
                     "reference": edit.diff_artifact_reference().to_string(),
                     "digest": edit.diff_artifact_digest().to_string(),
@@ -497,6 +697,8 @@ impl NativeDispatcher {
                         },
                         "diff_artifact": diff_artifact,
                         "diff_preview": edit.diff_preview(),
+                        "change_diff": change_diff,
+                        "change_diff_complete": edit.change_diff_complete(),
                         "feedback": feedback.payload,
                         "feedback_artifacts": {
                             "payload_artifact": feedback.payload_artifact.reference,
@@ -517,6 +719,71 @@ impl NativeDispatcher {
                 ))
             }
         }
+    }
+
+    fn resolve_structural_preview(
+        &mut self,
+        token: &str,
+        limits: crate::workspace::edit::ir::EditLimits,
+    ) -> Result<crate::workspace::edit::ir::EditIr, String> {
+        let valid = token.strip_prefix("kitsp1_").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+        if !valid {
+            return Err("structural_preview_invalid".to_owned());
+        }
+        let digest = structural_preview_token_digest(token);
+        let Some(record) = self.structural_previews.entries.get(&digest).cloned() else {
+            return Err("structural_preview_invalid".to_owned());
+        };
+        if record.principal != self.authenticated.principal_id().to_string()
+            || record.project != self.config.project_id().to_string()
+            || record.workspace != self.workspace_id.to_string()
+        {
+            return Err("structural_preview_invalid".to_owned());
+        }
+        if record.expires <= Instant::now() {
+            self.structural_previews.remove(&digest);
+            return Err("structural_preview_invalid".to_owned());
+        }
+        let state = self.revision_state();
+        let Ok((revision, workspace_digest)) = state else {
+            self.structural_previews.remove(&digest);
+            return Err("structural_preview_invalid".to_owned());
+        };
+        if revision != record.revision || workspace_digest != record.workspace_digest {
+            self.structural_previews.remove(&digest);
+            return Err("structural_preview_invalid".to_owned());
+        }
+        let Ok((_, index)) = self.workspace_index(&record.revision) else {
+            self.structural_previews.remove(&digest);
+            return Err("structural_preview_invalid".to_owned());
+        };
+        if *index.index_digest() != record.index_digest {
+            self.structural_previews.remove(&digest);
+            return Err("structural_preview_invalid".to_owned());
+        }
+        if record.expires <= Instant::now() {
+            self.structural_previews.remove(&digest);
+            return Err("structural_preview_invalid".to_owned());
+        }
+        let record = self
+            .structural_previews
+            .remove(&digest)
+            .ok_or_else(|| "structural_preview_invalid".to_owned())?;
+        let ir =
+            crate::workspace::edit::ir::EditIr::from_canonical_bytes(&record.canonical_ir, limits)
+                .map_err(|_| "structural_preview_invalid".to_owned())?;
+        if ir.digest() != record.ir_digest
+            || ir.expected_revision().as_str() != record.revision
+            || ir.expected_change_diff_digest() != Some(record.change_diff_digest.as_str())
+        {
+            return Err("structural_preview_invalid".to_owned());
+        }
+        Ok(ir)
     }
 
     fn run(
@@ -1013,15 +1280,18 @@ struct SearchInput {
     path_prefixes: Vec<String>,
     languages: Vec<String>,
     #[serde(default)]
+    rewrite: Option<String>,
+    #[serde(default)]
     cursor: Option<SearchCursor>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SearchModeInput {
     Path,
     Content,
     PathAndContent,
+    Structural,
 }
 
 impl From<SearchModeInput> for SearchMode {
@@ -1030,6 +1300,9 @@ impl From<SearchModeInput> for SearchMode {
             SearchModeInput::Path => Self::Path,
             SearchModeInput::Content => Self::Content,
             SearchModeInput::PathAndContent => Self::PathAndContent,
+            SearchModeInput::Structural => {
+                unreachable!("structural search is dispatched separately")
+            }
         }
     }
 }
@@ -1194,6 +1467,29 @@ fn failed(code: &str) -> DispatchOutcome {
 fn digest(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn structural_preview_token_digest(token: &str) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(b"kit-structural-preview-token-v1\0");
+    hash.update(token.as_bytes());
+    hash.finalize().into()
+}
+
+fn settle_result_bytes(value: &mut Value) -> Result<(), String> {
+    value["result_bytes"] = json!(0);
+    let mut size = 0;
+    loop {
+        let next = serde_json::to_vec(value)
+            .map_err(code("serialization_failed"))?
+            .len();
+        if next == size {
+            return Ok(());
+        }
+        size = next;
+        value["result_bytes"] = json!(size);
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1395,6 +1691,207 @@ mod tests {
         )
     }
 
+    #[test]
+    fn native_search_structural_rewrite_returns_bound_apply_without_writing() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        let source = directory.join("source/lib.rs");
+        std::fs::write(&source, "fn main() { let value = Some(1); }\n").unwrap();
+        let revision = dispatcher.revision().unwrap();
+        let input = serde_json::to_vec(&json!({
+            "expected_revision": revision.clone(),
+            "text": "Some($A)",
+            "mode": "structural",
+            "rewrite": "Ok($A)",
+            "path_prefixes": [],
+            "languages": ["rust"]
+        }))
+        .unwrap();
+
+        dispatcher.workspace_index(&revision).unwrap();
+        let syntax_metrics = dispatcher.syntax_index.metrics();
+        let (response, artifacts) = dispatcher.search(&input).unwrap();
+        assert_eq!(dispatcher.syntax_index.metrics(), syntax_metrics);
+        assert!(artifacts.is_empty());
+        assert_eq!(response["matches"].as_array().unwrap().len(), 1);
+        let apply = response["rewrite"]["apply"].as_object().unwrap();
+        assert_eq!(apply.len(), 1);
+        let token = apply["preview_token"].as_str().unwrap();
+        assert!(token.starts_with("kitsp1_"));
+        assert_eq!(token.len(), 71);
+        assert_eq!(
+            response["result_bytes"],
+            serde_json::to_vec(&response).unwrap().len()
+        );
+        assert!(
+            response["rewrite"]["change_diff"]
+                .as_str()
+                .unwrap()
+                .contains("+fn main() { let value = Ok(1); }")
+        );
+        assert!(!response.to_string().contains("replacement"));
+        assert!(!response.to_string().contains("expected_revision"));
+        assert_eq!(
+            std::fs::read_to_string(source).unwrap(),
+            "fn main() { let value = Some(1); }\n"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn changed_structural_preview(dispatcher: &mut NativeDispatcher) -> Value {
+        let revision = dispatcher.revision().unwrap();
+        dispatcher
+            .search(
+                &serde_json::to_vec(&json!({
+                    "expected_revision": revision,
+                    "text": "Some($A)",
+                    "mode": "structural",
+                    "rewrite": "Ok($A)",
+                    "path_prefixes": [],
+                    "languages": ["rust"]
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn structural_preview_token_is_scoped_single_use_and_returns_the_same_change_diff_string() {
+        let runner = CheckRunner::conformance([
+            ConformanceCheck::pass(b"diagnostics", b""),
+            ConformanceCheck::pass(b"typecheck", b""),
+            ConformanceCheck::pass(b"diagnostics", b""),
+            ConformanceCheck::pass(b"typecheck", b""),
+        ]);
+        let (directory, mut dispatcher) = dispatcher(Some(runner));
+        std::fs::write(
+            directory.join("source/lib.rs"),
+            "fn main() { let value = Some(1); }\n",
+        )
+        .unwrap();
+        let preview = changed_structural_preview(&mut dispatcher);
+        let token = preview["rewrite"]["apply"]["preview_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let change_diff = preview["rewrite"]["change_diff"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let owner = dispatcher.authenticated.clone();
+        let other = PrincipalId::generate().unwrap();
+        dispatcher.authenticated = AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
+            other,
+            dispatcher.config.project_id(),
+            dispatcher.grants.grants().iter().copied(),
+        ));
+        assert_eq!(
+            dispatcher.edit(
+                &serde_json::to_vec(&json!({"preview_token": token})).unwrap(),
+                attempt(&dispatcher),
+            ),
+            Err("structural_preview_invalid".to_owned())
+        );
+        dispatcher.authenticated = owner;
+        let input = serde_json::to_vec(&json!({"preview_token": token})).unwrap();
+        let owner_attempt = attempt(&dispatcher);
+        let (result, _, committed) = dispatcher.edit(&input, owner_attempt).unwrap();
+        assert!(committed);
+        assert!(result["change_diff"].is_string());
+        assert_eq!(result["change_diff"], change_diff);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("source/lib.rs")).unwrap(),
+            "fn main() { let value = Ok(1); }\n"
+        );
+        assert_eq!(
+            dispatcher.edit(&input, attempt(&dispatcher)),
+            Err("structural_preview_invalid".to_owned())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn identity_preview_has_no_token_and_expired_or_formatter_divergent_tokens_are_consumed() {
+        let runner = CheckRunner::conformance([
+            ConformanceCheck::pass(b"diagnostics", b""),
+            ConformanceCheck::pass(b"typecheck", b""),
+            ConformanceCheck::pass(b"diagnostics", b""),
+            ConformanceCheck::pass(b"typecheck", b""),
+        ]);
+        let (directory, mut dispatcher) = dispatcher(Some(runner));
+        let source = directory.join("source/lib.rs");
+        std::fs::write(&source, "fn main() { let value = Some(1); }\n").unwrap();
+        let revision = dispatcher.revision().unwrap();
+        let identity = dispatcher
+            .search(
+                &serde_json::to_vec(&json!({
+                    "expected_revision": revision,
+                    "text": "Some($A)",
+                    "mode": "structural",
+                    "rewrite": "Some($A)",
+                    "path_prefixes": [],
+                    "languages": ["rust"]
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(identity["rewrite"]["changed"], false);
+        assert!(identity["rewrite"].get("apply").is_none());
+
+        let expired = changed_structural_preview(&mut dispatcher);
+        let expired = expired["rewrite"]["apply"]["preview_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        dispatcher
+            .structural_previews
+            .entries
+            .values_mut()
+            .for_each(|record| record.expires = Instant::now());
+        assert_eq!(
+            dispatcher.edit(
+                &serde_json::to_vec(&json!({"preview_token": expired})).unwrap(),
+                attempt(&dispatcher),
+            ),
+            Err("structural_preview_invalid".to_owned())
+        );
+
+        let preview = changed_structural_preview(&mut dispatcher);
+        let token = preview["rewrite"]["apply"]["preview_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let path = crate::workspace::edit::ir::RootRelativePath::parse("lib.rs", 4096).unwrap();
+        dispatcher.formatter_required = true;
+        dispatcher.formatter = Some(NativeFormatterRuntime {
+            descriptor: crate::workspace::edit::format::FormatterDescriptor::new(
+                "rustfmt",
+                "test",
+                vec![path],
+            )
+            .unwrap(),
+            executor: test_support::formatter_executor(test_support::FormatterTestAction::Rewrite(
+                "lib.rs".to_owned(),
+                b"fn main() { let value = Ok( 1 ); }\n".to_vec(),
+            )),
+        });
+        let input = serde_json::to_vec(&json!({"preview_token": token})).unwrap();
+        assert_eq!(
+            dispatcher.edit(&input, attempt(&dispatcher)),
+            Err("edit_recovery_failed".to_owned())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "fn main() { let value = Some(1); }\n"
+        );
+        assert_eq!(
+            dispatcher.edit(&input, attempt(&dispatcher)),
+            Err("structural_preview_invalid".to_owned())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn protocol_server(
         responses: Vec<String>,
     ) -> (String, thread::JoinHandle<Vec<serde_json::Value>>) {
@@ -1493,6 +1990,103 @@ mod tests {
                 json!({"profile":"fast","targets":[]}),
             ),
         ]
+    }
+
+    #[test]
+    fn native_workspace_index_retains_tree_for_incremental_revision() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        let first_revision = dispatcher.revision().unwrap();
+        let (workspace, first_index) = dispatcher.workspace_index(&first_revision).unwrap();
+        assert_eq!(dispatcher.syntax_index.metrics().full_parses, 1);
+        let main = discover(
+            &workspace,
+            &first_index,
+            &DiscoverQuery {
+                terms: vec!["main".to_owned()],
+                roots: Vec::new(),
+                languages: vec!["rust".to_owned()],
+            },
+            &DiscoverOptions::default(),
+            None,
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .find(|result| result.symbol.as_deref() == Some("main"))
+        .unwrap();
+        assert_eq!(
+            (main.line, main.byte_start, main.byte_end),
+            (Some(1), Some(0), Some(12))
+        );
+
+        let updated_source = "fn updated_name() {\n    let changed = true;\n}\n";
+        std::fs::write(directory.join("source/lib.rs"), updated_source).unwrap();
+        let second_revision = dispatcher.revision().unwrap();
+        assert_ne!(second_revision, first_revision);
+        let (workspace, second_index) = dispatcher.workspace_index(&second_revision).unwrap();
+        assert_eq!(dispatcher.syntax_index.metrics().incremental_parses, 1);
+        assert_eq!(dispatcher.syntax_index.cache_usage().resident_files, 1);
+        let updated = discover(
+            &workspace,
+            &second_index,
+            &DiscoverQuery {
+                terms: vec!["updated_name".to_owned()],
+                roots: Vec::new(),
+                languages: vec!["rust".to_owned()],
+            },
+            &DiscoverOptions::default(),
+            None,
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .find(|result| result.symbol.as_deref() == Some("updated_name"))
+        .unwrap();
+        assert_eq!(updated.line, Some(1));
+        assert_eq!(updated.byte_start, Some(0));
+        assert_eq!(updated.byte_end, Some(updated_source.trim_end().len()));
+        assert_ne!(updated.byte_end, main.byte_end);
+        let records = &second_index
+            .entries()
+            .iter()
+            .find(|entry| entry.path == Path::new("lib.rs"))
+            .unwrap()
+            .syntax_records;
+        let updated_record = records
+            .iter()
+            .find(|record| record.display_name().value().as_str() == "updated_name")
+            .unwrap();
+        assert_eq!(updated_record.range().start_byte, 0);
+        assert_eq!(
+            updated_record.range().end_byte,
+            updated_source.trim_end().len()
+        );
+        assert_eq!(updated_record.range().start_line, 1);
+        assert_eq!(updated_record.range().end_line, 3);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.display_name().value().as_str() != "main")
+        );
+        let stale = discover(
+            &workspace,
+            &second_index,
+            &DiscoverQuery {
+                terms: vec!["main".to_owned()],
+                roots: Vec::new(),
+                languages: vec!["rust".to_owned()],
+            },
+            &DiscoverOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            stale
+                .results
+                .iter()
+                .all(|result| result.symbol.as_deref() != Some("main"))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn anthropic_tool_stream(inputs: &[(String, Value)]) -> String {
@@ -2035,8 +2629,35 @@ mod tests {
             "verified\n"
         );
         assert!(!result["verification"].is_null());
+        assert!(result["change_diff"].is_string());
         assert!(artifacts.len() >= 2);
         assert!(committed);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_empty_edit_creates_no_recovery_state_or_workspace_revision() {
+        let runner = CheckRunner::conformance([
+            ConformanceCheck::pass(b"diagnostics", b""),
+            ConformanceCheck::pass(b"typecheck", b""),
+            ConformanceCheck::pass(b"diagnostics", b""),
+            ConformanceCheck::pass(b"typecheck", b""),
+        ]);
+        let (directory, mut dispatcher) = dispatcher(Some(runner));
+        let revision = dispatcher.revision().unwrap();
+        let input = serde_json::to_vec(&json!({
+            "version": 1,
+            "expected_revision": revision,
+            "operations": []
+        }))
+        .unwrap();
+        assert_eq!(
+            dispatcher.edit(&input, attempt(&dispatcher)),
+            Err("edit_recovery_failed".to_owned())
+        );
+        assert_eq!(dispatcher.revision().unwrap(), revision);
+        assert!(!dispatcher.root.join(".kit-edit-recovery.manifest").exists());
+        assert!(!dispatcher.root.join(".kit-edit-recovery.ledger").exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

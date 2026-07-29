@@ -12,6 +12,7 @@ mod exec_cancel;
 mod fencing;
 mod lifecycle_cas;
 mod loop_restart;
+mod lsp_fencing;
 mod model_intent_outcome;
 mod process_reap;
 mod provider_interrupt;

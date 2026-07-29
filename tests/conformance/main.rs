@@ -27,6 +27,7 @@ mod handler_parity;
 mod harness_selfcheck;
 mod health_readiness;
 mod http_contract;
+mod lsp_facts;
 mod native_tools;
 mod process_output;
 mod prompt_determinism;
@@ -40,6 +41,8 @@ mod sched_budget;
 mod sse_cursor;
 mod store_append;
 mod store_projection;
+mod structural_rewrite;
+mod syntax_index;
 mod telemetry_export;
 mod terminal_lease;
 #[allow(clippy::duplicate_mod)]

@@ -1554,16 +1554,27 @@ components:
       additionalProperties: false
     RepositorySearchInput:
       $schema: https://json-schema.org/draft/2020-12/schema
-      type: object
-      required: [expected_revision, text, mode, path_prefixes, languages]
-      properties:
-        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
-        text: {type: string, minLength: 1, maxLength: 4096}
-        mode: {enum: [path, content, path_and_content]}
-        path_prefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
-        languages: {type: array, maxItems: 32, items: {type: string}}
-        cursor: {type: [object, 'null']}
-      additionalProperties: false
+      oneOf:
+        - type: object
+          required: [expected_revision, text, mode, path_prefixes, languages]
+          properties:
+            expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+            text: {type: string, minLength: 1, maxLength: 4096}
+            mode: {enum: [path, content, path_and_content]}
+            path_prefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+            languages: {type: array, maxItems: 32, items: {type: string}}
+            cursor: {type: [object, 'null']}
+          additionalProperties: false
+        - type: object
+          required: [expected_revision, text, mode, path_prefixes, languages]
+          properties:
+            expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+            text: {type: string, minLength: 1, maxLength: 4096}
+            mode: {const: structural}
+            path_prefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+            languages: {type: array, maxItems: 32, items: {type: string}}
+            rewrite: {type: [string, 'null'], minLength: 1, maxLength: 4096}
+          additionalProperties: false
     RepositoryReadInput:
       $schema: https://json-schema.org/draft/2020-12/schema
       type: object
@@ -1580,40 +1591,47 @@ components:
     RepositoryEditInput:
       $id: kit.native.edit.input.v1
       $schema: https://json-schema.org/draft/2020-12/schema
-      type: object
-      required: [version, expected_revision, operations]
-      properties:
-        version: {const: 1}
-        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
-        operations:
-          type: array
-          maxItems: 1000
-          items:
-            oneOf:
-              - type: object
-                required: [op, path, content, executable]
-                properties: {op: {const: add_file}, path: {type: string, minLength: 1}, content: {$ref: '#/components/schemas/RepositoryTextContent'}, executable: {type: boolean}}
-                additionalProperties: false
-              - type: object
-                required: [op, path, base_digest]
-                properties: {op: {const: delete_file}, path: {type: string, minLength: 1}, base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}}
-                additionalProperties: false
-              - type: object
-                required: [op, from, to, base_digest]
-                properties: {op: {const: move_file}, from: {type: string, minLength: 1}, to: {type: string, minLength: 1}, base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}}
-                additionalProperties: false
-              - type: object
-                required: [op, path, base_digest, range, expected, replacement, executable]
-                properties:
-                  op: {const: replace_range}
-                  path: {type: string, minLength: 1}
-                  base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}
-                  range: {type: object, required: [start, end], properties: {start: {type: integer, minimum: 0}, end: {type: integer, minimum: 0}}, additionalProperties: false}
-                  expected: {$ref: '#/components/schemas/RepositoryTextContent'}
-                  replacement: {$ref: '#/components/schemas/RepositoryTextContent'}
-                  executable: {enum: [preserve, executable, non_executable]}
-                additionalProperties: false
-      additionalProperties: false
+      oneOf:
+        - type: object
+          required: [version, expected_revision, operations]
+          properties:
+            version: {const: 1}
+            expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+            expected_change_diff_digest: {type: string, pattern: '^blake3:[0-9a-f]{64}$'}
+            operations:
+              type: array
+              maxItems: 1000
+              items:
+                oneOf:
+                  - type: object
+                    required: [op, path, content, executable]
+                    properties: {op: {const: add_file}, path: {type: string, minLength: 1}, content: {$ref: '#/components/schemas/RepositoryTextContent'}, executable: {type: boolean}}
+                    additionalProperties: false
+                  - type: object
+                    required: [op, path, base_digest]
+                    properties: {op: {const: delete_file}, path: {type: string, minLength: 1}, base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}}
+                    additionalProperties: false
+                  - type: object
+                    required: [op, from, to, base_digest]
+                    properties: {op: {const: move_file}, from: {type: string, minLength: 1}, to: {type: string, minLength: 1}, base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}}
+                    additionalProperties: false
+                  - type: object
+                    required: [op, path, base_digest, range, expected, replacement, executable]
+                    properties:
+                      op: {const: replace_range}
+                      path: {type: string, minLength: 1}
+                      base_digest: {$ref: '#/components/schemas/RepositoryContentDigest'}
+                      range: {type: object, required: [start, end], properties: {start: {type: integer, minimum: 0}, end: {type: integer, minimum: 0}}, additionalProperties: false}
+                      expected: {$ref: '#/components/schemas/RepositoryTextContent'}
+                      replacement: {$ref: '#/components/schemas/RepositoryTextContent'}
+                      executable: {enum: [preserve, executable, non_executable]}
+                    additionalProperties: false
+          additionalProperties: false
+        - type: object
+          required: [preview_token]
+          properties:
+            preview_token: {type: string, pattern: '^kitsp1_[0-9a-f]{64}$'}
+          additionalProperties: false
     RepositoryTextContent:
       type: object
       required: [encoding, newline, text, final_newline]

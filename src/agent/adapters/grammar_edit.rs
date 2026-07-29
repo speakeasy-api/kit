@@ -732,6 +732,39 @@ impl EditOrchestrator {
             trace,
         )
         .map_err(GrammarEditError::Normalize)?;
+        Self::execute_native_ir(
+            ir,
+            context,
+            authenticated,
+            grants,
+            config,
+            artifacts,
+            cancellation,
+            registry,
+            runner,
+            secrets,
+            syntax_executors,
+            services,
+            trace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_native_ir(
+        ir: EditIr,
+        context: &GrammarEditContext,
+        authenticated: &crate::api::auth::contract::AuthenticatedPrincipal,
+        grants: &crate::api::auth::contract::GrantSnapshot,
+        config: &RunConfigSnapshot,
+        artifacts: &crate::store::artifacts::ArtifactStore,
+        cancellation: &Arc<AtomicBool>,
+        registry: &crate::verify::profiles::VerificationRegistry,
+        runner: &mut crate::executor::check::CheckRunner,
+        secrets: &[crate::domain::secret::SecretLease],
+        syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
+        services: NativeEditServices<'_>,
+        trace: &mut impl EditTrace,
+    ) -> Result<NativeEditOutcome, EditOrchestrationError> {
         ensure_not_cancelled(Some(cancellation))?;
         let authority =
             crate::workspace::edit::validate::AuthenticatedEditAuthority::from_authenticated(

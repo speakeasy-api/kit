@@ -66,6 +66,7 @@ pub struct StagedEdit<'workspace> {
     workspace_digest: String,
     changes: Vec<super::StageChange>,
     operations: Vec<StagedOperation>,
+    expected_change_diff_digest: Option<String>,
     feedback_mapping: crate::verify::feedback::EditMapping,
     formatter: Option<super::FormatterCapture>,
     final_snapshot: Snapshot,
@@ -180,6 +181,10 @@ impl<'workspace> StagedEdit<'workspace> {
 
     pub(crate) fn operations(&self) -> &[StagedOperation] {
         &self.operations
+    }
+
+    pub(crate) fn expected_change_diff_digest(&self) -> Option<&str> {
+        self.expected_change_diff_digest.as_deref()
     }
 
     pub(crate) fn feedback_mapping(&self) -> &crate::verify::feedback::EditMapping {
@@ -590,6 +595,7 @@ pub fn stage<'workspace>(
         workspace_digest,
         changes,
         operations,
+        expected_change_diff_digest: plan.expected_change_diff_digest,
         feedback_mapping,
         formatter: formatter_capture,
         final_snapshot: current,

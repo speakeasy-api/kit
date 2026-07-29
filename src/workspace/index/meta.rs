@@ -1,13 +1,21 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     mem::size_of,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use crate::workspace::revision::{
     ContentDigest, EntryKind, EpochId, ManagedWorkspace, RevisionError, RevisionId, Snapshot,
 };
+use crate::workspace::syntax::{
+    LanguageDescriptor, SyntacticSymbolRecord, SyntaxError, SyntaxIndex, SyntaxOptions,
+    metadata_syntactic_record_logical_weight,
+};
+
+const SYNTAX_SLICE_LOGICAL_WEIGHT: usize = 2 * size_of::<usize>();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexOptions {
@@ -23,6 +31,9 @@ pub struct IndexOptions {
     pub max_matcher_work_bytes: usize,
     pub max_symbols_per_file: usize,
     pub max_symbol_bytes: usize,
+    pub max_syntax_records: usize,
+    /// Conservative deterministic metadata syntax weight, not allocator bytes or RSS.
+    pub max_syntax_logical_weight: usize,
     pub max_build_time: Duration,
 }
 
@@ -41,6 +52,8 @@ impl Default for IndexOptions {
             max_matcher_work_bytes: 64 * 1024,
             max_symbols_per_file: 256,
             max_symbol_bytes: 64 * 1024,
+            max_syntax_records: 65_536,
+            max_syntax_logical_weight: 128 * 1024 * 1024,
             max_build_time: Duration::from_secs(10),
         }
     }
@@ -80,12 +93,20 @@ pub struct MetadataEntry {
     pub language: Option<String>,
     pub content_state: ContentState,
     pub symbols: Vec<BasicSymbol>,
-    text: Option<String>,
+    pub syntax_records: Arc<[SyntacticSymbolRecord]>,
+    pub syntax_has_parse_errors: bool,
+    pub syntax_rejected_malformed: usize,
+    pub syntax_truncated: bool,
+    /// Known lower bound of syntactic declarations omitted from this entry.
+    pub syntax_omitted: usize,
+    syntax_digest: Option<[u8; 32]>,
+    source_digest: Option<[u8; 32]>,
+    text: Option<Arc<String>>,
 }
 
 impl MetadataEntry {
     pub(crate) fn text(&self) -> Option<&str> {
-        self.text.as_deref()
+        self.text.as_deref().map(String::as_str)
     }
 }
 
@@ -107,6 +128,9 @@ pub struct MetadataIndex {
     options_digest: [u8; 32],
     entries: Vec<MetadataEntry>,
     truncated: bool,
+    source_truncated: bool,
+    syntax_records: usize,
+    syntax_logical_weight: usize,
 }
 
 impl MetadataIndex {
@@ -114,6 +138,16 @@ impl MetadataIndex {
         workspace: &ManagedWorkspace,
         expected: RevisionId,
         options: &IndexOptions,
+    ) -> Result<Self, IndexError> {
+        let mut syntax = SyntaxIndex::new();
+        Self::build_with_syntax(workspace, expected, options, &mut syntax)
+    }
+
+    pub fn build_with_syntax(
+        workspace: &ManagedWorkspace,
+        expected: RevisionId,
+        options: &IndexOptions,
+        syntax: &mut SyntaxIndex,
     ) -> Result<Self, IndexError> {
         validate_options(options)?;
         let started = Instant::now();
@@ -135,48 +169,97 @@ impl MetadataIndex {
             max_content_bytes,
             deadline,
         )?;
-        let index = Self::from_snapshot_until(&snapshot, options, deadline)?;
-        workspace.validate_revision_until(expected, deadline)?;
-        Ok(index)
+        Self::from_snapshot_until_validated(&snapshot, options, deadline, syntax, || {
+            workspace
+                .validate_revision_until(expected, deadline)
+                .map(|_| ())
+                .map_err(IndexError::from)
+        })
     }
 
     pub fn from_snapshot(snapshot: &Snapshot, options: &IndexOptions) -> Result<Self, IndexError> {
+        let mut syntax = SyntaxIndex::new();
+        Self::from_snapshot_with_syntax(snapshot, options, &mut syntax)
+    }
+
+    pub fn from_snapshot_with_syntax(
+        snapshot: &Snapshot,
+        options: &IndexOptions,
+        syntax: &mut SyntaxIndex,
+    ) -> Result<Self, IndexError> {
         validate_options(options)?;
         let started = Instant::now();
         let deadline = started
             .checked_add(options.max_build_time)
             .unwrap_or(started);
-        Self::from_snapshot_until(snapshot, options, deadline)
+        Self::from_snapshot_until_validated(snapshot, options, deadline, syntax, || Ok(()))
+    }
+
+    fn from_snapshot_until_validated<F>(
+        snapshot: &Snapshot,
+        options: &IndexOptions,
+        deadline: Instant,
+        syntax: &mut SyntaxIndex,
+        validate: F,
+    ) -> Result<Self, IndexError>
+    where
+        F: FnOnce() -> Result<(), IndexError>,
+    {
+        let mut staged = syntax.fork()?;
+        let index = Self::from_snapshot_until(snapshot, options, deadline, &mut staged)?;
+        validate()?;
+        *syntax = staged;
+        Ok(index)
     }
 
     fn from_snapshot_until(
         snapshot: &Snapshot,
         options: &IndexOptions,
         deadline: Instant,
+        syntax: &mut SyntaxIndex,
     ) -> Result<Self, IndexError> {
+        syntax.begin_snapshot_before(deadline)?;
+        let result = Self::from_snapshot_until_inner(snapshot, options, deadline, syntax);
+        match result {
+            Ok((index, retained_rust_paths)) => {
+                syntax.finish_snapshot_before(deadline, retained_rust_paths.as_ref())?;
+                Ok(index)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn from_snapshot_until_inner(
+        snapshot: &Snapshot,
+        options: &IndexOptions,
+        deadline: Instant,
+        syntax: &mut SyntaxIndex,
+    ) -> Result<(Self, Option<BTreeSet<PathBuf>>), IndexError> {
         let rules = IgnoreRules::compile(snapshot, options, deadline)?;
+        let max_file_bytes = usize::try_from(options.max_file_bytes)
+            .map_err(|_| IndexError::InvalidOptions("file byte bound is out of range"))?;
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(options.max_entries.min(snapshot.entries().len()))
             .map_err(|_| IndexError::InvalidOptions("entry allocation failed"))?;
         let mut indexed_bytes = 0_u64;
         let mut truncated = false;
+        let mut source_truncated = false;
+        let mut scan_complete = true;
+        let mut retained_rust_paths = BTreeSet::new();
+        let mut syntax_record_count = 0_usize;
+        let mut syntax_logical_weight = 0_usize;
+        let mut syntax_output_exhausted = false;
 
         for source in snapshot.entries() {
-            if Instant::now() >= deadline {
-                truncated = true;
-                break;
-            }
+            check_deadline(deadline)?;
             validate_path(&source.path)?;
             let ignored = if private_path(&source.path) {
                 true
             } else {
                 match rules.ignored(&source.path, source.kind, deadline) {
                     Ok(ignored) => ignored,
-                    Err(IndexError::DeadlineExceeded) => {
-                        truncated = true;
-                        break;
-                    }
+                    Err(IndexError::DeadlineExceeded) => return Err(IndexError::DeadlineExceeded),
                     Err(error) => return Err(error),
                 }
             };
@@ -185,6 +268,8 @@ impl MetadataIndex {
             }
             if entries.len() == options.max_entries {
                 truncated = true;
+                source_truncated = true;
+                scan_complete = false;
                 break;
             }
             let path_text = source
@@ -193,31 +278,176 @@ impl MetadataIndex {
                 .ok_or_else(|| IndexError::NonUtf8Path(source.path.clone()))?;
             let size = source.size;
             let language = language(path_text).map(str::to_owned);
-            let (content_state, text, symbols) = if source.kind == EntryKind::Directory {
-                (ContentState::Directory, None, Vec::new())
+            let (
+                content_state,
+                text,
+                symbols,
+                syntax_records,
+                syntax_has_parse_errors,
+                syntax_rejected_malformed,
+                syntax_truncated,
+                syntax_omitted,
+                syntax_digest,
+                source_digest,
+            ) = if source.kind == EntryKind::Directory {
+                empty_content(ContentState::Directory)
             } else if size > options.max_file_bytes {
-                (ContentState::TooLarge, None, Vec::new())
+                empty_content(ContentState::TooLarge)
             } else if source.has_nul {
-                (ContentState::Binary, None, Vec::new())
+                empty_content(ContentState::Binary)
             } else if !source.valid_utf8 {
-                (ContentState::InvalidUtf8, None, Vec::new())
+                empty_content(ContentState::InvalidUtf8)
             } else if !source.content_complete {
                 truncated = true;
-                (ContentState::IndexLimit, None, Vec::new())
+                source_truncated = true;
+                scan_complete = false;
+                empty_content(ContentState::IndexLimit)
             } else if let Ok(value) = std::str::from_utf8(&source.bytes) {
                 if indexed_bytes.saturating_add(size) > options.max_indexed_bytes {
                     truncated = true;
-                    (ContentState::IndexLimit, None, Vec::new())
+                    source_truncated = true;
+                    scan_complete = false;
+                    empty_content(ContentState::IndexLimit)
                 } else {
                     indexed_bytes += size;
-                    let mut text = String::new();
-                    text.try_reserve_exact(value.len())
-                        .map_err(|_| IndexError::InvalidOptions("text allocation failed"))?;
-                    text.push_str(value);
+                    let (
+                        text,
+                        symbols,
+                        syntax_records,
+                        syntax_has_parse_errors,
+                        syntax_rejected_malformed,
+                        syntax_digest,
+                        source_digest,
+                        syntax_truncated,
+                        syntax_omitted,
+                    ) = if language.as_deref() == Some("rust") {
+                        check_deadline(deadline)?;
+                        retained_rust_paths.insert(source.path.clone());
+                        if syntax_output_exhausted {
+                            (
+                                copy_text_before(value, deadline)?,
+                                Vec::new(),
+                                Arc::from([]),
+                                false,
+                                0,
+                                None,
+                                Some(digest_bytes_before(&source.bytes, deadline)?),
+                                true,
+                                0,
+                            )
+                        } else {
+                            let result = syntax.index_snapshot_source_before(
+                                snapshot.revision().id(),
+                                &source.path,
+                                "rust",
+                                &source.bytes,
+                                &LanguageDescriptor::rust(),
+                                &SyntaxOptions {
+                                    max_path_bytes: 256 * 1024,
+                                    max_source_bytes: max_file_bytes,
+                                    max_query_bytes: 64 * 1024,
+                                    max_captures: options
+                                        .max_symbols_per_file
+                                        .saturating_mul(16)
+                                        .min(65_536),
+                                    max_scope_weight: options
+                                        .max_symbol_bytes
+                                        .saturating_mul(32)
+                                        .min(16 * 1024 * 1024),
+                                    max_symbols: options.max_symbols_per_file,
+                                    max_symbol_bytes: options.max_symbol_bytes,
+                                },
+                                deadline,
+                            )?;
+                            let mut retained = Vec::new();
+                            retained
+                                .try_reserve_exact(
+                                    result.records.len().min(
+                                        options
+                                            .max_syntax_records
+                                            .saturating_sub(syntax_record_count),
+                                    ),
+                                )
+                                .map_err(|_| {
+                                    IndexError::InvalidOptions("syntax record allocation failed")
+                                })?;
+                            let mut added_weight = 0_usize;
+                            for record in result.records.iter() {
+                                check_deadline(deadline)?;
+                                let record_weight =
+                                    metadata_syntactic_record_logical_weight(record);
+                                let slice_weight = if retained.is_empty() {
+                                    SYNTAX_SLICE_LOGICAL_WEIGHT
+                                } else {
+                                    0
+                                };
+                                if syntax_record_count.saturating_add(retained.len())
+                                    == options.max_syntax_records
+                                    || syntax_logical_weight
+                                        .saturating_add(added_weight)
+                                        .saturating_add(slice_weight)
+                                        .saturating_add(record_weight)
+                                        > options.max_syntax_logical_weight
+                                {
+                                    break;
+                                }
+                                added_weight = added_weight
+                                    .saturating_add(slice_weight)
+                                    .saturating_add(record_weight);
+                                retained.push(record.clone());
+                            }
+                            check_deadline(deadline)?;
+                            let aggregate_omitted =
+                                result.records.len().saturating_sub(retained.len());
+                            syntax_record_count += retained.len();
+                            syntax_logical_weight += added_weight;
+                            syntax_output_exhausted = aggregate_omitted != 0
+                                || syntax_record_count == options.max_syntax_records
+                                || syntax_logical_weight == options.max_syntax_logical_weight;
+                            let records = if retained.len() == result.records.len() {
+                                Arc::clone(&result.records)
+                            } else {
+                                Arc::from(retained)
+                            };
+                            (
+                                result.source(),
+                                Vec::new(),
+                                records,
+                                result.has_parse_errors,
+                                result.rejected_malformed,
+                                Some(result.canonical_digest),
+                                Some(result.identity.source_digest()),
+                                result.truncated || aggregate_omitted != 0,
+                                result.omitted.saturating_add(aggregate_omitted),
+                            )
+                        }
+                    } else {
+                        let basic = lexical_symbols(value, options, deadline)?;
+                        let source_digest = digest_bytes_before(&source.bytes, deadline)?;
+                        (
+                            copy_text_before(value, deadline)?,
+                            basic,
+                            Arc::from([]),
+                            false,
+                            0,
+                            None,
+                            Some(source_digest),
+                            false,
+                            0,
+                        )
+                    };
+                    truncated |= syntax_truncated;
                     (
                         ContentState::Text,
                         Some(text),
-                        lexical_symbols(value, options, deadline)?,
+                        symbols,
+                        syntax_records,
+                        syntax_has_parse_errors,
+                        syntax_rejected_malformed,
+                        syntax_truncated,
+                        syntax_omitted,
+                        syntax_digest,
+                        source_digest,
                     )
                 }
             } else {
@@ -233,21 +463,42 @@ impl MetadataIndex {
                 language,
                 content_state,
                 symbols,
+                syntax_records,
+                syntax_has_parse_errors,
+                syntax_rejected_malformed,
+                syntax_truncated,
+                syntax_omitted,
+                syntax_digest,
+                source_digest,
                 text,
             });
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let options_digest = digest_options(options, deadline)?;
-        let index_digest = digest_index(snapshot, &entries, options_digest, truncated, deadline)?;
-        Ok(Self {
-            epoch: snapshot.revision().epoch(),
-            revision: snapshot.revision().id(),
-            digest: snapshot.revision().digest().clone(),
-            index_digest,
+        let index_digest = digest_index(
+            snapshot,
+            &entries,
             options_digest,
-            entries,
             truncated,
-        })
+            source_truncated,
+            deadline,
+        )?;
+        check_deadline(deadline)?;
+        Ok((
+            Self {
+                epoch: snapshot.revision().epoch(),
+                revision: snapshot.revision().id(),
+                digest: snapshot.revision().digest().clone(),
+                index_digest,
+                options_digest,
+                entries,
+                truncated,
+                source_truncated,
+                syntax_records: syntax_record_count,
+                syntax_logical_weight,
+            },
+            scan_complete.then_some(retained_rust_paths),
+        ))
     }
 
     pub fn epoch(&self) -> EpochId {
@@ -272,6 +523,18 @@ impl MetadataIndex {
 
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    pub fn source_truncated(&self) -> bool {
+        self.source_truncated
+    }
+
+    pub fn syntax_record_count(&self) -> usize {
+        self.syntax_records
+    }
+
+    pub fn syntax_logical_weight(&self) -> usize {
+        self.syntax_logical_weight
     }
 
     pub fn cursor(&self) -> IndexCursor {
@@ -316,6 +579,7 @@ pub enum IndexError {
     IgnoreLimit(&'static str),
     DeadlineExceeded,
     CursorMismatch,
+    Syntax(SyntaxError),
 }
 
 impl From<RevisionError> for IndexError {
@@ -325,6 +589,15 @@ impl From<RevisionError> for IndexError {
                 Self::DeadlineExceeded
             }
             value => Self::Revision(value),
+        }
+    }
+}
+
+impl From<SyntaxError> for IndexError {
+    fn from(value: SyntaxError) -> Self {
+        match value {
+            SyntaxError::ParseTimeout | SyntaxError::QueryTimeout => Self::DeadlineExceeded,
+            value => Self::Syntax(value),
         }
     }
 }
@@ -348,6 +621,7 @@ impl fmt::Display for IndexError {
             Self::IgnoreLimit(kind) => write!(formatter, "gitignore {kind} limit exceeded"),
             Self::DeadlineExceeded => formatter.write_str("metadata index deadline exceeded"),
             Self::CursorMismatch => formatter.write_str("index cursor does not match this index"),
+            Self::Syntax(error) => error.fmt(formatter),
         }
     }
 }
@@ -356,6 +630,7 @@ impl std::error::Error for IndexError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Revision(error) => Some(error),
+            Self::Syntax(error) => Some(error),
             _ => None,
         }
     }
@@ -374,6 +649,8 @@ fn validate_options(options: &IndexOptions) -> Result<(), IndexError> {
         || options.max_matcher_work_bytes == 0
         || options.max_symbols_per_file == 0
         || options.max_symbol_bytes == 0
+        || options.max_syntax_records == 0
+        || options.max_syntax_logical_weight == 0
         || options.max_build_time.is_zero()
     {
         Err(IndexError::InvalidOptions("all bounds must be nonzero"))
@@ -469,7 +746,10 @@ fn lexical_symbols(
         let mut name = String::new();
         name.try_reserve_exact(rest.len().min(options.max_symbol_bytes))
             .map_err(|_| IndexError::InvalidOptions("symbol allocation failed"))?;
-        for value in rest.chars() {
+        for (character_index, value) in rest.chars().enumerate() {
+            if character_index % 1024 == 0 {
+                check_deadline(deadline)?;
+            }
             if !value.is_alphanumeric() && value != '_' && value != '$' {
                 break;
             }
@@ -505,6 +785,34 @@ fn lexical_symbols(
         });
     }
     Ok(symbols)
+}
+
+type EmptyContent = (
+    ContentState,
+    Option<Arc<String>>,
+    Vec<BasicSymbol>,
+    Arc<[SyntacticSymbolRecord]>,
+    bool,
+    usize,
+    bool,
+    usize,
+    Option<[u8; 32]>,
+    Option<[u8; 32]>,
+);
+
+fn empty_content(state: ContentState) -> EmptyContent {
+    (
+        state,
+        None,
+        Vec::new(),
+        Arc::from([]),
+        false,
+        0,
+        false,
+        0,
+        None,
+        None,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -870,6 +1178,36 @@ fn check_deadline(deadline: Instant) -> Result<(), IndexError> {
     }
 }
 
+fn digest_bytes_before(bytes: &[u8], deadline: Instant) -> Result<[u8; 32], IndexError> {
+    let mut hash = blake3::Hasher::new();
+    for chunk in bytes.chunks(64 * 1024) {
+        check_deadline(deadline)?;
+        hash.update(chunk);
+    }
+    check_deadline(deadline)?;
+    Ok(*hash.finalize().as_bytes())
+}
+
+fn copy_text_before(value: &str, deadline: Instant) -> Result<Arc<String>, IndexError> {
+    let mut text = String::new();
+    text.try_reserve_exact(value.len())
+        .map_err(|_| IndexError::InvalidOptions("text allocation failed"))?;
+    let mut start = 0_usize;
+    while start < value.len() {
+        check_deadline(deadline)?;
+        let mut end = start.saturating_add(64 * 1024).min(value.len());
+        while end < value.len() && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str(&value[start..end]);
+        start = end;
+    }
+    check_deadline(deadline)?;
+    let text = Arc::new(text);
+    check_deadline(deadline)?;
+    Ok(text)
+}
+
 fn ignore_error(path: &Path, line: usize, reason: &'static str) -> IndexError {
     IndexError::InvalidIgnore {
         path: path.to_owned(),
@@ -936,7 +1274,7 @@ fn segment_match(pattern: &str, value: &str, deadline: Instant) -> Result<bool, 
 
 fn digest_options(options: &IndexOptions, deadline: Instant) -> Result<[u8; 32], IndexError> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"kit-metadata-index-options-v1\0");
+    hash.update(b"kit-metadata-index-options-v2\0");
     for value in [
         options.max_entries as u128,
         options.max_indexed_bytes as u128,
@@ -950,6 +1288,8 @@ fn digest_options(options: &IndexOptions, deadline: Instant) -> Result<[u8; 32],
         options.max_matcher_work_bytes as u128,
         options.max_symbols_per_file as u128,
         options.max_symbol_bytes as u128,
+        options.max_syntax_records as u128,
+        options.max_syntax_logical_weight as u128,
         options.max_build_time.as_nanos(),
     ] {
         check_deadline(deadline)?;
@@ -964,27 +1304,309 @@ fn digest_index(
     entries: &[MetadataEntry],
     options: [u8; 32],
     truncated: bool,
+    source_truncated: bool,
     deadline: Instant,
 ) -> Result<[u8; 32], IndexError> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"kit-metadata-index-v1\0");
+    hash.update(b"kit-metadata-index-v4\0");
     hash.update(snapshot.revision().digest().as_str().as_bytes());
     hash.update(&options);
     hash.update(&[u8::from(truncated)]);
+    hash.update(&[u8::from(source_truncated)]);
+    hash.update(&(entries.len() as u64).to_le_bytes());
     for entry in entries {
         check_deadline(deadline)?;
-        hash.update(&(entry.path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
-        hash.update(entry.path.as_os_str().as_encoded_bytes());
-        hash.update(&(entry.size).to_le_bytes());
-        hash.update(&[
-            entry.kind as u8,
-            entry.content_state as u8,
-            u8::from(entry.executable),
-        ]);
-        if let Some(text) = &entry.text {
-            hash.update(blake3::hash(text.as_bytes()).as_bytes());
-        }
+        hash.update(&digest_entry(entry, deadline)?);
     }
     check_deadline(deadline)?;
     Ok(*hash.finalize().as_bytes())
+}
+
+fn digest_entry(entry: &MetadataEntry, deadline: Instant) -> Result<[u8; 32], IndexError> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"kit-metadata-entry-v1\0");
+    frame_before(
+        &mut hash,
+        entry.path.as_os_str().as_encoded_bytes(),
+        deadline,
+    )?;
+    hash.update(&(entry.size).to_le_bytes());
+    hash.update(&[
+        entry.kind as u8,
+        entry.content_state as u8,
+        u8::from(entry.executable),
+    ]);
+    if let Some(language) = &entry.language {
+        hash.update(&[1]);
+        frame_before(&mut hash, language.as_bytes(), deadline)?;
+    } else {
+        hash.update(&[0]);
+    }
+    if let Some(source_digest) = entry.source_digest {
+        hash.update(&[1]);
+        hash.update(&source_digest);
+    } else {
+        hash.update(&[0]);
+    }
+    match entry.syntax_digest {
+        Some(digest) => {
+            hash.update(&[1]);
+            hash.update(&digest);
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    hash.update(&[u8::from(entry.syntax_truncated)]);
+    hash.update(&(entry.syntax_omitted as u128).to_le_bytes());
+    hash.update(&(entry.syntax_records.len() as u128).to_le_bytes());
+    for record in entry.syntax_records.iter() {
+        check_deadline(deadline)?;
+        hash.update(&record.canonical_digest_before(deadline)?);
+    }
+    digest_lexical_symbols(&mut hash, &entry.symbols, deadline)?;
+    check_deadline(deadline)?;
+    Ok(*hash.finalize().as_bytes())
+}
+
+fn digest_lexical_symbols(
+    hash: &mut blake3::Hasher,
+    symbols: &[BasicSymbol],
+    deadline: Instant,
+) -> Result<(), IndexError> {
+    hash.update(&(symbols.len() as u64).to_le_bytes());
+    for symbol in symbols {
+        check_deadline(deadline)?;
+        frame_before(hash, symbol.name.as_bytes(), deadline)?;
+        hash.update(&[symbol.kind as u8]);
+        hash.update(&(symbol.line as u128).to_le_bytes());
+    }
+    check_deadline(deadline)
+}
+
+fn frame_before(
+    hash: &mut blake3::Hasher,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), IndexError> {
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    for chunk in bytes.chunks(64 * 1024) {
+        check_deadline(deadline)?;
+        hash.update(chunk);
+    }
+    check_deadline(deadline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::revision::RevisionOptions;
+    use crate::workspace::syntax::{LanguageDescriptor, ParseAction, SyntaxOptions};
+    use std::fs;
+
+    struct TransactionFixture {
+        root: PathBuf,
+        workspace_path: PathBuf,
+    }
+
+    impl TransactionFixture {
+        fn new() -> Self {
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random).unwrap();
+            let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "kit-metadata-transaction-{}",
+                random
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ));
+            let workspace_path = root.join("workspace");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&workspace_path).unwrap();
+            Self {
+                root,
+                workspace_path,
+            }
+        }
+
+        fn write(&self, path: &str, source: &str) {
+            fs::write(self.workspace_path.join(path), source).unwrap();
+        }
+
+        fn open(&self) -> ManagedWorkspace {
+            ManagedWorkspace::open_with_options(
+                &self.workspace_path,
+                RevisionOptions {
+                    max_entries: 1_000,
+                    max_name_bytes: 1024 * 1024,
+                    max_bytes: 16 * 1024 * 1024,
+                    max_memory_bytes: 32 * 1024 * 1024,
+                    max_depth: 64,
+                    max_scan_time: Duration::from_secs(5),
+                    max_scan_attempts: 2,
+                    watcher_interval: Duration::from_millis(5),
+                    reconciliation_interval: Duration::from_secs(60),
+                    metadata_path: Some(self.root.join("revision.state")),
+                },
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for TransactionFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn cached_action(
+        syntax: &SyntaxIndex,
+        revision: RevisionId,
+        path: &str,
+        source: &[u8],
+    ) -> ParseAction {
+        let mut probe = syntax.fork().unwrap();
+        probe.clear_fail_path_for_test();
+        probe
+            .index_snapshot_source_before(
+                revision,
+                Path::new(path),
+                "rust",
+                source,
+                &LanguageDescriptor::rust(),
+                &SyntaxOptions::default(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap()
+            .action
+    }
+
+    #[test]
+    fn lexical_symbol_digest_frames_sequence_boundaries() {
+        let digest = |names: &[&str]| {
+            let symbols = names
+                .iter()
+                .enumerate()
+                .map(|(line, name)| BasicSymbol {
+                    name: (*name).to_owned(),
+                    kind: SymbolKind::Function,
+                    line: line + 1,
+                })
+                .collect::<Vec<_>>();
+            let mut hash = blake3::Hasher::new();
+            digest_lexical_symbols(&mut hash, &symbols, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            *hash.finalize().as_bytes()
+        };
+        assert_ne!(digest(&["a", "bc"]), digest(&["ab", "c"]));
+        assert_ne!(digest(&["abc"]), digest(&["a", "bc"]));
+    }
+
+    #[test]
+    fn metadata_entry_digest_frames_entry_boundaries() {
+        let entry = |path: &str| MetadataEntry {
+            path: PathBuf::from(path),
+            kind: EntryKind::File,
+            executable: false,
+            size: 0,
+            language: None,
+            content_state: ContentState::Text,
+            symbols: Vec::new(),
+            syntax_records: Arc::from([]),
+            syntax_has_parse_errors: false,
+            syntax_rejected_malformed: 0,
+            syntax_truncated: false,
+            syntax_omitted: 0,
+            syntax_digest: None,
+            source_digest: None,
+            text: Some(Arc::new(String::new())),
+        };
+        let sequence = |paths: &[&str]| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut hash = blake3::Hasher::new();
+            hash.update(&(paths.len() as u64).to_le_bytes());
+            for path in paths {
+                hash.update(&digest_entry(&entry(path), deadline).unwrap());
+            }
+            *hash.finalize().as_bytes()
+        };
+        assert_ne!(sequence(&["a", "bc"]), sequence(&["ab", "c"]));
+        assert_ne!(sequence(&["abc"]), sequence(&["a", "bc"]));
+    }
+
+    #[test]
+    fn persistent_syntax_build_publishes_only_after_every_final_gate() {
+        let fixture = TransactionFixture::new();
+        fixture.write("a.rs", "fn old_a() {}\n");
+        fixture.write("z.rs", "fn old_z() {}\n");
+        let workspace = fixture.open();
+        let original_revision = workspace.current_revision().unwrap().id();
+        let options = IndexOptions::default();
+        let mut syntax = SyntaxIndex::new();
+        MetadataIndex::build_with_syntax(&workspace, original_revision, &options, &mut syntax)
+            .unwrap();
+        assert_eq!(
+            cached_action(&syntax, original_revision, "a.rs", b"fn old_a() {}\n"),
+            ParseAction::Reused
+        );
+
+        fixture.write("a.rs", "fn new_a() {}\n");
+        fixture.write("z.rs", "fn new_z() {}\n");
+        let staged_revision = workspace.current_revision().unwrap().id();
+        let snapshot = workspace.snapshot(staged_revision).unwrap();
+
+        syntax.fail_path_for_test(PathBuf::from("z.rs"));
+        let before = syntax.test_state();
+        assert!(matches!(
+            MetadataIndex::from_snapshot_with_syntax(&snapshot, &options, &mut syntax),
+            Err(IndexError::DeadlineExceeded)
+        ));
+        assert_eq!(syntax.test_state(), before);
+        syntax.clear_fail_path_for_test();
+        assert_eq!(
+            cached_action(&syntax, original_revision, "a.rs", b"fn old_a() {}\n"),
+            ParseAction::Reused
+        );
+
+        let before = syntax.test_state();
+        assert!(matches!(
+            MetadataIndex::from_snapshot_until_validated(
+                &snapshot,
+                &options,
+                Instant::now() + Duration::from_secs(5),
+                &mut syntax,
+                || Err(IndexError::DeadlineExceeded),
+            ),
+            Err(IndexError::DeadlineExceeded)
+        ));
+        assert_eq!(syntax.test_state(), before);
+        assert_eq!(
+            cached_action(&syntax, original_revision, "a.rs", b"fn old_a() {}\n"),
+            ParseAction::Reused
+        );
+
+        let before = syntax.test_state();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            MetadataIndex::from_snapshot_until_validated(
+                &snapshot,
+                &options,
+                deadline,
+                &mut syntax,
+                || {
+                    fixture.write("later.rs", "fn later() {}\n");
+                    workspace
+                        .validate_revision_until(staged_revision, deadline)
+                        .map(|_| ())
+                        .map_err(IndexError::from)
+                },
+            ),
+            Err(IndexError::Revision(RevisionError::StaleRevision { .. }))
+        ));
+        assert_eq!(syntax.test_state(), before);
+        assert_eq!(
+            cached_action(&syntax, original_revision, "a.rs", b"fn old_a() {}\n"),
+            ParseAction::Reused
+        );
+    }
 }

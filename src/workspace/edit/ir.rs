@@ -4,7 +4,11 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::Error as _,
+    ser::{SerializeSeq, SerializeStruct},
+};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::domain::events::ContentDigest;
@@ -442,6 +446,8 @@ pub struct EditIr {
     version: u32,
     identity_policy: FilesystemIdentityPolicy,
     expected_revision: RevisionToken,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_change_diff_digest: Option<String>,
     operations: Vec<CanonicalOperation>,
 }
 
@@ -480,6 +486,7 @@ impl EditIr {
             version: EDIT_IR_VERSION,
             identity_policy: limits.identity_policy,
             expected_revision,
+            expected_change_diff_digest: None,
             operations: canonical,
         })
     }
@@ -496,8 +503,24 @@ impl EditIr {
         self.identity_policy
     }
 
+    pub fn expected_change_diff_digest(&self) -> Option<&str> {
+        self.expected_change_diff_digest.as_deref()
+    }
+
+    pub fn with_expected_change_diff_digest(mut self, digest: String) -> Result<Self, IrError> {
+        if !valid_change_diff_digest(&digest) {
+            return Err(IrError::InvalidChangeDiffDigest);
+        }
+        self.expected_change_diff_digest = Some(digest);
+        Ok(self)
+    }
+
     pub fn operations(&self) -> &[CanonicalOperation] {
         &self.operations
+    }
+
+    pub fn apply_payload(&self) -> EditApplyPayload<'_> {
+        EditApplyPayload(self)
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -545,7 +568,10 @@ impl EditIr {
             supplied_metadata.push((operation.id, operation.order));
             operations.push(operation.operation.into_operation(limits)?);
         }
-        let rebuilt = Self::new(parsed.expected_revision, operations, limits)?;
+        let mut rebuilt = Self::new(parsed.expected_revision, operations, limits)?;
+        if let Some(digest) = parsed.expected_change_diff_digest {
+            rebuilt = rebuilt.with_expected_change_diff_digest(digest)?;
+        }
         if supplied_metadata
             .iter()
             .zip(&rebuilt.operations)
@@ -566,7 +592,55 @@ struct WireEditIr {
     version: u32,
     identity_policy: FilesystemIdentityPolicy,
     expected_revision: RevisionToken,
+    #[serde(default)]
+    expected_change_diff_digest: Option<String>,
     operations: Vec<WireCanonicalOperation>,
+}
+
+pub struct EditApplyPayload<'a>(&'a EditIr);
+
+impl Serialize for EditApplyPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let ir = self.0;
+        let mut state = serializer.serialize_struct(
+            "EditApplyPayload",
+            3 + usize::from(ir.expected_change_diff_digest.is_some()),
+        )?;
+        state.serialize_field("version", &ir.version)?;
+        state.serialize_field("expected_revision", &ir.expected_revision)?;
+        if let Some(digest) = &ir.expected_change_diff_digest {
+            state.serialize_field("expected_change_diff_digest", digest)?;
+        }
+        state.serialize_field("operations", &ApplyOperations(&ir.operations))?;
+        state.end()
+    }
+}
+
+struct ApplyOperations<'a>(&'a [CanonicalOperation]);
+
+impl Serialize for ApplyOperations<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for operation in self.0 {
+            sequence.serialize_element(operation.operation())?;
+        }
+        sequence.end()
+    }
+}
+
+fn valid_change_diff_digest(value: &str) -> bool {
+    value.strip_prefix("blake3:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 #[derive(Deserialize)]
@@ -666,7 +740,7 @@ impl WireOperation {
     }
 }
 
-pub(super) fn preflight_json(bytes: &[u8], limits: EditLimits) -> Result<(), IrError> {
+pub(crate) fn preflight_json(bytes: &[u8], limits: EditLimits) -> Result<(), IrError> {
     let mut index = 0;
     let mut operations = 0_usize;
     let mut paths = 0_usize;
@@ -986,6 +1060,7 @@ fn detect_move_cycles(
 pub enum IrError {
     InvalidPath(String),
     InvalidRevision(String),
+    InvalidChangeDiffDigest,
     UnsupportedEncoding,
     BinaryContent,
     InvalidNewline,
@@ -1029,6 +1104,9 @@ impl fmt::Display for IrError {
             }
             Self::InvalidRevision(revision) => {
                 write!(formatter, "invalid workspace revision: {revision}")
+            }
+            Self::InvalidChangeDiffDigest => {
+                formatter.write_str("invalid expected change-diff digest")
             }
             Self::UnsupportedEncoding => formatter.write_str("content is not UTF-8"),
             Self::BinaryContent => formatter.write_str("binary content is unsupported"),

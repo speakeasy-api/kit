@@ -46,7 +46,8 @@ REQUIRED_IDS = {
     "protocol.mcp.rmcp_crate", "protocol.mcp.application", "schema.json.dialect",
     "toon.spec", "toon.spec_commit", "toon.spec_tarball_sha256",
     "toon.fixture_manifest_sha256", "toon.serde_toon2", "toon.conformance",
-    "grammar.runtime", "grammar.languages", "grammar.queries", "lsp.protocol",
+    "grammar.runtime", "grammar.languages", "grammar.queries",
+    "structural.ast_grep_core", "structural.ast_grep_language", "lsp.protocol",
     "lsp.position_encoding", "lsp.servers", "scip.schema", "scip.index",
     "harness.swe_bench_verified", "harness.swe_bench_multilingual",
     "harness.swe_bench_live", "harness.swe_bench_multimodal", "harness.terminal_bench_2_1",
@@ -1189,6 +1190,36 @@ def validate_repository(document, pins, errors, execute_candidate_tools=True):
     for item in lock_packages:
         if str(item.get("source", "")).startswith("registry+") and not HEX64.fullmatch(str(item.get("checksum", ""))):
             errors.append(f"Cargo.lock registry package lacks a SHA-256 checksum: {item.get('name')} {item.get('version')}")
+    structural_crates = {
+        "ast-grep-core": (
+            "tree-sitter",
+            "cd97b166e4a9b45b0337cad09f849607018c820489865488dd1cd0e7059c4f16",
+            "structural.ast_grep_core",
+        ),
+        "ast-grep-language": (
+            "tree-sitter-rust",
+            "79b5df85d2ad1dbd19ae78e73ef77e8f1eccd798ec918efd48d81a7072d55c46",
+            "structural.ast_grep_language",
+        ),
+    }
+    dependencies = cargo_toml.get("dependencies", {})
+    for name, (feature, checksum, pin_id) in structural_crates.items():
+        dependency = dependencies.get(name)
+        if dependency != {
+            "version": "=0.40.1",
+            "default-features": False,
+            "features": [feature],
+        }:
+            errors.append(f"Cargo.toml {name} must be exact 0.40.1 with only {feature} and default features disabled")
+        locked = [
+            item for item in lock_packages
+            if item.get("name") == name and item.get("version") == "0.40.1"
+        ]
+        if len(locked) != 1 or locked[0].get("checksum") != checksum:
+            errors.append(f"Cargo.lock {name} 0.40.1 checksum does not match the structural pin")
+        value = pins[pin_id]["value"]
+        if not all(token in value for token in (f"{name}=0.40.1", f"features={feature}", "default_features=false", f"crate_sha256={checksum}")):
+            errors.append(f"{pin_id} does not bind the exact Cargo dependency and checksum")
 
     metadata = run_metadata(errors) if execute_candidate_tools else None
     if metadata is not None:

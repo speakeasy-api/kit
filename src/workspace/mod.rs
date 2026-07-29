@@ -5,3 +5,4 @@ pub mod path_auth;
 pub mod read;
 pub mod revision;
 pub mod search;
+pub mod syntax;

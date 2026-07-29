@@ -78,6 +78,8 @@ pub struct MaterializedEdit {
     diff_artifact: ArtifactReference,
     diff_artifact_digest: ArtifactDigest,
     diff_preview: Vec<u8>,
+    change_diff: Vec<u8>,
+    change_diff_complete: bool,
     verification: crate::verify::profiles::VerificationReceipt,
     committed_with_cancel_race: bool,
 }
@@ -101,6 +103,14 @@ impl MaterializedEdit {
 
     pub fn diff_preview(&self) -> &[u8] {
         &self.diff_preview
+    }
+
+    pub fn change_diff(&self) -> &[u8] {
+        &self.change_diff
+    }
+
+    pub const fn change_diff_complete(&self) -> bool {
+        self.change_diff_complete
     }
 
     pub fn verification_receipt(&self) -> &crate::verify::profiles::VerificationReceipt {
@@ -320,6 +330,11 @@ pub enum RecoveryError {
     CorruptManifest,
     UnsafeEntry(String),
     StageChanged,
+    ChangeDiffMismatch {
+        expected: String,
+        actual: String,
+        complete: bool,
+    },
     Cancelled,
     Revision(crate::workspace::revision::RevisionError),
     Artifact(crate::store::artifacts::ArtifactError),
@@ -343,6 +358,14 @@ impl fmt::Display for RecoveryError {
             Self::CorruptManifest => formatter.write_str("edit recovery manifest is corrupt"),
             Self::UnsafeEntry(path) => write!(formatter, "unsafe materialization entry at {path}"),
             Self::StageChanged => formatter.write_str("staged edit changed before materialization"),
+            Self::ChangeDiffMismatch {
+                expected,
+                actual,
+                complete,
+            } => write!(
+                formatter,
+                "staged change diff does not match preview binding (expected {expected}, actual {actual}, complete={complete})"
+            ),
             Self::Cancelled => formatter.write_str("edit cancelled before revision commit"),
             Self::Revision(error) => error.fmt(formatter),
             Self::Artifact(error) => error.fmt(formatter),
@@ -395,12 +418,15 @@ impl From<std::io::Error> for RecoveryError {
 
 pub type RecoveryHook<'a> = &'a mut dyn FnMut(RecoveryPoint, usize) -> bool;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn result(
     transaction_id: String,
     revision: Revision,
     diff_artifact: ArtifactReference,
     diff_artifact_digest: ArtifactDigest,
     diff_preview: Vec<u8>,
+    change_diff: Vec<u8>,
+    change_diff_complete: bool,
     verification: crate::verify::profiles::VerificationReceipt,
 ) -> MaterializedEdit {
     MaterializedEdit {
@@ -409,6 +435,8 @@ pub(crate) fn result(
         diff_artifact,
         diff_artifact_digest,
         diff_preview,
+        change_diff,
+        change_diff_complete,
         verification,
         committed_with_cancel_race: false,
     }

@@ -71,6 +71,7 @@ pub struct ValidatedTransaction<'workspace> {
     effects: Vec<PlannedEffect>,
     expected_paths: Vec<ExpectedPath>,
     changed_files: Vec<RootRelativePath>,
+    expected_change_diff_digest: Option<String>,
     authority: Option<AuthenticatedEditAuthority>,
 }
 
@@ -187,6 +188,7 @@ pub(crate) struct PlanConsumption<'workspace> {
     pub(crate) effects: Vec<PlannedEffect>,
     pub(crate) expected_paths: Vec<ExpectedPath>,
     pub(crate) changed_files: Vec<RootRelativePath>,
+    pub(crate) expected_change_diff_digest: Option<String>,
     pub(crate) authority: Option<AuthenticatedEditAuthority>,
     pub(crate) operation_context: EditOperationContext,
 }
@@ -209,6 +211,7 @@ impl<'workspace> ValidatedTransaction<'workspace> {
             effects: self.effects,
             expected_paths: self.expected_paths,
             changed_files: self.changed_files,
+            expected_change_diff_digest: self.expected_change_diff_digest,
             authority: self.authority,
             operation_context,
         })
@@ -668,9 +671,14 @@ fn validate_inner<'workspace>(
         .map_err(map_path_error)?;
     hook("finalized", Path::new(""));
     check_deadline(deadline)?;
+    let expected_change_diff_digest = ir
+        .expected_change_diff_digest()
+        .map(|digest| clone_string(digest, &mut budget))
+        .transpose()?;
     let digest = plan_digest(
         &revision,
         authority,
+        expected_change_diff_digest.as_deref(),
         &effects,
         &expected_paths,
         &changed_files,
@@ -695,6 +703,7 @@ fn validate_inner<'workspace>(
         effects,
         expected_paths,
         changed_files,
+        expected_change_diff_digest,
         authority,
     })
 }
@@ -1312,9 +1321,11 @@ fn map_revision_error(error: RevisionError) -> ValidationError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_digest(
     revision: &Revision,
     authority: Option<AuthenticatedEditAuthority>,
+    expected_change_diff_digest: Option<&str>,
     effects: &[PlannedEffect],
     expected_paths: &[ExpectedPath],
     changed_files: &[RootRelativePath],
@@ -1322,7 +1333,7 @@ fn plan_digest(
     deadline: Instant,
 ) -> Result<String, ValidationError> {
     let mut hasher = blake3::Hasher::new();
-    frame(&mut hasher, b"kit-validated-edit-plan-v1");
+    frame(&mut hasher, b"kit-validated-edit-plan-v2");
     let revision_id = hex_id::<32, 66>(b'r', revision.id().as_bytes());
     let epoch_id = hex_id::<16, 34>(b'e', revision.epoch().as_bytes());
     frame(&mut hasher, &revision_id);
@@ -1334,6 +1345,10 @@ fn plan_digest(
     } else {
         frame(&mut hasher, b"unauthenticated");
     }
+    frame(
+        &mut hasher,
+        expected_change_diff_digest.unwrap_or("").as_bytes(),
+    );
     for effect in effects {
         check_deadline(deadline)?;
         match effect {

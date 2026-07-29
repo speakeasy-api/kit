@@ -290,6 +290,61 @@ fn every_native_boundary_rejects_schema_invalid_input() {
 }
 
 #[test]
+fn native_search_and_edit_schemas_reject_cross_form_hybrids() {
+    let schema = |tool| {
+        &catalog()
+            .iter()
+            .find(|entry| entry.tool() == tool)
+            .unwrap()
+            .spec()
+            .input_schema
+    };
+    let search = jsonschema::validator_for(schema(NativeTool::Search)).unwrap();
+    let revision = format!("r:{}", "a".repeat(64));
+    let lexical = serde_json::json!({
+        "expected_revision": revision,
+        "text": "needle",
+        "mode": "content",
+        "path_prefixes": [],
+        "languages": []
+    });
+    assert!(search.is_valid(&lexical));
+    assert!(!search.is_valid(&serde_json::json!({
+        "expected_revision": revision,
+        "text": "needle",
+        "mode": "content",
+        "rewrite": "replacement",
+        "path_prefixes": [],
+        "languages": []
+    })));
+    assert!(!search.is_valid(&serde_json::json!({
+        "expected_revision": revision,
+        "text": "Some($A)",
+        "mode": "structural",
+        "cursor": {},
+        "path_prefixes": [],
+        "languages": ["rust"]
+    })));
+
+    let edit = jsonschema::validator_for(schema(NativeTool::Edit)).unwrap();
+    let token = format!("kitsp1_{}", "b".repeat(64));
+    assert!(edit.is_valid(&serde_json::json!({"preview_token": token})));
+    assert!(edit.is_valid(&serde_json::json!({
+        "version": 1,
+        "expected_revision": revision,
+        "operations": []
+    })));
+    assert!(!edit.is_valid(&serde_json::json!({"preview_token": "kitsp1_bad"})));
+    assert!(!edit.is_valid(&serde_json::json!({})));
+    assert!(!edit.is_valid(&serde_json::json!({
+        "preview_token": token,
+        "version": 1,
+        "expected_revision": revision,
+        "operations": []
+    })));
+}
+
+#[test]
 fn tool_surface_output_bounds() {
     for tool in catalog() {
         assert_eq!(

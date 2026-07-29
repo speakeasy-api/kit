@@ -304,7 +304,37 @@ fn req_lint_git_baseline_requires_distinct_ancestor_with_registry() {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     };
     let candidate = revision("HEAD");
-    let baseline = revision("HEAD^");
+    let registry_history = Command::new("git")
+        .args([
+            "log",
+            "--diff-filter=A",
+            "--format=%H",
+            "--reverse",
+            "HEAD",
+            "--",
+            "requirements/registry.yaml",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(registry_history.status.success());
+    let registry_add = String::from_utf8(registry_history.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .expect("requirements/registry.yaml has no addition commit")
+        .to_owned();
+    let baseline = revision(&format!("{registry_add}^"));
+    let baseline_path = format!("{baseline}:requirements/registry.yaml");
+    let baseline_registry = Command::new("git")
+        .args(["cat-file", "-e", &baseline_path])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        !baseline_registry.status.success(),
+        "history-derived baseline unexpectedly contains requirements/registry.yaml"
+    );
     let fixture = root.join("tests/conformance/req_lint_cases/positive");
     let invoke = |base: &str, candidate: &str| {
         Command::new("python3")

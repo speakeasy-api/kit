@@ -293,7 +293,7 @@ fn description(tool: NativeTool) -> &'static str {
             "Select for ranked repository tree, symbol, and relationship discovery at an expected revision; do not select for exact text lookup. Saves no workspace changes and returns at most 64 KiB with a revision-bound cursor. Example: {\"expected_revision\":\"r:<64 hex>\",\"terms\":[\"Config\"],\"roots\":[],\"languages\":[]}."
         }
         NativeTool::Search => {
-            "Select for exact batched lexical path/content lookup at an expected revision; do not select to read whole files or mutate them. Saves no workspace changes and returns at most 64 KiB with a revision-bound cursor. Example: {\"expected_revision\":\"r:<64 hex>\",\"text\":\"NativeCatalog\",\"mode\":\"path_and_content\",\"path_prefixes\":[],\"languages\":[]}."
+            "Select for exact lexical or Rust structural lookup and read-only rewrite previews at an expected revision; do not select to apply changes. Saves no workspace changes and returns at most 64 KiB; changed structural rewrites include an opaque single-use apply token and change diff. Example: {\"expected_revision\":\"r:<64 hex>\",\"text\":\"Some($A)\",\"mode\":\"structural\",\"rewrite\":\"Ok($A)\",\"path_prefixes\":[],\"languages\":[\"rust\"]}."
         }
         NativeTool::Read => {
             "Select for one bounded file or line/byte range at an expected revision; do not select for repository-wide search. Saves large/binary content as an authorized artifact and returns at most 64 KiB. Example: {\"expected_revision\":\"r:<64 hex>\",\"path\":\"src/lib.rs\",\"range\":{\"kind\":\"lines\",\"start\":1,\"end\":80}}."
@@ -340,23 +340,48 @@ fn input_schema(tool: NativeTool) -> Value {
             }),
             &["expected_revision", "terms", "roots", "languages"],
         ),
-        NativeTool::Search => object(
+        NativeTool::Search => {
+            let mut lexical = object(
+                json!({
+                    "cursor": {"type": ["object", "null"]},
+                    "expected_revision": revision(),
+                    "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
+                    "mode": {"enum": ["path", "content", "path_and_content"]},
+                    "path_prefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                    "text": {"maxLength": 4096, "minLength": 1, "type": "string"}
+                }),
+                &[
+                    "expected_revision",
+                    "text",
+                    "mode",
+                    "path_prefixes",
+                    "languages",
+                ],
+            );
+            let mut structural = object(
+                json!({
+                    "expected_revision": revision(),
+                    "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
+                    "mode": {"const": "structural"},
+                    "path_prefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                    "rewrite": {"maxLength": 4096, "minLength": 1, "type": ["string", "null"]},
+                    "text": {"maxLength": 4096, "minLength": 1, "type": "string"}
+                }),
+                &[
+                    "expected_revision",
+                    "text",
+                    "mode",
+                    "path_prefixes",
+                    "languages",
+                ],
+            );
+            lexical.as_object_mut().unwrap().remove("$schema");
+            structural.as_object_mut().unwrap().remove("$schema");
             json!({
-                "cursor": {"type": ["object", "null"]},
-                "expected_revision": revision(),
-                "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
-                "mode": {"enum": ["path", "content", "path_and_content"]},
-                "path_prefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
-                "text": {"maxLength": 4096, "minLength": 1, "type": "string"}
-            }),
-            &[
-                "expected_revision",
-                "text",
-                "mode",
-                "path_prefixes",
-                "languages",
-            ],
-        ),
+                "$schema": JSON_SCHEMA_DIALECT,
+                "oneOf": [lexical, structural]
+            })
+        }
         NativeTool::Read => object(
             json!({
                 "expected_revision": revision(),

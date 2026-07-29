@@ -384,7 +384,11 @@ fn unicode_crlf_symbols_and_deep_paths_are_searchable_without_binary_leaks() {
         .iter()
         .find(|entry| entry.path == Path::new(&deep))
         .unwrap();
-    assert_eq!(entry.symbols[0].name, "café");
+    assert_eq!(
+        entry.syntax_records[0].display_name().value().as_ref(),
+        "café"
+    );
+    assert!(entry.symbols.is_empty());
 
     let response = search(
         &workspace,

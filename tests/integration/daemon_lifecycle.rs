@@ -224,6 +224,41 @@ async fn wait_run_state(
     panic!("run did not reach {expected}: {last}");
 }
 
+async fn wait_repository_result(
+    address: std::net::SocketAddr,
+    credential: &str,
+    origin: &str,
+    result_id: &str,
+    nonce: &str,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for attempt in 0..3_000 {
+        let headers = authenticated_headers(
+            credential,
+            origin,
+            &format!("{nonce}-{result_id}-{attempt}"),
+        );
+        let (status, body) = request(
+            address,
+            "GET",
+            &format!("/v1/repository-results/{result_id}"),
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        last = serde_json::from_str(&body).unwrap();
+        if matches!(
+            last["status"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "outcome_unknown" | "denied")
+        ) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("repository operation did not terminate: {last}");
+}
+
 async fn start_scenario_run(
     root: &TestRoot,
     scenario: FakeScenario,
@@ -334,6 +369,247 @@ fn init_git(root: &std::path::Path) {
                 .success()
         );
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_repository_http_structural_preview_applies_the_exact_diff_once() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use kit::{
+        executor::{check::ConformanceCheck, profile::ResourceLimits},
+        verify::{
+            feedback::{DiagnosticAdapter, FeedbackLimits},
+            profiles::{CheckClass, CheckRequirement, DeclaredCheck, VerificationRegistry},
+        },
+    };
+
+    let root = TestRoot::new();
+    let project_root = root.0.join("project");
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(
+        project_root.join("src/lib.rs"),
+        "fn f() { let value = Some(1); }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/base.rs"),
+        "pub const BASE_ONLY_SENTINEL: u8 = 1;\n",
+    )
+    .unwrap();
+    init_git(&project_root);
+    let check = kit::executor::check::CheckCommand::new(
+        "diagnostics",
+        "cargo",
+        vec!["check".to_owned()],
+        format!("example.invalid/check@sha256:{}", "a".repeat(64)),
+        format!("sha256:{}", "b".repeat(64)),
+        format!("sha256:{}", "c".repeat(64)),
+        ResourceLimits::new(1_000, 1024 * 1024, 8, 1024, 1024, 1024, 1024, 1_000),
+    )
+    .unwrap();
+    let registry = VerificationRegistry::new(vec![
+        DeclaredCheck::new(
+            CheckClass::Diagnostics,
+            check,
+            CheckRequirement::Required,
+            BTreeSet::new(),
+            false,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let config = development_config(&root.0)
+        .with_project_root(&project_root)
+        .with_verification_registry(registry)
+        .with_native_feedback(
+            BTreeMap::from([(
+                "diagnostics".to_owned(),
+                DiagnosticAdapter::NormalizedJsonLinesV1,
+            )]),
+            FeedbackLimits::default(),
+        )
+        .with_native_check_completions([
+            ConformanceCheck::pass(b"", b""),
+            ConformanceCheck::pass(b"", b""),
+        ]);
+    let daemon = start_daemon(config).await.unwrap();
+    wait_ready(daemon.endpoint()).await;
+    let discovery = read_discovery(&root.0).unwrap();
+    let project = daemon.project_id();
+
+    let headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "repo-lifecycle-revision",
+    );
+    let (status, body) = request(
+        daemon.endpoint(),
+        "GET",
+        &format!("/v1/projects/{project}/repository/revision"),
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let revision = serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "repo-lifecycle-search",
+    );
+    headers.push(("Content-Type", "application/json".to_owned()));
+    let search_input = serde_json::json!({
+        "expected_revision": revision,
+        "text": "Some($A)",
+        "mode": "structural",
+        "rewrite": "Ok($A)",
+        "path_prefixes": [],
+        "languages": ["rust"]
+    });
+    let (status, body) = request(
+        daemon.endpoint(),
+        "POST",
+        &format!("/v1/projects/{project}/repository/search"),
+        &headers,
+        &search_input.to_string(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let queued: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(queued["operation"], "repo.search");
+    assert_eq!(queued["status"], "queued");
+    let search = wait_repository_result(
+        daemon.endpoint(),
+        &discovery.credential,
+        &discovery.endpoint,
+        queued["id"].as_str().unwrap(),
+        "repo-lifecycle-search-result",
+    )
+    .await;
+    assert_eq!(search["status"], "completed", "{search}");
+    let preview = &search["output"]["data"];
+    let rewrite = preview["rewrite"].as_object().unwrap();
+    let public_preview = preview.to_string();
+    for hidden in ["\"operations\":", "\"replacement\":", "\"expected\":"] {
+        assert!(
+            !public_preview.contains(hidden),
+            "public rewrite exposed {hidden}"
+        );
+    }
+    assert!(!public_preview.contains("BASE_ONLY_SENTINEL"));
+    let preview_diff = rewrite["change_diff"].as_str().unwrap().to_owned();
+    let token = rewrite["apply"]["preview_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let edit_input = serde_json::json!({"preview_token": token});
+
+    let mut headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "repo-lifecycle-edit",
+    );
+    headers.push(("Content-Type", "application/json".to_owned()));
+    headers.push(("Idempotency-Key", "repo-lifecycle-edit".to_owned()));
+    let (status, body) = request(
+        daemon.endpoint(),
+        "POST",
+        &format!("/v1/projects/{project}/repository/edit"),
+        &headers,
+        &edit_input.to_string(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let edit: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(edit["status"], "waiting_approval");
+    let edit_id = edit["id"].as_str().unwrap();
+    let mut headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "repo-lifecycle-edit-approval",
+    );
+    headers.push(("Content-Type", "application/json".to_owned()));
+    headers.push(("Idempotency-Key", "repo-lifecycle-edit-approval".to_owned()));
+    let (status, body) = request(
+        daemon.endpoint(),
+        "POST",
+        &format!("/v1/repository-results/{edit_id}/approval"),
+        &headers,
+        r#"{"decision":"approved"}"#,
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let applied = wait_repository_result(
+        daemon.endpoint(),
+        &discovery.credential,
+        &discovery.endpoint,
+        edit_id,
+        "repo-lifecycle-edit-result",
+    )
+    .await;
+    assert_eq!(applied["status"], "completed", "{applied}");
+    let applied_diff = applied["output"]["data"]["change_diff"].as_str().unwrap();
+    assert_eq!(preview_diff.as_bytes(), applied_diff.as_bytes());
+    assert_eq!(
+        fs::read_to_string(project_root.join("src/lib.rs")).unwrap(),
+        "fn f() { let value = Ok(1); }\n"
+    );
+
+    let mut headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "repo-lifecycle-replay",
+    );
+    headers.push(("Content-Type", "application/json".to_owned()));
+    headers.push(("Idempotency-Key", "repo-lifecycle-replay".to_owned()));
+    let (status, body) = request(
+        daemon.endpoint(),
+        "POST",
+        &format!("/v1/projects/{project}/repository/edit"),
+        &headers,
+        &edit_input.to_string(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(replay["status"], "waiting_approval");
+    let replay_id = replay["id"].as_str().unwrap();
+    let mut headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "repo-lifecycle-replay-approval",
+    );
+    headers.push(("Content-Type", "application/json".to_owned()));
+    headers.push((
+        "Idempotency-Key",
+        "repo-lifecycle-replay-approval".to_owned(),
+    ));
+    let (status, body) = request(
+        daemon.endpoint(),
+        "POST",
+        &format!("/v1/repository-results/{replay_id}/approval"),
+        &headers,
+        r#"{"decision":"approved"}"#,
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let replay = wait_repository_result(
+        daemon.endpoint(),
+        &discovery.credential,
+        &discovery.endpoint,
+        replay_id,
+        "repo-lifecycle-replay-result",
+    )
+    .await;
+    assert_eq!(replay["status"], "failed", "{replay}");
+    assert_eq!(replay["error"]["code"], "structural_preview_invalid");
+
+    daemon.shutdown().await.unwrap();
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

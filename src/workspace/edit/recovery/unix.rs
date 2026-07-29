@@ -16,6 +16,7 @@ use crate::{
     },
     workspace::{
         edit::{
+            diff::{DiffSide, FileSide, write_file_diff},
             ir::RootRelativePath,
             stage::{StageChange, StagedOperation, VerifiedStagedEdit},
         },
@@ -255,6 +256,9 @@ pub fn materialize_with_hook(
     hook: RecoveryHook<'_>,
 ) -> Result<MaterializedEdit, RecoveryError> {
     let (mut staged, verification) = staged.into_parts();
+    if staged.changes().is_empty() {
+        return Err(RecoveryError::InvalidOptions);
+    }
     if options.max_preview_bytes == 0
         || options.max_actions == 0
         || options.max_path_bytes == 0
@@ -297,6 +301,7 @@ pub fn materialize_with_hook(
     let transaction_name = format!(".kit-edit-recovery-{nonce}");
     let plan_digest = staged.plan_digest().to_owned();
     let stage_digest = staged.state_digest().to_owned();
+    let expected_change_diff_digest = staged.expected_change_diff_digest().map(str::to_owned);
     let base_revision = staged.revision();
     let base_epoch = staged.base_epoch();
     let base_digest = staged.base_workspace_digest().to_owned();
@@ -388,19 +393,21 @@ pub fn materialize_with_hook(
         let diff_file = create_file(&transaction_root, diff_name, 0o600)?;
         let mut diff =
             DiffWriter::new(diff_file, options.max_diff_bytes, options.max_preview_bytes);
+        write!(
+            diff,
+            "kit-actual-diff-v1\ntransaction={transaction}\nrevision={expected_revision}\nprincipal={principal}\nproject={project}\nplan={plan_digest}\nstage={stage_digest}\n\n"
+        )?;
+        diff.begin_change();
         actual_diff(
             &mut diff,
-            &transaction,
-            expected_revision,
-            &principal,
-            &project,
-            &plan_digest,
-            &stage_digest,
             &operations,
             &actions,
             &transaction_root,
             deadline,
         )?;
+        if let Some(expected) = expected_change_diff_digest.as_deref() {
+            diff.require_change_binding(expected)?;
+        }
         budget.diff(diff.bytes)?;
         diff.file.sync_all()?;
         transaction_root.sync_all()?;
@@ -642,12 +649,15 @@ pub fn materialize_with_hook(
     )?;
 
     let preview = diff.preview(artifact.digest());
+    let (change_diff, change_diff_complete) = diff.change_preview();
     let mut result = result(
         transaction,
         revision,
         artifact.reference(),
         artifact.digest(),
         preview,
+        change_diff,
+        change_diff_complete,
         verification,
     );
     if cancelled(&options) {
@@ -1772,6 +1782,10 @@ struct DiffWriter {
     max_bytes: u64,
     preview: Vec<u8>,
     max_preview_bytes: usize,
+    change_preview: Vec<u8>,
+    change_bytes: u64,
+    recording_change: bool,
+    change_hasher: blake3::Hasher,
 }
 
 impl DiffWriter {
@@ -1782,6 +1796,35 @@ impl DiffWriter {
             max_bytes,
             preview: Vec::with_capacity(max_preview_bytes.min(64 * 1024)),
             max_preview_bytes,
+            change_preview: Vec::with_capacity(max_preview_bytes.min(64 * 1024)),
+            change_bytes: 0,
+            recording_change: false,
+            change_hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn begin_change(&mut self) {
+        self.recording_change = true;
+    }
+
+    fn change_preview(&self) -> (Vec<u8>, bool) {
+        (
+            self.change_preview.clone(),
+            self.change_bytes <= self.max_preview_bytes as u64,
+        )
+    }
+
+    fn require_change_binding(&self, expected: &str) -> Result<(), RecoveryError> {
+        let actual = format!("blake3:{}", self.change_hasher.finalize().to_hex());
+        let complete = self.change_bytes <= self.max_preview_bytes as u64;
+        if actual == expected && complete {
+            Ok(())
+        } else {
+            Err(RecoveryError::ChangeDiffMismatch {
+                expected: expected.to_owned(),
+                actual,
+                complete,
+            })
         }
     }
 
@@ -1825,6 +1868,18 @@ impl Write for DiffWriter {
         let remaining = self.max_preview_bytes.saturating_sub(self.preview.len());
         self.preview
             .extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+        if self.recording_change {
+            self.change_hasher.update(bytes);
+            self.change_bytes = self
+                .change_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| io::Error::other("change diff size overflow"))?;
+            let remaining = self
+                .max_preview_bytes
+                .saturating_sub(self.change_preview.len());
+            self.change_preview
+                .extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+        }
         self.bytes = next;
         Ok(bytes.len())
     }
@@ -1837,12 +1892,6 @@ impl Write for DiffWriter {
 #[allow(clippy::too_many_arguments)]
 fn actual_diff<W: Write>(
     output: &mut W,
-    transaction: &str,
-    revision: RevisionId,
-    principal: &str,
-    project: &str,
-    plan_digest: &str,
-    stage_digest: &str,
     operations: &[StagedOperation],
     actions: &[Action],
     transaction_root: &File,
@@ -1852,13 +1901,6 @@ fn actual_diff<W: Write>(
         .iter()
         .map(|action| (action.path.as_str(), action))
         .collect();
-    write!(
-        output,
-        "{}",
-        format_args!(
-            "kit-actual-diff-v1\ntransaction={transaction}\nrevision={revision}\nprincipal={principal}\nproject={project}\nplan={plan_digest}\nstage={stage_digest}\n\n"
-        )
-    )?;
     let mut emitted = BTreeSet::new();
     for operation in operations {
         check_deadline(deadline)?;
@@ -1935,26 +1977,27 @@ fn append_file_diff<W: Write>(
     moved: bool,
     deadline: Instant,
 ) -> Result<(), RecoveryError> {
-    writeln!(output, "diff --git a/{from} b/{to}")?;
-    let exact_move = moved
-        && matches!((before, after), (Some(before), Some(after)) if before.digest == after.digest && before.mode == after.mode);
-    if exact_move {
-        writeln!(output, "similarity index 100%")?;
-    }
-    if moved {
-        writeln!(output, "rename from {from}")?;
-        writeln!(output, "rename to {to}")?;
-    }
-    match (before, after) {
-        (None, Some(after)) => writeln!(output, "new file mode {:06o}", after.mode)?,
-        (Some(before), None) => writeln!(output, "deleted file mode {:06o}", before.mode)?,
-        (Some(before), Some(after)) if before.mode != after.mode => {
-            writeln!(output, "old mode {:06o}", before.mode)?;
-            writeln!(output, "new mode {:06o}", after.mode)?;
-        }
-        _ => {}
-    }
-    if exact_move {
+    let same_content =
+        matches!((before, after), (Some(before), Some(after)) if before.digest == after.digest);
+    if moved
+        && same_content
+        && matches!((before, after), (Some(before), Some(after)) if before.mode == after.mode)
+    {
+        let side = |file: &StoredFile| FileSide {
+            mode: file.mode,
+            binary: false,
+            lines: 0,
+        };
+        write_file_diff::<_, RecoveryError, _>(
+            output,
+            from,
+            to,
+            before.map(side),
+            after.map(side),
+            true,
+            true,
+            |_, _| Ok(()),
+        )?;
         return Ok(());
     }
     let old_binary = before
@@ -1963,98 +2006,54 @@ fn append_file_diff<W: Write>(
     let new_binary = after
         .map(|file| inspect_image_before(root, file, deadline))
         .transpose()?;
-    if old_binary == Some(true) || new_binary == Some(true) {
-        writeln!(
-            output,
-            "Binary files {} and {} differ",
-            if before.is_some() {
-                format!("a/{from}")
-            } else {
-                "/dev/null".to_owned()
-            },
-            if after.is_some() {
-                format!("b/{to}")
-            } else {
-                "/dev/null".to_owned()
+    let old_count = match (before, old_binary) {
+        (Some(file), Some(false)) => image_line_count(root, file, deadline)?,
+        _ => 0,
+    };
+    let new_count = match (after, new_binary) {
+        (Some(file), Some(false)) => image_line_count(root, file, deadline)?,
+        _ => 0,
+    };
+    let side = |file: &StoredFile, binary: bool, lines: usize| FileSide {
+        mode: file.mode,
+        binary,
+        lines,
+    };
+    write_file_diff::<_, RecoveryError, _>(
+        output,
+        from,
+        to,
+        before.map(|file| side(file, old_binary.unwrap_or(false), old_count)),
+        after.map(|file| side(file, new_binary.unwrap_or(false), new_count)),
+        moved,
+        same_content,
+        |side, output| {
+            let stored = match side {
+                DiffSide::Before => before,
+                DiffSide::After => after,
             }
-        )?;
-        return Ok(());
-    }
-    writeln!(
-        output,
-        "--- {}",
-        if before.is_some() {
-            format!("a/{from}")
-        } else {
-            "/dev/null".to_owned()
-        }
+            .ok_or(RecoveryError::StageChanged)?;
+            append_image(output, root, stored, deadline)
+        },
     )?;
-    writeln!(
-        output,
-        "+++ {}",
-        if after.is_some() {
-            format!("b/{to}")
-        } else {
-            "/dev/null".to_owned()
-        }
-    )?;
-    let old_count = before
-        .map(|file| image_line_count(root, file, deadline))
-        .transpose()?
-        .unwrap_or(0);
-    let new_count = after
-        .map(|file| image_line_count(root, file, deadline))
-        .transpose()?
-        .unwrap_or(0);
-    writeln!(
-        output,
-        "@@ -{} +{} @@",
-        hunk_range(old_count),
-        hunk_range(new_count)
-    )?;
-    if let Some(file) = before {
-        append_image_lines(output, b'-', root, file, deadline)?;
-    }
-    if let Some(file) = after {
-        append_image_lines(output, b'+', root, file, deadline)?;
-    }
     Ok(())
 }
 
-fn append_image_lines<W: Write>(
+fn append_image<W: Write>(
     output: &mut W,
-    marker: u8,
     root: &File,
     stored: &StoredFile,
     deadline: Instant,
 ) -> Result<(), RecoveryError> {
     let mut file = open_image(root, stored)?;
     let mut buffer = [0_u8; 64 * 1024];
-    let mut line_start = true;
     loop {
         check_deadline(deadline)?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        let mut start = 0;
-        for (index, byte) in buffer[..count].iter().enumerate() {
-            if line_start {
-                output.write_all(&[marker])?;
-                line_start = false;
-            }
-            if *byte == b'\n' {
-                output.write_all(&buffer[start..=index])?;
-                start = index + 1;
-                line_start = true;
-            }
-        }
-        if start < count {
-            output.write_all(&buffer[start..count])?;
-        }
-    }
-    if !line_start {
-        output.write_all(b"\n\\ No newline at end of file\n")?;
+        output.write_all(&buffer[..count])?;
     }
     Ok(())
 }
@@ -2080,14 +2079,6 @@ fn image_line_count(
         last = Some(buffer[read - 1]);
     }
     Ok(count + usize::from(last.is_some_and(|byte| byte != b'\n')))
-}
-
-fn hunk_range(lines: usize) -> String {
-    match lines {
-        0 => "0,0".to_owned(),
-        1 => "1".to_owned(),
-        count => format!("1,{count}"),
-    }
 }
 
 fn inspect_image_before(

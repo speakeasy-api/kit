@@ -4,22 +4,20 @@
 
 - Status: open
 - Owner: repository intelligence owner
-- Evidence: RFC section 32 requires Tree-sitter grammar/query versions, LSP
-  position encoding and server versions, and a SCIP schema/index version. The
-  RFC and preflight records select no supported language set, grammar runtime,
-  grammar/query revisions, LSP servers or position encoding, or generated SCIP
-  index.
-- Action: select the supported language cells, then record exact grammar and
-  query artifact digests, LSP server artifacts and position encoding, and the
-  SCIP index producer/schema identity. Preserve the optional SCIP disposition
-  rule from `IMPLEMENTATION_PLAN.md:487-497`.
-- Verification: every corresponding empty `grammar.*`, `lsp.*`, and
-  `scip.index` value in `build-manifest.yaml` is replaced by an immutable value;
-  grammar ABI/query hash invalidation, LSP version/position fencing, and SCIP
-  schema/index freshness conformance pass at gate `G05`.
+- Evidence: the Rust-only Tree-sitter cell is closed by exact runtime, grammar
+  artifact, ABI and query pins in `build-manifest.yaml`. RFC section 32 also
+  requires LSP position encoding and server versions and a SCIP schema/index
+  version; those adapters remain unselected or unresolved.
+- Action: record LSP server artifacts and position encoding when that adapter is
+  selected, and select or explicitly disposition the SCIP index producer. Add
+  another grammar cell only when its language becomes supported. Preserve the
+  optional SCIP disposition rule from `IMPLEMENTATION_PLAN.md:487-497`.
+- Verification: the pinned Rust grammar ABI/artifact/query invalidation
+  conformance remains green; unresolved `lsp.*` and `scip.index` values are
+  closed or explicitly dispositioned before gate `G05`.
 - Blocks: complete code-intelligence pin closure at `G05`. Unit `1.09` remains
-  honest and verifiable because each absent value links here; this record does
-  not claim the code-intelligence adapters are implemented or selected.
+  honest and verifiable because each remaining absent value links here; this
+  record does not claim LSP, SCIP, other languages or M005 completion.
 
 ## EXT-21: Immutable CI Build Image
 

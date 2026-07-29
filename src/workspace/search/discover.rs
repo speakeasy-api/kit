@@ -256,11 +256,17 @@ pub fn discover(
             )?;
             rank_work += 1;
         }
-        for symbol in &entry.symbols {
+        for record in entry.syntax_records.iter() {
             check_deadline(deadline)?;
-            let Some((score, rationale)) = term_relevance(&symbol.name, &query.terms, deadline)?
-            else {
+            let name = record.display_name().value();
+            let Some((score, _)) = term_relevance(name, &query.terms, deadline)? else {
                 continue;
+            };
+            let rationale = match (entry.syntax_has_parse_errors, score) {
+                (true, 1_000) => "exact validated declaration in partial syntax tree",
+                (true, _) => "term in validated declaration from partial syntax tree",
+                (false, 1_000) => "exact syntactic declaration",
+                (false, _) => "term in syntactic declaration",
             };
             if rank_work == options.max_rank_work {
                 work_cut = true;
@@ -273,6 +279,41 @@ pub fn discover(
                     kind: DiscoverKind::Symbol,
                     score,
                     rationale,
+                    symbol: Some(name),
+                    line: Some(record.range().start_line),
+                    byte_start: Some(record.range().start_byte),
+                    byte_end: Some(record.range().end_byte),
+                    excerpt: None,
+                    excerpt_truncated: false,
+                },
+                capacity,
+                options.max_results_per_path,
+                &mut candidate_bytes,
+                dynamic_budget,
+                &mut rank_omitted,
+            )?;
+            rank_work += 1;
+        }
+        for symbol in &entry.symbols {
+            check_deadline(deadline)?;
+            let Some((score, _)) = term_relevance(&symbol.name, &query.terms, deadline)? else {
+                continue;
+            };
+            if rank_work == options.max_rank_work {
+                work_cut = true;
+                break 'entries;
+            }
+            retention_cut |= retain(
+                &mut candidates,
+                Candidate {
+                    path: &entry.path,
+                    kind: DiscoverKind::Symbol,
+                    score,
+                    rationale: if score == 1_000 {
+                        "exact lexical fallback symbol"
+                    } else {
+                        "term in lexical fallback symbol"
+                    },
                     symbol: Some(&symbol.name),
                     line: Some(symbol.line),
                     byte_start: None,

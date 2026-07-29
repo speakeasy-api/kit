@@ -13,6 +13,8 @@ agentkit-provider-ollama = { version = "=0.10.2", path = "vendor/agentkit/crates
 agentkit-provider-openai = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-openai" }
 agentkit-provider-openrouter = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-openrouter" }
 agentkit-tools-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-tools-core" }
+ast-grep-core = { version = "=0.40.1", default-features = false, features = ["tree-sitter"] }
+ast-grep-language = { version = "=0.40.1", default-features = false, features = ["tree-sitter-rust"] }
 axum = { version = "=0.8.8", default-features = false, features = ["http1", "json", "tokio"] }
 blake3 = "=1.8.2"
 chacha20poly1305 = "=0.10.1"
@@ -32,7 +34,10 @@ subtle = "=2.6.1"
 syn = { version = "=2.0.119", features = ["full"] }
 tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "=0.1.17"
+tree-sitter = "=0.25.10"
+tree-sitter-rust = "=0.24.0"
 unicode-normalization = "=0.1.25"
+url = "2.5.7"
 x509-parser = "0.18.0"
 zeroize = "1.8.2"
 
@@ -59,4 +64,3 @@ jsonwebtoken = { version = "10.1.0", default-features = false, features = ["aws_
 rcgen = "0.14.3"
 serde_yaml = "=0.9.34"
 tower = { version = "=0.5.3", features = ["util"] }
-url = "2.5.7"

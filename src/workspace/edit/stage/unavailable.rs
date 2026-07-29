@@ -42,6 +42,10 @@ impl StagedEdit<'_> {
         unreachable!()
     }
 
+    pub(crate) fn expected_change_diff_digest(&self) -> Option<&str> {
+        unreachable!()
+    }
+
     pub fn changes(&self) -> &[StageChange] {
         unreachable!()
     }

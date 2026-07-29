@@ -29,6 +29,8 @@ pub enum ModelEditFormat {
 struct StructuredEditWire {
     version: u32,
     expected_revision: RevisionToken,
+    #[serde(default)]
+    expected_change_diff_digest: Option<String>,
     operations: Vec<WireOperation>,
 }
 
@@ -56,6 +58,7 @@ pub(crate) fn structured_edit_schema(
         "additionalProperties": false,
         "properties": {
             "expected_revision": {"const": expected_revision.as_str(), "type": "string"},
+            "expected_change_diff_digest": {"pattern": "^blake3:[0-9a-f]{64}$", "type": "string"},
             "operations": {
                 "items": {"oneOf": [
                     {
@@ -107,6 +110,31 @@ pub(crate) fn native_edit_schema() -> Value {
         "type": "string"
     });
     schema
+        .as_object_mut()
+        .expect("edit schema is an object")
+        .remove("$id");
+    schema
+        .as_object_mut()
+        .expect("edit schema is an object")
+        .remove("$schema");
+    json!({
+        "$id": "kit.native.edit.input.v1",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+            schema,
+            {
+                "additionalProperties": false,
+                "properties": {
+                    "preview_token": {
+                        "pattern": "^kitsp1_[0-9a-f]{64}$",
+                        "type": "string"
+                    }
+                },
+                "required": ["preview_token"],
+                "type": "object"
+            }
+        ]
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -334,12 +362,15 @@ pub fn normalize_structured_json(
     for operation in envelope.operations {
         operations.push(operation.into_operation(context.limits)?);
     }
-    EditIr::new(
+    let mut ir = EditIr::new(
         context.expected_revision.clone(),
         operations,
         context.limits,
-    )
-    .map_err(Into::into)
+    )?;
+    if let Some(digest) = envelope.expected_change_diff_digest {
+        ir = ir.with_expected_change_diff_digest(digest)?;
+    }
+    Ok(ir)
 }
 
 fn check_envelope(
