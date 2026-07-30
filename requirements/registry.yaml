@@ -37767,7 +37767,7 @@
   applicability: mandatory
   interpretation: Repository discovery includes bounded relationship-graph evidence.
   acceptance_criteria:
-  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones:
   - M004
@@ -37783,13 +37783,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-M005-W01-C-001
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -37814,7 +37821,7 @@
   applicability: mandatory
   interpretation: Repository discovery includes version-control history evidence.
   acceptance_criteria:
-  - '`cargo test --test conformance repository_requirements` exits 0 with this requirement ID reported as passing.'
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones:
   - M004
@@ -37830,13 +37837,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-M005-W01-C-001
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -40185,7 +40199,7 @@
   applicability: mandatory
   interpretation: Repository discovery includes version-control history, blame, and changed-together evidence.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_807 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -40200,13 +40214,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-987
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_807 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -40378,7 +40399,7 @@
   applicability: mandatory
   interpretation: The code graph contains repository, package, file, symbol, test, diagnostic, and revision nodes connected by the enumerated edge kinds.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_811 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -40393,13 +40414,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-991
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_811 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -40424,7 +40452,7 @@
   applicability: mandatory
   interpretation: Each code-graph edge records provenance.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_812 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -40439,13 +40467,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-992
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_812 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -40470,7 +40505,7 @@
   applicability: mandatory
   interpretation: Each code-graph edge records confidence.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_813 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -40485,13 +40520,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-993
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_813 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -40516,7 +40558,7 @@
   applicability: mandatory
   interpretation: Each code-graph edge records revision.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_814 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -40531,13 +40573,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-994
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_814 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -40562,7 +40611,7 @@
   applicability: mandatory
   interpretation: Each code-graph edge records a source range.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_815 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -40577,13 +40626,20 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/graph/structure/mod.rs
+  - src/workspace/graph/history/mod.rs
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/graph_structure.rs
+  - tests/conformance/graph_history.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-995
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_815 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null

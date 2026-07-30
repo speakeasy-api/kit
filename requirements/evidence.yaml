@@ -9244,9 +9244,9 @@ records:
   revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
 - requirement_id: KIT-REPO-004
   evidence_type: conformance
-  evidence_id: EV-M005-W01-C-001
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9254,9 +9254,9 @@ records:
   revalidation_rule: Re-run when repository discovery, symbol records, or search-result contracts change.
 - requirement_id: KIT-REPO-005
   evidence_type: conformance
-  evidence_id: EV-M005-W01-C-001
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: '`cargo test --test conformance repository_requirements` exits 0 with 0 failed assertions.'
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9764,9 +9764,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-REPO-806 or its source contract changes.
 - requirement_id: KIT-REPO-807
   evidence_type: conformance
-  evidence_id: EV-1.04-C-987
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_807 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9804,9 +9804,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-REPO-810 or its source contract changes.
 - requirement_id: KIT-REPO-811
   evidence_type: conformance
-  evidence_id: EV-1.04-C-991
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_811 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9814,9 +9814,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-REPO-811 or its source contract changes.
 - requirement_id: KIT-REPO-812
   evidence_type: conformance
-  evidence_id: EV-1.04-C-992
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_812 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9824,9 +9824,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-REPO-812 or its source contract changes.
 - requirement_id: KIT-REPO-813
   evidence_type: conformance
-  evidence_id: EV-1.04-C-993
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_813 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9834,9 +9834,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-REPO-813 or its source contract changes.
 - requirement_id: KIT-REPO-814
   evidence_type: conformance
-  evidence_id: EV-1.04-C-994
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_814 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -9844,9 +9844,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-REPO-814 or its source contract changes.
 - requirement_id: KIT-REPO-815
   evidence_type: conformance
-  evidence_id: EV-1.04-C-995
+  evidence_id: EV-M005-W06-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_815 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance graph_structure -- --test-threads=1 && cargo test --locked --test conformance graph_history -- --test-threads=1` exits 0 with at least 1 selected test in each invocation and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null

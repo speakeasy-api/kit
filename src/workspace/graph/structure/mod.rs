@@ -34,6 +34,11 @@ use crate::{
     },
 };
 
+use super::history::{
+    BlameHunk, CHANGED_WITH_POLICY, ChangedWithFact, CoverageArea as HistoryCoverageArea,
+    CoverageStatus as HistoryCoverageStatus, HistoryGraph, ObjectFormat, ObjectId,
+};
+
 const TOML_PARSER_ID: &str = "toml@1.1.4+spec-1.1.0";
 const GLOBSET_ID: &str = "globset@0.4.19";
 const MANIFEST_POLICY: &str = "cargo-manifest-v2";
@@ -88,14 +93,15 @@ pub enum EdgeKind {
     Inherits,
     Overrides,
     Tests,
+    ChangedWith,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GraphRange {
-    start_byte: usize,
-    end_byte: usize,
-    start_line: usize,
-    end_line: usize,
+    pub(super) start_byte: usize,
+    pub(super) end_byte: usize,
+    pub(super) start_line: usize,
+    pub(super) end_line: usize,
 }
 
 impl GraphRange {
@@ -132,6 +138,7 @@ pub enum ProvenanceSource {
     TreeSitter,
     CargoTreeSitter,
     Lsp,
+    GitHistory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +150,7 @@ pub struct EdgeProvenance {
     revision: RevisionId,
     confidence_millis: u16,
     semantic: Option<SemanticEdgeProvenance>,
+    history: Option<HistoryEdgeProvenance>,
     evidence_digest: [u8; 32],
 }
 
@@ -161,6 +169,35 @@ pub struct SemanticEdgeProvenance {
     position_encoding: PositionEncoding,
     target_range: GraphRange,
     fact_range: GraphRange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryEdgeProvenance {
+    head: ObjectId,
+    head_tree: ObjectId,
+    object_format: ObjectFormat,
+    policy: String,
+    policy_digest: [u8; 32],
+    extractor_digest: [u8; 32],
+    scope_digest: [u8; 32],
+    support_commits: Arc<[ObjectId]>,
+    count: usize,
+    left_count: usize,
+    right_count: usize,
+    shared_count: usize,
+    strength_millis: u16,
+    coverage: CoverageStatus,
+    left_path: RootRelativePath,
+    right_path: RootRelativePath,
+    left_range: GraphRange,
+    right_range: GraphRange,
+    left_committed_blob: ObjectId,
+    right_committed_blob: ObjectId,
+    left_committed_range: GraphRange,
+    right_committed_range: GraphRange,
+    extraction_confidence_millis: u16,
+    revision: RevisionId,
+    evidence_digest: [u8; 32],
 }
 
 impl EdgeProvenance {
@@ -192,6 +229,88 @@ impl EdgeProvenance {
         self.semantic.as_ref()
     }
 
+    pub const fn history(&self) -> Option<&HistoryEdgeProvenance> {
+        self.history.as_ref()
+    }
+
+    pub const fn evidence_digest(&self) -> [u8; 32] {
+        self.evidence_digest
+    }
+}
+
+impl HistoryEdgeProvenance {
+    pub fn head(&self) -> &ObjectId {
+        &self.head
+    }
+    pub fn head_tree(&self) -> &ObjectId {
+        &self.head_tree
+    }
+    pub const fn object_format(&self) -> ObjectFormat {
+        self.object_format
+    }
+    pub fn policy(&self) -> &str {
+        &self.policy
+    }
+    pub const fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
+    }
+    pub const fn extractor_digest(&self) -> [u8; 32] {
+        self.extractor_digest
+    }
+    pub const fn scope_digest(&self) -> [u8; 32] {
+        self.scope_digest
+    }
+    pub fn support_commits(&self) -> &[ObjectId] {
+        &self.support_commits
+    }
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+    pub const fn left_count(&self) -> usize {
+        self.left_count
+    }
+    pub const fn right_count(&self) -> usize {
+        self.right_count
+    }
+    pub const fn shared_count(&self) -> usize {
+        self.shared_count
+    }
+    pub const fn strength_millis(&self) -> u16 {
+        self.strength_millis
+    }
+    pub const fn coverage(&self) -> CoverageStatus {
+        self.coverage
+    }
+    pub const fn left_path(&self) -> &RootRelativePath {
+        &self.left_path
+    }
+    pub const fn right_path(&self) -> &RootRelativePath {
+        &self.right_path
+    }
+    pub const fn left_range(&self) -> GraphRange {
+        self.left_range
+    }
+    pub const fn right_range(&self) -> GraphRange {
+        self.right_range
+    }
+    pub fn left_committed_blob(&self) -> &ObjectId {
+        &self.left_committed_blob
+    }
+    pub fn right_committed_blob(&self) -> &ObjectId {
+        &self.right_committed_blob
+    }
+    pub const fn left_committed_range(&self) -> GraphRange {
+        self.left_committed_range
+    }
+    pub const fn right_committed_range(&self) -> GraphRange {
+        self.right_committed_range
+    }
+    pub const fn extraction_confidence_millis(&self) -> u16 {
+        self.extraction_confidence_millis
+    }
+    pub const fn revision(&self) -> RevisionId {
+        self.revision
+    }
     pub const fn evidence_digest(&self) -> [u8; 32] {
         self.evidence_digest
     }
@@ -391,6 +510,7 @@ impl PartialOrd for CoverageRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructureGraph {
     revision: RevisionId,
+    workspace_digest: String,
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
     coverage: Vec<CoverageRecord>,
@@ -398,7 +518,55 @@ pub struct StructureGraph {
     snapshot_digest: [u8; 32],
     index_digest: [u8; 32],
     options_digest: [u8; 32],
+    history: Option<GraphHistoryMetadata>,
     logical_bytes: usize,
+    structural_content_digest: [u8; 32],
+    structural_snapshot_digest: [u8; 32],
+    structural_options_digest: [u8; 32],
+    enrichment_peak_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphHistoryMetadata {
+    head: ObjectId,
+    head_tree: ObjectId,
+    object_format: ObjectFormat,
+    shallow_digest: [u8; 32],
+    scope_digest: [u8; 32],
+    request_digest: [u8; 32],
+    content_digest: [u8; 32],
+    snapshot_digest: [u8; 32],
+    extractor_digest: [u8; 32],
+    options_digest: [u8; 32],
+    commits_coverage: CoverageStatus,
+    renames_coverage: CoverageStatus,
+    cochange_coverage: CoverageStatus,
+    blame_coverage: CoverageStatus,
+    commits_omitted: usize,
+    renames_omitted: usize,
+    cochange_omitted: usize,
+    blame_omitted: usize,
+    git_executable_digest: [u8; 32],
+    git_version_digest: [u8; 32],
+    git_implementation_digest: [u8; 32],
+    blame_hunks: Arc<[BlameHunk]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryEnrichmentLimits {
+    pub max_work: usize,
+    pub max_memory_bytes: usize,
+    pub max_time: Duration,
+}
+
+impl Default for HistoryEnrichmentLimits {
+    fn default() -> Self {
+        Self {
+            max_work: 10_000_000,
+            max_memory_bytes: 512 * 1024 * 1024,
+            max_time: Duration::from_secs(5),
+        }
+    }
 }
 
 impl StructureGraph {
@@ -408,6 +576,10 @@ impl StructureGraph {
 
     pub fn nodes(&self) -> &[GraphNode] {
         &self.nodes
+    }
+
+    pub fn workspace_digest(&self) -> &str {
+        &self.workspace_digest
     }
 
     pub fn edges(&self) -> &[GraphEdge] {
@@ -422,8 +594,16 @@ impl StructureGraph {
         self.content_digest
     }
 
+    pub const fn structural_content_digest(&self) -> [u8; 32] {
+        self.structural_content_digest
+    }
+
     pub const fn snapshot_digest(&self) -> [u8; 32] {
         self.snapshot_digest
+    }
+
+    pub const fn structural_snapshot_digest(&self) -> [u8; 32] {
+        self.structural_snapshot_digest
     }
 
     pub const fn index_digest(&self) -> [u8; 32] {
@@ -434,9 +614,536 @@ impl StructureGraph {
         self.options_digest
     }
 
+    pub const fn structural_options_digest(&self) -> [u8; 32] {
+        self.structural_options_digest
+    }
+
+    pub const fn history(&self) -> Option<&GraphHistoryMetadata> {
+        self.history.as_ref()
+    }
+
+    pub fn history_digest(&self) -> Option<[u8; 32]> {
+        self.history
+            .as_ref()
+            .map(GraphHistoryMetadata::content_digest)
+    }
+
+    pub fn with_history(
+        &self,
+        history: &HistoryGraph,
+        limits: HistoryEnrichmentLimits,
+    ) -> Result<Self, GraphError> {
+        if limits.max_work == 0 || limits.max_memory_bytes == 0 || limits.max_time.is_zero() {
+            return Err(GraphError::InvalidOptions(
+                "history enrichment bounds must be nonzero",
+            ));
+        }
+        let started = Instant::now();
+        let deadline = started.checked_add(limits.max_time).unwrap_or(started);
+        if self.revision != history.revision()
+            || self.index_digest != history.index_digest()
+            || self.workspace_digest != history.workspace_digest()
+        {
+            return Err(GraphError::HistoryMismatch);
+        }
+        let sort_work = sort_comparison_bound(
+            self.edges
+                .len()
+                .saturating_add(history.changed_with().len()),
+        )
+        .and_then(|work| {
+            sort_comparison_bound(self.coverage.len().saturating_add(1))
+                .and_then(|coverage| work.checked_add(coverage))
+        })
+        .ok_or(GraphError::BoundExceeded(GraphBound::Work))?;
+        let work = self
+            .nodes
+            .len()
+            .checked_add(self.edges.len())
+            .and_then(|work| work.checked_add(self.coverage.len()))
+            .and_then(|work| work.checked_add(history.changed_with().len().saturating_mul(4)))
+            .and_then(|work| work.checked_add(sort_work))
+            .and_then(|work| work.checked_add(self.logical_bytes))
+            .ok_or(GraphError::BoundExceeded(GraphBound::Work))?;
+        if work > limits.max_work {
+            return Err(GraphError::BoundExceeded(GraphBound::Work));
+        }
+        let map_bytes = self
+            .nodes
+            .len()
+            .checked_mul(BTREE_ENTRY_WEIGHT + size_of::<NodeId>() + size_of::<([u8; 32], usize)>())
+            .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        let adjacency_bytes = self
+            .nodes
+            .len()
+            .checked_mul(
+                BTREE_ENTRY_WEIGHT + size_of::<NodeId>() + size_of::<Vec<([u8; 32], NodeId)>>(),
+            )
+            .and_then(|bytes| {
+                self.edges
+                    .len()
+                    .checked_add(history.changed_with().len())?
+                    .checked_mul(2 * size_of::<([u8; 32], NodeId)>())
+                    .and_then(|adjacency| bytes.checked_add(adjacency))
+            })
+            .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        let added_history_bytes = history.changed_with().iter().try_fold(
+            size_of::<GraphHistoryMetadata>()
+                .checked_add(history.head().as_str().len())
+                .and_then(|bytes| bytes.checked_add(history.head_tree().as_str().len()))
+                .and_then(|bytes| bytes.checked_add(ARC_WEIGHT))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        history
+                            .blame_hunks()
+                            .iter()
+                            .map(|hunk| {
+                                size_of::<BlameHunk>()
+                                    + hunk.path().capacity()
+                                    + hunk.source_path().capacity()
+                                    + hunk.source_commit().map_or(0, |oid| oid.as_str().len())
+                                    + hunk.source_blob().map_or(0, |oid| oid.as_str().len())
+                            })
+                            .sum::<usize>(),
+                    )
+                })
+                .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?,
+            |bytes, fact| {
+                bytes
+                    .checked_add(history_fact_edge_weight(fact, history))
+                    .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))
+            },
+        )?;
+        let output_reservation = self
+            .logical_bytes
+            .checked_add(added_history_bytes)
+            .and_then(|bytes| {
+                let edge_capacity = grown_vec_capacity(
+                    self.edges.capacity(),
+                    self.edges
+                        .len()
+                        .saturating_add(history.changed_with().len()),
+                )?;
+                bytes.checked_add(
+                    edge_capacity
+                        .saturating_sub(self.edges.capacity())
+                        .checked_mul(size_of::<GraphEdge>())?,
+                )
+            })
+            .and_then(|bytes| {
+                let coverage_capacity = grown_vec_capacity(
+                    self.coverage.capacity(),
+                    self.coverage.len().saturating_add(1),
+                )?;
+                bytes.checked_add(
+                    coverage_capacity
+                        .saturating_sub(self.coverage.capacity())
+                        .checked_mul(size_of::<CoverageRecord>())?,
+                )
+            })
+            .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        if work
+            .checked_add(added_history_bytes)
+            .is_none_or(|work| work > limits.max_work)
+        {
+            return Err(GraphError::BoundExceeded(GraphBound::Work));
+        }
+        if Instant::now() >= deadline {
+            return Err(GraphError::BoundExceeded(GraphBound::Time));
+        }
+        let peak = self
+            .logical_bytes
+            .checked_add(history.logical_bytes())
+            .and_then(|bytes| bytes.checked_add(output_reservation))
+            .and_then(|bytes| bytes.checked_add(map_bytes))
+            .and_then(|bytes| bytes.checked_add(adjacency_bytes))
+            .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        if peak > limits.max_memory_bytes {
+            return Err(GraphError::BoundExceeded(GraphBound::StagingBytes));
+        }
+        if Instant::now() >= deadline {
+            return Err(GraphError::BoundExceeded(GraphBound::Time));
+        }
+        if self
+            .history
+            .as_ref()
+            .is_some_and(|metadata| metadata.snapshot_digest == history.snapshot_digest())
+        {
+            return Ok(self.clone());
+        }
+        let history_status = history_area_status(history, HistoryCoverageArea::CoChange);
+        let mut graph = self.clone();
+        graph
+            .edges
+            .retain(|edge| edge.kind != EdgeKind::ChangedWith);
+        graph
+            .coverage
+            .retain(|record| record.relation != EdgeKind::ChangedWith);
+        let files = graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                (node.kind == NodeKind::File)
+                    .then_some(node.path.as_ref().map(|path| (path.clone(), node.id)))
+                    .flatten()
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut missing = false;
+        for fact in history.changed_with() {
+            validate_changed_with_fact(fact)?;
+            let (Some(source), Some(target)) = (files.get(fact.left()), files.get(fact.right()))
+            else {
+                missing = true;
+                continue;
+            };
+            let source_provenance = fact.provenance();
+            let policy_digest = *blake3::hash(source_provenance.policy().as_bytes()).as_bytes();
+            let provenance = EdgeProvenance {
+                source: ProvenanceSource::GitHistory,
+                path: Some(fact.left().clone()),
+                range: source_provenance.left_range(),
+                range_kind: RangeKind::WholeFile,
+                revision: graph.revision,
+                confidence_millis: fact.extraction_confidence_millis(),
+                semantic: None,
+                history: Some(HistoryEdgeProvenance {
+                    head: history.head().clone(),
+                    head_tree: history.head_tree().clone(),
+                    object_format: history.object_format(),
+                    policy: source_provenance.policy().to_owned(),
+                    policy_digest,
+                    extractor_digest: history.extractor_digest(),
+                    scope_digest: source_provenance.scope_digest(),
+                    support_commits: Arc::from(source_provenance.commits()),
+                    count: source_provenance.count(),
+                    left_count: source_provenance.left_count(),
+                    right_count: source_provenance.right_count(),
+                    shared_count: source_provenance.shared_count(),
+                    strength_millis: fact.strength_millis(),
+                    coverage: history_status,
+                    left_path: fact.left().clone(),
+                    right_path: fact.right().clone(),
+                    left_range: source_provenance.left_range(),
+                    right_range: source_provenance.right_range(),
+                    left_committed_blob: source_provenance.left_committed_blob().clone(),
+                    right_committed_blob: source_provenance.right_committed_blob().clone(),
+                    left_committed_range: source_provenance.left_committed_range(),
+                    right_committed_range: source_provenance.right_committed_range(),
+                    extraction_confidence_millis: fact.extraction_confidence_millis(),
+                    revision: source_provenance.revision(),
+                    evidence_digest: source_provenance.evidence_digest(),
+                }),
+                evidence_digest: source_provenance.evidence_digest(),
+            };
+            graph.edges.push(GraphEdge {
+                source: *source,
+                target: *target,
+                kind: EdgeKind::ChangedWith,
+                structural_digest: digest_edge(
+                    *source,
+                    *target,
+                    EdgeKind::ChangedWith,
+                    &provenance,
+                ),
+                provenance,
+                revision: graph.revision,
+            });
+        }
+        let coverage_status = if missing {
+            CoverageStatus::Unavailable
+        } else {
+            history_status
+        };
+        graph.coverage.push(CoverageRecord {
+            subject: None,
+            relation: EdgeKind::ChangedWith,
+            status: coverage_status,
+            detail: if missing {
+                "history endpoint has no exact current file node"
+            } else if history_status == CoverageStatus::ObservedPartial {
+                "co-change evidence is limited to observed history"
+            } else {
+                "Git co-change facts extracted"
+            },
+            revision: graph.revision,
+        });
+        graph.coverage.sort();
+        graph.coverage.dedup();
+        graph.edges.sort_by(|left, right| {
+            (
+                left.source,
+                left.target,
+                left.kind,
+                provenance_key(&left.provenance),
+            )
+                .cmp(&(
+                    right.source,
+                    right.target,
+                    right.kind,
+                    provenance_key(&right.provenance),
+                ))
+        });
+        graph.edges.dedup_by(|left, right| {
+            left.source == right.source
+                && left.target == right.target
+                && left.kind == right.kind
+                && left.provenance == right.provenance
+        });
+        validate_history_coverage(history)?;
+        let metadata = GraphHistoryMetadata {
+            head: history.head().clone(),
+            head_tree: history.head_tree().clone(),
+            object_format: history.object_format(),
+            shallow_digest: history.shallow_digest(),
+            scope_digest: history.scope_digest(),
+            request_digest: history.request_digest(),
+            content_digest: history.content_digest(),
+            snapshot_digest: history.snapshot_digest(),
+            extractor_digest: history.extractor_digest(),
+            options_digest: history.options_digest(),
+            commits_coverage: history_area_status(history, HistoryCoverageArea::Commits),
+            renames_coverage: history_area_status(history, HistoryCoverageArea::Renames),
+            cochange_coverage: history_status,
+            blame_coverage: history_area_status(history, HistoryCoverageArea::Blame),
+            commits_omitted: history_area_omitted(history, HistoryCoverageArea::Commits),
+            renames_omitted: history_area_omitted(history, HistoryCoverageArea::Renames),
+            cochange_omitted: history_area_omitted(history, HistoryCoverageArea::CoChange),
+            blame_omitted: history_area_omitted(history, HistoryCoverageArea::Blame),
+            git_executable_digest: history.git_implementation().executable_digest(),
+            git_version_digest: history.git_implementation().version_digest(),
+            git_implementation_digest: history.git_implementation().digest(),
+            blame_hunks: history.blame_hunks_arc(),
+        };
+        let base_snapshot = graph.structural_snapshot_digest;
+        let base_options = graph.structural_options_digest;
+        graph.history = Some(metadata);
+        graph.recompute_subgraphs_and_content()?;
+        let mut options = blake3::Hasher::new();
+        options.update(b"kit-unified-graph-options-v1\0");
+        options.update(&base_options);
+        options.update(&history.options_digest());
+        options.update(&history.request_digest());
+        options.update(&history.extractor_digest());
+        graph.options_digest = *options.finalize().as_bytes();
+        let mut snapshot = blake3::Hasher::new();
+        snapshot.update(b"kit-unified-graph-snapshot-v1\0");
+        snapshot.update(&base_snapshot);
+        snapshot.update(&graph.content_digest);
+        snapshot.update(&graph.options_digest);
+        snapshot.update(&history.snapshot_digest());
+        snapshot.update(&history.shallow_digest());
+        graph.snapshot_digest = *snapshot.finalize().as_bytes();
+        graph.logical_bytes =
+            structure_graph_logical_weight(&graph.nodes, &graph.edges, &graph.coverage)?
+                .checked_add(graph.workspace_digest.capacity())
+                .and_then(|bytes| {
+                    let history = graph.history.as_ref()?;
+                    bytes
+                        .checked_add(history.head.capacity())?
+                        .checked_add(history.head_tree.capacity())?
+                        .checked_add(ARC_WEIGHT)?
+                        .checked_add(
+                            history
+                                .blame_hunks
+                                .iter()
+                                .map(|hunk| {
+                                    size_of::<BlameHunk>()
+                                        + hunk.path().capacity()
+                                        + hunk.source_path().capacity()
+                                        + hunk.source_commit().map_or(0, |oid| oid.as_str().len())
+                                        + hunk.source_blob().map_or(0, |oid| oid.as_str().len())
+                                })
+                                .sum::<usize>(),
+                        )
+                })
+                .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        if graph.logical_bytes > output_reservation {
+            return Err(GraphError::BoundExceeded(GraphBound::StagingBytes));
+        }
+        debug_assert!(graph.logical_bytes <= output_reservation);
+        graph.enrichment_peak_bytes = peak;
+        if Instant::now() >= deadline {
+            return Err(GraphError::BoundExceeded(GraphBound::Time));
+        }
+        Ok(graph)
+    }
+
+    fn recompute_subgraphs_and_content(&mut self) -> Result<(), GraphError> {
+        let mut structural = self
+            .nodes
+            .iter()
+            .map(|node| (node.id, (node.structural_digest, 0_usize)))
+            .collect::<BTreeMap<_, _>>();
+        for edge in &self.edges {
+            if !structural.contains_key(&edge.source) || !structural.contains_key(&edge.target) {
+                return Err(GraphError::InvalidIndex("graph edge endpoint is unknown"));
+            }
+            structural.get_mut(&edge.source).expect("checked source").1 += 1;
+            structural.get_mut(&edge.target).expect("checked target").1 += 1;
+        }
+        let mut adjacency = structural
+            .iter()
+            .map(|(node, (_, degree))| (*node, Vec::with_capacity(*degree)))
+            .collect::<BTreeMap<NodeId, Vec<([u8; 32], NodeId)>>>();
+        for edge in &self.edges {
+            adjacency
+                .get_mut(&edge.source)
+                .expect("checked source")
+                .push((edge.structural_digest, edge.target));
+            adjacency
+                .get_mut(&edge.target)
+                .expect("checked target")
+                .push((edge.structural_digest, edge.source));
+        }
+        for node in &mut self.nodes {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"kit-structure-subgraph-v2\0");
+            hash.update(&node.structural_digest);
+            for (edge, neighbor) in adjacency.get(&node.id).into_iter().flatten() {
+                hash.update(edge);
+                hash.update(&structural[neighbor].0);
+            }
+            node.subgraph_digest = *hash.finalize().as_bytes();
+        }
+        let mut content = blake3::Hasher::new();
+        content.update(b"kit-structure-content-v2\0");
+        for node in &self.nodes {
+            content.update(&node.structural_digest);
+        }
+        for edge in &self.edges {
+            content.update(&edge.structural_digest);
+        }
+        for coverage in &self.coverage {
+            digest_coverage(&mut content, coverage);
+        }
+        self.content_digest = *content.finalize().as_bytes();
+        Ok(())
+    }
+
     pub const fn logical_bytes(&self) -> usize {
         self.logical_bytes
     }
+
+    pub const fn enrichment_peak_bytes(&self) -> usize {
+        self.enrichment_peak_bytes
+    }
+}
+
+impl GraphHistoryMetadata {
+    pub fn head(&self) -> &ObjectId {
+        &self.head
+    }
+    pub fn head_tree(&self) -> &ObjectId {
+        &self.head_tree
+    }
+    pub const fn object_format(&self) -> ObjectFormat {
+        self.object_format
+    }
+    pub const fn shallow_digest(&self) -> [u8; 32] {
+        self.shallow_digest
+    }
+    pub const fn scope_digest(&self) -> [u8; 32] {
+        self.scope_digest
+    }
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    pub const fn content_digest(&self) -> [u8; 32] {
+        self.content_digest
+    }
+    pub const fn snapshot_digest(&self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+    pub const fn extractor_digest(&self) -> [u8; 32] {
+        self.extractor_digest
+    }
+    pub const fn options_digest(&self) -> [u8; 32] {
+        self.options_digest
+    }
+    pub const fn commits_coverage(&self) -> CoverageStatus {
+        self.commits_coverage
+    }
+    pub const fn renames_coverage(&self) -> CoverageStatus {
+        self.renames_coverage
+    }
+    pub const fn cochange_coverage(&self) -> CoverageStatus {
+        self.cochange_coverage
+    }
+    pub const fn blame_coverage(&self) -> CoverageStatus {
+        self.blame_coverage
+    }
+    pub const fn commits_omitted(&self) -> usize {
+        self.commits_omitted
+    }
+    pub const fn renames_omitted(&self) -> usize {
+        self.renames_omitted
+    }
+    pub const fn cochange_omitted(&self) -> usize {
+        self.cochange_omitted
+    }
+    pub const fn blame_omitted(&self) -> usize {
+        self.blame_omitted
+    }
+    pub const fn git_executable_digest(&self) -> [u8; 32] {
+        self.git_executable_digest
+    }
+    pub const fn git_version_digest(&self) -> [u8; 32] {
+        self.git_version_digest
+    }
+    pub const fn git_implementation_digest(&self) -> [u8; 32] {
+        self.git_implementation_digest
+    }
+    pub fn blame_hunks(&self) -> &[BlameHunk] {
+        &self.blame_hunks
+    }
+}
+
+fn history_area_status(history: &HistoryGraph, area: HistoryCoverageArea) -> CoverageStatus {
+    history
+        .coverage()
+        .iter()
+        .filter(|record| record.area() == area)
+        .map(|record| match record.status() {
+            HistoryCoverageStatus::Complete => CoverageStatus::Extracted,
+            HistoryCoverageStatus::ObservedPartial => CoverageStatus::ObservedPartial,
+            HistoryCoverageStatus::Unavailable => CoverageStatus::Unavailable,
+        })
+        .max_by_key(|status| match status {
+            CoverageStatus::Extracted => 0,
+            CoverageStatus::ObservedPartial => 1,
+            CoverageStatus::Unavailable
+            | CoverageStatus::NotExtracted
+            | CoverageStatus::Malformed
+            | CoverageStatus::Incomplete => 2,
+        })
+        .unwrap_or(CoverageStatus::Unavailable)
+}
+
+fn history_area_omitted(history: &HistoryGraph, area: HistoryCoverageArea) -> usize {
+    history
+        .coverage()
+        .iter()
+        .filter(|record| record.area() == area)
+        .map(|record| record.omitted_count())
+        .sum()
+}
+
+fn validate_history_coverage(history: &HistoryGraph) -> Result<(), GraphError> {
+    for area in [
+        HistoryCoverageArea::Commits,
+        HistoryCoverageArea::Renames,
+        HistoryCoverageArea::CoChange,
+        HistoryCoverageArea::Blame,
+    ] {
+        if history_area_status(history, area) == CoverageStatus::Extracted
+            && history_area_omitted(history, area) != 0
+        {
+            return Err(GraphError::InvalidEvidence(
+                "complete history coverage has omissions",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -532,6 +1239,7 @@ pub enum GraphError {
     MissingPathDependency { manifest: PathBuf, path: PathBuf },
     InvalidEvidence(&'static str),
     ContainmentCycle,
+    HistoryMismatch,
     BoundExceeded(GraphBound),
 }
 
@@ -572,6 +1280,9 @@ impl fmt::Display for GraphError {
             ),
             Self::InvalidEvidence(reason) => write!(formatter, "invalid graph evidence: {reason}"),
             Self::ContainmentCycle => formatter.write_str("graph containment cycle"),
+            Self::HistoryMismatch => {
+                formatter.write_str("history and structure graph snapshots do not match")
+            }
             Self::BoundExceeded(bound) => write!(formatter, "graph {bound:?} bound exceeded"),
         }
     }
@@ -1000,7 +1711,7 @@ impl<'a> Build<'a> {
                     .metrics
                     .changed_paths
                     .iter()
-                    .try_fold(bytes, |bytes, path| bytes.checked_add(path.as_str().len()))
+                    .try_fold(bytes, |bytes, path| bytes.checked_add(path.capacity()))
             })
             .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
         let staging_bytes = provider
@@ -1092,7 +1803,7 @@ impl<'a> Build<'a> {
                 self.reserve_staging(root_path_map_entry_weight::<[u8; 32]>(&path)?)?;
                 self.path_digests.insert(path.clone(), source_digest);
                 if self.previous_path_digests.get(&path) != Some(&source_digest) {
-                    self.reserve_staging(size_of::<RootRelativePath>() + path.as_str().len())?;
+                    self.reserve_staging(size_of::<RootRelativePath>() + path.capacity())?;
                     self.metrics.changed_paths.push(path);
                 }
             }
@@ -1130,7 +1841,7 @@ impl<'a> Build<'a> {
         self.step(self.previous_path_digests.len())?;
         for path in self.previous_path_digests.keys() {
             if !self.path_digests.contains_key(path) {
-                self.reserve_staging(size_of::<RootRelativePath>() + path.as_str().len())?;
+                self.reserve_staging(size_of::<RootRelativePath>() + path.capacity())?;
                 self.metrics.changed_paths.push(path.clone());
             }
         }
@@ -1477,6 +2188,7 @@ impl<'a> Build<'a> {
                 revision: self.index.revision(),
                 confidence_millis: 1_000,
                 semantic: None,
+                history: None,
                 evidence_digest: *blake3::hash(b"metadata-index-repository-revision").as_bytes(),
             },
         )
@@ -2411,6 +3123,7 @@ impl<'a> Build<'a> {
             EdgeKind::Inherits,
             EdgeKind::Overrides,
             EdgeKind::Tests,
+            EdgeKind::ChangedWith,
         ] {
             let unavailable = self
                 .coverage
@@ -2436,6 +3149,11 @@ impl<'a> Build<'a> {
                 )
             } else if observed.contains(&relation) {
                 (CoverageStatus::Extracted, "exact facts emitted")
+            } else if relation == EdgeKind::ChangedWith {
+                (
+                    CoverageStatus::Unavailable,
+                    "Git history evidence was not requested",
+                )
             } else if matches!(relation, EdgeKind::References | EdgeKind::Implements) {
                 (
                     CoverageStatus::Unavailable,
@@ -2649,13 +3367,16 @@ impl<'a> Build<'a> {
         snapshot.update(&evidence_digest);
         snapshot.update(&content_digest);
         let snapshot_digest = *snapshot.finalize().as_bytes();
-        let logical_bytes = structure_graph_logical_weight(&nodes, &edges, &coverage)?;
+        let logical_bytes = structure_graph_logical_weight(&nodes, &edges, &coverage)?
+            .checked_add(self.index.digest().to_string().len())
+            .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
         check_deadline(self.deadline)?;
         self.staging.check()?;
         self.metrics.consumed_work = self.work;
         self.metrics.peak_staging_bytes = self.staging.peak();
         let graph = StructureGraph {
             revision: self.index.revision(),
+            workspace_digest: self.index.digest().to_string(),
             nodes,
             edges,
             coverage,
@@ -2663,7 +3384,12 @@ impl<'a> Build<'a> {
             snapshot_digest,
             index_digest: *self.index.index_digest(),
             options_digest,
+            history: None,
             logical_bytes,
+            structural_content_digest: content_digest,
+            structural_snapshot_digest: snapshot_digest,
+            structural_options_digest: options_digest,
+            enrichment_peak_bytes: 0,
         };
         Ok((
             graph,
@@ -2735,7 +3461,7 @@ impl<'a> Build<'a> {
         let node_weight = map_weight
             .checked_add(name.capacity())
             .and_then(|weight| {
-                weight.checked_add(path.as_ref().map_or(0, |path| path.as_str().len()))
+                weight.checked_add(path.as_ref().map_or(0, RootRelativePath::capacity))
             })
             .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
         self.reserve_staging(node_weight)?;
@@ -4854,6 +5580,7 @@ fn syntax_provenance(
         revision,
         confidence_millis: 1_000,
         semantic: None,
+        history: None,
         evidence_digest: record.declaration_id(),
     })
 }
@@ -4871,6 +5598,7 @@ fn manifest_provenance(
         revision,
         confidence_millis: 1_000,
         semantic: None,
+        history: None,
         evidence_digest: entry
             .source_digest()
             .ok_or(GraphError::InvalidIndex("manifest digest is unavailable"))?,
@@ -4921,6 +5649,7 @@ fn convention_provenance(
         revision,
         confidence_millis: 1_000,
         semantic: None,
+        history: None,
         evidence_digest: *hash.finalize().as_bytes(),
     })
 }
@@ -4950,6 +5679,7 @@ fn cargo_syntax_provenance(
         revision,
         confidence_millis: 1_000,
         semantic: None,
+        history: None,
         evidence_digest: *hash.finalize().as_bytes(),
     })
 }
@@ -4967,6 +5697,7 @@ fn diagnostic_provenance(
         revision,
         confidence_millis: 1_000,
         semantic: None,
+        history: None,
         evidence_digest: diagnostic_id(diagnostic).0,
     }
 }
@@ -5003,6 +5734,7 @@ fn semantic_provenance(
         revision,
         confidence_millis: 1_000,
         semantic: Some(semantic),
+        history: None,
         evidence_digest: [0; 32],
     };
     let mut hash = blake3::Hasher::new();
@@ -5255,7 +5987,7 @@ fn root_path_map_entry_weight<T>(path: &RootRelativePath) -> Result<usize, Graph
     BTREE_ENTRY_WEIGHT
         .checked_add(size_of::<RootRelativePath>())
         .and_then(|weight| weight.checked_add(size_of::<T>()))
-        .and_then(|weight| weight.checked_add(path.as_str().len()))
+        .and_then(|weight| weight.checked_add(path.capacity()))
         .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))
 }
 
@@ -5327,7 +6059,7 @@ fn structure_graph_logical_weight(
         total = total
             .checked_add(node.name.capacity())
             .and_then(|bytes| {
-                bytes.checked_add(node.path.as_ref().map_or(0, |path| path.as_str().len()))
+                bytes.checked_add(node.path.as_ref().map_or(0, RootRelativePath::capacity))
             })
             .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
     }
@@ -5339,20 +6071,102 @@ fn structure_graph_logical_weight(
     Ok(total)
 }
 
+fn sort_comparison_bound(len: usize) -> Option<usize> {
+    if len < 2 {
+        return Some(0);
+    }
+    let levels = usize::BITS as usize - (len - 1).leading_zeros() as usize;
+    len.checked_mul(levels)
+}
+
+fn grown_vec_capacity(current: usize, required: usize) -> Option<usize> {
+    if required <= current {
+        return Some(current);
+    }
+    current
+        .max(1)
+        .checked_mul(2)
+        .map(|grown| grown.max(required))
+}
+
+fn history_fact_edge_weight(fact: &ChangedWithFact, history: &HistoryGraph) -> usize {
+    let provenance = fact.provenance();
+    size_of::<GraphEdge>()
+        + fact.left().capacity()
+        + history.head().capacity()
+        + history.head_tree().capacity()
+        + provenance.policy().len()
+        + ARC_WEIGHT
+        + provenance
+            .commits()
+            .iter()
+            .map(|commit| size_of::<ObjectId>() + commit.capacity())
+            .sum::<usize>()
+        + fact.left().capacity()
+        + fact.right().capacity()
+        + provenance.left_committed_blob().as_str().len()
+        + provenance.right_committed_blob().as_str().len()
+}
+
+fn validate_changed_with_fact(fact: &ChangedWithFact) -> Result<(), GraphError> {
+    let provenance = fact.provenance();
+    let shared = provenance.shared_count();
+    let union = provenance
+        .left_count()
+        .checked_add(provenance.right_count())
+        .and_then(|count| count.checked_sub(shared))
+        .filter(|count| {
+            *count != 0 && shared <= provenance.left_count() && shared <= provenance.right_count()
+        })
+        .ok_or(GraphError::InvalidEvidence("incoherent co-change counts"))?;
+    let strength = ((shared as u128 * 1_000 + (union / 2) as u128) / union as u128) as u16;
+    if provenance.policy() != CHANGED_WITH_POLICY
+        || provenance.count() != shared
+        || fact.count() != shared
+        || provenance.commits().len() != shared
+        || fact.strength_millis() != strength
+    {
+        return Err(GraphError::InvalidEvidence(
+            "incoherent co-change provenance",
+        ));
+    }
+    Ok(())
+}
+
 fn provenance_heap_weight(provenance: &EdgeProvenance) -> Result<usize, GraphError> {
     let mut total = provenance
         .path
         .as_ref()
-        .map_or(0, |path| path.as_str().len());
+        .map_or(0, RootRelativePath::capacity);
     if let Some(semantic) = &provenance.semantic {
         for amount in [
             semantic.origin_uri.capacity(),
-            semantic.origin_path.as_str().len(),
+            semantic.origin_path.capacity(),
             semantic.server_artifact.capacity(),
             semantic.server_configuration.capacity(),
         ] {
             total = total
                 .checked_add(amount)
+                .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        }
+    }
+    if let Some(history) = &provenance.history {
+        for amount in [
+            history.head.capacity(),
+            history.head_tree.capacity(),
+            history.policy.capacity(),
+            history.left_path.capacity(),
+            history.right_path.capacity(),
+            history.left_committed_blob.as_str().len(),
+            history.right_committed_blob.as_str().len(),
+        ] {
+            total = total
+                .checked_add(amount)
+                .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
+        }
+        for commit in history.support_commits.iter() {
+            total = total
+                .checked_add(size_of::<ObjectId>() + commit.capacity())
                 .ok_or(GraphError::BoundExceeded(GraphBound::StagingBytes))?;
         }
     }
@@ -5569,7 +6383,12 @@ fn digest_edge(
     hash.update(&source.0);
     hash.update(&target.0);
     frame(&mut hash, &[kind as u8]);
-    digest_provenance_fields(&mut hash, provenance, true, provenance.semantic.is_some());
+    digest_provenance_fields(
+        &mut hash,
+        provenance,
+        true,
+        provenance.semantic.is_some() || provenance.history.is_some(),
+    );
     *hash.finalize().as_bytes()
 }
 
@@ -5611,6 +6430,41 @@ fn digest_provenance_fields(
             digest_range(hash, semantic.fact_range);
         }
         None => frame(hash, &[0]),
+    }
+    if let Some(history) = &provenance.history {
+        frame(hash, &[1]);
+        frame(hash, history.head.as_str().as_bytes());
+        frame(hash, history.head_tree.as_str().as_bytes());
+        frame(hash, &[history.object_format as u8]);
+        frame(hash, history.policy.as_bytes());
+        frame(hash, &history.policy_digest);
+        frame(hash, &history.extractor_digest);
+        frame(hash, &history.scope_digest);
+        frame(hash, &(history.support_commits.len() as u128).to_le_bytes());
+        for commit in history.support_commits.iter() {
+            frame(hash, commit.as_str().as_bytes());
+        }
+        for value in [
+            history.count,
+            history.left_count,
+            history.right_count,
+            history.shared_count,
+            usize::from(history.strength_millis),
+        ] {
+            frame(hash, &(value as u128).to_le_bytes());
+        }
+        frame(hash, &[history.coverage as u8]);
+        frame(hash, history.left_path.as_str().as_bytes());
+        frame(hash, history.right_path.as_str().as_bytes());
+        digest_range(hash, history.left_range);
+        digest_range(hash, history.right_range);
+        frame(hash, history.left_committed_blob.as_str().as_bytes());
+        frame(hash, history.right_committed_blob.as_str().as_bytes());
+        digest_range(hash, history.left_committed_range);
+        digest_range(hash, history.right_committed_range);
+        frame(hash, &history.extraction_confidence_millis.to_le_bytes());
+        frame(hash, history.revision.as_bytes());
+        frame(hash, &history.evidence_digest);
     }
     if include_evidence_digest {
         frame(hash, &provenance.evidence_digest);

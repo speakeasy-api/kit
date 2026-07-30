@@ -1,6 +1,6 @@
 use std::{
-    collections::BTreeSet,
-    ffi::OsStr,
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -15,14 +15,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::workspace::edit::ir::RootRelativePath;
+
 const MARKER_NAME: &str = ".kit-workspace";
 const MARKER_VERSION: &str = "kit-workspace-v1";
 const MAX_COMMAND_OUTPUT: usize = 64 * 1024 * 1024;
 const MAX_ERROR_OUTPUT: usize = 16 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES: usize = 1_000_000;
+const MAX_SNAPSHOT_NAME_BYTES: usize = 256 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_GIT_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_GIT_PACK_ENTRIES: usize = 1_000_000;
+const MAX_GIT_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
+const GIT_EXECUTABLE_HASH_BUFFER_BYTES: usize = 64 * 1024;
+const BTREE_ENTRY_WEIGHT: usize = std::mem::size_of::<[usize; 8]>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcquisitionMode {
@@ -686,6 +694,97 @@ struct FilesystemIdentity {
     second: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrustedGitRepositoryIdentity {
+    root: FilesystemIdentity,
+    git_dir: FilesystemIdentity,
+    common_dir: FilesystemIdentity,
+    #[cfg(unix)]
+    policy_metadata: BTreeMap<PathBuf, UnixMetadata>,
+    #[cfg(unix)]
+    fence_metadata: BTreeMap<PathBuf, UnixMetadata>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TrustedGitRepositoryPolicySession {
+    root: File,
+    repository: PathBuf,
+    identity: TrustedGitRepositoryIdentity,
+    implementation: TrustedGitImplementationIdentity,
+    metrics: TrustedGitRepositoryPolicyMetrics,
+}
+
+impl TrustedGitRepositoryPolicySession {
+    pub(crate) const fn logical_bytes(&self) -> usize {
+        self.metrics.logical_bytes()
+    }
+    pub(crate) const fn peak_bytes(&self) -> usize {
+        self.metrics.peak_bytes()
+    }
+    pub(crate) const fn consumed_work(&self) -> usize {
+        self.metrics.consumed_work()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TrustedGitRepositoryPolicyMetrics {
+    pub(crate) logical_bytes: usize,
+    pub(crate) peak_bytes: usize,
+    pub(crate) consumed_work: usize,
+    pub(crate) policy_scans: usize,
+    pub(crate) fence_scans: usize,
+    pub(crate) streamed_executable_bytes: usize,
+    pub(crate) streamed_executable_chunks: usize,
+    pub(crate) commands: usize,
+    pub(crate) output_bytes: usize,
+}
+
+impl TrustedGitRepositoryPolicyMetrics {
+    pub(crate) const fn logical_bytes(self) -> usize {
+        self.logical_bytes
+    }
+    pub(crate) const fn peak_bytes(self) -> usize {
+        self.peak_bytes
+    }
+    pub(crate) const fn consumed_work(self) -> usize {
+        self.consumed_work
+    }
+    pub(crate) const fn policy_scans(self) -> usize {
+        self.policy_scans
+    }
+    pub(crate) const fn fence_scans(self) -> usize {
+        self.fence_scans
+    }
+    pub(crate) const fn streamed_executable_bytes(self) -> usize {
+        self.streamed_executable_bytes
+    }
+    pub(crate) const fn streamed_executable_chunks(self) -> usize {
+        self.streamed_executable_chunks
+    }
+    pub(crate) const fn commands(self) -> usize {
+        self.commands
+    }
+    pub(crate) const fn output_bytes(self) -> usize {
+        self.output_bytes
+    }
+}
+
+#[derive(Debug)]
+struct TrustedGitImplementationCapture {
+    identity: TrustedGitImplementationIdentity,
+    streamed_bytes: usize,
+    streamed_chunks: usize,
+    output_bytes: usize,
+    peak_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedGitImplementationIdentity {
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_digest: [u8; 32],
+    pub(crate) version_digest: [u8; 32],
+}
+
 struct GitState {
     hash: StateHash,
     dirty: bool,
@@ -844,7 +943,7 @@ fn snapshot_repository(source: &Path, target: &Path) -> Result<(), AcquisitionEr
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UnixMetadata {
     dev: u64,
     ino: u64,
@@ -853,6 +952,8 @@ struct UnixMetadata {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 #[cfg(unix)]
@@ -1227,6 +1328,34 @@ fn open_file_at(directory: &File, name: &OsStr, flags: libc::c_int) -> io::Resul
 }
 
 #[cfg(unix)]
+fn open_relative_file(root: &File, path: &Path) -> io::Result<File> {
+    let mut directory = root.try_clone()?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not root relative",
+            ));
+        };
+        if components.peek().is_some() {
+            directory = open_directory_at(&directory, name)?;
+        } else {
+            return open_file_at(&directory, name, libc::O_RDONLY | libc::O_NONBLOCK);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "path is empty"))
+}
+
+#[cfg(not(unix))]
+fn open_relative_file(_root: &File, _path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-relative files are unavailable",
+    ))
+}
+
+#[cfg(unix)]
 fn create_file_at(directory: &File, name: &OsStr, mode: libc::mode_t) -> io::Result<File> {
     use std::{
         os::fd::{AsRawFd, FromRawFd},
@@ -1268,6 +1397,21 @@ fn mkdir_at(directory: &File, name: &OsStr, mode: libc::mode_t) -> io::Result<()
 
 #[cfg(unix)]
 fn directory_entries(directory: &File) -> Result<Vec<std::ffi::OsString>, AcquisitionError> {
+    directory_entries_bounded(
+        directory,
+        MAX_SNAPSHOT_ENTRIES,
+        MAX_SNAPSHOT_NAME_BYTES,
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn directory_entries_bounded(
+    directory: &File,
+    max_entries: usize,
+    max_name_bytes: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<std::ffi::OsString>, AcquisitionError> {
     use std::{
         os::fd::{FromRawFd, IntoRawFd},
         os::unix::ffi::{OsStrExt, OsStringExt},
@@ -1287,15 +1431,43 @@ fn directory_entries(directory: &File) -> Result<Vec<std::ffi::OsString>, Acquis
         ));
     }
     let mut entries = Vec::new();
+    let mut name_bytes = 0_usize;
     loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            // SAFETY: stream was returned by fdopendir and has not been closed.
+            let _ = unsafe { libc::closedir(stream) };
+            return Err(AcquisitionError::CommandTimedOut(
+                "validate Git object packs",
+            ));
+        }
+        clear_errno();
         // SAFETY: stream remains valid until closed below.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
+            if let Some(error) = current_errno() {
+                // SAFETY: stream was returned by fdopendir and has not been closed.
+                let _ = unsafe { libc::closedir(stream) };
+                return Err(snapshot_error("enumerate repository directory", error));
+            }
             break;
         }
         // SAFETY: d_name is NUL-terminated for a valid dirent returned by readdir.
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
+            if entries.len() == max_entries {
+                // SAFETY: stream was returned by fdopendir and has not been closed.
+                let _ = unsafe { libc::closedir(stream) };
+                return Err(AcquisitionError::SnapshotLimitExceeded);
+            }
+            let Some(next_name_bytes) = name_bytes
+                .checked_add(name.len())
+                .filter(|bytes| *bytes <= max_name_bytes)
+            else {
+                // SAFETY: stream was returned by fdopendir and has not been closed.
+                let _ = unsafe { libc::closedir(stream) };
+                return Err(AcquisitionError::SnapshotLimitExceeded);
+            };
+            name_bytes = next_name_bytes;
             entries.push(std::ffi::OsString::from_vec(name.to_vec()));
         }
     }
@@ -1309,6 +1481,56 @@ fn directory_entries(directory: &File) -> Result<Vec<std::ffi::OsString>, Acquis
     }
     entries.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     Ok(entries)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn clear_errno() {
+    // SAFETY: __error returns this thread's errno storage.
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn current_errno() -> Option<io::Error> {
+    // SAFETY: __error returns this thread's errno storage.
+    let errno = unsafe { *libc::__error() };
+    (errno != 0).then(|| io::Error::from_raw_os_error(errno))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clear_errno() {
+    // SAFETY: __errno_location returns this thread's errno storage.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn current_errno() -> Option<io::Error> {
+    // SAFETY: __errno_location returns this thread's errno storage.
+    let errno = unsafe { *libc::__errno_location() };
+    (errno != 0).then(|| io::Error::from_raw_os_error(errno))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    ))
+))]
+fn clear_errno() {}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    ))
+))]
+fn current_errno() -> Option<io::Error> {
+    None
 }
 
 #[cfg(unix)]
@@ -1461,6 +1683,8 @@ fn unix_metadata_from_stat(metadata: libc::stat) -> UnixMetadata {
         size: metadata.st_size as u64,
         modified_seconds: metadata.st_mtime,
         modified_nanoseconds: metadata.st_mtime_nsec,
+        changed_seconds: metadata.st_ctime,
+        changed_nanoseconds: metadata.st_ctime_nsec,
     }
 }
 
@@ -1474,6 +1698,8 @@ fn unix_metadata_from_stat(metadata: libc::stat) -> UnixMetadata {
         size: metadata.st_size as u64,
         modified_seconds: metadata.st_mtime,
         modified_nanoseconds: metadata.st_mtime_nsec,
+        changed_seconds: metadata.st_ctime,
+        changed_nanoseconds: metadata.st_ctime_nsec,
     }
 }
 
@@ -2805,6 +3031,1271 @@ where
     git_output(repository, operation, arguments).map(|_| ())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TrustedGitRead<'a> {
+    Head,
+    ObjectFormat,
+    ShallowBoundaries,
+    Commit {
+        oid: &'a str,
+    },
+    Tree {
+        oid: &'a str,
+    },
+    Blob {
+        oid: &'a str,
+    },
+    Blame {
+        head: &'a str,
+        path: &'a RootRelativePath,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrustedGitReadLimits {
+    pub(crate) timeout: Duration,
+    pub(crate) stdout_bytes: usize,
+    pub(crate) stderr_bytes: usize,
+}
+
+#[cfg(unix)]
+fn validate_trusted_git_repository(
+    root: &File,
+    repository: &Path,
+    deadline: Instant,
+) -> Result<TrustedGitRepositoryIdentity, AcquisitionError> {
+    ensure_deadline(deadline, "validate Git repository")?;
+    verify_open_directory(root, repository, "Git repository root")?;
+    let dot_git = repository.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git)
+        .map_err(|source| io_error("inspect Git metadata", source))?;
+    let (git_dir, linked) = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        (dot_git.clone(), false)
+    } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+        let value = read_bounded_regular_file_before(
+            &dot_git,
+            MAX_GIT_METADATA_BYTES,
+            "read Git metadata pointer",
+            deadline,
+        )?;
+        let value = std::str::from_utf8(&value).map_err(|_| AcquisitionError::Unavailable {
+            capability: "UTF-8 local Git metadata pointer",
+        })?;
+        let relative =
+            value
+                .trim()
+                .strip_prefix("gitdir: ")
+                .ok_or(AcquisitionError::Unavailable {
+                    capability: "regular local Git metadata",
+                })?;
+        let canonical = fs::canonicalize(repository.join(relative))
+            .map_err(|source| io_error("canonicalize Git metadata", source))?;
+        let directory = open_absolute_directory(&canonical, "Git metadata")?;
+        verify_open_directory(&directory, &canonical, "Git metadata")?;
+        (canonical, true)
+    } else {
+        return Err(AcquisitionError::Unavailable {
+            capability: "regular local Git metadata",
+        });
+    };
+    let commondir = git_dir.join("commondir");
+    let common_dir = match fs::symlink_metadata(&commondir) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(AcquisitionError::Unavailable {
+                    capability: "regular local Git common directory pointer",
+                });
+            }
+            let value = read_bounded_regular_file_before(
+                &commondir,
+                MAX_GIT_METADATA_BYTES,
+                "read Git common directory",
+                deadline,
+            )?;
+            let value = std::str::from_utf8(&value).map_err(|_| AcquisitionError::Unavailable {
+                capability: "UTF-8 local Git common directory pointer",
+            })?;
+            let canonical = fs::canonicalize(git_dir.join(value.trim()))
+                .map_err(|source| io_error("canonicalize Git common directory", source))?;
+            let directory = open_absolute_directory(&canonical, "Git common directory")?;
+            verify_open_directory(&directory, &canonical, "Git common directory")?;
+            canonical
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !linked => git_dir.clone(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(AcquisitionError::Unavailable {
+                capability: "linked worktree common directory evidence",
+            });
+        }
+        Err(source) => return Err(io_error("inspect Git common directory", source)),
+    };
+    let common = open_absolute_directory(&common_dir, "Git common directory")?;
+    verify_open_directory(&common, &common_dir, "Git common directory")?;
+    let mut policy_metadata = BTreeMap::new();
+    if linked {
+        record_policy_metadata(
+            &mut policy_metadata,
+            dot_git.clone(),
+            unix_metadata_path(&dot_git)
+                .map_err(|source| io_error("inspect Git metadata pointer", source))?,
+        )?;
+    }
+    if common_dir != git_dir {
+        record_policy_metadata(
+            &mut policy_metadata,
+            commondir.clone(),
+            unix_metadata_path(&commondir)
+                .map_err(|source| io_error("inspect Git common directory pointer", source))?,
+        )?;
+    }
+    record_policy_metadata(
+        &mut policy_metadata,
+        git_dir.clone(),
+        unix_metadata_path(&git_dir)
+            .map_err(|source| io_error("inspect Git metadata directory", source))?,
+    )?;
+    record_policy_metadata(
+        &mut policy_metadata,
+        common_dir.clone(),
+        unix_metadata_path(&common_dir)
+            .map_err(|source| io_error("inspect Git common directory", source))?,
+    )?;
+    for path in [common_dir.join("config"), git_dir.join("config.worktree")] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                validate_git_config(&path, deadline)?;
+                record_policy_metadata(
+                    &mut policy_metadata,
+                    path.clone(),
+                    unix_metadata_path(&path)
+                        .map_err(|source| io_error("inspect local Git configuration", source))?,
+                )?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error("inspect local Git configuration", source)),
+        }
+    }
+    validate_git_objects(&common, &common_dir, deadline, &mut policy_metadata)?;
+    ensure_deadline(deadline, "validate Git repository")?;
+    verify_open_directory(root, repository, "Git repository root")?;
+    let root_identity = root
+        .metadata()
+        .map_err(|source| io_error("inspect Git repository root", source))?;
+    let git_identity = fs::symlink_metadata(&git_dir)
+        .map_err(|source| io_error("inspect Git metadata directory", source))?;
+    let common_identity = fs::symlink_metadata(&common_dir)
+        .map_err(|source| io_error("inspect Git common directory", source))?;
+    let fence_metadata = policy_metadata
+        .iter()
+        .filter(|(path, metadata)| {
+            metadata.kind() == libc::S_IFDIR
+                || matches!(
+                    path.file_name().and_then(OsStr::to_str),
+                    Some(".git" | "commondir" | "config" | "config.worktree")
+                )
+        })
+        .map(|(path, metadata)| (path.clone(), *metadata))
+        .collect();
+    let identity = TrustedGitRepositoryIdentity {
+        root: filesystem_identity(&root_identity).ok_or(AcquisitionError::Unavailable {
+            capability: "Git repository filesystem identity",
+        })?,
+        git_dir: filesystem_identity(&git_identity).ok_or(AcquisitionError::Unavailable {
+            capability: "Git metadata filesystem identity",
+        })?,
+        common_dir: filesystem_identity(&common_identity).ok_or(AcquisitionError::Unavailable {
+            capability: "Git common directory filesystem identity",
+        })?,
+        policy_metadata,
+        fence_metadata,
+    };
+    fence_trusted_git_repository(root, repository, &identity, deadline)?;
+    Ok(identity)
+}
+
+#[cfg(not(unix))]
+fn validate_trusted_git_repository(
+    _root: &File,
+    _repository: &Path,
+    _deadline: Instant,
+) -> Result<TrustedGitRepositoryIdentity, AcquisitionError> {
+    Err(AcquisitionError::Unavailable {
+        capability: "descriptor-relative trusted Git repository validation",
+    })
+}
+
+fn validate_git_config(path: &Path, deadline: Instant) -> Result<(), AcquisitionError> {
+    let bytes = read_bounded_regular_file_before(
+        path,
+        MAX_GIT_METADATA_BYTES,
+        "read local Git configuration",
+        deadline,
+    )?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| AcquisitionError::Unavailable {
+        capability: "UTF-8 local Git configuration",
+    })?;
+    for line in git_config_lines(text, deadline)? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let Some(value) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            else {
+                return Err(AcquisitionError::Unavailable {
+                    capability: "parseable local Git configuration",
+                });
+            };
+            let section = value
+                .split(|character: char| character.is_whitespace() || character == '.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(section.as_str(), "include" | "includeif") {
+                return Err(AcquisitionError::Unavailable {
+                    capability: "include-free local Git configuration",
+                });
+            }
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .map_or((line, None), |(key, value)| (key, Some(value.trim())));
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty()
+            || key.chars().any(char::is_whitespace)
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        {
+            return Err(AcquisitionError::Unavailable {
+                capability: "parseable local Git configuration",
+            });
+        }
+        let promisor = key == "promisor" || key.ends_with(".promisor");
+        if key == "include.path"
+            || (key.starts_with("includeif.") && key.ends_with(".path"))
+            || (promisor && !value.is_some_and(git_config_false))
+            || key == "partialclone"
+            || key.ends_with(".partialclone")
+            || key == "alternaterefscommand"
+            || key.ends_with(".alternaterefscommand")
+        {
+            return Err(AcquisitionError::Unavailable {
+                capability: "local non-promisor Git object storage",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn git_config_false(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "false" | "no" | "off" | "0"
+    )
+}
+
+fn git_config_lines(text: &str, deadline: Instant) -> Result<Vec<String>, AcquisitionError> {
+    let malformed = || AcquisitionError::Unavailable {
+        capability: "parseable local Git configuration",
+    };
+    let mut chars = text.chars().peekable();
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut quoted = false;
+    let mut comment = false;
+    while let Some(character) = chars.next() {
+        ensure_deadline(deadline, "validate local Git configuration")?;
+        if comment {
+            if character == '\n' {
+                lines.push(std::mem::take(&mut line));
+                comment = false;
+            }
+            continue;
+        }
+        match character {
+            '\n' => {
+                if quoted {
+                    return Err(malformed());
+                }
+                lines.push(std::mem::take(&mut line));
+            }
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '#' | ';' if !quoted => comment = true,
+            '"' => quoted = !quoted,
+            '\\' => match chars.next().ok_or_else(&malformed)? {
+                '\n' => {}
+                '\r' if chars.next() == Some('\n') => {}
+                'n' => line.push('\n'),
+                't' => line.push('\t'),
+                'b' => line.push('\u{0008}'),
+                '\\' => line.push('\\'),
+                '"' => line.push('"'),
+                _ => return Err(malformed()),
+            },
+            _ => line.push(character),
+        }
+    }
+    if quoted {
+        return Err(malformed());
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct GitObjectLimits {
+    entries: usize,
+    name_bytes: usize,
+}
+
+#[cfg(unix)]
+fn validate_git_objects(
+    common: &File,
+    common_path: &Path,
+    deadline: Instant,
+    policy_metadata: &mut BTreeMap<PathBuf, UnixMetadata>,
+) -> Result<(), AcquisitionError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let before = metadata_at(common, OsStr::new("objects"))
+        .map_err(|source| io_error("inspect Git objects directory", source))?;
+    if before.kind() != libc::S_IFDIR {
+        return Err(AcquisitionError::Unavailable {
+            capability: "regular local Git objects directory",
+        });
+    }
+    let objects = open_directory_at(common, OsStr::new("objects"))
+        .map_err(|source| io_error("open Git objects directory", source))?;
+    let opened = unix_metadata(&objects)
+        .map_err(|source| io_error("inspect open Git objects directory", source))?;
+    if !before.same_object(&opened) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    record_policy_metadata(policy_metadata, common_path.join("objects"), opened)?;
+    let mount = snapshot_mount_identity(&objects)?;
+    if snapshot_mount_identity(common)? != mount {
+        return Err(AcquisitionError::SourceFilesystemBoundary(PathBuf::from(
+            "objects",
+        )));
+    }
+    let mut limits = GitObjectLimits::default();
+    for name in git_object_entries(&objects, &mut limits, deadline)? {
+        ensure_deadline(deadline, "validate Git objects")?;
+        let bytes = name.as_bytes();
+        if bytes == b"pack" {
+            validate_git_object_directory(&objects, &name, &mount, deadline, |pack| {
+                validate_git_metadata_tree(
+                    pack,
+                    &common_path.join("objects/pack"),
+                    &mount,
+                    &mut limits,
+                    deadline,
+                    0,
+                    true,
+                    policy_metadata,
+                )
+            })?;
+        } else if bytes == b"info" {
+            validate_git_object_directory(&objects, &name, &mount, deadline, |info| {
+                validate_git_metadata_tree(
+                    info,
+                    &common_path.join("objects/info"),
+                    &mount,
+                    &mut limits,
+                    deadline,
+                    0,
+                    false,
+                    policy_metadata,
+                )
+            })?;
+        } else if bytes.len() == 2 && bytes.iter().all(u8::is_ascii_hexdigit) {
+            validate_git_object_directory(&objects, &name, &mount, deadline, |fanout| {
+                let fanout_path = common_path.join("objects").join(&name);
+                record_policy_metadata(
+                    policy_metadata,
+                    fanout_path.clone(),
+                    unix_metadata(fanout)
+                        .map_err(|source| io_error("inspect loose Git object directory", source))?,
+                )?;
+                for name in git_object_entries(fanout, &mut limits, deadline)? {
+                    ensure_deadline(deadline, "validate loose Git objects")?;
+                    let before = metadata_at(fanout, &name)
+                        .map_err(|source| io_error("inspect loose Git object", source))?;
+                    if before.kind() != libc::S_IFREG {
+                        return Err(AcquisitionError::Unavailable {
+                            capability: "regular local loose Git objects",
+                        });
+                    }
+                    let file = open_file_at(fanout, &name, libc::O_RDONLY | libc::O_NONBLOCK)
+                        .map_err(|source| io_error("open loose Git object", source))?;
+                    let opened = unix_metadata(&file)
+                        .map_err(|source| io_error("inspect open loose Git object", source))?;
+                    if !before.same_object(&opened) {
+                        return Err(AcquisitionError::FilesystemIdentityChanged);
+                    }
+                    if snapshot_mount_identity(&file)? != mount {
+                        return Err(AcquisitionError::SourceFilesystemBoundary(
+                            Path::new("objects").join(&name),
+                        ));
+                    }
+                    record_policy_metadata(policy_metadata, fanout_path.join(&name), opened)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            return Err(AcquisitionError::Unavailable {
+                capability: "regular local Git object storage",
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn validate_git_metadata_tree(
+    directory: &File,
+    directory_path: &Path,
+    mount: &SnapshotMountIdentity,
+    limits: &mut GitObjectLimits,
+    deadline: Instant,
+    depth: usize,
+    reject_promisor: bool,
+    policy_metadata: &mut BTreeMap<PathBuf, UnixMetadata>,
+) -> Result<(), AcquisitionError> {
+    if depth > 8 {
+        return Err(AcquisitionError::SnapshotLimitExceeded);
+    }
+    record_policy_metadata(
+        policy_metadata,
+        directory_path.to_owned(),
+        unix_metadata(directory)
+            .map_err(|source| io_error("inspect Git object metadata directory", source))?,
+    )?;
+    for name in git_object_entries(directory, limits, deadline)? {
+        ensure_deadline(deadline, "validate Git object metadata")?;
+        if name == OsStr::new("alternates") {
+            return Err(AcquisitionError::Unavailable {
+                capability: "local non-promisor Git object storage",
+            });
+        }
+        if reject_promisor && Path::new(&name).extension() == Some(OsStr::new("promisor")) {
+            return Err(AcquisitionError::Unavailable {
+                capability: "local non-promisor Git object storage",
+            });
+        }
+        let path = directory_path.join(&name);
+        let before = metadata_at(directory, &name)
+            .map_err(|source| io_error("inspect Git object metadata entry", source))?;
+        match before.kind() {
+            libc::S_IFDIR => {
+                let child = open_directory_at(directory, &name)
+                    .map_err(|source| io_error("open Git object metadata directory", source))?;
+                let opened = unix_metadata(&child).map_err(|source| {
+                    io_error("inspect open Git object metadata directory", source)
+                })?;
+                if !before.same_object(&opened) {
+                    return Err(AcquisitionError::FilesystemIdentityChanged);
+                }
+                if snapshot_mount_identity(&child)? != *mount {
+                    return Err(AcquisitionError::SourceFilesystemBoundary(path));
+                }
+                validate_git_metadata_tree(
+                    &child,
+                    &path,
+                    mount,
+                    limits,
+                    deadline,
+                    depth + 1,
+                    reject_promisor,
+                    policy_metadata,
+                )?;
+            }
+            libc::S_IFREG => {
+                let mut file = open_file_at(directory, &name, libc::O_RDONLY | libc::O_NONBLOCK)
+                    .map_err(|source| io_error("open Git object metadata file", source))?;
+                let opened = unix_metadata(&file)
+                    .map_err(|source| io_error("inspect open Git object metadata file", source))?;
+                if !before.same_object(&opened) {
+                    return Err(AcquisitionError::FilesystemIdentityChanged);
+                }
+                if snapshot_mount_identity(&file)? != *mount {
+                    return Err(AcquisitionError::SourceFilesystemBoundary(path));
+                }
+                let mut probe = [0_u8; 1];
+                file.read(&mut probe)
+                    .map_err(|source| io_error("read Git object metadata file", source))?;
+                ensure_deadline(deadline, "validate Git object metadata")?;
+                record_policy_metadata(policy_metadata, path, opened)?;
+            }
+            _ => {
+                return Err(AcquisitionError::Unavailable {
+                    capability: "regular local Git object metadata entries",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_git_object_directory(
+    parent: &File,
+    name: &OsStr,
+    mount: &SnapshotMountIdentity,
+    deadline: Instant,
+    validate: impl FnOnce(&File) -> Result<(), AcquisitionError>,
+) -> Result<(), AcquisitionError> {
+    ensure_deadline(deadline, "validate Git objects")?;
+    let before = metadata_at(parent, name)
+        .map_err(|source| io_error("inspect Git object directory", source))?;
+    if before.kind() != libc::S_IFDIR {
+        return Err(AcquisitionError::Unavailable {
+            capability: "regular local Git object directories",
+        });
+    }
+    let directory = open_directory_at(parent, name)
+        .map_err(|source| io_error("open Git object directory", source))?;
+    let opened = unix_metadata(&directory)
+        .map_err(|source| io_error("inspect open Git object directory", source))?;
+    if !before.same_object(&opened) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    if snapshot_mount_identity(&directory)? != *mount {
+        return Err(AcquisitionError::SourceFilesystemBoundary(
+            Path::new("objects").join(name),
+        ));
+    }
+    validate(&directory)
+}
+
+#[cfg(unix)]
+fn git_object_entries(
+    directory: &File,
+    limits: &mut GitObjectLimits,
+    deadline: Instant,
+) -> Result<Vec<OsString>, AcquisitionError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let entries = directory_entries_bounded(
+        directory,
+        MAX_GIT_PACK_ENTRIES.saturating_sub(limits.entries),
+        (MAX_GIT_METADATA_BYTES as usize).saturating_sub(limits.name_bytes),
+        Some(deadline),
+    )?;
+    limits.entries = limits
+        .entries
+        .checked_add(entries.len())
+        .ok_or(AcquisitionError::SnapshotLimitExceeded)?;
+    limits.name_bytes = limits
+        .name_bytes
+        .checked_add(
+            entries
+                .iter()
+                .map(|name| name.as_bytes().len())
+                .sum::<usize>(),
+        )
+        .ok_or(AcquisitionError::SnapshotLimitExceeded)?;
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn record_policy_metadata(
+    records: &mut BTreeMap<PathBuf, UnixMetadata>,
+    path: PathBuf,
+    metadata: UnixMetadata,
+) -> Result<(), AcquisitionError> {
+    if let Some(recorded) = records.get(&path) {
+        if *recorded != metadata {
+            return Err(AcquisitionError::FilesystemIdentityChanged);
+        }
+    } else {
+        records.insert(path, metadata);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_metadata_path(path: &Path) -> io::Result<UnixMetadata> {
+    use std::{mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: lstat receives a valid C path and writable metadata storage.
+    if unsafe { libc::lstat(path.as_ptr(), metadata.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful lstat initialized metadata.
+    Ok(unix_metadata_from_stat(unsafe { metadata.assume_init() }))
+}
+
+fn ensure_deadline(deadline: Instant, operation: &'static str) -> Result<(), AcquisitionError> {
+    if Instant::now() >= deadline {
+        Err(AcquisitionError::CommandTimedOut(operation))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_bounded_regular_file_before(
+    path: &Path,
+    max_bytes: u64,
+    operation: &'static str,
+    deadline: Instant,
+) -> Result<Vec<u8>, AcquisitionError> {
+    ensure_deadline(deadline, operation)?;
+    let before = fs::symlink_metadata(path).map_err(|source| io_error(operation, source))?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(AcquisitionError::Unavailable {
+            capability: "regular bounded Git metadata file",
+        });
+    }
+    if before.len() > max_bytes {
+        return Err(AcquisitionError::OutputTooLarge(operation));
+    }
+    let mut file = open_read_no_follow(path).map_err(|source| io_error(operation, source))?;
+    let opened = file
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    if !opened.is_file() || opened.len() > max_bytes || !same_filesystem_object(&before, &opened) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    let capacity =
+        usize::try_from(opened.len()).map_err(|_| AcquisitionError::OutputTooLarge(operation))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(operation, source))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(AcquisitionError::OutputTooLarge(operation));
+    }
+    let after = file
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    if !same_hashed_file_metadata(&opened, &after) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    ensure_deadline(deadline, operation)?;
+    Ok(bytes)
+}
+
+fn read_bounded_open_file_before(
+    mut file: File,
+    max_bytes: u64,
+    operation: &'static str,
+    deadline: Instant,
+) -> Result<Vec<u8>, AcquisitionError> {
+    ensure_deadline(deadline, operation)?;
+    let before = file
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    if !before.is_file() || before.len() > max_bytes {
+        return Err(AcquisitionError::OutputTooLarge(operation));
+    }
+    let capacity =
+        usize::try_from(before.len()).map_err(|_| AcquisitionError::OutputTooLarge(operation))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(operation, source))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(AcquisitionError::OutputTooLarge(operation));
+    }
+    let after = file
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    if !same_hashed_file_metadata(&before, &after) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    ensure_deadline(deadline, operation)?;
+    Ok(bytes)
+}
+
+fn verify_open_directory(
+    directory: &File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<(), AcquisitionError> {
+    let opened = directory
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    let current = fs::symlink_metadata(path).map_err(|source| io_error(operation, source))?;
+    if !opened.is_dir()
+        || !current.is_dir()
+        || current.file_type().is_symlink()
+        || !same_filesystem_object(&opened, &current)
+    {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fence_trusted_git_repository(
+    root: &File,
+    repository: &Path,
+    identity: &TrustedGitRepositoryIdentity,
+    deadline: Instant,
+) -> Result<(), AcquisitionError> {
+    ensure_deadline(deadline, "fence Git repository policy")?;
+    verify_open_directory(root, repository, "Git repository root")?;
+    let current_root = root
+        .metadata()
+        .map_err(|source| io_error("inspect Git repository root", source))?;
+    if filesystem_identity(&current_root).as_ref() != Some(&identity.root) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    for (path, expected) in &identity.fence_metadata {
+        ensure_deadline(deadline, "fence Git repository policy")?;
+        let current = unix_metadata_path(path)
+            .map_err(|source| io_error("inspect Git repository policy metadata", source))?;
+        if current != *expected {
+            return Err(AcquisitionError::FilesystemIdentityChanged);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fence_trusted_git_repository(
+    _root: &File,
+    _repository: &Path,
+    _identity: &TrustedGitRepositoryIdentity,
+    _deadline: Instant,
+) -> Result<(), AcquisitionError> {
+    Err(AcquisitionError::Unavailable {
+        capability: "descriptor-relative trusted Git repository validation",
+    })
+}
+
+pub(crate) fn begin_trusted_git_repository_policy_session(
+    root: &File,
+    repository: &Path,
+    deadline: Instant,
+) -> Result<TrustedGitRepositoryPolicySession, AcquisitionError> {
+    let identity = validate_trusted_git_repository(root, repository, deadline)?;
+    let repository = repository.to_owned();
+    let implementation = capture_trusted_git_implementation(deadline)?;
+    let logical_bytes =
+        trusted_git_policy_session_logical_bytes(&repository, &identity, &implementation.identity);
+    let validation_transient_bytes = policy_validation_transient_bytes(&identity);
+    let scan_work = policy_scan_work(&identity);
+    let consumed_work = scan_work
+        .checked_add(implementation.streamed_bytes)
+        .and_then(|work| work.checked_add(implementation.streamed_chunks))
+        .and_then(|work| work.checked_add(1))
+        .ok_or(AcquisitionError::SnapshotLimitExceeded)?;
+    Ok(TrustedGitRepositoryPolicySession {
+        root: root
+            .try_clone()
+            .map_err(|source| io_error("duplicate trusted Git repository root", source))?,
+        repository,
+        identity,
+        implementation: implementation.identity,
+        metrics: TrustedGitRepositoryPolicyMetrics {
+            logical_bytes,
+            peak_bytes: logical_bytes
+                .checked_add(implementation.peak_bytes.max(validation_transient_bytes))
+                .ok_or(AcquisitionError::SnapshotLimitExceeded)?,
+            consumed_work,
+            policy_scans: 1,
+            fence_scans: 1,
+            streamed_executable_bytes: implementation.streamed_bytes,
+            streamed_executable_chunks: implementation.streamed_chunks,
+            commands: 1,
+            output_bytes: implementation.output_bytes,
+        },
+    })
+}
+
+pub(crate) const fn trusted_git_repository_policy_metrics(
+    session: &TrustedGitRepositoryPolicySession,
+) -> TrustedGitRepositoryPolicyMetrics {
+    TrustedGitRepositoryPolicyMetrics {
+        logical_bytes: session.logical_bytes(),
+        peak_bytes: session.peak_bytes(),
+        consumed_work: session.consumed_work(),
+        ..session.metrics
+    }
+}
+
+pub(crate) fn trusted_git_implementation_identity(
+    session: &TrustedGitRepositoryPolicySession,
+) -> &TrustedGitImplementationIdentity {
+    &session.implementation
+}
+
+fn capture_trusted_git_implementation(
+    deadline: Instant,
+) -> Result<TrustedGitImplementationCapture, AcquisitionError> {
+    let executable = trusted_git_executable()?;
+    let (executable_digest, streamed_bytes, streamed_chunks) = hash_bounded_regular_file_before(
+        &executable,
+        MAX_GIT_EXECUTABLE_BYTES,
+        "digest Git executable",
+        deadline,
+    )?;
+    let mut command = Command::new(&executable);
+    command.env_clear().env("LC_ALL", "C").arg("--version");
+    let output = bounded_command_output_before(
+        command,
+        "identify Git version",
+        None,
+        deadline,
+        4 * 1024,
+        MAX_ERROR_OUTPUT,
+    )?;
+    let version = std::str::from_utf8(&output.stdout).map_err(|_| AcquisitionError::Git {
+        operation: "identify Git version",
+        message: "output was not UTF-8".into(),
+    })?;
+    let normalized = version.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Err(AcquisitionError::Git {
+            operation: "identify Git version",
+            message: "output was empty".into(),
+        });
+    }
+    let output_bytes = output.stdout.len().saturating_add(output.stderr.len());
+    let peak_bytes = GIT_EXECUTABLE_HASH_BUFFER_BYTES.max(
+        output
+            .stdout
+            .capacity()
+            .saturating_add(output.stderr.capacity()),
+    );
+    Ok(TrustedGitImplementationCapture {
+        identity: TrustedGitImplementationIdentity {
+            executable,
+            executable_digest,
+            version_digest: *blake3::hash(normalized.as_bytes()).as_bytes(),
+        },
+        streamed_bytes,
+        streamed_chunks,
+        output_bytes,
+        peak_bytes,
+    })
+}
+
+fn hash_bounded_regular_file_before(
+    path: &Path,
+    max_bytes: u64,
+    operation: &'static str,
+    deadline: Instant,
+) -> Result<([u8; 32], usize, usize), AcquisitionError> {
+    ensure_deadline(deadline, operation)?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|source| io_error(operation, source))?;
+    if !path_metadata.is_file() || path_metadata.file_type().is_symlink() {
+        return Err(AcquisitionError::Unavailable {
+            capability: "regular bounded Git executable",
+        });
+    }
+    let mut file = open_read_no_follow(path).map_err(|source| io_error(operation, source))?;
+    let before = file
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    if !before.is_file()
+        || before.len() > max_bytes
+        || !same_filesystem_object(&path_metadata, &before)
+    {
+        return Err(AcquisitionError::OutputTooLarge(operation));
+    }
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = [0_u8; GIT_EXECUTABLE_HASH_BUFFER_BYTES];
+    let mut total = 0_u64;
+    let mut chunks = 0_usize;
+    loop {
+        ensure_deadline(deadline, operation)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| io_error(operation, source))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .filter(|total| *total <= max_bytes)
+            .ok_or(AcquisitionError::OutputTooLarge(operation))?;
+        chunks = chunks
+            .checked_add(1)
+            .ok_or(AcquisitionError::SnapshotLimitExceeded)?;
+        hash.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|source| io_error(operation, source))?;
+    if total != before.len() || !same_hashed_file_metadata(&before, &after) {
+        return Err(AcquisitionError::FilesystemIdentityChanged);
+    }
+    ensure_deadline(deadline, operation)?;
+    Ok((
+        *hash.finalize().as_bytes(),
+        usize::try_from(total).map_err(|_| AcquisitionError::OutputTooLarge(operation))?,
+        chunks,
+    ))
+}
+
+pub(crate) fn finish_trusted_git_repository_policy_session(
+    session: &mut TrustedGitRepositoryPolicySession,
+    deadline: Instant,
+) -> Result<(), AcquisitionError> {
+    let final_identity =
+        validate_trusted_git_repository(&session.root, &session.repository, deadline)?;
+    let final_implementation = capture_trusted_git_implementation(deadline)?;
+    let final_logical = trusted_git_policy_session_logical_bytes(
+        &session.repository,
+        &final_identity,
+        &final_implementation.identity,
+    );
+    session.metrics.peak_bytes = session.metrics.peak_bytes.max(
+        session
+            .metrics
+            .logical_bytes
+            .saturating_add(final_logical)
+            .saturating_add(
+                final_implementation
+                    .peak_bytes
+                    .max(policy_validation_transient_bytes(&final_identity)),
+            ),
+    );
+    session.metrics.policy_scans = session.metrics.policy_scans.saturating_add(1);
+    session.metrics.fence_scans = session.metrics.fence_scans.saturating_add(1);
+    session.metrics.streamed_executable_bytes = session
+        .metrics
+        .streamed_executable_bytes
+        .saturating_add(final_implementation.streamed_bytes);
+    session.metrics.streamed_executable_chunks = session
+        .metrics
+        .streamed_executable_chunks
+        .saturating_add(final_implementation.streamed_chunks);
+    session.metrics.commands = session.metrics.commands.saturating_add(1);
+    session.metrics.output_bytes = session
+        .metrics
+        .output_bytes
+        .saturating_add(final_implementation.output_bytes);
+    session.metrics.consumed_work = session
+        .metrics
+        .consumed_work
+        .saturating_add(policy_scan_work(&final_identity))
+        .saturating_add(final_implementation.streamed_bytes)
+        .saturating_add(final_implementation.streamed_chunks)
+        .saturating_add(1);
+    if final_identity == session.identity && final_implementation.identity == session.implementation
+    {
+        Ok(())
+    } else {
+        Err(AcquisitionError::FilesystemIdentityChanged)
+    }
+}
+
+pub(crate) fn trusted_git_read(
+    root: &File,
+    repository: &Path,
+    read: TrustedGitRead<'_>,
+    limits: TrustedGitReadLimits,
+) -> Result<CapturedOutput, AcquisitionError> {
+    let deadline = Instant::now()
+        .checked_add(limits.timeout)
+        .ok_or(AcquisitionError::CommandTimedOut("validate Git repository"))?;
+    let mut session = begin_trusted_git_repository_policy_session(root, repository, deadline)?;
+    let output = trusted_git_read_before(&mut session, read, limits, deadline)?;
+    finish_trusted_git_repository_policy_session(&mut session, deadline)?;
+    Ok(output)
+}
+
+pub(crate) fn trusted_git_read_in_session(
+    session: &mut TrustedGitRepositoryPolicySession,
+    read: TrustedGitRead<'_>,
+    limits: TrustedGitReadLimits,
+) -> Result<CapturedOutput, AcquisitionError> {
+    let deadline =
+        Instant::now()
+            .checked_add(limits.timeout)
+            .ok_or(AcquisitionError::CommandTimedOut(
+                "fence Git repository policy",
+            ))?;
+    trusted_git_read_before(session, read, limits, deadline)
+}
+
+fn trusted_git_read_before(
+    session: &mut TrustedGitRepositoryPolicySession,
+    read: TrustedGitRead<'_>,
+    limits: TrustedGitReadLimits,
+    deadline: Instant,
+) -> Result<CapturedOutput, AcquisitionError> {
+    fence_trusted_git_repository(
+        &session.root,
+        &session.repository,
+        &session.identity,
+        deadline,
+    )?;
+    let (operation, arguments) = trusted_git_read_arguments(read)?;
+    let owned_root = session
+        .root
+        .try_clone()
+        .map_err(|source| io_error("duplicate trusted Git repository root", source))?;
+    let mut command = git_command_at(&session.repository, true, Some(owned_root))?;
+    command.args(arguments);
+    let output = bounded_command_output_before(
+        command,
+        operation,
+        None,
+        deadline,
+        limits.stdout_bytes,
+        limits.stderr_bytes,
+    )?;
+    if output.stdout.len() > limits.stdout_bytes || output.stderr.len() > limits.stderr_bytes {
+        return Err(AcquisitionError::OutputTooLarge(operation));
+    }
+    let output_bytes = output.stdout.len().saturating_add(output.stderr.len());
+    session.metrics.commands = session.metrics.commands.saturating_add(1);
+    session.metrics.output_bytes = session.metrics.output_bytes.saturating_add(output_bytes);
+    session.metrics.consumed_work = session
+        .metrics
+        .consumed_work
+        .saturating_add(session.identity.fence_metadata.len().saturating_mul(2))
+        .saturating_add(output_bytes)
+        .saturating_add(1);
+    session.metrics.fence_scans = session.metrics.fence_scans.saturating_add(2);
+    session.metrics.peak_bytes = session.metrics.peak_bytes.max(
+        session
+            .metrics
+            .logical_bytes
+            .saturating_add(output.stdout.capacity())
+            .saturating_add(output.stderr.capacity()),
+    );
+    let output = if matches!(read, TrustedGitRead::ShallowBoundaries) {
+        shallow_boundaries(&session.root, output, limits, deadline)?
+    } else {
+        output
+    };
+    fence_trusted_git_repository(
+        &session.root,
+        &session.repository,
+        &session.identity,
+        deadline,
+    )?;
+    Ok(output)
+}
+
+#[cfg(unix)]
+fn trusted_git_policy_session_logical_bytes(
+    repository: &PathBuf,
+    identity: &TrustedGitRepositoryIdentity,
+    implementation: &TrustedGitImplementationIdentity,
+) -> usize {
+    std::mem::size_of::<TrustedGitRepositoryPolicySession>()
+        .saturating_add(repository.capacity())
+        .saturating_add(implementation.executable.capacity())
+        .saturating_add(policy_map_logical_bytes(&identity.policy_metadata))
+        .saturating_add(policy_map_logical_bytes(&identity.fence_metadata))
+}
+
+#[cfg(unix)]
+fn policy_map_logical_bytes(records: &BTreeMap<PathBuf, UnixMetadata>) -> usize {
+    records
+        .keys()
+        .map(|path| {
+            BTREE_ENTRY_WEIGHT
+                .saturating_add(std::mem::size_of::<PathBuf>())
+                .saturating_add(std::mem::size_of::<UnixMetadata>())
+                .saturating_add(path.capacity())
+        })
+        .sum()
+}
+
+#[cfg(not(unix))]
+fn trusted_git_policy_session_logical_bytes(
+    repository: &PathBuf,
+    _identity: &TrustedGitRepositoryIdentity,
+    implementation: &TrustedGitImplementationIdentity,
+) -> usize {
+    std::mem::size_of::<TrustedGitRepositoryPolicySession>()
+        .saturating_add(repository.as_os_str().as_encoded_bytes().len())
+        .saturating_add(implementation.executable.capacity())
+}
+
+#[cfg(unix)]
+fn policy_scan_work(identity: &TrustedGitRepositoryIdentity) -> usize {
+    identity
+        .policy_metadata
+        .len()
+        .saturating_add(identity.fence_metadata.len())
+}
+
+#[cfg(unix)]
+fn policy_validation_transient_bytes(identity: &TrustedGitRepositoryIdentity) -> usize {
+    identity
+        .policy_metadata
+        .iter()
+        .filter(|(path, metadata)| {
+            metadata.kind() == libc::S_IFREG
+                && matches!(
+                    path.file_name().and_then(OsStr::to_str),
+                    Some(".git" | "commondir" | "config" | "config.worktree")
+                )
+        })
+        .filter_map(|(_, metadata)| usize::try_from(metadata.size).ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_mul(2)
+}
+
+#[cfg(not(unix))]
+fn policy_scan_work(_identity: &TrustedGitRepositoryIdentity) -> usize {
+    0
+}
+
+#[cfg(not(unix))]
+fn policy_validation_transient_bytes(_identity: &TrustedGitRepositoryIdentity) -> usize {
+    0
+}
+
+fn trusted_git_read_arguments(
+    read: TrustedGitRead<'_>,
+) -> Result<(&'static str, Vec<OsString>), AcquisitionError> {
+    let (operation, fixed): (&'static str, &[&str]) = match read {
+        TrustedGitRead::Head => ("resolve HEAD", &["rev-parse", "--verify", "HEAD^{commit}"]),
+        TrustedGitRead::ObjectFormat => (
+            "resolve object format",
+            &["rev-parse", "--show-object-format"],
+        ),
+        TrustedGitRead::ShallowBoundaries => (
+            "read shallow boundaries",
+            &[
+                "rev-parse",
+                "--is-shallow-repository",
+                "--git-path",
+                "shallow",
+            ],
+        ),
+        TrustedGitRead::Commit { .. } => ("read commit object", &["cat-file", "commit"]),
+        TrustedGitRead::Tree { .. } => {
+            ("read tree object", &["ls-tree", "-r", "-z", "--full-tree"])
+        }
+        TrustedGitRead::Blob { .. } => ("read blob object", &["cat-file", "blob"]),
+        TrustedGitRead::Blame { .. } => (
+            "read blame porcelain",
+            &["blame", "--line-porcelain", "--root", "--no-textconv"],
+        ),
+    };
+    let mut arguments = fixed.iter().map(OsString::from).collect::<Vec<_>>();
+    match read {
+        TrustedGitRead::Commit { oid }
+        | TrustedGitRead::Tree { oid }
+        | TrustedGitRead::Blob { oid } => {
+            validate_git_oid(oid)?;
+            arguments.push(oid.into());
+        }
+        TrustedGitRead::Blame { head, path } => {
+            validate_git_oid(head)?;
+            validate_git_path(path)?;
+            arguments.push(head.into());
+            arguments.push("--".into());
+            arguments.push(path.as_str().into());
+        }
+        TrustedGitRead::Head | TrustedGitRead::ObjectFormat | TrustedGitRead::ShallowBoundaries => {
+        }
+    }
+    Ok((operation, arguments))
+}
+
+fn validate_git_oid(value: &str) -> Result<(), AcquisitionError> {
+    if matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(AcquisitionError::Git {
+            operation: "validate read-only Git command",
+            message: "invalid object ID".into(),
+        })
+    }
+}
+
+fn validate_git_path(path: &RootRelativePath) -> Result<(), AcquisitionError> {
+    RootRelativePath::parse(path.as_str(), 256 * 1024)
+        .map(|_| ())
+        .map_err(|_| AcquisitionError::Git {
+            operation: "validate read-only Git command",
+            message: "invalid root-relative path".into(),
+        })
+}
+
+fn shallow_boundaries(
+    root: &File,
+    output: CapturedOutput,
+    limits: TrustedGitReadLimits,
+    deadline: Instant,
+) -> Result<CapturedOutput, AcquisitionError> {
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| AcquisitionError::Git {
+        operation: "read shallow boundaries",
+        message: "output was not UTF-8".into(),
+    })?;
+    let mut lines = text.lines();
+    match lines.next() {
+        Some("false") => {
+            if lines.next().is_none() || lines.next().is_some() {
+                return Err(AcquisitionError::Git {
+                    operation: "read shallow boundaries",
+                    message: "invalid shallow repository response".into(),
+                });
+            }
+            Ok(CapturedOutput {
+                stdout: Vec::new(),
+                ..output
+            })
+        }
+        Some("true") => {
+            let path = lines.next().ok_or(AcquisitionError::Git {
+                operation: "read shallow boundaries",
+                message: "shallow path was absent".into(),
+            })?;
+            if lines.next().is_some() {
+                return Err(AcquisitionError::CommandTimedOut("read shallow boundaries"));
+            }
+            ensure_deadline(deadline, "read shallow boundaries")?;
+            let path = Path::new(path);
+            let stdout = if path.is_absolute() {
+                read_bounded_regular_file_before(
+                    path,
+                    (limits.stdout_bytes as u64).min(MAX_GIT_METADATA_BYTES),
+                    "read shallow boundaries",
+                    deadline,
+                )?
+            } else {
+                let file = open_relative_file(root, path)
+                    .map_err(|source| io_error("open shallow boundaries", source))?;
+                read_bounded_open_file_before(
+                    file,
+                    (limits.stdout_bytes as u64).min(MAX_GIT_METADATA_BYTES),
+                    "read shallow boundaries",
+                    deadline,
+                )?
+            };
+            if stdout.len() > limits.stdout_bytes {
+                return Err(AcquisitionError::OutputTooLarge("read shallow boundaries"));
+            }
+            Ok(CapturedOutput { stdout, ..output })
+        }
+        _ => Err(AcquisitionError::Git {
+            operation: "read shallow boundaries",
+            message: "invalid shallow repository response".into(),
+        }),
+    }
+}
+
 fn git_output<I, S>(
     repository: &Path,
     operation: &'static str,
@@ -2814,7 +4305,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = git_command(repository)?;
+    let mut command = git_command(repository, false)?;
     command.args(arguments);
     bounded_command_output(
         command,
@@ -2836,7 +4327,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = git_command(repository)?;
+    let mut command = git_command(repository, false)?;
     command.args(arguments);
     bounded_command_output(
         command,
@@ -2848,7 +4339,15 @@ where
     )
 }
 
-fn git_command(repository: &Path) -> Result<Command, AcquisitionError> {
+fn git_command(repository: &Path, offline: bool) -> Result<Command, AcquisitionError> {
+    git_command_at(repository, offline, None)
+}
+
+fn git_command_at(
+    repository: &Path,
+    offline: bool,
+    root: Option<File>,
+) -> Result<Command, AcquisitionError> {
     let executable = trusted_git_executable()?;
     #[cfg(target_os = "macos")]
     let mut command = {
@@ -2866,22 +4365,43 @@ fn git_command(repository: &Path) -> Result<Command, AcquisitionError> {
     #[cfg(not(target_os = "macos"))]
     let mut command = Command::new(&executable);
     command
-        .current_dir(repository)
         .env_clear()
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", null_device())
         .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_PAGER", "cat")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("PAGER", "cat")
         .env("LC_ALL", "C")
+        .arg("--no-replace-objects")
         .arg("-c")
         .arg(format!("core.hooksPath={}", null_device()))
         .arg("-c")
         .arg("core.fsmonitor=false")
         .arg("-c")
+        .arg("core.quotePath=false")
+        .arg("-c")
         .arg("core.untrackedCache=false")
         .arg("-c")
         .arg("submodule.recurse=false");
+    if root.is_none() {
+        command.current_dir(repository);
+    }
+    configure_working_directory(&mut command, root);
+    if offline {
+        command
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .arg("-c")
+            .arg("protocol.allow=never")
+            .arg("-c")
+            .arg("protocol.file.allow=never")
+            .arg("-c")
+            .arg("credential.helper=")
+            .arg("-c")
+            .arg("core.askPass=");
+    }
     command.env(
         "PATH",
         executable
@@ -2896,6 +4416,29 @@ fn git_command(repository: &Path) -> Result<Command, AcquisitionError> {
     }
     Ok(command)
 }
+
+#[cfg(unix)]
+fn configure_working_directory(command: &mut Command, root: Option<File>) {
+    use std::{os::fd::AsRawFd, os::unix::process::CommandExt};
+
+    let Some(root) = root else { return };
+    let descriptor = root.as_raw_fd();
+    // SAFETY: fchdir is async-signal-safe; the captured File keeps the descriptor live through
+    // spawn and remains close-on-exec, so the descriptor cannot leak into Git.
+    unsafe {
+        command.pre_exec(move || {
+            let _keep_alive = &root;
+            if libc::fchdir(descriptor) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_working_directory(_command: &mut Command, _root: Option<File>) {}
 
 #[cfg(unix)]
 fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
@@ -2915,14 +4458,14 @@ fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
         .iter()
         .find_map(|candidate| verified_system_executable(Path::new(candidate)).ok())
         .ok_or(AcquisitionError::Unavailable {
-            capability: "an immutable administrator-owned system Git executable",
+            capability: "an administrator-controlled non-user-writable system Git executable",
         })
 }
 
 #[cfg(not(unix))]
 fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
     Err(AcquisitionError::Unavailable {
-        capability: "an immutable administrator-owned system Git executable",
+        capability: "an administrator-controlled non-user-writable system Git executable",
     })
 }
 
@@ -2937,35 +4480,35 @@ fn verified_system_executable(path: &Path) -> Result<PathBuf, AcquisitionError> 
     }
     let mut current = PathBuf::from("/");
     let root = fs::symlink_metadata(&current).map_err(|_| AcquisitionError::Unavailable {
-        capability: "an immutable administrator-owned system Git executable",
+        capability: "an administrator-controlled non-user-writable system Git executable",
     })?;
     if root.uid() != 0 || root.permissions().mode() & 0o022 != 0 || !root.is_dir() {
         return Err(AcquisitionError::Unavailable {
-            capability: "an immutable administrator-owned system Git executable",
+            capability: "an administrator-controlled non-user-writable system Git executable",
         });
     }
     for component in path.components().skip(1) {
         let Component::Normal(name) = component else {
             return Err(AcquisitionError::Unavailable {
-                capability: "an immutable system executable path",
+                capability: "an administrator-controlled non-user-writable executable path",
             });
         };
         current.push(name);
         let metadata =
             fs::symlink_metadata(&current).map_err(|_| AcquisitionError::Unavailable {
-                capability: "an immutable administrator-owned system Git executable",
+                capability: "an administrator-controlled non-user-writable system Git executable",
             })?;
         if metadata.uid() != 0
             || metadata.permissions().mode() & 0o022 != 0
             || metadata.file_type().is_symlink()
         {
             return Err(AcquisitionError::Unavailable {
-                capability: "an immutable administrator-owned system Git executable",
+                capability: "an administrator-controlled non-user-writable system Git executable",
             });
         }
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| AcquisitionError::Unavailable {
-        capability: "an immutable administrator-owned system Git executable",
+        capability: "an administrator-controlled non-user-writable system Git executable",
     })?;
     if !metadata.is_file()
         || metadata.file_type().is_block_device()
@@ -2973,27 +4516,49 @@ fn verified_system_executable(path: &Path) -> Result<PathBuf, AcquisitionError> 
         || metadata.permissions().mode() & 0o111 == 0
     {
         return Err(AcquisitionError::Unavailable {
-            capability: "an immutable administrator-owned system Git executable",
+            capability: "an administrator-controlled non-user-writable system Git executable",
         });
     }
     Ok(path.to_path_buf())
 }
 
 #[derive(Debug)]
-struct CapturedOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct CapturedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 fn bounded_command_output(
-    mut command: Command,
+    command: Command,
     operation: &'static str,
     input: Option<Vec<u8>>,
     timeout: Duration,
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<CapturedOutput, AcquisitionError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(AcquisitionError::CommandTimedOut(operation))?;
+    bounded_command_output_before(
+        command,
+        operation,
+        input,
+        deadline,
+        stdout_limit,
+        stderr_limit,
+    )
+}
+
+fn bounded_command_output_before(
+    mut command: Command,
+    operation: &'static str,
+    input: Option<Vec<u8>>,
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<CapturedOutput, AcquisitionError> {
+    ensure_deadline(deadline, operation)?;
     ensure_bounded_git_runner()?;
     command
         .stdin(if input.is_some() {
@@ -3038,7 +4603,6 @@ fn bounded_command_output(
             result
         })
     });
-    let deadline = Instant::now() + timeout;
     let mut finished = 0;
     let expected = 2 + usize::from(writer.is_some());
     let mut status = None;
@@ -3599,6 +5163,79 @@ mod tests {
 
         assert!(!same_hashed_file_metadata(&before, &after));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn policy_accounting_bounds_large_metadata_maps_and_streamed_executables() {
+        let executable = temporary_path("kit-large-executable");
+        let bytes = vec![0x5a; GIT_EXECUTABLE_HASH_BUFFER_BYTES * 3 + 17];
+        fs::write(&executable, &bytes).unwrap();
+        let (_, streamed, chunks) = hash_bounded_regular_file_before(
+            &executable,
+            bytes.len() as u64,
+            "test executable digest",
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(streamed, bytes.len());
+        assert_eq!(chunks, 4);
+
+        let metadata = UnixMetadata {
+            dev: 1,
+            ino: 1,
+            nlink: 1,
+            mode: libc::S_IFREG,
+            size: 0,
+            modified_seconds: 0,
+            modified_nanoseconds: 0,
+            changed_seconds: 0,
+            changed_nanoseconds: 0,
+        };
+        let policy_metadata = (0..4_096)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("/repo/.git/objects/{index:04x}")),
+                    metadata,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let fence_metadata = policy_metadata
+            .iter()
+            .take(128)
+            .map(|(path, metadata)| (path.clone(), *metadata))
+            .collect();
+        let identity = TrustedGitRepositoryIdentity {
+            root: FilesystemIdentity {
+                first: 1,
+                second: 1,
+            },
+            git_dir: FilesystemIdentity {
+                first: 1,
+                second: 2,
+            },
+            common_dir: FilesystemIdentity {
+                first: 1,
+                second: 2,
+            },
+            policy_metadata,
+            fence_metadata,
+        };
+        let implementation = TrustedGitImplementationIdentity {
+            executable: executable.clone(),
+            executable_digest: [1; 32],
+            version_digest: [2; 32],
+        };
+        let logical = trusted_git_policy_session_logical_bytes(
+            &PathBuf::from("/repo"),
+            &identity,
+            &implementation,
+        );
+        assert!(
+            logical
+                > 4_096 * (std::mem::size_of::<UnixMetadata>() + std::mem::size_of::<PathBuf>())
+        );
+        assert!(policy_scan_work(&identity) >= 4_096 + 128);
+        fs::remove_file(executable).unwrap();
     }
 
     #[test]

@@ -1416,7 +1416,7 @@ components:
         id: {$ref: '#/components/schemas/RepositoryResultId'}
         native_operation_id: {$ref: '#/components/schemas/RepositoryResultId'}
         native_result_id: {$ref: '#/components/schemas/RepositoryResultId'}
-        operation: {type: string, pattern: '^repo\\.(discover|search|read|edit|run|check)$'}
+        operation: {type: string, pattern: '^repo\.(discover|search|read|edit|run|check)$'}
         status: {enum: [queued, running, waiting_approval, completed, failed, cancelled, outcome_unknown, denied]}
         replayed: {type: boolean}
         approval: {$ref: '#/components/schemas/RepositoryApproval'}
@@ -1431,6 +1431,23 @@ components:
         created_at_unix_micros: {type: integer}
         updated_at_unix_micros: {type: integer}
       additionalProperties: false
+      allOf:
+        - if:
+            required: [status, operation, output]
+            properties:
+              status: {const: completed}
+              operation: {const: repo.discover}
+              output:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [mode]
+                    properties: {mode: {const: map}}
+          then:
+            properties:
+              output: {$ref: '#/components/schemas/RepositoryDiscoverMapNativeOutput'}
     RepositoryResultId:
       type: string
       pattern: '^tool_call_[0-7][0-9a-hjkmnp-tv-z]{25}$'
@@ -1561,6 +1578,15 @@ components:
             expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
             map:
               type: object
+              allOf:
+                - if:
+                    required: [relationships]
+                    properties:
+                      relationships:
+                        contains: {const: changed_with}
+                  then:
+                    required: [purpose]
+                    properties: {purpose: {const: neighborhood}}
               properties:
                 taskTerms: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 256}}
                 exactIdentifiers: {type: array, maxItems: 128, items: {type: string, pattern: '^[0-9a-f]{64}$'}}
@@ -1579,7 +1605,47 @@ components:
                 currentEditPaths: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
                 pathPrefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
                 languages: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 64}}
-                relationships: {type: array, maxItems: 16, uniqueItems: true, items: {enum: [contains, contained_by, semantic_declaration, semantic_definition, semantic_type_definition, semantic_implementation, semantic_reference, defines, imports, exports, references, calls, implements, inherits, overrides, tests]}}
+                historyPaths:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Optional exact bounded Git co-change scope. Omit to use all indexed file paths when changed_with is requested.
+                  items:
+                    type: string
+                    minLength: 1
+                    maxLength: 4096
+                    allOf:
+                      - not: {pattern: '^/'}
+                      - not: {pattern: '^[A-Za-z]:'}
+                      - not: {pattern: '\\'}
+                      - not: {pattern: '\p{Cc}'}
+                      - not: {pattern: '[?*"<>|:]'}
+                      - not: {pattern: '(?:^|/)(?:/|$)'}
+                      - not: {pattern: '(?:^|/)\.{1,2}(?:/|$)'}
+                      - not: {pattern: '[. ](?:/|$)'}
+                      - not: {pattern: '(?:^|/)(?:[cC][oO][nN](?:[iI][nN]\$|[oO][uU][tT]\$)?|[pP][rR][nN]|[aA][uU][xX]|[nN][uU][lL]|[cC][oO][mM][1-9¹²³]|[lL][pP][tT][1-9¹²³])(?:\.|/|$)'}
+                    description: Lexically safe canonical root-relative path. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 4096-byte UTF-8 limit and portable path rules.
+                blamePaths:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Optional exact bounded blame scope. Requested paths produce canonical digest-only blame hunks in map.blame; raw line text is never returned. Blame is never extracted when omitted.
+                  items:
+                    type: string
+                    minLength: 1
+                    maxLength: 4096
+                    allOf:
+                      - not: {pattern: '^/'}
+                      - not: {pattern: '^[A-Za-z]:'}
+                      - not: {pattern: '\\'}
+                      - not: {pattern: '\p{Cc}'}
+                      - not: {pattern: '[?*"<>|:]'}
+                      - not: {pattern: '(?:^|/)(?:/|$)'}
+                      - not: {pattern: '(?:^|/)\.{1,2}(?:/|$)'}
+                      - not: {pattern: '[. ](?:/|$)'}
+                      - not: {pattern: '(?:^|/)(?:[cC][oO][nN](?:[iI][nN]\$|[oO][uU][tT]\$)?|[pP][rR][nN]|[aA][uU][xX]|[nN][uU][lL]|[cC][oO][mM][1-9¹²³]|[lL][pP][tT][1-9¹²³])(?:\.|/|$)'}
+                    description: Lexically safe canonical root-relative path. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 4096-byte UTF-8 limit and portable path rules.
+                relationships: {type: array, maxItems: 16, uniqueItems: true, items: {enum: [contains, contained_by, semantic_declaration, semantic_definition, semantic_type_definition, semantic_implementation, semantic_reference, defines, imports, exports, references, calls, implements, inherits, overrides, tests, changed_with]}}
                 expansionSeeds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, pattern: '^[0-9a-f]{64}$'}}
                 graphSeeds:
                   type: array
@@ -1655,6 +1721,15 @@ components:
         map: {$ref: '#/components/schemas/RepositoryMapResponse'}
         semanticEvidenceAvailable: {type: boolean}
       additionalProperties: false
+    RepositoryDiscoverMapNativeOutput:
+      type: object
+      required: [version, data, artifacts, truncated]
+      properties:
+        version: {const: 1}
+        data: {$ref: '#/components/schemas/RepositoryDiscoverMapOutput'}
+        artifacts: {type: array, items: {type: string}}
+        truncated: {const: false}
+      additionalProperties: false
     RepositoryMapResponse:
       type: object
       description: Revision-bound canonical repository map. Structure graph metadata has one wire location in this object. Graph edge endpoints always preserve factual direction; traversal purpose changes reachability and hops, not endpoints. `contained_by` is the exact inverse projection of canonical `contains`. Opportunistic LSP graph relations use `observed_partial` completeness until a completeness proof exists.
@@ -1670,20 +1745,75 @@ components:
         graph_snapshot_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
         graph_content_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
         graph_options_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
-        path_nodes: {type: array, items: {type: object, additionalProperties: true}}
-        path_edges: {type: array, items: {type: object, additionalProperties: true}}
-        entries: {type: array, items: {type: object, additionalProperties: true}}
-        edges: {type: array, items: {type: object, additionalProperties: true}}
+        history:
+          type: object
+          required: [head, head_tree, object_format, shallow_digest, scope_digest, request_digest, content_digest, snapshot_digest, extractor_digest, options_digest, commits_completeness, renames_completeness, cochange_completeness, blame_completeness, commits_omitted, renames_omitted, cochange_omitted, blame_omitted, git_executable_digest, git_version_digest, git_implementation_digest]
+          properties:
+            head: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+            head_tree: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+            object_format: {enum: [sha1, sha256]}
+            shallow_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            scope_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            request_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            content_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            snapshot_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            extractor_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            options_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            commits_completeness: {enum: [complete, observed_partial, unavailable]}
+            renames_completeness: {enum: [complete, observed_partial, unavailable]}
+            cochange_completeness: {enum: [complete, observed_partial, unavailable]}
+            blame_completeness: {enum: [complete, observed_partial, unavailable]}
+            commits_omitted: {type: integer, minimum: 0}
+            renames_omitted: {type: integer, minimum: 0}
+            cochange_omitted: {type: integer, minimum: 0}
+            blame_omitted: {type: integer, minimum: 0}
+            git_executable_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            git_version_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            git_implementation_digest: {type: string, pattern: '^[0-9a-f]{64}$', description: Combined Git implementation identity over the canonical executable path, executable content digest, and normalized version digest.}
+          additionalProperties: false
+          allOf:
+            - if: {properties: {object_format: {const: sha1}}, required: [object_format]}
+              then:
+                properties:
+                  head: {pattern: '^[0-9a-f]{40}$'}
+                  head_tree: {pattern: '^[0-9a-f]{40}$'}
+            - if: {properties: {object_format: {const: sha256}}, required: [object_format]}
+              then:
+                properties:
+                  head: {pattern: '^[0-9a-f]{64}$'}
+                  head_tree: {pattern: '^[0-9a-f]{64}$'}
+            - if: {properties: {commits_completeness: {const: complete}}, required: [commits_completeness]}
+              then: {properties: {commits_omitted: {const: 0}}}
+            - if: {properties: {renames_completeness: {const: complete}}, required: [renames_completeness]}
+              then: {properties: {renames_omitted: {const: 0}}}
+            - if: {properties: {cochange_completeness: {const: complete}}, required: [cochange_completeness]}
+              then: {properties: {cochange_omitted: {const: 0}}}
+            - if: {properties: {blame_completeness: {const: complete}}, required: [blame_completeness]}
+              then: {properties: {blame_omitted: {const: 0}}}
+        blame:
+          type: array
+          maxItems: 200
+          description: Canonical bounded blame hunks for exactly the requested blamePaths. Line content is represented only by line_digest.
+          items: {$ref: '#/components/schemas/RepositoryBlameHunk'}
+        path_nodes: {type: array, maxItems: 200, items: {type: object, additionalProperties: true}}
+        path_edges: {type: array, maxItems: 200, items: {type: object, additionalProperties: true}}
+        entries: {type: array, maxItems: 200, items: {type: object, additionalProperties: true}}
+        edges: {type: array, maxItems: 200, items: {type: object, additionalProperties: true}}
         graph_nodes:
           type: array
+          maxItems: 200
           items:
             type: object
-            required: [node_id, kind, name, path, revision, structural_digest, subgraph_digest, rank, degree, hops, reasons]
+            required: [node_id, kind, name, path, range, revision, structural_digest, subgraph_digest, rank, degree, hops, reasons]
             properties:
               node_id: {type: string, pattern: '^[0-9a-f]{64}$'}
               kind: {enum: [repository, revision, package, file, symbol, test, diagnostic]}
               name: {type: string}
               path: {type: [string, 'null'], description: Package nodes use their canonical Cargo.toml path.}
+              range:
+                oneOf:
+                  - {$ref: '#/components/schemas/RepositoryGraphRange'}
+                  - {type: 'null'}
               revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
               structural_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
               subgraph_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
@@ -1691,21 +1821,30 @@ components:
               degree: {type: integer, minimum: 0}
               hops: {type: integer, minimum: 0}
               reasons: {type: array, items: {type: string}}
-            additionalProperties: true
+            additionalProperties: false
         graph_edges:
           type: array
+          maxItems: 200
           items:
             type: object
             required: [source_node, target_node, relationship, hops, provenance, revision, structural_digest]
             properties:
               source_node: {type: string, pattern: '^[0-9a-f]{64}$'}
               target_node: {type: string, pattern: '^[0-9a-f]{64}$'}
-              relationship: {enum: [contains, contained_by, defines, imports, exports, references, calls, implements, inherits, overrides, tests]}
+              relationship: {enum: [contains, contained_by, defines, imports, exports, references, calls, implements, inherits, overrides, tests, changed_with]}
               hops: {type: integer, minimum: 0}
-              provenance: {type: object, additionalProperties: true}
+              provenance:
+                $ref: '#/components/schemas/RepositoryGraphEdgeProvenance'
               revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
               structural_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
-            additionalProperties: true
+            additionalProperties: false
+            allOf:
+              - if: {properties: {relationship: {const: changed_with}}, required: [relationship]}
+                then:
+                  properties:
+                    provenance:
+                      properties: {source: {const: git_history}}
+                      required: [source]
         omissions:
           type: object
           required: [ranked_entries, index_entries, syntax_declarations, graph_relationships]
@@ -1721,7 +1860,178 @@ components:
         result_bytes: {type: integer, minimum: 0}
         truncated: {type: boolean}
         cursor: {type: [string, 'null'], pattern: '^kitmap1_[0-9a-f]{400}$'}
-      additionalProperties: true
+      additionalProperties: false
+      allOf:
+        - if: {required: [blame]}
+          then: {required: [history]}
+        - if:
+            required: [history]
+            properties:
+              history:
+                required: [object_format]
+                properties: {object_format: {const: sha1}}
+          then:
+            properties:
+              blame:
+                items:
+                  properties:
+                    source_commit: {type: [string, 'null'], pattern: '^[0-9a-f]{40}$'}
+                    source_blob: {type: [string, 'null'], pattern: '^[0-9a-f]{40}$'}
+        - if:
+            required: [history]
+            properties:
+              history:
+                required: [object_format]
+                properties: {object_format: {const: sha256}}
+          then:
+            properties:
+              blame:
+                items:
+                  properties:
+                    source_commit: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+                    source_blob: {type: [string, 'null'], pattern: '^[0-9a-f]{64}$'}
+    RepositoryBlameHunk:
+      type: object
+      required: [path, range, line_digest, source, source_commit, source_path, source_range, source_blob, boundary, confidence_millis, revision, evidence_digest]
+      properties:
+        path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+        range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        line_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        source: {enum: [git, worktree]}
+        source_commit: {type: [string, 'null'], pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        source_path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+        source_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        source_blob: {type: [string, 'null'], pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        boundary: {type: boolean}
+        confidence_millis: {type: integer, minimum: 0, maximum: 1000}
+        revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        evidence_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+      additionalProperties: false
+      oneOf:
+        - required: [source, source_commit, source_blob]
+          properties:
+            source: {const: git}
+            source_commit: {type: string}
+            source_blob: {type: string}
+        - required: [source]
+          properties:
+            source: {const: worktree}
+            source_commit: {type: 'null'}
+            source_blob: {type: 'null'}
+    RepositoryGraphRange:
+      type: object
+      required: [start_byte, end_byte, start_line, end_line]
+      properties:
+        start_byte: {type: integer, minimum: 0}
+        end_byte: {type: integer, minimum: 0}
+        start_line: {type: integer, minimum: 1}
+        end_line: {type: integer, minimum: 1}
+      additionalProperties: false
+    RepositoryGraphSemanticProvenance:
+      type: object
+      required: [relation, origin_uri, origin_path, document_version, request_generation, request_id, origin_position, origin_range, server_artifact, server_configuration, position_encoding, target_range, fact_range]
+      properties:
+        relation: {type: string}
+        origin_uri: {type: string}
+        origin_path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+        document_version: {type: integer}
+        request_generation: {type: integer, minimum: 0}
+        request_id: {type: integer, minimum: 0, maximum: 4294967295}
+        origin_position: {type: integer, minimum: 0}
+        origin_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        server_artifact: {type: string}
+        server_configuration: {type: string}
+        position_encoding: {enum: [utf-8, utf-16, utf-32]}
+        target_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        fact_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+      additionalProperties: false
+    RepositoryGraphHistoryProvenance:
+      type: object
+      required: [head, head_tree, object_format, policy, policy_digest, extractor_digest, scope_digest, support_commits, count, left_count, right_count, shared_count, strength_millis, coverage, left_path, right_path, left_range, right_range, left_committed_blob, right_committed_blob, left_committed_range, right_committed_range, extraction_confidence_millis, revision, evidence_digest]
+      properties:
+        head: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        head_tree: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        object_format: {enum: [sha1, sha256]}
+        policy: {const: non-root-non-merge-once-per-commit-v1}
+        policy_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        extractor_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        scope_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        support_commits:
+          type: array
+          minItems: 1
+          maxItems: 1000000
+          uniqueItems: true
+          items: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        count: {type: integer, minimum: 1, maximum: 1000000}
+        left_count: {type: integer, minimum: 1, maximum: 1000000}
+        right_count: {type: integer, minimum: 1, maximum: 1000000}
+        shared_count: {type: integer, minimum: 1, maximum: 1000000}
+        strength_millis: {type: integer, minimum: 0, maximum: 1000}
+        coverage: {enum: [complete, observed_partial]}
+        left_path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+        right_path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+        left_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        right_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        left_committed_blob: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        right_committed_blob: {type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'}
+        left_committed_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        right_committed_range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        extraction_confidence_millis: {type: integer, minimum: 0, maximum: 1000}
+        revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        evidence_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+      additionalProperties: false
+      allOf:
+        - if: {properties: {object_format: {const: sha1}}, required: [object_format]}
+          then:
+            properties:
+              head: {pattern: '^[0-9a-f]{40}$'}
+              head_tree: {pattern: '^[0-9a-f]{40}$'}
+              support_commits: {items: {type: string, pattern: '^[0-9a-f]{40}$'}}
+              left_committed_blob: {pattern: '^[0-9a-f]{40}$'}
+              right_committed_blob: {pattern: '^[0-9a-f]{40}$'}
+        - if: {properties: {object_format: {const: sha256}}, required: [object_format]}
+          then:
+            properties:
+              head: {pattern: '^[0-9a-f]{64}$'}
+              head_tree: {pattern: '^[0-9a-f]{64}$'}
+              support_commits: {items: {type: string, pattern: '^[0-9a-f]{64}$'}}
+              left_committed_blob: {pattern: '^[0-9a-f]{64}$'}
+              right_committed_blob: {pattern: '^[0-9a-f]{64}$'}
+    RepositoryGraphEdgeProvenance:
+      type: object
+      required: [source, path, range, range_kind, revision, confidence_millis, evidence_digest]
+      properties:
+        source: {enum: [metadata_index, cargo_manifest, cargo_convention, tree_sitter, cargo_tree_sitter, lsp, git_history]}
+        path:
+          oneOf:
+            - {$ref: '#/components/schemas/RepositoryRelativePath'}
+            - {type: 'null'}
+        range: {$ref: '#/components/schemas/RepositoryGraphRange'}
+        range_kind: {enum: [whole_file, declaration, manifest, normalized_fact]}
+        revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        confidence_millis: {type: integer, minimum: 0, maximum: 1000}
+        semantic:
+          oneOf:
+            - {$ref: '#/components/schemas/RepositoryGraphSemanticProvenance'}
+            - {type: 'null'}
+        history: {$ref: '#/components/schemas/RepositoryGraphHistoryProvenance'}
+        evidence_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+      additionalProperties: false
+      oneOf:
+        - required: [source, history]
+          properties: {source: {const: git_history}}
+          not: {required: [semantic]}
+        - required: [source, semantic]
+          properties:
+            source: {const: lsp}
+            semantic: {$ref: '#/components/schemas/RepositoryGraphSemanticProvenance'}
+          not: {required: [history]}
+        - required: [source]
+          properties:
+            source: {enum: [metadata_index, cargo_manifest, cargo_convention, tree_sitter, cargo_tree_sitter]}
+          allOf:
+            - not: {required: [semantic]}
+            - not: {required: [history]}
     RepositorySearchInput:
       $schema: https://json-schema.org/draft/2020-12/schema
       oneOf:

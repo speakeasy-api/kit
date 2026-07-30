@@ -58,7 +58,7 @@ impl Default for RevisionOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RevisionId([u8; 32]);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -591,6 +591,17 @@ impl ManagedWorkspace {
 
     pub fn current_revision(&self) -> Result<Revision, RevisionError> {
         self.bounded_scan(Capture::None).map(|scan| scan.revision)
+    }
+
+    pub(crate) fn canonical_root(&self) -> &Path {
+        &self.inner.root_path
+    }
+
+    pub(crate) fn duplicate_root(&self) -> Result<File, RevisionError> {
+        self.inner
+            .root
+            .try_clone()
+            .map_err(|source| io_error("duplicate workspace root handle", source))
     }
 
     pub fn is_dirty(&self) -> bool {

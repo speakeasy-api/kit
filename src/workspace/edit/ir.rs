@@ -103,6 +103,10 @@ impl RootRelativePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) const fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
 }
 
 fn is_windows_reserved(component: &str) -> bool {

@@ -33,13 +33,22 @@ use crate::{
     workspace::{
         acquire::AcquisitionResult,
         edit::ir::RootRelativePath,
-        graph::structure::{GraphError, GraphOptions, NodeId, StructureGraphProvider},
+        graph::{
+            history::{
+                HistoryError, HistoryGraphProvider, HistoryOptions, HistoryRequest,
+                ValidatedHistoryFence,
+            },
+            structure::{
+                GraphError, GraphOptions, HistoryEnrichmentLimits, NodeId, StructureGraph,
+                StructureGraphProvider,
+            },
+        },
         index::meta::{IndexOptions, MetadataIndex},
         map::{
             DeclarationId, ExpansionPurpose, ExpansionRequest, MapBound, MapBudget, MapCursor,
             MapError, MapLimits, Personalization, RelationshipKind, RepositoryMapRequest,
-            ScoreBand, SemanticRelationship, StackFrame, build_repository_map_with_structure,
-            validate_semantic_evidence,
+            ScoreBand, SemanticRelationship, StackFrame, build_repository_map_with_history,
+            build_repository_map_with_structure, validate_semantic_evidence,
         },
         read::{ArtifactContext, ReadOptions, ReadRange, ReadRequest, read},
         revision::{ManagedWorkspace, RevisionId, RevisionOptions},
@@ -84,6 +93,9 @@ const MAX_NATIVE_WORKSPACE_SCAN_TIME: std::time::Duration = std::time::Duration:
 const NATIVE_MAP_TOTAL_WORK: usize = 21_000_000;
 const NATIVE_MAP_TOTAL_MEMORY_BYTES: usize = 320 * 1024 * 1024;
 const NATIVE_MAP_TOTAL_TIME: Duration = Duration::from_secs(30);
+const NATIVE_HISTORY_TOTAL_WORK: usize = 121_000_000;
+const NATIVE_HISTORY_TOTAL_MEMORY_BYTES: usize = 832 * 1024 * 1024;
+const NATIVE_HISTORY_TOTAL_TIME: Duration = Duration::from_secs(65);
 const STRUCTURAL_PREVIEW_MAX_ENTRIES: usize = 128;
 const STRUCTURAL_PREVIEW_MAX_BYTES: usize = 8 * 1024 * 1024;
 const STRUCTURAL_PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
@@ -211,6 +223,20 @@ struct NativeStructureGraphKey {
     revision: RevisionId,
     index_digest: [u8; 32],
     semantic_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeHistoryGraphKey {
+    revision: RevisionId,
+    index_digest: [u8; 32],
+    request_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeUnifiedGraphKey {
+    structure_snapshot_digest: [u8; 32],
+    history_snapshot_digest: [u8; 32],
+    request_digest: [u8; 32],
 }
 
 impl NativeSemanticEvidenceStore {
@@ -346,6 +372,10 @@ pub(crate) struct NativeDispatcher {
     syntax_index: SyntaxIndex,
     structure_graph: StructureGraphProvider,
     structure_graph_key: Option<NativeStructureGraphKey>,
+    history_graph: HistoryGraphProvider,
+    history_graph_key: Option<NativeHistoryGraphKey>,
+    unified_graph: Option<(NativeUnifiedGraphKey, Arc<StructureGraph>)>,
+    unified_peak_bytes: usize,
     structural_previews: StructuralPreviewRegistry,
     build: PathBuf,
     temp: PathBuf,
@@ -403,6 +433,10 @@ impl NativeDispatcher {
             syntax_index: SyntaxIndex::new(),
             structure_graph: StructureGraphProvider::new(),
             structure_graph_key: None,
+            history_graph: HistoryGraphProvider::new(),
+            history_graph_key: None,
+            unified_graph: None,
+            unified_peak_bytes: 0,
             structural_previews: StructuralPreviewRegistry::default(),
             build,
             temp,
@@ -553,6 +587,8 @@ impl NativeDispatcher {
         )
         .map_err(code("workspace_index_failed"))?;
         self.structure_graph_key = None;
+        self.history_graph_key = None;
+        self.unified_graph = None;
         self.index = Some(index.clone());
         Ok((workspace, index))
     }
@@ -579,11 +615,49 @@ impl NativeDispatcher {
         {
             return Ok(false);
         }
+        self.unified_graph = None;
         self.structure_graph
             .refresh(workspace, index, options, &[], evidence)
             .map_err(NativeMapError::from)?;
         self.structure_graph_key = Some(key);
+        self.unified_graph = None;
         Ok(true)
+    }
+
+    fn refresh_history_graph(
+        &mut self,
+        workspace: &ManagedWorkspace,
+        index: &MetadataIndex,
+        request: &HistoryRequest,
+        options: &HistoryOptions,
+    ) -> Result<ValidatedHistoryFence, NativeMapError> {
+        let key = NativeHistoryGraphKey {
+            revision: index.revision(),
+            index_digest: *index.index_digest(),
+            request_digest: native_history_request_digest(request),
+        };
+        if self.history_graph_key == Some(key) {
+            let fence = self
+                .history_graph
+                .validated_fence(workspace)
+                .map_err(NativeMapError::from)?
+                .ok_or(NativeMapError::HistoryEvidenceUnavailable)?;
+            if self
+                .history_graph
+                .graph()
+                .is_some_and(|graph| graph.index_digest() == *index.index_digest())
+            {
+                return Ok(fence);
+            }
+        }
+        self.unified_graph = None;
+        let (_, fence) = self
+            .history_graph
+            .refresh_fenced(workspace, index, request, options)
+            .map_err(NativeMapError::from)?;
+        self.history_graph_key = Some(key);
+        self.unified_graph = None;
+        Ok(fence)
     }
 
     fn discover(&mut self, bytes: &[u8]) -> Result<(Value, Vec<String>), String> {
@@ -598,6 +672,7 @@ impl NativeDispatcher {
                 .iter()
                 .any(|relationship| relationship.is_semantic());
             let graph_requested = native_structure_requested(&request);
+            let history_requested = native_history_requested(&request);
             let stored = if semantic_requested {
                 self.semantic_evidence
                     .snapshot(index.revision())
@@ -613,8 +688,9 @@ impl NativeDispatcher {
             let evidence = native_semantic_evidence(&stored, index.revision())
                 .map_err(NativeMapError::code)?;
             let semantic_evidence_available = self.semantic_evidence.available(index.revision());
-            let (graph_options, map_limits) =
-                bounded_graph_map_limits(graph_requested).map_err(NativeMapError::code)?;
+            let (graph_options, history_options, map_limits) =
+                bounded_unified_map_limits(graph_requested, history_requested)
+                    .map_err(NativeMapError::code)?;
             if graph_requested {
                 self.refresh_structure_graph(
                     &workspace,
@@ -625,20 +701,139 @@ impl NativeDispatcher {
                 )
                 .map_err(NativeMapError::code)?;
             }
-            let structure = graph_requested
-                .then(|| self.structure_graph.graph())
-                .flatten();
-            let response = build_repository_map_with_structure(
-                &workspace,
-                &index,
-                &request,
-                &evidence,
-                map_limits,
-                cursor.as_ref(),
-                structure,
-            )
-            .map_err(NativeMapError::from)
-            .map_err(NativeMapError::code)?;
+            let history_fence = if history_requested {
+                let include_changed_with = request
+                    .expansion
+                    .relationships
+                    .contains(&RelationshipKind::ChangedWith);
+                let history_request = HistoryRequest::new(
+                    request.history_paths.clone(),
+                    request.blame_paths.clone(),
+                    include_changed_with,
+                );
+                Some(
+                    self.refresh_history_graph(
+                        &workspace,
+                        &index,
+                        &history_request,
+                        &history_options,
+                    )
+                    .map_err(NativeMapError::code)?,
+                )
+            } else {
+                None
+            };
+            let unified = if history_requested {
+                let history = self
+                    .history_graph
+                    .graph()
+                    .ok_or(NativeMapError::HistoryEvidenceUnavailable)
+                    .map_err(NativeMapError::code)?;
+                let base = self
+                    .structure_graph
+                    .graph()
+                    .ok_or(NativeMapError::GraphEvidenceUnavailable)
+                    .map_err(NativeMapError::code)?;
+                let key = NativeUnifiedGraphKey {
+                    structure_snapshot_digest: base.snapshot_digest(),
+                    history_snapshot_digest: history.snapshot_digest(),
+                    request_digest: history.request_digest(),
+                };
+                if self
+                    .unified_graph
+                    .as_ref()
+                    .is_none_or(|(cached, _)| *cached != key)
+                {
+                    let retained_cache = self
+                        .structure_graph
+                        .cache_usage()
+                        .logical_bytes()
+                        .checked_add(self.history_graph.cache_usage().logical_bytes())
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                history_fence
+                                    .as_ref()
+                                    .map_or(0, |fence| fence.metrics().peak_memory_bytes()),
+                            )
+                        })
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                self.unified_graph
+                                    .as_ref()
+                                    .map_or(0, |(_, graph)| graph.logical_bytes()),
+                            )
+                        })
+                        .and_then(|bytes| bytes.checked_add(map_limits.max_memory_bytes))
+                        .ok_or(NativeMapError::Unavailable)
+                        .map_err(NativeMapError::code)?;
+                    let enrichment_memory = NATIVE_HISTORY_TOTAL_MEMORY_BYTES
+                        .checked_sub(retained_cache)
+                        .filter(|bytes| *bytes != 0)
+                        .ok_or(NativeMapError::Unavailable)
+                        .map_err(NativeMapError::code)?;
+                    let graph = history
+                        .enrich_structure(
+                            base,
+                            HistoryEnrichmentLimits {
+                                max_work: NATIVE_HISTORY_TOTAL_WORK
+                                    .saturating_sub(graph_options.max_work)
+                                    .saturating_sub(history_options.max_work)
+                                    .saturating_sub(map_limits.max_work)
+                                    .saturating_sub(
+                                        ValidatedHistoryFence::conservative_metrics(4).work(),
+                                    )
+                                    .max(1),
+                                max_memory_bytes: enrichment_memory,
+                                max_time: Duration::from_secs(5),
+                            },
+                        )
+                        .map_err(NativeMapError::from)
+                        .map_err(NativeMapError::code)?;
+                    self.unified_peak_bytes = retained_cache
+                        .saturating_sub(map_limits.max_memory_bytes)
+                        .saturating_add(graph.enrichment_peak_bytes())
+                        .saturating_add(map_limits.max_memory_bytes);
+                    if self.unified_peak_bytes > NATIVE_HISTORY_TOTAL_MEMORY_BYTES {
+                        return Err(NativeMapError::Unavailable.code());
+                    }
+                    self.unified_graph = Some((key, Arc::new(graph)));
+                }
+                self.unified_graph
+                    .as_ref()
+                    .map(|(_, graph)| Arc::clone(graph))
+            } else {
+                None
+            };
+            let structure = unified.as_deref().or_else(|| {
+                graph_requested
+                    .then(|| self.structure_graph.graph())
+                    .flatten()
+            });
+            let response =
+                if let (Some(structure), Some(fence)) = (structure, history_fence.as_ref()) {
+                    build_repository_map_with_history(
+                        &workspace,
+                        &index,
+                        &request,
+                        &evidence,
+                        map_limits,
+                        cursor.as_ref(),
+                        structure,
+                        fence,
+                    )
+                } else {
+                    build_repository_map_with_structure(
+                        &workspace,
+                        &index,
+                        &request,
+                        &evidence,
+                        map_limits,
+                        cursor.as_ref(),
+                        structure,
+                    )
+                }
+                .map_err(NativeMapError::from)
+                .map_err(NativeMapError::code)?;
             let bytes = response
                 .to_canonical_json()
                 .map_err(|_| "map_serialization_failed".to_owned())?;
@@ -647,6 +842,64 @@ impl NativeDispatcher {
             }
             let map = serde_json::from_slice::<Value>(&bytes)
                 .map_err(|_| "map_serialization_failed".to_owned())?;
+            if let Some(fence) = history_fence.as_ref() {
+                fence
+                    .validate_repository(
+                        &workspace,
+                        Instant::now()
+                            .checked_add(map_limits.max_time)
+                            .unwrap_or_else(Instant::now),
+                    )
+                    .map_err(NativeMapError::from)
+                    .map_err(NativeMapError::code)?;
+                let resources = fence.metrics();
+                let observed_work = self
+                    .history_graph
+                    .metrics()
+                    .consumed_work()
+                    .checked_add(resources.work())
+                    .ok_or_else(|| NativeMapError::Unavailable.code())?;
+                let observed_commands = self
+                    .history_graph
+                    .metrics()
+                    .commands()
+                    .checked_add(resources.commands())
+                    .ok_or_else(|| NativeMapError::Unavailable.code())?;
+                let observed_output = self
+                    .history_graph
+                    .metrics()
+                    .output_bytes()
+                    .checked_add(resources.output_bytes())
+                    .ok_or_else(|| NativeMapError::Unavailable.code())?;
+                let observed_memory = self
+                    .history_graph
+                    .metrics()
+                    .peak_staging_bytes()
+                    .checked_add(resources.peak_memory_bytes())
+                    .and_then(|bytes| {
+                        bytes.checked_add(self.history_graph.cache_usage().logical_bytes())
+                    })
+                    .and_then(|bytes| {
+                        bytes.checked_add(self.structure_graph.cache_usage().logical_bytes())
+                    })
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            self.unified_graph
+                                .as_ref()
+                                .map_or(0, |(_, graph)| graph.logical_bytes()),
+                        )
+                    })
+                    .and_then(|memory| memory.checked_add(bytes.capacity()))
+                    .map(|bytes| bytes.max(self.unified_peak_bytes))
+                    .ok_or_else(|| NativeMapError::Unavailable.code())?;
+                if observed_work > NATIVE_HISTORY_TOTAL_WORK
+                    || observed_memory > NATIVE_HISTORY_TOTAL_MEMORY_BYTES
+                    || observed_commands > HistoryOptions::default().max_commands
+                    || observed_output > HistoryOptions::default().max_output_bytes
+                {
+                    return Err(NativeMapError::Unavailable.code());
+                }
+            }
             return Ok((
                 json!({
                     "mode": "map",
@@ -942,6 +1195,8 @@ impl NativeDispatcher {
             NativeEditOutcome::Committed { edit, feedback } => {
                 self.index = None;
                 self.structure_graph_key = None;
+                self.history_graph_key = None;
+                self.unified_graph = None;
                 self.structural_previews.clear();
                 let receipt = edit.verification_receipt();
                 let change_diff = std::str::from_utf8(edit.change_diff())
@@ -1579,6 +1834,10 @@ struct NativeMapInput {
     #[serde(default)]
     languages: Vec<String>,
     #[serde(default)]
+    history_paths: Vec<String>,
+    #[serde(default)]
+    blame_paths: Vec<String>,
+    #[serde(default)]
     relationships: Option<Vec<String>>,
     #[serde(default)]
     expansion_seeds: Vec<String>,
@@ -1784,11 +2043,35 @@ fn native_structure_requested(request: &RepositoryMapRequest) -> bool {
     !request.expansion.graph_seeds.is_empty()
         || !request.expansion.packages.is_empty()
         || !request.expansion.tests.is_empty()
+        || !request.history_paths.is_empty()
+        || !request.blame_paths.is_empty()
         || request
             .expansion
             .relationships
             .iter()
             .any(|relationship| relationship.is_structure())
+}
+
+fn native_history_requested(request: &RepositoryMapRequest) -> bool {
+    !request.history_paths.is_empty()
+        || !request.blame_paths.is_empty()
+        || request
+            .expansion
+            .relationships
+            .contains(&RelationshipKind::ChangedWith)
+}
+
+fn native_history_request_digest(request: &HistoryRequest) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"kit-native-history-request-v1\0");
+    hash.update(&[u8::from(request.include_changed_with())]);
+    for paths in [request.scope(), request.blame_paths()] {
+        hash.update(&(paths.len() as u64).to_le_bytes());
+        for path in paths {
+            native_digest_frame(&mut hash, path.as_str().as_bytes());
+        }
+    }
+    *hash.finalize().as_bytes()
 }
 
 fn native_semantic_digest(stored: &[NativeSemanticRelationship]) -> [u8; 32] {
@@ -1856,6 +2139,16 @@ fn native_map_request(
     validate_map_paths(&input.current_edit_paths, 32, MAX_PATH)?;
     validate_map_paths(&input.path_prefixes, 32, MAX_PATH)?;
     validate_map_paths(
+        &input.history_paths,
+        NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        MAX_PATH,
+    )?;
+    validate_map_paths(
+        &input.blame_paths,
+        NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        MAX_PATH,
+    )?;
+    validate_map_paths(
         &input.expand_paths,
         NATIVE_MAP_MAX_EXPANSION_SELECTORS,
         MAX_PATH,
@@ -1904,6 +2197,20 @@ fn native_map_request(
         .collect::<Result<Vec<_>, _>>()?;
     let paths = input
         .expand_paths
+        .into_iter()
+        .map(|value| {
+            RootRelativePath::parse(value, MAX_PATH).map_err(|_| NativeMapError::InvalidRequest)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let history_paths = input
+        .history_paths
+        .into_iter()
+        .map(|value| {
+            RootRelativePath::parse(value, MAX_PATH).map_err(|_| NativeMapError::InvalidRequest)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let blame_paths = input
+        .blame_paths
         .into_iter()
         .map(|value| {
             RootRelativePath::parse(value, MAX_PATH).map_err(|_| NativeMapError::InvalidRequest)
@@ -1963,6 +2270,7 @@ fn native_map_request(
                     "inherits" => Ok(RelationshipKind::Inherits),
                     "overrides" => Ok(RelationshipKind::Overrides),
                     "tests" => Ok(RelationshipKind::Tests),
+                    "changed_with" => Ok(RelationshipKind::ChangedWith),
                     _ => Err(NativeMapError::InvalidRequest),
                 })
                 .collect()
@@ -2026,6 +2334,8 @@ fn native_map_request(
             },
             path_prefixes: input.path_prefixes.into_iter().map(PathBuf::from).collect(),
             languages: input.languages,
+            history_paths,
+            blame_paths,
         },
         cursor,
     ))
@@ -2141,6 +2451,65 @@ fn bounded_graph_map_limits(
     )
 }
 
+fn bounded_unified_map_limits(
+    graph_requested: bool,
+    history_requested: bool,
+) -> Result<(GraphOptions, HistoryOptions, MapLimits), NativeMapError> {
+    let (graph, mut map) = bounded_graph_map_limits(graph_requested)?;
+    let mut history = HistoryOptions::default();
+    if history_requested {
+        if !graph_requested {
+            return Err(NativeMapError::Unavailable);
+        }
+        let fence = ValidatedHistoryFence::conservative_metrics(4);
+        history.max_work = NATIVE_HISTORY_TOTAL_WORK
+            .checked_sub(graph.max_work)
+            .and_then(|work| work.checked_sub(map.max_work))
+            .and_then(|work| work.checked_sub(fence.work()))
+            .and_then(|work| work.checked_sub(10_000_000))
+            .filter(|work| *work != 0)
+            .ok_or(NativeMapError::Unavailable)?;
+        history.max_staging_bytes = (512_usize * 1024 * 1024)
+            .checked_sub(fence.peak_memory_bytes())
+            .filter(|bytes| *bytes != 0)
+            .ok_or(NativeMapError::Unavailable)?;
+        history.max_commands = history
+            .max_commands
+            .checked_sub(fence.commands())
+            .filter(|commands| *commands != 0)
+            .ok_or(NativeMapError::Unavailable)?;
+        history.max_output_bytes = history
+            .max_output_bytes
+            .checked_sub(fence.output_bytes())
+            .filter(|bytes| *bytes != 0)
+            .ok_or(NativeMapError::Unavailable)?;
+        history.max_cache_bytes = history.max_cache_bytes.min(history.max_staging_bytes / 2);
+        history.max_time = Duration::from_secs(30);
+        map.max_time = Duration::from_secs(30);
+        if graph
+            .max_work
+            .checked_add(history.max_work)
+            .and_then(|work| work.checked_add(map.max_work))
+            .and_then(|work| work.checked_add(fence.work()))
+            .is_none_or(|work| work > NATIVE_HISTORY_TOTAL_WORK)
+            || graph
+                .max_staging_bytes
+                .checked_add(history.max_staging_bytes)
+                .and_then(|bytes| bytes.checked_add(map.max_memory_bytes))
+                .and_then(|bytes| bytes.checked_add(fence.peak_memory_bytes()))
+                .is_none_or(|bytes| bytes > NATIVE_HISTORY_TOTAL_MEMORY_BYTES)
+            || graph
+                .max_time
+                .checked_add(history.max_time)
+                .and_then(|time| time.checked_add(map.max_time))
+                .is_none_or(|time| time > NATIVE_HISTORY_TOTAL_TIME)
+        {
+            return Err(NativeMapError::Unavailable);
+        }
+    }
+    Ok((graph, history, map))
+}
+
 fn graph_map_limits_with_caps(
     graph_requested: bool,
     total_work: usize,
@@ -2185,6 +2554,8 @@ enum NativeMapError {
     GraphEvidenceInvalid,
     GraphEvidenceStale,
     GraphEvidenceUnavailable,
+    HistoryEvidenceStale,
+    HistoryEvidenceUnavailable,
     InvalidRequest,
     RevisionStale,
     RevisionUnavailable,
@@ -2211,6 +2582,8 @@ impl NativeMapError {
             Self::GraphEvidenceInvalid => "map_graph_evidence_invalid",
             Self::GraphEvidenceStale => "map_graph_evidence_stale",
             Self::GraphEvidenceUnavailable => "map_graph_evidence_unavailable",
+            Self::HistoryEvidenceStale => "map_history_evidence_stale",
+            Self::HistoryEvidenceUnavailable => "map_history_evidence_unavailable",
             Self::InvalidRequest => "map_invalid_request",
             Self::RevisionStale => "stale_revision",
             Self::RevisionUnavailable => "map_revision_unavailable",
@@ -2242,6 +2615,7 @@ impl From<MapError> for NativeMapError {
             MapError::SemanticEvidenceUnavailable => Self::SemanticEvidenceUnavailable,
             MapError::GraphEvidenceUnavailable => Self::GraphEvidenceUnavailable,
             MapError::GraphEvidenceStale => Self::GraphEvidenceStale,
+            MapError::HistoryEvidenceUnavailable => Self::HistoryEvidenceUnavailable,
             MapError::InvalidGraph(_) => Self::GraphEvidenceInvalid,
             MapError::Serialization(_) => Self::Serialization,
         }
@@ -2259,12 +2633,37 @@ impl From<GraphError> for NativeMapError {
             | GraphError::InvalidIndex(_)
             | GraphError::InvalidEvidence(_)
             | GraphError::ContainmentCycle
+            | GraphError::HistoryMismatch
             | GraphError::UnsafePath(_)
             | GraphError::MissingWorkspaceMember { .. }
             | GraphError::MissingPathDependency { .. } => Self::GraphEvidenceInvalid,
             GraphError::Revision(_)
             | GraphError::InvalidOptions(_)
             | GraphError::BoundExceeded(_) => Self::GraphEvidenceUnavailable,
+        }
+    }
+}
+
+impl From<HistoryError> for NativeMapError {
+    fn from(error: HistoryError) -> Self {
+        match error {
+            HistoryError::StaleRepositoryFence => Self::HistoryEvidenceStale,
+            HistoryError::Revision(crate::workspace::revision::RevisionError::StaleRevision {
+                ..
+            }) => Self::HistoryEvidenceStale,
+            HistoryError::InvalidRequest(_) | HistoryError::SelectorNoMatch(_) => {
+                Self::InvalidRequest
+            }
+            HistoryError::InvalidIndex(_)
+            | HistoryError::Malformed(_)
+            | HistoryError::MissingObject(_)
+            | HistoryError::RepositoryRootMismatch { .. }
+            | HistoryError::UnsafeGitPath(_) => Self::GraphEvidenceInvalid,
+            HistoryError::Unavailable(_)
+            | HistoryError::Git { .. }
+            | HistoryError::Revision(_)
+            | HistoryError::InvalidOptions(_)
+            | HistoryError::BoundExceeded(_) => Self::HistoryEvidenceUnavailable,
         }
     }
 }
@@ -2432,6 +2831,7 @@ mod tests {
         collections::BTreeSet,
         io::{Read as _, Write as _},
         net::TcpListener,
+        process::Command,
         sync::atomic::AtomicU64,
         thread,
         time::Duration,
@@ -2872,6 +3272,118 @@ mod tests {
             )
             .is_err()
         );
+        let (graph, history, map) = bounded_unified_map_limits(true, true).unwrap();
+        let fence = ValidatedHistoryFence::conservative_metrics(4);
+        assert!(
+            graph.max_work + history.max_work + map.max_work + fence.work()
+                < NATIVE_HISTORY_TOTAL_WORK
+        );
+        assert_eq!(
+            graph.max_staging_bytes
+                + history.max_staging_bytes
+                + map.max_memory_bytes
+                + fence.peak_memory_bytes(),
+            NATIVE_HISTORY_TOTAL_MEMORY_BYTES
+        );
+        assert_eq!(
+            graph.max_time + history.max_time + map.max_time,
+            NATIVE_HISTORY_TOTAL_TIME
+        );
+    }
+
+    #[test]
+    fn native_history_uses_real_git_and_reuses_provider_without_hooks() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        let root = directory.join("source");
+        let git = |arguments: &[&str]| {
+            let output = Command::new("/usr/bin/git")
+                .current_dir(&root)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "lib.rs", "format.json"]);
+        git(&[
+            "-c",
+            "user.name=Kit",
+            "-c",
+            "user.email=kit@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "first",
+        ]);
+        std::fs::write(root.join("lib.rs"), "fn main() { let _ = 1; }\n").unwrap();
+        std::fs::write(root.join("format.json"), "{\"changed\":true}\n").unwrap();
+        git(&["add", "lib.rs", "format.json"]);
+        git(&[
+            "-c",
+            "user.name=Kit",
+            "-c",
+            "user.email=kit@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "second",
+        ]);
+        let sentinel = directory.join("hook-ran");
+        let hook = root.join("hostile-hook");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&["config", "core.hooksPath", hook.to_str().unwrap()]);
+
+        let revision = dispatcher.revision().unwrap();
+        let input = discover_input(
+            &revision,
+            json!({
+                "historyPaths": ["format.json", "lib.rs"],
+                "blamePaths": ["lib.rs"],
+                "relationships": ["changed_with"],
+                "expandPaths": ["lib.rs"],
+                "purpose": "neighborhood"
+            }),
+        );
+        let first = dispatcher.discover(&input).unwrap().0;
+        assert_eq!(first["map"]["history"]["object_format"], "sha1");
+        assert_eq!(first["map"]["history"]["commits_completeness"], "complete");
+        assert!(
+            first["map"]["blame"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert_eq!(first["map"]["blame"][0]["path"], "lib.rs");
+        assert!(first["map"]["blame"][0]["line_digest"].as_str().is_some());
+        assert!(first["map"]["blame"][0].get("text").is_none());
+        assert_eq!(
+            first["map"]["graph_edges"][0]["relationship"],
+            "changed_with"
+        );
+        assert!(!sentinel.exists());
+        let metrics = dispatcher.history_graph.metrics().clone();
+        let cache = dispatcher.history_graph.cache_usage();
+        let first_unified = Arc::as_ptr(&dispatcher.unified_graph.as_ref().unwrap().1);
+        let second = dispatcher.discover(&input).unwrap().0;
+        let second_unified = Arc::as_ptr(&dispatcher.unified_graph.as_ref().unwrap().1);
+        assert_eq!(first, second);
+        assert_eq!(first_unified, second_unified);
+        assert!(dispatcher.unified_peak_bytes <= NATIVE_HISTORY_TOTAL_MEMORY_BYTES);
+        assert_eq!(dispatcher.history_graph.metrics(), &metrics);
+        assert_eq!(dispatcher.history_graph.cache_usage(), cache);
+        assert!(!sentinel.exists());
     }
 
     #[test]
@@ -3405,6 +3917,14 @@ mod tests {
             (
                 NativeMapError::GraphEvidenceInvalid,
                 "map_graph_evidence_invalid",
+            ),
+            (
+                NativeMapError::HistoryEvidenceUnavailable,
+                "map_history_evidence_unavailable",
+            ),
+            (
+                NativeMapError::HistoryEvidenceStale,
+                "map_history_evidence_stale",
             ),
             (NativeMapError::RevisionStale, "stale_revision"),
             (

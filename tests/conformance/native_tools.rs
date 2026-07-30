@@ -342,7 +342,9 @@ fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
             "currentEditPaths": ["src/main.rs"],
             "pathPrefixes": ["src"],
             "languages": ["rust"],
-            "relationships": ["contains", "contained_by", "semantic_definition", "imports", "tests"],
+            "historyPaths": ["src/lib.rs"],
+            "blamePaths": ["src/lib.rs"],
+            "relationships": ["contains", "contained_by", "semantic_definition", "imports", "tests", "changed_with"],
             "expansionSeeds": [],
             "graphSeeds": ["c".repeat(64)],
             "expandPaths": ["src/lib.rs"],
@@ -356,6 +358,11 @@ fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
         }
     });
     assert!(validator.is_valid(&map));
+    for purpose in ["dependencies", "dependents"] {
+        let mut directional = map.clone();
+        directional["map"]["purpose"] = serde_json::json!(purpose);
+        assert!(!validator.is_valid(&directional));
+    }
     for invalid in [
         serde_json::json!({"unexpected": true}),
         serde_json::json!({"budgets": {"items": 201}}),
@@ -407,6 +414,7 @@ fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
         "inherits",
         "overrides",
         "tests",
+        "changed_with",
     ] {
         assert!(
             map_properties["relationships"]["items"]["enum"]
@@ -416,7 +424,13 @@ fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
                 .any(|value| value == relationship)
         );
     }
-    for selector in ["graphSeeds", "expandPackages", "expandTests"] {
+    for selector in [
+        "graphSeeds",
+        "expandPackages",
+        "expandTests",
+        "historyPaths",
+        "blamePaths",
+    ] {
         assert_eq!(map_properties[selector]["maxItems"], 128);
         assert_eq!(map_properties[selector]["uniqueItems"], true);
     }
@@ -520,6 +534,10 @@ fn expand_paths_schema_matches_portable_paths_and_openapi() {
         &openapi["components"]["schemas"]["RepositoryDiscoverInput"]["oneOf"][1]["properties"]["map"]
             ["properties"]["expandPaths"]["items"]
     );
+    let map = &openapi["components"]["schemas"]["RepositoryDiscoverInput"]["oneOf"][1]["properties"]
+        ["map"]["properties"];
+    assert_eq!(schema, &map["historyPaths"]["items"]);
+    assert_eq!(schema, &map["blamePaths"]["items"]);
 }
 
 #[test]
@@ -531,6 +549,30 @@ fn all_native_descriptor_versions_remain_legacy_compatible() {
 }
 
 #[test]
+fn discover_output_schema_is_strict_for_map_mode_and_keeps_legacy_outputs() {
+    let discover = catalog()
+        .iter()
+        .find(|entry| entry.tool() == NativeTool::Discover)
+        .unwrap();
+    let schema = discover.spec().output_schema.as_ref().unwrap();
+    let validator = jsonschema::draft202012::options().build(schema).unwrap();
+    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        schema["oneOf"][1]["properties"]["data"]["$ref"],
+        "#/components/schemas/RepositoryDiscoverMapOutput"
+    );
+    assert!(validator.is_valid(&serde_json::json!({
+        "version": 1, "data": {"items": []}, "artifacts": [], "truncated": false
+    })));
+    assert!(!validator.is_valid(&serde_json::json!({
+        "version": 1,
+        "data": {"mode": "map", "semanticEvidenceAvailable": false},
+        "artifacts": [],
+        "truncated": false
+    })));
+}
+
+#[test]
 fn discover_implementation_digest_identifies_the_graph_map_capable_implementation() {
     let discover = catalog()
         .iter()
@@ -539,7 +581,7 @@ fn discover_implementation_digest_identifies_the_graph_map_capable_implementatio
     let old = Digest::of(DigestAlgorithm::Blake3, b"kit-native-discover-1.0.0");
     let map_capable = Digest::of(
         DigestAlgorithm::Blake3,
-        b"kit-native-discover-map-graph-1.0.0",
+        b"kit-native-discover-map-graph-history-blame-1.0.0",
     );
     assert_ne!(discover.identity().implementation_digest(), old);
     assert_eq!(discover.identity().implementation_digest(), map_capable);

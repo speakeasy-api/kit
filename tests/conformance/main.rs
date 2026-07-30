@@ -23,6 +23,7 @@ mod exec_profile;
 mod ext_m002;
 mod fixtures_selftest;
 mod grammar_edit_path;
+mod graph_history;
 mod graph_structure;
 mod handler_parity;
 mod harness_selfcheck;

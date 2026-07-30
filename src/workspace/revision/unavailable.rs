@@ -1,5 +1,7 @@
 use std::{
-    fmt, io,
+    fmt,
+    fs::File,
+    io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -266,6 +268,14 @@ impl ManagedWorkspace {
     }
 
     pub fn current_revision(&self) -> Result<Revision, RevisionError> {
+        Err(unavailable())
+    }
+
+    pub(crate) fn canonical_root(&self) -> &Path {
+        Path::new("")
+    }
+
+    pub(crate) fn duplicate_root(&self) -> Result<File, RevisionError> {
         Err(unavailable())
     }
 

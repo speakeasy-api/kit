@@ -17,10 +17,11 @@ use crate::{
     },
     workspace::{
         edit::ir::RootRelativePath,
+        graph::history::{BlameSource, HistoryRequest, ValidatedHistoryFence},
         graph::structure::{
             CoverageStatus, EdgeKind as StructureEdgeKind, GraphEdge as StructureEdge,
-            GraphNode as StructureNode, GraphRange, NodeId, NodeKind, ProvenanceSource, RangeKind,
-            StructureGraph,
+            GraphHistoryMetadata, GraphNode as StructureNode, GraphRange, HistoryEdgeProvenance,
+            NodeId, NodeKind, ProvenanceSource, RangeKind, StructureGraph,
         },
         index::meta::{ContentState, MetadataEntry, MetadataIndex},
         revision::{EntryKind, LimitKind, ManagedWorkspace, RevisionError, RevisionId},
@@ -186,6 +187,7 @@ pub enum RelationshipKind {
     Inherits,
     Overrides,
     Tests,
+    ChangedWith,
 }
 
 impl RelationshipKind {
@@ -222,6 +224,7 @@ impl RelationshipKind {
                 | Self::Inherits
                 | Self::Overrides
                 | Self::Tests
+                | Self::ChangedWith
         )
     }
 
@@ -237,6 +240,7 @@ impl RelationshipKind {
             StructureEdgeKind::Inherits => Self::Inherits,
             StructureEdgeKind::Overrides => Self::Overrides,
             StructureEdgeKind::Tests => Self::Tests,
+            StructureEdgeKind::ChangedWith => Self::ChangedWith,
         }
     }
 }
@@ -293,6 +297,8 @@ pub struct RepositoryMapRequest {
     pub expansion: ExpansionRequest,
     pub path_prefixes: Vec<PathBuf>,
     pub languages: Vec<String>,
+    pub history_paths: Vec<RootRelativePath>,
+    pub blame_paths: Vec<RootRelativePath>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +338,7 @@ pub enum MapError {
     SemanticEvidenceUnavailable,
     GraphEvidenceUnavailable,
     GraphEvidenceStale,
+    HistoryEvidenceUnavailable,
     InvalidGraph(&'static str),
     CursorMismatch,
     Revision(RevisionError),
@@ -379,6 +386,9 @@ impl fmt::Display for MapError {
             }
             Self::GraphEvidenceStale => {
                 formatter.write_str("repository map graph evidence is stale")
+            }
+            Self::HistoryEvidenceUnavailable => {
+                formatter.write_str("repository map history evidence is unavailable")
             }
             Self::InvalidGraph(reason) => {
                 write!(formatter, "invalid repository map graph: {reason}")
@@ -677,6 +687,7 @@ enum MapGraphProvenanceSource {
     TreeSitter,
     CargoTreeSitter,
     Lsp,
+    GitHistory,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -706,6 +717,39 @@ struct MapGraphSemanticProvenance {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MapGraphHistoryProvenance {
+    pub head: String,
+    pub head_tree: String,
+    pub object_format: &'static str,
+    pub policy: String,
+    #[serde(serialize_with = "serialize_hex")]
+    pub policy_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub extractor_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub scope_digest: [u8; 32],
+    pub support_commits: Vec<String>,
+    pub count: usize,
+    pub left_count: usize,
+    pub right_count: usize,
+    pub shared_count: usize,
+    pub strength_millis: u16,
+    pub coverage: MapCompleteness,
+    pub left_path: String,
+    pub right_path: String,
+    pub left_range: MapGraphRange,
+    pub right_range: MapGraphRange,
+    pub left_committed_blob: String,
+    pub right_committed_blob: String,
+    pub left_committed_range: MapGraphRange,
+    pub right_committed_range: MapGraphRange,
+    pub extraction_confidence_millis: u16,
+    pub revision: RevisionId,
+    #[serde(serialize_with = "serialize_hex")]
+    pub evidence_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct MapGraphEdgeProvenance {
     pub source: MapGraphProvenanceSource,
     pub path: Option<String>,
@@ -713,7 +757,10 @@ struct MapGraphEdgeProvenance {
     pub range_kind: MapGraphRangeKind,
     pub revision: RevisionId,
     pub confidence_millis: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic: Option<MapGraphSemanticProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<MapGraphHistoryProvenance>,
     #[serde(serialize_with = "serialize_hex")]
     pub evidence_digest: [u8; 32],
 }
@@ -754,6 +801,74 @@ enum MapCompleteness {
     RankedEntriesOmitted,
     IndexIncomplete,
     SyntaxIncomplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MapHistoryCompleteness {
+    Complete,
+    ObservedPartial,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MapHistoryMetadata {
+    pub head: String,
+    pub head_tree: String,
+    pub object_format: &'static str,
+    #[serde(serialize_with = "serialize_hex")]
+    pub shallow_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub scope_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub request_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub content_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub snapshot_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub extractor_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub options_digest: [u8; 32],
+    pub commits_completeness: MapHistoryCompleteness,
+    pub renames_completeness: MapHistoryCompleteness,
+    pub cochange_completeness: MapHistoryCompleteness,
+    pub blame_completeness: MapHistoryCompleteness,
+    pub commits_omitted: usize,
+    pub renames_omitted: usize,
+    pub cochange_omitted: usize,
+    pub blame_omitted: usize,
+    #[serde(serialize_with = "serialize_hex")]
+    pub git_executable_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub git_version_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub git_implementation_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MapBlameSource {
+    Git,
+    Worktree,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MapBlameHunk {
+    path: String,
+    range: MapGraphRange,
+    #[serde(serialize_with = "serialize_hex")]
+    line_digest: [u8; 32],
+    source: MapBlameSource,
+    source_commit: Option<String>,
+    source_path: String,
+    source_range: MapGraphRange,
+    source_blob: Option<String>,
+    boundary: bool,
+    confidence_millis: u16,
+    revision: RevisionId,
+    #[serde(serialize_with = "serialize_hex")]
+    evidence_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -916,6 +1031,10 @@ pub struct RepositoryMap {
         serialize_with = "serialize_optional_hex"
     )]
     graph_options_digest: Option<[u8; 32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<MapHistoryMetadata>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blame: Vec<MapBlameHunk>,
     path_nodes: Vec<RepositoryPathNode>,
     path_edges: Vec<RepositoryPathEdge>,
     entries: Vec<RepositoryMapEntry>,
@@ -1062,6 +1181,48 @@ pub fn build_repository_map_with_structure(
     cursor: Option<&MapCursor>,
     structure: Option<&StructureGraph>,
 ) -> Result<RepositoryMap, MapError> {
+    if structure.is_some_and(|graph| graph.history().is_some()) {
+        return Err(MapError::HistoryEvidenceUnavailable);
+    }
+    build_repository_map_internal(
+        workspace, index, request, evidence, limits, cursor, structure, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_repository_map_with_history(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    request: &RepositoryMapRequest,
+    evidence: &[SemanticRelationship<'_>],
+    limits: MapLimits,
+    cursor: Option<&MapCursor>,
+    structure: &StructureGraph,
+    fence: &ValidatedHistoryFence,
+) -> Result<RepositoryMap, MapError> {
+    build_repository_map_internal(
+        workspace,
+        index,
+        request,
+        evidence,
+        limits,
+        cursor,
+        Some(structure),
+        Some(fence),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_repository_map_internal(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    request: &RepositoryMapRequest,
+    evidence: &[SemanticRelationship<'_>],
+    limits: MapLimits,
+    cursor: Option<&MapCursor>,
+    structure: Option<&StructureGraph>,
+    history_fence: Option<&ValidatedHistoryFence>,
+) -> Result<RepositoryMap, MapError> {
     let started = Instant::now();
     let deadline = started.checked_add(limits.max_time).unwrap_or(started);
     let mut work = 0_usize;
@@ -1078,6 +1239,36 @@ pub fn build_repository_map_with_structure(
         if graph.revision() != index.revision() || graph.index_digest() != *index.index_digest() {
             return Err(MapError::GraphEvidenceStale);
         }
+        if (!request.history_paths.is_empty() || !request.blame_paths.is_empty())
+            && graph.history().is_none()
+        {
+            return Err(MapError::HistoryEvidenceUnavailable);
+        }
+        if let Some(history) = graph.history() {
+            let fence = history_fence.ok_or(MapError::HistoryEvidenceUnavailable)?;
+            let request_digest = HistoryRequest::new(
+                request.history_paths.clone(),
+                request.blame_paths.clone(),
+                request
+                    .expansion
+                    .relationships
+                    .contains(&RelationshipKind::ChangedWith),
+            )
+            .digest();
+            if fence.revision() != graph.revision()
+                || fence.history_snapshot_digest() != history.snapshot_digest()
+                || fence.history_content_digest() != history.content_digest()
+                || fence.request_digest() != request_digest
+                || history.request_digest() != request_digest
+            {
+                return Err(MapError::GraphEvidenceStale);
+            }
+            fence
+                .validate_repository(workspace, deadline)
+                .map_err(|_| MapError::GraphEvidenceStale)?;
+        } else if history_fence.is_some() {
+            return Err(MapError::HistoryEvidenceUnavailable);
+        }
         let partial =
             validate_structure_coverage(graph, request, &mut work, limits.max_work, deadline)?;
         Some((graph, partial))
@@ -1086,7 +1277,13 @@ pub fn build_repository_map_with_structure(
     };
     let structure_partial = structure.is_some_and(|(_, partial)| partial);
     let structure = structure.map(|(graph, _)| graph);
-    reserve_projection_memory(index, structure, evidence, limits.max_memory_bytes)?;
+    reserve_projection_memory(
+        index,
+        structure,
+        evidence,
+        cursor.is_none(),
+        limits.max_memory_bytes,
+    )?;
 
     let policy_digest = *blake3::hash(MAP_POLICY.as_bytes()).as_bytes();
     let neighborhood_digest = digest_request(request, &mut work, limits.max_work, deadline)?;
@@ -1249,6 +1446,17 @@ pub fn build_repository_map_with_structure(
             structure_expansion
                 .as_ref()
                 .map_or(0, |expansion| expansion.nodes.len()),
+        )
+        .saturating_add(
+            structure
+                .and_then(StructureGraph::history)
+                .map_or(0, |history| {
+                    history
+                        .blame_hunks()
+                        .iter()
+                        .filter(|hunk| request.blame_paths.iter().any(|path| path == hunk.path()))
+                        .count()
+                }),
         );
     let cursor_mandatory_edges = mandatory_edges
         .len()
@@ -1295,6 +1503,23 @@ pub fn build_repository_map_with_structure(
         graph_snapshot_digest: structure.map(StructureGraph::snapshot_digest),
         graph_content_digest: structure.map(StructureGraph::content_digest),
         graph_options_digest: structure.map(StructureGraph::options_digest),
+        history: structure
+            .and_then(StructureGraph::history)
+            .map(render_history_metadata),
+        blame: if cursor.is_none() {
+            structure
+                .and_then(StructureGraph::history)
+                .map_or_else(Vec::new, |history| {
+                    history
+                        .blame_hunks()
+                        .iter()
+                        .filter(|hunk| request.blame_paths.iter().any(|path| path == hunk.path()))
+                        .map(render_blame_hunk)
+                        .collect()
+                })
+        } else {
+            Vec::new()
+        },
         path_nodes: Vec::new(),
         path_edges: Vec::new(),
         entries: Vec::new(),
@@ -1458,7 +1683,8 @@ pub fn build_repository_map_with_structure(
         + response.entries.len()
         + response.edges.len()
         + response.graph_nodes.len()
-        + response.graph_edges.len();
+        + response.graph_edges.len()
+        + response.blame.len();
     if !settle_size(&mut response, request.budget.max_result_bytes, deadline)? {
         return Err(MapError::BoundExceeded(MapBound::ResultBytes));
     }
@@ -1610,6 +1836,11 @@ pub fn build_repository_map_with_structure(
     workspace.validate_revision_until(index.revision(), deadline)?;
     charge_work(&mut work, 0, limits.max_work)?;
     check_deadline(deadline)?;
+    if let Some(fence) = history_fence {
+        fence
+            .validate_repository(workspace, deadline)
+            .map_err(|_| MapError::GraphEvidenceStale)?;
+    }
     Ok(response)
 }
 
@@ -1620,6 +1851,16 @@ fn validate_request(
     work: &mut usize,
     deadline: Instant,
 ) -> Result<(), MapError> {
+    if request.expansion.purpose != ExpansionPurpose::Neighborhood
+        && request
+            .expansion
+            .relationships
+            .contains(&RelationshipKind::ChangedWith)
+    {
+        return Err(MapError::InvalidRequest(
+            "changed_with is valid only for neighborhood traversal",
+        ));
+    }
     if request
         .expansion
         .relationships
@@ -1764,6 +2005,16 @@ fn validate_request(
             "too many relationship filters",
         ),
         (
+            request.history_paths.len(),
+            limits.max_expansion_paths,
+            "too many history paths",
+        ),
+        (
+            request.blame_paths.len(),
+            limits.max_expansion_paths,
+            "too many blame paths",
+        ),
+        (
             evidence.len(),
             limits.max_semantic_relationships,
             "too many semantic relationships",
@@ -1832,7 +2083,13 @@ fn validate_request(
             .checked_add(path.as_os_str().as_encoded_bytes().len())
             .ok_or(MapError::InvalidRequest("input size overflow"))?;
     }
-    for path in &request.expansion.paths {
+    for path in request
+        .expansion
+        .paths
+        .iter()
+        .chain(&request.history_paths)
+        .chain(&request.blame_paths)
+    {
         check_deadline(deadline)?;
         charge_work(work, 1, limits.max_work)?;
         bytes = bytes
@@ -2482,6 +2739,8 @@ fn structure_requested(request: &RepositoryMapRequest) -> bool {
     !request.expansion.graph_seeds.is_empty()
         || !request.expansion.packages.is_empty()
         || !request.expansion.tests.is_empty()
+        || !request.history_paths.is_empty()
+        || !request.blame_paths.is_empty()
         || request
             .expansion
             .relationships
@@ -2525,6 +2784,7 @@ fn validate_structure_coverage(
             RelationshipKind::Inherits => Some(StructureEdgeKind::Inherits),
             RelationshipKind::Overrides => Some(StructureEdgeKind::Overrides),
             RelationshipKind::Tests => Some(StructureEdgeKind::Tests),
+            RelationshipKind::ChangedWith => Some(StructureEdgeKind::ChangedWith),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -2556,7 +2816,11 @@ fn validate_structure_coverage(
             return Err(MapError::InvalidGraph("relationship coverage is missing"));
         }
         if unavailable || (!extracted && !relation_partial) {
-            return Err(MapError::GraphEvidenceUnavailable);
+            return Err(if relation == StructureEdgeKind::ChangedWith {
+                MapError::HistoryEvidenceUnavailable
+            } else {
+                MapError::GraphEvidenceUnavailable
+            });
         }
         partial |= relation_partial;
     }
@@ -2567,6 +2831,7 @@ fn reserve_projection_memory(
     index: &MetadataIndex,
     structure: Option<&StructureGraph>,
     evidence: &[SemanticRelationship<'_>],
+    include_blame: bool,
     max_memory_bytes: usize,
 ) -> Result<(), MapError> {
     let declarations = index
@@ -2658,6 +2923,24 @@ fn reserve_projection_memory(
             .and_then(|bytes| bytes.checked_add(edge_bytes))
             .and_then(|bytes| bytes.checked_add(projected_heap_bytes))
             .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        if include_blame && let Some(history) = graph.history() {
+            bytes = history
+                .blame_hunks()
+                .iter()
+                .try_fold(bytes, |bytes, hunk| {
+                    bytes
+                        .checked_add(std::mem::size_of::<MapBlameHunk>())
+                        .and_then(|bytes| bytes.checked_add(hunk.path().as_str().len()))
+                        .and_then(|bytes| bytes.checked_add(hunk.source_path().as_str().len()))
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                hunk.source_commit().map_or(0, |oid| oid.as_str().len())
+                                    + hunk.source_blob().map_or(0, |oid| oid.as_str().len()),
+                            )
+                        })
+                })
+                .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        }
     }
     if bytes > max_memory_bytes {
         Err(MapError::BoundExceeded(MapBound::Memory))
@@ -3474,6 +3757,7 @@ fn render_structure_edge(
             target_range: semantic.target_range().into(),
             fact_range: semantic.fact_range().into(),
         });
+    let history = provenance.history().map(MapGraphHistoryProvenance::from);
     RepositoryGraphEdge {
         source_node: projected.source,
         target_node: projected.target,
@@ -3487,6 +3771,7 @@ fn render_structure_edge(
                 ProvenanceSource::TreeSitter => MapGraphProvenanceSource::TreeSitter,
                 ProvenanceSource::CargoTreeSitter => MapGraphProvenanceSource::CargoTreeSitter,
                 ProvenanceSource::Lsp => MapGraphProvenanceSource::Lsp,
+                ProvenanceSource::GitHistory => MapGraphProvenanceSource::GitHistory,
             },
             path: provenance.path().map(|path| path.as_str().to_owned()),
             range: provenance.range().into(),
@@ -3499,10 +3784,122 @@ fn render_structure_edge(
             revision: provenance.revision(),
             confidence_millis: provenance.confidence_millis(),
             semantic,
+            history,
             evidence_digest: provenance.evidence_digest(),
         },
         revision: edge.revision(),
         structural_digest: edge.structural_digest(),
+    }
+}
+
+impl From<&HistoryEdgeProvenance> for MapGraphHistoryProvenance {
+    fn from(history: &HistoryEdgeProvenance) -> Self {
+        Self {
+            head: history.head().to_string(),
+            head_tree: history.head_tree().to_string(),
+            object_format: object_format(history.object_format()),
+            policy: history.policy().to_owned(),
+            policy_digest: history.policy_digest(),
+            extractor_digest: history.extractor_digest(),
+            scope_digest: history.scope_digest(),
+            support_commits: history
+                .support_commits()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            count: history.count(),
+            left_count: history.left_count(),
+            right_count: history.right_count(),
+            shared_count: history.shared_count(),
+            strength_millis: history.strength_millis(),
+            coverage: coverage_completeness(history.coverage()),
+            left_path: history.left_path().as_str().to_owned(),
+            right_path: history.right_path().as_str().to_owned(),
+            left_range: history.left_range().into(),
+            right_range: history.right_range().into(),
+            left_committed_blob: history.left_committed_blob().to_string(),
+            right_committed_blob: history.right_committed_blob().to_string(),
+            left_committed_range: history.left_committed_range().into(),
+            right_committed_range: history.right_committed_range().into(),
+            extraction_confidence_millis: history.extraction_confidence_millis(),
+            revision: history.revision(),
+            evidence_digest: history.evidence_digest(),
+        }
+    }
+}
+
+fn render_history_metadata(history: &GraphHistoryMetadata) -> MapHistoryMetadata {
+    MapHistoryMetadata {
+        head: history.head().to_string(),
+        head_tree: history.head_tree().to_string(),
+        object_format: object_format(history.object_format()),
+        shallow_digest: history.shallow_digest(),
+        scope_digest: history.scope_digest(),
+        request_digest: history.request_digest(),
+        content_digest: history.content_digest(),
+        snapshot_digest: history.snapshot_digest(),
+        extractor_digest: history.extractor_digest(),
+        options_digest: history.options_digest(),
+        commits_completeness: history_coverage_completeness(history.commits_coverage()),
+        renames_completeness: history_coverage_completeness(history.renames_coverage()),
+        cochange_completeness: history_coverage_completeness(history.cochange_coverage()),
+        blame_completeness: history_coverage_completeness(history.blame_coverage()),
+        commits_omitted: history.commits_omitted(),
+        renames_omitted: history.renames_omitted(),
+        cochange_omitted: history.cochange_omitted(),
+        blame_omitted: history.blame_omitted(),
+        git_executable_digest: history.git_executable_digest(),
+        git_version_digest: history.git_version_digest(),
+        git_implementation_digest: history.git_implementation_digest(),
+    }
+}
+
+fn render_blame_hunk(hunk: &crate::workspace::graph::history::BlameHunk) -> MapBlameHunk {
+    MapBlameHunk {
+        path: hunk.path().as_str().to_owned(),
+        range: hunk.range().into(),
+        line_digest: hunk.line_digest(),
+        source: match hunk.source() {
+            BlameSource::Git => MapBlameSource::Git,
+            BlameSource::Worktree => MapBlameSource::Worktree,
+        },
+        source_commit: hunk.source_commit().map(ToString::to_string),
+        source_path: hunk.source_path().as_str().to_owned(),
+        source_range: hunk.source_range().into(),
+        source_blob: hunk.source_blob().map(ToString::to_string),
+        boundary: hunk.boundary(),
+        confidence_millis: hunk.confidence_millis(),
+        revision: hunk.revision(),
+        evidence_digest: hunk.evidence_digest(),
+    }
+}
+
+const fn object_format(format: crate::workspace::graph::history::ObjectFormat) -> &'static str {
+    match format {
+        crate::workspace::graph::history::ObjectFormat::Sha1 => "sha1",
+        crate::workspace::graph::history::ObjectFormat::Sha256 => "sha256",
+    }
+}
+
+const fn coverage_completeness(status: CoverageStatus) -> MapCompleteness {
+    match status {
+        CoverageStatus::Extracted => MapCompleteness::Complete,
+        CoverageStatus::ObservedPartial
+        | CoverageStatus::Unavailable
+        | CoverageStatus::NotExtracted
+        | CoverageStatus::Malformed
+        | CoverageStatus::Incomplete => MapCompleteness::ObservedPartial,
+    }
+}
+
+const fn history_coverage_completeness(status: CoverageStatus) -> MapHistoryCompleteness {
+    match status {
+        CoverageStatus::Extracted => MapHistoryCompleteness::Complete,
+        CoverageStatus::ObservedPartial => MapHistoryCompleteness::ObservedPartial,
+        CoverageStatus::Unavailable
+        | CoverageStatus::NotExtracted
+        | CoverageStatus::Malformed
+        | CoverageStatus::Incomplete => MapHistoryCompleteness::Unavailable,
     }
 }
 
@@ -3932,6 +4329,22 @@ fn precharge_mandatory(
                 }
             }
         }
+        if let Some(history) = structure.history() {
+            for hunk in history.blame_hunks() {
+                retained = retained
+                    .saturating_add(std::mem::size_of::<MapBlameHunk>())
+                    .saturating_add(escaped_string_upper_bound(hunk.path().as_str()))
+                    .saturating_add(escaped_string_upper_bound(hunk.source_path().as_str()))
+                    .saturating_add(
+                        hunk.source_commit()
+                            .map_or(0, |oid| escaped_string_upper_bound(oid.as_str())),
+                    )
+                    .saturating_add(
+                        hunk.source_blob()
+                            .map_or(0, |oid| escaped_string_upper_bound(oid.as_str())),
+                    );
+            }
+        }
     }
     charge_work(
         work,
@@ -4227,6 +4640,21 @@ fn digest_request(
         check_deadline(deadline)?;
         charge_work(work, 1, max_work)?;
         frame(&mut hash, path.as_str().as_bytes());
+    }
+    for (label, paths) in [
+        (b"\0history-paths\0".as_slice(), &request.history_paths),
+        (b"\0blame-paths\0".as_slice(), &request.blame_paths),
+    ] {
+        hash.update(label);
+        let mut paths = paths.iter().collect::<Vec<_>>();
+        charge_sort_work(work, paths.len(), max_work, deadline)?;
+        paths.sort_unstable();
+        paths.dedup();
+        for path in paths {
+            check_deadline(deadline)?;
+            charge_work(work, 1, max_work)?;
+            frame(&mut hash, path.as_str().as_bytes());
+        }
     }
     hash.update(b"\0expansion-symbols\0");
     let mut symbols = request.expansion.symbols.iter().collect::<Vec<_>>();

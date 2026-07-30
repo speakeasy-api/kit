@@ -48,7 +48,8 @@ REQUIRED_IDS = {
     "toon.fixture_manifest_sha256", "toon.serde_toon2", "toon.conformance",
     "grammar.runtime", "grammar.languages", "grammar.queries",
     "structural.ast_grep_core", "structural.ast_grep_language", "structural.toml",
-    "structural.globset", "structural.extractor_policy", "lsp.protocol",
+    "structural.globset", "structural.extractor_policy", "history.extractor_policy",
+    "history.git_disposition", "lsp.protocol",
     "lsp.position_encoding", "lsp.servers", "scip.schema", "scip.index",
     "harness.swe_bench_verified", "harness.swe_bench_multilingual",
     "harness.swe_bench_live", "harness.swe_bench_multimodal", "harness.terminal_bench_2_1",
@@ -166,6 +167,7 @@ EVIDENCE_COMMANDS = {
     "tool.openapi_spec_validator": "python3 -m openapi_spec_validator docs/api/openapi.yaml",
     "tool.cargo_metadata": "cargo --version",
     "tool.cargo_tree": "cargo tree --version",
+    "history.git_disposition": "git --version",
     "build.cargo_lock_sha256": "shasum -a 256 Cargo.lock",
 }
 
@@ -1395,6 +1397,29 @@ def validate(document, release=False, repository=True):
         errors.append(f"missing required pins: {', '.join(sorted(missing))}")
     if "rust.toolchain" in pins and not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", pins["rust.toolchain"]["value"]):
         errors.append("rust.toolchain must be an exact x.y.z release")
+    history_source = (ROOT / "src/workspace/graph/history/mod.rs").read_text(encoding="utf-8")
+    history_policy_match = re.search(
+        r'^pub const HISTORY_EXTRACTOR_POLICY: &str = "([^"]+)";$',
+        history_source,
+        re.M,
+    )
+    history_policy = pins.get("history.extractor_policy", {}).get("value")
+    if history_policy_match is None or history_policy != history_policy_match.group(1):
+        errors.append("history.extractor_policy must match the implemented fixed extraction policy")
+    acquire_source = (ROOT / "src/workspace/acquire/mod.rs").read_text(encoding="utf-8")
+    if any(command in history_source or command in acquire_source
+           for command in ("--find-renames", "diff-tree")):
+        errors.append("history extraction must not invoke Git rename or similarity heuristics")
+    if history_policy and "exact-only-observed-partial" not in history_policy:
+        errors.append("history.extractor_policy must disclose exact-only partial rename coverage")
+    git_disposition = pins.get("history.git_disposition", {}).get("value")
+    if git_disposition != (
+        "disposition=observed-local-runtime-not-immutable-support;"
+        "selection=runtime-qualified-admin-owned-absolute-system-git;"
+        "identity=absolute-path+executable-content-digest+normalized-version-output-digest;"
+        "fixture_format=sha1;parser_formats=sha1,sha256"
+    ):
+        errors.append("history.git_disposition must record bounded observed runtime identity without claiming immutable support")
     for pin_id in ("toon.spec_commit", "build.action_checkout"):
         if pin_id in pins and not HEX40.fullmatch(pins[pin_id]["value"]):
             errors.append(f"{pin_id} must be a lowercase 40-character Git object ID")

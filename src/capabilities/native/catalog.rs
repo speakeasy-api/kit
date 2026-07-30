@@ -272,12 +272,12 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
         description(tool),
         schema_value,
     )
-    .with_output_schema(output_schema())
+    .with_output_schema(output_schema(tool))
     .with_annotations(annotations)
     .with_metadata(metadata)
     .with_output_limit(ToolOutputLimit::fail(MAX_NATIVE_OUTPUT_BYTES));
     let implementation = if tool == NativeTool::Discover {
-        format!("kit-native-discover-map-graph-{VERSION}")
+        format!("kit-native-discover-map-graph-history-blame-{VERSION}")
     } else {
         format!("kit-native-{}-{VERSION}", tool.short_name())
     };
@@ -383,6 +383,16 @@ fn input_schema(tool: NativeTool) -> Value {
                     "expected_revision": revision(),
                     "map": {
                         "additionalProperties": false,
+                        "allOf": [{
+                            "if": {
+                                "properties": {"relationships": {"contains": {"const": "changed_with"}}},
+                                "required": ["relationships"]
+                            },
+                            "then": {
+                                "properties": {"purpose": {"const": "neighborhood"}},
+                                "required": ["purpose"]
+                            }
+                        }],
                         "properties": {
                             "budgets": {
                                 "additionalProperties": false,
@@ -405,10 +415,12 @@ fn input_schema(tool: NativeTool) -> Value {
                             "expansionSeeds": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
                             "graphSeeds": {"description": "Exact structure-graph node IDs.", "items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
                             "languages": {"items": {"maxLength": 64, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"},
+                            "historyPaths": {"description": "Optional exact bounded Git co-change scope. Omit to use all indexed file paths when changed_with is requested.", "items": expansion_path(), "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "blamePaths": {"description": "Optional exact bounded blame scope. Requested paths produce canonical digest-only blame hunks in map.blame; raw line text is never returned. Blame is never extracted when omitted.", "items": expansion_path(), "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
                             "pathPrefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
                             "purpose": {"enum": ["dependencies", "dependents", "neighborhood"]},
                             "recentlyReadPaths": {"items": relative_path(), "maxItems": 32, "type": "array"},
-                            "relationships": {"items": {"enum": ["contains", "contained_by", "semantic_declaration", "semantic_definition", "semantic_type_definition", "semantic_implementation", "semantic_reference", "defines", "imports", "exports", "references", "calls", "implements", "inherits", "overrides", "tests"]}, "maxItems": NATIVE_MAP_MAX_RELATIONSHIPS, "type": "array", "uniqueItems": true},
+                            "relationships": {"items": {"enum": ["contains", "contained_by", "semantic_declaration", "semantic_definition", "semantic_type_definition", "semantic_implementation", "semantic_reference", "defines", "imports", "exports", "references", "calls", "implements", "inherits", "overrides", "tests", "changed_with"]}, "maxItems": NATIVE_MAP_MAX_RELATIONSHIPS, "type": "array", "uniqueItems": true},
                             "scoreBand": {
                                 "additionalProperties": false,
                                 "description": "Inclusive u64 declaration rank under kit-repository-map-v1. Every band must match at least one declaration.",
@@ -540,16 +552,71 @@ fn input_schema(tool: NativeTool) -> Value {
     }
 }
 
-fn output_schema() -> Value {
-    object(
-        json!({
-            "artifacts": {"items": {"type": "string"}, "type": "array"},
-            "data": {},
-            "truncated": {"type": "boolean"},
-            "version": {"const": 1}
-        }),
-        &["version", "data", "artifacts", "truncated"],
+fn output_schema(tool: NativeTool) -> Value {
+    let generic = || {
+        object(
+            json!({
+                "artifacts": {"items": {"type": "string"}, "type": "array"},
+                "data": {},
+                "truncated": {"type": "boolean"},
+                "version": {"const": 1}
+            }),
+            &["version", "data", "artifacts", "truncated"],
+        )
+    };
+    if tool != NativeTool::Discover {
+        return generic();
+    }
+
+    let openapi: Value = serde_json::to_value(
+        serde_yaml::from_str::<serde_yaml::Value>(include_str!("../../../docs/api/openapi.yaml"))
+            .expect("OpenAPI schema parses"),
     )
+    .expect("OpenAPI schema converts to JSON");
+    let mut components = serde_json::Map::new();
+    for name in [
+        "RepositoryDiscoverMapOutput",
+        "RepositoryMapResponse",
+        "RepositoryRelativePath",
+        "RepositoryRevisionId",
+        "RepositoryBlameHunk",
+        "RepositoryGraphRange",
+        "RepositoryGraphEdgeProvenance",
+        "RepositoryGraphSemanticProvenance",
+        "RepositoryGraphHistoryProvenance",
+    ] {
+        components.insert(
+            name.to_owned(),
+            openapi["components"]["schemas"][name].clone(),
+        );
+    }
+    let wrapper = |data: Value| {
+        json!({
+            "additionalProperties": false,
+            "properties": {
+                "artifacts": {"items": {"type": "string"}, "type": "array"},
+                "data": data,
+                "truncated": {"const": false},
+                "version": {"const": 1}
+            },
+            "required": ["version", "data", "artifacts", "truncated"],
+            "type": "object"
+        })
+    };
+    json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "components": {"schemas": components},
+        "oneOf": [
+            wrapper(json!({
+                "not": {
+                    "properties": {"mode": {"const": "map"}},
+                    "required": ["mode"],
+                    "type": "object"
+                }
+            })),
+            wrapper(json!({"$ref": "#/components/schemas/RepositoryDiscoverMapOutput"}))
+        ]
+    })
 }
 
 #[cfg(test)]
