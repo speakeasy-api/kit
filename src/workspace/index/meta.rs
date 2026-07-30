@@ -108,6 +108,10 @@ impl MetadataEntry {
     pub(crate) fn text(&self) -> Option<&str> {
         self.text.as_deref().map(String::as_str)
     }
+
+    pub(crate) const fn source_digest(&self) -> Option<[u8; 32]> {
+        self.source_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -515,6 +519,10 @@ impl MetadataIndex {
 
     pub fn index_digest(&self) -> &[u8; 32] {
         &self.index_digest
+    }
+
+    pub(crate) const fn options_digest(&self) -> [u8; 32] {
+        self.options_digest
     }
 
     pub fn entries(&self) -> &[MetadataEntry] {

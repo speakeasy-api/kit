@@ -13,8 +13,8 @@ use kit::{
     },
     verify::lsp::{
         facts::{
-            FactLimits, LspWorkspaceSnapshot, OpenDocument, SemanticFact, SnapshotFile,
-            normalize_semantic_locations,
+            FactLimits, LspWorkspaceSnapshot, OpenDocument, SemanticFact, SemanticRelationKind,
+            SnapshotFile, normalize_semantic_locations,
         },
         session::{
             AcceptedResponse, CodecLimits, DocumentVersion, ExecutionProfileIdentity,
@@ -26,12 +26,13 @@ use kit::{
     workspace::{
         edit::ir::EditLimits,
         edit::ir::RootRelativePath,
+        graph::structure::{GraphOptions, StructureGraph, StructureGraphProvider},
         index::meta::{IndexOptions, MetadataIndex},
         map::{
             DeclarationId, ExpansionPurpose, ExpansionRequest, MAP_CURSOR_TOKEN_LENGTH, MapBound,
             MapBudget, MapCursor, MapError, MapLimits, Personalization, RelationshipKind,
             RepositoryMap, RepositoryMapRequest, ScoreBand, SemanticRelationship, StackFrame,
-            build_repository_map,
+            build_repository_map, build_repository_map_with_structure,
         },
         revision::{ManagedWorkspace, RevisionId, RevisionOptions},
     },
@@ -126,12 +127,372 @@ fn map(
     build_repository_map(workspace, index, request, &[], MapLimits::default(), None).unwrap()
 }
 
+fn structure(workspace: &ManagedWorkspace, index: &MetadataIndex) -> StructureGraph {
+    StructureGraphProvider::new()
+        .refresh(workspace, index, &GraphOptions::default(), &[], &[])
+        .unwrap()
+        .clone()
+}
+
 fn wire(map: &RepositoryMap) -> serde_json::Value {
     serde_json::from_slice(&map.to_canonical_json().unwrap()).unwrap()
 }
 
 fn wire_id(id: DeclarationId) -> serde_json::Value {
     serde_json::to_value(id).unwrap()
+}
+
+fn wire_digest(value: [u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn structure_graph_packages_tests_and_exact_provenance_are_projected() {
+    let fixture = Fixture::new(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n[dependencies]\nhelper={path=\"helper\"}\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn production() {}\n#[test]\nfn exact_test() { production(); }\n",
+        ),
+        (
+            "helper/Cargo.toml",
+            "[package]\nname=\"helper\"\nversion=\"0.1.0\"\n",
+        ),
+        ("helper/src/lib.rs", "pub fn helper() {}\n"),
+    ]);
+    let (workspace, index) = indexed(&fixture);
+    let graph = structure(&workspace, &index);
+
+    let imports = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            packages: vec!["root".to_owned()],
+            purpose: ExpansionPurpose::Dependencies,
+            relationships: vec![RelationshipKind::Imports],
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let imports = build_repository_map_with_structure(
+        &workspace,
+        &index,
+        &imports,
+        &[],
+        MapLimits::default(),
+        None,
+        Some(&graph),
+    )
+    .unwrap();
+    let imports = wire(&imports);
+    assert_eq!(imports["graph_evidence_available"], true);
+    assert_eq!(
+        imports["graph_snapshot_digest"],
+        wire_digest(graph.snapshot_digest())
+    );
+    assert!(
+        imports["graph_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| {
+                node["kind"] == "package" && node["name"] == "root" && node["path"] == "Cargo.toml"
+            })
+    );
+    assert!(
+        imports["graph_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| {
+                node["kind"] == "package"
+                    && node["name"] == "root"
+                    && node["reasons"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|reason| reason == "explicit_package")
+            })
+    );
+    let edge = imports["graph_edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["relationship"] == "imports")
+        .unwrap();
+    assert_eq!(edge["revision"], index.revision().to_string());
+    assert_eq!(edge["provenance"]["source"], "cargo_manifest");
+    assert_eq!(edge["provenance"]["path"], "Cargo.toml");
+    assert_eq!(edge["provenance"]["revision"], index.revision().to_string());
+    assert_eq!(edge["provenance"]["confidence_millis"], 1000);
+    assert_eq!(edge["provenance"]["range_kind"], "manifest");
+    assert_eq!(edge["provenance"]["semantic"], serde_json::Value::Null);
+    assert_eq!(
+        edge["provenance"]["evidence_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let tests = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            paths: vec![RootRelativePath::parse("src/lib.rs", 4096).unwrap()],
+            purpose: ExpansionPurpose::Dependencies,
+            relationships: vec![RelationshipKind::Tests],
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let tests = build_repository_map_with_structure(
+        &workspace,
+        &index,
+        &tests,
+        &[],
+        MapLimits::default(),
+        None,
+        Some(&graph),
+    )
+    .unwrap();
+    let tests = wire(&tests);
+    assert!(tests["graph_nodes"].as_array().unwrap().iter().any(|node| {
+        node["kind"] == "test" && node["name"] == "exact_test" && node["path"] == "src/lib.rs"
+    }));
+    assert!(tests["graph_edges"].as_array().unwrap().iter().any(|edge| {
+        edge["relationship"] == "tests"
+            && edge["provenance"]["source"] == "cargo_tree_sitter"
+            && edge["provenance"]["range_kind"] == "declaration"
+    }));
+
+    let inverse = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            packages: vec!["Cargo.toml".to_owned()],
+            purpose: ExpansionPurpose::Dependencies,
+            relationships: vec![RelationshipKind::ContainedBy],
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let inverse = wire(
+        &build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &inverse,
+            &[],
+            MapLimits::default(),
+            None,
+            Some(&graph),
+        )
+        .unwrap(),
+    );
+    assert!(
+        inverse["graph_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|edge| edge["relationship"] == "contained_by")
+    );
+    assert!(
+        !inverse
+            .to_string()
+            .contains("\"relationship\":\"contains\"")
+    );
+}
+
+#[test]
+fn structure_graph_absence_staleness_cursor_and_bounds_are_typed() {
+    let fixture = Fixture::new(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n[dependencies]\na={path=\"a\"}\nb={path=\"b\"}\n",
+        ),
+        ("src/lib.rs", "pub fn root() {}\npub fn extra() {}\n"),
+        ("a/Cargo.toml", "[package]\nname=\"a\"\nversion=\"0.1.0\"\n"),
+        ("a/src/lib.rs", "pub fn a() {}\n"),
+        ("b/Cargo.toml", "[package]\nname=\"b\"\nversion=\"0.1.0\"\n"),
+        ("b/src/lib.rs", "pub fn b() {}\n"),
+    ]);
+    let (workspace, index) = indexed(&fixture);
+    let graph = structure(&workspace, &index);
+    let request = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            packages: vec!["root".to_owned()],
+            purpose: ExpansionPurpose::Dependencies,
+            relationships: vec![RelationshipKind::Imports],
+            ..ExpansionRequest::default()
+        },
+        budget: MapBudget {
+            max_items: 6,
+            ..MapBudget::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    assert!(matches!(
+        build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &request,
+            &[],
+            MapLimits::default(),
+            None,
+            None,
+        ),
+        Err(MapError::GraphEvidenceUnavailable)
+    ));
+    let mut degree = request.clone();
+    degree.budget.max_degree = 1;
+    assert!(matches!(
+        build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &degree,
+            &[],
+            MapLimits::default(),
+            None,
+            Some(&graph),
+        ),
+        Err(MapError::BoundExceeded(MapBound::Degree))
+    ));
+
+    let first = build_repository_map_with_structure(
+        &workspace,
+        &index,
+        &request,
+        &[],
+        MapLimits::default(),
+        None,
+        Some(&graph),
+    )
+    .unwrap();
+    let cursor = first.cursor().unwrap();
+    let mut changed_provider = StructureGraphProvider::new();
+    let changed_graph = changed_provider
+        .refresh(
+            &workspace,
+            &index,
+            &GraphOptions {
+                max_nodes: GraphOptions::default().max_nodes - 1,
+                ..GraphOptions::default()
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &request,
+            &[],
+            MapLimits::default(),
+            Some(cursor),
+            Some(changed_graph),
+        ),
+        Err(MapError::CursorMismatch)
+    ));
+
+    fixture.write("src/lib.rs", "pub fn changed() {}\n");
+    let next_revision = workspace.current_revision().unwrap().id();
+    let next_index =
+        MetadataIndex::build(&workspace, next_revision, &IndexOptions::default()).unwrap();
+    assert!(matches!(
+        build_repository_map_with_structure(
+            &workspace,
+            &next_index,
+            &request,
+            &[],
+            MapLimits::default(),
+            None,
+            Some(&graph),
+        ),
+        Err(MapError::GraphEvidenceStale)
+    ));
+}
+
+#[test]
+fn structure_inverse_projection_has_exact_work_and_memory_floors() {
+    let fixture = Fixture::new(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n",
+        ),
+        ("src/lib.rs", "pub fn root() {}\n"),
+    ]);
+    let (workspace, index) = indexed(&fixture);
+    let graph = structure(&workspace, &index);
+    let request = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            packages: vec!["root".to_owned()],
+            purpose: ExpansionPurpose::Neighborhood,
+            relationships: vec![RelationshipKind::Contains, RelationshipKind::ContainedBy],
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let succeeds = |limits| {
+        build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &request,
+            &[],
+            limits,
+            None,
+            Some(&graph),
+        )
+    };
+
+    let mut low = 1;
+    let mut high = MapLimits::default().max_work;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match succeeds(MapLimits {
+            max_work: middle,
+            ..MapLimits::default()
+        }) {
+            Ok(_) => high = middle,
+            Err(MapError::InvalidRequest("map work limit exceeded")) => low = middle + 1,
+            Err(error) => panic!("unexpected work-bound result: {error:?}"),
+        }
+    }
+    succeeds(MapLimits {
+        max_work: low,
+        ..MapLimits::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        succeeds(MapLimits {
+            max_work: low - 1,
+            ..MapLimits::default()
+        }),
+        Err(MapError::InvalidRequest("map work limit exceeded"))
+    ));
+
+    let mut low = 1;
+    let mut high = MapLimits::default().max_memory_bytes;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match succeeds(MapLimits {
+            max_memory_bytes: middle,
+            ..MapLimits::default()
+        }) {
+            Ok(_) => high = middle,
+            Err(MapError::BoundExceeded(MapBound::Memory)) => low = middle + 1,
+            Err(error) => panic!("unexpected memory-bound result: {error:?}"),
+        }
+    }
+    succeeds(MapLimits {
+        max_memory_bytes: low,
+        ..MapLimits::default()
+    })
+    .unwrap();
+    assert!(matches!(
+        succeeds(MapLimits {
+            max_memory_bytes: low - 1,
+            ..MapLimits::default()
+        }),
+        Err(MapError::BoundExceeded(MapBound::Memory))
+    ));
 }
 
 fn id(index: &MetadataIndex, name: &str) -> DeclarationId {
@@ -435,6 +796,10 @@ fn every_expansion_selector_is_exact_inclusive_mandatory_and_set_like() {
             exact_declaration_ids: vec![alpha],
             ..Personalization::default()
         },
+        expansion: ExpansionRequest {
+            relationships: vec![RelationshipKind::Contains],
+            ..ExpansionRequest::default()
+        },
         ..RepositoryMapRequest::default()
     };
     let ranked = wire(&map(&workspace, &index, &ranked_request));
@@ -636,7 +1001,7 @@ fn repository_tree_expands_indexed_files_and_directories_without_declarations() 
     let dependent_request = RepositoryMapRequest {
         expansion: ExpansionRequest {
             paths: vec![RootRelativePath::parse("src/lib.rs", 4096).unwrap()],
-            purpose: ExpansionPurpose::Dependents,
+            purpose: ExpansionPurpose::Dependencies,
             relationships: vec![RelationshipKind::ContainedBy],
             ..ExpansionRequest::default()
         },
@@ -1221,6 +1586,35 @@ fn accepted_definition_paths(
     target_end: usize,
     encoding: PositionEncoding,
 ) -> AcceptedResponse {
+    accepted_semantic_paths(
+        fixture,
+        revision,
+        source_path,
+        source,
+        origin_line,
+        target_path,
+        target_line,
+        target_start,
+        target_end,
+        encoding,
+        "textDocument/definition",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accepted_semantic_paths(
+    fixture: &Fixture,
+    revision: RevisionId,
+    source_path: &str,
+    source: &str,
+    origin_line: usize,
+    target_path: &str,
+    target_line: usize,
+    target_start: usize,
+    target_end: usize,
+    encoding: PositionEncoding,
+    method: &str,
+) -> AcceptedResponse {
     let uri = fixture.uri(source_path);
     let target_uri = fixture.uri(target_path);
     let mut manager = LspSessionManager::new(Launcher, SessionLimits::default()).unwrap();
@@ -1253,7 +1647,7 @@ fn accepted_definition_paths(
             service,
             revision,
             &uri,
-            "textDocument/definition",
+            method,
             json!({
                 "textDocument": {"uri": uri},
                 "position": {"line": origin_line, "character": 0}
@@ -1327,6 +1721,209 @@ fn semantic_definition(
         encoding,
     );
     normalize_semantic_locations(&snapshot, &accepted).unwrap()
+}
+
+fn semantic_relation(
+    fixture: &Fixture,
+    revision: RevisionId,
+    source: &str,
+    target: &str,
+    method: &str,
+) -> Vec<SemanticFact> {
+    let snapshot = LspWorkspaceSnapshot::new(
+        fixture.root.clone(),
+        revision,
+        1,
+        vec![
+            SnapshotFile::new("source.rs", source.as_bytes().to_vec(), false),
+            SnapshotFile::new("target.rs", target.as_bytes().to_vec(), false),
+        ],
+        vec![OpenDocument::new(
+            fixture.uri("source.rs"),
+            DocumentVersion::new(1),
+            source.to_owned(),
+        )],
+        server(),
+        PositionEncoding::Utf8,
+        EditLimits::default(),
+        FactLimits::default(),
+    )
+    .unwrap();
+    let accepted = accepted_semantic_paths(
+        fixture,
+        revision,
+        "source.rs",
+        source,
+        0,
+        "target.rs",
+        0,
+        3,
+        9,
+        PositionEncoding::Utf8,
+        method,
+    );
+    normalize_semantic_locations(&snapshot, &accepted).unwrap()
+}
+
+#[test]
+fn semantic_relation_kinds_remain_distinct_and_queryable() {
+    let source = "fn source() { target(); }\n";
+    let target = "fn target() {}\n";
+    let fixture = Fixture::new(&[("source.rs", source), ("target.rs", target)]);
+    let (workspace, index) = indexed(&fixture);
+    let source_id = id(&index, "source");
+    let target_id = id(&index, "target");
+    let relations = [
+        (
+            "textDocument/declaration",
+            SemanticRelationKind::Declaration,
+            RelationshipKind::SemanticDeclaration,
+        ),
+        (
+            "textDocument/definition",
+            SemanticRelationKind::Definition,
+            RelationshipKind::SemanticDefinition,
+        ),
+        (
+            "textDocument/typeDefinition",
+            SemanticRelationKind::TypeDefinition,
+            RelationshipKind::SemanticTypeDefinition,
+        ),
+        (
+            "textDocument/references",
+            SemanticRelationKind::Reference,
+            RelationshipKind::SemanticReference,
+        ),
+        (
+            "textDocument/implementation",
+            SemanticRelationKind::Implementation,
+            RelationshipKind::SemanticImplementation,
+        ),
+    ];
+    let facts = relations
+        .iter()
+        .map(|(method, _, _)| semantic_relation(&fixture, index.revision(), source, target, method))
+        .collect::<Vec<_>>();
+    let evidence = facts
+        .iter()
+        .map(|facts| SemanticRelationship::new(source_id, &facts[0]))
+        .collect::<Vec<_>>();
+    for ((_, semantic, relationship), facts) in relations.iter().zip(&facts) {
+        assert_eq!(facts[0].relation(), *semantic);
+        assert_eq!(
+            RelationshipKind::from_semantic_relation(*semantic),
+            *relationship
+        );
+    }
+    let request = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            seeds: vec![source_id],
+            purpose: ExpansionPurpose::Neighborhood,
+            relationships: relations
+                .iter()
+                .map(|(_, _, relationship)| *relationship)
+                .collect(),
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let output = build_repository_map(
+        &workspace,
+        &index,
+        &request,
+        &evidence,
+        MapLimits::default(),
+        None,
+    )
+    .unwrap();
+    let output = wire(&output);
+    let kinds = output["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["relationship"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        kinds,
+        BTreeSet::from([
+            "semantic_declaration",
+            "semantic_definition",
+            "semantic_implementation",
+            "semantic_reference",
+            "semantic_type_definition",
+        ])
+    );
+    for edge in output["edges"].as_array().unwrap() {
+        let inverse = matches!(
+            edge["relationship"].as_str(),
+            Some("semantic_reference" | "semantic_implementation")
+        );
+        assert_eq!(
+            edge["source_declaration"],
+            if inverse {
+                wire_id(target_id)
+            } else {
+                wire_id(source_id)
+            }
+        );
+        assert_eq!(
+            edge["target_declaration"],
+            if inverse {
+                wire_id(source_id)
+            } else {
+                wire_id(target_id)
+            }
+        );
+    }
+
+    let reference = [evidence[3]];
+    let mut provider = StructureGraphProvider::new();
+    let graph = provider
+        .refresh(
+            &workspace,
+            &index,
+            &GraphOptions::default(),
+            &[],
+            &reference,
+        )
+        .unwrap()
+        .clone();
+    let partial = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            graph_seeds: vec![kit::workspace::graph::structure::NodeId::from_bytes(
+                source_id.as_bytes(),
+            )],
+            purpose: ExpansionPurpose::Neighborhood,
+            relationships: vec![RelationshipKind::References],
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let partial = wire(
+        &build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &partial,
+            &reference,
+            MapLimits::default(),
+            None,
+            Some(&graph),
+        )
+        .unwrap(),
+    );
+    assert_eq!(partial["completeness"], "observed_partial");
+    assert_eq!(partial["omissions"]["graph_relationships"], 1);
+    assert!(
+        partial["graph_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                edge["relationship"] == "references"
+                    && edge["source_node"] == wire_id(target_id)
+                    && edge["target_node"] == wire_id(source_id)
+            })
+    );
 }
 
 #[test]
@@ -1472,7 +2069,7 @@ fn runtime_item_token_hop_and_degree_bounds_are_exact() {
     request.expansion.seeds = vec![outer];
     request.expansion.relationships = vec![RelationshipKind::Contains];
     request.budget.max_hops = 2;
-    request.budget.max_degree = 2;
+    request.budget.max_degree = 3;
     let exact = map(&workspace, &index, &request);
     let required_items = exact.item_count();
     let required_tokens = exact.estimated_tokens();
@@ -1494,7 +2091,7 @@ fn runtime_item_token_hop_and_degree_bounds_are_exact() {
             .iter()
             .filter_map(|entry| entry["degree"].as_u64())
             .max(),
-        Some(2)
+        Some(3)
     );
 
     request.budget.max_items = required_items;
@@ -2037,4 +2634,18 @@ fn hostile_escaped_source_is_precharged_and_tiny_graph_work_fails_deterministica
             Err(MapError::InvalidRequest("map work limit exceeded"))
         ));
     }
+    assert!(matches!(
+        build_repository_map(
+            &workspace,
+            &index,
+            &RepositoryMapRequest::default(),
+            &[],
+            MapLimits {
+                max_memory_bytes: 1,
+                ..MapLimits::default()
+            },
+            None
+        ),
+        Err(MapError::BoundExceeded(MapBound::Memory))
+    ));
 }

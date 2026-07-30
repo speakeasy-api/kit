@@ -1422,7 +1422,9 @@ components:
         approval: {$ref: '#/components/schemas/RepositoryApproval'}
         owner: {$ref: '#/components/schemas/RepositoryOperationOwner'}
         cancellation_requested: {type: boolean}
-        output: {type: [object, 'null']}
+        output:
+          type: [object, 'null']
+          description: Completed native output. For repository discover map mode, `data` conforms to `RepositoryDiscoverMapOutput`; graph metadata exists only inside `data.map`.
         error: {oneOf: [{$ref: '#/components/schemas/RepositoryOperationError'}, {type: 'null'}]}
         cost: {oneOf: [{$ref: '#/components/schemas/RepositoryCost'}, {type: 'null'}]}
         artifacts: {oneOf: [{$ref: '#/components/schemas/RepositoryArtifacts'}, {type: 'null'}]}
@@ -1577,8 +1579,14 @@ components:
                 currentEditPaths: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
                 pathPrefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
                 languages: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 64}}
-                relationships: {type: array, maxItems: 7, uniqueItems: true, items: {enum: [contains, contained_by, semantic_declaration, semantic_definition, semantic_type_definition, semantic_implementation, semantic_reference]}}
+                relationships: {type: array, maxItems: 16, uniqueItems: true, items: {enum: [contains, contained_by, semantic_declaration, semantic_definition, semantic_type_definition, semantic_implementation, semantic_reference, defines, imports, exports, references, calls, implements, inherits, overrides, tests]}}
                 expansionSeeds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, pattern: '^[0-9a-f]{64}$'}}
+                graphSeeds:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Exact structure-graph node IDs.
+                  items: {type: string, pattern: '^[0-9a-f]{64}$'}
                 expandPaths:
                   type: array
                   maxItems: 128
@@ -1605,6 +1613,18 @@ components:
                   uniqueItems: true
                   description: Exact case-sensitive qualified or display symbols. An ambiguous exact display symbol selects all matches deterministically. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 256-byte UTF-8 limit.
                   items: {type: string, minLength: 1, maxLength: 256}
+                expandPackages:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Exact structure-graph package name or canonical manifest path.
+                  items: {type: string, minLength: 1, maxLength: 4096}
+                expandTests:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Exact structure-graph test name or canonical source path.
+                  items: {type: string, minLength: 1, maxLength: 4096}
                 scoreBand:
                   type: [object, 'null']
                   required: [min, max]
@@ -1626,6 +1646,82 @@ components:
                 cursor: {type: [string, 'null'], maxLength: 408, pattern: '^kitmap1_[0-9a-f]{400}$'}
               additionalProperties: false
           additionalProperties: false
+    RepositoryDiscoverMapOutput:
+      type: object
+      description: Native discover map-mode data. Graph availability and digests are not duplicated in this outer object.
+      required: [mode, map, semanticEvidenceAvailable]
+      properties:
+        mode: {const: map}
+        map: {$ref: '#/components/schemas/RepositoryMapResponse'}
+        semanticEvidenceAvailable: {type: boolean}
+      additionalProperties: false
+    RepositoryMapResponse:
+      type: object
+      description: Revision-bound canonical repository map. Structure graph metadata has one wire location in this object. Graph edge endpoints always preserve factual direction; traversal purpose changes reachability and hops, not endpoints. `contained_by` is the exact inverse projection of canonical `contains`. Opportunistic LSP graph relations use `observed_partial` completeness until a completeness proof exists.
+      required: [revision, index_digest, policy_digest, neighborhood_digest, evidence_digest, options_digest, path_nodes, path_edges, entries, edges, omissions, completeness, item_count, estimated_tokens, result_bytes, truncated, cursor]
+      properties:
+        revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+        index_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        policy_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        neighborhood_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        evidence_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        options_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        graph_evidence_available: {type: boolean}
+        graph_snapshot_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        graph_content_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        graph_options_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+        path_nodes: {type: array, items: {type: object, additionalProperties: true}}
+        path_edges: {type: array, items: {type: object, additionalProperties: true}}
+        entries: {type: array, items: {type: object, additionalProperties: true}}
+        edges: {type: array, items: {type: object, additionalProperties: true}}
+        graph_nodes:
+          type: array
+          items:
+            type: object
+            required: [node_id, kind, name, path, revision, structural_digest, subgraph_digest, rank, degree, hops, reasons]
+            properties:
+              node_id: {type: string, pattern: '^[0-9a-f]{64}$'}
+              kind: {enum: [repository, revision, package, file, symbol, test, diagnostic]}
+              name: {type: string}
+              path: {type: [string, 'null'], description: Package nodes use their canonical Cargo.toml path.}
+              revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+              structural_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+              subgraph_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+              rank: {type: integer, minimum: 0}
+              degree: {type: integer, minimum: 0}
+              hops: {type: integer, minimum: 0}
+              reasons: {type: array, items: {type: string}}
+            additionalProperties: true
+        graph_edges:
+          type: array
+          items:
+            type: object
+            required: [source_node, target_node, relationship, hops, provenance, revision, structural_digest]
+            properties:
+              source_node: {type: string, pattern: '^[0-9a-f]{64}$'}
+              target_node: {type: string, pattern: '^[0-9a-f]{64}$'}
+              relationship: {enum: [contains, contained_by, defines, imports, exports, references, calls, implements, inherits, overrides, tests]}
+              hops: {type: integer, minimum: 0}
+              provenance: {type: object, additionalProperties: true}
+              revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+              structural_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+            additionalProperties: true
+        omissions:
+          type: object
+          required: [ranked_entries, index_entries, syntax_declarations, graph_relationships]
+          properties:
+            ranked_entries: {type: integer, minimum: 0}
+            index_entries: {type: integer, minimum: 0}
+            syntax_declarations: {type: integer, minimum: 0}
+            graph_relationships: {type: integer, minimum: 0}
+          additionalProperties: false
+        completeness: {enum: [complete, observed_partial, ranked_entries_omitted, index_incomplete, syntax_incomplete]}
+        item_count: {type: integer, minimum: 0}
+        estimated_tokens: {type: integer, minimum: 0}
+        result_bytes: {type: integer, minimum: 0}
+        truncated: {type: boolean}
+        cursor: {type: [string, 'null'], pattern: '^kitmap1_[0-9a-f]{400}$'}
+      additionalProperties: true
     RepositorySearchInput:
       $schema: https://json-schema.org/draft/2020-12/schema
       oneOf:

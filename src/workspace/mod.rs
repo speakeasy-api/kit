@@ -1,5 +1,6 @@
 pub mod acquire;
 pub mod edit;
+pub mod graph;
 pub mod index;
 pub mod map;
 pub mod path_auth;

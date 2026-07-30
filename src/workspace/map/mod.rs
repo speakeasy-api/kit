@@ -17,6 +17,11 @@ use crate::{
     },
     workspace::{
         edit::ir::RootRelativePath,
+        graph::structure::{
+            CoverageStatus, EdgeKind as StructureEdgeKind, GraphEdge as StructureEdge,
+            GraphNode as StructureNode, GraphRange, NodeId, NodeKind, ProvenanceSource, RangeKind,
+            StructureGraph,
+        },
         index::meta::{ContentState, MetadataEntry, MetadataIndex},
         revision::{EntryKind, LimitKind, ManagedWorkspace, RevisionError, RevisionId},
         syntax::{
@@ -32,6 +37,7 @@ pub const MAP_POLICY_RANK_VERSION: &str = MAP_POLICY;
 const MAP_CURSOR_PREFIX: &str = "kitmap1_";
 const MAP_CURSOR_PAYLOAD_BYTES: usize = 200;
 pub const MAP_CURSOR_TOKEN_LENGTH: usize = MAP_CURSOR_PREFIX.len() + MAP_CURSOR_PAYLOAD_BYTES * 2;
+const BTREE_ENTRY_WEIGHT: usize = std::mem::size_of::<[usize; 8]>();
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeclarationId([u8; 32]);
@@ -123,6 +129,7 @@ pub struct MapLimits {
     pub max_semantic_relationships: usize,
     pub max_input_bytes: usize,
     pub max_work: usize,
+    pub max_memory_bytes: usize,
     pub max_candidates: usize,
     pub max_highlight_bytes: usize,
     pub max_cursor_frontier: usize,
@@ -151,6 +158,7 @@ impl Default for MapLimits {
             max_semantic_relationships: 100_000,
             max_input_bytes: 8 * 1024 * 1024,
             max_work: 10_000_000,
+            max_memory_bytes: 256 * 1024 * 1024,
             max_candidates: 100_000,
             max_highlight_bytes: 4 * 1024,
             max_cursor_frontier: 100_000,
@@ -169,10 +177,19 @@ pub enum RelationshipKind {
     SemanticTypeDefinition,
     SemanticImplementation,
     SemanticReference,
+    Defines,
+    Imports,
+    Exports,
+    References,
+    Calls,
+    Implements,
+    Inherits,
+    Overrides,
+    Tests,
 }
 
 impl RelationshipKind {
-    fn semantic(relation: SemanticRelationKind) -> Self {
+    pub const fn from_semantic_relation(relation: SemanticRelationKind) -> Self {
         match relation {
             SemanticRelationKind::Declaration => Self::SemanticDeclaration,
             SemanticRelationKind::Definition => Self::SemanticDefinition,
@@ -183,7 +200,44 @@ impl RelationshipKind {
     }
 
     pub(crate) fn is_semantic(self) -> bool {
-        !matches!(self, Self::Contains | Self::ContainedBy)
+        matches!(
+            self,
+            Self::SemanticDeclaration
+                | Self::SemanticDefinition
+                | Self::SemanticTypeDefinition
+                | Self::SemanticImplementation
+                | Self::SemanticReference
+        )
+    }
+
+    pub(crate) fn is_structure(self) -> bool {
+        matches!(
+            self,
+            Self::Defines
+                | Self::Imports
+                | Self::Exports
+                | Self::References
+                | Self::Calls
+                | Self::Implements
+                | Self::Inherits
+                | Self::Overrides
+                | Self::Tests
+        )
+    }
+
+    const fn from_structure(kind: StructureEdgeKind) -> Self {
+        match kind {
+            StructureEdgeKind::Contains => Self::Contains,
+            StructureEdgeKind::Defines => Self::Defines,
+            StructureEdgeKind::Imports => Self::Imports,
+            StructureEdgeKind::Exports => Self::Exports,
+            StructureEdgeKind::References => Self::References,
+            StructureEdgeKind::Calls => Self::Calls,
+            StructureEdgeKind::Implements => Self::Implements,
+            StructureEdgeKind::Inherits => Self::Inherits,
+            StructureEdgeKind::Overrides => Self::Overrides,
+            StructureEdgeKind::Tests => Self::Tests,
+        }
     }
 }
 
@@ -199,8 +253,11 @@ pub enum ExpansionPurpose {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpansionRequest {
     pub seeds: Vec<DeclarationId>,
+    pub graph_seeds: Vec<NodeId>,
     pub paths: Vec<RootRelativePath>,
     pub symbols: Vec<String>,
+    pub packages: Vec<String>,
+    pub tests: Vec<String>,
     pub score_band: Option<ScoreBand>,
     pub purpose: ExpansionPurpose,
     pub relationships: Vec<RelationshipKind>,
@@ -217,8 +274,11 @@ impl Default for ExpansionRequest {
     fn default() -> Self {
         Self {
             seeds: Vec::new(),
+            graph_seeds: Vec::new(),
             paths: Vec::new(),
             symbols: Vec::new(),
+            packages: Vec::new(),
+            tests: Vec::new(),
             score_band: None,
             purpose: ExpansionPurpose::Neighborhood,
             relationships: vec![RelationshipKind::Contains, RelationshipKind::ContainedBy],
@@ -257,6 +317,7 @@ pub enum MapBound {
     Hops,
     Degree,
     ResultBytes,
+    Memory,
 }
 
 #[derive(Debug)]
@@ -269,6 +330,9 @@ pub enum MapError {
     SelectorNoMatch(&'static str),
     StaleFact,
     SemanticEvidenceUnavailable,
+    GraphEvidenceUnavailable,
+    GraphEvidenceStale,
+    InvalidGraph(&'static str),
     CursorMismatch,
     Revision(RevisionError),
     TimeLimit,
@@ -309,6 +373,15 @@ impl fmt::Display for MapError {
             Self::StaleFact => formatter.write_str("repository map semantic fact is stale"),
             Self::SemanticEvidenceUnavailable => {
                 formatter.write_str("repository map semantic evidence is unavailable")
+            }
+            Self::GraphEvidenceUnavailable => {
+                formatter.write_str("repository map graph evidence is unavailable")
+            }
+            Self::GraphEvidenceStale => {
+                formatter.write_str("repository map graph evidence is stale")
+            }
+            Self::InvalidGraph(reason) => {
+                write!(formatter, "invalid repository map graph: {reason}")
             }
             Self::CursorMismatch => {
                 formatter.write_str("repository map cursor does not match the request")
@@ -484,6 +557,10 @@ enum RankingReason {
     SubstringTaskTerm,
     ExpansionSeed,
     ExpansionNeighbor,
+    ExplicitPackage,
+    ExplicitTest,
+    ExplicitGraphEvidence,
+    DegreePenalty,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -541,6 +618,120 @@ struct RepositoryMapEdge {
     pub provenance: EdgeProvenance,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MapGraphNodeKind {
+    Repository,
+    Revision,
+    Package,
+    File,
+    Symbol,
+    Test,
+    Diagnostic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RepositoryGraphNode {
+    #[serde(serialize_with = "serialize_node_id")]
+    pub node_id: NodeId,
+    pub kind: MapGraphNodeKind,
+    pub name: String,
+    pub path: Option<String>,
+    pub range: Option<MapGraphRange>,
+    pub revision: RevisionId,
+    #[serde(serialize_with = "serialize_hex")]
+    pub structural_digest: [u8; 32],
+    #[serde(serialize_with = "serialize_hex")]
+    pub subgraph_digest: [u8; 32],
+    pub rank: u64,
+    pub degree: usize,
+    pub hops: usize,
+    pub reasons: Vec<RankingReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct MapGraphRange {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl From<GraphRange> for MapGraphRange {
+    fn from(value: GraphRange) -> Self {
+        Self {
+            start_byte: value.start_byte(),
+            end_byte: value.end_byte(),
+            start_line: value.start_line(),
+            end_line: value.end_line(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MapGraphProvenanceSource {
+    MetadataIndex,
+    CargoManifest,
+    CargoConvention,
+    TreeSitter,
+    CargoTreeSitter,
+    Lsp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MapGraphRangeKind {
+    WholeFile,
+    Declaration,
+    Manifest,
+    NormalizedFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MapGraphSemanticProvenance {
+    pub relation: String,
+    pub origin_uri: String,
+    pub origin_path: String,
+    pub document_version: i32,
+    pub request_generation: u64,
+    pub request_id: u32,
+    pub origin_position: usize,
+    pub origin_range: MapGraphRange,
+    pub server_artifact: String,
+    pub server_configuration: String,
+    pub position_encoding: String,
+    pub target_range: MapGraphRange,
+    pub fact_range: MapGraphRange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct MapGraphEdgeProvenance {
+    pub source: MapGraphProvenanceSource,
+    pub path: Option<String>,
+    pub range: MapGraphRange,
+    pub range_kind: MapGraphRangeKind,
+    pub revision: RevisionId,
+    pub confidence_millis: u16,
+    pub semantic: Option<MapGraphSemanticProvenance>,
+    #[serde(serialize_with = "serialize_hex")]
+    pub evidence_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct RepositoryGraphEdge {
+    #[serde(serialize_with = "serialize_node_id")]
+    pub source_node: NodeId,
+    #[serde(serialize_with = "serialize_node_id")]
+    pub target_node: NodeId,
+    pub relationship: RelationshipKind,
+    pub hops: usize,
+    pub provenance: MapGraphEdgeProvenance,
+    pub revision: RevisionId,
+    #[serde(serialize_with = "serialize_hex")]
+    pub structural_digest: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct MapByteRange {
     pub start_byte: usize,
@@ -552,12 +743,14 @@ struct MapOmissions {
     pub ranked_entries: usize,
     pub index_entries: usize,
     pub syntax_declarations: usize,
+    pub graph_relationships: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MapCompleteness {
     Complete,
+    ObservedPartial,
     RankedEntriesOmitted,
     IndexIncomplete,
     SyntaxIncomplete,
@@ -706,10 +899,31 @@ pub struct RepositoryMap {
     evidence_digest: [u8; 32],
     #[serde(serialize_with = "serialize_hex")]
     options_digest: [u8; 32],
+    #[serde(skip_serializing_if = "is_false")]
+    graph_evidence_available: bool,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_hex"
+    )]
+    graph_snapshot_digest: Option<[u8; 32]>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_hex"
+    )]
+    graph_content_digest: Option<[u8; 32]>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_hex"
+    )]
+    graph_options_digest: Option<[u8; 32]>,
     path_nodes: Vec<RepositoryPathNode>,
     path_edges: Vec<RepositoryPathEdge>,
     entries: Vec<RepositoryMapEntry>,
     edges: Vec<RepositoryMapEdge>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    graph_nodes: Vec<RepositoryGraphNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    graph_edges: Vec<RepositoryGraphEdge>,
     omissions: MapOmissions,
     completeness: MapCompleteness,
     item_count: usize,
@@ -781,14 +995,52 @@ struct PathExpansion {
     graph: Vec<PathGraphEdge>,
 }
 
-type ExpansionOutput = (
-    BTreeSet<DeclarationId>,
-    BTreeSet<usize>,
-    BTreeMap<DeclarationId, usize>,
-);
+#[derive(Clone, Copy)]
+struct StructureMapEdge {
+    source: NodeId,
+    target: NodeId,
+    relationship: RelationshipKind,
+    graph_edge: usize,
+}
+
+struct StructureExpansion {
+    nodes: BTreeSet<usize>,
+    edges: BTreeSet<usize>,
+    hops: BTreeMap<usize, usize>,
+    degree: BTreeMap<usize, usize>,
+    reasons: BTreeMap<usize, BTreeSet<RankingReason>>,
+    node_indices: BTreeMap<NodeId, usize>,
+    graph: Vec<StructureMapEdge>,
+}
+
+type TraversalOutput<T> = (BTreeSet<T>, BTreeSet<usize>, BTreeMap<T, usize>);
+type ExpansionOutput = TraversalOutput<DeclarationId>;
 
 type Adjacency = BTreeMap<DeclarationId, Vec<(usize, DeclarationId)>>;
-type TargetIndex<'a> = BTreeMap<&'a str, Vec<(usize, usize, DeclarationId)>>;
+type TargetIndex<'a> = BTreeMap<&'a str, DeclarationRangeIndex>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedSemanticEdge<'a> {
+    pub source_declaration: DeclarationId,
+    pub target_declaration: DeclarationId,
+    pub fact: &'a SemanticFact,
+}
+
+struct DeclarationRangeIndex {
+    groups: Vec<DeclarationRangeGroup>,
+    max_end: Vec<usize>,
+}
+
+struct DeclarationRangeGroup {
+    start: usize,
+    ranges: Vec<(usize, DeclarationId)>,
+}
+
+enum RangeResolution {
+    Found(DeclarationId),
+    Missing,
+    Ambiguous,
+}
 
 pub fn build_repository_map(
     workspace: &ManagedWorkspace,
@@ -797,6 +1049,18 @@ pub fn build_repository_map(
     evidence: &[SemanticRelationship<'_>],
     limits: MapLimits,
     cursor: Option<&MapCursor>,
+) -> Result<RepositoryMap, MapError> {
+    build_repository_map_with_structure(workspace, index, request, evidence, limits, cursor, None)
+}
+
+pub fn build_repository_map_with_structure(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    request: &RepositoryMapRequest,
+    evidence: &[SemanticRelationship<'_>],
+    limits: MapLimits,
+    cursor: Option<&MapCursor>,
+    structure: Option<&StructureGraph>,
 ) -> Result<RepositoryMap, MapError> {
     let started = Instant::now();
     let deadline = started.checked_add(limits.max_time).unwrap_or(started);
@@ -808,10 +1072,26 @@ pub fn build_repository_map(
             "workspace epoch does not match index",
         ));
     }
+    let structure_requested = structure_requested(request);
+    let structure = if structure_requested {
+        let graph = structure.ok_or(MapError::GraphEvidenceUnavailable)?;
+        if graph.revision() != index.revision() || graph.index_digest() != *index.index_digest() {
+            return Err(MapError::GraphEvidenceStale);
+        }
+        let partial =
+            validate_structure_coverage(graph, request, &mut work, limits.max_work, deadline)?;
+        Some((graph, partial))
+    } else {
+        None
+    };
+    let structure_partial = structure.is_some_and(|(_, partial)| partial);
+    let structure = structure.map(|(graph, _)| graph);
+    reserve_projection_memory(index, structure, evidence, limits.max_memory_bytes)?;
 
     let policy_digest = *blake3::hash(MAP_POLICY.as_bytes()).as_bytes();
     let neighborhood_digest = digest_request(request, &mut work, limits.max_work, deadline)?;
     let evidence_digest = digest_evidence(evidence, &mut work, limits.max_work, deadline)?;
+    let evidence_digest = digest_structure_evidence(evidence_digest, structure);
     let options_digest = digest_options(request.budget, limits, deadline)?;
     validate_cursor(
         cursor,
@@ -879,20 +1159,23 @@ pub fn build_repository_map(
     let target_index = (semantic_requested && !evidence.is_empty())
         .then(|| build_target_index(&all, &mut work, limits.max_work, deadline))
         .transpose()?;
+    let semantic_edges = target_index
+        .as_ref()
+        .map(|target_index| {
+            project_semantic_edges(
+                &all,
+                target_index,
+                evidence,
+                index.revision(),
+                &mut work,
+                limits.max_work,
+                deadline,
+            )
+        })
+        .transpose()?;
     let mut graph = syntax_edges(&all, &selected, request, &mut work, limits, deadline)?;
-    if let Some(target_index) = &target_index {
-        add_semantic_edges(
-            &mut graph,
-            &all,
-            target_index,
-            &selected,
-            evidence,
-            index.revision(),
-            request,
-            &mut work,
-            limits,
-            deadline,
-        )?;
+    if let Some(semantic_edges) = &semantic_edges {
+        add_semantic_edges(&mut graph, &selected, semantic_edges, request)?;
     }
     charge_sort_work(&mut work, graph.len(), limits.max_work, deadline)?;
     graph.sort_by(compare_graph_edges);
@@ -907,19 +1190,28 @@ pub fn build_repository_map(
     for (edge_index, edge) in graph.iter().enumerate() {
         check_deadline(deadline)?;
         charge_work(&mut work, 1, limits.max_work)?;
-        adjacency
-            .entry(edge.source)
-            .or_default()
-            .push((edge_index, edge.target));
-        if request.expansion.purpose == ExpansionPurpose::Neighborhood
-            && edge.relationship.is_semantic()
-            && edge.source != edge.target
-        {
-            charge_work(&mut work, 1, limits.max_work)?;
-            adjacency
+        match request.expansion.purpose {
+            ExpansionPurpose::Dependencies => adjacency
+                .entry(edge.source)
+                .or_default()
+                .push((edge_index, edge.target)),
+            ExpansionPurpose::Dependents => adjacency
                 .entry(edge.target)
                 .or_default()
-                .push((edge_index, edge.source));
+                .push((edge_index, edge.source)),
+            ExpansionPurpose::Neighborhood => {
+                adjacency
+                    .entry(edge.source)
+                    .or_default()
+                    .push((edge_index, edge.target));
+                if edge.source != edge.target {
+                    charge_work(&mut work, 1, limits.max_work)?;
+                    adjacency
+                        .entry(edge.target)
+                        .or_default()
+                        .push((edge_index, edge.source));
+                }
+            }
         }
     }
     for (id, candidate) in &mut all {
@@ -944,15 +1236,28 @@ pub fn build_repository_map(
     )?;
 
     let path_expansion = expand_paths(index, request, &mut work, limits, deadline)?;
+    let structure_expansion = structure
+        .map(|graph| expand_structure(graph, &all, &selected, request, &mut work, limits, deadline))
+        .transpose()?;
     let (mandatory_ids, mandatory_edges, hops) = expand(
         &all, &selected, &adjacency, request, &mut work, limits, deadline,
     )?;
     let cursor_mandatory_entries = mandatory_ids
         .len()
-        .saturating_add(path_expansion.nodes.len());
+        .saturating_add(path_expansion.nodes.len())
+        .saturating_add(
+            structure_expansion
+                .as_ref()
+                .map_or(0, |expansion| expansion.nodes.len()),
+        );
     let cursor_mandatory_edges = mandatory_edges
         .len()
-        .saturating_add(path_expansion.edges.len());
+        .saturating_add(path_expansion.edges.len())
+        .saturating_add(
+            structure_expansion
+                .as_ref()
+                .map_or(0, |expansion| expansion.edges.len()),
+        );
     if cursor_mandatory_entries.saturating_add(cursor_mandatory_edges) > request.budget.max_items {
         return Err(MapError::BoundExceeded(MapBound::Items));
     }
@@ -986,16 +1291,27 @@ pub fn build_repository_map(
         neighborhood_digest,
         evidence_digest,
         options_digest,
+        graph_evidence_available: structure.is_some(),
+        graph_snapshot_digest: structure.map(StructureGraph::snapshot_digest),
+        graph_content_digest: structure.map(StructureGraph::content_digest),
+        graph_options_digest: structure.map(StructureGraph::options_digest),
         path_nodes: Vec::new(),
         path_edges: Vec::new(),
         entries: Vec::new(),
         edges: Vec::new(),
+        graph_nodes: Vec::new(),
+        graph_edges: Vec::new(),
         omissions: MapOmissions {
             ranked_entries: 0,
             index_entries: usize::from(index_incomplete),
             syntax_declarations: syntax_omitted,
+            graph_relationships: usize::from(structure_partial),
         },
-        completeness: MapCompleteness::Complete,
+        completeness: if structure_partial {
+            MapCompleteness::ObservedPartial
+        } else {
+            MapCompleteness::Complete
+        },
         item_count: 0,
         estimated_tokens: 0,
         result_bytes: 0,
@@ -1011,6 +1327,8 @@ pub fn build_repository_map(
             &mandatory_edges,
             index,
             &path_expansion,
+            structure,
+            structure_expansion.as_ref(),
             request.budget,
             limits.max_highlight_bytes,
             &mut work,
@@ -1058,6 +1376,25 @@ pub fn build_repository_map(
                     .max(hops.get(&edge.target).copied().unwrap_or(0)),
             ));
         }
+        if let (Some(graph), Some(expansion)) = (structure, &structure_expansion) {
+            for node_index in &expansion.nodes {
+                response.graph_nodes.push(render_structure_node(
+                    &graph.nodes()[*node_index],
+                    expansion.hops[node_index],
+                    expansion.degree[node_index],
+                    expansion.reasons.get(node_index),
+                )?);
+            }
+            for edge_index in &expansion.edges {
+                let edge = expansion.graph[*edge_index];
+                response.graph_edges.push(render_structure_edge(
+                    edge,
+                    &graph.edges()[edge.graph_edge],
+                    expansion.hops[&expansion.node_indices[&edge.source]]
+                        .max(expansion.hops[&expansion.node_indices[&edge.target]]),
+                ));
+            }
+        }
     }
     charge_sort_work(&mut work, response.entries.len(), limits.max_work, deadline)?;
     charge_sort_work(
@@ -1099,11 +1436,29 @@ pub fn build_repository_map(
     check_deadline(deadline)?;
     charge_sort_work(&mut work, response.edges.len(), limits.max_work, deadline)?;
     response.edges.sort_by(compare_output_edges);
+    response.graph_nodes.sort_by(|left, right| {
+        left.hops
+            .cmp(&right.hops)
+            .then_with(|| right.rank.cmp(&left.rank))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    response.graph_edges.sort_by(|left, right| {
+        left.hops
+            .cmp(&right.hops)
+            .then_with(|| left.source_node.cmp(&right.source_node))
+            .then_with(|| left.target_node.cmp(&right.target_node))
+            .then_with(|| left.relationship.cmp(&right.relationship))
+            .then_with(|| left.structural_digest.cmp(&right.structural_digest))
+    });
     check_deadline(deadline)?;
     response.item_count = response.path_nodes.len()
         + response.path_edges.len()
         + response.entries.len()
-        + response.edges.len();
+        + response.edges.len()
+        + response.graph_nodes.len()
+        + response.graph_edges.len();
     if !settle_size(&mut response, request.budget.max_result_bytes, deadline)? {
         return Err(MapError::BoundExceeded(MapBound::ResultBytes));
     }
@@ -1253,6 +1608,8 @@ pub fn build_repository_map(
     }
     enforce_serialized_budget(&response, request.budget)?;
     workspace.validate_revision_until(index.revision(), deadline)?;
+    charge_work(&mut work, 0, limits.max_work)?;
+    check_deadline(deadline)?;
     Ok(response)
 }
 
@@ -1290,6 +1647,7 @@ fn validate_request(
         || limits.max_semantic_relationships == 0
         || limits.max_input_bytes == 0
         || limits.max_work == 0
+        || limits.max_memory_bytes == 0
         || limits.max_candidates == 0
         || limits.max_highlight_bytes == 0
         || limits.max_cursor_frontier == 0
@@ -1376,6 +1734,11 @@ fn validate_request(
             "too many expansion seeds",
         ),
         (
+            request.expansion.graph_seeds.len(),
+            limits.max_expansion_seeds,
+            "too many graph expansion seeds",
+        ),
+        (
             request.expansion.paths.len(),
             limits.max_expansion_paths,
             "too many expansion paths",
@@ -1384,6 +1747,16 @@ fn validate_request(
             request.expansion.symbols.len(),
             limits.max_expansion_symbols,
             "too many expansion symbols",
+        ),
+        (
+            request.expansion.packages.len(),
+            limits.max_expansion_symbols,
+            "too many package selectors",
+        ),
+        (
+            request.expansion.tests.len(),
+            limits.max_expansion_symbols,
+            "too many test selectors",
         ),
         (
             request.expansion.relationships.len(),
@@ -1404,6 +1777,7 @@ fn validate_request(
         .exact_declaration_ids
         .len()
         .checked_add(request.expansion.seeds.len())
+        .and_then(|count| count.checked_add(request.expansion.graph_seeds.len()))
         .and_then(|count| count.checked_add(evidence.len()))
         .and_then(|count| count.checked_mul(32))
         .ok_or(MapError::InvalidRequest("input size overflow"))?;
@@ -1431,6 +1805,8 @@ fn validate_request(
         )
         .chain(request.languages.iter())
         .chain(request.expansion.symbols.iter())
+        .chain(request.expansion.packages.iter())
+        .chain(request.expansion.tests.iter())
     {
         check_deadline(deadline)?;
         charge_work(work, 1, limits.max_work)?;
@@ -1579,37 +1955,64 @@ fn build_target_index<'a>(
     max_work: usize,
     deadline: Instant,
 ) -> Result<TargetIndex<'a>, MapError> {
-    let mut index = TargetIndex::new();
+    let mut ranges_by_path = BTreeMap::<&str, Vec<(usize, usize, DeclarationId)>>::new();
     for (id, candidate) in all {
         check_deadline(deadline)?;
         charge_work(work, 1, max_work)?;
         let range = candidate.record.range();
-        index
-            .entry(candidate.path)
-            .or_default()
-            .push((range.start_byte, range.end_byte, *id));
+        ranges_by_path.entry(candidate.path).or_default().push((
+            range.start_byte,
+            range.end_byte,
+            *id,
+        ));
     }
-    for ranges in index.values_mut() {
+    let mut index = TargetIndex::new();
+    for (path, mut ranges) in ranges_by_path {
         charge_sort_work(work, ranges.len(), max_work, deadline)?;
         ranges.sort_unstable_by(|left, right| {
             left.0
                 .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| left.2.cmp(&right.2))
         });
         check_deadline(deadline)?;
+        let mut groups = Vec::<DeclarationRangeGroup>::new();
+        for (start, end, id) in ranges {
+            check_deadline(deadline)?;
+            charge_work(work, 1, max_work)?;
+            if let Some(group) = groups.last_mut().filter(|group| group.start == start) {
+                group.ranges.push((end, id));
+            } else {
+                groups.push(DeclarationRangeGroup {
+                    start,
+                    ranges: vec![(end, id)],
+                });
+            }
+        }
+        for group in &mut groups {
+            charge_sort_work(work, group.ranges.len(), max_work, deadline)?;
+            group.ranges.sort_unstable();
+        }
+        charge_work(
+            work,
+            groups.len().saturating_mul(2).saturating_sub(1),
+            max_work,
+        )?;
+        let mut max_end = vec![0; groups.len().saturating_mul(4).max(1)];
+        if !groups.is_empty() {
+            build_range_tree(&groups, &mut max_end, 1, 0, groups.len());
+        }
+        index.insert(path, DeclarationRangeIndex { groups, max_end });
     }
     Ok(index)
 }
 
-#[allow(dead_code)]
-pub(crate) fn validate_semantic_evidence(
+pub(crate) fn validated_semantic_edges<'a>(
     index: &MetadataIndex,
-    evidence: &[SemanticRelationship<'_>],
+    evidence: &'a [SemanticRelationship<'a>],
     limits: MapLimits,
-) -> Result<(), MapError> {
-    let started = Instant::now();
-    let deadline = started.checked_add(limits.max_time).unwrap_or(started);
+    deadline: Instant,
+) -> Result<(Vec<ValidatedSemanticEdge<'a>>, usize), MapError> {
     let mut work = 0_usize;
     if evidence.len() > limits.max_semantic_relationships {
         return Err(MapError::InvalidRequest("too many semantic relationships"));
@@ -1647,18 +2050,27 @@ pub(crate) fn validate_semantic_evidence(
         }
     }
     let target_index = build_target_index(&all, &mut work, limits.max_work, deadline)?;
-    for relationship in evidence {
-        validate_semantic_relationship(
-            &all,
-            &target_index,
-            relationship,
-            index.revision(),
-            &mut work,
-            limits.max_work,
-            deadline,
-        )?;
-    }
-    Ok(())
+    let edges = project_semantic_edges(
+        &all,
+        &target_index,
+        evidence,
+        index.revision(),
+        &mut work,
+        limits.max_work,
+        deadline,
+    )?;
+    check_deadline(deadline)?;
+    Ok((edges, work))
+}
+
+pub(crate) fn validate_semantic_evidence(
+    index: &MetadataIndex,
+    evidence: &[SemanticRelationship<'_>],
+    limits: MapLimits,
+) -> Result<(), MapError> {
+    let started = Instant::now();
+    let deadline = started.checked_add(limits.max_time).unwrap_or(started);
+    validated_semantic_edges(index, evidence, limits, deadline).map(|_| ())
 }
 
 fn syntax_edges<'a>(
@@ -1687,9 +2099,7 @@ fn syntax_edges<'a>(
         if !selected.contains(&parent) {
             continue;
         }
-        if relationships.contains(&RelationshipKind::Contains)
-            && request.expansion.purpose != ExpansionPurpose::Dependents
-        {
+        if relationships.contains(&RelationshipKind::Contains) {
             edges.push(GraphEdge {
                 source: parent,
                 target: *child,
@@ -1697,9 +2107,7 @@ fn syntax_edges<'a>(
                 provenance: GraphProvenance::Syntax(enclosing.provenance()),
             });
         }
-        if relationships.contains(&RelationshipKind::ContainedBy)
-            && request.expansion.purpose != ExpansionPurpose::Dependencies
-        {
+        if relationships.contains(&RelationshipKind::ContainedBy) {
             edges.push(GraphEdge {
                 source: *child,
                 target: parent,
@@ -1714,15 +2122,9 @@ fn syntax_edges<'a>(
 #[allow(clippy::too_many_arguments)]
 fn add_semantic_edges<'a>(
     graph: &mut Vec<GraphEdge<'a>>,
-    all: &BTreeMap<DeclarationId, Candidate<'a>>,
-    target_index: &TargetIndex<'_>,
     selected: &BTreeSet<DeclarationId>,
-    evidence: &'a [SemanticRelationship<'a>],
-    revision: RevisionId,
+    evidence: &[ValidatedSemanticEdge<'a>],
     request: &RepositoryMapRequest,
-    work: &mut usize,
-    limits: MapLimits,
-    deadline: Instant,
 ) -> Result<(), MapError> {
     let allowed = request
         .expansion
@@ -1731,42 +2133,65 @@ fn add_semantic_edges<'a>(
         .copied()
         .collect::<BTreeSet<_>>();
     for relationship in evidence {
-        let target = validate_semantic_relationship(
-            all,
-            target_index,
-            relationship,
-            revision,
-            work,
-            limits.max_work,
-            deadline,
-        )?;
         let fact = relationship.fact;
-        let kind = RelationshipKind::semantic(fact.relation());
+        let kind = RelationshipKind::from_semantic_relation(fact.relation());
         if !allowed.contains(&kind)
             || !selected.contains(&relationship.source_declaration)
-            || !selected.contains(&target)
+            || !selected.contains(&relationship.target_declaration)
         {
             continue;
         }
-        graph.push(
-            if request.expansion.purpose == ExpansionPurpose::Dependents {
-                GraphEdge {
-                    source: target,
-                    target: relationship.source_declaration,
-                    relationship: kind,
-                    provenance: GraphProvenance::Semantic(fact),
-                }
-            } else {
-                GraphEdge {
-                    source: relationship.source_declaration,
-                    target,
-                    relationship: kind,
-                    provenance: GraphProvenance::Semantic(fact),
-                }
-            },
-        );
+        let (source, target) = match fact.relation() {
+            SemanticRelationKind::Reference | SemanticRelationKind::Implementation => (
+                relationship.target_declaration,
+                relationship.source_declaration,
+            ),
+            SemanticRelationKind::Declaration
+            | SemanticRelationKind::Definition
+            | SemanticRelationKind::TypeDefinition => (
+                relationship.source_declaration,
+                relationship.target_declaration,
+            ),
+        };
+        graph.push(GraphEdge {
+            source,
+            target,
+            relationship: kind,
+            provenance: GraphProvenance::Semantic(fact),
+        });
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_semantic_edges<'a>(
+    all: &BTreeMap<DeclarationId, Candidate<'_>>,
+    target_index: &TargetIndex<'_>,
+    evidence: &'a [SemanticRelationship<'a>],
+    revision: RevisionId,
+    work: &mut usize,
+    max_work: usize,
+    deadline: Instant,
+) -> Result<Vec<ValidatedSemanticEdge<'a>>, MapError> {
+    evidence
+        .iter()
+        .map(|relationship| {
+            let target_declaration = validate_semantic_relationship(
+                all,
+                target_index,
+                relationship,
+                revision,
+                work,
+                max_work,
+                deadline,
+            )?;
+            Ok(ValidatedSemanticEdge {
+                source_declaration: relationship.source_declaration,
+                target_declaration,
+                fact: relationship.fact,
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1797,14 +2222,13 @@ fn validate_semantic_relationship(
         .get(&relationship.source_declaration)
         .ok_or(MapError::InvalidFact("source declaration is unknown"))?;
     validate_semantic_source(
-        all,
+        target_index,
         relationship.source_declaration,
         source,
         fact,
         revision,
         work,
         max_work,
-        deadline,
     )?;
     let path = fact.path().as_path().as_str();
     let start = fact.range().start();
@@ -1815,36 +2239,26 @@ fn validate_semantic_relationship(
     let ranges = target_index.get(path).ok_or(MapError::InvalidFact(
         "semantic target does not identify an indexed declaration",
     ))?;
-    let boundary = ranges.partition_point(|range| range.0 <= start);
-    let mut target = None;
-    for &(candidate_start, candidate_end, id) in ranges[..boundary].iter().rev() {
-        check_deadline(deadline)?;
-        charge_work(work, 1, max_work)?;
-        if target.is_some_and(|(best_width, _)| end - candidate_start > best_width) {
-            break;
-        }
-        if end <= candidate_end {
-            let width = candidate_end - candidate_start;
-            if target.is_none_or(|(best_width, best_id)| (width, id) < (best_width, best_id)) {
-                target = Some((width, id));
-            }
-        }
+    charge_work(work, logarithmic_work(ranges.groups.len()), max_work)?;
+    match ranges.resolve(start, end) {
+        RangeResolution::Found(id) => Ok(id),
+        RangeResolution::Missing => Err(MapError::InvalidFact(
+            "semantic target does not identify an indexed declaration",
+        )),
+        RangeResolution::Ambiguous => Err(MapError::InvalidFact(
+            "semantic target matches ambiguous declarations",
+        )),
     }
-    target.map(|(_, id)| id).ok_or(MapError::InvalidFact(
-        "semantic target does not identify an indexed declaration",
-    ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_semantic_source(
-    all: &BTreeMap<DeclarationId, Candidate<'_>>,
+    target_index: &TargetIndex<'_>,
     source_id: DeclarationId,
     source: &Candidate<'_>,
     fact: &SemanticFact,
     revision: RevisionId,
     work: &mut usize,
     max_work: usize,
-    deadline: Instant,
 ) -> Result<(), MapError> {
     if source.record.workspace_revision() != revision {
         return Err(MapError::StaleFact);
@@ -1861,40 +2275,100 @@ fn validate_semantic_source(
             "semantic source declaration does not contain request origin",
         ));
     }
-    let mut smallest = None;
-    let mut ambiguous = false;
-    for (id, candidate) in all {
-        check_deadline(deadline)?;
-        charge_work(work, 1, max_work)?;
-        let range = candidate.record.range();
-        if candidate.path != source.path
-            || fact.origin_point() < range.start_byte
-            || fact.origin_point() >= range.end_byte
-        {
-            continue;
-        }
-        let width = range.end_byte - range.start_byte;
-        match smallest {
-            None => smallest = Some((width, *id)),
-            Some((best_width, _)) if width < best_width => {
-                smallest = Some((width, *id));
-                ambiguous = false;
-            }
-            Some((best_width, _)) if width == best_width => ambiguous = true,
-            Some(_) => {}
-        }
-    }
-    if ambiguous {
-        return Err(MapError::InvalidFact(
+    let ranges = target_index.get(source.path).ok_or(MapError::InvalidFact(
+        "semantic source declaration does not match origin URI",
+    ))?;
+    charge_work(work, logarithmic_work(ranges.groups.len()), max_work)?;
+    let end = fact
+        .origin_point()
+        .checked_add(1)
+        .ok_or(MapError::InvalidFact("semantic request origin is invalid"))?;
+    match ranges.resolve(fact.origin_point(), end) {
+        RangeResolution::Found(id) if id == source_id => Ok(()),
+        RangeResolution::Ambiguous => Err(MapError::InvalidFact(
             "semantic request origin matches ambiguous declarations",
-        ));
-    }
-    if smallest.is_none_or(|(_, id)| id != source_id) {
-        return Err(MapError::InvalidFact(
+        )),
+        _ => Err(MapError::InvalidFact(
             "semantic source declaration is not the smallest declaration containing request origin",
-        ));
+        )),
     }
-    Ok(())
+}
+
+impl DeclarationRangeIndex {
+    fn resolve(&self, start: usize, end: usize) -> RangeResolution {
+        if start >= end || self.groups.is_empty() {
+            return RangeResolution::Missing;
+        }
+        let boundary = self.groups.partition_point(|group| group.start <= start);
+        let Some(group_index) = self.rightmost_containing(1, 0, self.groups.len(), boundary, end)
+        else {
+            return RangeResolution::Missing;
+        };
+        let ranges = &self.groups[group_index].ranges;
+        let first = ranges.partition_point(|(candidate_end, _)| *candidate_end < end);
+        let Some(&(candidate_end, id)) = ranges.get(first) else {
+            return RangeResolution::Missing;
+        };
+        if ranges
+            .get(first + 1)
+            .is_some_and(|(other_end, _)| *other_end == candidate_end)
+        {
+            RangeResolution::Ambiguous
+        } else {
+            RangeResolution::Found(id)
+        }
+    }
+
+    fn rightmost_containing(
+        &self,
+        node: usize,
+        left: usize,
+        right: usize,
+        boundary: usize,
+        end: usize,
+    ) -> Option<usize> {
+        if left >= boundary || self.max_end[node] < end {
+            return None;
+        }
+        if right - left == 1 {
+            return Some(left);
+        }
+        let middle = left + (right - left) / 2;
+        self.rightmost_containing(node * 2 + 1, middle, right, boundary, end)
+            .or_else(|| self.rightmost_containing(node * 2, left, middle, boundary, end))
+    }
+}
+
+fn build_range_tree(
+    groups: &[DeclarationRangeGroup],
+    output: &mut [usize],
+    node: usize,
+    left: usize,
+    right: usize,
+) -> usize {
+    let value = if right - left == 1 {
+        groups[left]
+            .ranges
+            .iter()
+            .map(|(end, _)| *end)
+            .max()
+            .unwrap_or(0)
+    } else {
+        let middle = left + (right - left) / 2;
+        build_range_tree(groups, output, node * 2, left, middle).max(build_range_tree(
+            groups,
+            output,
+            node * 2 + 1,
+            middle,
+            right,
+        ))
+    };
+    output[node] = value;
+    value
+}
+
+fn logarithmic_work(count: usize) -> usize {
+    usize::BITS as usize - count.max(1).leading_zeros() as usize
 }
 
 fn rank_candidates(
@@ -2004,6 +2478,442 @@ fn rank_candidates(
     Ok(())
 }
 
+fn structure_requested(request: &RepositoryMapRequest) -> bool {
+    !request.expansion.graph_seeds.is_empty()
+        || !request.expansion.packages.is_empty()
+        || !request.expansion.tests.is_empty()
+        || request
+            .expansion
+            .relationships
+            .iter()
+            .any(|relationship| relationship.is_structure())
+}
+
+fn validate_structure_coverage(
+    graph: &StructureGraph,
+    request: &RepositoryMapRequest,
+    work: &mut usize,
+    max_work: usize,
+    deadline: Instant,
+) -> Result<bool, MapError> {
+    for record in graph.coverage() {
+        check_deadline(deadline)?;
+        charge_work(work, 1, max_work)?;
+        if record.subject().is_none()
+            && matches!(
+                record.status(),
+                CoverageStatus::Malformed | CoverageStatus::Incomplete
+            )
+        {
+            return Err(MapError::InvalidGraph("graph extraction is incomplete"));
+        }
+    }
+    let requested = request
+        .expansion
+        .relationships
+        .iter()
+        .filter_map(|relationship| match relationship {
+            RelationshipKind::Contains | RelationshipKind::ContainedBy => {
+                Some(StructureEdgeKind::Contains)
+            }
+            RelationshipKind::Defines => Some(StructureEdgeKind::Defines),
+            RelationshipKind::Imports => Some(StructureEdgeKind::Imports),
+            RelationshipKind::Exports => Some(StructureEdgeKind::Exports),
+            RelationshipKind::References => Some(StructureEdgeKind::References),
+            RelationshipKind::Calls => Some(StructureEdgeKind::Calls),
+            RelationshipKind::Implements => Some(StructureEdgeKind::Implements),
+            RelationshipKind::Inherits => Some(StructureEdgeKind::Inherits),
+            RelationshipKind::Overrides => Some(StructureEdgeKind::Overrides),
+            RelationshipKind::Tests => Some(StructureEdgeKind::Tests),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut partial = false;
+    for relation in requested {
+        let mut found = false;
+        let mut extracted = false;
+        let mut relation_partial = false;
+        let mut unavailable = false;
+        for record in graph.coverage() {
+            check_deadline(deadline)?;
+            charge_work(work, 1, max_work)?;
+            if record.subject().is_some() || record.relation() != relation {
+                continue;
+            }
+            found = true;
+            match record.status() {
+                CoverageStatus::Extracted => extracted = true,
+                CoverageStatus::ObservedPartial => relation_partial = true,
+                CoverageStatus::Unavailable | CoverageStatus::NotExtracted => unavailable = true,
+                CoverageStatus::Malformed | CoverageStatus::Incomplete => {
+                    return Err(MapError::InvalidGraph(
+                        "requested relationship extraction is incomplete",
+                    ));
+                }
+            }
+        }
+        if !found {
+            return Err(MapError::InvalidGraph("relationship coverage is missing"));
+        }
+        if unavailable || (!extracted && !relation_partial) {
+            return Err(MapError::GraphEvidenceUnavailable);
+        }
+        partial |= relation_partial;
+    }
+    Ok(partial)
+}
+
+fn reserve_projection_memory(
+    index: &MetadataIndex,
+    structure: Option<&StructureGraph>,
+    evidence: &[SemanticRelationship<'_>],
+    max_memory_bytes: usize,
+) -> Result<(), MapError> {
+    let declarations = index
+        .entries()
+        .iter()
+        .try_fold(0_usize, |count, entry| {
+            count.checked_add(entry.syntax_records.len())
+        })
+        .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+    let mut bytes = declarations
+        .checked_mul(
+            std::mem::size_of::<Candidate<'_>>()
+                + std::mem::size_of::<DeclarationId>()
+                + 4 * std::mem::size_of::<usize>(),
+        )
+        .and_then(|bytes| {
+            bytes.checked_add(
+                index
+                    .entries()
+                    .len()
+                    .checked_mul(6 * std::mem::size_of::<usize>())?,
+            )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(
+                evidence
+                    .len()
+                    .checked_mul(2 * std::mem::size_of::<DeclarationId>())?,
+            )
+        })
+        .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+    if let Some(graph) = structure {
+        let coverage_bytes = graph
+            .coverage()
+            .len()
+            .checked_mul(std::mem::size_of::<CoverageStatus>())
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        let projected_edges = graph
+            .edges()
+            .len()
+            .checked_mul(2)
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        let adjacency_entries = projected_edges
+            .checked_mul(2)
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        let node_bytes = graph
+            .nodes()
+            .len()
+            .checked_mul(
+                BTREE_ENTRY_WEIGHT
+                    + std::mem::size_of::<NodeId>()
+                    + std::mem::size_of::<usize>()
+                    + BTREE_ENTRY_WEIGHT
+                    + std::mem::size_of::<usize>()
+                    + BTREE_ENTRY_WEIGHT
+                    + std::mem::size_of::<usize>()
+                    + std::mem::size_of::<BTreeSet<RankingReason>>()
+                    + 2 * (BTREE_ENTRY_WEIGHT + std::mem::size_of::<RankingReason>())
+                    + BTREE_ENTRY_WEIGHT
+                    + std::mem::size_of::<usize>()
+                    + BTREE_ENTRY_WEIGHT
+                    + 2 * std::mem::size_of::<usize>()
+                    + BTREE_ENTRY_WEIGHT
+                    + 2 * std::mem::size_of::<usize>()
+                    + BTREE_ENTRY_WEIGHT
+                    + std::mem::size_of::<usize>()
+                    + std::mem::size_of::<Vec<(usize, usize)>>()
+                    + std::mem::size_of::<RepositoryGraphNode>(),
+            )
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        let edge_bytes = projected_edges
+            .checked_mul(
+                std::mem::size_of::<StructureMapEdge>()
+                    + BTREE_ENTRY_WEIGHT
+                    + std::mem::size_of::<usize>()
+                    + std::mem::size_of::<RepositoryGraphEdge>(),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(adjacency_entries.checked_mul(2 * std::mem::size_of::<usize>())?)
+            })
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        let projected_heap_bytes = graph
+            .logical_bytes()
+            .checked_mul(2)
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+        bytes = bytes
+            .checked_add(coverage_bytes)
+            .and_then(|bytes| bytes.checked_add(node_bytes))
+            .and_then(|bytes| bytes.checked_add(edge_bytes))
+            .and_then(|bytes| bytes.checked_add(projected_heap_bytes))
+            .ok_or(MapError::BoundExceeded(MapBound::Memory))?;
+    }
+    if bytes > max_memory_bytes {
+        Err(MapError::BoundExceeded(MapBound::Memory))
+    } else {
+        Ok(())
+    }
+}
+
+fn digest_structure_evidence(
+    semantic_digest: [u8; 32],
+    structure: Option<&StructureGraph>,
+) -> [u8; 32] {
+    let Some(structure) = structure else {
+        return semantic_digest;
+    };
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"kit-repository-map-structure-evidence-v1\0");
+    hash.update(&semantic_digest);
+    hash.update(&structure.snapshot_digest());
+    hash.update(&structure.content_digest());
+    hash.update(&structure.options_digest());
+    *hash.finalize().as_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_structure(
+    structure: &StructureGraph,
+    declarations: &BTreeMap<DeclarationId, Candidate<'_>>,
+    selected: &BTreeSet<DeclarationId>,
+    request: &RepositoryMapRequest,
+    work: &mut usize,
+    limits: MapLimits,
+    deadline: Instant,
+) -> Result<StructureExpansion, MapError> {
+    if declarations
+        .len()
+        .checked_add(structure.nodes().len())
+        .is_none_or(|count| count > limits.max_candidates)
+    {
+        return Err(MapError::InvalidRequest("candidate limit exceeded"));
+    }
+    let mut node_indices = BTreeMap::new();
+    for (index, node) in structure.nodes().iter().enumerate() {
+        check_deadline(deadline)?;
+        charge_work(work, 1, limits.max_work)?;
+        if node_indices.insert(node.id(), index).is_some() {
+            return Err(MapError::InvalidGraph("duplicate node id"));
+        }
+    }
+
+    let mut seeds = BTreeSet::new();
+    let mut reasons = BTreeMap::<usize, BTreeSet<RankingReason>>::new();
+    let mut add_seed = |index: usize, reason: RankingReason| {
+        seeds.insert(index);
+        reasons
+            .entry(index)
+            .or_default()
+            .extend([RankingReason::ExplicitGraphEvidence, reason]);
+    };
+    for seed in &request.expansion.graph_seeds {
+        let index = node_indices
+            .get(seed)
+            .copied()
+            .ok_or(MapError::SelectorNoMatch("graph seed"))?;
+        add_seed(index, RankingReason::ExplicitGraphEvidence);
+    }
+    for seed in &request.expansion.seeds {
+        if let Some(index) = node_indices
+            .get(&NodeId::from_bytes(seed.as_bytes()))
+            .copied()
+        {
+            add_seed(index, RankingReason::ExplicitGraphEvidence);
+        }
+    }
+    for selector in &request.expansion.packages {
+        let mut matched = false;
+        for (index, node) in structure.nodes().iter().enumerate() {
+            check_deadline(deadline)?;
+            charge_work(work, 1, limits.max_work)?;
+            if node.kind() == NodeKind::Package
+                && (node.name() == selector
+                    || node.path().is_some_and(|path| path.as_str() == selector))
+            {
+                add_seed(index, RankingReason::ExplicitPackage);
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(MapError::SelectorNoMatch("package"));
+        }
+    }
+    for selector in &request.expansion.tests {
+        let mut matched = false;
+        for (index, node) in structure.nodes().iter().enumerate() {
+            check_deadline(deadline)?;
+            charge_work(work, 1, limits.max_work)?;
+            if node.kind() == NodeKind::Test
+                && (node.name() == selector
+                    || node.path().is_some_and(|path| path.as_str() == selector))
+            {
+                add_seed(index, RankingReason::ExplicitTest);
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(MapError::SelectorNoMatch("test"));
+        }
+    }
+    for path in &request.expansion.paths {
+        for (index, node) in structure.nodes().iter().enumerate() {
+            check_deadline(deadline)?;
+            charge_work(work, 1, limits.max_work)?;
+            if node.path().is_some_and(|candidate| candidate == path) {
+                add_seed(index, RankingReason::ExplicitGraphEvidence);
+            }
+        }
+    }
+    for symbol in &request.expansion.symbols {
+        for (index, node) in structure.nodes().iter().enumerate() {
+            check_deadline(deadline)?;
+            charge_work(work, 1, limits.max_work)?;
+            let declaration_matches = declarations
+                .get(&DeclarationId::from(node.id().as_bytes()))
+                .is_some_and(|candidate| {
+                    selected.contains(&DeclarationId::from(node.id().as_bytes()))
+                        && (candidate.record.display_name().value().as_str() == symbol
+                            || candidate.record.qualified_name().value().as_str() == symbol)
+                });
+            if node.kind() == NodeKind::Symbol && (node.name() == symbol || declaration_matches) {
+                add_seed(index, RankingReason::ExplicitGraphEvidence);
+            }
+        }
+    }
+    if let Some(band) = request.expansion.score_band {
+        for (id, candidate) in declarations {
+            if selected.contains(id)
+                && (band.min..=band.max).contains(&candidate.rank)
+                && let Some(index) = node_indices
+                    .get(&NodeId::from_bytes(id.as_bytes()))
+                    .copied()
+            {
+                add_seed(index, RankingReason::ExplicitGraphEvidence);
+            }
+        }
+    }
+
+    let relationships = request
+        .expansion
+        .relationships
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut graph = Vec::new();
+    for (edge_index, edge) in structure.edges().iter().enumerate() {
+        check_deadline(deadline)?;
+        charge_work(work, 1, limits.max_work)?;
+        let relationship = RelationshipKind::from_structure(edge.kind());
+        if relationships.contains(&relationship) {
+            charge_work(work, 1, limits.max_work)?;
+            check_deadline(deadline)?;
+            graph.push(StructureMapEdge {
+                source: edge.source(),
+                target: edge.target(),
+                relationship,
+                graph_edge: edge_index,
+            });
+        }
+        if edge.kind() == StructureEdgeKind::Contains
+            && relationships.contains(&RelationshipKind::ContainedBy)
+        {
+            charge_work(work, 1, limits.max_work)?;
+            check_deadline(deadline)?;
+            graph.push(StructureMapEdge {
+                source: edge.target(),
+                target: edge.source(),
+                relationship: RelationshipKind::ContainedBy,
+                graph_edge: edge_index,
+            });
+        }
+    }
+    let mut adjacency = BTreeMap::<usize, Vec<(usize, usize)>>::new();
+    for (edge_index, edge) in graph.iter().enumerate() {
+        check_deadline(deadline)?;
+        let source = *node_indices
+            .get(&edge.source)
+            .ok_or(MapError::InvalidGraph("edge source is unknown"))?;
+        let target = *node_indices
+            .get(&edge.target)
+            .ok_or(MapError::InvalidGraph("edge target is unknown"))?;
+        match request.expansion.purpose {
+            ExpansionPurpose::Dependencies => {
+                charge_work(work, 1, limits.max_work)?;
+                check_deadline(deadline)?;
+                adjacency
+                    .entry(source)
+                    .or_default()
+                    .push((edge_index, target));
+            }
+            ExpansionPurpose::Dependents => {
+                charge_work(work, 1, limits.max_work)?;
+                check_deadline(deadline)?;
+                adjacency
+                    .entry(target)
+                    .or_default()
+                    .push((edge_index, source));
+            }
+            ExpansionPurpose::Neighborhood => {
+                charge_work(work, 1, limits.max_work)?;
+                check_deadline(deadline)?;
+                adjacency
+                    .entry(source)
+                    .or_default()
+                    .push((edge_index, target));
+                if source != target {
+                    charge_work(work, 1, limits.max_work)?;
+                    check_deadline(deadline)?;
+                    adjacency
+                        .entry(target)
+                        .or_default()
+                        .push((edge_index, source));
+                }
+            }
+        }
+    }
+
+    let graph_seeds = seeds.clone();
+    let (nodes, edges, hops) = traverse_adjacency(
+        &adjacency,
+        seeds,
+        request.budget,
+        work,
+        limits.max_work,
+        deadline,
+    )?;
+    for node in nodes.difference(&graph_seeds) {
+        reasons
+            .entry(*node)
+            .or_default()
+            .insert(RankingReason::ExplicitGraphEvidence);
+    }
+    let mut degree = BTreeMap::new();
+    for node in &nodes {
+        charge_work(work, 1, limits.max_work)?;
+        degree.insert(*node, adjacency.get(node).map_or(0, Vec::len));
+    }
+    Ok(StructureExpansion {
+        nodes,
+        edges,
+        hops,
+        degree,
+        reasons,
+        node_indices,
+        graph,
+    })
+}
+
 fn expand_paths(
     index: &MetadataIndex,
     request: &RepositoryMapRequest,
@@ -2067,18 +2977,14 @@ fn expand_paths(
         else {
             continue;
         };
-        if relationships.contains(&RelationshipKind::Contains)
-            && request.expansion.purpose != ExpansionPurpose::Dependents
-        {
+        if relationships.contains(&RelationshipKind::Contains) {
             graph.push(PathGraphEdge {
                 source: parent_index,
                 target: child_index,
                 relationship: RelationshipKind::Contains,
             });
         }
-        if relationships.contains(&RelationshipKind::ContainedBy)
-            && request.expansion.purpose != ExpansionPurpose::Dependencies
-        {
+        if relationships.contains(&RelationshipKind::ContainedBy) {
             graph.push(PathGraphEdge {
                 source: child_index,
                 target: parent_index,
@@ -2104,45 +3010,38 @@ fn expand_paths(
     let mut adjacency = BTreeMap::<usize, Vec<(usize, usize)>>::new();
     for (edge_index, edge) in graph.iter().enumerate() {
         charge_work(work, 1, limits.max_work)?;
-        adjacency
-            .entry(edge.source)
-            .or_default()
-            .push((edge_index, edge.target));
-    }
-    let mut nodes = seeds.clone();
-    let mut edges = BTreeSet::new();
-    let mut hops = seeds
-        .iter()
-        .map(|seed| (*seed, 0_usize))
-        .collect::<BTreeMap<_, _>>();
-    let mut queue = seeds
-        .into_iter()
-        .map(|seed| (seed, 0_usize))
-        .collect::<VecDeque<_>>();
-    while let Some((source, at_hop)) = queue.pop_front() {
-        check_deadline(deadline)?;
-        let outgoing = adjacency.get(&source).map_or(&[][..], Vec::as_slice);
-        if outgoing.len() > request.budget.max_degree {
-            return Err(MapError::BoundExceeded(MapBound::Degree));
-        }
-        for (edge_index, target) in outgoing {
-            charge_work(work, 1, limits.max_work)?;
-            let next_hop = at_hop
-                .checked_add(1)
-                .ok_or(MapError::BoundExceeded(MapBound::Hops))?;
-            edges.insert(*edge_index);
-            if !nodes.contains(target) && next_hop > request.budget.max_hops {
-                return Err(MapError::BoundExceeded(MapBound::Hops));
-            }
-            if nodes.insert(*target) {
-                hops.insert(*target, next_hop);
-                queue.push_back((*target, next_hop));
-            }
-            if nodes.len().saturating_add(edges.len()) > request.budget.max_items {
-                return Err(MapError::BoundExceeded(MapBound::Items));
+        match request.expansion.purpose {
+            ExpansionPurpose::Dependencies => adjacency
+                .entry(edge.source)
+                .or_default()
+                .push((edge_index, edge.target)),
+            ExpansionPurpose::Dependents => adjacency
+                .entry(edge.target)
+                .or_default()
+                .push((edge_index, edge.source)),
+            ExpansionPurpose::Neighborhood => {
+                adjacency
+                    .entry(edge.source)
+                    .or_default()
+                    .push((edge_index, edge.target));
+                if edge.source != edge.target {
+                    charge_work(work, 1, limits.max_work)?;
+                    adjacency
+                        .entry(edge.target)
+                        .or_default()
+                        .push((edge_index, edge.source));
+                }
             }
         }
     }
+    let (nodes, edges, hops) = traverse_adjacency(
+        &adjacency,
+        seeds,
+        request.budget,
+        work,
+        limits.max_work,
+        deadline,
+    )?;
     let mut degree = BTreeMap::new();
     for node in &nodes {
         charge_work(work, 1, limits.max_work)?;
@@ -2219,6 +3118,24 @@ fn expand(
             return Err(MapError::SelectorNoMatch("score band"));
         }
     }
+    traverse_adjacency(
+        adjacency,
+        seeds,
+        request.budget,
+        work,
+        limits.max_work,
+        deadline,
+    )
+}
+
+fn traverse_adjacency<T: Copy + Ord>(
+    adjacency: &BTreeMap<T, Vec<(usize, T)>>,
+    seeds: BTreeSet<T>,
+    budget: MapBudget,
+    work: &mut usize,
+    max_work: usize,
+    deadline: Instant,
+) -> Result<TraversalOutput<T>, MapError> {
     let mut nodes = seeds.clone();
     let mut edges = BTreeSet::new();
     let mut hops = seeds
@@ -2232,23 +3149,23 @@ fn expand(
     while let Some((source, at_hop)) = queue.pop_front() {
         check_deadline(deadline)?;
         let outgoing = adjacency.get(&source).map_or(&[][..], Vec::as_slice);
-        if outgoing.len() > request.budget.max_degree {
+        if outgoing.len() > budget.max_degree {
             return Err(MapError::BoundExceeded(MapBound::Degree));
         }
         for (edge_index, target) in outgoing {
-            charge_work(work, 1, limits.max_work)?;
+            charge_work(work, 1, max_work)?;
             let next_hop = at_hop
                 .checked_add(1)
                 .ok_or(MapError::BoundExceeded(MapBound::Hops))?;
             edges.insert(*edge_index);
-            if !nodes.contains(target) && next_hop > request.budget.max_hops {
+            if !nodes.contains(target) && next_hop > budget.max_hops {
                 return Err(MapError::BoundExceeded(MapBound::Hops));
             }
             if nodes.insert(*target) {
                 hops.insert(*target, next_hop);
                 queue.push_back((*target, next_hop));
             }
-            if nodes.len().saturating_add(edges.len()) > request.budget.max_items {
+            if nodes.len().saturating_add(edges.len()) > budget.max_items {
                 return Err(MapError::BoundExceeded(MapBound::Items));
             }
         }
@@ -2483,6 +3400,119 @@ fn render_edge(
         semantic_source_range,
         semantic_target_range,
         provenance,
+    }
+}
+
+fn render_structure_node(
+    node: &StructureNode,
+    hops: usize,
+    degree: usize,
+    explicit_reasons: Option<&BTreeSet<RankingReason>>,
+) -> Result<RepositoryGraphNode, MapError> {
+    let mut reasons = explicit_reasons.cloned().unwrap_or_default();
+    reasons.insert(if hops == 0 {
+        RankingReason::ExpansionSeed
+    } else {
+        RankingReason::ExpansionNeighbor
+    });
+    if degree != 0 {
+        reasons.insert(RankingReason::DegreePenalty);
+    }
+    let mut rank = 0_u64;
+    for reason in &reasons {
+        rank = rank.saturating_add(match reason {
+            RankingReason::ExplicitPackage => 1_000_000_000_000_000,
+            RankingReason::ExplicitTest => 900_000_000_000_000,
+            RankingReason::ExplicitGraphEvidence => 10_000_000_000,
+            _ => 0,
+        });
+    }
+    Ok(RepositoryGraphNode {
+        node_id: node.id(),
+        kind: match node.kind() {
+            NodeKind::Repository => MapGraphNodeKind::Repository,
+            NodeKind::Revision => MapGraphNodeKind::Revision,
+            NodeKind::Package => MapGraphNodeKind::Package,
+            NodeKind::File => MapGraphNodeKind::File,
+            NodeKind::Symbol => MapGraphNodeKind::Symbol,
+            NodeKind::Test => MapGraphNodeKind::Test,
+            NodeKind::Diagnostic => MapGraphNodeKind::Diagnostic,
+        },
+        name: node.name().to_owned(),
+        path: node.path().map(|path| path.as_str().to_owned()),
+        range: node.range().map(Into::into),
+        revision: node.revision(),
+        structural_digest: node.structural_digest(),
+        subgraph_digest: node.subgraph_digest(),
+        rank: rank.saturating_sub(degree as u64),
+        degree,
+        hops,
+        reasons: reasons.into_iter().collect(),
+    })
+}
+
+fn render_structure_edge(
+    projected: StructureMapEdge,
+    edge: &StructureEdge,
+    hops: usize,
+) -> RepositoryGraphEdge {
+    let provenance = edge.provenance();
+    let semantic = provenance
+        .semantic()
+        .map(|semantic| MapGraphSemanticProvenance {
+            relation: semantic_relation_name(semantic.relation()).to_owned(),
+            origin_uri: semantic.origin_uri().to_owned(),
+            origin_path: semantic.origin_path().as_str().to_owned(),
+            document_version: semantic.document_version(),
+            request_generation: semantic.request_generation(),
+            request_id: semantic.request_id(),
+            origin_position: semantic.origin_position(),
+            origin_range: semantic.origin_range().into(),
+            server_artifact: semantic.server_artifact().to_owned(),
+            server_configuration: semantic.server_configuration().to_owned(),
+            position_encoding: position_encoding(semantic.position_encoding()).to_owned(),
+            target_range: semantic.target_range().into(),
+            fact_range: semantic.fact_range().into(),
+        });
+    RepositoryGraphEdge {
+        source_node: projected.source,
+        target_node: projected.target,
+        relationship: projected.relationship,
+        hops,
+        provenance: MapGraphEdgeProvenance {
+            source: match provenance.source() {
+                ProvenanceSource::MetadataIndex => MapGraphProvenanceSource::MetadataIndex,
+                ProvenanceSource::CargoManifest => MapGraphProvenanceSource::CargoManifest,
+                ProvenanceSource::CargoConvention => MapGraphProvenanceSource::CargoConvention,
+                ProvenanceSource::TreeSitter => MapGraphProvenanceSource::TreeSitter,
+                ProvenanceSource::CargoTreeSitter => MapGraphProvenanceSource::CargoTreeSitter,
+                ProvenanceSource::Lsp => MapGraphProvenanceSource::Lsp,
+            },
+            path: provenance.path().map(|path| path.as_str().to_owned()),
+            range: provenance.range().into(),
+            range_kind: match provenance.range_kind() {
+                RangeKind::WholeFile => MapGraphRangeKind::WholeFile,
+                RangeKind::Declaration => MapGraphRangeKind::Declaration,
+                RangeKind::Manifest => MapGraphRangeKind::Manifest,
+                RangeKind::NormalizedFact => MapGraphRangeKind::NormalizedFact,
+            },
+            revision: provenance.revision(),
+            confidence_millis: provenance.confidence_millis(),
+            semantic,
+            evidence_digest: provenance.evidence_digest(),
+        },
+        revision: edge.revision(),
+        structural_digest: edge.structural_digest(),
+    }
+}
+
+fn semantic_relation_name(relation: SemanticRelationKind) -> &'static str {
+    match relation {
+        SemanticRelationKind::Declaration => "declaration",
+        SemanticRelationKind::Definition => "definition",
+        SemanticRelationKind::TypeDefinition => "type_definition",
+        SemanticRelationKind::Implementation => "implementation",
+        SemanticRelationKind::Reference => "reference",
     }
 }
 
@@ -2815,6 +3845,8 @@ fn precharge_mandatory(
     edges: &BTreeSet<usize>,
     index: &MetadataIndex,
     paths: &PathExpansion,
+    structure: Option<&StructureGraph>,
+    structure_expansion: Option<&StructureExpansion>,
     budget: MapBudget,
     max_highlight_bytes: usize,
     work: &mut usize,
@@ -2872,13 +3904,44 @@ fn precharge_mandatory(
             }
         });
     }
+    if let (Some(structure), Some(expansion)) = (structure, structure_expansion) {
+        for node_index in &expansion.nodes {
+            let node = &structure.nodes()[*node_index];
+            retained = retained
+                .saturating_add(std::mem::size_of::<RepositoryGraphNode>())
+                .saturating_add(escaped_string_upper_bound(node.name()))
+                .saturating_add(
+                    node.path()
+                        .map_or(0, |path| escaped_string_upper_bound(path.as_str())),
+                );
+        }
+        for edge_index in &expansion.edges {
+            let edge = &structure.edges()[expansion.graph[*edge_index].graph_edge];
+            retained = retained.saturating_add(std::mem::size_of::<RepositoryGraphEdge>());
+            if let Some(path) = edge.provenance().path() {
+                retained = retained.saturating_add(escaped_string_upper_bound(path.as_str()));
+            }
+            if let Some(semantic) = edge.provenance().semantic() {
+                for value in [
+                    semantic.origin_uri(),
+                    semantic.origin_path().as_str(),
+                    semantic.server_artifact(),
+                    semantic.server_configuration(),
+                ] {
+                    retained = retained.saturating_add(escaped_string_upper_bound(value));
+                }
+            }
+        }
+    }
     charge_work(
         work,
         retained.max(
             ids.len()
                 .saturating_add(edges.len())
                 .saturating_add(paths.nodes.len())
-                .saturating_add(paths.edges.len()),
+                .saturating_add(paths.edges.len())
+                .saturating_add(structure_expansion.map_or(0, |value| value.nodes.len()))
+                .saturating_add(structure_expansion.map_or(0, |value| value.edges.len())),
         ),
         max_work,
     )?;
@@ -2925,7 +3988,9 @@ fn update_page_state(
     response.item_count = response.path_nodes.len()
         + response.path_edges.len()
         + response.entries.len()
-        + response.edges.len();
+        + response.edges.len()
+        + response.graph_nodes.len()
+        + response.graph_edges.len();
     response.omissions.ranked_entries = ranked.saturating_sub(consumed);
     response.completeness = if index_incomplete {
         MapCompleteness::IndexIncomplete
@@ -2933,6 +3998,8 @@ fn update_page_state(
         MapCompleteness::SyntaxIncomplete
     } else if response.omissions.ranked_entries != 0 {
         MapCompleteness::RankedEntriesOmitted
+    } else if response.omissions.graph_relationships != 0 {
+        MapCompleteness::ObservedPartial
     } else {
         MapCompleteness::Complete
     };
@@ -3141,6 +4208,16 @@ fn digest_request(
         charge_work(work, 1, max_work)?;
         hash.update(&seed.0);
     }
+    hash.update(b"\0expansion-graph-node-ids\0");
+    let mut graph_seeds = request.expansion.graph_seeds.clone();
+    charge_sort_work(work, graph_seeds.len(), max_work, deadline)?;
+    graph_seeds.sort_unstable();
+    graph_seeds.dedup();
+    for seed in graph_seeds {
+        check_deadline(deadline)?;
+        charge_work(work, 1, max_work)?;
+        hash.update(&seed.as_bytes());
+    }
     hash.update(b"\0expansion-paths\0");
     let mut paths = request.expansion.paths.iter().collect::<Vec<_>>();
     charge_sort_work(work, paths.len(), max_work, deadline)?;
@@ -3160,6 +4237,24 @@ fn digest_request(
         check_deadline(deadline)?;
         charge_work(work, 1, max_work)?;
         frame(&mut hash, symbol.as_bytes());
+    }
+    for (label, values) in [
+        (
+            b"\0expansion-packages\0".as_slice(),
+            &request.expansion.packages,
+        ),
+        (b"\0expansion-tests\0".as_slice(), &request.expansion.tests),
+    ] {
+        hash.update(label);
+        let mut values = values.iter().collect::<Vec<_>>();
+        charge_sort_work(work, values.len(), max_work, deadline)?;
+        values.sort_unstable();
+        values.dedup();
+        for value in values {
+            check_deadline(deadline)?;
+            charge_work(work, 1, max_work)?;
+            frame(&mut hash, value.as_bytes());
+        }
     }
     hash.update(b"\0expansion-score-band\0");
     match request.expansion.score_band {
@@ -3288,6 +4383,7 @@ fn digest_options(
         limits.max_semantic_relationships as u128,
         limits.max_input_bytes as u128,
         limits.max_work as u128,
+        limits.max_memory_bytes as u128,
         limits.max_candidates as u128,
         limits.max_highlight_bytes as u128,
         limits.max_cursor_frontier as u128,
@@ -3412,6 +4508,27 @@ where
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     serializer.serialize_str(&output)
+}
+
+fn serialize_optional_hex<S>(value: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serialize_hex(value, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn serialize_node_id<S>(value: &NodeId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serialize_hex(&value.as_bytes(), serializer)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

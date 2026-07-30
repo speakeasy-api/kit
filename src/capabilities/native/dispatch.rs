@@ -33,11 +33,12 @@ use crate::{
     workspace::{
         acquire::AcquisitionResult,
         edit::ir::RootRelativePath,
+        graph::structure::{GraphError, GraphOptions, NodeId, StructureGraphProvider},
         index::meta::{IndexOptions, MetadataIndex},
         map::{
             DeclarationId, ExpansionPurpose, ExpansionRequest, MapBound, MapBudget, MapCursor,
             MapError, MapLimits, Personalization, RelationshipKind, RepositoryMapRequest,
-            ScoreBand, SemanticRelationship, StackFrame, build_repository_map,
+            ScoreBand, SemanticRelationship, StackFrame, build_repository_map_with_structure,
             validate_semantic_evidence,
         },
         read::{ArtifactContext, ReadOptions, ReadRange, ReadRequest, read},
@@ -80,6 +81,9 @@ const MAX_RUN_IO_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_RUN_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_RUN_WALL_TIME_MILLIS: u64 = 10 * 60 * 1000;
 const MAX_NATIVE_WORKSPACE_SCAN_TIME: std::time::Duration = std::time::Duration::from_secs(20);
+const NATIVE_MAP_TOTAL_WORK: usize = 21_000_000;
+const NATIVE_MAP_TOTAL_MEMORY_BYTES: usize = 320 * 1024 * 1024;
+const NATIVE_MAP_TOTAL_TIME: Duration = Duration::from_secs(30);
 const STRUCTURAL_PREVIEW_MAX_ENTRIES: usize = 128;
 const STRUCTURAL_PREVIEW_MAX_BYTES: usize = 8 * 1024 * 1024;
 const STRUCTURAL_PREVIEW_TTL: Duration = Duration::from_secs(15 * 60);
@@ -202,6 +206,13 @@ struct NativeSemanticEvidenceState {
     relationships: Vec<NativeSemanticRelationship>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeStructureGraphKey {
+    revision: RevisionId,
+    index_digest: [u8; 32],
+    semantic_digest: [u8; 32],
+}
+
 impl NativeSemanticEvidenceStore {
     #[allow(dead_code)]
     pub(crate) fn publish(
@@ -288,6 +299,18 @@ impl NativeSemanticEvidenceStore {
             .is_ok_and(|state| state.revision == Some(revision) && !state.relationships.is_empty())
     }
 
+    fn snapshot_if_current(
+        &self,
+        revision: RevisionId,
+    ) -> Result<Vec<NativeSemanticRelationship>, NativeMapError> {
+        let state = self.inner.lock().map_err(|_| NativeMapError::Unavailable)?;
+        Ok(if state.revision == Some(revision) {
+            state.relationships.clone()
+        } else {
+            Vec::new()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -321,6 +344,8 @@ pub(crate) struct NativeDispatcher {
     workspace: Option<ManagedWorkspace>,
     index: Option<MetadataIndex>,
     syntax_index: SyntaxIndex,
+    structure_graph: StructureGraphProvider,
+    structure_graph_key: Option<NativeStructureGraphKey>,
     structural_previews: StructuralPreviewRegistry,
     build: PathBuf,
     temp: PathBuf,
@@ -376,6 +401,8 @@ impl NativeDispatcher {
             workspace: None,
             index: None,
             syntax_index: SyntaxIndex::new(),
+            structure_graph: StructureGraphProvider::new(),
+            structure_graph_key: None,
             structural_previews: StructuralPreviewRegistry::default(),
             build,
             temp,
@@ -525,8 +552,38 @@ impl NativeDispatcher {
             &mut self.syntax_index,
         )
         .map_err(code("workspace_index_failed"))?;
+        self.structure_graph_key = None;
         self.index = Some(index.clone());
         Ok((workspace, index))
+    }
+
+    fn refresh_structure_graph(
+        &mut self,
+        workspace: &ManagedWorkspace,
+        index: &MetadataIndex,
+        stored: &[NativeSemanticRelationship],
+        evidence: &[SemanticRelationship<'_>],
+        options: &GraphOptions,
+    ) -> Result<bool, NativeMapError> {
+        let key = NativeStructureGraphKey {
+            revision: index.revision(),
+            index_digest: *index.index_digest(),
+            semantic_digest: native_semantic_digest(stored),
+        };
+        if self.structure_graph_key == Some(key)
+            && self
+                .structure_graph
+                .validated_graph(workspace)
+                .map_err(NativeMapError::from)?
+                .is_some_and(|graph| graph.index_digest() == *index.index_digest())
+        {
+            return Ok(false);
+        }
+        self.structure_graph
+            .refresh(workspace, index, options, &[], evidence)
+            .map_err(NativeMapError::from)?;
+        self.structure_graph_key = Some(key);
+        Ok(true)
     }
 
     fn discover(&mut self, bytes: &[u8]) -> Result<(Value, Vec<String>), String> {
@@ -540,9 +597,14 @@ impl NativeDispatcher {
                 .relationships
                 .iter()
                 .any(|relationship| relationship.is_semantic());
+            let graph_requested = native_structure_requested(&request);
             let stored = if semantic_requested {
                 self.semantic_evidence
                     .snapshot(index.revision())
+                    .map_err(NativeMapError::code)?
+            } else if graph_requested {
+                self.semantic_evidence
+                    .snapshot_if_current(index.revision())
                     .map_err(NativeMapError::code)?
             } else {
                 self.semantic_evidence.clear_if_stale(index.revision());
@@ -551,13 +613,29 @@ impl NativeDispatcher {
             let evidence = native_semantic_evidence(&stored, index.revision())
                 .map_err(NativeMapError::code)?;
             let semantic_evidence_available = self.semantic_evidence.available(index.revision());
-            let response = build_repository_map(
+            let (graph_options, map_limits) =
+                bounded_graph_map_limits(graph_requested).map_err(NativeMapError::code)?;
+            if graph_requested {
+                self.refresh_structure_graph(
+                    &workspace,
+                    &index,
+                    &stored,
+                    &evidence,
+                    &graph_options,
+                )
+                .map_err(NativeMapError::code)?;
+            }
+            let structure = graph_requested
+                .then(|| self.structure_graph.graph())
+                .flatten();
+            let response = build_repository_map_with_structure(
                 &workspace,
                 &index,
                 &request,
                 &evidence,
-                bounded_map_limits(),
+                map_limits,
                 cursor.as_ref(),
+                structure,
             )
             .map_err(NativeMapError::from)
             .map_err(NativeMapError::code)?;
@@ -863,6 +941,7 @@ impl NativeDispatcher {
             }
             NativeEditOutcome::Committed { edit, feedback } => {
                 self.index = None;
+                self.structure_graph_key = None;
                 self.structural_previews.clear();
                 let receipt = edit.verification_receipt();
                 let change_diff = std::str::from_utf8(edit.change_diff())
@@ -1460,8 +1539,8 @@ fn validation_error_detail(
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum DiscoverInput {
-    Legacy(LegacyDiscoverInput),
-    Map(MapDiscoverInput),
+    Legacy(Box<LegacyDiscoverInput>),
+    Map(Box<MapDiscoverInput>),
 }
 
 #[derive(Deserialize)]
@@ -1504,9 +1583,15 @@ struct NativeMapInput {
     #[serde(default)]
     expansion_seeds: Vec<String>,
     #[serde(default)]
+    graph_seeds: Vec<String>,
+    #[serde(default)]
     expand_paths: Vec<String>,
     #[serde(default)]
     expand_symbols: Vec<String>,
+    #[serde(default)]
+    expand_packages: Vec<String>,
+    #[serde(default)]
+    expand_tests: Vec<String>,
     #[serde(default)]
     score_band: Option<NativeMapScoreBand>,
     #[serde(default)]
@@ -1695,6 +1780,71 @@ fn bounded_discover_options() -> DiscoverOptions {
     }
 }
 
+fn native_structure_requested(request: &RepositoryMapRequest) -> bool {
+    !request.expansion.graph_seeds.is_empty()
+        || !request.expansion.packages.is_empty()
+        || !request.expansion.tests.is_empty()
+        || request
+            .expansion
+            .relationships
+            .iter()
+            .any(|relationship| relationship.is_structure())
+}
+
+fn native_semantic_digest(stored: &[NativeSemanticRelationship]) -> [u8; 32] {
+    let mut facts = stored
+        .iter()
+        .map(|relationship| {
+            let fact = &relationship.fact;
+            let provenance = fact.provenance();
+            let origin = provenance.origin();
+            let mut hash = blake3::Hasher::new();
+            hash.update(&relationship.source_declaration.as_bytes());
+            hash.update(&[fact.relation() as u8]);
+            native_digest_frame(&mut hash, fact.path().as_path().as_str().as_bytes());
+            hash.update(&(fact.range().start() as u128).to_le_bytes());
+            hash.update(&(fact.range().end() as u128).to_le_bytes());
+            if let Some(range) = fact.target_range() {
+                hash.update(&[1]);
+                hash.update(&(range.start() as u128).to_le_bytes());
+                hash.update(&(range.end() as u128).to_le_bytes());
+            } else {
+                hash.update(&[0]);
+            }
+            hash.update(&(fact.origin_point() as u128).to_le_bytes());
+            hash.update(&(fact.origin_range().start() as u128).to_le_bytes());
+            hash.update(&(fact.origin_range().end() as u128).to_le_bytes());
+            hash.update(provenance.revision().as_bytes());
+            native_digest_frame(&mut hash, origin.uri().as_bytes());
+            hash.update(&origin.document_version().get().to_le_bytes());
+            hash.update(&origin.request_generation().to_le_bytes());
+            hash.update(&origin.request_id().get().to_le_bytes());
+            native_digest_frame(
+                &mut hash,
+                provenance.server().server_artifact.as_str().as_bytes(),
+            );
+            native_digest_frame(
+                &mut hash,
+                provenance.server().configuration.as_str().as_bytes(),
+            );
+            hash.update(&[provenance.position_encoding() as u8]);
+            *hash.finalize().as_bytes()
+        })
+        .collect::<Vec<_>>();
+    facts.sort_unstable();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"kit-native-structure-semantic-v1\0");
+    for fact in facts {
+        hash.update(&fact);
+    }
+    *hash.finalize().as_bytes()
+}
+
+fn native_digest_frame(hash: &mut blake3::Hasher, value: &[u8]) {
+    hash.update(&(value.len() as u64).to_le_bytes());
+    hash.update(value);
+}
+
 fn native_map_request(
     input: NativeMapInput,
 ) -> Result<(RepositoryMapRequest, Option<MapCursor>), NativeMapError> {
@@ -1715,8 +1865,19 @@ fn native_map_request(
         NATIVE_MAP_MAX_EXPANSION_SELECTORS,
         MAX_TEXT,
     )?;
+    validate_map_values(
+        &input.expand_packages,
+        NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        MAX_PATH,
+    )?;
+    validate_map_values(
+        &input.expand_tests,
+        NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        MAX_PATH,
+    )?;
     if input.exact_identifiers.len() > 128
         || input.expansion_seeds.len() > NATIVE_MAP_MAX_EXPANSION_SELECTORS
+        || input.graph_seeds.len() > NATIVE_MAP_MAX_EXPANSION_SELECTORS
         || input.stack_frames.len() > 32
         || input.score_band.is_some_and(|band| band.min > band.max)
     {
@@ -1731,6 +1892,15 @@ fn native_map_request(
         .expansion_seeds
         .iter()
         .map(|value| DeclarationId::parse(value).ok_or(NativeMapError::InvalidRequest))
+        .collect::<Result<Vec<_>, _>>()?;
+    let graph_seeds = input
+        .graph_seeds
+        .iter()
+        .map(|value| {
+            DeclarationId::parse(value)
+                .map(|id| NodeId::from_bytes(id.as_bytes()))
+                .ok_or(NativeMapError::InvalidRequest)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let paths = input
         .expand_paths
@@ -1784,6 +1954,15 @@ fn native_map_request(
                     "semantic_type_definition" => Ok(RelationshipKind::SemanticTypeDefinition),
                     "semantic_implementation" => Ok(RelationshipKind::SemanticImplementation),
                     "semantic_reference" => Ok(RelationshipKind::SemanticReference),
+                    "defines" => Ok(RelationshipKind::Defines),
+                    "imports" => Ok(RelationshipKind::Imports),
+                    "exports" => Ok(RelationshipKind::Exports),
+                    "references" => Ok(RelationshipKind::References),
+                    "calls" => Ok(RelationshipKind::Calls),
+                    "implements" => Ok(RelationshipKind::Implements),
+                    "inherits" => Ok(RelationshipKind::Inherits),
+                    "overrides" => Ok(RelationshipKind::Overrides),
+                    "tests" => Ok(RelationshipKind::Tests),
                     _ => Err(NativeMapError::InvalidRequest),
                 })
                 .collect()
@@ -1829,8 +2008,11 @@ fn native_map_request(
             budget,
             expansion: ExpansionRequest {
                 seeds,
+                graph_seeds,
                 paths,
                 symbols: input.expand_symbols,
+                packages: input.expand_packages,
+                tests: input.expand_tests,
                 score_band: input.score_band.map(|band| ScoreBand {
                     min: band.min,
                     max: band.max,
@@ -1940,11 +2122,57 @@ fn bounded_map_limits() -> MapLimits {
         max_semantic_relationships: NATIVE_MAP_MAX_SEMANTIC_RELATIONSHIPS,
         max_input_bytes: 256 * 1024,
         max_work: 1_000_000,
+        max_memory_bytes: 64 * 1024 * 1024,
         max_candidates: 100_000,
         max_highlight_bytes: 1024,
         max_cursor_frontier: 10_000,
         max_time: Duration::from_secs(30),
     }
+}
+
+fn bounded_graph_map_limits(
+    graph_requested: bool,
+) -> Result<(GraphOptions, MapLimits), NativeMapError> {
+    graph_map_limits_with_caps(
+        graph_requested,
+        NATIVE_MAP_TOTAL_WORK,
+        NATIVE_MAP_TOTAL_MEMORY_BYTES,
+        NATIVE_MAP_TOTAL_TIME,
+    )
+}
+
+fn graph_map_limits_with_caps(
+    graph_requested: bool,
+    total_work: usize,
+    total_memory_bytes: usize,
+    total_time: Duration,
+) -> Result<(GraphOptions, MapLimits), NativeMapError> {
+    let mut graph = GraphOptions::default();
+    let mut map = bounded_map_limits();
+    if graph_requested {
+        graph.max_work = total_work
+            .checked_sub(map.max_work)
+            .filter(|work| *work != 0)
+            .ok_or(NativeMapError::Unavailable)?;
+        graph.max_staging_bytes = total_memory_bytes
+            .checked_sub(map.max_memory_bytes)
+            .filter(|bytes| *bytes != 0)
+            .ok_or(NativeMapError::Unavailable)?;
+        graph.max_cache_bytes = graph.max_cache_bytes.min(graph.max_staging_bytes / 2);
+        graph.max_time = Duration::from_secs(5);
+        map.max_time = total_time
+            .checked_sub(graph.max_time)
+            .filter(|time| !time.is_zero())
+            .ok_or(NativeMapError::Unavailable)?;
+    } else {
+        if total_work == 0 || total_memory_bytes == 0 || total_time.is_zero() {
+            return Err(NativeMapError::Unavailable);
+        }
+        map.max_work = total_work;
+        map.max_memory_bytes = total_memory_bytes;
+        map.max_time = total_time;
+    }
+    Ok((graph, map))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1954,6 +2182,9 @@ enum NativeMapError {
     CursorMismatch,
     EvidenceInvalid,
     EvidenceStale,
+    GraphEvidenceInvalid,
+    GraphEvidenceStale,
+    GraphEvidenceUnavailable,
     InvalidRequest,
     RevisionStale,
     RevisionUnavailable,
@@ -1972,10 +2203,14 @@ impl NativeMapError {
             Self::Bound(MapBound::Hops) => "map_hops_bound_exceeded",
             Self::Bound(MapBound::Degree) => "map_degree_bound_exceeded",
             Self::Bound(MapBound::ResultBytes) => "map_result_bytes_bound_exceeded",
+            Self::Bound(MapBound::Memory) => "map_memory_bound_exceeded",
             Self::CursorInvalid => "map_cursor_invalid",
             Self::CursorMismatch => "map_cursor_mismatch",
             Self::EvidenceInvalid => "map_semantic_evidence_invalid",
             Self::EvidenceStale => "map_semantic_evidence_stale",
+            Self::GraphEvidenceInvalid => "map_graph_evidence_invalid",
+            Self::GraphEvidenceStale => "map_graph_evidence_stale",
+            Self::GraphEvidenceUnavailable => "map_graph_evidence_unavailable",
             Self::InvalidRequest => "map_invalid_request",
             Self::RevisionStale => "stale_revision",
             Self::RevisionUnavailable => "map_revision_unavailable",
@@ -2005,7 +2240,31 @@ impl From<MapError> for NativeMapError {
             MapError::InvalidFact(_) => Self::EvidenceInvalid,
             MapError::StaleFact => Self::EvidenceStale,
             MapError::SemanticEvidenceUnavailable => Self::SemanticEvidenceUnavailable,
+            MapError::GraphEvidenceUnavailable => Self::GraphEvidenceUnavailable,
+            MapError::GraphEvidenceStale => Self::GraphEvidenceStale,
+            MapError::InvalidGraph(_) => Self::GraphEvidenceInvalid,
             MapError::Serialization(_) => Self::Serialization,
+        }
+    }
+}
+
+impl From<GraphError> for NativeMapError {
+    fn from(error: GraphError) -> Self {
+        match error {
+            GraphError::StaleEvidence
+            | GraphError::Revision(crate::workspace::revision::RevisionError::StaleRevision {
+                ..
+            }) => Self::GraphEvidenceStale,
+            GraphError::MalformedManifest { .. }
+            | GraphError::InvalidIndex(_)
+            | GraphError::InvalidEvidence(_)
+            | GraphError::ContainmentCycle
+            | GraphError::UnsafePath(_)
+            | GraphError::MissingWorkspaceMember { .. }
+            | GraphError::MissingPathDependency { .. } => Self::GraphEvidenceInvalid,
+            GraphError::Revision(_)
+            | GraphError::InvalidOptions(_)
+            | GraphError::BoundExceeded(_) => Self::GraphEvidenceUnavailable,
         }
     }
 }
@@ -2590,6 +2849,32 @@ mod tests {
     }
 
     #[test]
+    fn native_graph_and_map_limits_share_one_fixed_envelope() {
+        let (graph, map) = graph_map_limits_with_caps(
+            true,
+            NATIVE_MAP_TOTAL_WORK,
+            NATIVE_MAP_TOTAL_MEMORY_BYTES,
+            NATIVE_MAP_TOTAL_TIME,
+        )
+        .unwrap();
+        assert_eq!(graph.max_work + map.max_work, NATIVE_MAP_TOTAL_WORK);
+        assert_eq!(
+            graph.max_staging_bytes + map.max_memory_bytes,
+            NATIVE_MAP_TOTAL_MEMORY_BYTES
+        );
+        assert_eq!(graph.max_time + map.max_time, NATIVE_MAP_TOTAL_TIME);
+        assert!(
+            graph_map_limits_with_caps(
+                true,
+                bounded_map_limits().max_work,
+                bounded_map_limits().max_memory_bytes,
+                Duration::from_secs(5),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn native_discover_map_ranks_syntax_and_returns_real_containment_without_semantic_claims() {
         let (directory, mut dispatcher) = dispatcher(None);
         std::fs::write(
@@ -2742,6 +3027,118 @@ mod tests {
                 Err("invalid_arguments".to_owned())
             );
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_discover_builds_and_reuses_real_cargo_structure_graphs() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        let source = directory.join("source");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(source.join("helper/src")).unwrap();
+        std::fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n[dependencies]\nhelper={path=\"helper\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("src/lib.rs"),
+            "pub fn root() {}\n#[test]\nfn root_test() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("helper/Cargo.toml"),
+            "[package]\nname=\"helper\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("helper/src/lib.rs"), "pub fn helper() {}\n").unwrap();
+
+        let revision = dispatcher.revision().unwrap();
+        let request = discover_input(
+            &revision,
+            json!({
+                "expandPackages": ["root"],
+                "relationships": ["imports"],
+                "purpose": "dependencies"
+            }),
+        );
+        let first = dispatcher.discover(&request).unwrap().0;
+        assert!(first.get("graphEvidenceAvailable").is_none());
+        assert!(first.get("graphDigests").is_none());
+        assert_eq!(first["map"]["graph_evidence_available"], true);
+        assert!(
+            first["map"]["graph_snapshot_digest"]
+                .as_str()
+                .unwrap()
+                .len()
+                == 64
+        );
+        assert!(
+            first["map"]["graph_nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| { node["kind"] == "package" && node["name"] == "helper" })
+        );
+        assert!(
+            first["map"]["graph_edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| {
+                    edge["relationship"] == "imports"
+                        && edge["provenance"]["source"] == "cargo_manifest"
+                })
+        );
+        let first_metrics = dispatcher.structure_graph.metrics().clone();
+        let second = dispatcher.discover(&request).unwrap().0;
+        assert_eq!(first, second);
+        assert_eq!(dispatcher.structure_graph.metrics(), &first_metrics);
+
+        let dependents = dispatcher
+            .discover(&discover_input(
+                &revision,
+                json!({
+                    "expandPackages": ["helper/Cargo.toml"],
+                    "relationships": ["imports"],
+                    "purpose": "dependents"
+                }),
+            ))
+            .unwrap()
+            .0;
+        let nodes = dependents["map"]["graph_nodes"].as_array().unwrap();
+        let root = nodes.iter().find(|node| node["name"] == "root").unwrap()["node_id"].clone();
+        let helper = nodes.iter().find(|node| node["name"] == "helper").unwrap()["node_id"].clone();
+        assert!(
+            dependents["map"]["graph_edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| {
+                    edge["relationship"] == "imports"
+                        && edge["source_node"] == root
+                        && edge["target_node"] == helper
+                })
+        );
+
+        std::fs::write(source.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        let next_revision = dispatcher.revision().unwrap();
+        dispatcher
+            .discover(&discover_input(
+                &next_revision,
+                json!({
+                    "expandPackages": ["root"],
+                    "relationships": ["imports"],
+                    "purpose": "dependencies"
+                }),
+            ))
+            .unwrap();
+        assert_eq!(dispatcher.structure_graph.metrics().parsed_fragments(), 0);
+        assert_eq!(dispatcher.structure_graph.metrics().reused_fragments(), 2);
+        assert_eq!(
+            dispatcher.structure_graph.metrics().changed_paths(),
+            &[RootRelativePath::parse("src/lib.rs", 4096).unwrap()]
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2981,6 +3378,10 @@ mod tests {
                 NativeMapError::Bound(MapBound::ResultBytes),
                 "map_result_bytes_bound_exceeded",
             ),
+            (
+                NativeMapError::Bound(MapBound::Memory),
+                "map_memory_bound_exceeded",
+            ),
             (NativeMapError::CursorInvalid, "map_cursor_invalid"),
             (NativeMapError::CursorMismatch, "map_cursor_mismatch"),
             (
@@ -2992,6 +3393,18 @@ mod tests {
             (
                 NativeMapError::EvidenceInvalid,
                 "map_semantic_evidence_invalid",
+            ),
+            (
+                NativeMapError::GraphEvidenceUnavailable,
+                "map_graph_evidence_unavailable",
+            ),
+            (
+                NativeMapError::GraphEvidenceStale,
+                "map_graph_evidence_stale",
+            ),
+            (
+                NativeMapError::GraphEvidenceInvalid,
+                "map_graph_evidence_invalid",
             ),
             (NativeMapError::RevisionStale, "stale_revision"),
             (

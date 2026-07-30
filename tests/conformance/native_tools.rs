@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeSet,
+    fs,
     io::{Read as _, Write as _},
     net::TcpListener,
     thread,
+    time::Duration,
 };
 
 use agentkit_core::{Item, ItemKind, MetadataMap, SessionId, TurnId};
@@ -21,7 +23,16 @@ use kit::{
         config::{Grant, LayerStack, RunConfigContext},
         ids::{PrincipalId, ProjectId, RunId},
     },
-    workspace::edit::ir::RootRelativePath,
+    workspace::{
+        edit::ir::RootRelativePath,
+        graph::structure::{GraphOptions, StructureGraphProvider},
+        index::meta::{IndexOptions, MetadataIndex},
+        map::{
+            ExpansionRequest, MapBound, MapError, MapLimits, RelationshipKind,
+            RepositoryMapRequest, build_repository_map_with_structure,
+        },
+        revision::{ManagedWorkspace, RevisionOptions},
+    },
 };
 
 fn catalog() -> &'static [kit::capabilities::native::NativeToolDescriptor; 6] {
@@ -331,10 +342,13 @@ fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
             "currentEditPaths": ["src/main.rs"],
             "pathPrefixes": ["src"],
             "languages": ["rust"],
-            "relationships": ["contains", "contained_by", "semantic_definition"],
+            "relationships": ["contains", "contained_by", "semantic_definition", "imports", "tests"],
             "expansionSeeds": [],
+            "graphSeeds": ["c".repeat(64)],
             "expandPaths": ["src/lib.rs"],
             "expandSymbols": ["Config"],
+            "expandPackages": ["kit"],
+            "expandTests": ["map_graph"],
             "scoreBand": {"min": 0, "max": 18446744073709551615_u64},
             "purpose": "neighborhood",
             "budgets": {"items": 200, "estimatedTokens": 16384, "hops": 4, "degree": 64, "resultBytes": 61440},
@@ -382,6 +396,30 @@ fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
         "terms": ["ignored"]
     })));
     let map_properties = &schema["oneOf"][1]["properties"]["map"]["properties"];
+    assert_eq!(map_properties["relationships"]["maxItems"], 16);
+    for relationship in [
+        "defines",
+        "imports",
+        "exports",
+        "references",
+        "calls",
+        "implements",
+        "inherits",
+        "overrides",
+        "tests",
+    ] {
+        assert!(
+            map_properties["relationships"]["items"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == relationship)
+        );
+    }
+    for selector in ["graphSeeds", "expandPackages", "expandTests"] {
+        assert_eq!(map_properties[selector]["maxItems"], 128);
+        assert_eq!(map_properties[selector]["uniqueItems"], true);
+    }
     assert!(
         map_properties["expandPaths"]["items"]["description"]
             .as_str()
@@ -493,13 +531,16 @@ fn all_native_descriptor_versions_remain_legacy_compatible() {
 }
 
 #[test]
-fn discover_implementation_digest_identifies_the_map_capable_implementation() {
+fn discover_implementation_digest_identifies_the_graph_map_capable_implementation() {
     let discover = catalog()
         .iter()
         .find(|descriptor| descriptor.tool() == NativeTool::Discover)
         .unwrap();
     let old = Digest::of(DigestAlgorithm::Blake3, b"kit-native-discover-1.0.0");
-    let map_capable = Digest::of(DigestAlgorithm::Blake3, b"kit-native-discover-map-1.0.0");
+    let map_capable = Digest::of(
+        DigestAlgorithm::Blake3,
+        b"kit-native-discover-map-graph-1.0.0",
+    );
     assert_ne!(discover.identity().implementation_digest(), old);
     assert_eq!(discover.identity().implementation_digest(), map_capable);
     assert_eq!(discover.identity().version().as_str(), "1.0.0");
@@ -573,6 +614,121 @@ fn tool_surface_output_bounds() {
                 .contains_key("agentkit.tool_output_limit")
         );
     }
+}
+
+#[test]
+fn native_graph_and_map_memory_envelope_uses_real_reservations() {
+    const TOTAL_MEMORY: usize = 320 * 1024 * 1024;
+    const MAP_MEMORY: usize = 64 * 1024 * 1024;
+    const GRAPH_MEMORY: usize = TOTAL_MEMORY - MAP_MEMORY;
+
+    let mut random = [0_u8; 12];
+    getrandom::fill(&mut random).unwrap();
+    let parent = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "kit-native-memory-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    let root = parent.join("workspace");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"native-memory\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn first() {}\n").unwrap();
+    let workspace = ManagedWorkspace::open_with_options(
+        &root,
+        RevisionOptions {
+            max_entries: 1_000,
+            max_name_bytes: 1024 * 1024,
+            max_bytes: 16 * 1024 * 1024,
+            max_memory_bytes: 32 * 1024 * 1024,
+            max_depth: 64,
+            max_scan_time: Duration::from_secs(5),
+            max_scan_attempts: 2,
+            watcher_interval: Duration::from_millis(5),
+            reconciliation_interval: Duration::from_secs(60),
+            metadata_path: Some(parent.join("revision.state")),
+        },
+    )
+    .unwrap();
+    let revision = workspace.current_revision().unwrap().id();
+    let index = MetadataIndex::build(&workspace, revision, &IndexOptions::default()).unwrap();
+    let graph_options = GraphOptions {
+        max_staging_bytes: GRAPH_MEMORY,
+        max_cache_bytes: GraphOptions::default()
+            .max_cache_bytes
+            .min(GRAPH_MEMORY / 2),
+        ..GraphOptions::default()
+    };
+    let mut provider = StructureGraphProvider::new();
+    provider
+        .refresh(&workspace, &index, &graph_options, &[], &[])
+        .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn second() {}\n").unwrap();
+    let revision = workspace.current_revision().unwrap().id();
+    let index = MetadataIndex::build(&workspace, revision, &IndexOptions::default()).unwrap();
+    provider
+        .refresh(&workspace, &index, &graph_options, &[], &[])
+        .unwrap();
+    assert!(provider.metrics().peak_staging_bytes() <= GRAPH_MEMORY);
+
+    let request = RepositoryMapRequest {
+        expansion: ExpansionRequest {
+            packages: vec!["native-memory".to_owned()],
+            relationships: vec![RelationshipKind::Contains],
+            ..ExpansionRequest::default()
+        },
+        ..RepositoryMapRequest::default()
+    };
+    let graph = provider.graph().unwrap();
+    let mut low = 1;
+    let mut high = MAP_MEMORY;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &request,
+            &[],
+            MapLimits {
+                max_memory_bytes: middle,
+                ..MapLimits::default()
+            },
+            None,
+            Some(graph),
+        ) {
+            Ok(_) => high = middle,
+            Err(MapError::BoundExceeded(MapBound::Memory)) => low = middle + 1,
+            Err(error) => panic!("unexpected native map memory result: {error:?}"),
+        }
+    }
+    assert!(matches!(
+        build_repository_map_with_structure(
+            &workspace,
+            &index,
+            &request,
+            &[],
+            MapLimits {
+                max_memory_bytes: low - 1,
+                ..MapLimits::default()
+            },
+            None,
+            Some(graph),
+        ),
+        Err(MapError::BoundExceeded(MapBound::Memory))
+    ));
+    let retained = graph
+        .logical_bytes()
+        .checked_add(provider.cache_usage().logical_bytes())
+        .unwrap();
+    assert!(retained + low <= TOTAL_MEMORY);
+    drop(provider);
+    drop(workspace);
+    fs::remove_dir_all(parent).unwrap();
 }
 
 #[test]

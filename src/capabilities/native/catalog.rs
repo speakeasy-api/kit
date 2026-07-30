@@ -28,7 +28,7 @@ pub(crate) const NATIVE_MAP_MAX_ESTIMATED_TOKENS: usize = 16_384;
 pub(crate) const NATIVE_MAP_MAX_HOPS: usize = 4;
 pub(crate) const NATIVE_MAP_MAX_DEGREE: usize = 64;
 pub(crate) const NATIVE_MAP_MAX_RESULT_BYTES: usize = 60 * 1024;
-pub(crate) const NATIVE_MAP_MAX_RELATIONSHIPS: usize = 7;
+pub(crate) const NATIVE_MAP_MAX_RELATIONSHIPS: usize = 16;
 pub(crate) const NATIVE_MAP_MAX_EXPANSION_SELECTORS: usize = 128;
 pub(crate) const NATIVE_MAP_MAX_SEMANTIC_RELATIONSHIPS: usize = 128;
 pub(crate) const NATIVE_MAP_MAX_SEMANTIC_EVIDENCE_BYTES: usize = 128 * 1024;
@@ -277,7 +277,7 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
     .with_metadata(metadata)
     .with_output_limit(ToolOutputLimit::fail(MAX_NATIVE_OUTPUT_BYTES));
     let implementation = if tool == NativeTool::Discover {
-        format!("kit-native-discover-map-{VERSION}")
+        format!("kit-native-discover-map-graph-{VERSION}")
     } else {
         format!("kit-native-{}-{VERSION}", tool.short_name())
     };
@@ -400,12 +400,15 @@ fn input_schema(tool: NativeTool) -> Value {
                             "exactIdentifiers": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": 128, "type": "array"},
                             "expandPaths": {"description": "Exact canonical indexed file or directory paths. Every path must match. Repository-tree expansion returns path nodes and direct path edges; an exact file also deterministically seeds its indexed declarations.", "items": expansion_path(), "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
                             "expandSymbols": {"description": "Exact case-sensitive qualified or display symbols. An ambiguous exact display symbol selects all matches deterministically. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 256-byte UTF-8 limit.", "items": {"maxLength": 256, "minLength": 1, "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "expandPackages": {"description": "Exact structure-graph package name or canonical manifest path.", "items": {"maxLength": 4096, "minLength": 1, "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "expandTests": {"description": "Exact structure-graph test name or canonical source path.", "items": {"maxLength": 4096, "minLength": 1, "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
                             "expansionSeeds": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "graphSeeds": {"description": "Exact structure-graph node IDs.", "items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
                             "languages": {"items": {"maxLength": 64, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"},
                             "pathPrefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
                             "purpose": {"enum": ["dependencies", "dependents", "neighborhood"]},
                             "recentlyReadPaths": {"items": relative_path(), "maxItems": 32, "type": "array"},
-                            "relationships": {"items": {"enum": ["contains", "contained_by", "semantic_declaration", "semantic_definition", "semantic_type_definition", "semantic_implementation", "semantic_reference"]}, "maxItems": NATIVE_MAP_MAX_RELATIONSHIPS, "type": "array", "uniqueItems": true},
+                            "relationships": {"items": {"enum": ["contains", "contained_by", "semantic_declaration", "semantic_definition", "semantic_type_definition", "semantic_implementation", "semantic_reference", "defines", "imports", "exports", "references", "calls", "implements", "inherits", "overrides", "tests"]}, "maxItems": NATIVE_MAP_MAX_RELATIONSHIPS, "type": "array", "uniqueItems": true},
                             "scoreBand": {
                                 "additionalProperties": false,
                                 "description": "Inclusive u64 declaration rank under kit-repository-map-v1. Every band must match at least one declaration.",

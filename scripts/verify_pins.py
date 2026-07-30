@@ -47,7 +47,8 @@ REQUIRED_IDS = {
     "toon.spec", "toon.spec_commit", "toon.spec_tarball_sha256",
     "toon.fixture_manifest_sha256", "toon.serde_toon2", "toon.conformance",
     "grammar.runtime", "grammar.languages", "grammar.queries",
-    "structural.ast_grep_core", "structural.ast_grep_language", "lsp.protocol",
+    "structural.ast_grep_core", "structural.ast_grep_language", "structural.toml",
+    "structural.globset", "structural.extractor_policy", "lsp.protocol",
     "lsp.position_encoding", "lsp.servers", "scip.schema", "scip.index",
     "harness.swe_bench_verified", "harness.swe_bench_multilingual",
     "harness.swe_bench_live", "harness.swe_bench_multimodal", "harness.terminal_bench_2_1",
@@ -1220,6 +1221,50 @@ def validate_repository(document, pins, errors, execute_candidate_tools=True):
         value = pins[pin_id]["value"]
         if not all(token in value for token in (f"{name}=0.40.1", f"features={feature}", "default_features=false", f"crate_sha256={checksum}")):
             errors.append(f"{pin_id} does not bind the exact Cargo dependency and checksum")
+
+    toml_checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+    if dependencies.get("toml") != {
+        "version": "=1.1.4",
+        "default-features": False,
+        "features": ["parse", "serde"],
+    }:
+        errors.append(
+            "Cargo.toml toml must be exact 1.1.4 with only parse,serde and default features disabled"
+        )
+    locked_toml = [
+        item for item in lock_packages
+        if item.get("name") == "toml" and item.get("version") == "1.1.4+spec-1.1.0"
+    ]
+    if len(locked_toml) != 1 or locked_toml[0].get("checksum") != toml_checksum:
+        errors.append("Cargo.lock toml 1.1.4+spec-1.1.0 checksum does not match the structural pin")
+    toml_pin = pins["structural.toml"]["value"]
+    if not all(token in toml_pin for token in (
+        "toml=1.1.4+spec-1.1.0", "features=parse,serde", "default_features=false",
+        f"crate_sha256={toml_checksum}",
+    )):
+        errors.append("structural.toml does not bind the exact Cargo dependency and checksum")
+
+    globset_checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+    if dependencies.get("globset") != "=0.4.19":
+        errors.append("Cargo.toml globset must be exact 0.4.19")
+    locked_globset = [
+        item for item in lock_packages
+        if item.get("name") == "globset" and item.get("version") == "0.4.19"
+    ]
+    if len(locked_globset) != 1 or locked_globset[0].get("checksum") != globset_checksum:
+        errors.append("Cargo.lock globset 0.4.19 checksum does not match the structural pin")
+    globset_pin = pins["structural.globset"]["value"]
+    if not all(token in globset_pin for token in (
+        "globset=0.4.19", f"crate_sha256={globset_checksum}",
+    )):
+        errors.append("structural.globset does not bind the exact Cargo dependency and checksum")
+    policy = pins["structural.extractor_policy"]["value"]
+    for token in (
+        "toml@1.1.4+spec-1.1.0", "globset@0.4.19", "tree-sitter@0.25.10",
+        "tree-sitter-rust@0.24.0", "query:c8c12ba2ce020cbd6b3c30eb8852dae0b7f67e08d72a60036415824f995d20d2",
+    ):
+        if token not in policy:
+            errors.append(f"structural.extractor_policy is missing {token}")
 
     metadata = run_metadata(errors) if execute_candidate_tools else None
     if metadata is not None:
