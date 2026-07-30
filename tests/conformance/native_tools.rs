@@ -13,13 +13,15 @@ use agentkit_provider_openai::{OpenAIAdapter, OpenAIConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 use kit::{
-    capabilities::native::{
-        JSON_SCHEMA_DIALECT, MAX_NATIVE_OUTPUT_BYTES, NativeCatalog, NativeTool,
+    capabilities::{
+        kernel::identity::{Digest, DigestAlgorithm},
+        native::{JSON_SCHEMA_DIALECT, MAX_NATIVE_OUTPUT_BYTES, NativeCatalog, NativeTool},
     },
     domain::{
         config::{Grant, LayerStack, RunConfigContext},
         ids::{PrincipalId, ProjectId, RunId},
     },
+    workspace::edit::ir::RootRelativePath,
 };
 
 fn catalog() -> &'static [kit::capabilities::native::NativeToolDescriptor; 6] {
@@ -287,6 +289,220 @@ fn every_native_boundary_rejects_schema_invalid_input() {
                 .is_valid(&input)
         );
     }
+}
+
+#[test]
+fn discover_map_schema_is_strict_bounded_and_preserves_the_legacy_form() {
+    let descriptor = catalog()
+        .iter()
+        .find(|entry| entry.tool() == NativeTool::Discover)
+        .unwrap();
+    let schema = &descriptor.spec().input_schema;
+    let validator = jsonschema::validator_for(schema).unwrap();
+    let revision = format!("r:{}", "a".repeat(64));
+    let legacy = serde_json::json!({
+        "expected_revision": revision,
+        "terms": ["Config"],
+        "roots": [],
+        "languages": ["rust"],
+        "cursor": null
+    });
+    assert!(validator.is_valid(&legacy));
+    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+    let legacy_schema = &schema["oneOf"][0];
+    assert_eq!(
+        legacy_schema["properties"],
+        serde_json::json!({
+            "cursor": {"type": ["object", "null"]},
+            "expected_revision": {"pattern": "^r:[0-9a-f]{64}$", "type": "string"},
+            "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
+            "roots": {"items": {"maxLength": 4096, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"},
+            "terms": {"items": {"maxLength": 256, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"}
+        })
+    );
+
+    let map = serde_json::json!({
+        "expected_revision": revision,
+        "map": {
+            "taskTerms": ["Config"],
+            "exactIdentifiers": ["b".repeat(64)],
+            "stackFrames": [{"path": "src/lib.rs", "symbol": "Config", "line": 1}],
+            "recentlyReadPaths": ["src/lib.rs"],
+            "currentEditPaths": ["src/main.rs"],
+            "pathPrefixes": ["src"],
+            "languages": ["rust"],
+            "relationships": ["contains", "contained_by", "semantic_definition"],
+            "expansionSeeds": [],
+            "expandPaths": ["src/lib.rs"],
+            "expandSymbols": ["Config"],
+            "scoreBand": {"min": 0, "max": 18446744073709551615_u64},
+            "purpose": "neighborhood",
+            "budgets": {"items": 200, "estimatedTokens": 16384, "hops": 4, "degree": 64, "resultBytes": 61440},
+            "cursor": null
+        }
+    });
+    assert!(validator.is_valid(&map));
+    for invalid in [
+        serde_json::json!({"unexpected": true}),
+        serde_json::json!({"budgets": {"items": 201}}),
+        serde_json::json!({"budgets": {"estimatedTokens": 16385}}),
+        serde_json::json!({"budgets": {"hops": 5}}),
+        serde_json::json!({"budgets": {"degree": 65}}),
+        serde_json::json!({"budgets": {"resultBytes": 61441}}),
+        serde_json::json!({"cursor": {}}),
+        serde_json::json!({"expandPaths": vec!["src/lib.rs"; 129]}),
+        serde_json::json!({"expandPaths": ["/src/lib.rs"]}),
+        serde_json::json!({"expandPaths": ["C:/src/lib.rs"]}),
+        serde_json::json!({"expandPaths": ["src\\lib.rs"]}),
+        serde_json::json!({"expandPaths": ["."]}),
+        serde_json::json!({"expandPaths": [".."]}),
+        serde_json::json!({"expandPaths": ["src/../lib.rs"]}),
+        serde_json::json!({"expandPaths": ["src/line\nfeed.rs"]}),
+        serde_json::json!({"expandSymbols": [""]}),
+        serde_json::json!({"scoreBand": {"min": 0}}),
+        serde_json::json!({"scoreBand": {"min": 0, "max": 1, "extra": true}}),
+    ] {
+        let mut request = serde_json::json!({
+            "expected_revision": revision,
+            "map": {}
+        });
+        request["map"] = invalid;
+        assert!(!validator.is_valid(&request), "{request}");
+    }
+    assert!(!validator.is_valid(&serde_json::json!({
+        "expected_revision": revision,
+        "terms": [],
+        "roots": [],
+        "languages": [],
+        "map": {}
+    })));
+    assert!(!validator.is_valid(&serde_json::json!({
+        "expected_revision": revision,
+        "map": {},
+        "terms": ["ignored"]
+    })));
+    let map_properties = &schema["oneOf"][1]["properties"]["map"]["properties"];
+    assert!(
+        map_properties["expandPaths"]["items"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("4096-byte UTF-8 limit")
+    );
+    assert!(
+        map_properties["expandSymbols"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("256-byte UTF-8 limit")
+    );
+}
+
+#[test]
+fn expand_paths_schema_matches_portable_paths_and_openapi() {
+    let discover = catalog()
+        .iter()
+        .find(|entry| entry.tool() == NativeTool::Discover)
+        .unwrap();
+    let schema = &discover.spec().input_schema["oneOf"][1]["properties"]["map"]["properties"]["expandPaths"]
+        ["items"];
+    let validator = jsonschema::validator_for(schema).unwrap();
+
+    for invalid in [
+        "",
+        "/src/lib.rs",
+        "C:/src/lib.rs",
+        "src\\lib.rs",
+        "src//lib.rs",
+        "src/",
+        ".",
+        "..",
+        "src/./lib.rs",
+        "src/../lib.rs",
+        "src/file.",
+        "src/file ",
+        "src/line\nfeed.rs",
+        "src/control\u{0085}.rs",
+        "src/file?.rs",
+        "src/file*.rs",
+        "src/file\".rs",
+        "src/file<.rs",
+        "src/file>.rs",
+        "src/file|.rs",
+        "src/file:.rs",
+        "CON",
+        "prn.txt",
+        "src/AuX.rs",
+        "nul.log",
+        "COM1",
+        "com9.rs",
+        "LPT1",
+        "lpt9.txt",
+        "CONIN$",
+        "conout$.log",
+        "COM¹.txt",
+        "lpt³.log",
+    ] {
+        assert!(
+            RootRelativePath::parse(invalid, 4096).is_err(),
+            "{invalid:?}"
+        );
+        assert!(
+            !validator.is_valid(&serde_json::json!(invalid)),
+            "{invalid:?}"
+        );
+    }
+    for prefix in ["COM", "com", "LPT", "lpt"] {
+        for number in 1..=9 {
+            let invalid = format!("src/{prefix}{number}.txt");
+            assert!(RootRelativePath::parse(&invalid, 4096).is_err());
+            assert!(!validator.is_valid(&serde_json::json!(invalid)));
+        }
+    }
+    for valid in [
+        "README.md",
+        "src/lib.rs",
+        ".gitignore",
+        "...file",
+        "console",
+        "com10",
+        "a.b",
+        "資料/日本語.rs",
+    ] {
+        assert!(RootRelativePath::parse(valid, 4096).is_ok(), "{valid:?}");
+        assert!(validator.is_valid(&serde_json::json!(valid)), "{valid:?}");
+    }
+    assert!(!validator.is_valid(&serde_json::json!("a".repeat(4097))));
+
+    let openapi: serde_json::Value = serde_json::to_value(
+        serde_yaml::from_str::<serde_yaml::Value>(include_str!("../../docs/api/openapi.yaml"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema,
+        &openapi["components"]["schemas"]["RepositoryDiscoverInput"]["oneOf"][1]["properties"]["map"]
+            ["properties"]["expandPaths"]["items"]
+    );
+}
+
+#[test]
+fn all_native_descriptor_versions_remain_legacy_compatible() {
+    for descriptor in catalog() {
+        assert_eq!(descriptor.identity().version().as_str(), "1.0.0");
+        assert_eq!(descriptor.spec().metadata["kit.native.version"], "1.0.0");
+    }
+}
+
+#[test]
+fn discover_implementation_digest_identifies_the_map_capable_implementation() {
+    let discover = catalog()
+        .iter()
+        .find(|descriptor| descriptor.tool() == NativeTool::Discover)
+        .unwrap();
+    let old = Digest::of(DigestAlgorithm::Blake3, b"kit-native-discover-1.0.0");
+    let map_capable = Digest::of(DigestAlgorithm::Blake3, b"kit-native-discover-map-1.0.0");
+    assert_ne!(discover.identity().implementation_digest(), old);
+    assert_eq!(discover.identity().implementation_digest(), map_capable);
+    assert_eq!(discover.identity().version().as_str(), "1.0.0");
 }
 
 #[test]

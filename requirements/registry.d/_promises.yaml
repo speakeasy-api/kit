@@ -10646,7 +10646,7 @@
   applicability: mandatory
   interpretation: Code-graph traversal is hop-bounded.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_817 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -10661,13 +10661,15 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-997
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_817 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -10692,7 +10694,7 @@
   applicability: mandatory
   interpretation: Code-graph traversal is degree-penalized.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_818 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -10707,13 +10709,15 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-998
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_818 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -10738,7 +10742,7 @@
   applicability: mandatory
   interpretation: Code-graph traversal is token-budgeted.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_819 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -10753,13 +10757,15 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-999
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_819 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -10784,7 +10790,7 @@
   applicability: mandatory
   interpretation: The personalized repository map is generated or updated when the task neighborhood changes rather than injected unchanged every turn.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_820 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -10799,13 +10805,16 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1000
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_820 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -10830,7 +10839,7 @@
   applicability: mandatory
   interpretation: Discover accepts query terms, roots, languages, relationship filters, an expansion cursor, and a token or item budget.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_821 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -10845,13 +10854,17 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1001
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_821 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -10935,7 +10948,7 @@
   applicability: mandatory
   interpretation: Discover can expand a path, symbol, relationship, or score band.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_823 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -10950,13 +10963,17 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - src/capabilities/native/catalog.rs
+  - src/capabilities/native/dispatch.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1003
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_823 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -26629,7 +26646,7 @@
   applicability: mandatory
   interpretation: Repository-map output contains signatures and selected source lines without exceeding its declared token budget.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_repo_833 exits 0 with 1 passed and 0 failed
+  - '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   primary_milestone: M005
   contributing_milestones: []
   dependencies: []
@@ -26644,13 +26661,15 @@
   - hostile
   release_gates:
   - G05
-  implementation_links: []
+  implementation_links:
+  - src/workspace/map/mod.rs
+  - tests/conformance/repo_map_bounds.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-M005-W07-C-833
+  evidence_id: EV-M005-W05-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_repo_833 exits 0 with 1 passed and 0 failed
+  expected_result: '`cargo test --locked --test conformance repo_map_bounds -- --test-threads=1` exits 0 with at least 1 selected test and 0 failed tests.'
   artifact_digest: null
   environment_digest: null
   versions: null

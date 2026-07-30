@@ -1543,15 +1543,89 @@ components:
     RepositoryRelativePath: {type: string, minLength: 1, maxLength: 4096}
     RepositoryDiscoverInput:
       $schema: https://json-schema.org/draft/2020-12/schema
-      type: object
-      required: [expected_revision, terms, roots, languages]
-      properties:
-        expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
-        terms: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 256}}
-        roots: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
-        languages: {type: array, maxItems: 32, items: {type: string}}
-        cursor: {type: [object, 'null']}
-      additionalProperties: false
+      oneOf:
+        - type: object
+          required: [expected_revision, terms, roots, languages]
+          properties:
+            expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+            terms: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 256}}
+            roots: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+            languages: {type: array, maxItems: 32, items: {type: string}}
+            cursor: {type: [object, 'null']}
+          additionalProperties: false
+        - type: object
+          required: [expected_revision, map]
+          properties:
+            expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+            map:
+              type: object
+              properties:
+                taskTerms: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 256}}
+                exactIdentifiers: {type: array, maxItems: 128, items: {type: string, pattern: '^[0-9a-f]{64}$'}}
+                stackFrames:
+                  type: array
+                  maxItems: 32
+                  items:
+                    type: object
+                    required: [path]
+                    properties:
+                      path: {$ref: '#/components/schemas/RepositoryRelativePath'}
+                      symbol: {type: [string, 'null'], minLength: 1, maxLength: 256}
+                      line: {type: [integer, 'null'], minimum: 1, maximum: 10000000}
+                    additionalProperties: false
+                recentlyReadPaths: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+                currentEditPaths: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+                pathPrefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
+                languages: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 64}}
+                relationships: {type: array, maxItems: 7, uniqueItems: true, items: {enum: [contains, contained_by, semantic_declaration, semantic_definition, semantic_type_definition, semantic_implementation, semantic_reference]}}
+                expansionSeeds: {type: array, maxItems: 128, uniqueItems: true, items: {type: string, pattern: '^[0-9a-f]{64}$'}}
+                expandPaths:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Exact canonical indexed file or directory paths. Every path must match. Repository-tree expansion returns path nodes and direct path edges; an exact file also deterministically seeds its indexed declarations.
+                  items:
+                    type: string
+                    minLength: 1
+                    maxLength: 4096
+                    allOf:
+                      - not: {pattern: '^/'}
+                      - not: {pattern: '^[A-Za-z]:'}
+                      - not: {pattern: '\\'}
+                      - not: {pattern: '\p{Cc}'}
+                      - not: {pattern: '[?*"<>|:]'}
+                      - not: {pattern: '(?:^|/)(?:/|$)'}
+                      - not: {pattern: '(?:^|/)\.{1,2}(?:/|$)'}
+                      - not: {pattern: '[. ](?:/|$)'}
+                      - not: {pattern: '(?:^|/)(?:[cC][oO][nN](?:[iI][nN]\$|[oO][uU][tT]\$)?|[pP][rR][nN]|[aA][uU][xX]|[nN][uU][lL]|[cC][oO][mM][1-9¹²³]|[lL][pP][tT][1-9¹²³])(?:\.|/|$)'}
+                    description: Lexically safe canonical root-relative path. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 4096-byte UTF-8 limit and portable path rules.
+                expandSymbols:
+                  type: array
+                  maxItems: 128
+                  uniqueItems: true
+                  description: Exact case-sensitive qualified or display symbols. An ambiguous exact display symbol selects all matches deterministically. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 256-byte UTF-8 limit.
+                  items: {type: string, minLength: 1, maxLength: 256}
+                scoreBand:
+                  type: [object, 'null']
+                  required: [min, max]
+                  description: Inclusive u64 declaration rank under kit-repository-map-v1. Every band must match at least one declaration.
+                  properties:
+                    min: {type: integer, minimum: 0, maximum: 18446744073709551615}
+                    max: {type: integer, minimum: 0, maximum: 18446744073709551615}
+                  additionalProperties: false
+                purpose: {enum: [dependencies, dependents, neighborhood]}
+                budgets:
+                  type: object
+                  properties:
+                    items: {type: integer, minimum: 1, maximum: 200}
+                    estimatedTokens: {type: integer, minimum: 1, maximum: 16384}
+                    hops: {type: integer, minimum: 0, maximum: 4}
+                    degree: {type: integer, minimum: 1, maximum: 64}
+                    resultBytes: {type: integer, minimum: 1, maximum: 61440}
+                  additionalProperties: false
+                cursor: {type: [string, 'null'], maxLength: 408, pattern: '^kitmap1_[0-9a-f]{400}$'}
+              additionalProperties: false
+          additionalProperties: false
     RepositorySearchInput:
       $schema: https://json-schema.org/draft/2020-12/schema
       oneOf:

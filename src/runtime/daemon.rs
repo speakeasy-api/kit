@@ -944,6 +944,8 @@ impl Daemon {
                 .restore_terminal(control, snapshot)
                 .map_err(|error| DaemonError::Setup(format!("executor API: {error:?}")))?;
         }
+        let native_semantic_evidence =
+            crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default();
         let mut executor_config = RunExecutorConfig::new(
             &database,
             Arc::clone(&artifact_store),
@@ -958,6 +960,7 @@ impl Daemon {
             config.native_diagnostic_adapters.clone(),
             config.native_feedback_limits.clone(),
         )
+        .with_native_semantic_evidence(native_semantic_evidence.clone())
         .with_native_edit_validation_time(config.native_edit_validation_time);
         if let Some(descriptor) = &config.native_formatter_descriptor {
             executor_config = executor_config
@@ -1036,8 +1039,8 @@ impl Daemon {
             .map_err(|error| DaemonError::Setup(error.to_string()))?;
         let authorizer = ScopedAuthorizer;
         let exec_service: Arc<dyn crate::api::http::exec::ExecService> = exec_manager.clone();
-        let repo_service: Arc<dyn crate::api::http::repo::RepoService> =
-            Arc::new(crate::api::http::repo::LazyNativeRepoService::new(
+        let repo_service: Arc<dyn crate::api::http::repo::RepoService> = Arc::new(
+            crate::api::http::repo::LazyNativeRepoService::with_semantic_evidence(
                 crate::api::http::repo::NativeRepoOptions {
                     database: database.clone(),
                     project_root: config.project_root.clone(),
@@ -1065,7 +1068,9 @@ impl Daemon {
                     check_completions: config.native_check_completions.clone(),
                 },
                 authority.clone(),
-            ));
+                native_semantic_evidence,
+            ),
+        );
         let service: Arc<dyn ServiceHandler> =
             Arc::new(Mutex::new(Service::with_runtime_and_config(
                 store,

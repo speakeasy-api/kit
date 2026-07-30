@@ -164,6 +164,23 @@ pub struct PendingToken {
     pub method: RequestMethod,
     pub server: ServerIdentity,
     pub position_encoding: PositionEncoding,
+    pub request_position: Option<RequestPosition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestPosition {
+    line: u32,
+    character: u32,
+}
+
+impl RequestPosition {
+    pub const fn line(self) -> u32 {
+        self.line
+    }
+
+    pub const fn character(self) -> u32 {
+        self.character
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -912,10 +929,92 @@ fn validate_json_rpc_id(id: &Value) -> Result<(), CodecError> {
     }
 }
 
+fn semantic_request_position(
+    method: &str,
+    uri: &str,
+    params: &Value,
+) -> Result<Option<RequestPosition>, SessionError> {
+    if !matches!(
+        method,
+        "textDocument/declaration"
+            | "textDocument/definition"
+            | "textDocument/typeDefinition"
+            | "textDocument/implementation"
+            | "textDocument/references"
+    ) {
+        return Ok(None);
+    }
+    let text_document = params
+        .get("textDocument")
+        .and_then(Value::as_object)
+        .ok_or(SessionError::InvalidRequestPosition)?;
+    if text_document.get("uri").and_then(Value::as_str) != Some(uri) {
+        return Err(SessionError::InvalidRequestPosition);
+    }
+    let position = params
+        .get("position")
+        .and_then(Value::as_object)
+        .ok_or(SessionError::InvalidRequestPosition)?;
+    let line = position
+        .get("line")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= i32::MAX as u32)
+        .ok_or(SessionError::InvalidRequestPosition)?;
+    let character = position
+        .get("character")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value <= i32::MAX as u32)
+        .ok_or(SessionError::InvalidRequestPosition)?;
+    Ok(Some(RequestPosition { line, character }))
+}
+
+fn valid_request_position(
+    text: &str,
+    position: RequestPosition,
+    encoding: PositionEncoding,
+) -> bool {
+    let target_line = position.line as usize;
+    let mut line_start = 0_usize;
+    for _ in 0..target_line {
+        let Some(newline) = text[line_start..].find('\n') else {
+            return false;
+        };
+        line_start += newline + 1;
+    }
+    let physical_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |newline| line_start + newline);
+    let line_end =
+        if physical_end > line_start && text.as_bytes().get(physical_end - 1) == Some(&b'\r') {
+            physical_end - 1
+        } else {
+            physical_end
+        };
+    let line = &text[line_start..line_end];
+    let character = position.character as usize;
+    match encoding {
+        PositionEncoding::Utf8 => character <= line.len() && line.is_char_boundary(character),
+        PositionEncoding::Utf16 => {
+            character == 0
+                || line
+                    .chars()
+                    .scan(0_usize, |units, character| {
+                        *units += character.len_utf16();
+                        Some(*units)
+                    })
+                    .any(|units| units == character)
+        }
+        PositionEncoding::Utf32 => character <= line.chars().count(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionError {
     InvalidLimits,
     InvalidScope,
+    InvalidRequestPosition,
     CapacityExceeded,
     DocumentCapacityExceeded,
     DocumentTooLarge,
@@ -1441,6 +1540,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
         {
             return Err(SessionError::InvalidScope);
         }
+        let request_position = semantic_request_position(method, uri, &params)?;
         let limits = self.limits;
         let clock = &self.clock;
         let process_ids = &mut self.process_ids;
@@ -1456,6 +1556,11 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             .documents
             .get(uri)
             .ok_or(SessionError::DocumentNotFound)?;
+        if request_position.is_some_and(|position| {
+            !valid_request_position(&document.text, position, session.scope.position_encoding)
+        }) {
+            return Err(SessionError::InvalidRequestPosition);
+        }
         if session.pending.len() >= limits.max_pending_requests {
             return Err(SessionError::PendingCapacityExceeded);
         }
@@ -1477,6 +1582,7 @@ impl<L: OwnedLspLauncher, C: TickClock> LspSessionManager<L, C> {
             method: RequestMethod(method.to_owned()),
             server: session.scope.server.clone(),
             position_encoding: session.scope.position_encoding,
+            request_position,
         };
         send_session(
             session,

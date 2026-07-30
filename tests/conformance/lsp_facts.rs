@@ -260,13 +260,28 @@ fn accepted(
             text.to_owned(),
         )
         .unwrap();
+    let params = if matches!(
+        method,
+        "textDocument/declaration"
+            | "textDocument/definition"
+            | "textDocument/typeDefinition"
+            | "textDocument/implementation"
+            | "textDocument/references"
+    ) {
+        json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": 0, "character": 0}
+        })
+    } else {
+        json!({})
+    };
     let token = manager
         .request(
             service,
             revision,
             uri,
             method,
-            json!({}),
+            params,
             manager.now_tick() + 10_000,
         )
         .unwrap();
@@ -425,6 +440,14 @@ fn semantic_locations_require_the_exact_accepted_current_fence() {
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].range().start(), 3);
     assert_eq!(facts[0].range().end(), 7);
+    assert_eq!(facts[0].origin_point(), 0);
+    assert_eq!(
+        (
+            facts[0].origin_range().start(),
+            facts[0].origin_range().end()
+        ),
+        (0, 0)
+    );
     assert_eq!(
         facts[0].classification(),
         RepositoryFactClassification::Semantic
@@ -442,7 +465,7 @@ fn semantic_locations_require_the_exact_accepted_current_fence() {
         "textDocument/implementation",
         PositionEncoding::Utf16,
         json!([{
-            "originSelectionRange":{"start":{"line":0,"character":3},"end":{"line":0,"character":7}},
+            "originSelectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":7}},
             "targetUri":uri,
             "targetRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":12}},
             "targetSelectionRange":{"start":{"line":0,"character":3},"end":{"line":0,"character":7}}
@@ -451,7 +474,26 @@ fn semantic_locations_require_the_exact_accepted_current_fence() {
     let links = normalize_semantic_locations(&snapshot, &link_response).unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].target_range().unwrap().start(), 0);
-    assert_eq!(links[0].origin_selection_range().unwrap().end(), 7);
+    assert_eq!(links[0].origin_range().end(), 7);
+
+    let mismatched_link = accepted(
+        &uri,
+        current,
+        7,
+        "fn main() {}\n",
+        "textDocument/implementation",
+        PositionEncoding::Utf16,
+        json!([{
+            "originSelectionRange":{"start":{"line":0,"character":3},"end":{"line":0,"character":7}},
+            "targetUri":uri,
+            "targetRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":12}},
+            "targetSelectionRange":{"start":{"line":0,"character":3},"end":{"line":0,"character":7}}
+        }]),
+    );
+    assert_eq!(
+        normalize_semantic_locations(&snapshot, &mismatched_link),
+        Err(LspNormalizeError::MalformedRange)
+    );
 
     let stale = self::snapshot(
         &fixture,

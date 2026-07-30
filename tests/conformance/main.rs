@@ -33,6 +33,7 @@ mod process_output;
 mod prompt_determinism;
 mod repo_api;
 mod repo_discover;
+mod repo_map_bounds;
 mod repo_search;
 mod req_lint;
 mod retention_model;

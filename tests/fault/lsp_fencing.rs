@@ -444,6 +444,72 @@ fn stale_document_versions_are_discarded_100_of_100_then_current_is_accepted() {
 }
 
 #[test]
+fn semantic_request_position_is_validated_and_fenced_in_the_pending_token() {
+    let (mut manager, state, _) = manager();
+    let workspace_revision = revision(36);
+    let service = open_document(
+        &mut manager,
+        scope(RevisionPolicy::ManagedLive),
+        workspace_revision,
+    );
+    let token = manager
+        .request(
+            service,
+            workspace_revision,
+            URI,
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": URI},
+                "position": {"line": 0, "character": 1}
+            }),
+            100,
+        )
+        .unwrap();
+    let position = token.request_position.unwrap();
+    assert_eq!((position.line(), position.character()), (0, 1));
+
+    let sent = state
+        .lock()
+        .unwrap()
+        .method_count("textDocument/definition");
+    for params in [
+        json!({}),
+        json!({
+            "textDocument": {"uri": "file:///workspace/other.test"},
+            "position": {"line": 0, "character": 1}
+        }),
+        json!({
+            "textDocument": {"uri": URI},
+            "position": {"line": -1, "character": 1}
+        }),
+        json!({
+            "textDocument": {"uri": URI},
+            "position": {"line": 0, "character": 4}
+        }),
+    ] {
+        assert_eq!(
+            manager.request(
+                service,
+                workspace_revision,
+                URI,
+                "textDocument/definition",
+                params,
+                100,
+            ),
+            Err(SessionError::InvalidRequestPosition)
+        );
+    }
+    assert_eq!(
+        state
+            .lock()
+            .unwrap()
+            .method_count("textDocument/definition"),
+        sent
+    );
+    manager.shutdown().unwrap();
+}
+
+#[test]
 fn old_generation_and_wrong_id_cannot_complete_a_current_request() {
     let (mut manager, _, _) = manager();
     let workspace_revision = revision(2);

@@ -23,6 +23,15 @@ pub const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/sch
 pub const MAX_NATIVE_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_OUTPUT_BYTES: usize = 64 * 1024;
 const VERSION: &str = "1.0.0";
+pub(crate) const NATIVE_MAP_MAX_ITEMS: usize = 200;
+pub(crate) const NATIVE_MAP_MAX_ESTIMATED_TOKENS: usize = 16_384;
+pub(crate) const NATIVE_MAP_MAX_HOPS: usize = 4;
+pub(crate) const NATIVE_MAP_MAX_DEGREE: usize = 64;
+pub(crate) const NATIVE_MAP_MAX_RESULT_BYTES: usize = 60 * 1024;
+pub(crate) const NATIVE_MAP_MAX_RELATIONSHIPS: usize = 7;
+pub(crate) const NATIVE_MAP_MAX_EXPANSION_SELECTORS: usize = 128;
+pub(crate) const NATIVE_MAP_MAX_SEMANTIC_RELATIONSHIPS: usize = 128;
+pub(crate) const NATIVE_MAP_MAX_SEMANTIC_EVIDENCE_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -267,7 +276,11 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
     .with_annotations(annotations)
     .with_metadata(metadata)
     .with_output_limit(ToolOutputLimit::fail(MAX_NATIVE_OUTPUT_BYTES));
-    let implementation = format!("kit-native-{}-{VERSION}", tool.short_name());
+    let implementation = if tool == NativeTool::Discover {
+        format!("kit-native-discover-map-{VERSION}")
+    } else {
+        format!("kit-native-{}-{VERSION}", tool.short_name())
+    };
     NativeToolDescriptor {
         tool,
         spec,
@@ -290,7 +303,7 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
 fn description(tool: NativeTool) -> &'static str {
     match tool {
         NativeTool::Discover => {
-            "Select for ranked repository tree, symbol, and relationship discovery at an expected revision; do not select for exact text lookup. Saves no workspace changes and returns at most 64 KiB with a revision-bound cursor. Example: {\"expected_revision\":\"r:<64 hex>\",\"terms\":[\"Config\"],\"roots\":[],\"languages\":[]}."
+            "Select for ranked repository tree, symbol, relationship, or personalized declaration-map discovery at an expected revision; do not select for exact text lookup. Saves no workspace changes and returns at most 64 KiB with mode-specific revision-bound cursors. Example: {\"expected_revision\":\"r:<64 hex>\",\"map\":{\"taskTerms\":[\"Config\"]}}."
         }
         NativeTool::Search => {
             "Select for exact lexical or Rust structural lookup and read-only rewrite previews at an expected revision; do not select to apply changes. Saves no workspace changes and returns at most 64 KiB; changed structural rewrites include an opaque single-use apply token and change diff. Example: {\"expected_revision\":\"r:<64 hex>\",\"text\":\"Some($A)\",\"mode\":\"structural\",\"rewrite\":\"Ok($A)\",\"path_prefixes\":[],\"languages\":[\"rust\"]}."
@@ -328,18 +341,107 @@ fn relative_path() -> Value {
     json!({"maxLength": 4096, "minLength": 1, "type": "string"})
 }
 
+fn expansion_path() -> Value {
+    json!({
+        "allOf": [
+            {"not": {"pattern": "^/"}},
+            {"not": {"pattern": "^[A-Za-z]:"}},
+            {"not": {"pattern": r"\\"}},
+            {"not": {"pattern": r"\p{Cc}"}},
+            {"not": {"pattern": r#"[?*"<>|:]"#}},
+            {"not": {"pattern": "(?:^|/)(?:/|$)"}},
+            {"not": {"pattern": r"(?:^|/)\.{1,2}(?:/|$)"}},
+            {"not": {"pattern": r"[. ](?:/|$)"}},
+            {"not": {"pattern": r"(?:^|/)(?:[cC][oO][nN](?:[iI][nN]\$|[oO][uU][tT]\$)?|[pP][rR][nN]|[aA][uU][xX]|[nN][uU][lL]|[cC][oO][mM][1-9¹²³]|[lL][pP][tT][1-9¹²³])(?:\.|/|$)"}}
+        ],
+        "description": "Lexically safe canonical root-relative path. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 4096-byte UTF-8 limit and portable path rules.",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+    })
+}
+
 fn input_schema(tool: NativeTool) -> Value {
     match tool {
-        NativeTool::Discover => object(
-            json!({
-                "cursor": {"type": ["object", "null"]},
-                "expected_revision": revision(),
-                "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
-                "roots": {"items": relative_path(), "maxItems": 32, "type": "array"},
-                "terms": {"items": {"maxLength": 256, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"}
-            }),
-            &["expected_revision", "terms", "roots", "languages"],
-        ),
+        NativeTool::Discover => {
+            let mut legacy = object(
+                json!({
+                    "cursor": {"type": ["object", "null"]},
+                    "expected_revision": revision(),
+                    "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
+                    "roots": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                    "terms": {"items": {"maxLength": 256, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"}
+                }),
+                &["expected_revision", "terms", "roots", "languages"],
+            );
+            legacy
+                .as_object_mut()
+                .expect("object schema")
+                .remove("$schema");
+            let mut map = object(
+                json!({
+                    "expected_revision": revision(),
+                    "map": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "budgets": {
+                                "additionalProperties": false,
+                                "properties": {
+                                    "degree": {"maximum": NATIVE_MAP_MAX_DEGREE, "minimum": 1, "type": "integer"},
+                                    "estimatedTokens": {"maximum": NATIVE_MAP_MAX_ESTIMATED_TOKENS, "minimum": 1, "type": "integer"},
+                                    "hops": {"maximum": NATIVE_MAP_MAX_HOPS, "minimum": 0, "type": "integer"},
+                                    "items": {"maximum": NATIVE_MAP_MAX_ITEMS, "minimum": 1, "type": "integer"},
+                                    "resultBytes": {"maximum": NATIVE_MAP_MAX_RESULT_BYTES, "minimum": 1, "type": "integer"}
+                                },
+                                "type": "object"
+                            },
+                            "cursor": {"maxLength": crate::workspace::map::MAP_CURSOR_TOKEN_LENGTH, "pattern": "^kitmap1_[0-9a-f]{400}$", "type": ["string", "null"]},
+                            "currentEditPaths": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                            "exactIdentifiers": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": 128, "type": "array"},
+                            "expandPaths": {"description": "Exact canonical indexed file or directory paths. Every path must match. Repository-tree expansion returns path nodes and direct path edges; an exact file also deterministically seeds its indexed declarations.", "items": expansion_path(), "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "expandSymbols": {"description": "Exact case-sensitive qualified or display symbols. An ambiguous exact display symbol selects all matches deterministically. maxLength is a conservative character prefilter; runtime validation authoritatively enforces the 256-byte UTF-8 limit.", "items": {"maxLength": 256, "minLength": 1, "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "expansionSeeds": {"items": {"pattern": "^[0-9a-f]{64}$", "type": "string"}, "maxItems": NATIVE_MAP_MAX_EXPANSION_SELECTORS, "type": "array", "uniqueItems": true},
+                            "languages": {"items": {"maxLength": 64, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"},
+                            "pathPrefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                            "purpose": {"enum": ["dependencies", "dependents", "neighborhood"]},
+                            "recentlyReadPaths": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                            "relationships": {"items": {"enum": ["contains", "contained_by", "semantic_declaration", "semantic_definition", "semantic_type_definition", "semantic_implementation", "semantic_reference"]}, "maxItems": NATIVE_MAP_MAX_RELATIONSHIPS, "type": "array", "uniqueItems": true},
+                            "scoreBand": {
+                                "additionalProperties": false,
+                                "description": "Inclusive u64 declaration rank under kit-repository-map-v1. Every band must match at least one declaration.",
+                                "properties": {
+                                    "max": {"maximum": 18446744073709551615_u64, "minimum": 0, "type": "integer"},
+                                    "min": {"maximum": 18446744073709551615_u64, "minimum": 0, "type": "integer"}
+                                },
+                                "required": ["min", "max"],
+                                "type": ["object", "null"]
+                            },
+                            "stackFrames": {
+                                "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "line": {"maximum": 10000000, "minimum": 1, "type": ["integer", "null"]},
+                                        "path": relative_path(),
+                                        "symbol": {"maxLength": 256, "minLength": 1, "type": ["string", "null"]}
+                                    },
+                                    "required": ["path"],
+                                    "type": "object"
+                                },
+                                "maxItems": 32,
+                                "type": "array"
+                            },
+                            "taskTerms": {"items": {"maxLength": 256, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"}
+                        },
+                        "type": "object"
+                    }
+                }),
+                &["expected_revision", "map"],
+            );
+            map.as_object_mut()
+                .expect("object schema")
+                .remove("$schema");
+            json!({"$schema": JSON_SCHEMA_DIALECT, "oneOf": [legacy, map]})
+        }
         NativeTool::Search => {
             let mut lexical = object(
                 json!({

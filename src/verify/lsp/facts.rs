@@ -93,6 +93,7 @@ impl SemanticPath {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactOrigin {
     uri: Arc<str>,
+    path: SemanticPath,
     document_version: DocumentVersion,
     request_generation: u64,
     request_id: RequestId,
@@ -101,6 +102,10 @@ pub struct FactOrigin {
 impl FactOrigin {
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    pub const fn path(&self) -> &SemanticPath {
+        &self.path
     }
 
     pub const fn document_version(&self) -> DocumentVersion {
@@ -168,7 +173,8 @@ pub struct SemanticFact {
     path: SemanticPath,
     range: SemanticByteRange,
     target_range: Option<SemanticByteRange>,
-    origin_selection_range: Option<SemanticByteRange>,
+    origin_point: usize,
+    origin_range: SemanticByteRange,
     provenance: Arc<SemanticProvenance>,
 }
 
@@ -189,8 +195,12 @@ impl SemanticFact {
         self.target_range.as_ref()
     }
 
-    pub const fn origin_selection_range(&self) -> Option<&SemanticByteRange> {
-        self.origin_selection_range.as_ref()
+    pub const fn origin_point(&self) -> usize {
+        self.origin_point
+    }
+
+    pub const fn origin_range(&self) -> &SemanticByteRange {
+        &self.origin_range
     }
 
     pub fn provenance(&self) -> &SemanticProvenance {
@@ -729,18 +739,35 @@ pub fn normalize_semantic_locations(
     if values.len() > snapshot.fact_limits.max_facts {
         return Err(LspNormalizeError::LimitExceeded);
     }
+    let mut position_budget = PositionBudget::new(snapshot.fact_limits.max_position_work_bytes);
+    let token = accepted.token();
+    let request_position = token
+        .request_position
+        .ok_or(LspNormalizeError::MalformedPayload)?;
+    let origin_path = snapshot.resolve_uri(&token.uri)?;
+    let origin_text = snapshot.text_for_uri(&token.uri, &origin_path)?;
+    let origin_point = convert_position(
+        origin_text,
+        PositionWire {
+            line: u64::from(request_position.line()),
+            character: u64::from(request_position.character()),
+        },
+        snapshot.position_encoding,
+        &mut position_budget,
+    )?;
     let mut output_budget = OutputBudget::new(snapshot.fact_limits.max_retained_output_bytes);
     output_budget.charge(
         accepted
             .token()
             .uri
             .len()
-            .checked_add(server_retained_bytes(&accepted.token().server))
+            .checked_add(origin_path.as_str().len())
+            .and_then(|value| value.checked_add(server_retained_bytes(&accepted.token().server)))
             .and_then(|value| value.checked_add(std::mem::size_of::<SemanticProvenance>()))
             .and_then(|value| value.checked_add(4 * std::mem::size_of::<usize>()))
             .ok_or(LspNormalizeError::LimitExceeded)?,
     )?;
-    let origin = origin(accepted.token());
+    let origin = origin(accepted.token(), SemanticPath(origin_path));
     let provenance = Arc::new(SemanticProvenance {
         classification: RepositoryFactClassification::Semantic,
         source: RepositoryFactProvenance::Lsp,
@@ -750,7 +777,6 @@ pub fn normalize_semantic_locations(
         position_encoding: accepted.token().position_encoding,
         confidence: NormalizedConfidence::ExactSource,
     });
-    let mut position_budget = PositionBudget::new(snapshot.fact_limits.max_position_work_bytes);
     let mut facts = Vec::with_capacity(values.len());
     let mut representation = None;
     for value in values {
@@ -764,7 +790,7 @@ pub fn normalize_semantic_locations(
         {
             return Err(LspNormalizeError::MalformedPayload);
         }
-        let (uri, range, target_range, origin_selection_range) = if is_link {
+        let (uri, range, target_range, origin_range) = if is_link {
             let link: LocationLinkWire = serde_json::from_value(value.clone())
                 .map_err(|_| LspNormalizeError::MalformedPayload)?;
             let path = snapshot.resolve_uri(&link.target_uri)?;
@@ -797,7 +823,19 @@ pub fn normalize_semantic_locations(
                         &mut position_budget,
                     )
                 })
-                .transpose()?;
+                .transpose()?
+                .unwrap_or(SemanticByteRange {
+                    start: origin_point,
+                    end: origin_point,
+                });
+            let contains_origin = if origin_range.start == origin_range.end {
+                origin_point == origin_range.start
+            } else {
+                origin_range.start <= origin_point && origin_point < origin_range.end
+            };
+            if !contains_origin {
+                return Err(LspNormalizeError::MalformedRange);
+            }
             (link.target_uri, selection, Some(target), origin_range)
         } else {
             let location: LocationWire = serde_json::from_value(value.clone())
@@ -810,7 +848,15 @@ pub fn normalize_semantic_locations(
                 snapshot.position_encoding,
                 &mut position_budget,
             )?;
-            (location.uri, range, None, None)
+            (
+                location.uri,
+                range,
+                None,
+                SemanticByteRange {
+                    start: origin_point,
+                    end: origin_point,
+                },
+            )
         };
         let path = snapshot.resolve_uri(&uri)?;
         output_budget.charge(
@@ -824,7 +870,8 @@ pub fn normalize_semantic_locations(
             path: SemanticPath(path),
             range,
             target_range,
-            origin_selection_range,
+            origin_point,
+            origin_range,
             provenance: provenance.clone(),
         });
     }
@@ -1486,9 +1533,10 @@ fn validate_notification(
     Ok(())
 }
 
-fn origin(token: &PendingToken) -> FactOrigin {
+fn origin(token: &PendingToken, path: SemanticPath) -> FactOrigin {
     FactOrigin {
         uri: Arc::from(token.uri.as_str()),
+        path,
         document_version: token.document_version,
         request_generation: token.generation,
         request_id: token.request_id,

@@ -365,6 +365,7 @@ enum LazyNativeRepoState {
     Uninitialized {
         options: Box<NativeRepoOptions>,
         authority: ControlPlaneAuthority,
+        semantic_evidence: crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
     },
     Ready(Box<NativeRepoService>),
     Failed(String),
@@ -377,13 +378,18 @@ pub(crate) struct LazyNativeRepoService {
 }
 
 impl LazyNativeRepoService {
-    pub(crate) fn new(options: NativeRepoOptions, authority: ControlPlaneAuthority) -> Self {
+    pub(crate) fn with_semantic_evidence(
+        options: NativeRepoOptions,
+        authority: ControlPlaneAuthority,
+        semantic_evidence: crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
+    ) -> Self {
         let database = options.database.clone();
         let artifacts = Arc::clone(&options.artifacts);
         let state = match migrate(&database) {
             Ok(()) => LazyNativeRepoState::Uninitialized {
                 options: Box::new(options),
                 authority,
+                semantic_evidence,
             },
             Err(error) => LazyNativeRepoState::Failed(error),
         };
@@ -406,19 +412,37 @@ impl LazyNativeRepoService {
             LazyNativeRepoState::Uninitialized { .. } => unreachable!(),
         }
     }
+
+    #[cfg(test)]
+    fn shares_semantic_evidence_with(
+        &self,
+        evidence: &crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
+    ) -> bool {
+        self.state.lock().is_ok_and(|state| match &*state {
+            LazyNativeRepoState::Uninitialized {
+                semantic_evidence, ..
+            } => semantic_evidence.shares_state_with(evidence),
+            LazyNativeRepoState::Ready(_) | LazyNativeRepoState::Failed(_) => false,
+        })
+    }
 }
 
 fn initialize(state: &mut LazyNativeRepoState) {
     if !matches!(state, LazyNativeRepoState::Uninitialized { .. }) {
         return;
     }
-    let LazyNativeRepoState::Uninitialized { options, authority } = std::mem::replace(
+    let LazyNativeRepoState::Uninitialized {
+        options,
+        authority,
+        semantic_evidence,
+    } = std::mem::replace(
         state,
         LazyNativeRepoState::Failed("repository initialization interrupted".to_owned()),
-    ) else {
+    )
+    else {
         unreachable!()
     };
-    *state = match NativeRepoService::open(*options, &authority) {
+    *state = match NativeRepoService::open(*options, &authority, semantic_evidence) {
         Ok(service) => LazyNativeRepoState::Ready(Box::new(service)),
         Err(error) => LazyNativeRepoState::Failed(error),
     };
@@ -506,6 +530,7 @@ impl NativeRepoService {
     pub(crate) fn open(
         options: NativeRepoOptions,
         authority: &ControlPlaneAuthority,
+        semantic_evidence: crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
     ) -> Result<Self, String> {
         let root = std::fs::canonicalize(&options.project_root)
             .map_err(|error| format!("trusted project root unavailable: {error}"))?;
@@ -664,6 +689,7 @@ impl NativeRepoService {
                         limits: options.feedback_limits,
                     },
                 ),
+                semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: options.edit_validation_time,
                 #[cfg(test)]
                 run_runner: None,
@@ -3765,6 +3791,44 @@ mod tests {
     use super::*;
     use crate::domain::ids::PrincipalId;
 
+    struct Registry;
+
+    impl crate::executor::process::own::ProcessRegistry for Registry {
+        fn prepared(
+            &self,
+            _: crate::executor::process::own::ProcessRegistrationContext,
+            _: crate::domain::lifecycle::ProcessClaim,
+            _: &crate::executor::process::tree::PersistedBoundary,
+            _: crate::executor::process::own::ProcessTerminalConfig,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn started(
+            &self,
+            _: crate::executor::process::own::ProcessRegistrationContext,
+            _: &crate::executor::process::own::ProcessRecord,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn exited(
+            &self,
+            _: crate::executor::process::own::ProcessRegistrationContext,
+            _: &crate::executor::process::own::ProcessRecord,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn outcome_unknown(
+            &self,
+            _: crate::executor::process::own::ProcessRegistrationContext,
+            _: crate::domain::ids::ProcessId,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn database(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
             "kit-repository-api-{name}-{}-{}",
@@ -3788,6 +3852,53 @@ mod tests {
             snapshot
         };
         AuthenticatedPrincipal::from_grants(snapshot)
+    }
+
+    #[test]
+    fn lazy_repo_service_uses_the_injected_native_semantic_evidence_store() {
+        let database = database("shared-semantic-evidence");
+        let directory = database.parent().unwrap().to_owned();
+        let project_root = directory.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(project_root.join("lib.rs"), "fn source() {}\n").unwrap();
+        let principal_id = PrincipalId::from_stable_bytes(b"semantic-evidence-owner");
+        let project_id = ProjectId::from_stable_bytes(b"semantic-evidence-project");
+        let evidence =
+            crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default();
+        let service = LazyNativeRepoService::with_semantic_evidence(
+            NativeRepoOptions {
+                database: database.clone(),
+                project_root,
+                scratch: directory.join("scratch"),
+                artifacts: Arc::new(ArtifactStore::open(directory.join("artifacts")).unwrap()),
+                principal_id,
+                project_id,
+                provider: Provider::Anthropic,
+                process_registration: ProcessRegistryRegistration::new(
+                    Arc::new(Registry),
+                    crate::executor::process::own::ProcessRegistrationContext {
+                        project_id,
+                        principal_id,
+                    },
+                ),
+                cancellation: SqliteCancellationCoordinator::new(&database),
+                container_image: None,
+                verification_registry: crate::verify::profiles::VerificationRegistry::empty(),
+                formatter: None,
+                formatter_required: false,
+                diagnostic_adapters: BTreeMap::new(),
+                feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
+                edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
+                    .max_validation_time,
+                #[cfg(debug_assertions)]
+                check_completions: Vec::new(),
+            },
+            ControlPlaneAuthority::for_test(),
+            evidence.clone(),
+        );
+
+        assert!(service.shares_semantic_evidence_with(&evidence));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn insert_operation(
@@ -3911,6 +4022,53 @@ mod tests {
             )
             .unwrap();
         (principal_id, project_id)
+    }
+
+    #[test]
+    fn queued_legacy_discover_payload_remains_compatible_with_current_descriptor() {
+        let database = database("legacy-discover-queued");
+        let _store = crate::test_support::open_sqlite_store(&database).unwrap();
+        migrate(&database).unwrap();
+        let principal_id = PrincipalId::from_stable_bytes(b"legacy-discover-owner");
+        let project_id = ProjectId::from_stable_bytes(b"legacy-discover-project");
+        let id = ToolCallId::from_stable_bytes(b"legacy-discover-operation");
+        let connection = open_repository_connection(&database).unwrap();
+        insert_operation(
+            &connection,
+            id,
+            principal_id,
+            project_id,
+            NativeTool::Discover,
+            "queued",
+        );
+        let legacy = serde_json::to_vec(&json!({
+            "expected_revision": format!("r:{}", "a".repeat(64)),
+            "terms": ["Config"],
+            "roots": [],
+            "languages": ["rust"],
+            "cursor": null
+        }))
+        .unwrap();
+        connection
+            .execute(
+                "UPDATE repository_operations SET input=?2 WHERE result_id=?1",
+                params![id.to_string(), legacy],
+            )
+            .unwrap();
+
+        let queued = load_operation(&database, &id.to_string()).unwrap();
+        let input: Value = serde_json::from_slice(&queued.input).unwrap();
+        let descriptor = NativeCatalog::all()
+            .iter()
+            .find(|descriptor| descriptor.tool() == NativeTool::Discover)
+            .unwrap();
+        assert_eq!(descriptor.identity().version().as_str(), "1.0.0");
+        assert!(
+            jsonschema::validator_for(&descriptor.spec().input_schema)
+                .unwrap()
+                .is_valid(&input)
+        );
+        assert!(input.get("map").is_none());
     }
 
     fn create_legacy_repository(database: &Path, count: usize) {

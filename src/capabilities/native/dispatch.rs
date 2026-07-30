@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -28,10 +28,18 @@ use crate::{
     },
     store::artifacts::{ArtifactRetention, ArtifactStore},
     telemetry::redact::{CaptureBoundary, CaptureRedactor},
+    verify::lsp::facts::SemanticFact,
     verify::profiles::{ProfileSelection, VerificationRegistry},
     workspace::{
         acquire::AcquisitionResult,
+        edit::ir::RootRelativePath,
         index::meta::{IndexOptions, MetadataIndex},
+        map::{
+            DeclarationId, ExpansionPurpose, ExpansionRequest, MapBound, MapBudget, MapCursor,
+            MapError, MapLimits, Personalization, RelationshipKind, RepositoryMapRequest,
+            ScoreBand, SemanticRelationship, StackFrame, build_repository_map,
+            validate_semantic_evidence,
+        },
         read::{ArtifactContext, ReadOptions, ReadRange, ReadRequest, read},
         revision::{ManagedWorkspace, RevisionId, RevisionOptions},
         search::{
@@ -55,6 +63,12 @@ pub(crate) struct NativeFeedbackRuntime {
     pub limits: crate::verify::feedback::FeedbackLimits,
 }
 
+use super::catalog::{
+    NATIVE_MAP_MAX_DEGREE, NATIVE_MAP_MAX_ESTIMATED_TOKENS, NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+    NATIVE_MAP_MAX_HOPS, NATIVE_MAP_MAX_ITEMS, NATIVE_MAP_MAX_RELATIONSHIPS,
+    NATIVE_MAP_MAX_RESULT_BYTES, NATIVE_MAP_MAX_SEMANTIC_EVIDENCE_BYTES,
+    NATIVE_MAP_MAX_SEMANTIC_RELATIONSHIPS,
+};
 use super::{MAX_NATIVE_OUTPUT_BYTES, NativeCatalog, NativeTool};
 
 const MAX_RUN_CPU_MILLIS: u64 = 60_000;
@@ -165,9 +179,141 @@ pub(crate) struct NativeRuntime {
     pub formatter_required: bool,
     pub formatter: Option<NativeFormatterRuntime>,
     pub feedback: Option<NativeFeedbackRuntime>,
+    pub semantic_evidence: NativeSemanticEvidenceStore,
     pub edit_validation_time: std::time::Duration,
     #[cfg(test)]
     pub run_runner: Option<CheckRunner>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeSemanticRelationship {
+    pub source_declaration: DeclarationId,
+    pub fact: SemanticFact,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct NativeSemanticEvidenceStore {
+    inner: Arc<Mutex<NativeSemanticEvidenceState>>,
+}
+
+#[derive(Default)]
+struct NativeSemanticEvidenceState {
+    revision: Option<RevisionId>,
+    relationships: Vec<NativeSemanticRelationship>,
+}
+
+impl NativeSemanticEvidenceStore {
+    #[allow(dead_code)]
+    pub(crate) fn publish(
+        &self,
+        index: &MetadataIndex,
+        relationship: NativeSemanticRelationship,
+    ) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "native semantic evidence store unavailable".to_owned())?;
+        if state
+            .revision
+            .is_some_and(|revision| revision != index.revision())
+        {
+            return Err("native semantic evidence revision mismatch".to_owned());
+        }
+        let mut relationships = state.relationships.clone();
+        relationships.push(relationship);
+        validate_native_semantic_replacement(index, &relationships)?;
+        relationships = relationships.into_boxed_slice().into_vec();
+        state.revision = Some(index.revision());
+        state.relationships = relationships;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn replace(
+        &self,
+        index: &MetadataIndex,
+        mut relationships: Vec<NativeSemanticRelationship>,
+    ) -> Result<(), String> {
+        if relationships.is_empty() {
+            return self.clear();
+        }
+        validate_native_semantic_replacement(index, &relationships)?;
+        relationships = relationships.into_boxed_slice().into_vec();
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "native semantic evidence store unavailable".to_owned())?;
+        state.revision = Some(index.revision());
+        state.relationships = relationships;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear(&self) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "native semantic evidence store unavailable".to_owned())?;
+        state.revision = None;
+        state.relationships.clear();
+        Ok(())
+    }
+
+    fn snapshot(
+        &self,
+        revision: RevisionId,
+    ) -> Result<Vec<NativeSemanticRelationship>, NativeMapError> {
+        let state = self.inner.lock().map_err(|_| NativeMapError::Unavailable)?;
+        if state.relationships.is_empty() {
+            return Err(NativeMapError::SemanticEvidenceUnavailable);
+        }
+        if state.revision != Some(revision) {
+            return Err(NativeMapError::EvidenceStale);
+        }
+        Ok(state.relationships.clone())
+    }
+
+    fn clear_if_stale(&self, revision: RevisionId) {
+        if let Ok(mut state) = self.inner.lock()
+            && state.revision.is_some_and(|stored| stored != revision)
+        {
+            state.revision = None;
+            state.relationships.clear();
+        }
+    }
+
+    fn available(&self, revision: RevisionId) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|state| state.revision == Some(revision) && !state.relationships.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+#[allow(dead_code)]
+fn validate_native_semantic_replacement(
+    index: &MetadataIndex,
+    relationships: &[NativeSemanticRelationship],
+) -> Result<(), String> {
+    validate_native_semantic_store(relationships)?;
+    if relationships
+        .iter()
+        .any(|relationship| relationship.fact.provenance().revision() != index.revision())
+    {
+        return Err("native semantic evidence revision mismatch".to_owned());
+    }
+    let evidence = relationships
+        .iter()
+        .map(|relationship| {
+            SemanticRelationship::new(relationship.source_declaration, &relationship.fact)
+        })
+        .collect::<Vec<_>>();
+    validate_semantic_evidence(index, &evidence, bounded_map_limits())
+        .map_err(|error| format!("native semantic evidence rejected: {error}"))
 }
 
 pub(crate) struct NativeDispatcher {
@@ -195,6 +341,7 @@ pub(crate) struct NativeDispatcher {
     formatter_required: bool,
     formatter: Option<NativeFormatterRuntime>,
     feedback: Option<NativeFeedbackRuntime>,
+    semantic_evidence: NativeSemanticEvidenceStore,
     edit_validation_time: std::time::Duration,
     #[cfg(test)]
     run_runner: Option<CheckRunner>,
@@ -249,6 +396,7 @@ impl NativeDispatcher {
             formatter_required: runtime.formatter_required,
             formatter: runtime.formatter,
             feedback: runtime.feedback,
+            semantic_evidence: runtime.semantic_evidence,
             edit_validation_time: runtime.edit_validation_time,
             #[cfg(test)]
             run_runner: runtime.run_runner,
@@ -384,6 +532,55 @@ impl NativeDispatcher {
     fn discover(&mut self, bytes: &[u8]) -> Result<(Value, Vec<String>), String> {
         self.ensure_not_cancelled()?;
         let input: DiscoverInput = decode(bytes)?;
+        if let DiscoverInput::Map(input) = input {
+            let (request, cursor) = native_map_request(input.map).map_err(NativeMapError::code)?;
+            let (workspace, index) = self.workspace_index(&input.expected_revision)?;
+            let semantic_requested = request
+                .expansion
+                .relationships
+                .iter()
+                .any(|relationship| relationship.is_semantic());
+            let stored = if semantic_requested {
+                self.semantic_evidence
+                    .snapshot(index.revision())
+                    .map_err(NativeMapError::code)?
+            } else {
+                self.semantic_evidence.clear_if_stale(index.revision());
+                Vec::new()
+            };
+            let evidence = native_semantic_evidence(&stored, index.revision())
+                .map_err(NativeMapError::code)?;
+            let semantic_evidence_available = self.semantic_evidence.available(index.revision());
+            let response = build_repository_map(
+                &workspace,
+                &index,
+                &request,
+                &evidence,
+                bounded_map_limits(),
+                cursor.as_ref(),
+            )
+            .map_err(NativeMapError::from)
+            .map_err(NativeMapError::code)?;
+            let bytes = response
+                .to_canonical_json()
+                .map_err(|_| "map_serialization_failed".to_owned())?;
+            if bytes.len() > NATIVE_MAP_MAX_RESULT_BYTES {
+                return Err("map_result_bytes_bound_exceeded".to_owned());
+            }
+            let map = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| "map_serialization_failed".to_owned())?;
+            return Ok((
+                json!({
+                    "mode": "map",
+                    "map": map,
+                    "semanticEvidenceAvailable": semantic_evidence_available,
+                }),
+                Vec::new(),
+            ));
+        }
+        let DiscoverInput::Legacy(input) = input else {
+            unreachable!()
+        };
         let (workspace, index) = self.workspace_index(&input.expected_revision)?;
         let response = discover(
             &workspace,
@@ -1261,14 +1458,103 @@ fn validation_error_detail(
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum DiscoverInput {
+    Legacy(LegacyDiscoverInput),
+    Map(MapDiscoverInput),
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DiscoverInput {
+struct LegacyDiscoverInput {
     expected_revision: String,
     terms: Vec<String>,
     roots: Vec<String>,
     languages: Vec<String>,
     #[serde(default)]
     cursor: Option<DiscoverCursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MapDiscoverInput {
+    expected_revision: String,
+    map: NativeMapInput,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeMapInput {
+    #[serde(default)]
+    task_terms: Vec<String>,
+    #[serde(default)]
+    exact_identifiers: Vec<String>,
+    #[serde(default)]
+    stack_frames: Vec<NativeMapStackFrame>,
+    #[serde(default)]
+    recently_read_paths: Vec<String>,
+    #[serde(default)]
+    current_edit_paths: Vec<String>,
+    #[serde(default)]
+    path_prefixes: Vec<String>,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    relationships: Option<Vec<String>>,
+    #[serde(default)]
+    expansion_seeds: Vec<String>,
+    #[serde(default)]
+    expand_paths: Vec<String>,
+    #[serde(default)]
+    expand_symbols: Vec<String>,
+    #[serde(default)]
+    score_band: Option<NativeMapScoreBand>,
+    #[serde(default)]
+    purpose: Option<NativeMapPurpose>,
+    #[serde(default)]
+    budgets: NativeMapBudgets,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeMapStackFrame {
+    path: String,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    line: Option<usize>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeMapPurpose {
+    Dependencies,
+    Dependents,
+    Neighborhood,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeMapBudgets {
+    #[serde(default)]
+    items: Option<usize>,
+    #[serde(default)]
+    estimated_tokens: Option<usize>,
+    #[serde(default)]
+    hops: Option<usize>,
+    #[serde(default)]
+    degree: Option<usize>,
+    #[serde(default)]
+    result_bytes: Option<usize>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMapScoreBand {
+    min: u64,
+    max: u64,
 }
 
 #[derive(Deserialize)]
@@ -1409,6 +1695,369 @@ fn bounded_discover_options() -> DiscoverOptions {
     }
 }
 
+fn native_map_request(
+    input: NativeMapInput,
+) -> Result<(RepositoryMapRequest, Option<MapCursor>), NativeMapError> {
+    const MAX_PATH: usize = 4096;
+    const MAX_TEXT: usize = 256;
+    validate_map_values(&input.task_terms, 32, MAX_TEXT)?;
+    validate_map_values(&input.languages, 32, 64)?;
+    validate_map_paths(&input.recently_read_paths, 32, MAX_PATH)?;
+    validate_map_paths(&input.current_edit_paths, 32, MAX_PATH)?;
+    validate_map_paths(&input.path_prefixes, 32, MAX_PATH)?;
+    validate_map_paths(
+        &input.expand_paths,
+        NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        MAX_PATH,
+    )?;
+    validate_map_values(
+        &input.expand_symbols,
+        NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        MAX_TEXT,
+    )?;
+    if input.exact_identifiers.len() > 128
+        || input.expansion_seeds.len() > NATIVE_MAP_MAX_EXPANSION_SELECTORS
+        || input.stack_frames.len() > 32
+        || input.score_band.is_some_and(|band| band.min > band.max)
+    {
+        return Err(NativeMapError::InvalidRequest);
+    }
+    let exact_declaration_ids = input
+        .exact_identifiers
+        .iter()
+        .map(|value| DeclarationId::parse(value).ok_or(NativeMapError::InvalidRequest))
+        .collect::<Result<Vec<_>, _>>()?;
+    let seeds = input
+        .expansion_seeds
+        .iter()
+        .map(|value| DeclarationId::parse(value).ok_or(NativeMapError::InvalidRequest))
+        .collect::<Result<Vec<_>, _>>()?;
+    let paths = input
+        .expand_paths
+        .into_iter()
+        .map(|value| {
+            RootRelativePath::parse(value, MAX_PATH).map_err(|_| NativeMapError::InvalidRequest)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let stack_frames = input
+        .stack_frames
+        .into_iter()
+        .map(|frame| {
+            validate_map_path(&frame.path, MAX_PATH)?;
+            if frame
+                .symbol
+                .as_ref()
+                .is_some_and(|symbol| symbol.is_empty() || symbol.len() > MAX_TEXT)
+                || frame
+                    .line
+                    .is_some_and(|line| !(1..=10_000_000).contains(&line))
+            {
+                return Err(NativeMapError::InvalidRequest);
+            }
+            Ok(StackFrame {
+                path: frame.path.into(),
+                symbol: frame.symbol,
+                line: frame.line,
+            })
+        })
+        .collect::<Result<Vec<_>, NativeMapError>>()?;
+    let relationships = input.relationships.map_or_else(
+        || {
+            Ok(vec![
+                RelationshipKind::Contains,
+                RelationshipKind::ContainedBy,
+            ])
+        },
+        |values| {
+            if values.len() > NATIVE_MAP_MAX_RELATIONSHIPS
+                || values.iter().collect::<BTreeSet<_>>().len() != values.len()
+            {
+                return Err(NativeMapError::InvalidRequest);
+            }
+            values
+                .into_iter()
+                .map(|value| match value.as_str() {
+                    "contains" => Ok(RelationshipKind::Contains),
+                    "contained_by" => Ok(RelationshipKind::ContainedBy),
+                    "semantic_declaration" => Ok(RelationshipKind::SemanticDeclaration),
+                    "semantic_definition" => Ok(RelationshipKind::SemanticDefinition),
+                    "semantic_type_definition" => Ok(RelationshipKind::SemanticTypeDefinition),
+                    "semantic_implementation" => Ok(RelationshipKind::SemanticImplementation),
+                    "semantic_reference" => Ok(RelationshipKind::SemanticReference),
+                    _ => Err(NativeMapError::InvalidRequest),
+                })
+                .collect()
+        },
+    )?;
+    let budget = MapBudget {
+        max_items: input.budgets.items.unwrap_or(NATIVE_MAP_MAX_ITEMS),
+        max_estimated_tokens: input
+            .budgets
+            .estimated_tokens
+            .unwrap_or(NATIVE_MAP_MAX_ESTIMATED_TOKENS),
+        max_hops: input.budgets.hops.unwrap_or(NATIVE_MAP_MAX_HOPS),
+        max_degree: input.budgets.degree.unwrap_or(NATIVE_MAP_MAX_DEGREE),
+        max_result_bytes: input
+            .budgets
+            .result_bytes
+            .unwrap_or(NATIVE_MAP_MAX_RESULT_BYTES),
+    };
+    validate_native_map_budget(budget)?;
+    let cursor = input
+        .cursor
+        .as_deref()
+        .map(MapCursor::from_token)
+        .transpose()
+        .map_err(|_| NativeMapError::CursorInvalid)?;
+    Ok((
+        RepositoryMapRequest {
+            personalization: Personalization {
+                task_terms: input.task_terms,
+                exact_declaration_ids,
+                stack_frames,
+                recently_read_paths: input
+                    .recently_read_paths
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                current_edit_paths: input
+                    .current_edit_paths
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+            },
+            budget,
+            expansion: ExpansionRequest {
+                seeds,
+                paths,
+                symbols: input.expand_symbols,
+                score_band: input.score_band.map(|band| ScoreBand {
+                    min: band.min,
+                    max: band.max,
+                }),
+                purpose: match input.purpose.unwrap_or(NativeMapPurpose::Neighborhood) {
+                    NativeMapPurpose::Dependencies => ExpansionPurpose::Dependencies,
+                    NativeMapPurpose::Dependents => ExpansionPurpose::Dependents,
+                    NativeMapPurpose::Neighborhood => ExpansionPurpose::Neighborhood,
+                },
+                relationships,
+            },
+            path_prefixes: input.path_prefixes.into_iter().map(PathBuf::from).collect(),
+            languages: input.languages,
+        },
+        cursor,
+    ))
+}
+
+fn validate_map_values(
+    values: &[String],
+    maximum: usize,
+    max_length: usize,
+) -> Result<(), NativeMapError> {
+    if values.len() > maximum
+        || values
+            .iter()
+            .any(|value| value.is_empty() || value.len() > max_length)
+    {
+        Err(NativeMapError::InvalidRequest)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_map_paths(
+    values: &[String],
+    maximum: usize,
+    max_length: usize,
+) -> Result<(), NativeMapError> {
+    if values.len() > maximum {
+        return Err(NativeMapError::InvalidRequest);
+    }
+    values
+        .iter()
+        .try_for_each(|value| validate_map_path(value, max_length))
+}
+
+fn validate_map_path(value: &str, max_length: usize) -> Result<(), NativeMapError> {
+    RootRelativePath::parse(value.to_owned(), max_length)
+        .map(|_| ())
+        .map_err(|_| NativeMapError::InvalidRequest)
+}
+
+fn validate_native_map_budget(budget: MapBudget) -> Result<(), NativeMapError> {
+    for (actual, maximum, allow_zero, bound) in [
+        (
+            budget.max_items,
+            NATIVE_MAP_MAX_ITEMS,
+            false,
+            MapBound::Items,
+        ),
+        (
+            budget.max_estimated_tokens,
+            NATIVE_MAP_MAX_ESTIMATED_TOKENS,
+            false,
+            MapBound::EstimatedTokens,
+        ),
+        (budget.max_hops, NATIVE_MAP_MAX_HOPS, true, MapBound::Hops),
+        (
+            budget.max_degree,
+            NATIVE_MAP_MAX_DEGREE,
+            false,
+            MapBound::Degree,
+        ),
+        (
+            budget.max_result_bytes,
+            NATIVE_MAP_MAX_RESULT_BYTES,
+            false,
+            MapBound::ResultBytes,
+        ),
+    ] {
+        if actual > maximum || (actual == 0 && !allow_zero) {
+            return Err(NativeMapError::Bound(bound));
+        }
+    }
+    Ok(())
+}
+
+fn bounded_map_limits() -> MapLimits {
+    MapLimits {
+        max_items: NATIVE_MAP_MAX_ITEMS,
+        max_estimated_tokens: NATIVE_MAP_MAX_ESTIMATED_TOKENS,
+        max_hops: NATIVE_MAP_MAX_HOPS,
+        max_degree: NATIVE_MAP_MAX_DEGREE,
+        max_result_bytes: NATIVE_MAP_MAX_RESULT_BYTES,
+        max_task_terms: 32,
+        max_exact_ids: 128,
+        max_stack_frames: 32,
+        max_recent_paths: 32,
+        max_current_edit_paths: 32,
+        max_path_filters: 32,
+        max_language_filters: 32,
+        max_expansion_seeds: 128,
+        max_expansion_paths: NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        max_expansion_symbols: NATIVE_MAP_MAX_EXPANSION_SELECTORS,
+        max_relationship_kinds: NATIVE_MAP_MAX_RELATIONSHIPS,
+        max_semantic_relationships: NATIVE_MAP_MAX_SEMANTIC_RELATIONSHIPS,
+        max_input_bytes: 256 * 1024,
+        max_work: 1_000_000,
+        max_candidates: 100_000,
+        max_highlight_bytes: 1024,
+        max_cursor_frontier: 10_000,
+        max_time: Duration::from_secs(30),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeMapError {
+    Bound(MapBound),
+    CursorInvalid,
+    CursorMismatch,
+    EvidenceInvalid,
+    EvidenceStale,
+    InvalidRequest,
+    RevisionStale,
+    RevisionUnavailable,
+    SemanticEvidenceUnavailable,
+    SelectorNoMatch,
+    Serialization,
+    TimeLimit,
+    Unavailable,
+}
+
+impl NativeMapError {
+    fn code(self) -> String {
+        match self {
+            Self::Bound(MapBound::Items) => "map_items_bound_exceeded",
+            Self::Bound(MapBound::EstimatedTokens) => "map_estimated_tokens_bound_exceeded",
+            Self::Bound(MapBound::Hops) => "map_hops_bound_exceeded",
+            Self::Bound(MapBound::Degree) => "map_degree_bound_exceeded",
+            Self::Bound(MapBound::ResultBytes) => "map_result_bytes_bound_exceeded",
+            Self::CursorInvalid => "map_cursor_invalid",
+            Self::CursorMismatch => "map_cursor_mismatch",
+            Self::EvidenceInvalid => "map_semantic_evidence_invalid",
+            Self::EvidenceStale => "map_semantic_evidence_stale",
+            Self::InvalidRequest => "map_invalid_request",
+            Self::RevisionStale => "stale_revision",
+            Self::RevisionUnavailable => "map_revision_unavailable",
+            Self::SemanticEvidenceUnavailable => "map_semantic_evidence_unavailable",
+            Self::SelectorNoMatch => "map_selector_no_match",
+            Self::Serialization => "map_serialization_failed",
+            Self::TimeLimit => "map_time_limit_exceeded",
+            Self::Unavailable => "map_unavailable",
+        }
+        .to_owned()
+    }
+}
+
+impl From<MapError> for NativeMapError {
+    fn from(error: MapError) -> Self {
+        match error {
+            MapError::BoundExceeded(bound) => Self::Bound(bound),
+            MapError::CursorMismatch => Self::CursorMismatch,
+            MapError::Revision(crate::workspace::revision::RevisionError::StaleRevision {
+                ..
+            }) => Self::RevisionStale,
+            MapError::Revision(_) => Self::RevisionUnavailable,
+            MapError::TimeLimit => Self::TimeLimit,
+            MapError::InvalidRequest(_) => Self::InvalidRequest,
+            MapError::SelectorNoMatch(_) => Self::SelectorNoMatch,
+            MapError::InvalidLimits(_) | MapError::InvalidIndex(_) => Self::Unavailable,
+            MapError::InvalidFact(_) => Self::EvidenceInvalid,
+            MapError::StaleFact => Self::EvidenceStale,
+            MapError::SemanticEvidenceUnavailable => Self::SemanticEvidenceUnavailable,
+            MapError::Serialization(_) => Self::Serialization,
+        }
+    }
+}
+
+fn native_semantic_evidence(
+    stored: &[NativeSemanticRelationship],
+    revision: RevisionId,
+) -> Result<Vec<SemanticRelationship<'_>>, NativeMapError> {
+    validate_native_semantic_store(stored).map_err(|_| NativeMapError::EvidenceInvalid)?;
+    if stored
+        .iter()
+        .any(|relationship| relationship.fact.provenance().revision() != revision)
+    {
+        return Err(NativeMapError::EvidenceStale);
+    }
+    Ok(stored
+        .iter()
+        .map(|relationship| {
+            SemanticRelationship::new(relationship.source_declaration, &relationship.fact)
+        })
+        .collect())
+}
+
+fn validate_native_semantic_store(stored: &[NativeSemanticRelationship]) -> Result<(), String> {
+    if stored.len() > NATIVE_MAP_MAX_SEMANTIC_RELATIONSHIPS {
+        return Err("native semantic evidence count exceeds trusted bound".to_owned());
+    }
+    let bytes = stored.iter().try_fold(0_usize, |bytes, relationship| {
+        let fact = &relationship.fact;
+        bytes
+            .checked_add(std::mem::size_of::<NativeSemanticRelationship>())
+            .and_then(|bytes| bytes.checked_add(fact.path().as_path().as_str().len()))
+            .and_then(|bytes| {
+                bytes.checked_add(fact.provenance().origin().path().as_path().as_str().len())
+            })
+            .and_then(|bytes| bytes.checked_add(fact.provenance().origin().uri().len()))
+            .and_then(|bytes| {
+                bytes.checked_add(fact.provenance().server().server_artifact.as_str().len())
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(fact.provenance().server().configuration.as_str().len())
+            })
+            .and_then(|bytes| bytes.checked_add(6 * std::mem::size_of::<u64>()))
+            .ok_or_else(|| "native semantic evidence byte count overflowed".to_owned())
+    })?;
+    if bytes > NATIVE_MAP_MAX_SEMANTIC_EVIDENCE_BYTES {
+        Err("native semantic evidence bytes exceed trusted bound".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn trusted_run_limits(limits: ResourceLimits) -> bool {
     limits.finite()
         && limits.cpu_millis <= MAX_RUN_CPU_MILLIS
@@ -1531,6 +2180,7 @@ mod tests {
 
     use agentkit_core::{Item, ItemKind};
     use agentkit_loop::{Agent, LoopInterrupt, LoopStep, ModelAdapter, SessionConfig};
+    use url::Url;
 
     use crate::{
         agent::adapters::tool::{ToolBinding, ToolExecutorAdapter, ToolKernelContext},
@@ -1541,21 +2191,47 @@ mod tests {
         },
         domain::{
             config::{LayerStack, RunConfigContext},
-            ids::{AttemptId, PrincipalId, ProjectId, RunId, WorkspaceId},
-            lifecycle::{AttemptOwnership, FencingToken},
+            events::ContentDigest,
+            ids::{AttemptId, PrincipalId, ProcessId, ProjectId, RunId, WorkspaceId},
+            lifecycle::{AttemptOwnership, FencingToken, ProcessClaim, ProcessOwnership},
         },
         executor::{
             check::{CheckCommand, ConformanceCheck},
-            profile::ResourceLimits,
+            profile::{ExecutorProfile, ProfileSpec, ResourceLimits, TrustTier},
         },
         runtime::scheduler::{budget::RunBudget, reserve::BudgetLedger},
         test_support,
-        verify::profiles::{CheckClass, CheckRequirement, DeclaredCheck, VerificationRegistry},
+        verify::{
+            lsp::{
+                facts::{
+                    FactLimits, LspWorkspaceSnapshot, OpenDocument, SnapshotFile,
+                    normalize_semantic_locations,
+                },
+                session::{
+                    CodecLimits, DocumentVersion, ExecutionProfileIdentity, LaunchRequest,
+                    LspCodec, LspSessionManager, OwnedLspLauncher, OwnedLspTransport,
+                    PositionEncoding, ResponseDisposition, RevisionPolicy, SendContext,
+                    ServerIdentity, SessionLimits, SessionPurpose, SessionScope, TransportError,
+                },
+            },
+            profiles::{CheckClass, CheckRequirement, DeclaredCheck, VerificationRegistry},
+        },
+        workspace::{edit::ir::EditLimits, index::meta::IndexOptions},
     };
 
     use super::*;
 
     fn dispatcher(runner: Option<CheckRunner>) -> (PathBuf, NativeDispatcher) {
+        dispatcher_with_semantic(runner, |_, _| (Vec::new(), None))
+    }
+
+    fn dispatcher_with_semantic(
+        runner: Option<CheckRunner>,
+        evidence: impl FnOnce(
+            &Path,
+            &Path,
+        ) -> (Vec<NativeSemanticRelationship>, Option<ManagedWorkspace>),
+    ) -> (PathBuf, NativeDispatcher) {
         let directory = std::env::temp_dir().join(format!(
             "kit-native-check-{}",
             crate::domain::ids::RunId::generate().unwrap()
@@ -1563,8 +2239,13 @@ mod tests {
         let root = directory.join("source");
         let scratch = directory.join("scratch");
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(root.join("lib.rs"), "fn main() {}\n").unwrap();
         std::fs::write(root.join("format.json"), "{}\n").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let scratch = std::fs::canonicalize(scratch).unwrap();
+        let (semantic_relationships, workspace_guard) = evidence(&root, &scratch);
+        let semantic_evidence = NativeSemanticEvidenceStore::default();
         let artifacts = Arc::new(ArtifactStore::open(directory.join("artifacts")).unwrap());
         let principal = PrincipalId::generate().unwrap();
         let project = ProjectId::generate().unwrap();
@@ -1625,7 +2306,7 @@ mod tests {
             .unwrap(),
         ])
         .unwrap();
-        let dispatcher = NativeDispatcher::open(
+        let mut dispatcher = NativeDispatcher::open(
             root,
             &scratch,
             artifacts,
@@ -1674,12 +2355,21 @@ mod tests {
                     ]),
                     limits: crate::verify::feedback::FeedbackLimits::default(),
                 }),
+                semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
                 run_runner: None,
             },
         )
         .unwrap();
+        let revision = dispatcher.revision().unwrap();
+        if !semantic_relationships.is_empty() {
+            let (_, index) = dispatcher.workspace_index(&revision).unwrap();
+            semantic_evidence
+                .replace(&index, semantic_relationships)
+                .unwrap();
+        }
+        drop(workspace_guard);
         (directory, dispatcher)
     }
 
@@ -1689,6 +2379,632 @@ mod tests {
             dispatcher.authenticated.principal_id(),
             crate::domain::lifecycle::FencingToken::new(1),
         )
+    }
+
+    fn discover_input(revision: &str, map: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "expected_revision": revision,
+            "map": map,
+        }))
+        .unwrap()
+    }
+
+    struct LspLauncher;
+
+    struct LspTransport {
+        claim: ProcessClaim,
+    }
+
+    impl OwnedLspLauncher for LspLauncher {
+        type Transport = LspTransport;
+
+        fn launch(
+            &mut self,
+            request: LaunchRequest<'_>,
+        ) -> Result<Self::Transport, TransportError> {
+            Ok(LspTransport {
+                claim: ProcessClaim::new(
+                    ProcessId::generate().unwrap(),
+                    ProcessOwnership::DaemonService(request.service.id),
+                ),
+            })
+        }
+    }
+
+    impl OwnedLspTransport for LspTransport {
+        fn claim(&self) -> ProcessClaim {
+            self.claim
+        }
+
+        fn initialize(
+            &mut self,
+            _: &[u8],
+            _: CodecLimits,
+            _: SendContext,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn send_frame(&mut self, _: &[u8], _: SendContext) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn receive_frame(
+            &mut self,
+            _: CodecLimits,
+            _: SendContext,
+        ) -> Result<Vec<u8>, TransportError> {
+            Err(TransportError::ReadFailed)
+        }
+
+        fn close_and_reap(&mut self, _: SendContext) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn test_digest(byte: u8) -> ContentDigest {
+        ContentDigest::parse(&format!("blake3:{}", format!("{byte:02x}").repeat(32))).unwrap()
+    }
+
+    fn lsp_server() -> ServerIdentity {
+        ServerIdentity {
+            server_artifact: test_digest(1),
+            configuration: test_digest(2),
+        }
+    }
+
+    fn lsp_profile() -> ExecutionProfileIdentity {
+        let profile = ExecutorProfile::new(ProfileSpec::isolated(
+            TrustTier::TrustedLocal,
+            host_platform().unwrap(),
+            host_architecture().unwrap(),
+            ResourceLimits::new(
+                60_000,
+                1024 * 1024 * 1024,
+                64,
+                64 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                64 * 1024 * 1024,
+                60_000,
+            ),
+        ))
+        .unwrap();
+        ExecutionProfileIdentity::from_profile(&profile)
+    }
+
+    fn normalized_native_semantic_relationship(
+        root: &Path,
+        _scratch: &Path,
+    ) -> (Vec<NativeSemanticRelationship>, Option<ManagedWorkspace>) {
+        let source = "fn source() { target(); }\n";
+        let target = "fn target() {}\n";
+        std::fs::write(root.join("source.rs"), source).unwrap();
+        std::fs::write(root.join("target.rs"), target).unwrap();
+        let workspace = ManagedWorkspace::open(root).unwrap();
+        let revision = workspace.current_revision().unwrap().id();
+        let index = MetadataIndex::build(&workspace, revision, &IndexOptions::default()).unwrap();
+        let source_declaration = index
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.syntax_records.iter())
+            .find(|record| record.qualified_name().value().as_str() == "source")
+            .map(|record| DeclarationId::from(record.declaration_id()))
+            .unwrap();
+        let source_uri = Url::from_file_path(root.join("source.rs"))
+            .unwrap()
+            .to_string();
+        let target_uri = Url::from_file_path(root.join("target.rs"))
+            .unwrap()
+            .to_string();
+        let server = lsp_server();
+        let mut manager = LspSessionManager::new(LspLauncher, SessionLimits::default()).unwrap();
+        let service = manager
+            .open(
+                SessionScope {
+                    principal_id: PrincipalId::generate().unwrap(),
+                    project_id: ProjectId::generate().unwrap(),
+                    workspace_id: WorkspaceId::generate().unwrap(),
+                    canonical_root_identity: test_digest(3),
+                    purpose: SessionPurpose::Live,
+                    revision_policy: RevisionPolicy::ManagedLive,
+                    server: server.clone(),
+                    position_encoding: PositionEncoding::Utf8,
+                    execution_profile: lsp_profile(),
+                },
+                revision,
+            )
+            .unwrap();
+        manager
+            .open_document(
+                service,
+                source_uri.clone(),
+                DocumentVersion::new(1),
+                source.to_owned(),
+            )
+            .unwrap();
+        let token = manager
+            .request(
+                service,
+                revision,
+                &source_uri,
+                "textDocument/definition",
+                json!({
+                    "textDocument": {"uri": source_uri},
+                    "position": {"line": 0, "character": 0}
+                }),
+                manager.now_tick() + 10_000,
+            )
+            .unwrap();
+        let frame = LspCodec::encode(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": token.request_id.get(),
+                "result": {
+                    "uri": target_uri,
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 9}
+                    }
+                }
+            }),
+            SessionLimits::default().codec,
+        )
+        .unwrap();
+        let ResponseDisposition::Accepted(accepted) = manager
+            .receive_captured_response(service, &token, &frame)
+            .unwrap()
+        else {
+            panic!("normalized LSP response was not accepted")
+        };
+        manager.shutdown().unwrap();
+        let snapshot = LspWorkspaceSnapshot::new(
+            root.to_owned(),
+            revision,
+            1,
+            vec![
+                SnapshotFile::new("source.rs", source.as_bytes().to_vec(), false),
+                SnapshotFile::new("target.rs", target.as_bytes().to_vec(), false),
+            ],
+            vec![OpenDocument::new(
+                source_uri,
+                DocumentVersion::new(1),
+                source.to_owned(),
+            )],
+            server,
+            PositionEncoding::Utf8,
+            EditLimits::default(),
+            FactLimits::default(),
+        )
+        .unwrap();
+        let fact = normalize_semantic_locations(&snapshot, &accepted)
+            .unwrap()
+            .remove(0);
+        (
+            vec![NativeSemanticRelationship {
+                source_declaration,
+                fact,
+            }],
+            Some(workspace),
+        )
+    }
+
+    #[test]
+    fn native_discover_map_ranks_syntax_and_returns_real_containment_without_semantic_claims() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        std::fs::write(
+            directory.join("source/lib.rs"),
+            "fn parent() { fn child() {} }\nfn unrelated() {}\n",
+        )
+        .unwrap();
+        let revision = dispatcher.revision().unwrap();
+        let (_, index) = dispatcher.workspace_index(&revision).unwrap();
+        let parent = index
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.syntax_records.iter())
+            .find(|record| record.qualified_name().value().as_str() == "parent")
+            .unwrap()
+            .declaration_id();
+        let input = discover_input(
+            &revision,
+            json!({
+                "taskTerms": ["child"],
+                "relationships": ["contains"],
+                "expansionSeeds": [hex(&parent)],
+                "budgets": {"items": 20}
+            }),
+        );
+        let first = dispatcher.discover(&input).unwrap().0;
+        let second = dispatcher.discover(&input).unwrap().0;
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
+        assert_eq!(first["mode"], "map");
+        assert_eq!(first["semanticEvidenceAvailable"], false);
+        assert!(
+            first["map"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["qualified_name"] == "parent::child"
+                        && entry["reasons"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|reason| reason == "exact_task_term")
+                })
+        );
+        assert!(
+            first["map"]["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| {
+                    edge["relationship"] == "contains"
+                        && edge["provenance"]["source"] == "tree_sitter"
+                })
+        );
+        let selectors = dispatcher
+            .discover(&discover_input(
+                &revision,
+                json!({
+                    "expandPaths": ["lib.rs"],
+                    "expandSymbols": ["parent"],
+                    "scoreBand": {"min": 0, "max": u64::MAX},
+                    "relationships": ["contains"]
+                }),
+            ))
+            .unwrap()
+            .0;
+        assert!(
+            selectors["map"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["qualified_name"] == "parent::child")
+        );
+        let declaration_free_path = dispatcher
+            .discover(&discover_input(
+                &revision,
+                json!({"expandPaths": ["format.json"], "relationships": []}),
+            ))
+            .unwrap()
+            .0;
+        assert_eq!(
+            declaration_free_path["map"]["path_nodes"][0]["path"],
+            "format.json"
+        );
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({"expandSymbols": ["paren"]}),
+            )),
+            Err("map_selector_no_match".to_owned())
+        );
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({"expandPaths": ["../lib.rs"]}),
+            )),
+            Err("map_invalid_request".to_owned())
+        );
+        for path in ["/lib.rs", "C:/lib.rs", "src\\lib.rs"] {
+            assert_eq!(
+                dispatcher.discover(&discover_input(&revision, json!({"expandPaths": [path]}),)),
+                Err("map_invalid_request".to_owned())
+            );
+        }
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({"scoreBand": {"min": 2, "max": 1}}),
+            )),
+            Err("map_invalid_request".to_owned())
+        );
+        let DispatchOutcome::Succeeded(canonical) = output(first, Vec::new()) else {
+            panic!("bounded map output failed");
+        };
+        assert!(canonical.body.len() <= MAX_NATIVE_OUTPUT_BYTES);
+
+        let legacy = dispatcher
+            .discover(
+                &serde_json::to_vec(&json!({
+                    "expected_revision": revision,
+                    "terms": ["child"],
+                    "roots": [],
+                    "languages": ["rust"]
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .0;
+        assert!(legacy.get("results").is_some());
+        assert!(legacy.get("mode").is_none());
+        for hybrid in [
+            json!({
+                "expected_revision": revision,
+                "terms": [],
+                "roots": [],
+                "languages": [],
+                "map": {}
+            }),
+            json!({
+                "expected_revision": revision,
+                "map": {},
+                "terms": ["ignored"]
+            }),
+        ] {
+            assert_eq!(
+                dispatcher.discover(&serde_json::to_vec(&hybrid).unwrap()),
+                Err("invalid_arguments".to_owned())
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_discover_map_uses_normalized_runtime_semantic_evidence() {
+        let (directory, mut dispatcher) =
+            dispatcher_with_semantic(None, normalized_native_semantic_relationship);
+        let publisher = dispatcher.semantic_evidence.clone();
+        let agent_native_runtime = dispatcher.semantic_evidence.clone();
+        let http_native_service = dispatcher.semantic_evidence.clone();
+        assert!(publisher.shares_state_with(&agent_native_runtime));
+        assert!(publisher.shares_state_with(&http_native_service));
+        let revision = dispatcher.revision().unwrap();
+        assert_eq!(
+            dispatcher
+                .semantic_evidence
+                .snapshot(RevisionId::parse(&revision).unwrap())
+                .unwrap()[0]
+                .fact
+                .provenance()
+                .revision()
+                .to_string(),
+            revision
+        );
+        let (_, index) = dispatcher.workspace_index(&revision).unwrap();
+        let source = index
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.syntax_records.iter())
+            .find(|record| record.qualified_name().value().as_str() == "source")
+            .unwrap()
+            .declaration_id();
+        let response = dispatcher
+            .discover(&discover_input(
+                &revision,
+                json!({
+                    "relationships": ["semantic_definition"],
+                    "expansionSeeds": [hex(&source)],
+                    "purpose": "dependencies"
+                }),
+            ))
+            .unwrap()
+            .0;
+        assert_eq!(response["semanticEvidenceAvailable"], true);
+        assert!(
+            response["map"]["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| {
+                    edge["relationship"] == "semantic_definition"
+                        && edge["provenance"]["source"] == "lsp"
+                        && edge["provenance"]["fact"]["classification"] == "semantic"
+                })
+        );
+
+        let stored = publisher.snapshot(index.revision()).unwrap().remove(0);
+        http_native_service.clear().unwrap();
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({"relationships": ["semantic_definition"]}),
+            )),
+            Err("map_semantic_evidence_unavailable".to_owned())
+        );
+        publisher.publish(&index, stored.clone()).unwrap();
+        assert_eq!(
+            agent_native_runtime
+                .snapshot(index.revision())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            http_native_service
+                .snapshot(index.revision())
+                .unwrap()
+                .len(),
+            1
+        );
+        agent_native_runtime
+            .replace(&index, vec![stored.clone(), stored.clone()])
+            .unwrap();
+        assert_eq!(
+            http_native_service
+                .snapshot(index.revision())
+                .unwrap()
+                .len(),
+            2
+        );
+        http_native_service.replace(&index, vec![stored]).unwrap();
+
+        std::fs::write(directory.join("source/source.rs"), "fn changed() {}\n").unwrap();
+        let next_revision = dispatcher.revision().unwrap();
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &next_revision,
+                json!({"relationships": ["semantic_definition"]}),
+            )),
+            Err("map_semantic_evidence_stale".to_owned())
+        );
+        let containment = dispatcher
+            .discover(&discover_input(
+                &next_revision,
+                json!({"relationships": ["contains"]}),
+            ))
+            .unwrap()
+            .0;
+        assert_eq!(containment["semanticEvidenceAvailable"], false);
+        assert_eq!(containment["mode"], "map");
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &next_revision,
+                json!({"relationships": ["semantic_definition"]}),
+            )),
+            Err("map_semantic_evidence_unavailable".to_owned())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_map_budget_relationship_and_cursor_failures_are_typed() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        std::fs::write(
+            directory.join("source/lib.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        )
+        .unwrap();
+        let revision = dispatcher.revision().unwrap();
+        for (budget, expected) in [
+            (json!({"items": 201}), "map_items_bound_exceeded"),
+            (
+                json!({"estimatedTokens": 16385}),
+                "map_estimated_tokens_bound_exceeded",
+            ),
+            (json!({"hops": 5}), "map_hops_bound_exceeded"),
+            (json!({"degree": 65}), "map_degree_bound_exceeded"),
+            (
+                json!({"resultBytes": 61441}),
+                "map_result_bytes_bound_exceeded",
+            ),
+        ] {
+            assert_eq!(
+                dispatcher.discover(&discover_input(&revision, json!({"budgets": budget}))),
+                Err(expected.to_owned())
+            );
+        }
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({"relationships": ["semantic_definition"]}),
+            )),
+            Err("map_semantic_evidence_unavailable".to_owned())
+        );
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({"pathPrefixes": ["../outside"]}),
+            )),
+            Err("map_invalid_request".to_owned())
+        );
+
+        let first = dispatcher
+            .discover(&discover_input(&revision, json!({"budgets": {"items": 1}})))
+            .unwrap()
+            .0;
+        let token = first["map"]["cursor"].as_str().unwrap().to_owned();
+        let first_id = first["map"]["entries"][0]["declaration_id"].clone();
+        let second = dispatcher
+            .discover(&discover_input(
+                &revision,
+                json!({"budgets": {"items": 1}, "cursor": token.clone()}),
+            ))
+            .unwrap()
+            .0;
+        assert_ne!(first_id, second["map"]["entries"][0]["declaration_id"]);
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({
+                    "budgets": {"items": 1},
+                    "cursor": first["map"]["cursor"],
+                    "expandSymbols": ["one"]
+                }),
+            )),
+            Err("map_cursor_mismatch".to_owned())
+        );
+        let mut tampered = token.into_bytes();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &revision,
+                json!({
+                    "budgets": {"items": 1},
+                    "cursor": String::from_utf8(tampered).unwrap()
+                }),
+            )),
+            Err("map_cursor_invalid".to_owned())
+        );
+        std::fs::write(directory.join("source/lib.rs"), "fn replacement() {}\n").unwrap();
+        assert_eq!(
+            dispatcher.discover(&discover_input(&revision, json!({}))),
+            Err("stale_revision".to_owned())
+        );
+        let next_revision = dispatcher.revision().unwrap();
+        assert_eq!(
+            dispatcher.discover(&discover_input(
+                &next_revision,
+                json!({"budgets": {"items": 1}, "cursor": first["map"]["cursor"]}),
+            )),
+            Err("map_cursor_mismatch".to_owned())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_map_error_codes_are_exhaustive_and_stable() {
+        for (error, expected) in [
+            (
+                NativeMapError::Bound(MapBound::Items),
+                "map_items_bound_exceeded",
+            ),
+            (
+                NativeMapError::Bound(MapBound::EstimatedTokens),
+                "map_estimated_tokens_bound_exceeded",
+            ),
+            (
+                NativeMapError::Bound(MapBound::Hops),
+                "map_hops_bound_exceeded",
+            ),
+            (
+                NativeMapError::Bound(MapBound::Degree),
+                "map_degree_bound_exceeded",
+            ),
+            (
+                NativeMapError::Bound(MapBound::ResultBytes),
+                "map_result_bytes_bound_exceeded",
+            ),
+            (NativeMapError::CursorInvalid, "map_cursor_invalid"),
+            (NativeMapError::CursorMismatch, "map_cursor_mismatch"),
+            (
+                NativeMapError::SemanticEvidenceUnavailable,
+                "map_semantic_evidence_unavailable",
+            ),
+            (NativeMapError::SelectorNoMatch, "map_selector_no_match"),
+            (NativeMapError::EvidenceStale, "map_semantic_evidence_stale"),
+            (
+                NativeMapError::EvidenceInvalid,
+                "map_semantic_evidence_invalid",
+            ),
+            (NativeMapError::RevisionStale, "stale_revision"),
+            (
+                NativeMapError::RevisionUnavailable,
+                "map_revision_unavailable",
+            ),
+            (NativeMapError::TimeLimit, "map_time_limit_exceeded"),
+            (NativeMapError::InvalidRequest, "map_invalid_request"),
+            (NativeMapError::Unavailable, "map_unavailable"),
+            (NativeMapError::Serialization, "map_serialization_failed"),
+        ] {
+            assert_eq!(error.code(), expected);
+        }
     }
 
     #[test]

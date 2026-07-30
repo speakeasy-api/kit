@@ -147,6 +147,8 @@ pub struct RunExecutorConfig {
     native_diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
     native_feedback_limits: crate::verify::feedback::FeedbackLimits,
     native_edit_validation_time: Duration,
+    pub(crate) native_semantic_evidence:
+        crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
     #[cfg(debug_assertions)]
     native_check_completions: Vec<crate::executor::check::ConformanceCheck>,
 }
@@ -193,6 +195,8 @@ impl RunExecutorConfig {
             native_feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
             native_edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                 .max_validation_time,
+            native_semantic_evidence:
+                crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default(),
             #[cfg(debug_assertions)]
             native_check_completions: Vec::new(),
         }
@@ -238,6 +242,14 @@ impl RunExecutorConfig {
 
     pub fn with_native_edit_validation_time(mut self, timeout: Duration) -> Self {
         self.native_edit_validation_time = timeout;
+        self
+    }
+
+    pub(crate) fn with_native_semantic_evidence(
+        mut self,
+        evidence: crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
+    ) -> Self {
+        self.native_semantic_evidence = evidence;
         self
     }
 
@@ -1688,6 +1700,7 @@ fn tool_adapter(
                     limits: config.native_feedback_limits.clone(),
                 },
             ),
+            semantic_evidence: config.native_semantic_evidence.clone(),
             edit_validation_time: config.native_edit_validation_time,
             #[cfg(test)]
             run_runner: None,
@@ -3483,7 +3496,7 @@ mod selector_tests {
 
     use super::{ExecutorError, SelectedAdapter, SelectedModelAdapter};
     #[cfg(debug_assertions)]
-    use super::{FakeProvider, FakeResponse};
+    use super::{FakeProvider, FakeResponse, RunExecutorConfig};
     use crate::{
         agent::extensions::{
             ExtensionConfigStack, ExtensionPoint, ExtensionRegistry, TrustedExtensionToken,
@@ -3492,6 +3505,40 @@ mod selector_tests {
         api::service::RunFailureCode,
         domain::{config::Provider, secret::SecretLease},
     };
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn executor_config_uses_the_injected_native_semantic_evidence_store() {
+        let directory = std::env::temp_dir().join(format!(
+            "kit-executor-semantic-evidence-{}",
+            crate::domain::ids::RunId::generate().unwrap()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("state.sqlite3");
+        let artifacts = Arc::new(
+            crate::store::artifacts::ArtifactStore::open(directory.join("artifacts")).unwrap(),
+        );
+        let store = Arc::new(std::sync::Mutex::new(
+            crate::test_support::open_service_store(&database).unwrap(),
+        ));
+        let scheduler = crate::runtime::scheduler::DurableScheduler::open(&database).unwrap();
+        let evidence =
+            crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default();
+        let config = RunExecutorConfig::new(
+            &database,
+            artifacts,
+            store,
+            scheduler,
+            SelectedModelAdapter::for_test(
+                Provider::OpenAi,
+                Arc::new(FakeProvider::new(FakeResponse::completed("test"))),
+            ),
+        )
+        .with_native_semantic_evidence(evidence.clone());
+
+        assert!(config.native_semantic_evidence.shares_state_with(&evidence));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn concrete_adapter_variants_construct_without_network_calls() {
