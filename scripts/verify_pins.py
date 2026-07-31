@@ -81,7 +81,7 @@ GOVERNANCE_COMMANDS = {
 }
 WORKFLOW_JOBS = {
     "m003-external", "m003-platform-source", "m004-dogfood", "m004-stats",
-    "m004-attestations", "lane", "release-validate", "publish",
+    "m004-attestations", "w07-macos-release", "lane", "release-validate", "publish",
 }
 M003_EXTERNAL_COMMANDS = (
     "cargo test --locked --test adversarial trial_grader_access::production_helper_denies_agent_grader_input_reads_and_writes -- --ignored --exact",
@@ -516,6 +516,12 @@ def validate_workflow(workflow, pins, errors):
             "needs": ["m003-external", "m004-dogfood", "m004-stats"],
             "if": None,
         },
+        "w07-macos-release": {
+            "permissions": read_permissions,
+            "environment": None,
+            "needs": None,
+            "if": None,
+        },
         "lane": {
             "permissions": read_permissions,
             "environment": None,
@@ -525,7 +531,7 @@ def validate_workflow(workflow, pins, errors):
         "release-validate": {
             "permissions": {"contents": "read", "actions": "read"},
             "environment": "release-validation",
-            "needs": ["lane", "m003-external", "m004-dogfood", "m004-stats", "m004-attestations"],
+            "needs": ["lane", "m003-external", "m004-dogfood", "m004-stats", "m004-attestations", "w07-macos-release"],
             "if": PROTECTED_WORKFLOW_IF,
         },
         "publish": {
@@ -581,6 +587,11 @@ def validate_workflow(workflow, pins, errors):
             "persist-credentials": False,
         }],
         "m004-attestations": [],
+        "w07-macos-release": [{
+            "ref": "${{ inputs.candidate_ref || github.ref }}",
+            "fetch-depth": 0,
+            "persist-credentials": False,
+        }],
         "lane": [{
             "ref": "${{ inputs.candidate_ref || github.ref }}",
             "fetch-depth": 0,
