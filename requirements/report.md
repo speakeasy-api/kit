@@ -21,9 +21,9 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 ## Lifecycle
 
 - active: 67
-- implemented: 378
+- implemented: 384
 - mitigated: 6
-- proposed: 586
+- proposed: 580
 - tombstoned: 1
 
 ## Applicability

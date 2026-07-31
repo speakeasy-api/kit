@@ -15,11 +15,12 @@ use crate::{
         },
         invoke::{ApprovalState, RetrySafety},
     },
+    capabilities::schema::NormalizedSchema,
     domain::config::{Grant, RunConfigSnapshot},
     runtime::scheduler::limits::Spend,
 };
 
-pub const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+pub const JSON_SCHEMA_DIALECT: &str = crate::capabilities::schema::JSON_SCHEMA_2020_12;
 pub const MAX_NATIVE_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_OUTPUT_BYTES: usize = 64 * 1024;
 const VERSION: &str = "1.0.0";
@@ -212,14 +213,15 @@ impl NativeCatalog {
 fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
     let schema_value = input_schema(tool);
     let source = serde_json::to_vec(&schema_value).expect("native schemas serialize");
-    let schema = SourceSchema::new(
-        source.clone(),
+    let schema = NormalizedSchema::ingest(
+        &source,
         JSON_SCHEMA_DIALECT,
         description(tool).as_bytes(),
-        source,
         DigestAlgorithm::Sha256,
     )
-    .expect("native schemas are non-empty");
+    .expect("native schemas are valid JSON Schema")
+    .source()
+    .clone();
     let (effect, grants, annotations, retry_safety, reservation, approval) = match tool {
         NativeTool::Discover | NativeTool::Search | NativeTool::Read => (
             EffectClass::WorkspaceRead,

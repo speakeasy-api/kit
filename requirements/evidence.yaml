@@ -11761,7 +11761,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance native_schema_dialect -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::native_schema_dialect -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -11771,7 +11771,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-002
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_source_preservation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_source_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -11781,7 +11781,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-003
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_normalized_preservation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_normalized_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -11791,7 +11791,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-004
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_projection_preservation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_projection_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -11801,7 +11801,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-005
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_form_digests -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_form_digests -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -11811,7 +11811,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-006
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_author_docs -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_author_docs -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null

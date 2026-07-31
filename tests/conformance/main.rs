@@ -41,6 +41,7 @@ mod req_lint;
 mod retention_model;
 mod run_telemetry;
 mod sched_budget;
+mod schema_projection;
 mod sse_cursor;
 mod store_append;
 mod store_projection;

@@ -1074,14 +1074,14 @@
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-TOOL
   applicability: mandatory
   interpretation: Every native Kit tool schema declares or resolves to the 2020-12 dialect.
   acceptance_criteria:
-  - cargo test --test conformance native_schema_dialect -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance schema_projection::native_schema_dialect -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -1096,13 +1096,15 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/schema/
+  - tests/conformance/schema_projection.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-001
   evidence_job: integration
-  expected_result: cargo test --test conformance native_schema_dialect -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::native_schema_dialect -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1120,14 +1122,14 @@
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-TOOL
   applicability: mandatory
   interpretation: Catalog storage retains byte-addressable source schemas independently of normalized and provider forms.
   acceptance_criteria:
-  - cargo test --test conformance schema_source_preservation -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance schema_projection::schema_source_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -1142,13 +1144,15 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/schema/
+  - tests/conformance/schema_projection.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-002
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_source_preservation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_source_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1166,14 +1170,14 @@
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-TOOL
   applicability: mandatory
   interpretation: Catalog storage retains the normalized internal view associated with every source schema.
   acceptance_criteria:
-  - cargo test --test conformance schema_normalized_preservation -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance schema_projection::schema_normalized_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -1188,13 +1192,15 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/schema/
+  - tests/conformance/schema_projection.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-003
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_normalized_preservation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_normalized_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1212,14 +1218,14 @@
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-TOOL
   applicability: mandatory
   interpretation: Each projection used for registration or deferred invocation remains retrievable with its provider and model identity.
   acceptance_criteria:
-  - cargo test --test conformance schema_projection_preservation -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance schema_projection::schema_projection_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -1234,13 +1240,15 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/schema/
+  - tests/conformance/schema_projection.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-004
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_projection_preservation -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_projection_preservation -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1258,14 +1266,14 @@
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-TOOL
   applicability: mandatory
   interpretation: Every stored schema form has a reproducible digest bound to that exact form.
   acceptance_criteria:
-  - cargo test --test conformance schema_form_digests -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance schema_projection::schema_form_digests -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -1280,13 +1288,15 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/schema/
+  - tests/conformance/schema_projection.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-005
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_form_digests -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_form_digests -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1304,14 +1314,14 @@
   source_quote: Descriptions, defaults, enums, required fields, and important constraints remain present. Raw JSON Schema keywords that do not help the model are omitted from the projection. Author documentation MUST NOT be dropped.
   source_fingerprint: eb903415501b5392ecdb5c8bfc7bf6616febab37310c76eba9f6293a3f95b3fb
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-TOOL
   applicability: mandatory
   interpretation: Documentation text present in a source schema remains represented in every model-facing projection.
   acceptance_criteria:
-  - cargo test --test conformance schema_author_docs -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance schema_projection::schema_author_docs -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -1326,13 +1336,15 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/schema/
+  - tests/conformance/schema_projection.rs
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-M006-W01-C-006
   evidence_job: integration
-  expected_result: cargo test --test conformance schema_author_docs -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance schema_projection::schema_author_docs -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
