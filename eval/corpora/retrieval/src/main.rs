@@ -1,5 +1,5 @@
 use kit_retrieval_eval::{
-    cleanup_failed_run, prepare, refresh_frozen, run_local, run_trusted, run_worker,
+    cleanup_failed_run, prepare, refresh_frozen, run_canary, run_local, run_trusted, run_worker,
     run_worker_startup_probe, verify_with_vendor,
 };
 use std::{env, error::Error, path::PathBuf};
@@ -51,6 +51,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Err("run-local accepts exactly one vendor directory".into());
             }
             run_local(&vendor)?;
+        }
+        "canary" => {
+            let vendor = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or("canary requires a cargo vendor --locked --versioned-dirs directory")?;
+            if arguments.next().is_some() {
+                return Err("canary accepts exactly one vendor directory".into());
+            }
+            run_canary(&vendor)?;
         }
         "run-trusted" => {
             if arguments.next().is_some() {

@@ -2,11 +2,7 @@
 
 use kit_retrieval_eval::{LocalSandboxRequest, SandboxOutcome, run_local_sandbox};
 use sha2::{Digest as _, Sha256};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{fs, path::Path, time::Duration};
 
 #[test]
 fn built_worker_reaches_main_without_exposing_home_oracle_or_network() {
@@ -38,7 +34,8 @@ fn built_worker_reaches_main_without_exposing_home_oracle_or_network() {
     )
     .unwrap();
 
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_w07-retrieval"));
+    let executable = root.join("w07-worker");
+    fs::copy(env!("CARGO_BIN_EXE_w07-retrieval"), &executable).unwrap();
     let outcome = run_local_sandbox(LocalSandboxRequest {
         executable: executable.clone(),
         expected_executable_digest: digest(&executable),

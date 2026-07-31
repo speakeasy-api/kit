@@ -1,18 +1,26 @@
 {
   "schema_version": "2.0",
   "kind": "m005_w07_preregistration",
-  "experiment_id": "m005-w07-rust-registry-v3",
+  "experiment_id": "m005-w07-rust-registry-v4",
   "state": "PRE_RUN_FROZEN",
   "language": "rust",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
-  "prior_invalid_experiment": {
-    "experiment_id": "m005-w07-rust-registry-v2",
-    "status": "INVALID_HARNESS",
-    "incident_path": "eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json",
-    "incident_digest": "sha256:9b90c4a2236a5bce8e8c96c4fdbad3e788b642dc0ed1a3e56c17e8901b1fb445"
-  },
+  "prior_invalid_experiments": [
+    {
+      "experiment_id": "m005-w07-rust-registry-v2",
+      "status": "INVALID_HARNESS",
+      "incident_path": "eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json",
+      "incident_digest": "sha256:9b90c4a2236a5bce8e8c96c4fdbad3e788b642dc0ed1a3e56c17e8901b1fb445"
+    },
+    {
+      "experiment_id": "m005-w07-rust-registry-v3",
+      "status": "INVALID_HARNESS",
+      "incident_path": "eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json",
+      "incident_digest": "sha256:fd188ebe46948c6bc12488bb24ba78842ae3a3a40a573a535c634843108f8094"
+    }
+  ],
   "immutable_inputs": {
-    "build_inputs": "sha256:1ee7929122b32d768c86d3def95766a53e4cd10ad2097c12ec99aaff4b420abb"
+    "build_inputs": "sha256:3971fc7336e403f0f5461a22c3f4ade47e9d1209ebf0979d2c7e819fd2e4416c"
   },
   "runtime_environment": {
     "manifest_digest": "sha256:9196ec006f89f8a6244b20f393077cceb443815e80b0d26ea3d834a29fc3a31a",
@@ -139,6 +147,7 @@
     "lexical_context_rule": "lexical candidates are the UTF-8 bounded window of up to 1024 bytes before and after an actual literal lexical match; range and snippet are that fixed lexical context, never the match substring or a syntax-derived item",
     "localization_relevance": "a candidate localizes a registered symbol iff it has exact_item semantics and exactly equals the registered item range, or it has lexical_context semantics on the same path and contains the registered declaration start byte; other_context never localizes",
     "history_materialization_rule": "before measurement use pinned absolute Git init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and every VCS-present frozen Rust byte, remove every worktree file outside the frozen package file set, materialize the exact checksum-validated published package snapshot including registry-only files, and retain separately sandboxed genuine .git object metadata; any failure is terminal",
+    "premeasurement_canary_rule": "PREMEASUREMENT_CANARY: after all 72 materializations and before signed registration or admission, run a fresh unit-0 L worker with the exact six-argument production command, executable, and sandbox policy; require exit 0, schema-valid raw output bound to the expected unit, arm, and source digest with a complete lexical observation; delete its worktree, cache, request, and output state, never record it as a measured row, and fail INVALID_HARNESS before registration on any error",
     "measured_timestamp_rule": "signed registration and signed admission must precede CLOCK_REALTIME start; each trial stores measured start/end plus monotonic elapsed; otherwise terminal failure",
     "raw_observation_rule": "persist every source response candidate/range/snippet/provenance, source start/end, timing, truncation, and error before deterministic top-k projection",
     "verification_rule": "verify schemas, the immutable preregistration/public key, materialization receipt digest/count, and Ed25519 ledger/table reconciliation in Rust; recompute the frozen Rust-tree source digest, reconstruct top-k only from raw observations, grade hidden target/decoys, and compare the complete expected edited tree digest",

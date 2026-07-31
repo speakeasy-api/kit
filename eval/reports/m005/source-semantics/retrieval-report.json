@@ -1,12 +1,12 @@
 {
   "schema_version": "2.0",
   "kind": "m005_w07_status_report",
-  "experiment_id": "m005-w07-rust-registry-v3",
+  "experiment_id": "m005-w07-rust-registry-v4",
   "status": "NOT_RUN_PRECOMMIT",
   "statistical_verdict": null,
   "gate_claim": "NONE; C-L and G05 are not claimed",
   "chronology": "uncommitted preregistration cannot prove pre-measurement chronology",
-  "preregistration_digest": "sha256:b12173d9cfaafaf43b70959421e5921ad92b5b0b2d56cf1e94ce0be949656bd0",
+  "preregistration_digest": "sha256:25422bf7804e57c6dcd856f6fff1389da0f2283d31bd9d65953a816d87260109",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
   "units": 72,
   "class_counts": {

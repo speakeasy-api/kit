@@ -1,10 +1,11 @@
 use crate::{
     AdmissionRecord, Arm, ArmConfig, ClassAnalysis, CorpusManifest, ExecutorEvidence,
-    GitMaterializationReceipt, LedgerEvent, LedgerTableRow, MeasuredReport,
-    MeasuredRuntimeManifest, NormalizedSymlink, PackagePin, ProtocolError, RawTrial,
-    RegistrationRecord, RepositoryClass, Result, SandboxOutcome, SignedLedger, SignedLedgerEntry,
-    TaskPin, TrialBinding, TrialGrade, TrialTerminal, WorkerArmRequest, WorkerQuery, canonical,
-    grade, run_local_sandbox, sha256,
+    GitMaterializationReceipt, LedgerEvent, LedgerTableRow, LocalWorkerSandboxRequest,
+    MeasuredReport, MeasuredRuntimeManifest, NormalizedSymlink, PackagePin, ProtocolError,
+    RawTrial, RegistrationRecord, RepositoryClass, Result, RetrievalSource, SandboxOutcome,
+    SignedLedger, SignedLedgerEntry, SourceStatus, TaskPin, TrialBinding, TrialGrade,
+    TrialTerminal, WorkerArmRequest, WorkerQuery, canonical, grade, run_local_worker_sandbox,
+    sha256,
 };
 use ed25519_dalek::{
     Signer, SigningKey, VerifyingKey,
@@ -14,9 +15,7 @@ use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    ffi::OsString,
-    fs,
+    env, fs,
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -34,14 +33,14 @@ const PUBLIC_KEY_PATH: &str = "eval/corpora/retrieval/public-key.pem";
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ScheduleManifest {
     schema_version: String,
     kind: String,
     units: Vec<ScheduleUnit>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ScheduleUnit {
     schedule_index: usize,
     unit_id: String,
@@ -116,7 +115,6 @@ pub fn run_local(vendor: &Path) -> Result<()> {
     if run_root.exists() {
         return Err(ProtocolError("retained retrieval-run directory already exists".into()).into());
     }
-    fs::create_dir(&run_root)?;
     let temporary = unique_temp_root()?;
     fs::create_dir(&temporary)?;
     let result = run_local_inner(
@@ -134,7 +132,69 @@ pub fn run_local(vendor: &Path) -> Result<()> {
         commit_time,
     );
     let _ = fs::remove_dir_all(&temporary);
+    if result.is_err() && run_root.is_dir() && fs::read_dir(&run_root)?.next().is_none() {
+        fs::remove_dir(&run_root)?;
+    }
     result
+}
+
+pub fn run_canary(vendor: &Path) -> Result<()> {
+    let vendor = crate::canonicalize_vendor_root(vendor)?;
+    let root = workspace_root();
+    let preregistration: crate::Preregistration = serde_json::from_slice(&read_bounded(
+        &root.join(PREREG_PATH),
+        crate::MAX_JSON_BYTES as u64,
+    )?)?;
+    let schedule: ScheduleManifest = serde_json::from_slice(&read_bounded(
+        &root.join(MANIFEST_PATH),
+        crate::MAX_JSON_BYTES as u64,
+    )?)?;
+    validate_schedule(&schedule)?;
+    crate::protocol::verify_input_pins(&root, &preregistration)?;
+    let git = pinned_git(&preregistration)?;
+    let unit = schedule.units[0].clone();
+    let canary_schedule = ScheduleManifest {
+        schema_version: schedule.schema_version,
+        kind: schedule.kind,
+        units: vec![unit],
+    };
+    let temporary = unique_temp_root()?;
+    fs::create_dir(&temporary)?;
+    let result = (|| -> Result<()> {
+        let executable = temporary.join("w07-worker");
+        let executable_digest = copy_bounded(
+            &env::current_exe()?.canonicalize()?,
+            &executable,
+            256 << 20,
+            None,
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))?;
+        let receipts = temporary.join("canary-materialization");
+        fs::create_dir(&receipts)?;
+        let (checkouts, _, count) =
+            prepare_checkouts(&git, &vendor, &temporary, &receipts, &canary_schedule)?;
+        if count != 1 {
+            return Err(ProtocolError(
+                "non-measured canary materialized an invalid unit count".into(),
+            )
+            .into());
+        }
+        run_premeasurement_canary(
+            &root,
+            &vendor,
+            &temporary,
+            &canary_schedule,
+            &checkouts,
+            &executable,
+            &executable_digest,
+            &git,
+            &root.join(PUBLIC_KEY_PATH),
+        )
+    })();
+    let _ = fs::remove_dir_all(&temporary);
+    result?;
+    println!("PREMEASUREMENT_CANARY_PASS unit=rust-small-01 arm=L measured_rows=0");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,11 +216,31 @@ fn run_local_inner(
     let executable = temporary.join("w07-worker");
     let executable_digest = copy_bounded(&executable_source, &executable, 256 << 20, None)?;
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))?;
+    let prestart = temporary.join("pre-registration");
+    fs::create_dir(&prestart)?;
     let runtime = measured_runtime(&executable, git)?;
-    write_json(&run_root.join("runtime.json"), &runtime)?;
+    write_json(&prestart.join("runtime.json"), &runtime)?;
     let runtime_digest = sha256(&canonical(&runtime)?);
     let (checkouts, materialization_receipt_digest, materialization_receipt_count) =
-        prepare_checkouts(git, vendor, temporary, run_root, schedule)?;
+        prepare_checkouts(git, vendor, temporary, &prestart, schedule)?;
+    run_premeasurement_canary(
+        root,
+        vendor,
+        temporary,
+        schedule,
+        &checkouts,
+        &executable,
+        &executable_digest,
+        git,
+        key_path,
+    )?;
+    fs::create_dir(run_root)?;
+    fs::rename(prestart.join("runtime.json"), run_root.join("runtime.json"))?;
+    fs::rename(
+        prestart.join("git-materialization.jsonl"),
+        run_root.join("git-materialization.jsonl"),
+    )?;
+    fs::remove_dir(prestart)?;
     let registered_at = timestamp()?;
     if parse_timestamp(&commit_time)? >= parse_timestamp(&registered_at)? {
         return Err(
@@ -290,26 +370,21 @@ fn run_local_inner(
             let launch_time = timestamp_after(&admitted_at)?;
             let readonly_roots =
                 history_read_roots(&repository, &source, &checkouts[unit.schedule_index])?;
-            let outcome = run_local_sandbox(crate::LocalSandboxRequest {
+            let outcome = run_local_worker_sandbox(LocalWorkerSandboxRequest {
                 executable: executable.clone(),
-                allowed_executables: vec![git.path.clone()],
-                arguments: vec![
-                    OsString::from("worker"),
-                    source.clone().into_os_string(),
-                    readonly_roots[0].clone().into_os_string(),
-                    query_path.clone().into_os_string(),
-                    request_path.clone().into_os_string(),
-                    worker_output.clone().into_os_string(),
-                    cache.clone().into_os_string(),
-                ],
+                git_executable: git.path.clone(),
                 source_snapshot: source.clone(),
+                git_metadata_root: readonly_roots[0].clone(),
+                query_path: query_path.clone(),
+                request_path: request_path.clone(),
+                output_path: worker_output.clone(),
+                output_root: output.clone(),
+                cache_root: cache.clone(),
+                temporary_root: temp.clone(),
                 readonly_roots,
-                request_files: vec![query_path, request_path],
-                writable_roots: vec![output, cache, temp],
                 forbidden_paths: vec![root.to_path_buf(), key_path.to_path_buf()],
                 expected_executable_digest: executable_digest.clone(),
                 max_duration: Duration::from_secs(120),
-                capture_stderr: false,
             })?;
             let raw = match outcome {
                 SandboxOutcome::Exited { status, .. } if status.success() => {
@@ -318,7 +393,10 @@ fn run_local_inner(
                     let _sealed_digest = sha256(&sealed);
                     serde_json::from_slice::<RawTrial>(&sealed)?
                 }
-                SandboxOutcome::Exited { status, .. } => failed_raw(
+                SandboxOutcome::Exited {
+                    status,
+                    stderr_first_line,
+                } => failed_raw(
                     unit,
                     *arm,
                     admission_digest,
@@ -326,9 +404,9 @@ fn run_local_inner(
                     executable_digest.clone(),
                     launch_time,
                     TrialTerminal::Error,
-                    format!("worker exited with {status}"),
+                    worker_failure(format!("worker exited with {status}"), stderr_first_line),
                 )?,
-                SandboxOutcome::TimedOut { .. } => failed_raw(
+                SandboxOutcome::TimedOut { stderr_first_line } => failed_raw(
                     unit,
                     *arm,
                     admission_digest,
@@ -336,9 +414,19 @@ fn run_local_inner(
                     executable_digest.clone(),
                     launch_time,
                     TrialTerminal::Timeout,
-                    "worker timed out".into(),
+                    worker_failure("worker timed out".into(), stderr_first_line),
                 )?,
             };
+            if raw_records.is_empty()
+                && raw.terminal != TrialTerminal::Complete
+                && raw.observations.is_empty()
+            {
+                return Err(ProtocolError(format!(
+                    "INVALID_HARNESS: first production worker failed before observations: {}",
+                    raw.worker_error.as_deref().unwrap_or("worker error")
+                ))
+                .into());
+            }
             validate_trial_binding(unit, &admission, &raw)?;
             measured_started_at.get_or_insert_with(|| raw.measured_started_at.clone());
             measured_ended_at = Some(raw.measured_ended_at.clone());
@@ -419,6 +507,156 @@ fn run_local_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_premeasurement_canary(
+    root: &Path,
+    vendor: &Path,
+    temporary: &Path,
+    schedule: &ScheduleManifest,
+    checkouts: &[MaterializedCheckout],
+    executable: &Path,
+    executable_digest: &str,
+    git: &PinnedGit,
+    key_path: &Path,
+) -> Result<()> {
+    let unit = schedule
+        .units
+        .first()
+        .ok_or_else(|| ProtocolError("PREMEASUREMENT_CANARY: schedule is empty".into()))?;
+    let canary_root = temporary.join("premeasurement-canary");
+    fs::create_dir(&canary_root)?;
+    let repository = canary_root.join("repository");
+    let result = (|| -> Result<()> {
+        clone_checkout(
+            git,
+            vendor,
+            &checkouts[unit.schedule_index],
+            &repository,
+            unit,
+        )?;
+        let source = if unit.package.path_in_vcs.is_empty() {
+            repository.clone()
+        } else {
+            repository.join(&unit.package.path_in_vcs)
+        };
+        let inputs = canary_root.join("inputs");
+        let output = canary_root.join("output");
+        let cache = canary_root.join("cache");
+        let temp = canary_root.join("tmp");
+        for path in [&inputs, &output, &cache, &temp] {
+            fs::create_dir(path)?;
+        }
+        let query_path = inputs.join("query.json");
+        let request_path = inputs.join("arm.json");
+        let worker_output = output.join("raw.json");
+        let admission_digest = sha256(b"m005-w07-v4-premeasurement-canary-admission");
+        let cache_id = sha256(b"m005-w07-v4-premeasurement-canary-cache");
+        write_json(
+            &query_path,
+            &WorkerQuery {
+                task_id: unit.task.task_id.clone(),
+                query: unit.task.query.clone(),
+                query_digest: unit.task.query_digest.clone(),
+            },
+        )?;
+        write_json(
+            &request_path,
+            &WorkerArmRequest {
+                unit_id: unit.unit_id.clone(),
+                source_digest: unit.rust_source_digest.clone(),
+                admission_digest: admission_digest.clone(),
+                executor_evidence: ExecutorEvidence::LocalSandboxNotTrusted,
+                cache_id,
+                worker_executable_digest: executable_digest.into(),
+                config: ArmConfig::frozen(Arm::L),
+            },
+        )?;
+        let readonly_roots =
+            history_read_roots(&repository, &source, &checkouts[unit.schedule_index])?;
+        let outcome = run_local_worker_sandbox(LocalWorkerSandboxRequest {
+            executable: executable.to_path_buf(),
+            expected_executable_digest: executable_digest.into(),
+            git_executable: git.path.clone(),
+            source_snapshot: source,
+            git_metadata_root: readonly_roots[0].clone(),
+            query_path,
+            request_path,
+            output_path: worker_output.clone(),
+            output_root: output,
+            cache_root: cache,
+            temporary_root: temp,
+            readonly_roots,
+            forbidden_paths: vec![root.to_path_buf(), key_path.to_path_buf()],
+            max_duration: Duration::from_secs(120),
+        })?;
+        match outcome {
+            SandboxOutcome::Exited { status, .. } if status.success() => {}
+            SandboxOutcome::Exited {
+                status,
+                stderr_first_line,
+            } => {
+                return Err(ProtocolError(format!(
+                    "PREMEASUREMENT_CANARY INVALID_HARNESS: {}",
+                    worker_failure(format!("worker exited with {status}"), stderr_first_line)
+                ))
+                .into());
+            }
+            SandboxOutcome::TimedOut { stderr_first_line } => {
+                return Err(ProtocolError(format!(
+                    "PREMEASUREMENT_CANARY INVALID_HARNESS: {}",
+                    worker_failure("worker timed out".into(), stderr_first_line)
+                ))
+                .into());
+            }
+        }
+        let sealed = read_bounded(&worker_output, crate::MAX_JSON_BYTES as u64)?;
+        crate::protocol::validate_schema(
+            include_bytes!("../schema/v2/raw-trial.schema.json"),
+            &sealed,
+        )?;
+        let raw: RawTrial = serde_json::from_slice(&sealed)?;
+        let lexical = raw.observations.iter().find(|observation| {
+            observation.source == RetrievalSource::Lexical
+                && observation.status == SourceStatus::Available
+                && observation.error.is_none()
+                && observation.error_code.is_none()
+                && !observation.truncated
+                && observation.complete_candidate_count == observation.candidates.len()
+        });
+        if raw.unit_id != unit.unit_id
+            || raw.task_id != unit.task.task_id
+            || raw.arm != Arm::L
+            || raw.source_digest != unit.rust_source_digest
+            || raw.admission_digest != admission_digest
+            || raw.executor_evidence != ExecutorEvidence::LocalSandboxNotTrusted
+            || raw.terminal != TrialTerminal::Complete
+            || raw.worker_error.is_some()
+            || lexical.is_none()
+        {
+            return Err(ProtocolError(
+                "PREMEASUREMENT_CANARY INVALID_HARNESS: worker output binding or lexical observation is invalid"
+                    .into(),
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let remove = fs::remove_dir_all(&canary_root);
+    let prune = git_status(
+        git,
+        &checkouts[unit.schedule_index].path,
+        &["worktree", "prune"],
+    );
+    result?;
+    remove?;
+    prune?;
+    Ok(())
+}
+
+fn worker_failure(message: String, stderr_first_line: Option<String>) -> String {
+    stderr_first_line.map_or(message.clone(), |stderr| format!("{message}: {stderr}"))
+}
+
 pub fn run_trusted() -> Result<()> {
     let root = workspace_root();
     crate::protocol::verify()?;
@@ -426,7 +664,7 @@ pub fn run_trusted() -> Result<()> {
     let report = crate::BlockedReport {
         schema_version: "2.0".into(),
         kind: "m005_w07_blocked_report".into(),
-        experiment_id: "m005-w07-rust-registry-v3".into(),
+        experiment_id: "m005-w07-rust-registry-v4".into(),
         status: "BLOCKED_G03_G04".into(),
         gate_claim: "NONE_BLOCKED_EXTERNAL".into(),
         measured_trials: 0,
@@ -2220,6 +2458,28 @@ mod tests {
         .unwrap();
         assert!(cleanup_failed_run_at(&root).is_err());
         assert!(run.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_accepts_pre_registration_canary_failure_state() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir_all(root.join(Path::new(REPORT_PATH).parent().unwrap())).unwrap();
+        fs::write(
+            root.join(REPORT_PATH),
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "m005_w07_status_report",
+                "status": "NOT_RUN_PRECOMMIT",
+                "measured_trials": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        cleanup_failed_run_at(&root).unwrap();
+        let run = root.join(RUN_PATH);
+        fs::create_dir(&run).unwrap();
+        cleanup_failed_run_at(&root).unwrap();
+        assert!(!run.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

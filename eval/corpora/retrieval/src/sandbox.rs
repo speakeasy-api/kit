@@ -1,5 +1,6 @@
 use crate::{ProtocolError, Result, sha256};
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs,
     io::Read,
@@ -24,6 +25,23 @@ pub struct LocalSandboxRequest {
     pub capture_stderr: bool,
 }
 
+pub struct LocalWorkerSandboxRequest {
+    pub executable: PathBuf,
+    pub expected_executable_digest: String,
+    pub git_executable: PathBuf,
+    pub source_snapshot: PathBuf,
+    pub git_metadata_root: PathBuf,
+    pub query_path: PathBuf,
+    pub request_path: PathBuf,
+    pub output_path: PathBuf,
+    pub output_root: PathBuf,
+    pub cache_root: PathBuf,
+    pub temporary_root: PathBuf,
+    pub readonly_roots: Vec<PathBuf>,
+    pub forbidden_paths: Vec<PathBuf>,
+    pub max_duration: Duration,
+}
+
 #[derive(Debug)]
 pub enum SandboxOutcome {
     Exited {
@@ -33,6 +51,34 @@ pub enum SandboxOutcome {
     TimedOut {
         stderr_first_line: Option<String>,
     },
+}
+
+pub fn run_local_worker_sandbox(request: LocalWorkerSandboxRequest) -> Result<SandboxOutcome> {
+    run_local_sandbox(LocalSandboxRequest {
+        executable: request.executable,
+        expected_executable_digest: request.expected_executable_digest,
+        allowed_executables: vec![request.git_executable],
+        arguments: vec![
+            OsString::from("worker"),
+            request.source_snapshot.clone().into_os_string(),
+            request.git_metadata_root.into_os_string(),
+            request.query_path.clone().into_os_string(),
+            request.request_path.clone().into_os_string(),
+            request.output_path.into_os_string(),
+            request.cache_root.clone().into_os_string(),
+        ],
+        source_snapshot: request.source_snapshot,
+        readonly_roots: request.readonly_roots,
+        request_files: vec![request.query_path, request.request_path],
+        writable_roots: vec![
+            request.output_root,
+            request.cache_root,
+            request.temporary_root,
+        ],
+        forbidden_paths: request.forbidden_paths,
+        max_duration: request.max_duration,
+        capture_stderr: true,
+    })
 }
 
 pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome> {
@@ -92,9 +138,38 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
     {
         return Err(ProtocolError("sandbox inputs and writable roots overlap".into()).into());
     }
+    let temporary_root = std::env::temp_dir().canonicalize()?;
+    let metadata_ancestors = protected
+        .iter()
+        .copied()
+        .chain(writable.iter())
+        .map(|path| validated_ancestor_chain(path, &temporary_root))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let data_ancestors = std::iter::once(&source)
+        .chain(writable.iter())
+        .map(|path| validated_ancestor_chain(path, &temporary_root))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     let mut profile = String::from(
-        "(version 1)\n(deny default)\n(deny network*)\n(allow process-fork)\n(allow signal (target self))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.iossupportversion\") (sysctl-name \"kern.osvariant_status\") (sysctl-name \"hw.ephemeral_storage\") (sysctl-name \"hw.pagesize_compat\"))\n(allow file-read* (literal \"/\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/private/var/db/timezone\") (literal \"/dev/null\") (literal \"/dev/urandom\"))\n",
+        "(version 1)\n(deny default)\n(deny network*)\n(allow process-fork)\n(allow signal (target self))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.iossupportversion\") (sysctl-name \"kern.osvariant_status\") (sysctl-name \"hw.ephemeral_storage\") (sysctl-name \"hw.pagesize_compat\"))\n(allow file-read* (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/private/var/db/timezone\") (literal \"/dev/null\") (literal \"/dev/urandom\"))\n",
     );
+    for path in metadata_ancestors {
+        profile.push_str(&format!(
+            "(allow file-read-metadata (literal {}))\n",
+            sandbox_string(&path)?
+        ));
+    }
+    for path in data_ancestors {
+        profile.push_str(&format!(
+            "(allow file-read-data (literal {}))\n",
+            sandbox_string(&path)?
+        ));
+    }
     profile.push_str(&format!(
         "(allow process-exec (literal {}))\n(allow file-read* (literal {}) (subpath {}))\n",
         sandbox_string(&executable)?,
@@ -248,6 +323,32 @@ fn existing_file(path: &Path) -> Result<PathBuf> {
 
 fn overlaps(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn validated_ancestor_chain(path: &Path, temporary_root: &Path) -> Result<Vec<PathBuf>> {
+    let fixed_roots = [
+        temporary_root,
+        Path::new("/System"),
+        Path::new("/bin"),
+        Path::new("/usr"),
+        Path::new("/private/var/db/timezone"),
+        Path::new("/dev"),
+    ];
+    let _fixed_root = fixed_roots
+        .into_iter()
+        .find(|root| path.starts_with(root))
+        .ok_or_else(|| {
+            ProtocolError("sandbox path is outside fixed system and temporary roots".into())
+        })?;
+    let mut chain = Vec::new();
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ProtocolError("sandbox ancestor is a symlink".into()).into());
+        }
+        chain.push(ancestor.to_path_buf());
+    }
+    Ok(chain)
 }
 
 fn identity(path: &Path) -> Result<(u64, u64, u64)> {

@@ -1,13 +1,31 @@
 {
   "$schema":"https://json-schema.org/draft/2020-12/schema",
-  "type":"object","additionalProperties":false,
-  "required":["schema_version","kind","experiment_id","preregistration_digest","status","route","scheduled_trials","aborted_trials","signal","failure_phase","observations","root_cause","claims","measured_started_at","measured_ended_at","artifact_sha256"],
-  "properties":{
-    "schema_version":{"const":"1.0"},"kind":{"const":"m005_w07_worker_abort_incident"},"experiment_id":{"const":"m005-w07-rust-registry-v2"},"preregistration_digest":{"const":"sha256:68def4141404f99704822ee6752e0f68fbf19ea6ef70db967d8d1d33013b2787"},
-    "status":{"const":"INVALID_HARNESS"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"scheduled_trials":{"const":504},"aborted_trials":{"const":504},"signal":{"const":"SIGABRT"},"failure_phase":{"const":"BEFORE_MAIN"},"observations":{"const":0},
-    "root_cause":{"type":"object","additionalProperties":false,"required":["code","sysctl"],"properties":{"code":{"const":"DENIED_SYSCTL"},"sysctl":{"const":"hw.pagesize_compat"}}},
+  "$defs":{
     "claims":{"type":"object","additionalProperties":false,"required":["retrieval","statistical","g05"],"properties":{"retrieval":{"const":false},"statistical":{"const":false},"g05":{"const":false}}},
-    "measured_started_at":{"const":"2026-07-31T04:40:23.784083Z"},"measured_ended_at":{"const":"2026-07-31T05:22:02.472128Z"},
-    "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"const":"84c345cf402095535d3908d971705569e4109fd88ab67330993705544f53a9d2"},"raw_trials":{"const":"e164784b323a2a1b8f66b3b3621bacaa2326ab6fdc98968d96293f5f3119d3a7"},"signed_ledger":{"const":"74b7c51b36e157b5d5be6014820344be3c7e08986f18b2a871aa6ecfb36fd4d8"},"git_materialization":{"const":"f50c494020859f9bbc58243a7d240c2e61a86bdaf6adec2ae61d6a16a31c8d58"}}}
-  }
+    "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"type":"string","pattern":"^[0-9a-f]{64}$"},"raw_trials":{"type":"string","pattern":"^[0-9a-f]{64}$"},"signed_ledger":{"type":"string","pattern":"^[0-9a-f]{64}$"},"git_materialization":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}
+  },
+  "oneOf":[
+    {
+      "type":"object","additionalProperties":false,
+      "required":["schema_version","kind","experiment_id","preregistration_digest","status","route","scheduled_trials","aborted_trials","signal","failure_phase","observations","root_cause","claims","measured_started_at","measured_ended_at","artifact_sha256"],
+      "properties":{
+        "schema_version":{"const":"1.0"},"kind":{"const":"m005_w07_worker_abort_incident"},"experiment_id":{"const":"m005-w07-rust-registry-v2"},"preregistration_digest":{"const":"sha256:68def4141404f99704822ee6752e0f68fbf19ea6ef70db967d8d1d33013b2787"},
+        "status":{"const":"INVALID_HARNESS"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"scheduled_trials":{"const":504},"aborted_trials":{"const":504},"signal":{"const":"SIGABRT"},"failure_phase":{"const":"BEFORE_MAIN"},"observations":{"const":0},
+        "root_cause":{"type":"object","additionalProperties":false,"required":["code","sysctl"],"properties":{"code":{"const":"DENIED_SYSCTL"},"sysctl":{"const":"hw.pagesize_compat"}}},
+        "claims":{"$ref":"#/$defs/claims"},"measured_started_at":{"const":"2026-07-31T04:40:23.784083Z"},"measured_ended_at":{"const":"2026-07-31T05:22:02.472128Z"},
+        "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"const":"84c345cf402095535d3908d971705569e4109fd88ab67330993705544f53a9d2"},"raw_trials":{"const":"e164784b323a2a1b8f66b3b3621bacaa2326ab6fdc98968d96293f5f3119d3a7"},"signed_ledger":{"const":"74b7c51b36e157b5d5be6014820344be3c7e08986f18b2a871aa6ecfb36fd4d8"},"git_materialization":{"const":"f50c494020859f9bbc58243a7d240c2e61a86bdaf6adec2ae61d6a16a31c8d58"}}}
+      }
+    },
+    {
+      "type":"object","additionalProperties":false,
+      "required":["schema_version","kind","experiment_id","preregistration_digest","status","route","scheduled_trials","harness_error_trials","exit_status","failure_phase","observations","root_cause","claims","measured_started_at","measured_ended_at","reported_at","artifact_sha256"],
+      "properties":{
+        "schema_version":{"const":"1.0"},"kind":{"const":"m005_w07_invalid_harness_incident"},"experiment_id":{"const":"m005-w07-rust-registry-v3"},"preregistration_digest":{"const":"sha256:b12173d9cfaafaf43b70959421e5921ad92b5b0b2d56cf1e94ce0be949656bd0"},
+        "status":{"const":"INVALID_HARNESS"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"scheduled_trials":{"const":504},"harness_error_trials":{"const":504},"exit_status":{"const":1},"failure_phase":{"const":"BEFORE_OBSERVATIONS"},"observations":{"const":0},
+        "root_cause":{"type":"object","additionalProperties":false,"required":["code","denied_operations","syscall","scope"],"properties":{"code":{"const":"SANDBOX_DENIED_ANCESTOR_TRAVERSAL"},"denied_operations":{"const":["file-read-metadata","file-read-data"]},"syscall":{"const":"openat"},"scope":{"const":"validated protected and writable path ancestor traversal"}}},
+        "claims":{"$ref":"#/$defs/claims"},"measured_started_at":{"const":"2026-07-31T05:54:46.761067Z"},"measured_ended_at":{"const":"2026-07-31T06:36:37.46211Z"},"reported_at":{"const":"2026-07-31T06:39:36.258254Z"},
+        "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"const":"c553577ef27913ddc99a32489cdf5fe602c0d838cd833e5d6ce7c88c514731f7"},"raw_trials":{"const":"75ba103a42a0333d3eee1818828a421ef21f7e912d05b8e2a11395374f003c90"},"signed_ledger":{"const":"666749b9df1fbb2184a13282a3d1c01c3454c8f0a1a8583ccbadd8c0716e864e"},"git_materialization":{"const":"bd3331d824d5ea57603f7e9f8e36ae0c9510160875c891de316b40c82b5504a9"}}}
+      }
+    }
+  ]
 }

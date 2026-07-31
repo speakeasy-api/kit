@@ -28,8 +28,10 @@ const MANIFEST_PATH: &str = "eval/reports/m005/source-semantics/corpus-manifest.
 const PREREG_PATH: &str = "eval/preregistration/m005-w07.yaml";
 const REPORT_PATH: &str = "eval/reports/m005/source-semantics/retrieval-report.json";
 const PUBLIC_KEY_PATH: &str = "eval/corpora/retrieval/public-key.pem";
-const INCIDENT_PATH: &str =
+const V2_INCIDENT_PATH: &str =
     "eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json";
+const V3_INCIDENT_PATH: &str =
+    "eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json";
 const CHECKSUM_FILE: &str = ".cargo-checksum.json";
 const VCS_INFO_FILE: &str = ".cargo_vcs_info.json";
 const MAX_FILES: usize = 100_000;
@@ -208,11 +210,12 @@ pub fn verify_with_vendor(vendor: Option<&Path>) -> Result<()> {
     validate_schema_definition(include_bytes!("../schema/v2/measured-report.schema.json"))?;
     validate_schema_definition(include_bytes!("../schema/v2/blocked-report.schema.json"))?;
     validate_schema_definition(include_bytes!("../schema/v2/signed-ledger.schema.json"))?;
-    let incident = read_bounded(&root.join(INCIDENT_PATH), 64 * 1024)?;
-    validate_schema(
-        include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
-        &incident,
-    )?;
+    for path in [V2_INCIDENT_PATH, V3_INCIDENT_PATH] {
+        validate_schema(
+            include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
+            &read_bounded(&root.join(path), 64 * 1024)?,
+        )?;
+    }
     let manifest: CorpusManifest = serde_json::from_slice(&manifest_bytes)?;
     let preregistration: Preregistration = serde_json::from_slice(&preregistration_bytes)?;
     validate_manifest(&manifest)?;
@@ -251,7 +254,7 @@ pub fn verify_with_vendor(vendor: Option<&Path>) -> Result<()> {
         let expected = crate::BlockedReport {
             schema_version: "2.0".into(),
             kind: "m005_w07_blocked_report".into(),
-            experiment_id: "m005-w07-rust-registry-v3".into(),
+            experiment_id: "m005-w07-rust-registry-v4".into(),
             status: "BLOCKED_G03_G04".into(),
             gate_claim: "NONE_BLOCKED_EXTERNAL".into(),
             measured_trials: 0,
@@ -733,11 +736,11 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
     Ok(Preregistration {
         schema_version: "2.0".into(),
         kind: "m005_w07_preregistration".into(),
-        experiment_id: "m005-w07-rust-registry-v3".into(),
+        experiment_id: "m005-w07-rust-registry-v4".into(),
         state: "PRE_RUN_FROZEN".into(),
         language: "rust".into(),
         corpus_manifest_digest,
-        prior_invalid_experiment: prior_invalid_experiment(root)?,
+        prior_invalid_experiments: prior_invalid_experiments(root)?,
         immutable_inputs,
         runtime_environment,
         public_receipt_key: PublicReceiptKey {
@@ -771,6 +774,7 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
             lexical_context_rule: "lexical candidates are the UTF-8 bounded window of up to 1024 bytes before and after an actual literal lexical match; range and snippet are that fixed lexical context, never the match substring or a syntax-derived item".into(),
             localization_relevance: "a candidate localizes a registered symbol iff it has exact_item semantics and exactly equals the registered item range, or it has lexical_context semantics on the same path and contains the registered declaration start byte; other_context never localizes".into(),
             history_materialization_rule: "before measurement use pinned absolute Git init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and every VCS-present frozen Rust byte, remove every worktree file outside the frozen package file set, materialize the exact checksum-validated published package snapshot including registry-only files, and retain separately sandboxed genuine .git object metadata; any failure is terminal".into(),
+            premeasurement_canary_rule: "PREMEASUREMENT_CANARY: after all 72 materializations and before signed registration or admission, run a fresh unit-0 L worker with the exact six-argument production command, executable, and sandbox policy; require exit 0, schema-valid raw output bound to the expected unit, arm, and source digest with a complete lexical observation; delete its worktree, cache, request, and output state, never record it as a measured row, and fail INVALID_HARNESS before registration on any error".into(),
             measured_timestamp_rule: "signed registration and signed admission must precede CLOCK_REALTIME start; each trial stores measured start/end plus monotonic elapsed; otherwise terminal failure".into(),
             raw_observation_rule: "persist every source response candidate/range/snippet/provenance, source start/end, timing, truncation, and error before deterministic top-k projection".into(),
             verification_rule: "verify schemas, the immutable preregistration/public key, materialization receipt digest/count, and Ed25519 ledger/table reconciliation in Rust; recompute the frozen Rust-tree source digest, reconstruct top-k only from raw observations, grade hidden target/decoys, and compare the complete expected edited tree digest".into(),
@@ -781,19 +785,27 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
     })
 }
 
-fn prior_invalid_experiment(root: &Path) -> Result<PriorInvalidExperiment> {
-    let bytes = read_bounded(&root.join(INCIDENT_PATH), 64 * 1024)?;
-    validate_schema(
-        include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
-        &bytes,
-    )?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    Ok(PriorInvalidExperiment {
-        experiment_id: "m005-w07-rust-registry-v2".into(),
-        status: "INVALID_HARNESS".into(),
-        incident_path: INCIDENT_PATH.into(),
-        incident_digest: sha256(&canonical(&value)?),
+fn prior_invalid_experiments(root: &Path) -> Result<Vec<PriorInvalidExperiment>> {
+    [
+        ("m005-w07-rust-registry-v2", V2_INCIDENT_PATH),
+        ("m005-w07-rust-registry-v3", V3_INCIDENT_PATH),
+    ]
+    .into_iter()
+    .map(|(experiment_id, incident_path)| {
+        let bytes = read_bounded(&root.join(incident_path), 64 * 1024)?;
+        validate_schema(
+            include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
+            &bytes,
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        Ok(PriorInvalidExperiment {
+            experiment_id: experiment_id.into(),
+            status: "INVALID_HARNESS".into(),
+            incident_path: incident_path.into(),
+            incident_digest: sha256(&canonical(&value)?),
+        })
     })
+    .collect()
 }
 
 fn analysis_plan() -> AnalysisPlan {
@@ -906,10 +918,10 @@ fn validate_preregistration(plan: &Preregistration, manifest: &CorpusManifest) -
     runtime.manifest_digest.clear();
     if plan.schema_version != "2.0"
         || plan.kind != "m005_w07_preregistration"
-        || plan.experiment_id != "m005-w07-rust-registry-v3"
+        || plan.experiment_id != "m005-w07-rust-registry-v4"
         || plan.state != "PRE_RUN_FROZEN"
         || plan.corpus_manifest_digest != sha256(&canonical(manifest)?)
-        || plan.prior_invalid_experiment != prior_invalid_experiment(&workspace_root())?
+        || plan.prior_invalid_experiments != prior_invalid_experiments(&workspace_root())?
         || plan.public_receipt_key.algorithm != "Ed25519"
         || !plan.oracle_selection.outcome_independent
         || plan.analysis.contrast != "C-L"
@@ -995,7 +1007,7 @@ fn not_run_report(
     StatusReport {
         schema_version: "2.0".into(),
         kind: "m005_w07_status_report".into(),
-        experiment_id: "m005-w07-rust-registry-v3".into(),
+        experiment_id: "m005-w07-rust-registry-v4".into(),
         status: "NOT_RUN_PRECOMMIT".into(),
         statistical_verdict: None,
         gate_claim: "NONE; C-L and G05 are not claimed".into(),
