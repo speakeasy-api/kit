@@ -8,7 +8,10 @@ use crate::{
     },
 };
 
-use super::identity::{CapabilityIdentity, Digest, DigestAlgorithm, put_bytes, put_digest};
+use super::{
+    grant_ext::{GrantExtension, RequestExtension},
+    identity::{CapabilityIdentity, Digest, DigestAlgorithm, put_bytes, put_digest},
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EffectClass {
@@ -88,7 +91,7 @@ impl ArgumentConstraints {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CapabilityGrant {
     principal_id: PrincipalId,
     project_id: ProjectId,
@@ -97,10 +100,11 @@ pub struct CapabilityGrant {
     schema_digest: Digest,
     effect: EffectClass,
     argument_constraints: ArgumentConstraints,
+    extension: GrantExtension,
 }
 
 impl CapabilityGrant {
-    pub const fn new(
+    pub fn new(
         principal_id: PrincipalId,
         project_id: ProjectId,
         workspace_id: WorkspaceId,
@@ -117,6 +121,7 @@ impl CapabilityGrant {
             schema_digest,
             effect,
             argument_constraints,
+            extension: GrantExtension::default(),
         }
     }
 
@@ -148,7 +153,26 @@ impl CapabilityGrant {
         &self.argument_constraints
     }
 
-    fn allows(&self, input: &BindingInputs) -> bool {
+    pub fn with_extension(mut self, extension: GrantExtension) -> Self {
+        self.extension = extension;
+        self
+    }
+
+    pub const fn extension(&self) -> &GrantExtension {
+        &self.extension
+    }
+
+    fn match_outcome(&self, input: &BindingInputs) -> GrantMatch {
+        if !self.matches_except_depth(input) {
+            GrantMatch::Denied
+        } else if input.delegation_depth > self.extension.maximum_delegation_depth() {
+            GrantMatch::DepthExceeded
+        } else {
+            GrantMatch::Allowed
+        }
+    }
+
+    fn matches_except_depth(&self, input: &BindingInputs) -> bool {
         self.principal_id == input.principal_id
             && self.project_id == input.project_id
             && self.workspace_id == input.workspace_id
@@ -158,6 +182,7 @@ impl CapabilityGrant {
             && self
                 .argument_constraints
                 .allows(&input.argument_constraints)
+            && self.extension.allows_except_depth(&input.extension)
     }
 
     fn write_canonical(&self, output: &mut Vec<u8>) {
@@ -168,6 +193,7 @@ impl CapabilityGrant {
         put_digest(output, self.schema_digest);
         output.push(self.effect.tag());
         self.argument_constraints.write_canonical(output);
+        self.extension.write_canonical(output);
     }
 }
 
@@ -225,9 +251,24 @@ impl CapabilityGrantSnapshot {
         self.digest
     }
 
-    fn allows(&self, input: &BindingInputs) -> bool {
-        self.grants.iter().any(|grant| grant.allows(input))
+    fn match_outcome(&self, input: &BindingInputs) -> GrantMatch {
+        let mut outcome = GrantMatch::Denied;
+        for grant in &self.grants {
+            match grant.match_outcome(input) {
+                GrantMatch::Allowed => return GrantMatch::Allowed,
+                GrantMatch::DepthExceeded => outcome = GrantMatch::DepthExceeded,
+                GrantMatch::Denied => {}
+            }
+        }
+        outcome
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GrantMatch {
+    Allowed,
+    DepthExceeded,
+    Denied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,7 +289,7 @@ impl DelegationSnapshot {
         if path.is_empty() {
             return Err(DelegationError::EmptyPath);
         }
-        if path.len() > usize::from(maximum_depth) {
+        if path.len().saturating_sub(1) > usize::from(maximum_depth) {
             return Err(DelegationError::DepthExceeded);
         }
         if path.iter().collect::<BTreeSet<_>>().len() != path.len() {
@@ -324,6 +365,8 @@ pub struct BindingInputs {
     config_snapshot_digest: [u8; 32],
     grant_snapshot_digest: Digest,
     delegation_digest: Option<Digest>,
+    extension: RequestExtension,
+    delegation_depth: u16,
 }
 
 impl BindingInputs {
@@ -367,6 +410,18 @@ impl BindingInputs {
         self.delegation_digest
     }
 
+    pub const fn extension(&self) -> &RequestExtension {
+        &self.extension
+    }
+
+    pub const fn delegation_depth(&self) -> u16 {
+        self.delegation_depth
+    }
+
+    pub(super) fn into_extension(self) -> RequestExtension {
+        self.extension
+    }
+
     fn write_canonical(&self, output: &mut Vec<u8>) {
         put_bytes(output, self.principal_id.to_string().as_bytes());
         self.capability.write_canonical(output);
@@ -384,6 +439,8 @@ impl BindingInputs {
             }
             None => output.push(0),
         }
+        self.extension.write_canonical(output);
+        output.extend_from_slice(&self.delegation_depth.to_be_bytes());
     }
 }
 
@@ -398,6 +455,7 @@ pub struct GrantRequest<'a> {
     pub config: &'a RunConfigSnapshot,
     pub grants: &'a CapabilityGrantSnapshot,
     pub delegation: Option<&'a DelegationSnapshot>,
+    pub extension: RequestExtension,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,6 +469,7 @@ pub enum GrantReasonCode {
     NoMatchingGrant,
     DelegationPrincipalMismatch,
     DelegationDenied,
+    DelegationDepthExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +504,10 @@ impl GrantDecision {
 
 pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
     let authenticated = request.authenticated.grant_snapshot();
+    let delegation_depth = request
+        .delegation
+        .map_or(0, |delegation| delegation.path().len().saturating_sub(1));
+    let delegation_depth = u16::try_from(delegation_depth).unwrap_or(u16::MAX);
     let binding_inputs = BindingInputs {
         principal_id: request.authenticated.principal_id(),
         capability: request.capability.clone(),
@@ -456,10 +519,16 @@ pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
         config_snapshot_digest: request.config.digest(),
         grant_snapshot_digest: request.grants.digest(),
         delegation_digest: request.delegation.map(DelegationSnapshot::digest),
+        extension: request.extension,
+        delegation_depth,
     };
     let mut canonical = Vec::new();
     canonical.extend_from_slice(b"KCAPDECISION\0");
     binding_inputs.write_canonical(&mut canonical);
+    put_bytes(
+        &mut canonical,
+        authenticated.project_id().to_string().as_bytes(),
+    );
     canonical.extend_from_slice(&(authenticated.grants().len() as u64).to_be_bytes());
     for grant in authenticated.grants() {
         canonical.push(grant_tag(*grant));
@@ -488,19 +557,37 @@ pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
         .contains(&request.effect.required_grant())
     {
         GrantReasonCode::EffectNotConfigured
-    } else if !request.grants.allows(&binding_inputs) {
-        GrantReasonCode::NoMatchingGrant
+    } else if binding_inputs.extension.egress().is_some()
+        && !authenticated.grants().contains(&Grant::NetworkEgress)
+    {
+        GrantReasonCode::EffectNotAuthenticated
+    } else if binding_inputs.extension.egress().is_some()
+        && !request
+            .config
+            .effective_authority()
+            .contains(&Grant::NetworkEgress)
+    {
+        GrantReasonCode::EffectNotConfigured
     } else if request.delegation.is_some_and(|delegation| {
         delegation.path().last().copied() != Some(request.authenticated.principal_id())
     }) {
         GrantReasonCode::DelegationPrincipalMismatch
-    } else if request
-        .delegation
-        .is_some_and(|delegation| !delegation.grants().allows(&binding_inputs))
-    {
-        GrantReasonCode::DelegationDenied
     } else {
-        GrantReasonCode::Granted
+        match request.grants.match_outcome(&binding_inputs) {
+            GrantMatch::Denied => GrantReasonCode::NoMatchingGrant,
+            GrantMatch::DepthExceeded => GrantReasonCode::DelegationDepthExceeded,
+            GrantMatch::Allowed => {
+                request
+                    .delegation
+                    .map_or(GrantReasonCode::Granted, |delegation| {
+                        match delegation.grants().match_outcome(&binding_inputs) {
+                            GrantMatch::Allowed => GrantReasonCode::Granted,
+                            GrantMatch::DepthExceeded => GrantReasonCode::DelegationDepthExceeded,
+                            GrantMatch::Denied => GrantReasonCode::DelegationDenied,
+                        }
+                    })
+            }
+        }
     };
 
     GrantDecision {
@@ -509,10 +596,6 @@ pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
         snapshot_digest,
         binding_inputs,
     }
-}
-
-pub fn authorized(request: GrantRequest<'_>) -> Option<BindingInputs> {
-    decide(request).into_authorized_inputs()
 }
 
 const fn grant_tag(grant: Grant) -> u8 {

@@ -117,6 +117,7 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
                     config: &config,
                     grants: &grants,
                     delegation: None,
+                    extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
                 })
                 .is_allowed()
             );
@@ -139,6 +140,7 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
                     config: &config,
                     grants: &grants,
                     delegation: None,
+                    extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
                     capability: &capability,
                     discovered_schema_digest: schema,
                     bound_schema_digest: schema,

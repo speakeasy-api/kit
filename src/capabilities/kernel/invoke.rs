@@ -33,6 +33,7 @@ use super::{
         self, ArgumentConstraints, CapabilityGrantSnapshot, DelegationSnapshot, EffectClass,
         GrantReasonCode, GrantRequest,
     },
+    grant_ext::RequestExtension,
     identity::{CapabilityIdentity, Digest, DigestAlgorithm, put_bytes, put_digest},
 };
 
@@ -116,6 +117,7 @@ pub struct InvocationEnvelope<'a> {
     pub config: &'a RunConfigSnapshot,
     pub grants: &'a CapabilityGrantSnapshot,
     pub delegation: Option<&'a DelegationSnapshot>,
+    pub extension: RequestExtension,
     pub capability: &'a CapabilityIdentity,
     pub discovered_schema_digest: Digest,
     pub bound_schema_digest: Digest,
@@ -148,6 +150,7 @@ pub struct AuthorizedInvocation {
     invocation_id: ToolCallId,
     idempotency_key: String,
     attempt: AttemptOwnership,
+    extension: RequestExtension,
 }
 
 impl AuthorizedInvocation {
@@ -177,6 +180,10 @@ impl AuthorizedInvocation {
 
     pub const fn attempt(&self) -> AttemptOwnership {
         self.attempt
+    }
+
+    pub const fn extension(&self) -> &RequestExtension {
+        &self.extension
     }
 }
 
@@ -297,12 +304,15 @@ pub fn invoke(
         config: envelope.config,
         grants: envelope.grants,
         delegation: envelope.delegation,
+        extension: envelope.extension.clone(),
     });
-    if !decision.is_allowed() {
-        return Err(InvokeError::AuthorizationDenied(decision.reason()));
-    }
+    let decision_digest = decision.snapshot_digest();
+    let reason = decision.reason();
+    let authorized_inputs = decision
+        .into_authorized_inputs()
+        .ok_or(InvokeError::AuthorizationDenied(reason))?;
 
-    let request_digest = request_digest(&envelope, decision.snapshot_digest());
+    let request_digest = request_digest(&envelope, decision_digest);
     let reservation_id = reservation_id(request_digest);
     runtime
         .budget
@@ -381,6 +391,7 @@ pub fn invoke(
         invocation_id: envelope.invocation_id,
         idempotency_key: envelope.idempotency_key.as_str().to_owned(),
         attempt: envelope.attempt,
+        extension: authorized_inputs.into_extension(),
     };
     let dispatched = Dispatcher {
         backend: runtime.backend,

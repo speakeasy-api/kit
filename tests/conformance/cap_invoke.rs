@@ -195,6 +195,7 @@ fn call(
         config,
         grants,
         delegation: None,
+        extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
         capability,
         discovered_schema_digest: *discovered_schema,
         bound_schema_digest: *schema,

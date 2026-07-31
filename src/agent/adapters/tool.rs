@@ -313,6 +313,7 @@ impl ToolExecutorAdapter {
                 config: &self.context.config,
                 grants: &self.context.grants,
                 delegation: self.context.delegation.as_ref(),
+                extension: crate::capabilities::kernel::grant_ext::RequestExtension::default(),
                 capability: &binding.capability,
                 discovered_schema_digest: binding.discovered_schema_digest,
                 bound_schema_digest: binding.bound_schema_digest,

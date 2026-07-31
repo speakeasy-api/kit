@@ -1330,6 +1330,7 @@ impl NativeRepoWorker {
                 config: &operation.config,
                 grants: &grants,
                 delegation: None,
+                extension: crate::capabilities::kernel::grant_ext::RequestExtension::default(),
                 capability: descriptor.identity(),
                 discovered_schema_digest: descriptor.schema().normalized_digest(),
                 bound_schema_digest: descriptor.schema().normalized_digest(),

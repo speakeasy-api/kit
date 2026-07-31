@@ -29,7 +29,7 @@ built_ins:
     identity: kit.durable-model-adapter
     version: 0.1.0
     schema_digest: sha256:e8c7cfcf4cf66cbad65763720f48e1d2c571759fb45585b5cfd1fd3631c35fd1
-    implementation_digest: sha256:b18f3636e34912e12661b480e16580aaa067a88eddabe55b1908f2b5e0f0220b
+    implementation_digest: sha256:7b7eddfae5236c4d47f57910293a315da151cb0b490b73d18abb2bb55130f2a6
     source: src/agent/adapters/model.rs
   - extension_point: prompt_module
     identity: kit.prompt-modules

@@ -8,7 +8,7 @@ use kit::{
     capabilities::kernel::{
         grant::{
             ArgumentConstraints, CapabilityGrant, CapabilityGrantSnapshot, DelegationSnapshot,
-            EffectClass, GrantReasonCode, GrantRequest, authorized, decide,
+            EffectClass, GrantReasonCode, GrantRequest, decide,
         },
         identity::{
             CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
@@ -201,6 +201,7 @@ fn grant_is_the_intersection_of_auth_config_rule_and_delegation() {
         config: &config,
         grants: &root_grants,
         delegation: Some(&delegation),
+        extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
     });
     assert!(allowed.is_allowed());
     assert_eq!(allowed.reason(), GrantReasonCode::Granted);
@@ -228,6 +229,7 @@ fn grant_is_the_intersection_of_auth_config_rule_and_delegation() {
         config: &config,
         grants: &root_grants,
         delegation: Some(&delegation),
+        extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
     });
     assert!(!denied.is_allowed());
     assert_eq!(denied.reason(), GrantReasonCode::DelegationDenied);
@@ -275,6 +277,7 @@ fn decision_replays_identically_and_later_config_cannot_expand_it() {
             config,
             grants: &grants,
             delegation: None,
+            extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
         })
     };
 
@@ -318,7 +321,7 @@ fn deny_by_default_keeps_unauthorized_capabilities_absent() {
     let discovered = [&visible, &forbidden]
         .into_iter()
         .filter_map(|capability| {
-            authorized(GrantRequest {
+            decide(GrantRequest {
                 authenticated: &authenticated,
                 capability,
                 schema_digest,
@@ -329,7 +332,9 @@ fn deny_by_default_keeps_unauthorized_capabilities_absent() {
                 config: &config,
                 grants: &grants,
                 delegation: None,
+                extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
             })
+            .into_authorized_inputs()
         })
         .collect::<Vec<_>>();
     assert_eq!(discovered.len(), 1);
@@ -346,6 +351,7 @@ fn deny_by_default_keeps_unauthorized_capabilities_absent() {
         config: &config,
         grants: &grants,
         delegation: None,
+        extension: kit::capabilities::kernel::grant_ext::RequestExtension::default(),
     });
     assert_eq!(denied.reason(), GrantReasonCode::NoMatchingGrant);
 }

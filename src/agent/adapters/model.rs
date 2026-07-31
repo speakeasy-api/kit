@@ -652,6 +652,7 @@ impl ModelKernel {
             config: &security.config,
             grants: &security.grants,
             delegation: security.delegation.as_ref(),
+            extension: crate::capabilities::kernel::grant_ext::RequestExtension::default(),
         });
         if decision.is_allowed() {
             Ok(())
