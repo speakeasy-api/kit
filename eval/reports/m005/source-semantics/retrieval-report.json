@@ -6,7 +6,7 @@
   "statistical_verdict": null,
   "gate_claim": "NONE; C-L and G05 are not claimed",
   "chronology": "uncommitted preregistration cannot prove pre-measurement chronology",
-  "preregistration_digest": "sha256:6064a65b9ab35b4257a601e4ab72f7defbe23c6ae0409f4980cc671b08d26324",
+  "preregistration_digest": "sha256:68def4141404f99704822ee6752e0f68fbf19ea6ef70db967d8d1d33013b2787",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
   "units": 72,
   "class_counts": {

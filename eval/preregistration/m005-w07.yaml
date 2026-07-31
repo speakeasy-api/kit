@@ -6,7 +6,7 @@
   "language": "rust",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
   "immutable_inputs": {
-    "build_inputs": "sha256:2dc8831e950a3684b6a3a88b85f6cbd38302b1cc0651bf0a3263bca393498271"
+    "build_inputs": "sha256:0725eebb155b75b5d0694c2b0f823243678c175edb545d13380497c54d73935f"
   },
   "runtime_environment": {
     "manifest_digest": "sha256:9196ec006f89f8a6244b20f393077cceb443815e80b0d26ea3d834a29fc3a31a",
@@ -132,11 +132,11 @@
     },
     "lexical_context_rule": "lexical candidates are the UTF-8 bounded window of up to 1024 bytes before and after an actual literal lexical match; range and snippet are that fixed lexical context, never the match substring or a syntax-derived item",
     "localization_relevance": "a candidate localizes a registered symbol iff it has exact_item semantics and exactly equals the registered item range, or it has lexical_context semantics on the same path and contains the registered declaration start byte; other_context never localizes",
-    "history_materialization_rule": "before measurement use pinned absolute Git init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and frozen Rust bytes, remove every worktree file outside the frozen package file set, and retain separately sandboxed genuine .git object metadata; any failure is terminal",
+    "history_materialization_rule": "before measurement use pinned absolute Git init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and every VCS-present frozen Rust byte, remove every worktree file outside the frozen package file set, materialize the exact checksum-validated published package snapshot including registry-only files, and retain separately sandboxed genuine .git object metadata; any failure is terminal",
     "measured_timestamp_rule": "signed registration and signed admission must precede CLOCK_REALTIME start; each trial stores measured start/end plus monotonic elapsed; otherwise terminal failure",
     "raw_observation_rule": "persist every source response candidate/range/snippet/provenance, source start/end, timing, truncation, and error before deterministic top-k projection",
     "verification_rule": "verify schemas, the immutable preregistration/public key, materialization receipt digest/count, and Ed25519 ledger/table reconciliation in Rust; recompute the frozen Rust-tree source digest, reconstruct top-k only from raw observations, grade hidden target/decoys, and compare the complete expected edited tree digest",
-    "build_rule": "workers can read only the filtered genuine pinned package worktree plus separate exact Git object metadata after frozen Rust-byte validation; root/index/search contain no sibling or unpublished worktree files, and no synthetic history, generated source, package substitution, or answer-bearing paths are permitted"
+    "build_rule": "workers can read only the exact checksum-validated published package snapshot overlaid on the filtered pinned worktree plus separate exact Git object metadata; root/index/search contain no sibling or unpublished VCS worktree files, and no synthetic history or answer-bearing paths are permitted"
   },
   "analysis": {
     "contrast": "C-L",

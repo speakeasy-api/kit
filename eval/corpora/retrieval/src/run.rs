@@ -240,7 +240,13 @@ fn run_local_inner(
             let trial_root = temporary.join(format!("trial-{:04}", raw_records.len()));
             fs::create_dir(&trial_root)?;
             let repository = trial_root.join("repository");
-            clone_checkout(git, &checkouts[unit.schedule_index], &repository, unit)?;
+            clone_checkout(
+                git,
+                vendor,
+                &checkouts[unit.schedule_index],
+                &repository,
+                unit,
+            )?;
             let source = if unit.package.path_in_vcs.is_empty() {
                 repository.clone()
             } else {
@@ -708,8 +714,30 @@ fn prepare_checkouts(
         for command in &commands[1..] {
             git_status_owned(git, &checkout, command)?;
         }
-        let files = validate_checkout(git, vendor, &checkout, unit)?;
-        let normalized_symlinks = filter_checkout(&checkout, &unit.package.path_in_vcs, &files)?;
+        let files = validate_checkout(git, vendor, &checkout, unit).map_err(|error| {
+            ProtocolError(format!(
+                "failed to validate package/VCS materialization for {}: {error}",
+                unit.unit_id
+            ))
+        })?;
+        let normalized_symlinks = filter_checkout(&checkout, &unit.package.path_in_vcs, &files)
+            .map_err(|error| {
+                ProtocolError(format!(
+                    "failed to filter package/VCS materialization for {}: {error}",
+                    unit.unit_id
+                ))
+            })?;
+        let source = if unit.package.path_in_vcs.is_empty() {
+            checkout.clone()
+        } else {
+            checkout.join(&unit.package.path_in_vcs)
+        };
+        materialize_package_files(
+            &vendor.join(format!("{}-{}", unit.package.name, unit.package.version)),
+            &source,
+            &files,
+            &unit.unit_id,
+        )?;
         let package_files = files.keys().cloned().collect::<Vec<_>>();
         append_jsonl(
             &receipts,
@@ -768,17 +796,36 @@ fn validate_checkout(
     };
     let mut rust = std::collections::BTreeMap::new();
     for (relative, expected) in files.iter().filter(|(path, _)| path.ends_with(".rs")) {
-        let package_bytes = read_bounded(&package.join(relative), crate::MAX_SOURCE_FILE_BYTES)?;
-        let checkout_bytes = read_bounded(&source.join(relative), crate::MAX_SOURCE_FILE_BYTES)?;
-        let digest = format!("{:x}", Sha256::digest(&checkout_bytes));
-        if checkout_bytes != package_bytes || digest != *expected {
-            return Err(ProtocolError(format!(
-                "upstream/package Rust bytes differ for {}:{}",
-                unit.unit_id, relative
-            ))
-            .into());
+        let checkout_path = source.join(relative);
+        match fs::symlink_metadata(&checkout_path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => {
+                let checkout_bytes = read_bounded(&checkout_path, crate::MAX_SOURCE_FILE_BYTES)
+                    .map_err(|error| {
+                        ProtocolError(format!(
+                            "failed to read VCS Rust path {}:{relative}: {error}",
+                            unit.unit_id
+                        ))
+                    })?;
+                let digest = format!("{:x}", Sha256::digest(&checkout_bytes));
+                if digest != *expected {
+                    return Err(ProtocolError(format!(
+                        "upstream/package Rust bytes differ for {}:{relative}",
+                        unit.unit_id
+                    ))
+                    .into());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ProtocolError(format!(
+                    "failed to inspect VCS Rust path {}:{relative}: {error}",
+                    unit.unit_id
+                ))
+                .into());
+            }
         }
-        rust.insert(relative.clone(), digest);
+        rust.insert(relative.clone(), expected.clone());
     }
     if sha256(&canonical(&rust)?) != unit.rust_source_digest {
         return Err(ProtocolError("upstream Rust source-tree digest mismatch".into()).into());
@@ -788,6 +835,7 @@ fn validate_checkout(
 
 fn clone_checkout(
     git: &PinnedGit,
+    vendor: &Path,
     source: &MaterializedCheckout,
     destination: &Path,
     unit: &ScheduleUnit,
@@ -808,6 +856,17 @@ fn clone_checkout(
         destination,
         &unit.package.path_in_vcs,
         &source.package_files,
+    )?;
+    let package_source = if unit.package.path_in_vcs.is_empty() {
+        destination.to_path_buf()
+    } else {
+        destination.join(&unit.package.path_in_vcs)
+    };
+    materialize_package_files(
+        &vendor.join(format!("{}-{}", unit.package.name, unit.package.version)),
+        &package_source,
+        &source.package_files,
+        &unit.unit_id,
     )?;
     if git_output(git, destination, &["rev-parse", "HEAD"])? != unit.package.vcs_commit {
         return Err(ProtocolError("fresh checkout HEAD mismatch".into()).into());
@@ -989,6 +1048,44 @@ fn filter_directory(
                 fs::remove_file(&path)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn materialize_package_files(
+    package: &Path,
+    destination: &Path,
+    files: &BTreeMap<String, String>,
+    unit_id: &str,
+) -> Result<()> {
+    for (relative, expected) in files {
+        let target = destination.join(relative);
+        if let Some(parent) = target.parent() {
+            crate::reject_symlink_components(parent, true)?;
+            fs::create_dir_all(parent)?;
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&target)?,
+            Ok(_) => {
+                return Err(ProtocolError(format!(
+                    "refusing to replace non-file package path {unit_id}:{relative}"
+                ))
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        copy_bounded(
+            &package.join(relative),
+            &target,
+            crate::MAX_SOURCE_FILE_BYTES,
+            Some(expected),
+        )
+        .map_err(|error| {
+            ProtocolError(format!(
+                "failed to materialize package path {unit_id}:{relative}: {error}"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1794,6 +1891,34 @@ mod tests {
     }
 
     #[test]
+    fn package_materialization_adds_registry_only_files_and_replaces_vcs_bytes() {
+        let root = unique_temp_root().unwrap();
+        let package = root.join("package");
+        let checkout = root.join("checkout");
+        fs::create_dir_all(package.join("generated")).unwrap();
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(package.join("existing.rs"), b"published\n").unwrap();
+        fs::write(package.join("generated/test.rs"), b"generated\n").unwrap();
+        fs::write(checkout.join("existing.rs"), b"vcs\n").unwrap();
+        let files = frozen_files(&[
+            ("existing.rs", b"published\n"),
+            ("generated/test.rs", b"generated\n"),
+        ]);
+
+        materialize_package_files(&package, &checkout, &files, "unit").unwrap();
+
+        assert_eq!(
+            fs::read(checkout.join("existing.rs")).unwrap(),
+            b"published\n"
+        );
+        assert_eq!(
+            fs::read(checkout.join("generated/test.rs")).unwrap(),
+            b"generated\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn checkout_filter_removes_unwanted_symlink_without_following_it() {
         let root = unique_temp_root().unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -1964,8 +2089,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit networked materialization smoke"]
-    fn first_eleven_materializations_smoke() {
+    #[ignore = "explicit non-measured networked materialization-only smoke"]
+    fn all_package_vcs_materializations_smoke() {
         let vendor = env::var_os("KIT_M005_W07_SMOKE_VENDOR")
             .map(PathBuf::from)
             .expect("KIT_M005_W07_SMOKE_VENDOR is required")
@@ -1977,12 +2102,10 @@ mod tests {
         )
         .unwrap();
         let git = pinned_git(&preregistration).unwrap();
-        let mut schedule: serde_json::Value = serde_json::from_slice(
+        let schedule: ScheduleManifest = serde_json::from_slice(
             &read_bounded(&root.join(MANIFEST_PATH), crate::MAX_JSON_BYTES as u64).unwrap(),
         )
         .unwrap();
-        schedule["units"].as_array_mut().unwrap().truncate(11);
-        let schedule: ScheduleManifest = serde_json::from_value(schedule).unwrap();
         let scratch = unique_temp_root().unwrap();
         let temporary = scratch.join("temporary");
         let run_root = scratch.join("run");
@@ -1990,13 +2113,26 @@ mod tests {
         fs::create_dir(&temporary).unwrap();
         fs::create_dir(&run_root).unwrap();
 
-        let result = prepare_checkouts(&git, &vendor, &temporary, &run_root, &schedule);
+        let (checkouts, _, count) =
+            prepare_checkouts(&git, &vendor, &temporary, &run_root, &schedule).unwrap();
+        for unit in &schedule.units {
+            let destination = temporary.join(format!("smoke-{:02}", unit.schedule_index));
+            clone_checkout(
+                &git,
+                &vendor,
+                &checkouts[unit.schedule_index],
+                &destination,
+                unit,
+            )
+            .unwrap();
+            fs::remove_dir_all(destination).unwrap();
+        }
         assert_eq!(
             scratch.parent(),
             Some(env::temp_dir().canonicalize().unwrap().as_path())
         );
         fs::remove_dir_all(&scratch).unwrap();
-        assert_eq!(result.unwrap().2, 11);
+        assert_eq!(count, crate::UNIT_COUNT);
     }
 
     #[test]
