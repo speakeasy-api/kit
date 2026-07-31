@@ -39,6 +39,19 @@
         "claims":{"$ref":"#/$defs/claims"},
         "artifact_sha256":{"type":"object","additionalProperties":false,"required":["admissions","git_materialization","registration","runtime"],"properties":{"admissions":{"const":"a73a64f77a0084d220b591d7ad5f548c306f4a4dd21e97a7c66ed80a97da9b5e"},"git_materialization":{"const":"bd3331d824d5ea57603f7e9f8e36ae0c9510160875c891de316b40c82b5504a9"},"registration":{"const":"ceb10d962e4729642f2ca467f1ada4cddc3b936b2e6a9f15e20209ff2e6c3b5a"},"runtime":{"const":"5abfd8d9729b626078977240256f68298675ebccd4c8cf0197e3125383de6e1e"}}}
       }
+    },
+    {
+      "type":"object","additionalProperties":false,
+      "required":["schema_version","kind","experiment_id","preregistration_digest","status","route","failure_phase","scheduled_rows","raw_trial_records","complete_records","adapter_error_records","affected_units","affected_syntax_arms","materialization_records","registration_records","admission_records","grade_records","trial_binding_records","signed_ledger_present","measured_report_present","registered_at","measured_started_at","measured_ended_at","reported_at","invalidated_report_status","invalidated_statistical_verdict","invalidated_guardrails_passed","root_cause","claims","artifact_sha256"],
+      "properties":{
+        "schema_version":{"const":"1.0"},"kind":{"const":"m005_w07_completed_run_invalid_harness_incident"},"experiment_id":{"const":"m005-w07-rust-registry-v5"},"preregistration_digest":{"const":"sha256:e68c0c2241352c524cc4b5b75c3bbd036810b96f0a6f1b74a87fc4da9f723523"},
+        "status":{"const":"INVALID_HARNESS"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"failure_phase":{"const":"RAW_TRIAL_ADAPTER_CONVERSION"},"scheduled_rows":{"const":504},"raw_trial_records":{"const":504},"complete_records":{"const":289},"adapter_error_records":{"const":215},"affected_units":{"const":43},"affected_syntax_arms":{"const":["C","F","F-P","F-G","F-H"]},
+        "materialization_records":{"const":72},"registration_records":{"const":1},"admission_records":{"const":504},"grade_records":{"const":504},"trial_binding_records":{"const":504},"signed_ledger_present":{"const":true},"measured_report_present":{"const":true},
+        "registered_at":{"const":"2026-07-31T13:01:36.289593Z"},"measured_started_at":{"const":"2026-07-31T13:01:36.710222Z"},"measured_ended_at":{"const":"2026-07-31T13:25:00.410166Z"},"reported_at":{"const":"2026-07-31T13:26:57.643077Z"},
+        "invalidated_report_status":{"const":"FAIL_LOCAL_CALIBRATION"},"invalidated_statistical_verdict":{"const":"FAIL"},"invalidated_guardrails_passed":{"const":false},
+        "root_cause":{"type":"object","additionalProperties":false,"required":["code"],"properties":{"code":{"const":"W07_TREE_SITTER_SNIPPET_BOUND_MISMATCH"}}},"claims":{"$ref":"#/$defs/claims"},
+        "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"const":"8c13aa06e71032d6154338b223dbef42db7a4e4d9e430ac24c241bd94855af1b"},"raw_trials":{"const":"d3be8936407f4fda00605cf07646bc1fd241e9ddc8fe41807afec81f1584322a"},"signed_ledger":{"const":"6039ccc283332b8389bb9c6afc8ad9ae7071397ea6385236cef7e86c526338df"},"git_materialization":{"const":"3e53bf9163334679ac47076df28316274e5bd77d65819741984b7b5112ac2d87"}}}
+      }
     }
   ]
 }

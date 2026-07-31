@@ -4,7 +4,7 @@
   "type":"object","additionalProperties":false,
   "required":["schema_version","kind","experiment_id","status","route","statistical_verdict","gate_claim","preregistration_digest","corpus_manifest_digest","registration_digest","runtime_manifest_digest","materialization_receipt_digest","materialization_receipt_count","measured_started_at","measured_ended_at","reported_at","units","measured_trials","terminal_trials","class_analyses","guardrails_passed","external_blockers"],
   "properties":{
-    "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_measured_report"},"experiment_id":{"const":"m005-w07-rust-registry-v5"},
+    "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_measured_report"},"experiment_id":{"const":"m005-w07-rust-registry-v6"},
     "status":{"enum":["PASS_LOCAL_CALIBRATION","FAIL_LOCAL_CALIBRATION"]},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},
     "statistical_verdict":{"enum":["PASS","FAIL"]},"gate_claim":{"const":"NONE_BLOCKED_EXTERNAL"},
     "preregistration_digest":{"$ref":"#/$defs/digest"},"corpus_manifest_digest":{"$ref":"#/$defs/digest"},"registration_digest":{"$ref":"#/$defs/digest"},"runtime_manifest_digest":{"$ref":"#/$defs/digest"},"materialization_receipt_digest":{"$ref":"#/$defs/digest"},"materialization_receipt_count":{"const":72},

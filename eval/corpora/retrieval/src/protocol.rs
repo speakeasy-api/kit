@@ -34,6 +34,8 @@ const V3_INCIDENT_PATH: &str =
     "eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json";
 const V4_INCIDENT_PATH: &str =
     "eval/reports/m005/source-semantics/incidents/m005-w07-v4-metadata-owner.json";
+const V5_INCIDENT_PATH: &str =
+    "eval/reports/m005/source-semantics/incidents/m005-w07-v5-snippet-bound.json";
 const RELEASE_EXECUTABLE_PATH: &str = "eval/corpora/retrieval/target/release/w07-retrieval";
 const CHECKSUM_FILE: &str = ".cargo-checksum.json";
 const VCS_INFO_FILE: &str = ".cargo_vcs_info.json";
@@ -213,7 +215,12 @@ pub fn verify_with_vendor(vendor: Option<&Path>) -> Result<()> {
     validate_schema_definition(include_bytes!("../schema/v2/measured-report.schema.json"))?;
     validate_schema_definition(include_bytes!("../schema/v2/blocked-report.schema.json"))?;
     validate_schema_definition(include_bytes!("../schema/v2/signed-ledger.schema.json"))?;
-    for path in [V2_INCIDENT_PATH, V3_INCIDENT_PATH, V4_INCIDENT_PATH] {
+    for path in [
+        V2_INCIDENT_PATH,
+        V3_INCIDENT_PATH,
+        V4_INCIDENT_PATH,
+        V5_INCIDENT_PATH,
+    ] {
         validate_schema(
             include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
             &read_bounded(&root.join(path), 64 * 1024)?,
@@ -261,7 +268,7 @@ pub fn verify_with_vendor(vendor: Option<&Path>) -> Result<()> {
         let expected = crate::BlockedReport {
             schema_version: "2.0".into(),
             kind: "m005_w07_blocked_report".into(),
-            experiment_id: "m005-w07-rust-registry-v5".into(),
+            experiment_id: "m005-w07-rust-registry-v6".into(),
             status: "BLOCKED_G03_G04".into(),
             gate_claim: "NONE_BLOCKED_EXTERNAL".into(),
             measured_trials: 0,
@@ -731,8 +738,10 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
         route: crate::ExecutorEvidence::LocalSandboxNotTrusted,
         uname_path: uname_path.to_string_lossy().into_owned(),
         sw_vers_path: sw_vers_path.to_string_lossy().into_owned(),
-        rustc_path: rustc_path.to_string_lossy().into_owned(),
-        cargo_path: cargo_path.to_string_lossy().into_owned(),
+        rustc_role: "rustc".into(),
+        rustc_executable_basename: executable_basename(&rustc_path)?,
+        cargo_role: "cargo".into(),
+        cargo_executable_basename: executable_basename(&cargo_path)?,
         os: command_output("uname", &["-s"])?,
         architecture: command_output("uname", &["-m"])?,
         os_version: command_output("sw_vers", &["-productVersion"])?,
@@ -758,7 +767,7 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
     Ok(Preregistration {
         schema_version: "2.0".into(),
         kind: "m005_w07_preregistration".into(),
-        experiment_id: "m005-w07-rust-registry-v5".into(),
+        experiment_id: "m005-w07-rust-registry-v6".into(),
         state: "PRE_RUN_FROZEN".into(),
         language: "rust".into(),
         corpus_manifest_digest,
@@ -797,11 +806,11 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
             lexical_context_rule: "lexical candidates are the UTF-8 bounded window of up to 1024 bytes before and after an actual literal lexical match; range and snippet are that fixed lexical context, never the match substring or a syntax-derived item".into(),
             localization_relevance: "a candidate localizes a registered symbol iff it has exact_item semantics and exactly equals the registered item range, or it has lexical_context semantics on the same path and contains the registered declaration start byte; other_context never localizes".into(),
             history_materialization_rule: "before measurement use the exact W06b-selected trusted system Git executable pinned by absolute path, SHA-256, and version for init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and every VCS-present frozen Rust byte, remove every worktree file outside the frozen package file set, materialize the exact checksum-validated published package snapshot including registry-only files, and retain separately sandboxed genuine .git object metadata; any failure is terminal".into(),
-            premeasurement_canary_rule: "PREMEASUREMENT_CANARY: use cargo run --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- canary VENDOR_DIR; after all 72 materializations and before signed registration or admission, run all seven arms for root-level unit 0 and all seven arms for the first nested-package unit in frozen balanced order, each with a fresh checkout, cache, input, output, temporary root, and process and the exact production command, release executable, Git pin, and sandbox policy; require exactly 14 exits at zero, schema-valid complete raw output with exact bindings, exactly the enabled source observations in order, no source error or available truncated observation, F-S syntax initialization zero, and history Git implementation SHA-256 equal preregistration, allowing only typed terminal-unavailable sources; capture bounded sanitized source code/message and stderr, require delete and prune success for each arm before the next, record zero measured or admission rows, and fail INVALID_HARNESS with cleanup on any error".into(),
+            premeasurement_canary_rule: "PREMEASUREMENT_CANARY: use cargo run --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- canary VENDOR_DIR; after all 72 materializations and before signed registration or admission, run all seven arms for root-level unit 0 and all seven arms for the first nested-package unit in frozen balanced order, then syntax-enabled arm C on the corpus unit with the maximum frozen target item byte span (earliest schedule index breaks ties), selected independently of outcomes; use a fresh checkout, cache, input, output, temporary root, and process for each exact production command with the release executable, Git pin, and sandbox policy; require exactly 15 exits at zero, schema-valid terminal-complete raw output with exact bindings and exactly the enabled source observations in order, no source error, F-S syntax initialization zero, history Git implementation SHA-256 equal preregistration, no available truncated observation in the original 14 cases, and an exact Tree-sitter item in the extra C case whose range exceeds 4096 bytes while its valid UTF-8 snippet is at most 4096 bytes and marked truncated, allowing declared source truncation and only typed terminal-unavailable sources; capture bounded sanitized source code/message and stderr, require delete and prune success for each arm before the next, record zero measured or admission rows, and fail INVALID_HARNESS with cleanup on any error".into(),
             measured_timestamp_rule: "signed registration and signed admission must precede CLOCK_REALTIME start; each trial stores measured start/end plus monotonic elapsed; otherwise terminal failure".into(),
             raw_observation_rule: "persist every source response candidate/range/snippet/provenance, source start/end, timing, truncation, bounded sanitized variant-specific source error code/message, structural pattern attempt/success counts, and the actual W06b Git executable SHA-256 for successful history observations before deterministic top-k projection; lexical, map, graph, structural, and history errors distinguish time limit, deterministic bound, invalid request, invalid index, and invalid contract as applicable; history API errors are SourceStatus::Error while Git pin mismatch is harness-fatal; structural partial success is available only with successful_pattern_count > 0 and a bounded diagnostic, zero success is Error, and successful empty searches remain available".into(),
             verification_rule: "verify schemas, every immutable preregistered runtime/tool/profile field, the public key, canonical W06b Git path/SHA-256/version, materialization receipt digest/count, the exact manifest-derived ordered 504-trial unit/task/class/arm schedule across admissions/raw/grades/bindings/ledger, raw history implementation pins, and Ed25519 ledger/table reconciliation in Rust; recompute the frozen Rust-tree source digest, reconstruct top-k only from raw observations, grade hidden target/decoys, and compare the complete expected edited tree digest".into(),
-            build_rule: "measured run-local and standalone canary require the compile-time Cargo marker profile=release, opt-level=3, DEBUG=false, and disabled debug assertions, with a canonical release target path as a secondary check; runtime.json records that marker, exact OS/architecture and rustc/cargo/Git/sandbox executable paths/digests/versions, and the SHA-256 of the actual copied worker executable; workers can read only the exact checksum-validated published package snapshot overlaid on the filtered pinned worktree plus separate exact Git object metadata; a nested package builds a separate repository-root lexical history index and charges that build to index_latency_ms, while root/index/search contain no sibling or unpublished VCS worktree files, and no synthetic history or answer-bearing paths are permitted".into(),
+            build_rule: "measured run-local and standalone canary require the compile-time Cargo marker profile=release, opt-level=3, DEBUG=false, and disabled debug assertions, with a canonical release target path as a secondary check; runtime.json records that marker, exact OS/architecture, stable rustc/cargo roles and executable basenames with digests/versions, exact system Git and sandbox executable paths/digests/versions, and the SHA-256 of the actual copied worker executable, while preregistration and runtime artifacts forbid user-home and temporary-namespace absolute paths; workers can read only the exact checksum-validated published package snapshot overlaid on the filtered pinned worktree plus separate exact Git object metadata; a nested package builds a separate repository-root lexical history index and charges that build to index_latency_ms, while root/index/search contain no sibling or unpublished VCS worktree files, and no synthetic history or answer-bearing paths are permitted".into(),
         },
         analysis: analysis_plan(),
         external_blockers: vec!["G03 production executor availability".into(), "G04 prerequisite gate".into(), "BLK-14 production LSP pins".into(), "EXT-15 trusted-model credentials/spend".into()],
@@ -813,6 +822,7 @@ fn prior_invalid_experiments(root: &Path) -> Result<Vec<PriorInvalidExperiment>>
         ("m005-w07-rust-registry-v2", V2_INCIDENT_PATH),
         ("m005-w07-rust-registry-v3", V3_INCIDENT_PATH),
         ("m005-w07-rust-registry-v4", V4_INCIDENT_PATH),
+        ("m005-w07-rust-registry-v5", V5_INCIDENT_PATH),
     ]
     .into_iter()
     .map(|(experiment_id, incident_path)| {
@@ -955,7 +965,7 @@ fn validate_preregistration(plan: &Preregistration, manifest: &CorpusManifest) -
     runtime.manifest_digest.clear();
     if plan.schema_version != "2.0"
         || plan.kind != "m005_w07_preregistration"
-        || plan.experiment_id != "m005-w07-rust-registry-v5"
+        || plan.experiment_id != "m005-w07-rust-registry-v6"
         || plan.state != "PRE_RUN_FROZEN"
         || plan.corpus_manifest_digest != sha256(&canonical(manifest)?)
         || plan.prior_invalid_experiments != prior_invalid_experiments(&workspace_root())?
@@ -979,13 +989,15 @@ fn validate_preregistration(plan: &Preregistration, manifest: &CorpusManifest) -
         || [
             &plan.runtime_environment.uname_path,
             &plan.runtime_environment.sw_vers_path,
-            &plan.runtime_environment.rustc_path,
-            &plan.runtime_environment.cargo_path,
             &plan.runtime_environment.git_path,
             &plan.runtime_environment.sandbox_exec_path,
         ]
         .into_iter()
         .any(|path| !Path::new(path).is_absolute())
+        || plan.runtime_environment.rustc_role != "rustc"
+        || plan.runtime_environment.cargo_role != "cargo"
+        || !valid_executable_basename(&plan.runtime_environment.rustc_executable_basename)
+        || !valid_executable_basename(&plan.runtime_environment.cargo_executable_basename)
         || runtime_digest != sha256(&canonical(&runtime)?)
         || [
             &plan.runtime_environment.git_executable_digest,
@@ -1058,7 +1070,7 @@ fn not_run_report(
     StatusReport {
         schema_version: "2.0".into(),
         kind: "m005_w07_status_report".into(),
-        experiment_id: "m005-w07-rust-registry-v5".into(),
+        experiment_id: "m005-w07-rust-registry-v6".into(),
         status: "NOT_RUN_PRECOMMIT".into(),
         statistical_verdict: None,
         gate_claim: "NONE; C-L and G05 are not claimed".into(),
@@ -1278,6 +1290,7 @@ fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::create_dir_all(parent)?;
     crate::reject_symlink_components(path, true)?;
     let mut bytes = serde_json::to_vec_pretty(value)?;
+    crate::run::reject_machine_local_artifact_paths(&bytes)?;
     bytes.push(b'\n');
     if bytes.len() > MAX_JSON_BYTES {
         return Err(ProtocolError("output exceeds JSON bound".into()).into());
@@ -1392,6 +1405,18 @@ fn command_output(program: &str, arguments: &[&str]) -> Result<String> {
 fn executable_digest(program: &str, maximum: u64) -> Result<String> {
     let path = crate::run::resolve_executable(program)?;
     file_digest(&path, maximum)
+}
+
+fn executable_basename(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| valid_executable_basename(name))
+        .map(str::to_owned)
+        .ok_or_else(|| ProtocolError("tool executable has no stable basename".into()).into())
+}
+
+fn valid_executable_basename(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 255 && !name.contains(['/', '\\'])
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

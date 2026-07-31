@@ -2,5 +2,5 @@
   "$schema":"https://json-schema.org/draft/2020-12/schema",
   "type":"object","additionalProperties":false,
   "required":["schema_version","kind","experiment_id","status","gate_claim","measured_trials","blocker"],
-  "properties":{"schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_blocked_report"},"experiment_id":{"const":"m005-w07-rust-registry-v5"},"status":{"const":"BLOCKED_G03_G04"},"gate_claim":{"const":"NONE_BLOCKED_EXTERNAL"},"measured_trials":{"const":0},"blocker":{"const":"BLOCKED_G03_G04: M005-W07 trusted execution requires the unavailable pinned M004 production isolated adapter and satisfied G04; no trial was measured"}}
+  "properties":{"schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_blocked_report"},"experiment_id":{"const":"m005-w07-rust-registry-v6"},"status":{"const":"BLOCKED_G03_G04"},"gate_claim":{"const":"NONE_BLOCKED_EXTERNAL"},"measured_trials":{"const":0},"blocker":{"const":"BLOCKED_G03_G04: M005-W07 trusted execution requires the unavailable pinned M004 production isolated adapter and satisfied G04; no trial was measured"}}
 }

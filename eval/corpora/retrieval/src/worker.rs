@@ -439,7 +439,8 @@ fn syntax_observation(
                         return Ok((candidates, true, None));
                     }
                     let range = record.range();
-                    let snippet = record.declaration().value().text().to_owned();
+                    let declaration = record.declaration().value();
+                    let (snippet, bounded) = bounded_snippet(declaration.text());
                     candidates.push(RawCandidate {
                         range: CandidateRange {
                             path: path_string(record.canonical_path()),
@@ -450,7 +451,7 @@ fn syntax_observation(
                         },
                         symbol: Some(record.display_name().value().to_string()),
                         snippet: snippet.clone(),
-                        snippet_truncated: record.declaration().value().truncated(),
+                        snippet_truncated: declaration.truncated() || bounded,
                         semantics: CandidateSemantics::ExactItem,
                         source: RetrievalSource::TreeSitter,
                         source_revision_digest: revision_digest.into(),
@@ -635,6 +636,7 @@ fn metadata_observation(
                 .enumerate()
                 .map(|(ordinal, entry)| {
                     let path = path_string(&entry.path);
+                    let (snippet, snippet_truncated) = bounded_snippet(&path);
                     RawCandidate {
                         range: CandidateRange {
                             path: path.clone(),
@@ -644,8 +646,8 @@ fn metadata_observation(
                             end_line: 1,
                         },
                         symbol: None,
-                        snippet: path.clone(),
-                        snippet_truncated: false,
+                        snippet,
+                        snippet_truncated,
                         semantics: CandidateSemantics::OtherContext,
                         source: RetrievalSource::FilesystemMetadata,
                         source_revision_digest: revision_digest.into(),
@@ -699,24 +701,27 @@ fn graph_observation(
                 .filter_map(|node| Some((node.path()?, node.range()?, node)))
                 .take(MAX_CANDIDATES)
                 .enumerate()
-                .map(|(ordinal, (path, range, node))| RawCandidate {
-                    range: CandidateRange {
-                        path: path.to_string(),
-                        start_byte: range.start_byte(),
-                        end_byte: range.end_byte(),
-                        start_line: range.start_line(),
-                        end_line: range.end_line(),
-                    },
-                    symbol: Some(node.name().into()),
-                    snippet: node.name().into(),
-                    snippet_truncated: false,
-                    semantics: CandidateSemantics::ExactItem,
-                    source: RetrievalSource::StructureGraph,
-                    source_revision_digest: revision_digest.into(),
-                    provenance_digest: sha256(&node.id().as_bytes()),
-                    raw_score_micros: 300_000,
-                    token_overlap_micros: overlap(&query.query, node.name()),
-                    response_ordinal: ordinal,
+                .map(|(ordinal, (path, range, node))| {
+                    let (snippet, snippet_truncated) = bounded_snippet(node.name());
+                    RawCandidate {
+                        range: CandidateRange {
+                            path: path.to_string(),
+                            start_byte: range.start_byte(),
+                            end_byte: range.end_byte(),
+                            start_line: range.start_line(),
+                            end_line: range.end_line(),
+                        },
+                        symbol: Some(node.name().into()),
+                        snippet,
+                        snippet_truncated,
+                        semantics: CandidateSemantics::ExactItem,
+                        source: RetrievalSource::StructureGraph,
+                        source_revision_digest: revision_digest.into(),
+                        provenance_digest: sha256(&node.id().as_bytes()),
+                        raw_score_micros: 300_000,
+                        token_overlap_micros: overlap(&query.query, node.name()),
+                        response_ordinal: ordinal,
+                    }
                 })
                 .collect::<Vec<_>>();
             let graph = graph.clone();
@@ -798,6 +803,7 @@ fn history_observation(
                 .map(|hunk| {
                     let range = hunk.range();
                     let path = hunk.path().to_string();
+                    let (snippet, snippet_truncated) = bounded_snippet(&path);
                     RawCandidate {
                         range: CandidateRange {
                             path: path.clone(),
@@ -807,8 +813,8 @@ fn history_observation(
                             end_line: range.end_line(),
                         },
                         symbol: None,
-                        snippet: path.clone(),
-                        snippet_truncated: false,
+                        snippet,
+                        snippet_truncated,
                         semantics: CandidateSemantics::OtherContext,
                         source: source_kind,
                         source_revision_digest: revision_digest.into(),
@@ -946,6 +952,7 @@ fn whole_file_candidate(
     let entry = index.entries().iter().find(|entry| {
         entry.path == Path::new(path) && entry.kind == EntryKind::File && entry.size > 0
     })?;
+    let (snippet, snippet_truncated) = bounded_snippet(path);
     Some(RawCandidate {
         range: CandidateRange {
             path: path.to_owned(),
@@ -955,8 +962,8 @@ fn whole_file_candidate(
             end_line: 1,
         },
         symbol: None,
-        snippet: path.to_owned(),
-        snippet_truncated: false,
+        snippet,
+        snippet_truncated,
         semantics: CandidateSemantics::OtherContext,
         source,
         source_revision_digest: revision_digest.into(),
@@ -1725,6 +1732,92 @@ mod tests {
     fn normalization_is_integer_and_deterministic() {
         assert_eq!(query_payload("Locate: \"Alpha beta.\""), "Alpha beta.");
         assert_eq!(overlap("alpha beta", "BETA gamma"), 50_000);
+    }
+
+    #[test]
+    fn tree_sitter_keeps_large_unicode_item_range_and_bounds_snippet() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "kit-w07-large-declaration-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let source_root = root.join("source");
+        let cache = root.join("cache");
+        fs::create_dir_all(source_root.join("src")).unwrap();
+        fs::create_dir(&cache).unwrap();
+        let source = format!(
+            "/// Large declaration.\npub const HUGE: &str = \"{}\";\n",
+            "é".repeat(3_000)
+        );
+        fs::write(source_root.join("src/lib.rs"), &source).unwrap();
+
+        let workspace = ManagedWorkspace::open_with_options(
+            &source_root,
+            RevisionOptions {
+                metadata_path: Some(cache.join("revision.state")),
+                ..RevisionOptions::default()
+            },
+        )
+        .unwrap();
+        let revision = workspace.current_revision().unwrap().id();
+        let mut syntax = SyntaxIndex::new();
+        let index = MetadataIndex::build_with_syntax(
+            &workspace,
+            revision,
+            &IndexOptions::default(),
+            &mut syntax,
+        )
+        .unwrap();
+        let digest = sha256(b"large-declaration");
+        let query = WorkerQuery {
+            task_id: "large-declaration".into(),
+            query: "Locate Large declaration".into(),
+            query_digest: sha256(b"Locate Large declaration"),
+        };
+        let observation = syntax_observation(&index, &query, &digest).unwrap();
+        let candidate = observation
+            .candidates
+            .iter()
+            .find(|candidate| candidate.symbol.as_deref() == Some("HUGE"))
+            .unwrap();
+        let expected_start = source.find("pub const HUGE").unwrap();
+        let expected_end = source.trim_end().len();
+        assert_eq!(
+            (candidate.range.start_byte, candidate.range.end_byte),
+            (expected_start, expected_end)
+        );
+        assert!(candidate.range.end_byte - candidate.range.start_byte > 4_096);
+        assert!(candidate.snippet.len() <= 4_096);
+        assert!(candidate.snippet_truncated);
+        assert!(candidate.snippet.is_char_boundary(candidate.snippet.len()));
+
+        let projected = crate::ProjectedCandidate {
+            rank: 1,
+            range: candidate.range.clone(),
+            symbol: candidate.symbol.clone(),
+            snippet: candidate.snippet.clone(),
+            snippet_truncated: candidate.snippet_truncated,
+            semantics: candidate.semantics,
+            source: candidate.source,
+            source_revision_digest: candidate.source_revision_digest.clone(),
+            provenance_digest: candidate.provenance_digest.clone(),
+            score_micros: candidate.score_micros(),
+            response_ordinal: candidate.response_ordinal,
+        };
+        assert!(crate::grader::localizes(
+            &projected,
+            &crate::SymbolPin {
+                path: "src/lib.rs".into(),
+                symbol: "HUGE".into(),
+                symbol_kind: "const".into(),
+                start_byte: expected_start,
+                end_byte: expected_end,
+                start_line: 2,
+                end_line: 2,
+                doc_digest: sha256(b"Large declaration."),
+            }
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

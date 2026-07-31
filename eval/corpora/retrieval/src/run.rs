@@ -3,7 +3,7 @@ use crate::{
     GitMaterializationReceipt, LedgerEvent, LedgerTableRow, LocalWorkerSandboxRequest,
     MeasuredReport, MeasuredRuntimeManifest, NormalizedSymlink, PackagePin, ProtocolError,
     RawTrial, RegistrationRecord, RepositoryClass, Result, SandboxOutcome, SignedLedger,
-    SignedLedgerEntry, SourceStatus, TaskPin, TrialBinding, TrialGrade, TrialTerminal,
+    SignedLedgerEntry, SourceStatus, SymbolPin, TaskPin, TrialBinding, TrialGrade, TrialTerminal,
     WorkerArmRequest, WorkerQuery, canonical, grade, run_local_worker_sandbox, sha256,
 };
 use ed25519_dalek::{
@@ -55,8 +55,15 @@ struct ScheduleUnit {
     rust_source_digest: String,
     checksum_manifest_digest: String,
     task: TaskPin,
-    oracle: IgnoredAny,
+    oracle: ScheduleOracle,
     arm_order: Vec<Arm>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ScheduleOracle {
+    target: SymbolPin,
+    #[serde(flatten)]
+    _ignored: BTreeMap<String, IgnoredAny>,
 }
 
 #[derive(Clone)]
@@ -163,7 +170,7 @@ pub fn run_canary(vendor: &Path) -> Result<()> {
     verify_postcommit_inputs(&root, &preregistration)?;
     require_pristine_not_run(&root)?;
     let (runtime, git) = capture_premeasurement_identity(&preregistration)?;
-    let mut units = canary_units(&schedule)?
+    let mut units = canary_materialization_units(&schedule)?
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -193,7 +200,7 @@ pub fn run_canary(vendor: &Path) -> Result<()> {
         fs::create_dir(&receipts)?;
         let (checkouts, _, count) =
             prepare_checkouts(&git, &vendor, &temporary, &receipts, &canary_schedule)?;
-        if count != 2 {
+        if count != canary_schedule.units.len() {
             return Err(ProtocolError(
                 "non-measured canary materialized an invalid unit count".into(),
             )
@@ -220,7 +227,7 @@ pub fn run_canary(vendor: &Path) -> Result<()> {
         "standalone canary",
     )?;
     println!(
-        "PREMEASUREMENT_CANARY_PASS units=rust-small-01+first-nested count=14 measured_rows=0 admission_rows=0"
+        "PREMEASUREMENT_CANARY_PASS units=root+first-nested+maximum-target count=15 measured_rows=0 admission_rows=0"
     );
     Ok(())
 }
@@ -566,43 +573,42 @@ fn run_premeasurement_canary(
     git: &PinnedGit,
     key_path: &Path,
 ) -> Result<()> {
-    let units = canary_units(schedule)?;
+    let cases = canary_cases(schedule)?;
     let canary_root = temporary.join("premeasurement-canary");
     fs::create_dir(&canary_root)?;
     let result = (|| -> Result<()> {
         let mut processes = BTreeSet::new();
         let mut count = 0;
-        for unit in units {
-            for arm in unit.arm_order.iter().copied() {
-                let process = run_canary_arm(
-                    root,
-                    vendor,
-                    &canary_root,
-                    unit,
-                    &checkouts[unit.schedule_index],
-                    executable,
-                    executable_digest,
-                    git,
-                    key_path,
-                    count,
-                    arm,
+        for (unit, arm, require_bounded_target) in cases {
+            let process = run_canary_arm(
+                root,
+                vendor,
+                &canary_root,
+                unit,
+                &checkouts[unit.schedule_index],
+                executable,
+                executable_digest,
+                git,
+                key_path,
+                count,
+                arm,
+                require_bounded_target,
+            )
+            .map_err(|error| {
+                ProtocolError(format!(
+                    "PREMEASUREMENT_CANARY INVALID_HARNESS unit {} arm {arm:?}: {error}",
+                    unit.unit_id
+                ))
+            })?;
+            if process == 0 || !processes.insert(process) {
+                return Err(ProtocolError(
+                    "PREMEASUREMENT_CANARY did not use 15 fresh worker processes".into(),
                 )
-                .map_err(|error| {
-                    ProtocolError(format!(
-                        "PREMEASUREMENT_CANARY INVALID_HARNESS unit {} arm {arm:?}: {error}",
-                        unit.unit_id
-                    ))
-                })?;
-                if process == 0 || !processes.insert(process) {
-                    return Err(ProtocolError(
-                        "PREMEASUREMENT_CANARY did not use 14 fresh worker processes".into(),
-                    )
-                    .into());
-                }
-                count += 1;
+                .into());
             }
+            count += 1;
         }
-        if count != 14 || processes.len() != 14 {
+        if count != 15 || processes.len() != 15 {
             return Err(
                 ProtocolError("PREMEASUREMENT_CANARY observation count mismatch".into()).into(),
             );
@@ -632,6 +638,7 @@ fn run_canary_arm(
     key_path: &Path,
     index: usize,
     arm: Arm,
+    require_bounded_target: bool,
 ) -> Result<u32> {
     let arm_root = canary_root.join(format!("arm-{index}"));
     fs::create_dir(&arm_root)?;
@@ -653,8 +660,8 @@ fn run_canary_arm(
         let query_path = inputs.join("query.json");
         let request_path = inputs.join("arm.json");
         let worker_output = output.join("raw.json");
-        let admission_digest = sha256(format!("m005-w07-v5-canary-admission-{index}").as_bytes());
-        let cache_id = sha256(format!("m005-w07-v5-canary-cache-{index}").as_bytes());
+        let admission_digest = sha256(format!("m005-w07-v6-canary-admission-{index}").as_bytes());
+        let cache_id = sha256(format!("m005-w07-v6-canary-cache-{index}").as_bytes());
         let config = ArmConfig::frozen(arm);
         write_json(
             &query_path,
@@ -734,7 +741,14 @@ fn run_canary_arm(
             || raw.arm_config_digest != sha256(&canonical(&config)?)
             || raw.worker_executable_digest != executable_digest
             || raw.cache_id != cache_id
-            || !canary_raw_shape_is_valid(&raw, &config, &unit.rust_source_digest, &git.digest)
+            || !canary_raw_shape_is_valid_inner(
+                &raw,
+                &config,
+                &unit.rust_source_digest,
+                &git.digest,
+                !require_bounded_target,
+            )
+            || require_bounded_target && !canary_has_bounded_large_declaration(&raw)
         {
             let observations = raw
                 .observations
@@ -774,11 +788,22 @@ fn run_canary_arm(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn canary_raw_shape_is_valid(
     raw: &RawTrial,
     config: &ArmConfig,
     source_digest: &str,
     git_digest: &str,
+) -> bool {
+    canary_raw_shape_is_valid_inner(raw, config, source_digest, git_digest, true)
+}
+
+fn canary_raw_shape_is_valid_inner(
+    raw: &RawTrial,
+    config: &ArmConfig,
+    source_digest: &str,
+    git_digest: &str,
+    reject_available_truncation: bool,
 ) -> bool {
     crate::grader::validate_raw(raw, config).is_ok()
         && raw.syntax_initializations == usize::from(config.syntax_initialization_permitted)
@@ -793,7 +818,9 @@ pub(crate) fn canary_raw_shape_is_valid(
         && !raw.observations.iter().any(|observation| {
             observation.source_revision_digest != source_digest
                 || observation.complete_candidate_count != observation.candidates.len()
-                || (observation.status == SourceStatus::Available && observation.truncated)
+                || (reject_available_truncation
+                    && observation.status == SourceStatus::Available
+                    && observation.truncated)
                 || (matches!(
                     observation.source,
                     crate::RetrievalSource::History | crate::RetrievalSource::GitPathHistory
@@ -819,7 +846,7 @@ pub(crate) fn canary_raw_shape_is_valid(
         })
 }
 
-fn canary_units(schedule: &ScheduleManifest) -> Result<Vec<&ScheduleUnit>> {
+fn canary_materialization_units(schedule: &ScheduleManifest) -> Result<Vec<&ScheduleUnit>> {
     let root = schedule
         .units
         .first()
@@ -830,7 +857,72 @@ fn canary_units(schedule: &ScheduleManifest) -> Result<Vec<&ScheduleUnit>> {
         .iter()
         .find(|unit| !unit.package.path_in_vcs.is_empty())
         .ok_or_else(|| ProtocolError("PREMEASUREMENT_CANARY nested unit is absent".into()))?;
-    Ok(vec![root, nested])
+    let maximum = maximum_target_unit(schedule)?;
+    let mut units = vec![root, nested];
+    if !units.iter().any(|unit| unit.unit_id == maximum.unit_id) {
+        units.push(maximum);
+    }
+    Ok(units)
+}
+
+fn canary_cases(schedule: &ScheduleManifest) -> Result<Vec<(&ScheduleUnit, Arm, bool)>> {
+    let units = canary_materialization_units(schedule)?;
+    let mut cases = units[..2]
+        .iter()
+        .flat_map(|unit| {
+            unit.arm_order
+                .iter()
+                .copied()
+                .map(|arm| (*unit, arm, false))
+        })
+        .collect::<Vec<_>>();
+    cases.push((maximum_target_unit(schedule)?, Arm::C, true));
+    Ok(cases)
+}
+
+fn maximum_target_unit(schedule: &ScheduleManifest) -> Result<&ScheduleUnit> {
+    let maximum_span = schedule
+        .units
+        .iter()
+        .map(|unit| {
+            unit.oracle
+                .target
+                .end_byte
+                .saturating_sub(unit.oracle.target.start_byte)
+        })
+        .max()
+        .ok_or_else(|| ProtocolError("PREMEASUREMENT_CANARY schedule is empty".into()))?;
+    schedule
+        .units
+        .iter()
+        .find(|unit| {
+            unit.oracle
+                .target
+                .end_byte
+                .saturating_sub(unit.oracle.target.start_byte)
+                == maximum_span
+        })
+        .ok_or_else(|| {
+            ProtocolError("PREMEASUREMENT_CANARY maximum target is absent".into()).into()
+        })
+}
+
+fn canary_has_bounded_large_declaration(raw: &RawTrial) -> bool {
+    raw.observations
+        .iter()
+        .find(|observation| observation.source == crate::RetrievalSource::TreeSitter)
+        .is_some_and(|observation| {
+            observation.candidates.iter().any(|candidate| {
+                candidate.semantics == crate::CandidateSemantics::ExactItem
+                    && candidate
+                        .range
+                        .end_byte
+                        .saturating_sub(candidate.range.start_byte)
+                        > 4_096
+                    && candidate.snippet.len() <= 4_096
+                    && candidate.snippet_truncated
+            })
+        })
 }
 
 fn worker_failure(message: String, stderr_first_line: Option<String>) -> String {
@@ -937,7 +1029,7 @@ pub fn run_trusted() -> Result<()> {
     let report = crate::BlockedReport {
         schema_version: "2.0".into(),
         kind: "m005_w07_blocked_report".into(),
-        experiment_id: "m005-w07-rust-registry-v5".into(),
+        experiment_id: "m005-w07-rust-registry-v6".into(),
         status: "BLOCKED_G03_G04".into(),
         gate_claim: "NONE_BLOCKED_EXTERNAL".into(),
         measured_trials: 0,
@@ -1871,8 +1963,10 @@ fn measured_runtime(executable: &Path, git: &PinnedGit) -> Result<MeasuredRuntim
         route: ExecutorEvidence::LocalSandboxNotTrusted,
         uname_path: path_string(&uname),
         sw_vers_path: path_string(&sw_vers),
-        rustc_path: path_string(&rustc),
-        cargo_path: path_string(&cargo),
+        rustc_role: "rustc".into(),
+        rustc_executable_basename: executable_basename(&rustc)?,
+        cargo_role: "cargo".into(),
+        cargo_executable_basename: executable_basename(&cargo)?,
         os: command_output("uname", &["-s"])?,
         architecture: command_output("uname", &["-m"])?,
         os_version: command_output("sw_vers", &["-productVersion"])?,
@@ -2062,6 +2156,7 @@ pub(crate) fn trusted_git_status(git: &PinnedGit, root: &Path, arguments: &[&str
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<usize> {
     let line = canonical(value)?;
+    reject_machine_local_artifact_paths(&line)?;
     if line.is_empty() || line.len() > MAX_LINE_BYTES || line.contains(&b'\n') {
         return Err(ProtocolError("JSONL record exceeds line bound".into()).into());
     }
@@ -2099,6 +2194,7 @@ fn count_lines(file: &mut fs::File) -> Result<usize> {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
+    reject_machine_local_artifact_paths(&bytes)?;
     bytes.push(b'\n');
     if bytes.len() > crate::MAX_JSON_BYTES {
         return Err(ProtocolError("JSON output exceeds bound".into()).into());
@@ -2111,6 +2207,31 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .open(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn executable_basename(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !name.contains(['/', '\\']))
+        .map(str::to_owned)
+        .ok_or_else(|| ProtocolError("tool executable has no stable basename".into()).into())
+}
+
+pub(crate) fn reject_machine_local_artifact_paths(bytes: &[u8]) -> Result<()> {
+    if [
+        b"/Users/".as_slice(),
+        b"/private/var/folders/",
+        b"/var/folders/",
+    ]
+    .into_iter()
+    .any(|forbidden| {
+        bytes
+            .windows(forbidden.len())
+            .any(|window| window == forbidden)
+    }) {
+        return Err(ProtocolError("public artifact contains a machine-local path".into()).into());
+    }
     Ok(())
 }
 
@@ -2438,6 +2559,67 @@ mod tests {
                 .unwrap()
                 .contains("/private/")
         );
+    }
+
+    #[test]
+    fn canary_adds_maximum_frozen_target_as_fifteenth_case() {
+        let schedule: ScheduleManifest = serde_json::from_slice(include_bytes!(
+            "../../../reports/m005/source-semantics/corpus-manifest.json"
+        ))
+        .unwrap();
+        let cases = canary_cases(&schedule).unwrap();
+        assert_eq!(cases.len(), 15);
+        let (unit, arm, requires_bound) = cases.last().unwrap();
+        assert_eq!(unit.unit_id, "rust-large-15");
+        assert_eq!(*arm, Arm::C);
+        assert!(*requires_bound);
+        assert_eq!(
+            unit.oracle.target.end_byte - unit.oracle.target.start_byte,
+            30_475
+        );
+    }
+
+    #[test]
+    fn frozen_symbol_ranges_are_valid_and_include_a_large_canary_target() {
+        let manifest: CorpusManifest = serde_json::from_slice(include_bytes!(
+            "../../../reports/m005/source-semantics/corpus-manifest.json"
+        ))
+        .unwrap();
+        let symbols = manifest
+            .units
+            .iter()
+            .flat_map(|unit| std::iter::once(&unit.oracle.target).chain(unit.oracle.decoys.iter()));
+        let spans = symbols
+            .map(|symbol| {
+                assert!(symbol.start_byte < symbol.end_byte);
+                assert!(symbol.start_line <= symbol.end_line);
+                symbol.end_byte - symbol.start_byte
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), crate::UNIT_COUNT * 4);
+        assert_eq!(spans.into_iter().max(), Some(30_475));
+    }
+
+    #[test]
+    fn public_artifact_writer_rejects_home_and_temporary_paths() {
+        for artifact in ["runtime", "receipt", "report", "raw"] {
+            reject_machine_local_artifact_paths(
+                format!("{{\"kind\":\"{artifact}\",\"tool\":\"rustc:rustup\"}}").as_bytes(),
+            )
+            .unwrap();
+            for path in [
+                "/Users/private/tool",
+                "/private/var/folders/private/tool",
+                "/var/folders/private/tool",
+            ] {
+                assert!(
+                    reject_machine_local_artifact_paths(
+                        format!("{{\"kind\":\"{artifact}\",\"path\":\"{path}\"}}").as_bytes()
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 {
   "schema_version": "2.0",
   "kind": "m005_w07_preregistration",
-  "experiment_id": "m005-w07-rust-registry-v5",
+  "experiment_id": "m005-w07-rust-registry-v6",
   "state": "PRE_RUN_FROZEN",
   "language": "rust",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
@@ -23,14 +23,20 @@
       "status": "INVALID_HARNESS",
       "incident_path": "eval/reports/m005/source-semantics/incidents/m005-w07-v4-metadata-owner.json",
       "incident_digest": "sha256:d697d6a3085ce8e390b88d27de1239bd96bcb6653d9b86936805b5af74c538bf"
+    },
+    {
+      "experiment_id": "m005-w07-rust-registry-v5",
+      "status": "INVALID_HARNESS",
+      "incident_path": "eval/reports/m005/source-semantics/incidents/m005-w07-v5-snippet-bound.json",
+      "incident_digest": "sha256:5f80da6a02f9d20f34ae4f704f45d33c6c479df351d99a64965975b43227f9c5"
     }
   ],
   "immutable_inputs": {
-    "build_inputs": "sha256:2283420fcd4a01c551b71cc86979fa7d8f4a4042225687a8d4d6195461051829",
-    "release_executable_digest": "sha256:bd421c63b191c7e7b1e81244aee6d80d43e394571cca3e8d9c245db0defbebfd"
+    "build_inputs": "sha256:d4529c6601ce1a45d4733e671e6e39967dedb1a08770eba038ce97147046d6f4",
+    "release_executable_digest": "sha256:bdb62e83869afc7639b79f68dba6d60739f9f46c000803a13b05dd332d21bf92"
   },
   "runtime_environment": {
-    "manifest_digest": "sha256:1359dc6d94c22ca1c74e283a38e85f591113f61fc9b1bc39a6c5827d0d7ac889",
+    "manifest_digest": "sha256:e73ad47ce6fbb56d1ac06dfe48ea296dbb17a3afaac69e59e979bb5195e03791",
     "route": "LOCAL_SANDBOX_NOT_TRUSTED",
     "os": "Darwin",
     "uname_path": "/usr/bin/uname",
@@ -39,10 +45,12 @@
     "os_version": "26.5.2",
     "sw_vers_path": "/usr/bin/sw_vers",
     "sw_vers_executable_digest": "sha256:f4704a35bc196e6dd101a7de40f9e9ce51dd17bdba7ef29ce465a00d123f2ec5",
-    "rustc_path": "/Users/danielkov/.cargo/bin/rustup",
+    "rustc_role": "rustc",
+    "rustc_executable_basename": "rustup",
     "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)\nbinary: rustc\ncommit-hash: 4a4ef493e3a1488c6e321570238084b38948f6db\ncommit-date: 2026-03-02\nhost: aarch64-apple-darwin\nrelease: 1.94.0\nLLVM version: 21.1.8",
     "rustc_executable_digest": "sha256:aeb4105778ca1bd3c6b0e75768f581c656633cd51368fa61289b6a71696ac7e1",
-    "cargo_path": "/Users/danielkov/.cargo/bin/rustup",
+    "cargo_role": "cargo",
+    "cargo_executable_basename": "rustup",
     "cargo": "cargo 1.94.0 (85eff7c80 2026-01-15)\nrelease: 1.94.0\ncommit-hash: 85eff7c80277b57f78b11e28d14154ab12fcf643\ncommit-date: 2026-01-15\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.3 vendored)\nlibcurl: 8.7.1 (sys:0.4.84+curl-8.17.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.5.4 30 Sep 2025\nos: Mac OS 26.5.2 [64-bit]",
     "cargo_executable_digest": "sha256:aeb4105778ca1bd3c6b0e75768f581c656633cd51368fa61289b6a71696ac7e1",
     "git_path": "/Library/Developer/CommandLineTools/usr/bin/git",
@@ -173,11 +181,11 @@
     "lexical_context_rule": "lexical candidates are the UTF-8 bounded window of up to 1024 bytes before and after an actual literal lexical match; range and snippet are that fixed lexical context, never the match substring or a syntax-derived item",
     "localization_relevance": "a candidate localizes a registered symbol iff it has exact_item semantics and exactly equals the registered item range, or it has lexical_context semantics on the same path and contains the registered declaration start byte; other_context never localizes",
     "history_materialization_rule": "before measurement use the exact W06b-selected trusted system Git executable pinned by absolute path, SHA-256, and version for init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and every VCS-present frozen Rust byte, remove every worktree file outside the frozen package file set, materialize the exact checksum-validated published package snapshot including registry-only files, and retain separately sandboxed genuine .git object metadata; any failure is terminal",
-    "premeasurement_canary_rule": "PREMEASUREMENT_CANARY: use cargo run --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- canary VENDOR_DIR; after all 72 materializations and before signed registration or admission, run all seven arms for root-level unit 0 and all seven arms for the first nested-package unit in frozen balanced order, each with a fresh checkout, cache, input, output, temporary root, and process and the exact production command, release executable, Git pin, and sandbox policy; require exactly 14 exits at zero, schema-valid complete raw output with exact bindings, exactly the enabled source observations in order, no source error or available truncated observation, F-S syntax initialization zero, and history Git implementation SHA-256 equal preregistration, allowing only typed terminal-unavailable sources; capture bounded sanitized source code/message and stderr, require delete and prune success for each arm before the next, record zero measured or admission rows, and fail INVALID_HARNESS with cleanup on any error",
+    "premeasurement_canary_rule": "PREMEASUREMENT_CANARY: use cargo run --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- canary VENDOR_DIR; after all 72 materializations and before signed registration or admission, run all seven arms for root-level unit 0 and all seven arms for the first nested-package unit in frozen balanced order, then syntax-enabled arm C on the corpus unit with the maximum frozen target item byte span (earliest schedule index breaks ties), selected independently of outcomes; use a fresh checkout, cache, input, output, temporary root, and process for each exact production command with the release executable, Git pin, and sandbox policy; require exactly 15 exits at zero, schema-valid terminal-complete raw output with exact bindings and exactly the enabled source observations in order, no source error, F-S syntax initialization zero, history Git implementation SHA-256 equal preregistration, no available truncated observation in the original 14 cases, and an exact Tree-sitter item in the extra C case whose range exceeds 4096 bytes while its valid UTF-8 snippet is at most 4096 bytes and marked truncated, allowing declared source truncation and only typed terminal-unavailable sources; capture bounded sanitized source code/message and stderr, require delete and prune success for each arm before the next, record zero measured or admission rows, and fail INVALID_HARNESS with cleanup on any error",
     "measured_timestamp_rule": "signed registration and signed admission must precede CLOCK_REALTIME start; each trial stores measured start/end plus monotonic elapsed; otherwise terminal failure",
     "raw_observation_rule": "persist every source response candidate/range/snippet/provenance, source start/end, timing, truncation, bounded sanitized variant-specific source error code/message, structural pattern attempt/success counts, and the actual W06b Git executable SHA-256 for successful history observations before deterministic top-k projection; lexical, map, graph, structural, and history errors distinguish time limit, deterministic bound, invalid request, invalid index, and invalid contract as applicable; history API errors are SourceStatus::Error while Git pin mismatch is harness-fatal; structural partial success is available only with successful_pattern_count > 0 and a bounded diagnostic, zero success is Error, and successful empty searches remain available",
     "verification_rule": "verify schemas, every immutable preregistered runtime/tool/profile field, the public key, canonical W06b Git path/SHA-256/version, materialization receipt digest/count, the exact manifest-derived ordered 504-trial unit/task/class/arm schedule across admissions/raw/grades/bindings/ledger, raw history implementation pins, and Ed25519 ledger/table reconciliation in Rust; recompute the frozen Rust-tree source digest, reconstruct top-k only from raw observations, grade hidden target/decoys, and compare the complete expected edited tree digest",
-    "build_rule": "measured run-local and standalone canary require the compile-time Cargo marker profile=release, opt-level=3, DEBUG=false, and disabled debug assertions, with a canonical release target path as a secondary check; runtime.json records that marker, exact OS/architecture and rustc/cargo/Git/sandbox executable paths/digests/versions, and the SHA-256 of the actual copied worker executable; workers can read only the exact checksum-validated published package snapshot overlaid on the filtered pinned worktree plus separate exact Git object metadata; a nested package builds a separate repository-root lexical history index and charges that build to index_latency_ms, while root/index/search contain no sibling or unpublished VCS worktree files, and no synthetic history or answer-bearing paths are permitted"
+    "build_rule": "measured run-local and standalone canary require the compile-time Cargo marker profile=release, opt-level=3, DEBUG=false, and disabled debug assertions, with a canonical release target path as a secondary check; runtime.json records that marker, exact OS/architecture, stable rustc/cargo roles and executable basenames with digests/versions, exact system Git and sandbox executable paths/digests/versions, and the SHA-256 of the actual copied worker executable, while preregistration and runtime artifacts forbid user-home and temporary-namespace absolute paths; workers can read only the exact checksum-validated published package snapshot overlaid on the filtered pinned worktree plus separate exact Git object metadata; a nested package builds a separate repository-root lexical history index and charges that build to index_latency_ms, while root/index/search contain no sibling or unpublished VCS worktree files, and no synthetic history or answer-bearing paths are permitted"
   },
   "analysis": {
     "contrast": "C-L",

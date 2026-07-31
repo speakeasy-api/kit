@@ -3,8 +3,9 @@
 This crate freezes an honest Rust retrieval corpus from published crates that are already present in
 the root `Cargo.lock`. It contains no generated repositories, target symbols, answer-bearing paths,
 or measured result. The retained report is `NOT_RUN_PRECOMMIT` and makes no C-L or G05 claim.
-The v5 preregistration binds the sanitized `INVALID_HARNESS` incidents from the v2, v3, and partial
-v4 runs; the incidents contain no machine-local path and make no retrieval or statistical claim.
+The v6 preregistration binds the sanitized `INVALID_HARNESS` incidents from v2 through v5; the
+incidents contain no machine-local path and make no retrieval, statistical, or G05 claim. The corpus,
+treatments, outcomes, and analysis are unchanged from v5.
 
 ## Frozen Corpus
 
@@ -101,8 +102,8 @@ rm -rf "$vendor"
 Both run routes compare the complete runtime identity and current executable SHA-256 with the
 preregistration before creating a run directory, materializing an upstream checkout, running a
 canary, registering, or admitting a trial. A stale or separately built release binary is rejected.
-The standalone 14-arm premeasurement canary is release-only and writes zero measured or admission
-rows:
+The standalone 15-arm premeasurement canary is release-only: the original root and nested 14 arms
+plus arm C on the maximum frozen target item range. It writes zero measured or admission rows:
 
 ```sh
 vendor="$(mktemp -d)"

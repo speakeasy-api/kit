@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "kind": "m005_w07_completed_run_invalid_harness_incident",
+  "experiment_id": "m005-w07-rust-registry-v5",
+  "preregistration_digest": "sha256:e68c0c2241352c524cc4b5b75c3bbd036810b96f0a6f1b74a87fc4da9f723523",
+  "status": "INVALID_HARNESS",
+  "route": "LOCAL_SANDBOX_NOT_TRUSTED",
+  "failure_phase": "RAW_TRIAL_ADAPTER_CONVERSION",
+  "scheduled_rows": 504,
+  "raw_trial_records": 504,
+  "complete_records": 289,
+  "adapter_error_records": 215,
+  "affected_units": 43,
+  "affected_syntax_arms": [
+    "C",
+    "F",
+    "F-P",
+    "F-G",
+    "F-H"
+  ],
+  "materialization_records": 72,
+  "registration_records": 1,
+  "admission_records": 504,
+  "grade_records": 504,
+  "trial_binding_records": 504,
+  "signed_ledger_present": true,
+  "measured_report_present": true,
+  "registered_at": "2026-07-31T13:01:36.289593Z",
+  "measured_started_at": "2026-07-31T13:01:36.710222Z",
+  "measured_ended_at": "2026-07-31T13:25:00.410166Z",
+  "reported_at": "2026-07-31T13:26:57.643077Z",
+  "invalidated_report_status": "FAIL_LOCAL_CALIBRATION",
+  "invalidated_statistical_verdict": "FAIL",
+  "invalidated_guardrails_passed": false,
+  "root_cause": {
+    "code": "W07_TREE_SITTER_SNIPPET_BOUND_MISMATCH"
+  },
+  "claims": {
+    "retrieval": false,
+    "statistical": false,
+    "g05": false
+  },
+  "artifact_sha256": {
+    "report": "8c13aa06e71032d6154338b223dbef42db7a4e4d9e430ac24c241bd94855af1b",
+    "raw_trials": "d3be8936407f4fda00605cf07646bc1fd241e9ddc8fe41807afec81f1584322a",
+    "signed_ledger": "6039ccc283332b8389bb9c6afc8ad9ae7071397ea6385236cef7e86c526338df",
+    "git_materialization": "3e53bf9163334679ac47076df28316274e5bd77d65819741984b7b5112ac2d87"
+  }
+}

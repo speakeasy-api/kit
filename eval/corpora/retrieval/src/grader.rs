@@ -407,7 +407,7 @@ fn exact_symbol_range(range: &CandidateRange, symbol: &crate::SymbolPin) -> bool
         && range.end_line == symbol.end_line
 }
 
-fn localizes(candidate: &ProjectedCandidate, symbol: &crate::SymbolPin) -> bool {
+pub(crate) fn localizes(candidate: &ProjectedCandidate, symbol: &crate::SymbolPin) -> bool {
     match candidate.semantics {
         CandidateSemantics::ExactItem => exact_symbol_range(&candidate.range, symbol),
         CandidateSemantics::LexicalContext => {
