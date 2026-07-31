@@ -16125,9 +16125,10 @@
   applicability: mandatory
   interpretation: Affected-check selection uses explicit user commands and repository policy.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16139,23 +16140,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1107
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-803 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16176,9 +16175,10 @@
   applicability: mandatory
   interpretation: Affected-check selection uses changed paths and package ownership.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16190,23 +16190,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1108
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-804 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16227,9 +16225,10 @@
   applicability: mandatory
   interpretation: Affected-check selection uses symbol-to-test graph edges.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16241,23 +16240,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1109
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-805 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16278,9 +16275,10 @@
   applicability: mandatory
   interpretation: Affected-check selection uses build-system dependency graphs.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16292,23 +16290,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1110
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-806 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16329,9 +16325,10 @@
   applicability: mandatory
   interpretation: Affected-check selection uses historical co-change and failure data.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16343,23 +16340,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1111
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-807 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16380,9 +16375,10 @@
   applicability: mandatory
   interpretation: Affected-check selection uses coverage when available.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16394,23 +16390,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1112
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-808 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16431,9 +16425,10 @@
   applicability: mandatory
   interpretation: Affected-check selection can use model proposals under deterministic validation.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16445,23 +16440,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1113
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-809 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -16482,9 +16475,10 @@
   applicability: mandatory
   interpretation: A learned selector cannot omit critical checks solely from a low-risk prediction.
   acceptance_criteria:
-  - cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  primary_milestone: M004
-  contributing_milestones: []
+  - cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  primary_milestone: M005
+  contributing_milestones:
+  - M004
   dependencies: []
   owner: Verification owner
   criticality: high
@@ -16496,23 +16490,21 @@
   - clustered
   - hostile
   release_gates:
-  - G04
-  implementation_links: []
+  - G05
+  implementation_links:
+  - src/verify/affected/
+  - tests/adversarial/affected_floor.rs
+  - docs/operations/verification-profiles.md
   public_contract_links: []
   telemetry_links: []
   evidence_type: conformance
-  evidence_id: EV-1.04-C-1114
-  evidence_job: evidence-report
-  expected_result: cargo test --locked --test conformance --test integration --test fault --test adversarial -- --test-threads=1 exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
-  artifact_digest: c20956d53013f962e645e2574b32874bc2a38a2a1561353ab9d07c77c44b7e32
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  evidence_id: EV-M005-W10-C-001
+  evidence_job: adversarial
+  expected_result: cargo test --locked --test adversarial affected_floor -- --test-threads=1 exits 0 with 4 passed and 0 failed; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-VERIFY-810 or its source contract changes.
   decision_record: null
   deviation_record: null

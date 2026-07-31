@@ -29,7 +29,7 @@ use crate::{
 };
 
 pub const VERIFICATION_PROFILE_VERSION: u16 = 3;
-const MAX_CHECKS: usize = 64;
+pub(crate) const MAX_CHECKS: usize = 64;
 const MAX_PREVIEW_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -143,7 +143,7 @@ impl DeclaredCheck {
         self.command.resources()
     }
 
-    fn affected(&self, changed: &BTreeSet<String>) -> bool {
+    pub(crate) fn affected(&self, changed: &BTreeSet<String>) -> bool {
         self.changed_path_prefixes.is_empty()
             || changed.iter().any(|path| {
                 self.changed_path_prefixes.iter().any(|prefix| {
@@ -153,6 +153,14 @@ impl DeclaredCheck {
                             .is_some_and(|suffix| suffix.starts_with('/'))
                 })
             })
+    }
+
+    pub(crate) fn changed_path_prefix_count(&self) -> usize {
+        self.changed_path_prefixes.len()
+    }
+
+    pub(crate) fn changed_path_prefix_bytes(&self) -> usize {
+        self.changed_path_prefixes.iter().map(String::len).sum()
     }
 }
 

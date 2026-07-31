@@ -20,6 +20,16 @@ Reordering project declarations cannot change the plan or digest.
 - `full` requires explicit full-check authority and an explicitly supplied finite budget. It selects
   every declared check.
 
+M005 affected selection feeds the existing `targeted` profile an exact set of trusted check IDs. Its
+deterministic candidates combine repository policy, changed-path prefixes, package ownership,
+symbol-to-test and build-graph results, co-change and prior-failure history, and coverage when
+available. Critical checks, explicitly requested checks, and required checks reached by any affected
+signal form a protected floor. Model proposals use a bounded, strict JSON shape containing only a
+version and additive `select` IDs; malformed or unknown proposals fall back to all deterministic
+candidates. A proposal cannot express commands, exclusions, policy, criticality, or budgets, and an
+over-budget protected floor fails rather than truncating checks. Graph, history, failure, and coverage
+producers remain responsible for revision-fencing evidence before supplying normalized check IDs.
+
 Every selected plan is ordered by class (`syntax`, `diagnostics`, `typecheck`, `targeted`, `full`)
 and then lexical check ID. Callers cannot reorder the plan with target-set ordering.
 

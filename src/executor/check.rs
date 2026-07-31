@@ -1090,7 +1090,7 @@ fn lower_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn safe_id(value: &str) -> bool {
+pub(crate) fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value

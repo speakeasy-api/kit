@@ -33,8 +33,8 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 
 ## Evidence
 
-- pass: 384
-- pending: 654
+- pass: 376
+- pending: 662
 
 ## Release Gate
 
