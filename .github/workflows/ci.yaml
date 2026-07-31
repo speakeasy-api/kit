@@ -412,8 +412,8 @@ jobs:
           LANE: ${{ matrix.name }}
           LANE_MANIFEST: ${{ matrix.manifest }}
           EXPECTED_COMMAND: ${{ matrix.expected_command }}
-          GOVERNANCE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
-          GOVERNANCE_CANDIDATE_SHA: ${{ github.sha }}
+          GOVERNANCE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.event_name == 'workflow_dispatch' && inputs.baseline_ref || '' }}
+          GOVERNANCE_CANDIDATE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_ref || github.sha }}
         run: |
           python3 - <<'PY'
           import os

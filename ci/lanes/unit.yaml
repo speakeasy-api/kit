@@ -3,4 +3,5 @@ name: unit
 commands:
   - cargo test --locked --lib --bins
   - cargo test --locked --manifest-path eval/corpora/retrieval/Cargo.toml
-  - cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml --bin w07-retrieval -- verify
+  - cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml --bin w07-retrieval -- archive-check evidence/m005-w07/v6/manifest.json
+  - cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml --bin w07-retrieval -- evidence-size-check

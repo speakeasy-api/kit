@@ -1,8 +1,9 @@
 # M005-W07 Preregistered Retrieval Protocol
 
 This crate freezes an honest Rust retrieval corpus from published crates that are already present in
-the root `Cargo.lock`. It contains no generated repositories, target symbols, answer-bearing paths,
-or measured result. The retained report is `NOT_RUN_PRECOMMIT` and makes no C-L or G05 claim.
+the root `Cargo.lock`. It contains no generated repositories, target symbols, or answer-bearing
+paths. The retained v6 report is a completed negative local calibration and makes no G05 or
+production claim; its lossless evidence is under `evidence/m005-w07/v6/`.
 The v6 preregistration binds the sanitized `INVALID_HARNESS` incidents from v2 through v5; the
 incidents contain no machine-local path and make no retrieval, statistical, or G05 claim. The corpus,
 treatments, outcomes, and analysis are unchanged from v5.
@@ -76,10 +77,19 @@ cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- refresh-
 cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- verify
 ```
 
-The exact precommit/CI verification command does not regenerate or run the measured corpus:
+The pre-run verification command remains available for future frozen experiments and does not
+regenerate or run a measured corpus:
 
 ```sh
 cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- verify
+```
+
+CI checks the retained v6 archive while streaming the approximately 461 MiB raw table
+(483,489,120 bytes) without allocating it in full:
+
+```sh
+cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- \
+  archive-check evidence/m005-w07/v6/manifest.json
 ```
 
 After committing all pinned files, create the caller-owned registry source directory and invoke the

@@ -1,0 +1,112 @@
+{
+  "schema_version": "1.0",
+  "kind": "m005_w07_evidence_archive",
+  "experiment_id": "m005-w07-rust-registry-v6",
+  "source_commit": "c6f00fe6dcd51ccfc6d571708d65da6d8fbb0dab",
+  "preregistration": {
+    "logical_path": "eval/preregistration/m005-w07.yaml",
+    "size": 14647,
+    "file_sha256": "sha256:fa1a2e409bfaa8cfadd2ea8e087120fdb03142f6a2260ed83f291a95469395ee",
+    "canonical_sha256": "sha256:fcb2ec7d1ee42bd305f26afd14c37d202ad13fa4be468e02c5bec7689b304795"
+  },
+  "corpus_manifest": {
+    "logical_path": "eval/reports/m005/source-semantics/corpus-manifest.json",
+    "size": 237508,
+    "file_sha256": "sha256:65bf68e69418d5e1b3f4cbf90d4d75e0799930d3032be1851ec2107b03113a64",
+    "canonical_sha256": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e"
+  },
+  "public_key": {
+    "logical_path": "eval/corpora/retrieval/public-key.pem",
+    "size": 113,
+    "file_sha256": "sha256:4c6e12eb84e9c1f882b61dca1d98aec9efdcfa3a13e6cbf1218dd35746196d23",
+    "subject_public_key_info_sha256": "sha256:e960cd052953c19f94814a6c52a3ac8869c0d0eba7958bccf9b62653ddb46cee"
+  },
+  "compression": {
+    "format": "zstd",
+    "level": 19,
+    "frames_per_file": 1,
+    "checksum": true,
+    "content_size": true,
+    "dictionary": false,
+    "decoder_crate": "zstd",
+    "decoder_version": "0.13.3",
+    "decoder_default_features": false,
+    "maximum_window_size": 8388608
+  },
+  "aggregate_uncompressed_size": 488487888,
+  "aggregate_compressed_size": 20054700,
+  "entries": [
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-report.json",
+      "stored_path": "payload/retrieval-report.json.zst",
+      "uncompressed_size": 2110,
+      "uncompressed_sha256": "sha256:fa42a9c36fc07a71f0a5ab2edb918bb3c9fde62a5f79739c279b13ecfe5df4d6",
+      "compressed_size": 883,
+      "compressed_sha256": "sha256:cbd5d895b9a9627d1dc094c6767c557579c8fa624ce9b2ddf8e9cb2c5f49f062"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/admissions.jsonl",
+      "stored_path": "payload/retrieval-run/admissions.jsonl.zst",
+      "uncompressed_size": 269706,
+      "uncompressed_sha256": "sha256:e9aa58a2b155cee33a8b3a4da705ae4b08cddd671599e8cbd2b64c953b228a84",
+      "compressed_size": 11867,
+      "compressed_sha256": "sha256:7dfda7128a1acf64ab18adefab520d1684956954578eff46d48d7f63aa5ca809"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/git-materialization.jsonl",
+      "stored_path": "payload/retrieval-run/git-materialization.jsonl.zst",
+      "uncompressed_size": 161899,
+      "uncompressed_sha256": "sha256:3e53bf9163334679ac47076df28316274e5bd77d65819741984b7b5112ac2d87",
+      "compressed_size": 25762,
+      "compressed_sha256": "sha256:dd2ef7095cae277eb5512722c1c317fc4624e3be329802a59e6f2f2b0d4b1974"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/grades.jsonl",
+      "stored_path": "payload/retrieval-run/grades.jsonl.zst",
+      "uncompressed_size": 3620574,
+      "uncompressed_sha256": "sha256:6aa169f35505f3285a8db60b8fa94165629a92aae8d14355c11d83d49ecae7da",
+      "compressed_size": 331116,
+      "compressed_sha256": "sha256:8cb3151724c5ac79e34779a0a0bdb6c6ef272bdea5d7dccc6bb177aa6ddaf012"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/raw-trials.jsonl",
+      "stored_path": "payload/retrieval-run/raw-trials.jsonl.zst",
+      "uncompressed_size": 483489120,
+      "uncompressed_sha256": "sha256:e91c313d7bac9a1d620d61a75b275b01a3bb6f4635b57a74c70086cf6d8ef4ca",
+      "compressed_size": 19495153,
+      "compressed_sha256": "sha256:2dc7014ffbb528169855ec98c8003586616f75022edf00d99ba6ed2ef914e4de"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/registration.json",
+      "stored_path": "payload/retrieval-run/registration.json.zst",
+      "uncompressed_size": 876,
+      "uncompressed_sha256": "sha256:cae2340aab4364862d081a32b7248de722c172f4d04149360c07d05a47def0c7",
+      "compressed_size": 513,
+      "compressed_sha256": "sha256:63689a1b87cb14378239ecbc7b91d57a0e61ef64186c3f0c99f5ba40888605b6"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/runtime.json",
+      "stored_path": "payload/retrieval-run/runtime.json.zst",
+      "uncompressed_size": 2264,
+      "uncompressed_sha256": "sha256:2c83ead245e1710037ce5a8849690e7278cea765c7d879d4cee9c2a47dfb3fb7",
+      "compressed_size": 1100,
+      "compressed_sha256": "sha256:d3b7a21f3c77cacba7df81a161ce1359f67bb8c334266cfb1b32ab0d5c05a448"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/signed-ledger.json",
+      "stored_path": "payload/retrieval-run/signed-ledger.json.zst",
+      "uncompressed_size": 801995,
+      "uncompressed_sha256": "sha256:1953cdda713cc6cacb6b543487e4a80efd27d41d4cc864b37d43912b7490cf5c",
+      "compressed_size": 152620,
+      "compressed_sha256": "sha256:a9a2adbbaaa1b2196690715be21ff98acc42e762ee45f9bf0bfebb84679737c7"
+    },
+    {
+      "logical_path": "eval/reports/m005/source-semantics/retrieval-run/trial-bindings.jsonl",
+      "stored_path": "payload/retrieval-run/trial-bindings.jsonl.zst",
+      "uncompressed_size": 139344,
+      "uncompressed_sha256": "sha256:105f8f027c9bf8f66b217244c6d6c316a41954c60160ee4903339ff17a5725cb",
+      "compressed_size": 35686,
+      "compressed_sha256": "sha256:b62e6ffec00c9eaa8e3ff090e9a61f9cd7f534196e7e73bedab785e623b16e17"
+    }
+  ]
+}

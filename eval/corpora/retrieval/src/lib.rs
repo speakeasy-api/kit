@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod archive;
 mod grader;
 mod model;
 mod protocol;
@@ -9,6 +10,7 @@ mod startup_probe;
 mod verifier;
 mod worker;
 
+pub use archive::{archive_check, archive_verify, evidence_size_check};
 pub use grader::{grade, project};
 pub use model::*;
 pub use protocol::{prepare, refresh_frozen, verify, verify_with_vendor};

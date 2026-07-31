@@ -19,6 +19,7 @@ toml = { version = "=1.1.4", default-features = false, features = ["parse", "ser
 tree-sitter = "=0.25.10"
 tree-sitter-rust = "=0.24.0"
 url = "2.5.7"
+zstd = { version = "=0.13.3", default-features = false }
 
 [lib]
 path = "src/lib.rs"
