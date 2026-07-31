@@ -181,6 +181,37 @@ impl MetadataIndex {
         })
     }
 
+    /// Builds file and lexical metadata without constructing or invoking a syntax runtime.
+    pub fn build_lexical(
+        workspace: &ManagedWorkspace,
+        expected: RevisionId,
+        options: &IndexOptions,
+    ) -> Result<Self, IndexError> {
+        validate_options(options)?;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(options.max_build_time)
+            .unwrap_or(started);
+        let max_file_bytes = usize::try_from(options.max_file_bytes)
+            .map_err(|_| IndexError::InvalidOptions("file byte bound is out of range"))?;
+        let max_content_bytes = options
+            .max_indexed_bytes
+            .checked_add(options.max_ignore_bytes as u64)
+            .ok_or(IndexError::InvalidOptions(
+                "retained content bound overflow",
+            ))?;
+        let snapshot = workspace.metadata_snapshot_before(
+            expected,
+            max_file_bytes,
+            options.max_ignore_bytes,
+            max_content_bytes,
+            deadline,
+        )?;
+        let (index, _) = Self::from_snapshot_until_inner(&snapshot, options, deadline, None)?;
+        workspace.validate_revision_until(expected, deadline)?;
+        Ok(index)
+    }
+
     pub fn from_snapshot(snapshot: &Snapshot, options: &IndexOptions) -> Result<Self, IndexError> {
         let mut syntax = SyntaxIndex::new();
         Self::from_snapshot_with_syntax(snapshot, options, &mut syntax)
@@ -223,7 +254,7 @@ impl MetadataIndex {
         syntax: &mut SyntaxIndex,
     ) -> Result<Self, IndexError> {
         syntax.begin_snapshot_before(deadline)?;
-        let result = Self::from_snapshot_until_inner(snapshot, options, deadline, syntax);
+        let result = Self::from_snapshot_until_inner(snapshot, options, deadline, Some(syntax));
         match result {
             Ok((index, retained_rust_paths)) => {
                 syntax.finish_snapshot_before(deadline, retained_rust_paths.as_ref())?;
@@ -237,7 +268,7 @@ impl MetadataIndex {
         snapshot: &Snapshot,
         options: &IndexOptions,
         deadline: Instant,
-        syntax: &mut SyntaxIndex,
+        mut syntax: Option<&mut SyntaxIndex>,
     ) -> Result<(Self, Option<BTreeSet<PathBuf>>), IndexError> {
         let rules = IgnoreRules::compile(snapshot, options, deadline)?;
         let max_file_bytes = usize::try_from(options.max_file_bytes)
@@ -324,7 +355,7 @@ impl MetadataIndex {
                         source_digest,
                         syntax_truncated,
                         syntax_omitted,
-                    ) = if language.as_deref() == Some("rust") {
+                    ) = if language.as_deref() == Some("rust") && syntax.is_some() {
                         check_deadline(deadline)?;
                         retained_rust_paths.insert(source.path.clone());
                         if syntax_output_exhausted {
@@ -340,29 +371,32 @@ impl MetadataIndex {
                                 0,
                             )
                         } else {
-                            let result = syntax.index_snapshot_source_before(
-                                snapshot.revision().id(),
-                                &source.path,
-                                "rust",
-                                &source.bytes,
-                                &LanguageDescriptor::rust(),
-                                &SyntaxOptions {
-                                    max_path_bytes: 256 * 1024,
-                                    max_source_bytes: max_file_bytes,
-                                    max_query_bytes: 64 * 1024,
-                                    max_captures: options
-                                        .max_symbols_per_file
-                                        .saturating_mul(16)
-                                        .min(65_536),
-                                    max_scope_weight: options
-                                        .max_symbol_bytes
-                                        .saturating_mul(32)
-                                        .min(16 * 1024 * 1024),
-                                    max_symbols: options.max_symbols_per_file,
-                                    max_symbol_bytes: options.max_symbol_bytes,
-                                },
-                                deadline,
-                            )?;
+                            let result = syntax
+                                .as_deref_mut()
+                                .expect("syntax-enabled branch")
+                                .index_snapshot_source_before(
+                                    snapshot.revision().id(),
+                                    &source.path,
+                                    "rust",
+                                    &source.bytes,
+                                    &LanguageDescriptor::rust(),
+                                    &SyntaxOptions {
+                                        max_path_bytes: 256 * 1024,
+                                        max_source_bytes: max_file_bytes,
+                                        max_query_bytes: 64 * 1024,
+                                        max_captures: options
+                                            .max_symbols_per_file
+                                            .saturating_mul(16)
+                                            .min(65_536),
+                                        max_scope_weight: options
+                                            .max_symbol_bytes
+                                            .saturating_mul(32)
+                                            .min(16 * 1024 * 1024),
+                                        max_symbols: options.max_symbols_per_file,
+                                        max_symbol_bytes: options.max_symbol_bytes,
+                                    },
+                                    deadline,
+                                )?;
                             let mut retained = Vec::new();
                             retained
                                 .try_reserve_exact(
@@ -1508,6 +1542,30 @@ mod tests {
         };
         assert_ne!(digest(&["a", "bc"]), digest(&["ab", "c"]));
         assert_ne!(digest(&["abc"]), digest(&["a", "bc"]));
+    }
+
+    #[test]
+    fn lexical_build_never_publishes_syntax_metadata() {
+        let fixture = TransactionFixture::new();
+        fixture.write("lib.rs", "pub fn lexical_only() {}\n");
+        let workspace = fixture.open();
+        let revision = workspace.current_revision().unwrap().id();
+        let index =
+            MetadataIndex::build_lexical(&workspace, revision, &IndexOptions::default()).unwrap();
+        let rust = index
+            .entries()
+            .iter()
+            .find(|entry| entry.path == Path::new("lib.rs"))
+            .unwrap();
+        assert_eq!(index.syntax_record_count(), 0);
+        assert_eq!(index.syntax_logical_weight(), 0);
+        assert!(rust.syntax_records.is_empty());
+        assert!(rust.syntax_digest.is_none());
+        assert!(
+            rust.symbols
+                .iter()
+                .any(|symbol| symbol.name == "lexical_only")
+        );
     }
 
     #[test]

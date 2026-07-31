@@ -1,0 +1,169 @@
+{
+  "schema_version": "2.0",
+  "kind": "m005_w07_preregistration",
+  "experiment_id": "m005-w07-rust-registry-v2",
+  "state": "PRE_RUN_FROZEN",
+  "language": "rust",
+  "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
+  "immutable_inputs": {
+    "build_inputs": "sha256:735c2f73a9cff803a26d5625062b51dfaa51c749d001a28943207eaa644b4973"
+  },
+  "runtime_environment": {
+    "manifest_digest": "sha256:9196ec006f89f8a6244b20f393077cceb443815e80b0d26ea3d834a29fc3a31a",
+    "os": "Darwin",
+    "uname_executable_digest": "sha256:c189136263d277786f29a16eb3137de7bcf4512d2282d0036f440022f325bfc4",
+    "architecture": "arm64",
+    "os_version": "26.5.2",
+    "sw_vers_executable_digest": "sha256:f4704a35bc196e6dd101a7de40f9e9ce51dd17bdba7ef29ce465a00d123f2ec5",
+    "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)\nbinary: rustc\ncommit-hash: 4a4ef493e3a1488c6e321570238084b38948f6db\ncommit-date: 2026-03-02\nhost: aarch64-apple-darwin\nrelease: 1.94.0\nLLVM version: 21.1.8",
+    "rustc_executable_digest": "sha256:aeb4105778ca1bd3c6b0e75768f581c656633cd51368fa61289b6a71696ac7e1",
+    "cargo": "cargo 1.94.0 (85eff7c80 2026-01-15)\nrelease: 1.94.0\ncommit-hash: 85eff7c80277b57f78b11e28d14154ab12fcf643\ncommit-date: 2026-01-15\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.3 vendored)\nlibcurl: 8.7.1 (sys:0.4.84+curl-8.17.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.5.4 30 Sep 2025\nos: Mac OS 26.5.2 [64-bit]",
+    "cargo_executable_digest": "sha256:aeb4105778ca1bd3c6b0e75768f581c656633cd51368fa61289b6a71696ac7e1",
+    "git_path": "/usr/bin/git",
+    "git": "git version 2.50.1 (Apple Git-155)",
+    "git_executable_digest": "sha256:179301dcb41ea78accc3fa0048a7e6f6710d891945a751a34addd622020c1818",
+    "sandbox_exec": "sha256:8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16",
+    "route": "PRE_RUN"
+  },
+  "public_receipt_key": {
+    "algorithm": "Ed25519",
+    "key_id": "ed25519-e960cd052953c19f94814a6c",
+    "subject_public_key_info_sha256": "sha256:e960cd052953c19f94814a6c52a3ac8869c0d0eba7958bccf9b62653ddb46cee",
+    "pem_path": "eval/corpora/retrieval/public-key.pem"
+  },
+  "oracle_selection": {
+    "algorithm": "minimum SHA-256 of domain, source digest, package/version, path, exact item byte range, symbol, and normalized existing doc comment; next three hashes are decoys",
+    "eligibility": "tree-sitter-rust public function/struct/enum/trait/type/const/static/mod item with a contiguous non-empty /// doc comment; snapshot needs at least four",
+    "query_derivation": "first normalized existing documentation sentence, capped at 240 Unicode scalar values, embedded in a fixed locate-public-item request",
+    "decoy_count": 3,
+    "outcome_independent": true
+  },
+  "trial_protocol": {
+    "trusted_executor": "existing M004 production isolated trial executor; only its TrustedContainerHelper/TrustedWindowsComposite routes may produce trusted evidence",
+    "local_executor": "implemented macOS sandbox-exec deny-default backend is local-only and must label all receipts LOCAL_SANDBOX_NOT_TRUSTED; it may not satisfy G03/G04/G05",
+    "worker_visible_inputs": [
+      "fresh source snapshot",
+      "task query",
+      "arm configuration",
+      "single arm-specific output path"
+    ],
+    "worker_forbidden_inputs": [
+      "oracle",
+      "corpus manifest",
+      "report",
+      "preregistration",
+      "other arm outputs or caches",
+      "authority/signing environment"
+    ],
+    "fresh_process_per_non_oracle_arm": true,
+    "fresh_cache_per_non_oracle_arm": true,
+    "oracle_is_grader_only": true,
+    "syntax_free_arm": "F-S",
+    "syntax_free_sources": [
+      "lexical",
+      "filesystem_metadata",
+      "cargo_metadata_without_source_parse",
+      "git_path_history"
+    ],
+    "arm_source_sets": {
+      "L": [
+        "lexical"
+      ],
+      "C": [
+        "lexical",
+        "tree_sitter",
+        "structural",
+        "lsp"
+      ],
+      "F": [
+        "lexical",
+        "tree_sitter",
+        "structural",
+        "lsp",
+        "personalized_map",
+        "structure_graph",
+        "history"
+      ],
+      "F-S": [
+        "lexical",
+        "filesystem_metadata",
+        "cargo_metadata_without_source_parse",
+        "git_path_history"
+      ],
+      "F-P": [
+        "lexical",
+        "tree_sitter",
+        "structural",
+        "lsp",
+        "structure_graph",
+        "history"
+      ],
+      "F-G": [
+        "lexical",
+        "tree_sitter",
+        "structural",
+        "lsp",
+        "personalized_map",
+        "history"
+      ],
+      "F-H": [
+        "lexical",
+        "tree_sitter",
+        "structural",
+        "lsp",
+        "personalized_map",
+        "structure_graph"
+      ]
+    },
+    "normalization": {
+      "version": "m005-w07-normalization-v1",
+      "raw_score_rule": "clamp source-native score to [-1000000,1000000]; add exact integer token-overlap micros; retain no inferred ranges",
+      "deduplication": "exact (path,start_byte,end_byte,start_line,end_line); retain highest score then source then response ordinal",
+      "rank_order": "score_micros descending; retain first 10 and truncate projected snippets in rank order to the hard 2048-token estimate",
+      "tie_break": [
+        "path ascending UTF-8 bytes",
+        "start_byte ascending",
+        "end_byte ascending",
+        "source enum ascending",
+        "response_ordinal ascending",
+        "provenance_digest ascending"
+      ],
+      "top_k": 10
+    },
+    "lexical_context_rule": "lexical candidates are the UTF-8 bounded window of up to 1024 bytes before and after an actual literal lexical match; range and snippet are that fixed lexical context, never the match substring or a syntax-derived item",
+    "localization_relevance": "a candidate localizes a registered symbol iff it has exact_item semantics and exactly equals the registered item range, or it has lexical_context semantics on the same path and contains the registered declaration start byte; other_context never localizes",
+    "history_materialization_rule": "before measurement use pinned absolute Git init plus remote plus fetch --depth=100 of the exact .cargo_vcs_info.json 40-hex commit and detach FETCH_HEAD, verify exact HEAD/remote and frozen Rust bytes, remove every worktree file outside the frozen package file set, and retain separately sandboxed genuine .git object metadata; any failure is terminal",
+    "measured_timestamp_rule": "signed registration and signed admission must precede CLOCK_REALTIME start; each trial stores measured start/end plus monotonic elapsed; otherwise terminal failure",
+    "raw_observation_rule": "persist every source response candidate/range/snippet/provenance, source start/end, timing, truncation, and error before deterministic top-k projection",
+    "verification_rule": "verify schemas, the immutable preregistration/public key, materialization receipt digest/count, and Ed25519 ledger/table reconciliation in Rust; recompute the frozen Rust-tree source digest, reconstruct top-k only from raw observations, grade hidden target/decoys, and compare the complete expected edited tree digest",
+    "build_rule": "workers can read only the filtered genuine pinned package worktree plus separate exact Git object metadata after frozen Rust-byte validation; root/index/search contain no sibling or unpublished worktree files, and no synthetic history, generated source, package substitution, or answer-bearing paths are permitted"
+  },
+  "analysis": {
+    "contrast": "C-L",
+    "estimand": "paired target-localization success risk difference within each preregistered Rust SLOC class",
+    "k": 10,
+    "familywise_alpha": 0.05,
+    "class_alpha": 0.016666666666666666,
+    "interval": "exact core finite-sample paired binary interval with Bonferroni alpha allocation; no duplicate statistics implementation",
+    "acceptance": "PASS iff the C-L lower confidence bound is strictly greater than zero in all three classes and every C/F/F-S/F-P/F-G/F-H treatment-arm guardrail passes; L guardrail failures are permitted and contribute only to the baseline localization outcome",
+    "stopping": "all 72 units x 7 non-oracle arms; no optional stopping",
+    "exclusions": [],
+    "replacement": false,
+    "retry": false,
+    "missing_and_error": "terminal localization failure",
+    "guardrails": {
+      "downstream_mechanical": "100% in candidate/full treatment arms; relevant retrieved context authorizes the frozen edit at the exact hidden target in a fresh tree, followed by complete expected digest equality",
+      "freshness": "zero stale results",
+      "latency": "index <=10000 ms and query <=3000 ms per terminal trial",
+      "provenance": "100% of projected candidates",
+      "token_budget": "hard 2048 tokens per arm",
+      "wrong_decoy": "100% in candidate/full treatment arms: target localized and no registered decoy localized in reconstructed top-k; not required for L"
+    }
+  },
+  "external_blockers": [
+    "G03 production executor availability",
+    "G04 prerequisite gate",
+    "BLK-14 production LSP pins",
+    "EXT-15 trusted-model credentials/spend"
+  ]
+}

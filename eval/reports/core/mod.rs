@@ -4471,6 +4471,26 @@ fn exact_binary_interval(
     })
 }
 
+/// Exact finite-sample paired-binary risk-difference interval used by core reports.
+pub fn exact_paired_binary_interval(
+    baseline: &[bool],
+    candidate: &[bool],
+    alpha: f64,
+) -> Result<ConfidenceInterval, StatsError> {
+    if !(0.0..1.0).contains(&alpha) {
+        return Err(StatsError::Numeric("invalid paired binary alpha"));
+    }
+    let baseline = baseline
+        .iter()
+        .map(|value| f64::from(u8::from(*value)))
+        .collect::<Vec<_>>();
+    let candidate = candidate
+        .iter()
+        .map(|value| f64::from(u8::from(*value)))
+        .collect::<Vec<_>>();
+    exact_binary_interval(&baseline, &candidate, alpha)
+}
+
 fn one_sided_lower(
     metric: CoreMetric,
     baseline: &[f64],
@@ -5517,6 +5537,21 @@ mod numerical_tests {
         assert!(interval.upper >= interval.estimate);
         assert!((-1.0..=1.0).contains(&interval.lower));
         assert!((-1.0..=1.0).contains(&interval.upper));
+    }
+
+    #[test]
+    fn public_exact_paired_binary_interval_uses_caller_alpha() {
+        let baseline = vec![false; 24];
+        let candidate = vec![true; 24];
+        let family = exact_paired_binary_interval(&baseline, &candidate, 0.05).unwrap();
+        let bonferroni = exact_paired_binary_interval(&baseline, &candidate, 0.05 / 3.0).unwrap();
+        assert_eq!(bonferroni.sample_count, 24);
+        assert_eq!(bonferroni.confidence_level, 1.0 - 0.05 / 3.0);
+        assert!(bonferroni.lower <= family.lower);
+        assert!(family.estimate >= family.lower && family.estimate <= family.upper);
+        assert!(bonferroni.estimate >= bonferroni.lower && bonferroni.estimate <= bonferroni.upper);
+        assert!(exact_paired_binary_interval(&baseline[..2], &candidate[..2], 0.05).is_err());
+        assert!(exact_paired_binary_interval(&baseline, &candidate, 1.0).is_err());
     }
 
     #[test]

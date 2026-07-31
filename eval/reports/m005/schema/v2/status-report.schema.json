@@ -1,0 +1,20 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$defs":{"digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"}},
+  "type":"object","additionalProperties":false,
+  "required":["schema_version","kind","experiment_id","status","statistical_verdict","gate_claim","chronology","preregistration_digest","corpus_manifest_digest","units","class_counts","measured_trials","external_blockers"],
+  "properties": {
+    "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_status_report"},
+    "experiment_id":{"const":"m005-w07-rust-registry-v2"},"status":{"const":"NOT_RUN_PRECOMMIT"},
+    "statistical_verdict":{"type":"null"},"gate_claim":{"const":"NONE; C-L and G05 are not claimed"},
+    "chronology":{"const":"uncommitted preregistration cannot prove pre-measurement chronology"},
+    "preregistration_digest":{"$ref":"#/$defs/digest"},"corpus_manifest_digest":{"$ref":"#/$defs/digest"},
+    "units":{"const":72},
+    "class_counts": {
+      "type":"object","additionalProperties":false,"required":["small","medium","large"],
+      "properties":{"small":{"const":24},"medium":{"const":24},"large":{"const":24}}
+    },
+    "measured_trials":{"const":0},
+    "external_blockers":{"const":["G03","G04","BLK-14","EXT-15"]}
+  }
+}

@@ -1,5 +1,6 @@
 /target/
 /dogfood-harness/target/
+/eval/corpora/retrieval/target/
 /.kit/
 /.kit.backups/
 __pycache__/

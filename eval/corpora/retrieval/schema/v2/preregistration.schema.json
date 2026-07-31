@@ -1,0 +1,90 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+    "bounded_string":{"type":"string","minLength":1,"maxLength":16384},
+    "immutable_inputs": {
+      "type":"object","additionalProperties":false,
+      "required":["build_inputs"],
+      "properties": {
+        "build_inputs":{"$ref":"#/$defs/digest"}
+      }
+    },
+    "runtime": {
+      "type":"object","additionalProperties":false,
+      "required":["manifest_digest","os","uname_executable_digest","architecture","os_version","sw_vers_executable_digest","rustc","rustc_executable_digest","cargo","cargo_executable_digest","git_path","git","git_executable_digest","sandbox_exec","route"],
+      "properties": {
+        "manifest_digest":{"$ref":"#/$defs/digest"},"os":{"$ref":"#/$defs/bounded_string"},"uname_executable_digest":{"$ref":"#/$defs/digest"},
+        "architecture":{"$ref":"#/$defs/bounded_string"},"os_version":{"$ref":"#/$defs/bounded_string"},"sw_vers_executable_digest":{"$ref":"#/$defs/digest"},
+        "rustc":{"$ref":"#/$defs/bounded_string"},"rustc_executable_digest":{"$ref":"#/$defs/digest"},"cargo":{"$ref":"#/$defs/bounded_string"},"cargo_executable_digest":{"$ref":"#/$defs/digest"},
+        "git_path":{"type":"string","pattern":"^/","maxLength":4096},"git":{"$ref":"#/$defs/bounded_string"},"git_executable_digest":{"$ref":"#/$defs/digest"},"sandbox_exec":{"$ref":"#/$defs/digest"},
+        "route":{"const":"PRE_RUN"}
+      }
+    },
+    "public_key": {
+      "type":"object","additionalProperties":false,"required":["algorithm","key_id","subject_public_key_info_sha256","pem_path"],
+      "properties": {
+        "algorithm":{"const":"Ed25519"},"key_id":{"type":"string","pattern":"^ed25519-[0-9a-f]{24}$"},
+        "subject_public_key_info_sha256":{"$ref":"#/$defs/digest"},
+        "pem_path":{"const":"eval/corpora/retrieval/public-key.pem"}
+      }
+    },
+    "oracle_selection": {
+      "type":"object","additionalProperties":false,"required":["algorithm","eligibility","query_derivation","decoy_count","outcome_independent"],
+      "properties": {
+        "algorithm":{"type":"string","minLength":80,"maxLength":2048},
+        "eligibility":{"type":"string","minLength":80,"maxLength":2048},
+        "query_derivation":{"type":"string","minLength":80,"maxLength":2048},
+        "decoy_count":{"const":3},"outcome_independent":{"const":true}
+      }
+    },
+    "trial_protocol": {
+      "type":"object","additionalProperties":false,
+      "required":["trusted_executor","local_executor","worker_visible_inputs","worker_forbidden_inputs","fresh_process_per_non_oracle_arm","fresh_cache_per_non_oracle_arm","oracle_is_grader_only","syntax_free_arm","syntax_free_sources","arm_source_sets","normalization","lexical_context_rule","localization_relevance","history_materialization_rule","measured_timestamp_rule","raw_observation_rule","verification_rule","build_rule"],
+      "properties": {
+        "trusted_executor":{"$ref":"#/$defs/bounded_string"},"local_executor":{"$ref":"#/$defs/bounded_string"},
+        "worker_visible_inputs":{"type":"array","minItems":4,"maxItems":4,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
+        "worker_forbidden_inputs":{"type":"array","minItems":6,"maxItems":6,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
+        "fresh_process_per_non_oracle_arm":{"const":true},"fresh_cache_per_non_oracle_arm":{"const":true},
+        "oracle_is_grader_only":{"const":true},"syntax_free_arm":{"const":"F-S"},
+        "syntax_free_sources":{"const":["lexical","filesystem_metadata","cargo_metadata_without_source_parse","git_path_history"]},
+        "arm_source_sets":{"type":"object","additionalProperties":false,"required":["L","C","F","F-S","F-P","F-G","F-H"],"properties":{"L":{"const":["lexical"]},"C":{"const":["lexical","tree_sitter","structural","lsp"]},"F":{"const":["lexical","tree_sitter","structural","lsp","personalized_map","structure_graph","history"]},"F-S":{"const":["lexical","filesystem_metadata","cargo_metadata_without_source_parse","git_path_history"]},"F-P":{"const":["lexical","tree_sitter","structural","lsp","structure_graph","history"]},"F-G":{"const":["lexical","tree_sitter","structural","lsp","personalized_map","history"]},"F-H":{"const":["lexical","tree_sitter","structural","lsp","personalized_map","structure_graph"]}}},
+        "normalization":{"type":"object","additionalProperties":false,"required":["version","raw_score_rule","deduplication","rank_order","tie_break","top_k"],"properties":{"version":{"const":"m005-w07-normalization-v1"},"raw_score_rule":{"$ref":"#/$defs/bounded_string"},"deduplication":{"$ref":"#/$defs/bounded_string"},"rank_order":{"$ref":"#/$defs/bounded_string"},"tie_break":{"type":"array","minItems":6,"maxItems":6,"items":{"$ref":"#/$defs/bounded_string"}},"top_k":{"const":10}}},
+        "lexical_context_rule":{"$ref":"#/$defs/bounded_string"},"localization_relevance":{"$ref":"#/$defs/bounded_string"},"history_materialization_rule":{"$ref":"#/$defs/bounded_string"},
+        "measured_timestamp_rule":{"$ref":"#/$defs/bounded_string"},"raw_observation_rule":{"$ref":"#/$defs/bounded_string"},
+        "verification_rule":{"$ref":"#/$defs/bounded_string"},"build_rule":{"$ref":"#/$defs/bounded_string"}
+      }
+    },
+    "analysis": {
+      "type":"object","additionalProperties":false,
+      "required":["contrast","estimand","k","familywise_alpha","class_alpha","interval","acceptance","stopping","exclusions","replacement","retry","missing_and_error","guardrails"],
+      "properties": {
+        "contrast":{"const":"C-L"},"estimand":{"$ref":"#/$defs/bounded_string"},"k":{"const":10},
+        "familywise_alpha":{"const":0.05},"class_alpha":{"const":0.016666666666666666},
+        "interval":{"$ref":"#/$defs/bounded_string"},"acceptance":{"$ref":"#/$defs/bounded_string"},
+        "stopping":{"$ref":"#/$defs/bounded_string"},"exclusions":{"const":[]},"replacement":{"const":false},
+        "retry":{"const":false},"missing_and_error":{"const":"terminal localization failure"},
+        "guardrails": {
+          "type":"object","additionalProperties":false,
+          "required":["downstream_mechanical","freshness","latency","provenance","token_budget","wrong_decoy"],
+          "properties": {
+            "downstream_mechanical":{"$ref":"#/$defs/bounded_string"},"freshness":{"$ref":"#/$defs/bounded_string"},
+            "latency":{"$ref":"#/$defs/bounded_string"},"provenance":{"$ref":"#/$defs/bounded_string"},
+            "token_budget":{"$ref":"#/$defs/bounded_string"},"wrong_decoy":{"$ref":"#/$defs/bounded_string"}
+          }
+        }
+      }
+    }
+  },
+  "type":"object","additionalProperties":false,
+  "required":["schema_version","kind","experiment_id","state","language","corpus_manifest_digest","immutable_inputs","runtime_environment","public_receipt_key","oracle_selection","trial_protocol","analysis","external_blockers"],
+  "properties": {
+    "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_preregistration"},
+    "experiment_id":{"const":"m005-w07-rust-registry-v2"},"state":{"const":"PRE_RUN_FROZEN"},
+    "language":{"const":"rust"},"corpus_manifest_digest":{"$ref":"#/$defs/digest"},
+    "immutable_inputs":{"$ref":"#/$defs/immutable_inputs"},"runtime_environment":{"$ref":"#/$defs/runtime"},
+    "public_receipt_key":{"$ref":"#/$defs/public_key"},"oracle_selection":{"$ref":"#/$defs/oracle_selection"},
+    "trial_protocol":{"$ref":"#/$defs/trial_protocol"},"analysis":{"$ref":"#/$defs/analysis"},
+    "external_blockers":{"type":"array","minItems":4,"maxItems":4,"uniqueItems":true,"items":{"type":"string","minLength":2,"maxLength":256}}
+  }
+}

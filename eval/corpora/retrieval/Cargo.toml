@@ -1,0 +1,27 @@
+[package]
+name = "kit-retrieval-eval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+publish = false
+
+[dependencies]
+ed25519-dalek = { version = "=2.2.0", features = ["pem", "pkcs8"] }
+jsonschema = { version = "=0.48.2", default-features = false }
+libc = "=0.2.189"
+kit = { path = "../../.." }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.141"
+sha2 = "=0.10.9"
+time = { version = "=0.3.54", features = ["formatting", "parsing"] }
+toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde"] }
+tree-sitter = "=0.25.10"
+tree-sitter-rust = "=0.24.0"
+url = "2.5.7"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "w07-retrieval"
+path = "src/main.rs"
