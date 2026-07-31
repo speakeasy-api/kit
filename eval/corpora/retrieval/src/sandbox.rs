@@ -148,7 +148,9 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
         .into_iter()
         .flatten()
         .collect::<BTreeSet<_>>();
-    let data_ancestors = std::iter::once(&source)
+    let data_ancestors = protected
+        .iter()
+        .copied()
         .chain(writable.iter())
         .map(|path| validated_ancestor_chain(path, &temporary_root))
         .collect::<Result<Vec<_>>>()?
@@ -156,8 +158,9 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
         .flatten()
         .collect::<BTreeSet<_>>();
     let mut profile = String::from(
-        "(version 1)\n(deny default)\n(deny network*)\n(allow process-fork)\n(allow signal (target self))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.iossupportversion\") (sysctl-name \"kern.osvariant_status\") (sysctl-name \"hw.ephemeral_storage\") (sysctl-name \"hw.pagesize_compat\"))\n(allow file-read* (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/private/var/db/timezone\") (literal \"/dev/null\") (literal \"/dev/urandom\"))\n",
+        "(version 1)\n(deny default)\n(deny network*)\n(allow process-fork)\n(allow signal (target self))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.iosupportversion\") (sysctl-name \"kern.osvariant_status\") (sysctl-name \"hw.ephemeral_storage\") (sysctl-name \"hw.pagesize_compat\"))\n(allow file-read* (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/private/var/db/timezone\") (literal \"/dev/null\") (literal \"/dev/urandom\"))\n",
     );
+    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
     for path in metadata_ancestors {
         profile.push_str(&format!(
             "(allow file-read-metadata (literal {}))\n",
@@ -328,6 +331,8 @@ fn overlaps(left: &Path, right: &Path) -> bool {
 fn validated_ancestor_chain(path: &Path, temporary_root: &Path) -> Result<Vec<PathBuf>> {
     let fixed_roots = [
         temporary_root,
+        Path::new("/Applications"),
+        Path::new("/Library/Developer"),
         Path::new("/System"),
         Path::new("/bin"),
         Path::new("/usr"),

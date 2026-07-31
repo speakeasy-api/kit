@@ -1,7 +1,7 @@
 use crate::{
-    AdmissionRecord, CorpusManifest, GitMaterializationReceipt, LedgerEvent, MeasuredReport,
-    MeasuredRuntimeManifest, ProtocolError, RawTrial, RegistrationRecord, Result, SignedLedger,
-    TrialBinding, TrialGrade, canonical, grade, sha256,
+    AdmissionRecord, Arm, CorpusManifest, GitMaterializationReceipt, LedgerEvent, MeasuredReport,
+    MeasuredRuntimeManifest, ProtocolError, RawTrial, RegistrationRecord, RepositoryClass, Result,
+    SignedLedger, TrialBinding, TrialGrade, canonical, grade, sha256,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::{
@@ -48,6 +48,7 @@ pub(crate) fn verify_measured(
             ProtocolError("measured tables do not contain the fixed 504 trials".into()).into(),
         );
     }
+    verify_raw_schedule(manifest, &raws)?;
     crate::protocol::validate_schema(
         include_bytes!("../schema/v2/signed-ledger.schema.json"),
         &canonical(&ledger)?,
@@ -65,6 +66,7 @@ pub(crate) fn verify_measured(
         )?;
     }
     let registration_digest = sha256(&canonical(&registration)?);
+    crate::run::verify_runtime_identity(&runtime, preregistration)?;
     let git = crate::run::pinned_git(preregistration)?;
     let head = crate::run::trusted_git_output(
         &git,
@@ -129,18 +131,40 @@ pub(crate) fn verify_measured(
             let raw = &raws[index];
             let retained_grade = &grades[index];
             let binding = &bindings[index];
-            let unit = manifest
+            let (unit, expected_arm) = manifest
                 .units
                 .iter()
-                .find(|unit| unit.unit_id == raw.unit_id)
-                .ok_or_else(|| ProtocolError("raw unit is absent from manifest".into()))?;
+                .flat_map(|unit| unit.arm_order.iter().map(move |arm| (unit, *arm)))
+                .nth(index)
+                .expect("fixed schedule");
             if admission.unit_id != raw.unit_id
                 || admission.arm != raw.arm
                 || admission.sequence_index != index
+                || admission.unit_id != unit.unit_id
+                || admission.arm != expected_arm
                 || admission.source_digest != unit.rust_source_digest
+                || admission.task_query_digest != unit.task.query_digest
+                || admission.arm_config_digest
+                    != sha256(&canonical(&crate::ArmConfig::frozen(expected_arm))?)
+                || admission.registration_digest != registration_digest
+                || raw.unit_id != unit.unit_id
+                || raw.task_id != unit.task.task_id
+                || raw.repository_class != unit.repository_class
+                || raw.arm != expected_arm
+                || raw.executor_evidence != registration.route
                 || raw.source_digest != unit.rust_source_digest
+                || raw.task_query_digest != unit.task.query_digest
+                || raw.arm_config_digest != admission.arm_config_digest
                 || raw.admission_digest != sha256(&canonical(admission)?)
                 || raw.worker_executable_digest != runtime.executable_digest
+                || raw.observations.iter().any(|observation| {
+                    !observation_git_matches_runtime(
+                        observation.source,
+                        observation.status,
+                        observation.git_executable_digest.as_deref(),
+                        &runtime.git_executable_digest,
+                    )
+                })
                 || crate::run::parse_timestamp(&registration.registered_at)?
                     >= crate::run::parse_timestamp(&admission.admitted_at)?
                 || crate::run::parse_timestamp(&admission.admitted_at)?
@@ -158,6 +182,8 @@ pub(crate) fn verify_measured(
             if &computed != retained_grade
                 || binding.unit_id != raw.unit_id
                 || binding.arm != raw.arm
+                || retained_grade.unit_id != unit.unit_id
+                || retained_grade.arm != expected_arm
                 || binding.raw_trial_digest != sha256(&canonical(raw)?)
                 || binding.grade_digest != sha256(&canonical(&computed)?)
             {
@@ -190,8 +216,78 @@ pub(crate) fn verify_measured(
         }
         Ok(())
     })();
-    let _ = fs::remove_dir_all(scratch);
-    verification
+    crate::run::finish_with_cleanup(
+        verification,
+        vec![(
+            "verification temporary cleanup",
+            fs::remove_dir_all(scratch).map_err(Into::into),
+        )],
+        "measured verification",
+    )
+}
+
+type TrialIdentity = (String, String, RepositoryClass, Arm);
+
+fn expected_schedule(manifest: &CorpusManifest) -> Vec<TrialIdentity> {
+    manifest
+        .units
+        .iter()
+        .flat_map(|unit| {
+            unit.arm_order.iter().map(move |arm| {
+                (
+                    unit.unit_id.clone(),
+                    unit.task.task_id.clone(),
+                    unit.repository_class,
+                    *arm,
+                )
+            })
+        })
+        .collect()
+}
+
+fn verify_raw_schedule(manifest: &CorpusManifest, raws: &[RawTrial]) -> Result<()> {
+    let actual = raws
+        .iter()
+        .map(|raw| {
+            (
+                raw.unit_id.clone(),
+                raw.task_id.clone(),
+                raw.repository_class,
+                raw.arm,
+            )
+        })
+        .collect::<Vec<_>>();
+    verify_schedule_identities(manifest, &actual)
+}
+
+fn verify_schedule_identities(manifest: &CorpusManifest, actual: &[TrialIdentity]) -> Result<()> {
+    if actual != expected_schedule(manifest) {
+        return Err(ProtocolError(
+            "raw trials do not exactly match the frozen ordered 504-trial schedule".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn observation_git_matches_runtime(
+    source: crate::RetrievalSource,
+    status: crate::SourceStatus,
+    observed: Option<&str>,
+    expected: &str,
+) -> bool {
+    if matches!(
+        source,
+        crate::RetrievalSource::History | crate::RetrievalSource::GitPathHistory
+    ) {
+        if status == crate::SourceStatus::Error {
+            observed.is_none()
+        } else {
+            observed == Some(expected)
+        }
+    } else {
+        observed.is_none()
+    }
 }
 
 fn verify_receipts(
@@ -544,5 +640,145 @@ mod tests {
         assert_eq!(digest, sha256(&authenticated));
         assert_ne!(digest, sha256(&fs::read(&path).unwrap()));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_observation_requires_the_runtime_git_digest() {
+        let expected = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(observation_git_matches_runtime(
+            crate::RetrievalSource::History,
+            crate::SourceStatus::Available,
+            Some(expected),
+            expected
+        ));
+        assert!(!observation_git_matches_runtime(
+            crate::RetrievalSource::GitPathHistory,
+            crate::SourceStatus::Available,
+            Some(other),
+            expected
+        ));
+        assert!(!observation_git_matches_runtime(
+            crate::RetrievalSource::History,
+            crate::SourceStatus::Available,
+            None,
+            expected
+        ));
+        assert!(observation_git_matches_runtime(
+            crate::RetrievalSource::Lexical,
+            crate::SourceStatus::Available,
+            None,
+            expected
+        ));
+    }
+
+    #[test]
+    fn duplicate_trial_omitting_another_schedule_entry_is_rejected() {
+        let manifest: CorpusManifest = serde_json::from_slice(include_bytes!(
+            "../../../reports/m005/source-semantics/corpus-manifest.json"
+        ))
+        .unwrap();
+        let mut rows = expected_schedule(&manifest);
+        assert_eq!(rows.len(), 504);
+        rows[1] = rows[0].clone();
+        assert!(verify_schedule_identities(&manifest, &rows).is_err());
+    }
+
+    #[test]
+    fn tampered_tool_and_profile_runtime_fields_are_rejected() {
+        let preregistration: crate::Preregistration =
+            serde_json::from_slice(include_bytes!("../../../preregistration/m005-w07.yaml"))
+                .unwrap();
+        let mut value = serde_json::to_value(&preregistration.runtime_environment).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("manifest_digest");
+        object.insert("schema_version".into(), "2.0".into());
+        object.insert("kind".into(), "m005_w07_runtime_manifest".into());
+        object.insert(
+            "executable_digest".into(),
+            preregistration
+                .immutable_inputs
+                .release_executable_digest
+                .clone()
+                .into(),
+        );
+        let runtime: MeasuredRuntimeManifest = serde_json::from_value(value).unwrap();
+        crate::run::verify_runtime_identity(&runtime, &preregistration).unwrap();
+        for field in [
+            "os",
+            "uname_path",
+            "uname_executable_digest",
+            "architecture",
+            "os_version",
+            "sw_vers_path",
+            "sw_vers_executable_digest",
+            "rustc_path",
+            "rustc",
+            "rustc_executable_digest",
+            "cargo_path",
+            "cargo",
+            "cargo_executable_digest",
+            "git_path",
+            "git",
+            "git_executable_digest",
+            "sandbox_exec_path",
+            "sandbox_exec",
+            "sandbox_exec_executable_digest",
+            "profile",
+            "opt_level",
+            "debug",
+        ] {
+            let mut tampered = serde_json::to_value(&runtime).unwrap();
+            tampered[field] = "tampered".into();
+            let tampered: MeasuredRuntimeManifest = serde_json::from_value(tampered).unwrap();
+            assert!(crate::run::verify_runtime_identity(&tampered, &preregistration).is_err());
+        }
+        let mut tampered = runtime.clone();
+        tampered.debug_assertions = true;
+        assert!(crate::run::verify_runtime_identity(&tampered, &preregistration).is_err());
+        let mut tampered = runtime;
+        tampered.executable_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        assert!(crate::run::verify_runtime_identity(&tampered, &preregistration).is_err());
+    }
+
+    #[test]
+    fn stale_executable_and_runtime_mismatch_create_no_run_state() {
+        let preregistration: crate::Preregistration =
+            serde_json::from_slice(include_bytes!("../../../preregistration/m005-w07.yaml"))
+                .unwrap();
+        let mut value = serde_json::to_value(&preregistration.runtime_environment).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("manifest_digest");
+        object.insert("schema_version".into(), "2.0".into());
+        object.insert("kind".into(), "m005_w07_runtime_manifest".into());
+        object.insert(
+            "executable_digest".into(),
+            preregistration
+                .immutable_inputs
+                .release_executable_digest
+                .clone()
+                .into(),
+        );
+        let runtime: MeasuredRuntimeManifest = serde_json::from_value(value).unwrap();
+        for (index, mut mismatched) in [runtime.clone(), runtime].into_iter().enumerate() {
+            if index == 0 {
+                mismatched.executable_digest =
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .into();
+            } else {
+                mismatched.os = "unexpected".into();
+            }
+            let root = unique_temp().unwrap();
+            let run = root.join("retrieval-run");
+            let result = crate::run::verify_runtime_identity(&mismatched, &preregistration)
+                .and_then(|_| {
+                    fs::create_dir_all(&run)?;
+                    fs::write(run.join("registration.json"), b"must not exist")?;
+                    Ok(())
+                });
+            assert!(result.is_err());
+            assert!(!run.exists());
+        }
     }
 }

@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.94.0"
 publish = false
 
+[features]
+external-git-sandbox = []
+
 [dependencies]
 agentkit-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-core" }
 agentkit-loop = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-loop" }

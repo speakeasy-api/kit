@@ -5,7 +5,7 @@
   "required":["schema_version","kind","experiment_id","status","statistical_verdict","gate_claim","chronology","preregistration_digest","corpus_manifest_digest","units","class_counts","measured_trials","external_blockers"],
   "properties": {
     "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_status_report"},
-    "experiment_id":{"const":"m005-w07-rust-registry-v4"},"status":{"const":"NOT_RUN_PRECOMMIT"},
+    "experiment_id":{"const":"m005-w07-rust-registry-v5"},"status":{"const":"NOT_RUN_PRECOMMIT"},
     "statistical_verdict":{"type":"null"},"gate_claim":{"const":"NONE; C-L and G05 are not claimed"},
     "chronology":{"const":"uncommitted preregistration cannot prove pre-measurement chronology"},
     "preregistration_digest":{"$ref":"#/$defs/digest"},"corpus_manifest_digest":{"$ref":"#/$defs/digest"},

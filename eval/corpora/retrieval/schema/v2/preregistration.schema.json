@@ -5,20 +5,21 @@
     "bounded_string":{"type":"string","minLength":1,"maxLength":16384},
     "immutable_inputs": {
       "type":"object","additionalProperties":false,
-      "required":["build_inputs"],
+      "required":["build_inputs","release_executable_digest"],
       "properties": {
-        "build_inputs":{"$ref":"#/$defs/digest"}
+        "build_inputs":{"$ref":"#/$defs/digest"},
+        "release_executable_digest":{"$ref":"#/$defs/digest"}
       }
     },
     "runtime": {
       "type":"object","additionalProperties":false,
-      "required":["manifest_digest","os","uname_executable_digest","architecture","os_version","sw_vers_executable_digest","rustc","rustc_executable_digest","cargo","cargo_executable_digest","git_path","git","git_executable_digest","sandbox_exec","route"],
+      "required":["manifest_digest","route","os","uname_path","uname_executable_digest","architecture","os_version","sw_vers_path","sw_vers_executable_digest","rustc_path","rustc","rustc_executable_digest","cargo_path","cargo","cargo_executable_digest","git_path","git","git_executable_digest","sandbox_exec_path","sandbox_exec","sandbox_exec_executable_digest","profile","opt_level","debug","debug_assertions"],
       "properties": {
-        "manifest_digest":{"$ref":"#/$defs/digest"},"os":{"$ref":"#/$defs/bounded_string"},"uname_executable_digest":{"$ref":"#/$defs/digest"},
-        "architecture":{"$ref":"#/$defs/bounded_string"},"os_version":{"$ref":"#/$defs/bounded_string"},"sw_vers_executable_digest":{"$ref":"#/$defs/digest"},
-        "rustc":{"$ref":"#/$defs/bounded_string"},"rustc_executable_digest":{"$ref":"#/$defs/digest"},"cargo":{"$ref":"#/$defs/bounded_string"},"cargo_executable_digest":{"$ref":"#/$defs/digest"},
-        "git_path":{"type":"string","pattern":"^/","maxLength":4096},"git":{"$ref":"#/$defs/bounded_string"},"git_executable_digest":{"$ref":"#/$defs/digest"},"sandbox_exec":{"$ref":"#/$defs/digest"},
-        "route":{"const":"PRE_RUN"}
+        "manifest_digest":{"$ref":"#/$defs/digest"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"os":{"$ref":"#/$defs/bounded_string"},"uname_path":{"type":"string","pattern":"^/","maxLength":4096},"uname_executable_digest":{"$ref":"#/$defs/digest"},
+        "architecture":{"$ref":"#/$defs/bounded_string"},"os_version":{"$ref":"#/$defs/bounded_string"},"sw_vers_path":{"type":"string","pattern":"^/","maxLength":4096},"sw_vers_executable_digest":{"$ref":"#/$defs/digest"},
+        "rustc_path":{"type":"string","pattern":"^/","maxLength":4096},"rustc":{"$ref":"#/$defs/bounded_string"},"rustc_executable_digest":{"$ref":"#/$defs/digest"},"cargo_path":{"type":"string","pattern":"^/","maxLength":4096},"cargo":{"$ref":"#/$defs/bounded_string"},"cargo_executable_digest":{"$ref":"#/$defs/digest"},
+        "git_path":{"type":"string","pattern":"^/","maxLength":4096},"git":{"$ref":"#/$defs/bounded_string"},"git_executable_digest":{"$ref":"#/$defs/digest"},"sandbox_exec_path":{"const":"/usr/bin/sandbox-exec"},"sandbox_exec":{"$ref":"#/$defs/bounded_string"},"sandbox_exec_executable_digest":{"$ref":"#/$defs/digest"},
+        "profile":{"const":"release"},"opt_level":{"const":"3"},"debug":{"const":"false"},"debug_assertions":{"const":false}
       }
     },
     "public_key": {
@@ -31,7 +32,7 @@
     },
     "prior_invalid_experiment": {
       "type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],
-      "properties":{"experiment_id":{"enum":["m005-w07-rust-registry-v2","m005-w07-rust-registry-v3"]},"status":{"const":"INVALID_HARNESS"},"incident_path":{"enum":["eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json","eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json"]},"incident_digest":{"$ref":"#/$defs/digest"}}
+      "properties":{"experiment_id":{"enum":["m005-w07-rust-registry-v2","m005-w07-rust-registry-v3","m005-w07-rust-registry-v4"]},"status":{"const":"INVALID_HARNESS"},"incident_path":{"enum":["eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json","eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json","eval/reports/m005/source-semantics/incidents/m005-w07-v4-metadata-owner.json"]},"incident_digest":{"$ref":"#/$defs/digest"}}
     },
     "oracle_selection": {
       "type":"object","additionalProperties":false,"required":["algorithm","eligibility","query_derivation","decoy_count","outcome_independent"],
@@ -44,7 +45,7 @@
     },
     "trial_protocol": {
       "type":"object","additionalProperties":false,
-      "required":["trusted_executor","local_executor","worker_visible_inputs","worker_forbidden_inputs","fresh_process_per_non_oracle_arm","fresh_cache_per_non_oracle_arm","oracle_is_grader_only","syntax_free_arm","syntax_free_sources","arm_source_sets","normalization","lexical_context_rule","localization_relevance","history_materialization_rule","premeasurement_canary_rule","measured_timestamp_rule","raw_observation_rule","verification_rule","build_rule"],
+      "required":["trusted_executor","local_executor","worker_visible_inputs","worker_forbidden_inputs","fresh_process_per_non_oracle_arm","fresh_cache_per_non_oracle_arm","oracle_is_grader_only","syntax_free_arm","syntax_free_sources","arm_source_sets","source_limits","normalization","lexical_context_rule","localization_relevance","history_materialization_rule","premeasurement_canary_rule","measured_timestamp_rule","raw_observation_rule","verification_rule","build_rule"],
       "properties": {
         "trusted_executor":{"$ref":"#/$defs/bounded_string"},"local_executor":{"$ref":"#/$defs/bounded_string"},
         "worker_visible_inputs":{"type":"array","minItems":4,"maxItems":4,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":256}},
@@ -53,6 +54,7 @@
         "oracle_is_grader_only":{"const":true},"syntax_free_arm":{"const":"F-S"},
         "syntax_free_sources":{"const":["lexical","filesystem_metadata","cargo_metadata_without_source_parse","git_path_history"]},
         "arm_source_sets":{"type":"object","additionalProperties":false,"required":["L","C","F","F-S","F-P","F-G","F-H"],"properties":{"L":{"const":["lexical"]},"C":{"const":["lexical","tree_sitter","structural","lsp"]},"F":{"const":["lexical","tree_sitter","structural","lsp","personalized_map","structure_graph","history"]},"F-S":{"const":["lexical","filesystem_metadata","cargo_metadata_without_source_parse","git_path_history"]},"F-P":{"const":["lexical","tree_sitter","structural","lsp","structure_graph","history"]},"F-G":{"const":["lexical","tree_sitter","structural","lsp","personalized_map","history"]},"F-H":{"const":["lexical","tree_sitter","structural","lsp","personalized_map","structure_graph"]}}},
+        "source_limits":{"type":"object","additionalProperties":false,"required":["total_ms","lexical_ms","structural_pattern_ms","structural_total_ms","map_ms","graph_ms","history_ms"],"properties":{"total_ms":{"const":90000},"lexical_ms":{"const":30000},"structural_pattern_ms":{"const":5000},"structural_total_ms":{"const":30000},"map_ms":{"const":30000},"graph_ms":{"const":30000},"history_ms":{"const":30000}}},
         "normalization":{"type":"object","additionalProperties":false,"required":["version","raw_score_rule","deduplication","rank_order","tie_break","top_k"],"properties":{"version":{"const":"m005-w07-normalization-v1"},"raw_score_rule":{"$ref":"#/$defs/bounded_string"},"deduplication":{"$ref":"#/$defs/bounded_string"},"rank_order":{"$ref":"#/$defs/bounded_string"},"tie_break":{"type":"array","minItems":6,"maxItems":6,"items":{"$ref":"#/$defs/bounded_string"}},"top_k":{"const":10}}},
         "lexical_context_rule":{"$ref":"#/$defs/bounded_string"},"localization_relevance":{"$ref":"#/$defs/bounded_string"},"history_materialization_rule":{"$ref":"#/$defs/bounded_string"},"premeasurement_canary_rule":{"$ref":"#/$defs/bounded_string"},
         "measured_timestamp_rule":{"$ref":"#/$defs/bounded_string"},"raw_observation_rule":{"$ref":"#/$defs/bounded_string"},
@@ -84,9 +86,9 @@
   "required":["schema_version","kind","experiment_id","state","language","corpus_manifest_digest","prior_invalid_experiments","immutable_inputs","runtime_environment","public_receipt_key","oracle_selection","trial_protocol","analysis","external_blockers"],
   "properties": {
     "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_preregistration"},
-    "experiment_id":{"const":"m005-w07-rust-registry-v4"},"state":{"const":"PRE_RUN_FROZEN"},
+    "experiment_id":{"const":"m005-w07-rust-registry-v5"},"state":{"const":"PRE_RUN_FROZEN"},
     "language":{"const":"rust"},"corpus_manifest_digest":{"$ref":"#/$defs/digest"},
-    "prior_invalid_experiments":{"type":"array","minItems":2,"maxItems":2,"prefixItems":[{"type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],"properties":{"experiment_id":{"const":"m005-w07-rust-registry-v2"},"status":{"const":"INVALID_HARNESS"},"incident_path":{"const":"eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json"},"incident_digest":{"const":"sha256:9b90c4a2236a5bce8e8c96c4fdbad3e788b642dc0ed1a3e56c17e8901b1fb445"}}},{"type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],"properties":{"experiment_id":{"const":"m005-w07-rust-registry-v3"},"status":{"const":"INVALID_HARNESS"},"incident_path":{"const":"eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json"},"incident_digest":{"const":"sha256:fd188ebe46948c6bc12488bb24ba78842ae3a3a40a573a535c634843108f8094"}}}]},"immutable_inputs":{"$ref":"#/$defs/immutable_inputs"},"runtime_environment":{"$ref":"#/$defs/runtime"},
+    "prior_invalid_experiments":{"type":"array","minItems":3,"maxItems":3,"prefixItems":[{"type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],"properties":{"experiment_id":{"const":"m005-w07-rust-registry-v2"},"status":{"const":"INVALID_HARNESS"},"incident_path":{"const":"eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json"},"incident_digest":{"const":"sha256:9b90c4a2236a5bce8e8c96c4fdbad3e788b642dc0ed1a3e56c17e8901b1fb445"}}},{"type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],"properties":{"experiment_id":{"const":"m005-w07-rust-registry-v3"},"status":{"const":"INVALID_HARNESS"},"incident_path":{"const":"eval/reports/m005/source-semantics/incidents/m005-w07-v3-sandbox-traversal.json"},"incident_digest":{"const":"sha256:fd188ebe46948c6bc12488bb24ba78842ae3a3a40a573a535c634843108f8094"}}},{"type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],"properties":{"experiment_id":{"const":"m005-w07-rust-registry-v4"},"status":{"const":"INVALID_HARNESS"},"incident_path":{"const":"eval/reports/m005/source-semantics/incidents/m005-w07-v4-metadata-owner.json"},"incident_digest":{"const":"sha256:d697d6a3085ce8e390b88d27de1239bd96bcb6653d9b86936805b5af74c538bf"}}}]},"immutable_inputs":{"$ref":"#/$defs/immutable_inputs"},"runtime_environment":{"$ref":"#/$defs/runtime"},
     "public_receipt_key":{"$ref":"#/$defs/public_key"},"oracle_selection":{"$ref":"#/$defs/oracle_selection"},
     "trial_protocol":{"$ref":"#/$defs/trial_protocol"},"analysis":{"$ref":"#/$defs/analysis"},
     "external_blockers":{"type":"array","minItems":4,"maxItems":4,"uniqueItems":true,"items":{"type":"string","minLength":2,"maxLength":256}}

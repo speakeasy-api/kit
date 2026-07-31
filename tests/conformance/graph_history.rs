@@ -339,7 +339,7 @@ fn pinned_seven_commit_fixture_has_exact_rename_cochange_and_blame() {
     let golden = hex(graph.content_digest());
     assert_eq!(
         golden,
-        "76ce8b5e0717c1364d08fd7834c62c2d9744eae55c0a29f5959f6d8583256d81"
+        "00ad09ee049a8498b986c5dd29675564e34781d0ca8a9a1a6512953eb13a698a"
     );
     for _ in 0..9 {
         let mut cold = HistoryGraphProvider::new();

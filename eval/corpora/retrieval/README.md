@@ -3,8 +3,8 @@
 This crate freezes an honest Rust retrieval corpus from published crates that are already present in
 the root `Cargo.lock`. It contains no generated repositories, target symbols, answer-bearing paths,
 or measured result. The retained report is `NOT_RUN_PRECOMMIT` and makes no C-L or G05 claim.
-The v3 preregistration binds the sanitized `INVALID_HARNESS` incident from the v2 worker-abort run;
-that incident contains no retrieval observation or machine-local path.
+The v5 preregistration binds the sanitized `INVALID_HARNESS` incidents from the v2, v3, and partial
+v4 runs; the incidents contain no machine-local path and make no retrieval or statistical claim.
 
 ## Frozen Corpus
 
@@ -28,6 +28,13 @@ Every non-oracle arm is a fresh process with a fresh cache. It receives only a f
 task query, arm configuration, and one arm-specific output path. `O` is not a worker; it is hidden
 grader input. `F-S` is dependency-closed to lexical, filesystem metadata, parse-free Cargo metadata,
 and Git path history, and must not construct a syntax index.
+
+Measured and standalone canary workers require the exact preregistered release executable SHA-256,
+Cargo `release` profile marker,
+`opt-level=3`, `DEBUG=false`, and disabled debug assertions. Their frozen source limits are 90 seconds
+total, 30 seconds lexical, 5 seconds per structural pattern and 30 seconds structural total, and 30
+seconds each for map, graph, and history. These execution limits are separate from the unchanged
+outcome guardrails of 10 seconds indexing and 3 seconds query latency.
 
 Trusted evidence must use the existing M004 production isolated executor. The deny-default macOS
 `sandbox-exec` helper in this crate is explicitly `LOCAL_SANDBOX_NOT_TRUSTED`; it cannot satisfy G03,
@@ -56,11 +63,16 @@ cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- prepare 
 rm -rf "$vendor"
 ```
 
-After changing any pinned runner, schema, lane, or root execution/statistics input and before the
-preregistration commit, refresh only the preregistration pins and retained `NOT_RUN` report:
+After changing any pinned runner, schema, lane, or root execution/statistics input, use this exact
+order: first commit all pinned inputs and make the tree clean; then build the canonical release
+binary; then refresh only the normalized preregistration and retained `NOT_RUN` report; then verify
+and commit those two refreshed files without rebuilding. They are excluded from the build-input pin,
+so normalization cannot change the already frozen release executable SHA-256:
 
 ```sh
+cargo build --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml
 cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- refresh-frozen
+cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- verify
 ```
 
 The exact precommit/CI verification command does not regenerate or run the measured corpus:
@@ -81,17 +93,32 @@ G05 or production-gate result:
 vendor="$(mktemp -d)"
 cargo vendor --locked --versioned-dirs "$vendor" >/dev/null
 KIT_M005_W07_SIGNING_KEY=.kit/m005-w07-ed25519-private.pem \
-  cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- run-local "$vendor"
+  cargo run --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- run-local "$vendor"
 cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- verify "$vendor"
 rm -rf "$vendor"
 ```
 
-If setup or materialization fails before a measured report is produced, remove only the guarded
-failed run directory before retrying:
+Both run routes compare the complete runtime identity and current executable SHA-256 with the
+preregistration before creating a run directory, materializing an upstream checkout, running a
+canary, registering, or admitting a trial. A stale or separately built release binary is rejected.
+The standalone 14-arm premeasurement canary is release-only and writes zero measured or admission
+rows:
+
+```sh
+vendor="$(mktemp -d)"
+cargo vendor --locked --versioned-dirs "$vendor" >/dev/null
+cargo run --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- canary "$vendor"
+rm -rf "$vendor"
+```
+
+If setup or the canary fails before registration, remove only that guarded pre-registration state:
 
 ```sh
 cargo run --locked --manifest-path eval/corpora/retrieval/Cargo.toml -- cleanup-failed
 ```
+
+Once `registration.json`, an admission, any trial/grade/binding, or a ledger exists, cleanup refuses.
+Retain a sanitized incident and create a new experiment; the same preregistration is never retried.
 
 The trusted command never falls back to local evidence. Until a pinned M004 adapter and G03/G04 are
 available, it atomically writes the schema-valid zero-trial `BLOCKED_G03_G04` report; `verify`

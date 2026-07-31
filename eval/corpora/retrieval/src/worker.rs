@@ -6,18 +6,25 @@ use crate::{
 use kit::workspace::{
     edit::ir::RootRelativePath,
     graph::{
-        history::{HistoryGraphProvider, HistoryOptions, HistoryRequest},
-        structure::{GraphOptions, NodeKind, StructureGraph, StructureGraphProvider},
+        history::{
+            HistoryBound, HistoryError, HistoryGraph, HistoryGraphProvider, HistoryOptions,
+            HistoryRequest,
+        },
+        structure::{
+            GraphBound, GraphError, GraphOptions, NodeKind, StructureGraph, StructureGraphProvider,
+        },
     },
     index::meta::{IndexOptions, MetadataIndex},
     map::{
-        MapBudget, MapLimits, Personalization, RepositoryMapRequest, build_repository_map,
-        build_repository_map_with_structure,
+        MapBudget, MapError, MapLimits, Personalization, RepositoryMapRequest,
+        build_repository_map, build_repository_map_with_structure,
     },
-    revision::{EntryKind, ManagedWorkspace, RevisionOptions},
+    revision::{EntryKind, LimitKind, ManagedWorkspace, RevisionError, RevisionOptions},
     search::{
-        lexical::{SearchMode, SearchOptions, SearchQuery, search as lexical_search},
-        structural::{StructuralOptions, StructuralQuery, search as structural_search},
+        lexical::{SearchError, SearchMode, SearchOptions, SearchQuery, search as lexical_search},
+        structural::{
+            StructuralError, StructuralOptions, StructuralQuery, search as structural_search,
+        },
     },
     syntax::SyntaxIndex,
 };
@@ -80,6 +87,10 @@ fn validate_worker_inputs(query: &WorkerQuery, request: &WorkerArmRequest) -> Re
         || request.unit_id.is_empty()
         || request.cache_id.is_empty()
         || !crate::valid_digest(&request.worker_executable_digest)
+        || !Path::new(&request.git_path).is_absolute()
+        || !crate::valid_digest(&request.git_executable_digest)
+        || request.git_version.is_empty()
+        || request.git_version.len() > 4096
         || !matches!(
             request.executor_evidence,
             ExecutorEvidence::LocalSandboxNotTrusted | ExecutorEvidence::M004ProductionTrusted
@@ -113,7 +124,8 @@ pub(crate) fn execute(
     let mut syntax_initializations = 0;
     let mut syntax = None;
     let index_options = IndexOptions {
-        max_symbol_bytes: 4_096,
+        max_indexed_bytes: crate::MAX_SNAPSHOT_BYTES,
+        max_file_bytes: crate::MAX_SOURCE_FILE_BYTES,
         ..IndexOptions::default()
     };
     let index = if request.config.syntax_initialization_permitted {
@@ -126,14 +138,42 @@ pub(crate) fn execute(
     } else {
         MetadataIndex::build_lexical(&workspace, revision, &index_options)?
     };
-    let index_latency_ms = millis(index_started.elapsed());
+    let primary_index_elapsed = index_started.elapsed();
     let revision_digest = rust_tree_digest(source, Path::new(""), &index)?;
     if revision_digest != request.source_digest {
         return Err(
             ProtocolError("worker Rust tree differs from frozen source digest".into()).into(),
         );
     }
+    let history_enabled = request.config.enabled_sources.iter().any(|source| {
+        matches!(
+            source,
+            RetrievalSource::History | RetrievalSource::GitPathHistory
+        )
+    });
+    let (history_owner, nested_index_elapsed) = if history_enabled
+        && !source_prefix.as_os_str().is_empty()
+    {
+        let nested_started = Instant::now();
+        let history_options = RevisionOptions {
+            metadata_path: Some(cache.join("history-revision.state")),
+            max_scan_time: Duration::from_secs(10),
+            ..RevisionOptions::default()
+        };
+        let history_workspace = ManagedWorkspace::open_with_options(&repository, history_options)?;
+        let history_revision = history_workspace.current_revision()?.id();
+        let history_index =
+            MetadataIndex::build_lexical(&history_workspace, history_revision, &index_options)?;
+        (
+            Some((history_workspace, history_index)),
+            Some(nested_started.elapsed()),
+        )
+    } else {
+        (None, None)
+    };
+    let index_latency_ms = combined_index_latency_ms(primary_index_elapsed, nested_index_elapsed);
     let query_started = Instant::now();
+    let source_limits = request.config.source_limits;
     let mut observations = BTreeMap::new();
 
     if enabled(&request.config, RetrievalSource::Lexical) {
@@ -146,6 +186,8 @@ pub(crate) fn execute(
                 &index,
                 &query,
                 &revision_digest,
+                query_started,
+                source_limits,
             )?,
         );
     }
@@ -164,6 +206,8 @@ pub(crate) fn execute(
                 syntax,
                 &query,
                 &revision_digest,
+                query_started,
+                source_limits,
             )?,
             None => unavailable(
                 RetrievalSource::Structural,
@@ -208,46 +252,41 @@ pub(crate) fn execute(
 
     let mut structure = None;
     if enabled(&request.config, RetrievalSource::StructureGraph) {
-        let (observation, graph) = graph_observation(&workspace, &index, &query, &revision_digest)?;
+        let (observation, graph) = graph_observation(
+            &workspace,
+            &index,
+            &query,
+            &revision_digest,
+            query_started,
+            source_limits,
+        )?;
         observations.insert(RetrievalSource::StructureGraph, observation);
         structure = graph;
     }
-    let history_paths = history_paths(&observations, &source_prefix, &index)?;
-    let history = if request.config.enabled_sources.iter().any(|source| {
-        matches!(
-            source,
-            RetrievalSource::History | RetrievalSource::GitPathHistory
-        )
-    }) {
-        let history_options = RevisionOptions {
-            metadata_path: Some(cache.join("history-revision.state")),
-            max_scan_time: Duration::from_secs(10),
-            ..RevisionOptions::default()
-        };
-        let history_workspace = ManagedWorkspace::open_with_options(&repository, history_options)?;
-        let history_revision = history_workspace.current_revision()?.id();
-        let history_index =
-            MetadataIndex::build_lexical(&history_workspace, history_revision, &index_options)?;
-        Some((history_workspace, history_index))
-    } else {
-        None
-    };
-    for source_kind in [RetrievalSource::History, RetrievalSource::GitPathHistory] {
-        if enabled(&request.config, source_kind) {
-            let (history_workspace, history_index) = history
-                .as_ref()
-                .ok_or_else(|| ProtocolError("history workspace was not initialized".into()))?;
-            observations.insert(
-                source_kind,
-                history_observation(
-                    history_workspace,
-                    history_index,
-                    &query,
-                    &revision_digest,
-                    source_kind,
-                    &history_paths,
-                )?,
-            );
+    if history_enabled {
+        let paths = history_paths(&observations, &source_prefix, &index)?;
+        if let Some((history_workspace, history_index)) = &history_owner {
+            insert_history_observations(
+                &mut observations,
+                history_workspace,
+                history_index,
+                &query,
+                &revision_digest,
+                &paths,
+                &request,
+                query_started,
+            )?;
+        } else {
+            insert_history_observations(
+                &mut observations,
+                &workspace,
+                &index,
+                &query,
+                &revision_digest,
+                &paths,
+                &request,
+                query_started,
+            )?;
         }
     }
     if enabled(&request.config, RetrievalSource::PersonalizedMap) {
@@ -259,6 +298,8 @@ pub(crate) fn execute(
                 structure.as_ref(),
                 &query,
                 &revision_digest,
+                query_started,
+                source_limits,
             )?,
         );
     }
@@ -281,6 +322,7 @@ pub(crate) fn execute(
         kind: "m005_w07_raw_arm_trial".into(),
         unit_id: request.unit_id,
         task_id: query.task_id,
+        repository_class: request.repository_class,
         arm: request.config.arm,
         executor_evidence: request.executor_evidence,
         admission_digest: request.admission_digest,
@@ -305,6 +347,7 @@ pub(crate) fn execute(
     Ok(raw)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lexical_observation(
     repository: &Path,
     source_prefix: &Path,
@@ -312,12 +355,16 @@ fn lexical_observation(
     index: &MetadataIndex,
     query: &WorkerQuery,
     revision_digest: &str,
+    query_started: Instant,
+    limits: crate::SourceLimits,
 ) -> Result<SourceObservation> {
     observe(
         RetrievalSource::Lexical,
         "kit::workspace::search::lexical::search",
         revision_digest,
         || {
+            let max_time = source_duration(query_started, limits, limits.lexical_ms)
+                .ok_or_else(|| typed_failure(RetrievalSource::Lexical, FailureKind::Time))?;
             let text = query_payload(&query.query);
             let response = lexical_search(
                 workspace,
@@ -334,18 +381,25 @@ fn lexical_observation(
                     max_results: 10_000,
                     max_cursor_offset: 10_000,
                     max_result_bytes: 8 * 1024 * 1024,
-                    max_time: Duration::from_secs(3),
+                    max_time,
                     ..SearchOptions::default()
                 },
                 None,
-            )?;
+            )
+            .map_err(lexical_failure)?;
             let candidates = response
                 .matches
                 .iter()
                 .enumerate()
                 .map(|(ordinal, found)| {
                     let (range, snippet, snippet_truncated) =
-                        lexical_context(repository, &found.path, found.byte_start, found.byte_end)?;
+                        lexical_context(repository, &found.path, found.byte_start, found.byte_end)
+                            .map_err(|_| {
+                                typed_failure(
+                                    RetrievalSource::Lexical,
+                                    FailureKind::InvalidContract,
+                                )
+                            })?;
                     Ok(RawCandidate {
                         range,
                         symbol: None,
@@ -354,13 +408,15 @@ fn lexical_observation(
                         semantics: CandidateSemantics::LexicalContext,
                         source: RetrievalSource::Lexical,
                         source_revision_digest: revision_digest.into(),
-                        provenance_digest: sha256(&serde_json::to_vec(found)?),
+                        provenance_digest: sha256(&serde_json::to_vec(found).map_err(|_| {
+                            typed_failure(RetrievalSource::Lexical, FailureKind::InvalidContract)
+                        })?),
                         raw_score_micros: i64::from(found.score) * 1_000,
                         token_overlap_micros: overlap(&query.query, &snippet),
                         response_ordinal: ordinal,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<std::result::Result<Vec<_>, SourceFailure>>()?;
             Ok((candidates, response.truncated, None))
         },
     )
@@ -410,6 +466,7 @@ fn syntax_observation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn structural_observation(
     source_prefix: &Path,
     workspace: &ManagedWorkspace,
@@ -417,8 +474,14 @@ fn structural_observation(
     syntax: &mut SyntaxIndex,
     query: &WorkerQuery,
     revision_digest: &str,
+    query_started: Instant,
+    limits: crate::SourceLimits,
 ) -> Result<SourceObservation> {
-    observe(
+    let mut attempted_pattern_count = 0;
+    let mut successful_pattern_count = 0;
+    let mut failures = Vec::new();
+    let structural_started = Instant::now();
+    let observation = observe(
         RetrievalSource::Structural,
         "kit::workspace::search::structural::search",
         revision_digest,
@@ -435,8 +498,20 @@ fn structural_observation(
             ];
             let mut candidates = Vec::new();
             let mut truncated = false;
-            let mut error = None;
             for pattern in patterns {
+                attempted_pattern_count += 1;
+                let max_time = source_duration(query_started, limits, limits.structural_pattern_ms)
+                    .and_then(|duration| {
+                        remaining_duration(structural_started, limits.structural_total_ms)
+                            .map(|remaining| duration.min(remaining))
+                    });
+                let Some(max_time) = max_time else {
+                    failures.push(typed_failure(
+                        RetrievalSource::Structural,
+                        FailureKind::Time,
+                    ));
+                    continue;
+                };
                 let response = match structural_search(
                     workspace,
                     index,
@@ -452,20 +527,22 @@ fn structural_observation(
                             .collect(),
                         max_matches: 10_000,
                         max_output_bytes: 8 * 1024 * 1024,
-                        max_time: Duration::from_secs(3),
+                        max_time,
                         ..StructuralOptions::default()
                     },
                 ) {
                     Ok(response) => response,
-                    Err(source_error) => {
-                        error = Some(source_error.to_string());
+                    Err(error) => {
+                        failures.push(structural_failure(error));
                         continue;
                     }
                 };
+                successful_pattern_count += 1;
                 truncated |= response.truncated;
                 for found in response.matches {
                     if candidates.len() == MAX_CANDIDATES {
-                        return Ok((candidates, true, error));
+                        truncated = true;
+                        continue;
                     }
                     let (snippet, snippet_truncated) = bounded_snippet(&found.text);
                     candidates.push(RawCandidate {
@@ -486,16 +563,58 @@ fn structural_observation(
                         semantics: CandidateSemantics::ExactItem,
                         source: RetrievalSource::Structural,
                         source_revision_digest: revision_digest.into(),
-                        provenance_digest: sha256(&serde_json::to_vec(&found)?),
+                        provenance_digest: sha256(&serde_json::to_vec(&found).map_err(|_| {
+                            typed_failure(RetrievalSource::Structural, FailureKind::InvalidContract)
+                        })?),
                         raw_score_micros: 400_000,
                         token_overlap_micros: overlap(&query.query, &found.text),
                         response_ordinal: candidates.len(),
                     });
                 }
             }
-            Ok((candidates, truncated, error))
+            Ok((candidates, truncated, None))
         },
-    )
+    )?;
+    Ok(finalize_structural_observation(
+        observation,
+        attempted_pattern_count,
+        successful_pattern_count,
+        &failures,
+    ))
+}
+
+fn finalize_structural_observation(
+    mut observation: SourceObservation,
+    attempted_pattern_count: usize,
+    successful_pattern_count: usize,
+    failures: &[SourceFailure],
+) -> SourceObservation {
+    observation.attempted_pattern_count = attempted_pattern_count;
+    observation.successful_pattern_count = successful_pattern_count;
+    if observation.status != SourceStatus::Available {
+        return observation;
+    }
+    if successful_pattern_count == 0 && attempted_pattern_count > 0 {
+        observation.status = SourceStatus::Error;
+        observation.candidates.clear();
+        observation.complete_candidate_count = 0;
+        observation.truncated = false;
+        let failure = combined_structural_failure(failures);
+        observation.error_code = Some(failure.code);
+        observation.error = Some(format!(
+            "all {attempted_pattern_count} structural patterns failed: {}",
+            failure.message
+        ));
+    } else if successful_pattern_count < attempted_pattern_count {
+        let failure = combined_structural_failure(failures);
+        observation.error_code = Some(failure.code);
+        observation.error = Some(format!(
+            "{} of {attempted_pattern_count} structural patterns failed: {}",
+            attempted_pattern_count - successful_pattern_count,
+            failure.message
+        ));
+    }
+    observation
 }
 
 fn metadata_observation(
@@ -547,15 +666,31 @@ fn graph_observation(
     index: &MetadataIndex,
     query: &WorkerQuery,
     revision_digest: &str,
+    query_started: Instant,
+    limits: crate::SourceLimits,
 ) -> Result<(SourceObservation, Option<StructureGraph>)> {
     let started_at = timestamp()?;
     let started = Instant::now();
     let mut provider = StructureGraphProvider::new();
-    let options = GraphOptions {
-        max_nodes: MAX_CANDIDATES,
-        ..GraphOptions::default()
-    };
-    match provider.refresh(workspace, index, &options, &[], &[]) {
+    let max_time = source_duration(query_started, limits, limits.graph_ms);
+    let response = max_time
+        .ok_or_else(|| typed_failure(RetrievalSource::StructureGraph, FailureKind::Time))
+        .and_then(|max_time| {
+            provider
+                .refresh(
+                    workspace,
+                    index,
+                    &GraphOptions {
+                        max_nodes: MAX_CANDIDATES,
+                        max_time,
+                        ..GraphOptions::default()
+                    },
+                    &[],
+                    &[],
+                )
+                .map_err(graph_failure)
+        });
+    match response {
         Ok(graph) => {
             let candidates = graph
                 .nodes()
@@ -590,6 +725,8 @@ fn graph_observation(
                     source: RetrievalSource::StructureGraph,
                     api: "kit::workspace::graph::structure::StructureGraphProvider::refresh".into(),
                     status: SourceStatus::Available,
+                    attempted_pattern_count: 0,
+                    successful_pattern_count: 0,
                     started_at,
                     ended_at: timestamp()?,
                     elapsed_ns: nanos(started.elapsed()),
@@ -597,27 +734,28 @@ fn graph_observation(
                     candidates,
                     truncated: false,
                     source_revision_digest: revision_digest.into(),
+                    git_executable_digest: None,
                     error_code: None,
                     error: None,
                 },
                 Some(graph),
             ))
         }
-        Err(_) => Ok((
+        Err(failure) => Ok((
             error_observation(
                 RetrievalSource::StructureGraph,
                 "kit::workspace::graph::structure::StructureGraphProvider::refresh",
                 revision_digest,
                 started_at,
                 started,
-                "STRUCTURE_GRAPH_ERROR",
-                SourceStatus::Error,
+                failure,
             )?,
             None,
         )),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn history_observation(
     workspace: &ManagedWorkspace,
     index: &MetadataIndex,
@@ -625,17 +763,35 @@ fn history_observation(
     revision_digest: &str,
     source_kind: RetrievalSource,
     paths: &[RootRelativePath],
+    request: &WorkerArmRequest,
+    query_started: Instant,
 ) -> Result<SourceObservation> {
     let started_at = timestamp()?;
     let started = Instant::now();
     let mut provider = HistoryGraphProvider::new();
-    match provider.refresh(
-        workspace,
-        index,
-        &HistoryRequest::all(paths.to_vec()),
-        &HistoryOptions::default(),
-    ) {
+    let max_time = source_duration(
+        query_started,
+        request.config.source_limits,
+        request.config.source_limits.history_ms,
+    );
+    let response = max_time
+        .ok_or_else(|| typed_failure(source_kind, FailureKind::Time))
+        .and_then(|max_time| {
+            provider
+                .refresh(
+                    workspace,
+                    index,
+                    &HistoryRequest::all(paths.to_vec()),
+                    &HistoryOptions {
+                        max_time,
+                        ..HistoryOptions::default()
+                    },
+                )
+                .map_err(|error| history_failure(source_kind, error))
+        });
+    match response {
         Ok(graph) => {
+            let git_executable_digest = validate_history_git(graph, request)?;
             let mut candidates = graph
                 .blame_hunks()
                 .iter()
@@ -699,6 +855,8 @@ fn history_observation(
                 source: source_kind,
                 api: "kit::workspace::graph::history::HistoryGraphProvider::refresh".into(),
                 status: SourceStatus::Available,
+                attempted_pattern_count: 0,
+                successful_pattern_count: 0,
                 started_at,
                 ended_at: timestamp()?,
                 elapsed_ns: nanos(started.elapsed()),
@@ -709,15 +867,72 @@ fn history_observation(
                     + graph.changed_with().len().saturating_mul(2)
                     > MAX_CANDIDATES,
                 source_revision_digest: revision_digest.into(),
+                git_executable_digest: Some(git_executable_digest),
                 error_code: None,
                 error: None,
             })
         }
-        Err(error) => Err(ProtocolError(format!(
-            "pinned checkout did not provide W06b history: {error}"
-        ))
-        .into()),
+        Err(failure) => error_observation(
+            source_kind,
+            "kit::workspace::graph::history::HistoryGraphProvider::refresh",
+            revision_digest,
+            started_at,
+            started,
+            failure,
+        ),
     }
+}
+
+fn validate_history_git(graph: &HistoryGraph, request: &WorkerArmRequest) -> Result<String> {
+    let selected = kit::workspace::acquire::trusted_git_executable()?;
+    let implementation = graph.git_implementation();
+    let bytes = read_bounded(&selected, 128 << 20)?;
+    let executable_digest = sha256(&bytes);
+    let version = request
+        .git_version
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if Path::new(implementation.executable()) != selected
+        || Path::new(&request.git_path) != selected
+        || implementation.executable_digest() != *blake3::hash(&bytes).as_bytes()
+        || implementation.version_digest() != *blake3::hash(version.as_bytes()).as_bytes()
+        || executable_digest != request.git_executable_digest
+    {
+        return Err(ProtocolError("W06b history Git implementation pin mismatch".into()).into());
+    }
+    Ok(executable_digest)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_history_observations(
+    observations: &mut BTreeMap<RetrievalSource, SourceObservation>,
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    query: &WorkerQuery,
+    revision_digest: &str,
+    paths: &[RootRelativePath],
+    request: &WorkerArmRequest,
+    query_started: Instant,
+) -> Result<()> {
+    for source in [RetrievalSource::History, RetrievalSource::GitPathHistory] {
+        if enabled(&request.config, source) {
+            observations.insert(
+                source,
+                history_observation(
+                    workspace,
+                    index,
+                    query,
+                    revision_digest,
+                    source,
+                    paths,
+                    request,
+                    query_started,
+                )?,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn whole_file_candidate(
@@ -819,20 +1034,29 @@ fn map_observation(
     structure: Option<&StructureGraph>,
     query: &WorkerQuery,
     revision_digest: &str,
+    query_started: Instant,
+    limits: crate::SourceLimits,
 ) -> Result<SourceObservation> {
     observe(
         RetrievalSource::PersonalizedMap,
         "kit::workspace::map::build_repository_map",
         revision_digest,
         || {
+            let max_time =
+                source_duration(query_started, limits, limits.map_ms).ok_or_else(|| {
+                    typed_failure(RetrievalSource::PersonalizedMap, FailureKind::Time)
+                })?;
             let request = RepositoryMapRequest {
                 personalization: Personalization {
                     task_terms: tokens(&query.query).into_iter().collect(),
                     ..Personalization::default()
                 },
                 budget: MapBudget {
-                    max_estimated_tokens: 2_048,
-                    ..MapBudget::default()
+                    max_items: 10_000,
+                    max_estimated_tokens: 1_000_000,
+                    max_hops: 32,
+                    max_degree: 10_000,
+                    max_result_bytes: 4 * 1024 * 1024,
                 },
                 languages: vec!["rust".into()],
                 ..RepositoryMapRequest::default()
@@ -843,15 +1067,46 @@ fn map_observation(
                     index,
                     &request,
                     &[],
-                    MapLimits::default(),
+                    MapLimits {
+                        max_time,
+                        ..MapLimits::default()
+                    },
                     None,
                     Some(graph),
-                )?
+                )
+                .map_err(map_failure)?
             } else {
-                build_repository_map(workspace, index, &request, &[], MapLimits::default(), None)?
+                build_repository_map(
+                    workspace,
+                    index,
+                    &request,
+                    &[],
+                    MapLimits {
+                        max_time,
+                        ..MapLimits::default()
+                    },
+                    None,
+                )
+                .map_err(map_failure)?
             };
-            let value: Value = serde_json::from_slice(&response.to_canonical_json()?)?;
-            let candidates = map_candidates(&value, query, revision_digest)?;
+            let bytes = response.to_canonical_json().map_err(|_| {
+                typed_failure(
+                    RetrievalSource::PersonalizedMap,
+                    FailureKind::InvalidContract,
+                )
+            })?;
+            let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                typed_failure(
+                    RetrievalSource::PersonalizedMap,
+                    FailureKind::InvalidContract,
+                )
+            })?;
+            let candidates = map_candidates(&value, query, revision_digest).map_err(|_| {
+                typed_failure(
+                    RetrievalSource::PersonalizedMap,
+                    FailureKind::InvalidContract,
+                )
+            })?;
             Ok((candidates, response.truncated(), None))
         },
     )
@@ -901,6 +1156,195 @@ fn map_candidates(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum FailureKind {
+    Time,
+    Bound,
+    InvalidRequest,
+    InvalidIndex,
+    InvalidContract,
+}
+
+#[derive(Clone)]
+struct SourceFailure {
+    code: String,
+    message: String,
+}
+
+fn typed_failure(source: RetrievalSource, kind: FailureKind) -> SourceFailure {
+    let prefix = match source {
+        RetrievalSource::Lexical => "LEXICAL",
+        RetrievalSource::Structural => "STRUCTURAL",
+        RetrievalSource::PersonalizedMap => "MAP",
+        RetrievalSource::StructureGraph => "GRAPH",
+        RetrievalSource::History => "HISTORY",
+        RetrievalSource::GitPathHistory => "GIT_PATH_HISTORY",
+        _ => "SOURCE",
+    };
+    let (suffix, message) = match kind {
+        FailureKind::Time => ("TIME_LIMIT", "source API time limit exceeded"),
+        FailureKind::Bound => ("BOUND_EXCEEDED", "source API deterministic bound exceeded"),
+        FailureKind::InvalidRequest => ("INVALID_REQUEST", "source API request is invalid"),
+        FailureKind::InvalidIndex => ("INVALID_INDEX", "source API index is invalid or stale"),
+        FailureKind::InvalidContract => (
+            "INVALID_CONTRACT",
+            "source API response or execution contract is invalid",
+        ),
+    };
+    SourceFailure {
+        code: format!("{prefix}_{suffix}"),
+        message: message.into(),
+    }
+}
+
+fn revision_failure(source: RetrievalSource, error: RevisionError) -> SourceFailure {
+    match error {
+        RevisionError::LimitExceeded(LimitKind::Time) => typed_failure(source, FailureKind::Time),
+        RevisionError::LimitExceeded(_) => typed_failure(source, FailureKind::Bound),
+        _ => typed_failure(source, FailureKind::InvalidIndex),
+    }
+}
+
+fn lexical_failure(error: SearchError) -> SourceFailure {
+    match error {
+        SearchError::TimeLimit => typed_failure(RetrievalSource::Lexical, FailureKind::Time),
+        SearchError::InvalidQuery(_) => {
+            typed_failure(RetrievalSource::Lexical, FailureKind::InvalidRequest)
+        }
+        SearchError::Revision(error) => revision_failure(RetrievalSource::Lexical, error),
+        SearchError::InvalidOptions(_)
+        | SearchError::CursorMismatch
+        | SearchError::Serialization(_) => {
+            typed_failure(RetrievalSource::Lexical, FailureKind::InvalidContract)
+        }
+    }
+}
+
+fn structural_failure(error: StructuralError) -> SourceFailure {
+    match error {
+        StructuralError::TimeLimit => typed_failure(RetrievalSource::Structural, FailureKind::Time),
+        StructuralError::InvalidQuery(_) => {
+            typed_failure(RetrievalSource::Structural, FailureKind::InvalidRequest)
+        }
+        StructuralError::Revision(error) => revision_failure(RetrievalSource::Structural, error),
+        StructuralError::InvalidOptions(_)
+        | StructuralError::MalformedSource(_)
+        | StructuralError::IncompleteRewrite(_)
+        | StructuralError::AmbiguousRewrite(_)
+        | StructuralError::EditIr(_)
+        | StructuralError::Syntax(_)
+        | StructuralError::Serialization(_) => {
+            typed_failure(RetrievalSource::Structural, FailureKind::InvalidContract)
+        }
+    }
+}
+
+fn map_failure(error: MapError) -> SourceFailure {
+    match error {
+        MapError::TimeLimit => typed_failure(RetrievalSource::PersonalizedMap, FailureKind::Time),
+        MapError::BoundExceeded(_) => {
+            typed_failure(RetrievalSource::PersonalizedMap, FailureKind::Bound)
+        }
+        MapError::InvalidRequest(_) => typed_failure(
+            RetrievalSource::PersonalizedMap,
+            FailureKind::InvalidRequest,
+        ),
+        MapError::InvalidIndex(_) => {
+            typed_failure(RetrievalSource::PersonalizedMap, FailureKind::InvalidIndex)
+        }
+        MapError::Revision(error) => revision_failure(RetrievalSource::PersonalizedMap, error),
+        MapError::InvalidLimits(_)
+        | MapError::InvalidFact(_)
+        | MapError::SelectorNoMatch(_)
+        | MapError::StaleFact
+        | MapError::SemanticEvidenceUnavailable
+        | MapError::GraphEvidenceUnavailable
+        | MapError::GraphEvidenceStale
+        | MapError::HistoryEvidenceUnavailable
+        | MapError::InvalidGraph(_)
+        | MapError::CursorMismatch
+        | MapError::Serialization(_) => typed_failure(
+            RetrievalSource::PersonalizedMap,
+            FailureKind::InvalidContract,
+        ),
+    }
+}
+
+fn graph_failure(error: GraphError) -> SourceFailure {
+    match error {
+        GraphError::BoundExceeded(GraphBound::Time) => {
+            typed_failure(RetrievalSource::StructureGraph, FailureKind::Time)
+        }
+        GraphError::BoundExceeded(_) => {
+            typed_failure(RetrievalSource::StructureGraph, FailureKind::Bound)
+        }
+        GraphError::InvalidIndex(_) => {
+            typed_failure(RetrievalSource::StructureGraph, FailureKind::InvalidIndex)
+        }
+        GraphError::Revision(error) => revision_failure(RetrievalSource::StructureGraph, error),
+        GraphError::InvalidOptions(_)
+        | GraphError::StaleEvidence
+        | GraphError::UnsafePath(_)
+        | GraphError::MalformedManifest { .. }
+        | GraphError::MissingWorkspaceMember { .. }
+        | GraphError::MissingPathDependency { .. }
+        | GraphError::InvalidEvidence(_)
+        | GraphError::ContainmentCycle
+        | GraphError::HistoryMismatch => typed_failure(
+            RetrievalSource::StructureGraph,
+            FailureKind::InvalidContract,
+        ),
+    }
+}
+
+fn history_failure(source: RetrievalSource, error: HistoryError) -> SourceFailure {
+    match error {
+        HistoryError::BoundExceeded(HistoryBound::Time) => typed_failure(source, FailureKind::Time),
+        HistoryError::BoundExceeded(_) => typed_failure(source, FailureKind::Bound),
+        HistoryError::InvalidRequest(_) => typed_failure(source, FailureKind::InvalidRequest),
+        HistoryError::InvalidIndex(_) => typed_failure(source, FailureKind::InvalidIndex),
+        HistoryError::Revision(error) => revision_failure(source, error),
+        HistoryError::InvalidOptions(_)
+        | HistoryError::SelectorNoMatch(_)
+        | HistoryError::Unavailable(_)
+        | HistoryError::StaleRepositoryFence
+        | HistoryError::Git { .. }
+        | HistoryError::Malformed(_)
+        | HistoryError::MissingObject(_)
+        | HistoryError::RepositoryRootMismatch { .. }
+        | HistoryError::UnsafeGitPath(_) => typed_failure(source, FailureKind::InvalidContract),
+    }
+}
+
+fn combined_structural_failure(failures: &[SourceFailure]) -> SourceFailure {
+    let first = failures.first().cloned().unwrap_or_else(|| {
+        typed_failure(RetrievalSource::Structural, FailureKind::InvalidContract)
+    });
+    if failures.iter().all(|failure| failure.code == first.code) {
+        first
+    } else {
+        SourceFailure {
+            code: "STRUCTURAL_MULTIPLE_ERRORS".into(),
+            message: "structural patterns failed with multiple typed source errors".into(),
+        }
+    }
+}
+
+fn source_duration(
+    started: Instant,
+    limits: crate::SourceLimits,
+    source_ms: u64,
+) -> Option<Duration> {
+    remaining_duration(started, limits.total_ms)
+        .map(|remaining| remaining.min(Duration::from_millis(source_ms)))
+}
+
+fn remaining_duration(started: Instant, limit_ms: u64) -> Option<Duration> {
+    Duration::from_millis(limit_ms)
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+}
+
 fn observe<F>(
     source: RetrievalSource,
     api: &str,
@@ -908,7 +1352,7 @@ fn observe<F>(
     action: F,
 ) -> Result<SourceObservation>
 where
-    F: FnOnce() -> Result<(Vec<RawCandidate>, bool, Option<String>)>,
+    F: FnOnce() -> std::result::Result<(Vec<RawCandidate>, bool, Option<String>), SourceFailure>,
 {
     let started_at = timestamp()?;
     let started = Instant::now();
@@ -921,6 +1365,8 @@ where
                 source,
                 api: api.into(),
                 status: SourceStatus::Available,
+                attempted_pattern_count: 0,
+                successful_pattern_count: 0,
                 started_at,
                 ended_at: timestamp()?,
                 elapsed_ns: nanos(started.elapsed()),
@@ -928,19 +1374,14 @@ where
                 candidates,
                 truncated,
                 source_revision_digest: revision_digest.into(),
+                git_executable_digest: None,
                 error_code: None,
                 error,
             })
         }
-        Err(_) => error_observation(
-            source,
-            api,
-            revision_digest,
-            started_at,
-            started,
-            "KIT_API_ERROR",
-            SourceStatus::Error,
-        ),
+        Err(failure) => {
+            error_observation(source, api, revision_digest, started_at, started, failure)
+        }
     }
 }
 
@@ -955,6 +1396,8 @@ fn unavailable(
         source,
         api: api.into(),
         status: SourceStatus::TerminalUnavailable,
+        attempted_pattern_count: 0,
+        successful_pattern_count: 0,
         started_at: at.clone(),
         ended_at: at,
         elapsed_ns: 0,
@@ -962,6 +1405,7 @@ fn unavailable(
         candidates: Vec::new(),
         truncated: false,
         source_revision_digest: revision_digest.into(),
+        git_executable_digest: None,
         error_code: Some(code.into()),
         error: Some(code.into()),
     })
@@ -974,13 +1418,14 @@ fn error_observation(
     revision_digest: &str,
     started_at: String,
     started: Instant,
-    code: &str,
-    status: SourceStatus,
+    failure: SourceFailure,
 ) -> Result<SourceObservation> {
     Ok(SourceObservation {
         source,
         api: api.into(),
-        status,
+        status: SourceStatus::Error,
+        attempted_pattern_count: 0,
+        successful_pattern_count: 0,
         started_at,
         ended_at: timestamp()?,
         elapsed_ns: nanos(started.elapsed()),
@@ -988,8 +1433,9 @@ fn error_observation(
         candidates: Vec::new(),
         truncated: false,
         source_revision_digest: revision_digest.into(),
-        error_code: Some(code.into()),
-        error: Some(code.into()),
+        git_executable_digest: None,
+        error_code: Some(failure.code),
+        error: Some(failure.message),
     })
 }
 
@@ -1216,6 +1662,10 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn combined_index_latency_ms(primary: Duration, nested: Option<Duration>) -> u64 {
+    millis(primary.saturating_add(nested.unwrap_or_default()))
+}
+
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -1278,6 +1728,74 @@ mod tests {
     }
 
     #[test]
+    fn nested_repository_index_build_is_charged_to_index_latency() {
+        assert_eq!(
+            combined_index_latency_ms(
+                Duration::from_micros(1_500),
+                Some(Duration::from_micros(2_500))
+            ),
+            4
+        );
+        assert_eq!(
+            combined_index_latency_ms(Duration::from_micros(1_500), None),
+            1
+        );
+    }
+
+    #[test]
+    fn source_errors_keep_typed_sanitized_variants() {
+        let failures = [
+            lexical_failure(SearchError::TimeLimit),
+            lexical_failure(SearchError::InvalidQuery("secret")),
+            structural_failure(StructuralError::InvalidQuery("secret".into())),
+            map_failure(MapError::BoundExceeded(
+                kit::workspace::map::MapBound::Memory,
+            )),
+            map_failure(MapError::InvalidIndex("secret")),
+            graph_failure(GraphError::BoundExceeded(GraphBound::Time)),
+            graph_failure(GraphError::UnsafePath(std::path::PathBuf::from(
+                "/private/secret",
+            ))),
+            history_failure(
+                RetrievalSource::History,
+                HistoryError::BoundExceeded(HistoryBound::Work),
+            ),
+            history_failure(
+                RetrievalSource::GitPathHistory,
+                HistoryError::Git {
+                    operation: "show",
+                    message: "/private/secret".into(),
+                },
+            ),
+        ];
+        let codes = failures
+            .iter()
+            .map(|failure| failure.code.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            [
+                "LEXICAL_TIME_LIMIT",
+                "LEXICAL_INVALID_REQUEST",
+                "STRUCTURAL_INVALID_REQUEST",
+                "MAP_BOUND_EXCEEDED",
+                "MAP_INVALID_INDEX",
+                "GRAPH_TIME_LIMIT",
+                "GRAPH_INVALID_CONTRACT",
+                "HISTORY_BOUND_EXCEEDED",
+                "GIT_PATH_HISTORY_INVALID_CONTRACT",
+            ]
+        );
+        assert!(failures.iter().all(|failure| {
+            failure.code.len() <= 128
+                && failure.message.len() <= 512
+                && !failure.message.contains("secret")
+                && !failure.message.contains(['/', '\\', '='])
+                && !failure.message.chars().any(char::is_control)
+        }));
+    }
+
+    #[test]
     fn linked_worktree_pointer_cannot_escape_allowed_metadata_root() {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "kit-w07-worker-pointer-{}-{}",
@@ -1306,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_fixture_executes_exact_source_set_for_every_arm() {
+    fn tiny_fixture_matches_canary_shape_for_every_arm_and_both_roots() {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "kit-w07-worker-{}-{}",
             std::process::id(),
@@ -1369,72 +1887,182 @@ mod tests {
             )]))
             .unwrap(),
         );
-        for arm in [Arm::L, Arm::C, Arm::F, Arm::FS, Arm::FP, Arm::FG, Arm::FH] {
-            let cache = root.join(format!("cache-{arm:?}"));
-            fs::create_dir(&cache).unwrap();
-            let config = ArmConfig::frozen(arm);
-            let raw = execute(
-                &source,
-                &git_metadata_root,
-                &cache,
-                WorkerQuery {
-                    task_id: "task".into(),
-                    query: query_text.into(),
-                    query_digest: sha256(query_text.as_bytes()),
-                },
-                WorkerArmRequest {
-                    unit_id: "unit".into(),
-                    source_digest: source_digest.clone(),
-                    admission_digest:
-                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                            .into(),
-                    executor_evidence: ExecutorEvidence::LocalSandboxNotTrusted,
-                    cache_id: format!("cache-{arm:?}"),
-                    worker_executable_digest:
-                        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-                            .into(),
-                    config: config.clone(),
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                raw.observations
-                    .iter()
-                    .map(|item| item.source)
-                    .collect::<Vec<_>>(),
-                config.enabled_sources
-            );
-            assert_eq!(
-                raw.syntax_initializations,
-                usize::from(config.syntax_initialization_permitted)
-            );
-            let lexical = raw
-                .observations
-                .iter()
-                .find(|observation| observation.source == RetrievalSource::Lexical)
+        let root_source_digest = sha256(
+            &canonical(&BTreeMap::from([(
+                "crate/src/lib.rs".to_owned(),
+                format!(
+                    "{:x}",
+                    sha2::Sha256::digest(b"/// Finds alpha.\npub fn alpha() {}\n")
+                ),
+            )]))
+            .unwrap(),
+        );
+        let mut shape_count = 0;
+        for (root_name, worker_source, worker_source_digest, lexical_path, history_states) in [
+            (
+                "root",
+                repository.as_path(),
+                root_source_digest.as_str(),
+                "crate/src/lib.rs",
+                1,
+            ),
+            (
+                "nested",
+                source.as_path(),
+                source_digest.as_str(),
+                "src/lib.rs",
+                2,
+            ),
+        ] {
+            for arm in [Arm::L, Arm::C, Arm::F, Arm::FS, Arm::FP, Arm::FG, Arm::FH] {
+                let cache = root.join(format!("cache-{root_name}-{arm:?}"));
+                fs::create_dir(&cache).unwrap();
+                let config = ArmConfig::frozen(arm);
+                let mut raw = execute(
+                    worker_source,
+                    &git_metadata_root,
+                    &cache,
+                    WorkerQuery {
+                        task_id: "task".into(),
+                        query: query_text.into(),
+                        query_digest: sha256(query_text.as_bytes()),
+                    },
+                    WorkerArmRequest {
+                        unit_id: "unit".into(),
+                        repository_class: crate::RepositoryClass::Small,
+                        source_digest: worker_source_digest.into(),
+                        admission_digest:
+                            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .into(),
+                        executor_evidence: ExecutorEvidence::LocalSandboxNotTrusted,
+                        cache_id: format!("cache-{root_name}-{arm:?}"),
+                        worker_executable_digest:
+                            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                                .into(),
+                        git_path: crate::run::git_path(&git).to_string_lossy().into_owned(),
+                        git_executable_digest: crate::run::git_digest(&git).into(),
+                        git_version: crate::run::git_version(&git).into(),
+                        config: config.clone(),
+                    },
+                )
                 .unwrap();
-            assert!(lexical.candidates.iter().any(|candidate| {
-                candidate.range.path == "src/lib.rs"
-                    && candidate.range.start_byte <= 17
-                    && 17 < candidate.range.end_byte
-                    && candidate.snippet.contains("pub fn alpha")
-            }));
-            if matches!(arm, Arm::F | Arm::FP | Arm::FG | Arm::FS) {
-                let history = raw.observations.iter().find(|observation| {
-                    matches!(
-                        observation.source,
-                        RetrievalSource::History | RetrievalSource::GitPathHistory
-                    )
-                });
-                assert!(history.is_some_and(|observation| !observation.candidates.is_empty()));
-            }
-            assert_eq!(
-                raw.observations
+                assert!(crate::run::canary_raw_shape_is_valid(
+                    &raw,
+                    &config,
+                    worker_source_digest,
+                    crate::run::git_digest(&git),
+                ));
+                assert_eq!(
+                    raw.observations
+                        .iter()
+                        .map(|item| item.source)
+                        .collect::<Vec<_>>(),
+                    config.enabled_sources
+                );
+                let lexical = raw
+                    .observations
                     .iter()
-                    .any(|observation| observation.source == RetrievalSource::History),
-                matches!(arm, Arm::F | Arm::FP | Arm::FG)
-            );
+                    .find(|observation| observation.source == RetrievalSource::Lexical)
+                    .unwrap();
+                assert!(lexical.candidates.iter().any(|candidate| {
+                    candidate.range.path == lexical_path
+                        && candidate.range.start_byte <= 17
+                        && 17 < candidate.range.end_byte
+                        && candidate.snippet.contains("pub fn alpha")
+                }));
+                if matches!(arm, Arm::F | Arm::FP | Arm::FG | Arm::FS) {
+                    let history = raw.observations.iter().find(|observation| {
+                        matches!(
+                            observation.source,
+                            RetrievalSource::History | RetrievalSource::GitPathHistory
+                        )
+                    });
+                    assert!(history.is_some_and(|observation| !observation.candidates.is_empty()));
+                    assert_eq!(
+                        history
+                            .and_then(|observation| observation.git_executable_digest.as_deref()),
+                        Some(crate::run::git_digest(&git))
+                    );
+                    assert_eq!(revision_state_count(&cache), history_states);
+                    assert_eq!(
+                        cache.join("history-revision.state").exists(),
+                        root_name == "nested"
+                    );
+                }
+                if root_name == "root" && arm == Arm::FG {
+                    let structural = raw
+                        .observations
+                        .iter_mut()
+                        .find(|observation| observation.source == RetrievalSource::Structural)
+                        .unwrap();
+                    *structural = finalize_structural_observation(
+                        structural.clone(),
+                        8,
+                        7,
+                        &[typed_failure(
+                            RetrievalSource::Structural,
+                            FailureKind::Time,
+                        )],
+                    );
+                    assert!(crate::run::canary_raw_shape_is_valid(
+                        &raw,
+                        &config,
+                        worker_source_digest,
+                        crate::run::git_digest(&git),
+                    ));
+
+                    let mut successful_empty = raw.clone();
+                    let structural = successful_empty
+                        .observations
+                        .iter_mut()
+                        .find(|observation| observation.source == RetrievalSource::Structural)
+                        .unwrap();
+                    structural.candidates.clear();
+                    structural.complete_candidate_count = 0;
+                    structural.error_code = None;
+                    structural.error = None;
+                    *structural = finalize_structural_observation(structural.clone(), 8, 8, &[]);
+                    assert_eq!(structural.status, SourceStatus::Available);
+                    assert!(structural.candidates.is_empty());
+                    assert!(crate::run::canary_raw_shape_is_valid(
+                        &successful_empty,
+                        &config,
+                        worker_source_digest,
+                        crate::run::git_digest(&git),
+                    ));
+
+                    let mut all_failed = raw.clone();
+                    let structural = all_failed
+                        .observations
+                        .iter_mut()
+                        .find(|observation| observation.source == RetrievalSource::Structural)
+                        .unwrap();
+                    *structural = finalize_structural_observation(
+                        structural.clone(),
+                        8,
+                        0,
+                        &vec![
+                            typed_failure(
+                                RetrievalSource::Structural,
+                                FailureKind::InvalidRequest,
+                            );
+                            8
+                        ],
+                    );
+                    assert_eq!(structural.status, SourceStatus::Error);
+                    assert!(structural.candidates.is_empty());
+                    assert_eq!(structural.complete_candidate_count, 0);
+                    assert!(!crate::run::canary_raw_shape_is_valid(
+                        &all_failed,
+                        &config,
+                        worker_source_digest,
+                        crate::run::git_digest(&git),
+                    ));
+                }
+                shape_count += 1;
+            }
         }
+        assert_eq!(shape_count, 14);
         fs::write(repository.join("sibling.rs"), "pub fn unpublished() {}\n").unwrap();
         let cache = root.join("cache-sibling");
         fs::create_dir(&cache).unwrap();
@@ -1450,6 +2078,7 @@ mod tests {
                 },
                 WorkerArmRequest {
                     unit_id: "unit".into(),
+                    repository_class: crate::RepositoryClass::Small,
                     source_digest,
                     admission_digest:
                         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1459,11 +2088,25 @@ mod tests {
                     worker_executable_digest:
                         "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
                             .into(),
+                    git_path: crate::run::git_path(&git).to_string_lossy().into_owned(),
+                    git_executable_digest: crate::run::git_digest(&git).into(),
+                    git_version: crate::run::git_version(&git).into(),
                     config: ArmConfig::frozen(Arm::L),
                 },
             )
             .is_err()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn revision_state_count(cache: &Path) -> usize {
+        fs::read_dir(cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "state")
+            })
+            .count()
     }
 }

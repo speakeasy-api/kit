@@ -26,6 +26,19 @@
         "claims":{"$ref":"#/$defs/claims"},"measured_started_at":{"const":"2026-07-31T05:54:46.761067Z"},"measured_ended_at":{"const":"2026-07-31T06:36:37.46211Z"},"reported_at":{"const":"2026-07-31T06:39:36.258254Z"},
         "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"const":"c553577ef27913ddc99a32489cdf5fe602c0d838cd833e5d6ce7c88c514731f7"},"raw_trials":{"const":"75ba103a42a0333d3eee1818828a421ef21f7e912d05b8e2a11395374f003c90"},"signed_ledger":{"const":"666749b9df1fbb2184a13282a3d1c01c3454c8f0a1a8583ccbadd8c0716e864e"},"git_materialization":{"const":"bd3331d824d5ea57603f7e9f8e36ae0c9510160875c891de316b40c82b5504a9"}}}
       }
+    },
+    {
+      "type":"object","additionalProperties":false,
+      "required":["schema_version","kind","experiment_id","preregistration_digest","status","route","frozen_commit_sha","stage","unit_id","arm","materialization_records","registration_records","admission_records","raw_trial_records","grade_records","trial_binding_records","signed_ledger_present","measured_report_present","registered_at","admitted_at","root_cause","claims","artifact_sha256"],
+      "properties":{
+        "schema_version":{"const":"1.0"},"kind":{"const":"m005_w07_partial_run_incident"},"experiment_id":{"const":"m005-w07-rust-registry-v4"},"preregistration_digest":{"const":"sha256:25422bf7804e57c6dcd856f6fff1389da0f2283d31bd9d65953a816d87260109"},
+        "status":{"const":"INVALID_HARNESS"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"frozen_commit_sha":{"const":"c2adbca45721a2dddae0b0271f23a625b7a68579"},"stage":{"const":"FIRST_MEASURED_WORKER_BEFORE_OBSERVATIONS"},"unit_id":{"const":"rust-small-01"},"arm":{"const":"F-P"},
+        "materialization_records":{"const":72},"registration_records":{"const":1},"admission_records":{"const":1},"raw_trial_records":{"const":0},"grade_records":{"const":0},"trial_binding_records":{"const":0},"signed_ledger_present":{"const":false},"measured_report_present":{"const":false},
+        "registered_at":{"const":"2026-07-31T08:05:21.770013Z"},"admitted_at":{"const":"2026-07-31T08:05:21.776173Z"},
+        "root_cause":{"type":"object","additionalProperties":false,"required":["code"],"properties":{"code":{"const":"SAME_ROOT_DIFFERENT_REVISION_METADATA_OWNER"}}},
+        "claims":{"$ref":"#/$defs/claims"},
+        "artifact_sha256":{"type":"object","additionalProperties":false,"required":["admissions","git_materialization","registration","runtime"],"properties":{"admissions":{"const":"a73a64f77a0084d220b591d7ad5f548c306f4a4dd21e97a7c66ed80a97da9b5e"},"git_materialization":{"const":"bd3331d824d5ea57603f7e9f8e36ae0c9510160875c891de316b40c82b5504a9"},"registration":{"const":"ceb10d962e4729642f2ca467f1ada4cddc3b936b2e6a9f15e20209ff2e6c3b5a"},"runtime":{"const":"5abfd8d9729b626078977240256f68298675ebccd4c8cf0197e3125383de6e1e"}}}
+      }
     }
   ]
 }

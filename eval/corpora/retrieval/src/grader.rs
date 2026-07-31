@@ -65,6 +65,7 @@ pub fn project(raw: &RawTrial, config: &ArmConfig) -> Result<Vec<ProjectedCandid
 
 pub fn grade(unit: &CorpusUnit, raw: &RawTrial, source: &Path) -> Result<TrialGrade> {
     if raw.unit_id != unit.unit_id
+        || raw.repository_class != unit.repository_class
         || raw.source_digest != unit.rust_source_digest
         || raw.task_query_digest != unit.task.query_digest
     {
@@ -106,7 +107,12 @@ pub fn grade(unit: &CorpusUnit, raw: &RawTrial, source: &Path) -> Result<TrialGr
         .map(|candidate| candidate.snippet.len().div_ceil(4))
         .sum::<usize>();
     let token_budget_success = token_count <= config.token_budget && raw.token_count == token_count;
-    let terminal_success = raw.terminal == TrialTerminal::Complete && raw.worker_error.is_none();
+    let terminal_success = raw.terminal == TrialTerminal::Complete
+        && raw.worker_error.is_none()
+        && raw
+            .observations
+            .iter()
+            .all(|observation| observation.status != SourceStatus::Error);
     Ok(TrialGrade {
         schema_version: "2.0".into(),
         kind: "m005_w07_trial_grade".into(),
@@ -132,7 +138,7 @@ pub fn projected_token_count(raw: &RawTrial, config: &ArmConfig) -> Result<usize
         .sum())
 }
 
-fn validate_raw(raw: &RawTrial, config: &ArmConfig) -> Result<()> {
+pub(crate) fn validate_raw(raw: &RawTrial, config: &ArmConfig) -> Result<()> {
     if raw.schema_version != "2.0"
         || raw.kind != "m005_w07_raw_arm_trial"
         || raw.arm != config.arm
@@ -177,6 +183,17 @@ fn validate_raw(raw: &RawTrial, config: &ArmConfig) -> Result<()> {
     for observation in &raw.observations {
         if observation.api.is_empty()
             || observation.api.len() > 256
+            || observation
+                .error_code
+                .as_ref()
+                .is_some_and(|code| code.len() > 128)
+            || observation
+                .error
+                .as_ref()
+                .is_some_and(|error| error.len() > 512)
+            || observation.error.as_ref().is_some_and(|error| {
+                error.contains(['/', '\\', '=']) || error.chars().any(char::is_control)
+            })
             || observation.complete_candidate_count != observation.candidates.len()
             || observation.candidates.len() > 100_000
             || observation.elapsed_ns > 120_000_000_000
@@ -190,18 +207,115 @@ fn validate_raw(raw: &RawTrial, config: &ArmConfig) -> Result<()> {
         if aggregate > 200_000 {
             return Err(ProtocolError("candidate aggregate bound exceeded".into()).into());
         }
-        if observation.status != SourceStatus::Available
-            && (!observation.candidates.is_empty()
-                || observation.error_code.is_none()
-                || observation.error.is_none())
-        {
-            return Err(ProtocolError("unavailable source manufactured candidates".into()).into());
-        }
+        validate_source_semantics(observation)?;
         for candidate in &observation.candidates {
             validate_candidate(candidate, observation)?;
         }
     }
     Ok(())
+}
+
+fn validate_source_semantics(observation: &crate::SourceObservation) -> Result<()> {
+    use crate::RetrievalSource::*;
+
+    let diagnostic = || {
+        observation.error.as_ref().is_some_and(|message| {
+            !message.is_empty()
+                && message.len() <= 512
+                && !message.contains(['/', '\\', '='])
+                && !message.chars().any(char::is_control)
+        })
+    };
+    let no_results = observation.candidates.is_empty()
+        && observation.complete_candidate_count == 0
+        && !observation.truncated;
+    let patterns_are_zero =
+        observation.attempted_pattern_count == 0 && observation.successful_pattern_count == 0;
+    let code = observation.error_code.as_deref();
+    let valid = match observation.status {
+        SourceStatus::Available if observation.source == Structural => {
+            observation.attempted_pattern_count == 8
+                && observation.successful_pattern_count > 0
+                && observation.successful_pattern_count <= observation.attempted_pattern_count
+                && if observation.successful_pattern_count < observation.attempted_pattern_count {
+                    code.is_some_and(|code| error_code_is_valid(Structural, code)) && diagnostic()
+                } else {
+                    code.is_none() && observation.error.is_none()
+                }
+        }
+        SourceStatus::Available => {
+            patterns_are_zero && code.is_none() && observation.error.is_none()
+        }
+        SourceStatus::TerminalUnavailable => {
+            patterns_are_zero
+                && no_results
+                && code.is_some_and(|code| {
+                    matches!(
+                        (observation.source, code),
+                        (Lsp, "BLK-14_NO_PINNED_RUST_LSP_SERVER")
+                            | (
+                                CargoMetadataWithoutSourceParse,
+                                "NO_PINNED_PARSE_FREE_CARGO_METADATA_ADAPTER"
+                            )
+                            | (Structural, "DEPENDENCY_CLOSED_SYNTAX_DISABLED")
+                    )
+                })
+                && diagnostic()
+        }
+        SourceStatus::Error => {
+            no_results
+                && diagnostic()
+                && code.is_some_and(|code| error_code_is_valid(observation.source, code))
+                && if observation.source == Structural {
+                    observation.attempted_pattern_count == 8
+                        && observation.successful_pattern_count == 0
+                } else {
+                    patterns_are_zero
+                }
+        }
+    };
+    let history_digest_is_valid = if matches!(observation.source, History | GitPathHistory) {
+        observation.status == SourceStatus::Available
+            && observation
+                .git_executable_digest
+                .as_deref()
+                .is_some_and(valid_digest)
+            || observation.status == SourceStatus::Error
+                && observation.git_executable_digest.is_none()
+    } else {
+        observation.git_executable_digest.is_none()
+    };
+    if !valid || !history_digest_is_valid {
+        return Err(ProtocolError(format!(
+            "invalid typed source contract for {:?}",
+            observation.source
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn error_code_is_valid(source: crate::RetrievalSource, code: &str) -> bool {
+    use crate::RetrievalSource::*;
+    let suffix = match source {
+        Lexical => code.strip_prefix("LEXICAL_"),
+        Structural => code.strip_prefix("STRUCTURAL_"),
+        PersonalizedMap => code.strip_prefix("MAP_"),
+        StructureGraph => code.strip_prefix("GRAPH_"),
+        History => code.strip_prefix("HISTORY_"),
+        GitPathHistory => code.strip_prefix("GIT_PATH_HISTORY_"),
+        _ => None,
+    };
+    suffix.is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "TIME_LIMIT"
+                | "BOUND_EXCEEDED"
+                | "INVALID_REQUEST"
+                | "INVALID_INDEX"
+                | "INVALID_CONTRACT"
+        ) || source == Structural && suffix == "MULTIPLE_ERRORS"
+    }) && !(source == StructureGraph && code.ends_with("INVALID_REQUEST"))
 }
 
 fn validate_candidate(
@@ -390,6 +504,7 @@ mod tests {
             kind: "m005_w07_raw_arm_trial".into(),
             unit_id: "u".into(),
             task_id: "t".into(),
+            repository_class: RepositoryClass::Small,
             arm: crate::Arm::L,
             executor_evidence: ExecutorEvidence::LocalSandboxNotTrusted,
             admission_digest:
@@ -415,6 +530,8 @@ mod tests {
                 source: RetrievalSource::Lexical,
                 api: "api".into(),
                 status: SourceStatus::Available,
+                attempted_pattern_count: 0,
+                successful_pattern_count: 0,
                 started_at: "2026-01-01T00:00:00Z".into(),
                 ended_at: "2026-01-01T00:00:01Z".into(),
                 elapsed_ns: 1,
@@ -427,6 +544,7 @@ mod tests {
                 truncated: false,
                 source_revision_digest:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                git_executable_digest: None,
                 error_code: None,
                 error: None,
             }],
@@ -580,6 +698,7 @@ mod tests {
                 },
                 crate::WorkerArmRequest {
                     unit_id: "fixture".into(),
+                    repository_class: RepositoryClass::Small,
                     source_digest: unit.rust_source_digest.clone(),
                     admission_digest:
                         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -589,6 +708,11 @@ mod tests {
                     worker_executable_digest:
                         "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
                             .into(),
+                    git_path: "/usr/bin/git".into(),
+                    git_executable_digest:
+                        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                            .into(),
+                    git_version: "git version fixture".into(),
                     config: config.clone(),
                 },
             )
@@ -599,6 +723,146 @@ mod tests {
         assert!(clean.localization_success);
         assert!(!clean.wrong_decoy_success);
         assert!(clean.downstream_mechanical_success);
+
+        let mut latency_failure = raw.clone();
+        latency_failure.query_latency_ms = 3_001;
+        let latency_grade = grade(&unit, &latency_failure, &root).unwrap();
+        assert!(!latency_grade.latency_success);
+        assert!(latency_grade.terminal_success);
+
+        let mut source_time_limit = raw.clone();
+        source_time_limit.query_latency_ms = 1;
+        source_time_limit.token_count = 0;
+        let lexical = &mut source_time_limit.observations[0];
+        lexical.status = SourceStatus::Error;
+        lexical.candidates.clear();
+        lexical.complete_candidate_count = 0;
+        lexical.truncated = false;
+        lexical.error_code = Some("LEXICAL_TIME_LIMIT".into());
+        lexical.error = Some("source API time limit exceeded".into());
+        let source_grade = grade(&unit, &source_time_limit, &root).unwrap();
+        assert!(source_grade.latency_success);
+        assert!(!source_grade.terminal_success);
+
+        let structural_config = ArmConfig::frozen(crate::Arm::C);
+        let mut structural_raw = raw.clone();
+        structural_raw.arm = crate::Arm::C;
+        structural_raw.arm_config_digest = sha256(&canonical(&structural_config).unwrap());
+        structural_raw.syntax_initializations = 1;
+        let mut empty_observation = structural_raw.observations[0].clone();
+        empty_observation.candidates.clear();
+        empty_observation.complete_candidate_count = 0;
+        empty_observation.api = "api".into();
+        let mut tree_sitter = empty_observation.clone();
+        tree_sitter.source = RetrievalSource::TreeSitter;
+        let mut structural = empty_observation.clone();
+        structural.source = RetrievalSource::Structural;
+        structural.attempted_pattern_count = 8;
+        structural.successful_pattern_count = 8;
+        let mut lsp = empty_observation;
+        lsp.source = RetrievalSource::Lsp;
+        lsp.status = SourceStatus::TerminalUnavailable;
+        lsp.error_code = Some("BLK-14_NO_PINNED_RUST_LSP_SERVER".into());
+        lsp.error = lsp.error_code.clone();
+        structural_raw.observations = vec![
+            structural_raw.observations[0].clone(),
+            tree_sitter,
+            structural,
+            lsp,
+        ];
+        structural_raw.token_count =
+            projected_token_count(&structural_raw, &structural_config).unwrap();
+        crate::protocol::validate_schema(
+            include_bytes!("../schema/v2/raw-trial.schema.json"),
+            &canonical(&structural_raw).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::run::canary_raw_shape_is_valid(
+            &structural_raw,
+            &structural_config,
+            &unit.rust_source_digest,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ));
+        assert!(
+            grade(&unit, &structural_raw, &root)
+                .unwrap()
+                .terminal_success
+        );
+
+        let mut arbitrary_code = structural_raw.clone();
+        let lsp = arbitrary_code.observations.last_mut().unwrap();
+        lsp.error_code = Some("ARBITRARY".into());
+        assert!(validate_raw(&arbitrary_code, &structural_config).is_err());
+
+        let mut source_mismatch = structural_raw.clone();
+        let lsp = source_mismatch.observations.last_mut().unwrap();
+        lsp.error_code = Some("NO_PINNED_PARSE_FREE_CARGO_METADATA_ADAPTER".into());
+        assert!(validate_raw(&source_mismatch, &structural_config).is_err());
+
+        let mut unknown_unavailable = structural_raw.clone();
+        let lsp = unknown_unavailable.observations.last_mut().unwrap();
+        lsp.error_code = Some("LSP_UNKNOWN_UNAVAILABLE".into());
+        assert!(validate_raw(&unknown_unavailable, &structural_config).is_err());
+
+        let mut available_generic_error = structural_raw.clone();
+        let lexical = available_generic_error.observations.first_mut().unwrap();
+        lexical.error_code = Some("LEXICAL_TIME_LIMIT".into());
+        lexical.error = Some("source API time limit exceeded".into());
+        assert!(validate_raw(&available_generic_error, &structural_config).is_err());
+
+        let structural = structural_raw
+            .observations
+            .iter_mut()
+            .find(|observation| observation.source == RetrievalSource::Structural)
+            .unwrap();
+        structural.successful_pattern_count = 7;
+        structural.error_code = Some("STRUCTURAL_TIME_LIMIT".into());
+        structural.error =
+            Some("1 of 8 structural patterns failed: source API time limit exceeded".into());
+        assert!(validate_raw(&structural_raw, &structural_config).is_ok());
+        crate::protocol::validate_schema(
+            include_bytes!("../schema/v2/raw-trial.schema.json"),
+            &canonical(&structural_raw).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::run::canary_raw_shape_is_valid(
+            &structural_raw,
+            &structural_config,
+            &unit.rust_source_digest,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ));
+        assert!(
+            grade(&unit, &structural_raw, &root)
+                .unwrap()
+                .terminal_success
+        );
+
+        let structural = structural_raw
+            .observations
+            .iter_mut()
+            .find(|observation| observation.source == RetrievalSource::Structural)
+            .unwrap();
+        structural.successful_pattern_count = 0;
+        structural.status = SourceStatus::Error;
+        structural.error_code = Some("STRUCTURAL_INVALID_REQUEST".into());
+        structural.error =
+            Some("all 8 structural patterns failed: source API request is invalid".into());
+        crate::protocol::validate_schema(
+            include_bytes!("../schema/v2/raw-trial.schema.json"),
+            &canonical(&structural_raw).unwrap(),
+        )
+        .unwrap();
+        assert!(!crate::run::canary_raw_shape_is_valid(
+            &structural_raw,
+            &structural_config,
+            &unit.rust_source_digest,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ));
+        assert!(
+            !grade(&unit, &structural_raw, &root)
+                .unwrap()
+                .terminal_success
+        );
 
         let decoy_cache = root.with_extension("decoy-cache");
         fs::create_dir(&decoy_cache).unwrap();
@@ -614,6 +878,7 @@ mod tests {
                 },
                 crate::WorkerArmRequest {
                     unit_id: "fixture".into(),
+                    repository_class: RepositoryClass::Small,
                     source_digest: unit.rust_source_digest.clone(),
                     admission_digest:
                         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -623,6 +888,11 @@ mod tests {
                     worker_executable_digest:
                         "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
                             .into(),
+                    git_path: "/usr/bin/git".into(),
+                    git_executable_digest:
+                        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                            .into(),
+                    git_version: "git version fixture".into(),
                     config: config.clone(),
                 },
             )

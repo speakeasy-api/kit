@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "kind": "m005_w07_partial_run_incident",
+  "experiment_id": "m005-w07-rust-registry-v4",
+  "preregistration_digest": "sha256:25422bf7804e57c6dcd856f6fff1389da0f2283d31bd9d65953a816d87260109",
+  "status": "INVALID_HARNESS",
+  "route": "LOCAL_SANDBOX_NOT_TRUSTED",
+  "frozen_commit_sha": "c2adbca45721a2dddae0b0271f23a625b7a68579",
+  "stage": "FIRST_MEASURED_WORKER_BEFORE_OBSERVATIONS",
+  "unit_id": "rust-small-01",
+  "arm": "F-P",
+  "materialization_records": 72,
+  "registration_records": 1,
+  "admission_records": 1,
+  "raw_trial_records": 0,
+  "grade_records": 0,
+  "trial_binding_records": 0,
+  "signed_ledger_present": false,
+  "measured_report_present": false,
+  "registered_at": "2026-07-31T08:05:21.770013Z",
+  "admitted_at": "2026-07-31T08:05:21.776173Z",
+  "root_cause": {
+    "code": "SAME_ROOT_DIFFERENT_REVISION_METADATA_OWNER"
+  },
+  "claims": {
+    "retrieval": false,
+    "statistical": false,
+    "g05": false
+  },
+  "artifact_sha256": {
+    "admissions": "a73a64f77a0084d220b591d7ad5f548c306f4a4dd21e97a7c66ed80a97da9b5e",
+    "git_materialization": "bd3331d824d5ea57603f7e9f8e36ae0c9510160875c891de316b40c82b5504a9",
+    "registration": "ceb10d962e4729642f2ca467f1ada4cddc3b936b2e6a9f15e20209ff2e6c3b5a",
+    "runtime": "5abfd8d9729b626078977240256f68298675ebccd4c8cf0197e3125383de6e1e"
+  }
+}

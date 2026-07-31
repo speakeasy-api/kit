@@ -155,7 +155,32 @@ pub struct ArmConfig {
     pub enabled_sources: Vec<RetrievalSource>,
     pub syntax_initialization_permitted: bool,
     pub token_budget: usize,
+    pub source_limits: SourceLimits,
     pub normalization: NormalizationContract,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceLimits {
+    pub total_ms: u64,
+    pub lexical_ms: u64,
+    pub structural_pattern_ms: u64,
+    pub structural_total_ms: u64,
+    pub map_ms: u64,
+    pub graph_ms: u64,
+    pub history_ms: u64,
+}
+
+impl SourceLimits {
+    pub const FROZEN: Self = Self {
+        total_ms: 90_000,
+        lexical_ms: 30_000,
+        structural_pattern_ms: 5_000,
+        structural_total_ms: 30_000,
+        map_ms: 30_000,
+        graph_ms: 30_000,
+        history_ms: 30_000,
+    };
 }
 
 impl ArmConfig {
@@ -209,6 +234,7 @@ impl ArmConfig {
             syntax_initialization_permitted: !matches!(arm, Arm::L | Arm::FS),
             enabled_sources,
             token_budget: 2_048,
+            source_limits: SourceLimits::FROZEN,
             normalization: NormalizationContract {
                 version: "m005-w07-normalization-v1".into(),
                 raw_score_rule: "clamp source-native score to [-1000000,1000000]; add exact integer token-overlap micros; retain no inferred ranges".into(),
@@ -249,11 +275,15 @@ pub struct WorkerQuery {
 #[serde(deny_unknown_fields)]
 pub struct WorkerArmRequest {
     pub unit_id: String,
+    pub repository_class: RepositoryClass,
     pub source_digest: String,
     pub admission_digest: String,
     pub executor_evidence: ExecutorEvidence,
     pub cache_id: String,
     pub worker_executable_digest: String,
+    pub git_path: String,
+    pub git_executable_digest: String,
+    pub git_version: String,
     pub config: ArmConfig,
 }
 
@@ -305,6 +335,8 @@ pub struct SourceObservation {
     pub source: RetrievalSource,
     pub api: String,
     pub status: SourceStatus,
+    pub attempted_pattern_count: usize,
+    pub successful_pattern_count: usize,
     pub started_at: String,
     pub ended_at: String,
     pub elapsed_ns: u64,
@@ -312,6 +344,7 @@ pub struct SourceObservation {
     pub candidates: Vec<RawCandidate>,
     pub truncated: bool,
     pub source_revision_digest: String,
+    pub git_executable_digest: Option<String>,
     pub error_code: Option<String>,
     pub error: Option<String>,
 }
@@ -338,6 +371,7 @@ pub struct RawTrial {
     pub kind: String,
     pub unit_id: String,
     pub task_id: String,
+    pub repository_class: RepositoryClass,
     pub arm: Arm,
     pub executor_evidence: ExecutorEvidence,
     pub admission_digest: String,
@@ -472,19 +506,61 @@ pub struct MeasuredRuntimeManifest {
     pub kind: String,
     pub route: ExecutorEvidence,
     pub os: String,
+    pub uname_path: String,
     pub uname_executable_digest: String,
     pub architecture: String,
     pub os_version: String,
+    pub sw_vers_path: String,
     pub sw_vers_executable_digest: String,
+    pub rustc_path: String,
     pub rustc: String,
     pub rustc_executable_digest: String,
+    pub cargo_path: String,
     pub cargo: String,
     pub cargo_executable_digest: String,
     pub git_path: String,
     pub git: String,
     pub git_executable_digest: String,
+    pub sandbox_exec_path: String,
     pub sandbox_exec: String,
+    pub sandbox_exec_executable_digest: String,
+    pub profile: String,
+    pub opt_level: String,
+    pub debug: String,
+    pub debug_assertions: bool,
     pub executable_digest: String,
+}
+
+impl MeasuredRuntimeManifest {
+    pub(crate) fn immutable_environment(&self) -> RuntimeEnvironment {
+        RuntimeEnvironment {
+            manifest_digest: String::new(),
+            route: self.route,
+            os: self.os.clone(),
+            uname_path: self.uname_path.clone(),
+            uname_executable_digest: self.uname_executable_digest.clone(),
+            architecture: self.architecture.clone(),
+            os_version: self.os_version.clone(),
+            sw_vers_path: self.sw_vers_path.clone(),
+            sw_vers_executable_digest: self.sw_vers_executable_digest.clone(),
+            rustc_path: self.rustc_path.clone(),
+            rustc: self.rustc.clone(),
+            rustc_executable_digest: self.rustc_executable_digest.clone(),
+            cargo_path: self.cargo_path.clone(),
+            cargo: self.cargo.clone(),
+            cargo_executable_digest: self.cargo_executable_digest.clone(),
+            git_path: self.git_path.clone(),
+            git: self.git.clone(),
+            git_executable_digest: self.git_executable_digest.clone(),
+            sandbox_exec_path: self.sandbox_exec_path.clone(),
+            sandbox_exec: self.sandbox_exec.clone(),
+            sandbox_exec_executable_digest: self.sandbox_exec_executable_digest.clone(),
+            profile: self.profile.clone(),
+            opt_level: self.opt_level.clone(),
+            debug: self.debug.clone(),
+            debug_assertions: self.debug_assertions,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -614,28 +690,90 @@ pub struct PriorInvalidExperiment {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct PartialRunIncident {
+    pub schema_version: String,
+    pub kind: String,
+    pub experiment_id: String,
+    pub preregistration_digest: String,
+    pub status: String,
+    pub route: ExecutorEvidence,
+    pub frozen_commit_sha: String,
+    pub stage: String,
+    pub unit_id: String,
+    pub arm: Arm,
+    pub materialization_records: usize,
+    pub registration_records: usize,
+    pub admission_records: usize,
+    pub raw_trial_records: usize,
+    pub grade_records: usize,
+    pub trial_binding_records: usize,
+    pub signed_ledger_present: bool,
+    pub measured_report_present: bool,
+    pub registered_at: String,
+    pub admitted_at: String,
+    pub root_cause: PartialRunRootCause,
+    pub claims: IncidentClaims,
+    pub artifact_sha256: PartialRunArtifacts,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialRunRootCause {
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentClaims {
+    pub retrieval: bool,
+    pub statistical: bool,
+    pub g05: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialRunArtifacts {
+    pub admissions: String,
+    pub git_materialization: String,
+    pub registration: String,
+    pub runtime: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImmutableInputs {
     pub build_inputs: String,
+    pub release_executable_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEnvironment {
     pub manifest_digest: String,
+    pub route: ExecutorEvidence,
     pub os: String,
+    pub uname_path: String,
     pub uname_executable_digest: String,
     pub architecture: String,
     pub os_version: String,
+    pub sw_vers_path: String,
     pub sw_vers_executable_digest: String,
+    pub rustc_path: String,
     pub rustc: String,
     pub rustc_executable_digest: String,
+    pub cargo_path: String,
     pub cargo: String,
     pub cargo_executable_digest: String,
     pub git_path: String,
     pub git: String,
     pub git_executable_digest: String,
+    pub sandbox_exec_path: String,
     pub sandbox_exec: String,
-    pub route: String,
+    pub sandbox_exec_executable_digest: String,
+    pub profile: String,
+    pub opt_level: String,
+    pub debug: String,
+    pub debug_assertions: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -670,6 +808,7 @@ pub struct TrialProtocol {
     pub syntax_free_arm: String,
     pub syntax_free_sources: Vec<String>,
     pub arm_source_sets: BTreeMap<Arm, Vec<RetrievalSource>>,
+    pub source_limits: SourceLimits,
     pub normalization: NormalizationContract,
     pub lexical_context_rule: String,
     pub localization_relevance: String,

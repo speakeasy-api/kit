@@ -12,6 +12,7 @@ use std::{
     fs,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -60,11 +61,15 @@ fn exact_worker_shape_opens_workspace_and_preserves_isolation() {
     };
     let request = WorkerArmRequest {
         unit_id: "tiny-unit".into(),
+        repository_class: kit_retrieval_eval::RepositoryClass::Small,
         source_digest: source_digest.clone(),
         admission_digest: digest_bytes(b"tiny-admission"),
         executor_evidence: ExecutorEvidence::LocalSandboxNotTrusted,
         cache_id: digest_bytes(b"tiny-cache"),
         worker_executable_digest: executable_digest.clone(),
+        git_path: git_path().to_string_lossy().into_owned(),
+        git_executable_digest: digest(&git_path()),
+        git_version: git_version(),
         config: ArmConfig::frozen(Arm::L),
     };
     let query_path = inputs.join("query.json");
@@ -174,6 +179,185 @@ fn exact_worker_shape_opens_workspace_and_preserves_isolation() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn exact_worker_shape_uses_one_root_owner_and_distinct_nested_history_owner() {
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "kit-w07-worker-history-shape-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let executable = root.join("w07-worker");
+    fs::copy(env!("CARGO_BIN_EXE_w07-retrieval"), &executable).unwrap();
+    let executable_digest = digest(&executable);
+
+    for (name, nested, arm) in [
+        ("root-fp", false, Arm::FP),
+        ("nested-fp", true, Arm::FP),
+        ("nested-fs", true, Arm::FS),
+    ] {
+        run_history_worker_case(&root, &executable, &executable_digest, name, nested, arm);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn run_history_worker_case(
+    root: &Path,
+    executable: &Path,
+    executable_digest: &str,
+    name: &str,
+    nested: bool,
+    arm: Arm,
+) {
+    let case = root.join(name);
+    let upstream = case.join("upstream");
+    let repository = case.join("repository");
+    let package = if nested {
+        upstream.join("crate")
+    } else {
+        upstream.clone()
+    };
+    fs::create_dir_all(package.join("src")).unwrap();
+    let rust = b"/// Finds alpha.\npub fn alpha() {}\n";
+    fs::write(package.join("src/lib.rs"), rust).unwrap();
+    git(&upstream, &["init"]);
+    git(&upstream, &["add", "."]);
+    git(
+        &upstream,
+        &[
+            "-c",
+            "user.name=W07 Test",
+            "-c",
+            "user.email=w07@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    git(
+        &upstream,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            repository.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let source = if nested {
+        repository.join("crate")
+    } else {
+        repository.clone()
+    };
+    let inputs = case.join("inputs");
+    let output = case.join("output");
+    let cache = case.join("cache");
+    let temp = case.join("tmp");
+    let oracle = case.join("oracle");
+    for path in [&inputs, &output, &cache, &temp, &oracle] {
+        fs::create_dir(path).unwrap();
+    }
+    let query_text = "Locate the public Rust item documented as: \"Finds alpha.\"";
+    let query = WorkerQuery {
+        task_id: format!("{name}-task"),
+        query: query_text.into(),
+        query_digest: digest_bytes(query_text.as_bytes()),
+    };
+    let config = ArmConfig::frozen(arm);
+    let request = WorkerArmRequest {
+        unit_id: format!("{name}-unit"),
+        repository_class: kit_retrieval_eval::RepositoryClass::Small,
+        source_digest: digest_json(&BTreeMap::from([(
+            "src/lib.rs",
+            format!("{:x}", Sha256::digest(rust)),
+        )])),
+        admission_digest: digest_bytes(format!("{name}-admission").as_bytes()),
+        executor_evidence: ExecutorEvidence::LocalSandboxNotTrusted,
+        cache_id: digest_bytes(format!("{name}-cache").as_bytes()),
+        worker_executable_digest: executable_digest.into(),
+        git_path: git_path().to_string_lossy().into_owned(),
+        git_executable_digest: digest(&git_path()),
+        git_version: git_version(),
+        config: config.clone(),
+    };
+    let query_path = inputs.join("query.json");
+    let request_path = inputs.join("arm.json");
+    let raw_path = output.join("raw.json");
+    fs::write(&query_path, serde_json::to_vec(&query).unwrap()).unwrap();
+    fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+    let metadata = upstream.join(".git").canonicalize().unwrap();
+    let mut readonly_roots = vec![metadata.clone()];
+    if nested {
+        readonly_roots.push(repository.clone());
+    }
+    let outcome = run_local_worker_sandbox(LocalWorkerSandboxRequest {
+        executable: executable.into(),
+        expected_executable_digest: executable_digest.into(),
+        git_executable: git_path(),
+        source_snapshot: source,
+        git_metadata_root: metadata,
+        query_path,
+        request_path,
+        output_path: raw_path.clone(),
+        output_root: output,
+        cache_root: cache.clone(),
+        temporary_root: temp,
+        readonly_roots,
+        forbidden_paths: vec![oracle],
+        max_duration: Duration::from_secs(30),
+    })
+    .unwrap();
+    match outcome {
+        SandboxOutcome::Exited { status, .. } if status.success() => {}
+        other => panic!("history worker failed: {other:?}"),
+    }
+    let raw: RawTrial = serde_json::from_slice(&fs::read(raw_path).unwrap()).unwrap();
+    assert_eq!(
+        raw.observations
+            .iter()
+            .map(|observation| observation.source)
+            .collect::<Vec<_>>(),
+        config.enabled_sources
+    );
+    assert_eq!(
+        raw.syntax_initializations,
+        usize::from(config.syntax_initialization_permitted)
+    );
+    let history_source = if arm == Arm::FS {
+        RetrievalSource::GitPathHistory
+    } else {
+        RetrievalSource::History
+    };
+    let expected_git_digest = digest(&git_path());
+    assert!(raw.observations.iter().any(|observation| {
+        observation.source == history_source
+            && observation.status == SourceStatus::Available
+            && !observation.candidates.is_empty()
+            && observation.git_executable_digest.as_deref() == Some(expected_git_digest.as_str())
+    }));
+    let state_count = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "state")
+        })
+        .count();
+    assert_eq!(state_count, if nested { 2 } else { 1 });
+    assert_eq!(cache.join("history-revision.state").exists(), nested);
+}
+
+fn git(root: &Path, arguments: &[&str]) {
+    let status = Command::new(git_path())
+        .args(arguments)
+        .current_dir(root)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git command failed: {arguments:?}");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     executable: &Path,
@@ -190,7 +374,7 @@ fn run_worker(
     run_local_worker_sandbox(LocalWorkerSandboxRequest {
         executable: executable.to_path_buf(),
         expected_executable_digest: executable_digest.into(),
-        git_executable: PathBuf::from("/usr/bin/git"),
+        git_executable: git_path(),
         source_snapshot: source.to_path_buf(),
         git_metadata_root: source.join(".git"),
         query_path: query.to_path_buf(),
@@ -239,6 +423,23 @@ fn assert_denied(
 
 fn digest(path: &Path) -> String {
     digest_bytes(&fs::read(path).unwrap())
+}
+
+fn git_path() -> PathBuf {
+    kit::workspace::acquire::trusted_git_executable().unwrap()
+}
+
+fn git_version() -> String {
+    String::from_utf8(
+        Command::new(git_path())
+            .arg("--version")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .into()
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {

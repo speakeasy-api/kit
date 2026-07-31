@@ -191,6 +191,24 @@ jobs:
         env:
           CELL_COMMAND: ${{ matrix.command }}
         run: bash -euo pipefail -c "$CELL_COMMAND"
+  w07-macos-release:
+    name: w07-macos-release
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.candidate_ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal && rustup override set 1.94.0
+      - name: Build and test the release W07 worker
+        run: |
+          test "$(uname -s)" = Darwin
+          cargo build --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml
+          cargo test --release --locked --manifest-path eval/corpora/retrieval/Cargo.toml --test startup --test worker_shape
   m004-dogfood:
     name: m004-trusted-linux-dogfood
     runs-on: [self-hosted, linux, x64, kit-m004]
@@ -419,7 +437,7 @@ jobs:
           PY
   release-validate:
     if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.workflow_ref == format('{0}/.github/workflows/ci.yaml@refs/heads/{1}', github.repository, github.event.repository.default_branch)
-    needs: [lane, m003-external, m004-dogfood, m004-stats, m004-attestations]
+    needs: [lane, m003-external, m004-dogfood, m004-stats, m004-attestations, w07-macos-release]
     runs-on: ubuntu-24.04
     environment: release-validation
     outputs:

@@ -3846,7 +3846,13 @@ fn capture_trusted_git_implementation(
         deadline,
     )?;
     let mut command = Command::new(&executable);
-    command.env_clear().env("LC_ALL", "C").arg("--version");
+    command
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_device())
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("LC_ALL", "C")
+        .arg("--version");
     let output = bounded_command_output_before(
         command,
         "identify Git version",
@@ -4349,7 +4355,7 @@ fn git_command_at(
     root: Option<File>,
 ) -> Result<Command, AcquisitionError> {
     let executable = trusted_git_executable()?;
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "external-git-sandbox")))]
     let mut command = {
         let sandbox = verified_system_executable(Path::new("/usr/bin/sandbox-exec"))?;
         let mut command = Command::new(sandbox);
@@ -4362,13 +4368,14 @@ fn git_command_at(
             .arg(&executable);
         command
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), feature = "external-git-sandbox"))]
     let mut command = Command::new(&executable);
     command
         .env_clear()
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_device())
         .env("GIT_CONFIG_GLOBAL", null_device())
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_PAGER", "cat")
@@ -4441,11 +4448,15 @@ fn configure_working_directory(command: &mut Command, root: Option<File>) {
 fn configure_working_directory(_command: &mut Command, _root: Option<File>) {}
 
 #[cfg(unix)]
-fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
+pub fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const CANDIDATES: &[&str] = &["/usr/bin/git", "/bin/git"];
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const CANDIDATES: &[&str] = &["/usr/bin/git"];
+    const CANDIDATES: &[&str] = &[
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+        "/Library/Developer/CommandLineTools/usr/bin/git",
+        "/usr/bin/git",
+    ];
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
@@ -4463,7 +4474,7 @@ fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
 }
 
 #[cfg(not(unix))]
-fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
+pub fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
     Err(AcquisitionError::Unavailable {
         capability: "an administrator-controlled non-user-writable system Git executable",
     })
