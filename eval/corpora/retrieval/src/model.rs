@@ -429,6 +429,14 @@ pub struct GitMaterializationReceipt {
     pub rust_source_digest: String,
     pub package_file_set_digest: String,
     pub package_files: Vec<String>,
+    pub normalized_symlinks: Vec<NormalizedSymlink>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedSymlink {
+    pub path: String,
+    pub target_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,10 +1,10 @@
 use crate::{
     AdmissionRecord, Arm, ArmConfig, ClassAnalysis, CorpusManifest, ExecutorEvidence,
     GitMaterializationReceipt, LedgerEvent, LedgerTableRow, MeasuredReport,
-    MeasuredRuntimeManifest, PackagePin, ProtocolError, RawTrial, RegistrationRecord,
-    RepositoryClass, Result, SandboxOutcome, SignedLedger, SignedLedgerEntry, TaskPin,
-    TrialBinding, TrialGrade, TrialTerminal, WorkerArmRequest, WorkerQuery, canonical, grade,
-    run_local_sandbox, sha256,
+    MeasuredRuntimeManifest, NormalizedSymlink, PackagePin, ProtocolError, RawTrial,
+    RegistrationRecord, RepositoryClass, Result, SandboxOutcome, SignedLedger, SignedLedgerEntry,
+    TaskPin, TrialBinding, TrialGrade, TrialTerminal, WorkerArmRequest, WorkerQuery, canonical,
+    grade, run_local_sandbox, sha256,
 };
 use ed25519_dalek::{
     Signer, SigningKey, VerifyingKey,
@@ -21,6 +21,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -66,7 +67,7 @@ pub(crate) struct PinnedGit {
 
 struct MaterializedCheckout {
     path: PathBuf,
-    package_files: Vec<String>,
+    package_files: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -708,7 +709,7 @@ fn prepare_checkouts(
             git_status_owned(git, &checkout, command)?;
         }
         let files = validate_checkout(git, vendor, &checkout, unit)?;
-        filter_checkout(&checkout, &unit.package.path_in_vcs, files.keys())?;
+        let normalized_symlinks = filter_checkout(&checkout, &unit.package.path_in_vcs, &files)?;
         let package_files = files.keys().cloned().collect::<Vec<_>>();
         append_jsonl(
             &receipts,
@@ -727,11 +728,12 @@ fn prepare_checkouts(
                 rust_source_digest: unit.rust_source_digest.clone(),
                 package_file_set_digest: sha256(&canonical(&files)?),
                 package_files: package_files.clone(),
+                normalized_symlinks,
             },
         )?;
         checkouts.push(MaterializedCheckout {
             path: checkout,
-            package_files,
+            package_files: files,
         });
     }
     Ok((checkouts, file_digest(&receipts)?, schedule.units.len()))
@@ -805,7 +807,7 @@ fn clone_checkout(
     filter_checkout(
         destination,
         &unit.package.path_in_vcs,
-        source.package_files.iter(),
+        &source.package_files,
     )?;
     if git_output(git, destination, &["rev-parse", "HEAD"])? != unit.package.vcs_commit {
         return Err(ProtocolError("fresh checkout HEAD mismatch".into()).into());
@@ -813,25 +815,134 @@ fn clone_checkout(
     Ok(())
 }
 
-fn filter_checkout<'a>(
+fn filter_checkout(
     checkout: &Path,
     package_prefix: &str,
-    package_files: impl Iterator<Item = &'a String>,
-) -> Result<()> {
+    package_files: &BTreeMap<String, String>,
+) -> Result<Vec<NormalizedSymlink>> {
     let wanted = package_files
-        .map(|path| {
+        .iter()
+        .map(|(path, digest)| {
             if package_prefix.is_empty() {
-                path.clone()
+                (path.clone(), digest.clone())
             } else {
-                format!("{package_prefix}/{path}")
+                (format!("{package_prefix}/{path}"), digest.clone())
             }
         })
-        .collect::<BTreeSet<_>>();
-    filter_directory(checkout, checkout, &wanted)?;
-    Ok(())
+        .collect::<BTreeMap<_, _>>();
+    let canonical_root = checkout.canonicalize()?;
+    let mut normalized = normalize_wanted_symlinks(&canonical_root, &wanted)?;
+    filter_directory(&canonical_root, &canonical_root, &wanted)?;
+    if !package_prefix.is_empty() {
+        let prefix = format!("{package_prefix}/");
+        for normalization in &mut normalized {
+            normalization.path = normalization
+                .path
+                .strip_prefix(&prefix)
+                .expect("wanted path has package prefix")
+                .to_owned();
+        }
+    }
+    Ok(normalized)
 }
 
-fn filter_directory(root: &Path, directory: &Path, wanted: &BTreeSet<String>) -> Result<()> {
+fn normalize_wanted_symlinks(
+    root: &Path,
+    wanted: &BTreeMap<String, String>,
+) -> Result<Vec<NormalizedSymlink>> {
+    let mut normalized = Vec::new();
+    for (relative, expected) in wanted {
+        validate_relative(relative)?;
+        let components = Path::new(relative).components().collect::<Vec<_>>();
+        let mut current = root.to_path_buf();
+        for (index, component) in components.iter().enumerate() {
+            current.push(component.as_os_str());
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            if index + 1 != components.len() {
+                return Err(ProtocolError(format!(
+                    "symlink in fetched worktree at {} is forbidden: path is an ancestor of a frozen package file",
+                    path_string(current.strip_prefix(root)?)
+                ))
+                .into());
+            }
+            normalized.push(normalize_wanted_symlink(
+                root, &current, relative, expected,
+            )?);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_wanted_symlink(
+    root: &Path,
+    path: &Path,
+    relative: &str,
+    expected: &str,
+) -> Result<NormalizedSymlink> {
+    let target = path.canonicalize().map_err(|error| {
+        ProtocolError(format!(
+            "failed to resolve frozen package symlink {relative}: {error}"
+        ))
+    })?;
+    if !target.starts_with(root) {
+        return Err(ProtocolError(format!(
+            "frozen package symlink {relative} escapes the checkout root"
+        ))
+        .into());
+    }
+    let (bytes, mode) = read_bounded_file(&target, crate::MAX_SOURCE_FILE_BYTES, true)?;
+    let digest = sha256(&bytes);
+    if digest.strip_prefix("sha256:") != Some(expected) {
+        return Err(ProtocolError(format!(
+            "frozen package symlink target digest mismatch: {relative}"
+        ))
+        .into());
+    }
+
+    fs::remove_file(path)?;
+    let write_result = (|| -> Result<()> {
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        output.set_permissions(fs::Permissions::from_mode(mode))?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        let metadata = output.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != bytes.len() as u64
+            || metadata.permissions().mode() & 0o7777 != mode
+        {
+            return Err(ProtocolError("normalized symlink file mismatch".into()).into());
+        }
+        Ok(())
+    })();
+    if write_result.is_err()
+        && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        let _ = fs::remove_file(path);
+    }
+    write_result?;
+    Ok(NormalizedSymlink {
+        path: relative.to_owned(),
+        target_digest: digest,
+    })
+}
+
+fn filter_directory(
+    root: &Path,
+    directory: &Path,
+    wanted: &BTreeMap<String, String>,
+) -> Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
@@ -840,6 +951,11 @@ fn filter_directory(root: &Path, directory: &Path, wanted: &BTreeSet<String>) ->
         if relative == ".git" {
             continue;
         }
+        let exact = wanted.contains_key(&relative);
+        let ancestor = wanted
+            .keys()
+            .any(|wanted| wanted.starts_with(&format!("{relative}/")));
+        let retained = exact || ancestor;
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
             ProtocolError(format!(
                 "failed to inspect filtered checkout path {}: {error}",
@@ -847,12 +963,20 @@ fn filter_directory(root: &Path, directory: &Path, wanted: &BTreeSet<String>) ->
             ))
         })?;
         if metadata.file_type().is_symlink() {
-            return Err(ProtocolError("symlink in fetched worktree is forbidden".into()).into());
+            if retained {
+                let relation = if exact {
+                    "a frozen package file"
+                } else {
+                    "an ancestor of a frozen package file"
+                };
+                return Err(ProtocolError(format!(
+                    "symlink in fetched worktree at {relative} is forbidden: path is {relation}"
+                ))
+                .into());
+            }
+            fs::remove_file(&path)?;
+            continue;
         }
-        let retained = wanted.contains(&relative)
-            || wanted
-                .iter()
-                .any(|wanted| wanted.starts_with(&format!("{relative}/")));
         if metadata.is_dir() && retained {
             filter_directory(root, &path, wanted)?;
             if fs::read_dir(&path)?.next().is_none() {
@@ -1463,6 +1587,10 @@ fn path_string(path: &Path) -> String {
 }
 
 fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
+    Ok(read_bounded_file(path, maximum, false)?.0)
+}
+
+fn read_bounded_file(path: &Path, maximum: u64, allow_empty: bool) -> Result<(Vec<u8>, u32)> {
     crate::reject_symlink_components(path, false)?;
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -1475,9 +1603,13 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
             ))
         })?;
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
+    if !metadata.file_type().is_file()
+        || (!allow_empty && metadata.len() == 0)
+        || metadata.len() > maximum
+    {
         return Err(ProtocolError(format!("invalid bounded file: {}", path.display())).into());
     }
+    let mode = metadata.permissions().mode() & 0o7777;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     Read::by_ref(&mut file)
         .take(maximum + 1)
@@ -1486,10 +1618,11 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     if bytes.len() as u64 != metadata.len()
         || after.len() != metadata.len()
         || after.modified()? != metadata.modified()?
+        || after.permissions().mode() & 0o7777 != mode
     {
         return Err(ProtocolError("bounded file changed during read".into()).into());
     }
-    Ok(bytes)
+    Ok((bytes, mode))
 }
 
 fn validate_relative(value: &str) -> Result<()> {
@@ -1507,10 +1640,13 @@ fn validate_relative(value: &str) -> Result<()> {
 }
 
 fn unique_temp_root() -> Result<PathBuf> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let suffix = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    Ok(env::temp_dir()
-        .canonicalize()?
-        .join(format!("kit-m005-w07-{}-{suffix}", std::process::id())))
+    Ok(env::temp_dir().canonicalize()?.join(format!(
+        "kit-m005-w07-{}-{suffix}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    )))
 }
 
 fn workspace_root() -> PathBuf {
@@ -1520,6 +1656,13 @@ fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frozen_files(files: &[(&str, &[u8])]) -> BTreeMap<String, String> {
+        files
+            .iter()
+            .map(|(path, bytes)| (path.to_string(), format!("{:x}", Sha256::digest(bytes))))
+            .collect()
+    }
 
     fn guardrail_grade(arm: Arm, success: bool) -> TrialGrade {
         TrialGrade {
@@ -1637,7 +1780,10 @@ mod tests {
         filter_checkout(
             &root,
             "",
-            [".cargo_vcs_info.json".to_owned(), "src/lib.rs".to_owned()].iter(),
+            &frozen_files(&[
+                (".cargo_vcs_info.json", b"missing"),
+                ("src/lib.rs", b"pub fn retained() {}\n"),
+            ]),
         )
         .unwrap();
 
@@ -1645,6 +1791,212 @@ mod tests {
         assert!(!root.join(".cargo_vcs_info.json").exists());
         assert!(!root.join("unpublished.rs").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_removes_unwanted_symlink_without_following_it() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn retained() {}\n").unwrap();
+        std::os::unix::fs::symlink("src", root.join("unwanted")).unwrap();
+
+        filter_checkout(
+            &root,
+            "",
+            &frozen_files(&[("src/lib.rs", b"pub fn retained() {}\n")]),
+        )
+        .unwrap();
+
+        assert!(root.join("src/lib.rs").is_file());
+        assert!(fs::symlink_metadata(root.join("unwanted")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_regularizes_in_root_wanted_symlink_with_exact_digest_and_mode() {
+        let root = unique_temp_root().unwrap();
+        let bytes = b"licensed bytes\n";
+        fs::create_dir_all(root.join("crates/package")).unwrap();
+        fs::write(root.join("LICENSE-APACHE"), bytes).unwrap();
+        fs::set_permissions(
+            root.join("LICENSE-APACHE"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../../LICENSE-APACHE",
+            root.join("crates/package/LICENSE-APACHE"),
+        )
+        .unwrap();
+
+        let normalized = filter_checkout(
+            &root,
+            "crates/package",
+            &frozen_files(&[("LICENSE-APACHE", bytes)]),
+        )
+        .unwrap();
+
+        let wanted = root.join("crates/package/LICENSE-APACHE");
+        let metadata = fs::symlink_metadata(&wanted).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(fs::read(&wanted).unwrap(), bytes);
+        assert_eq!(
+            normalized,
+            [NormalizedSymlink {
+                path: "LICENSE-APACHE".into(),
+                target_digest: sha256(bytes),
+            }]
+        );
+        assert!(!root.join("LICENSE-APACHE").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_rejects_wanted_symlink_with_wrong_digest() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("actual"), b"actual").unwrap();
+        std::os::unix::fs::symlink("actual", root.join("wanted")).unwrap();
+
+        let error = filter_checkout(&root, "", &frozen_files(&[("wanted", b"expected")]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("target digest mismatch"));
+        assert!(
+            fs::symlink_metadata(root.join("wanted"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_rejects_wanted_symlink_escaping_checkout() {
+        let scratch = unique_temp_root().unwrap();
+        let root = scratch.join("checkout");
+        let outside = scratch.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, b"expected").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("wanted")).unwrap();
+
+        let error = filter_checkout(&root, "", &frozen_files(&[("wanted", b"expected")]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("escapes the checkout root"));
+        assert!(
+            fs::symlink_metadata(root.join("wanted"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_rejects_wanted_symlink_cycle() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink("second", root.join("wanted")).unwrap();
+        std::os::unix::fs::symlink("wanted", root.join("second")).unwrap();
+
+        let error = filter_checkout(&root, "", &frozen_files(&[("wanted", b"expected")]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to resolve frozen package symlink wanted"));
+        assert!(
+            fs::symlink_metadata(root.join("wanted"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_rejects_wanted_symlink_to_directory() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir_all(root.join("actual")).unwrap();
+        std::os::unix::fs::symlink("actual", root.join("wanted")).unwrap();
+
+        let error = filter_checkout(&root, "", &frozen_files(&[("wanted", b"expected")]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid bounded file"));
+        assert!(
+            fs::symlink_metadata(root.join("wanted"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_rejects_symlink_directory_ancestor_with_path() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir_all(root.join("actual-src")).unwrap();
+        fs::write(root.join("actual-src/lib.rs"), "pub fn actual() {}\n").unwrap();
+        std::os::unix::fs::symlink("actual-src", root.join("src")).unwrap();
+
+        let error = filter_checkout(
+            &root,
+            "",
+            &frozen_files(&[("src/lib.rs", b"pub fn actual() {}\n")]),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("src"));
+        assert!(error.contains("ancestor of a frozen package file"));
+        assert!(
+            fs::symlink_metadata(root.join("src"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit networked materialization smoke"]
+    fn first_eleven_materializations_smoke() {
+        let vendor = env::var_os("KIT_M005_W07_SMOKE_VENDOR")
+            .map(PathBuf::from)
+            .expect("KIT_M005_W07_SMOKE_VENDOR is required")
+            .canonicalize()
+            .unwrap();
+        let root = workspace_root();
+        let preregistration: crate::Preregistration = serde_json::from_slice(
+            &read_bounded(&root.join(PREREG_PATH), crate::MAX_JSON_BYTES as u64).unwrap(),
+        )
+        .unwrap();
+        let git = pinned_git(&preregistration).unwrap();
+        let mut schedule: serde_json::Value = serde_json::from_slice(
+            &read_bounded(&root.join(MANIFEST_PATH), crate::MAX_JSON_BYTES as u64).unwrap(),
+        )
+        .unwrap();
+        schedule["units"].as_array_mut().unwrap().truncate(11);
+        let schedule: ScheduleManifest = serde_json::from_value(schedule).unwrap();
+        let scratch = unique_temp_root().unwrap();
+        let temporary = scratch.join("temporary");
+        let run_root = scratch.join("run");
+        fs::create_dir(&scratch).unwrap();
+        fs::create_dir(&temporary).unwrap();
+        fs::create_dir(&run_root).unwrap();
+
+        let result = prepare_checkouts(&git, &vendor, &temporary, &run_root, &schedule);
+        assert_eq!(
+            scratch.parent(),
+            Some(env::temp_dir().canonicalize().unwrap().as_path())
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+        assert_eq!(result.unwrap().2, 11);
     }
 
     #[test]

@@ -209,6 +209,13 @@ fn verify_receipts(
             .filter(|(path, _)| path.ends_with(".rs"))
             .map(|(path, digest)| (path.clone(), digest.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let mut normalized_paths = std::collections::BTreeSet::new();
+        let valid_normalizations = receipt.normalized_symlinks.iter().all(|normalization| {
+            normalized_paths.insert(&normalization.path)
+                && files
+                    .get(&normalization.path)
+                    .is_some_and(|digest| normalization.target_digest == format!("sha256:{digest}"))
+        });
         if receipt.unit_id != unit.unit_id
             || receipt.git_path != preregistration.runtime_environment.git_path
             || receipt.git_digest != preregistration.runtime_environment.git_executable_digest
@@ -224,6 +231,7 @@ fn verify_receipts(
             || receipt.package_file_set_digest != unit.source_digest
             || receipt.package_file_set_digest != sha256(&canonical(&files)?)
             || receipt.package_files != package_files
+            || !valid_normalizations
             || receipt.commands.len() != 4
             || receipt.commands[0].first().map(String::as_str) != Some("init")
             || receipt.commands[1]
