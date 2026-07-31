@@ -828,12 +828,6 @@ fn filter_checkout<'a>(
         })
         .collect::<BTreeSet<_>>();
     filter_directory(checkout, checkout, &wanted)?;
-    for path in &wanted {
-        let metadata = fs::symlink_metadata(checkout.join(path))?;
-        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            return Err(ProtocolError("filtered package file is not regular".into()).into());
-        }
-    }
     Ok(())
 }
 
@@ -846,7 +840,12 @@ fn filter_directory(root: &Path, directory: &Path, wanted: &BTreeSet<String>) ->
         if relative == ".git" {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            ProtocolError(format!(
+                "failed to inspect filtered checkout path {}: {error}",
+                path.display()
+            ))
+        })?;
         if metadata.file_type().is_symlink() {
             return Err(ProtocolError("symlink in fetched worktree is forbidden".into()).into());
         }
@@ -1393,7 +1392,15 @@ fn git_output(git: &PinnedGit, root: &Path, arguments: &[&str]) -> Result<String
 }
 
 fn git_output_bytes(git: &PinnedGit, root: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
-    let output = trusted_git_command(git, root)?.args(arguments).output()?;
+    let output = trusted_git_command(git, root)?
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            ProtocolError(format!(
+                "failed to launch pinned Git in {} with {arguments:?}: {error}",
+                root.display()
+            ))
+        })?;
     if !output.status.success()
         || output.stdout.len() > 64 * 1024 * 1024
         || output.stderr.len() > 64 * 1024
@@ -1413,7 +1420,15 @@ fn git_status(git: &PinnedGit, root: &Path, arguments: &[&str]) -> Result<()> {
 }
 
 fn git_status_owned(git: &PinnedGit, root: &Path, arguments: &[String]) -> Result<()> {
-    let output = trusted_git_command(git, root)?.args(arguments).output()?;
+    let output = trusted_git_command(git, root)?
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            ProtocolError(format!(
+                "failed to launch pinned Git materialization in {} with {arguments:?}: {error}",
+                root.display()
+            ))
+        })?;
     if !output.status.success()
         || output.stdout.len() > 64 * 1024
         || output.stderr.len() > 64 * 1024
@@ -1452,7 +1467,13 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>> {
     let mut file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| {
+            ProtocolError(format!(
+                "failed to open bounded file {}: {error}",
+                path.display()
+            ))
+        })?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
         return Err(ProtocolError(format!("invalid bounded file: {}", path.display())).into());
@@ -1604,6 +1625,26 @@ mod tests {
         )
         .unwrap();
         parse_timestamp(&normalize_timestamp(&commit_time).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkout_filter_allows_registry_only_files() {
+        let root = unique_temp_root().unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn retained() {}\n").unwrap();
+        fs::write(root.join("unpublished.rs"), "pub fn removed() {}\n").unwrap();
+
+        filter_checkout(
+            &root,
+            "",
+            [".cargo_vcs_info.json".to_owned(), "src/lib.rs".to_owned()].iter(),
+        )
+        .unwrap();
+
+        assert!(root.join("src/lib.rs").is_file());
+        assert!(!root.join(".cargo_vcs_info.json").exists());
+        assert!(!root.join("unpublished.rs").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
