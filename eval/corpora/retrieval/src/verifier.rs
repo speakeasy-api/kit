@@ -93,10 +93,7 @@ pub(crate) fn verify_measured(
             "eval/preregistration/m005-w07.yaml",
         ],
     )?;
-    let head_time =
-        time::OffsetDateTime::parse(&head_time, &time::format_description::well_known::Rfc3339)?
-            .to_offset(time::UtcOffset::UTC)
-            .format(&time::format_description::well_known::Rfc3339)?;
+    let head_time = crate::run::normalize_timestamp(&head_time)?;
     if registration.preregistration_digest != sha256(&canonical(preregistration)?)
         || registration.corpus_manifest_digest != sha256(&canonical(manifest)?)
         || registration.immutable_inputs_digest

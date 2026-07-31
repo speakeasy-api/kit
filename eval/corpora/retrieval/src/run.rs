@@ -1339,10 +1339,12 @@ fn timestamp_after(previous: &str) -> Result<String> {
     }
 }
 
-fn normalize_timestamp(value: &str) -> Result<String> {
-    Ok(parse_timestamp(value)?
+pub(crate) fn normalize_timestamp(value: &str) -> Result<String> {
+    let normalized = OffsetDateTime::parse(value, &Rfc3339)?
         .to_offset(time::UtcOffset::UTC)
-        .format(&Rfc3339)?)
+        .format(&Rfc3339)?;
+    parse_timestamp(&normalized)?;
+    Ok(normalized)
 }
 
 pub(crate) fn parse_timestamp(value: &str) -> Result<OffsetDateTime> {
@@ -1586,6 +1588,27 @@ mod tests {
                 < parse_timestamp("2026-01-01T00:00:00.000000001Z").unwrap()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_commit_timestamps_are_normalized_before_artifact_validation() {
+        assert_eq!(
+            normalize_timestamp("2026-07-31T09:30:00+05:30").unwrap(),
+            "2026-07-31T04:00:00Z"
+        );
+        assert_eq!(
+            normalize_timestamp("2026-07-30T20:00:00-07:00").unwrap(),
+            "2026-07-31T03:00:00Z"
+        );
+
+        let git = preregistration_git().unwrap();
+        let commit_time = git_output(
+            &git,
+            &workspace_root(),
+            &["log", "-1", "--format=%cI", "--", PREREG_PATH],
+        )
+        .unwrap();
+        parse_timestamp(&normalize_timestamp(&commit_time).unwrap()).unwrap();
     }
 
     #[test]
