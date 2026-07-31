@@ -6517,9 +6517,14 @@
   - src/capabilities/kernel/grant.rs
   - src/capabilities/kernel/grant_ext.rs
   - src/capabilities/kernel/invoke.rs
+  - src/capabilities/broker/mod.rs
+  - src/capabilities/native/orchestrate.rs
+  - src/agent/adapters/tool.rs
   public_contract_links: []
   telemetry_links:
   - tests/conformance/grant_ext.rs
+  - tests/conformance/broker_paths.rs
+  - tests/fault/broker_auth_interrupt.rs
   evidence_type: conformance
   evidence_id: EV-7.14-C-201
   evidence_job: integration
@@ -7299,9 +7304,13 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/broker/mod.rs
+  - src/capabilities/schema/mod.rs
+  - src/agent/adapters/tool.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/broker_paths.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1027
   evidence_job: integration
@@ -8097,9 +8106,12 @@
   - G06
   - G07
   - G12
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/broker/mod.rs
+  - src/capabilities/kernel/grant.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/broker_paths.rs
   evidence_type: conformance
   evidence_id: EV-8.09-C-102
   evidence_job: adversarial

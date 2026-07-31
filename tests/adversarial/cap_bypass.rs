@@ -13,16 +13,21 @@ use kit::{
         contract::{AuthenticatedPrincipal, Authenticator, GrantSnapshot},
         local_peer::{LocalPeerAuthenticator, LocalPeerObservation},
     },
-    capabilities::kernel::{
-        grant::{ArgumentConstraints, CapabilityGrant, CapabilityGrantSnapshot, EffectClass},
-        identity::{
-            CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
-            CapabilityVersion, Digest, DigestAlgorithm,
+    api::service::AttemptDriverClaim,
+    capabilities::{
+        broker::{BrokerInvocation, BrokerOutcome, BrokerRuntime, invoke as broker_invoke},
+        kernel::{
+            grant::{ArgumentConstraints, CapabilityGrant, CapabilityGrantSnapshot, EffectClass},
+            identity::{
+                CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
+                CapabilityVersion, Digest, DigestAlgorithm,
+            },
+            invoke::{
+                ApprovalState, AuthorizedInvocation, CanonicalOutput, DispatchOutcome,
+                InvocationEnvelope, InvocationStatus, RetrySafety,
+            },
         },
-        invoke::{
-            ApprovalState, AuthorizedInvocation, CanonicalOutput, DispatchOutcome,
-            InvocationEnvelope, InvocationRuntime, InvocationStatus, RetrySafety, invoke,
-        },
+        schema::{JSON_SCHEMA_2020_12, NormalizedSchema},
     },
     domain::{
         config::{
@@ -81,6 +86,7 @@ struct Fixture {
     capability: CapabilityIdentity,
     discovered_schema: Digest,
     bound_schema: Digest,
+    normalized_schema: NormalizedSchema,
     effect: EffectClass,
     constraints: ArgumentConstraints,
     arguments: Vec<u8>,
@@ -91,6 +97,7 @@ struct Fixture {
     cancellation: Arc<AtomicBool>,
     fence: Arc<AtomicU64>,
     attempt: AttemptOwnership,
+    claim: AttemptDriverClaim,
     invocation_id: ToolCallId,
     key: IdempotencyKey,
     command_id: CommandId,
@@ -115,7 +122,14 @@ impl Fixture {
             "1.0.0",
             b"implementation-v1",
         );
-        let schema = Digest::of(DigestAlgorithm::Sha256, b"schema-v1");
+        let normalized_schema = NormalizedSchema::ingest(
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            JSON_SCHEMA_2020_12,
+            b"bypass schema",
+            DigestAlgorithm::Sha256,
+        )
+        .unwrap();
+        let schema = normalized_schema.source().normalized_digest();
         let constraints = ArgumentConstraints::new([b"workspace=root".as_slice()]);
         let grants = CapabilityGrantSnapshot::new(
             &config,
@@ -133,7 +147,22 @@ impl Fixture {
         let directory =
             std::env::temp_dir().join(format!("kit-cap-bypass-{}", EventId::generate().unwrap()));
         std::fs::create_dir(&directory).unwrap();
-        let store = test_support::open_sqlite_store(directory.join("store.sqlite3")).unwrap();
+        let mut store = test_support::open_sqlite_store(directory.join("store.sqlite3")).unwrap();
+        let attempt = AttemptOwnership::new(
+            AttemptId::generate().unwrap(),
+            principal_id,
+            FencingToken::new(11),
+        );
+        let claim = store
+            .install_driver_claim_for_test(AttemptDriverClaim {
+                run_id: config.run_id(),
+                attempt_id: attempt.attempt_id,
+                principal_id,
+                fence: attempt.fencing_token,
+                lease_version: 1,
+                expires_at_unix_micros: 0,
+            })
+            .unwrap();
         Self {
             store,
             directory,
@@ -143,6 +172,7 @@ impl Fixture {
             capability,
             discovered_schema: schema,
             bound_schema: schema,
+            normalized_schema,
             effect: EffectClass::WorkspaceRead,
             constraints,
             arguments: br#"{"path":"README.md"}"#.to_vec(),
@@ -152,11 +182,8 @@ impl Fixture {
             approval: ApprovalState::NotRequired,
             cancellation: Arc::new(AtomicBool::new(false)),
             fence: Arc::new(AtomicU64::new(11)),
-            attempt: AttemptOwnership::new(
-                AttemptId::generate().unwrap(),
-                principal_id,
-                FencingToken::new(11),
-            ),
+            attempt,
+            claim,
             invocation_id: ToolCallId::generate().unwrap(),
             key: IdempotencyKey::parse("bypass-key").unwrap(),
             command_id: CommandId::generate().unwrap(),
@@ -283,6 +310,7 @@ fn run(
         capability,
         discovered_schema,
         bound_schema,
+        normalized_schema,
         effect,
         constraints,
         arguments,
@@ -293,6 +321,7 @@ fn run(
         cancellation,
         fence,
         attempt,
+        claim,
         invocation_id,
         key,
         command_id,
@@ -302,7 +331,7 @@ fn run(
         trace_id,
         ..
     } = fixture;
-    invoke(
+    let request = BrokerInvocation::generic(
         InvocationEnvelope {
             authenticated,
             config,
@@ -324,7 +353,7 @@ fn run(
             approval: *approval,
             cancellation,
             attempt: *attempt,
-            driver_claim: None,
+            driver_claim: Some(*claim),
             current_fence: fence,
             command_id: *command_id,
             intent_event_id: *intent_event_id,
@@ -332,10 +361,14 @@ fn run(
             occurred_at,
             trace_id,
         },
-        InvocationRuntime::new(store, budget, backend),
-    )
-    .map(|result| result.canonical.status)
-    .map_err(|error| error.to_string())
+        normalized_schema,
+    );
+    broker_invoke(request, BrokerRuntime::new(store, budget, backend))
+        .map(|outcome| match outcome {
+            BrokerOutcome::Completed(result) => result.invocation.canonical.status,
+            BrokerOutcome::AuthRequired(_) => unreachable!("direct invocation cannot require auth"),
+        })
+        .map_err(|error| error.to_string())
 }
 
 fn authenticate(
@@ -464,9 +497,13 @@ fn at_least_twenty_bypass_routes_cannot_reach_dispatch() {
 #[test]
 fn dispatcher_and_authorized_token_construction_remain_private() {
     let source = include_str!("../../src/capabilities/kernel/invoke.rs");
+    let broker = include_str!("../../src/capabilities/broker/mod.rs");
     assert!(!source.contains("pub struct Dispatcher"));
     assert!(!source.contains("pub fn dispatch"));
     assert!(!source.contains("pub capability: CapabilityIdentity"));
     assert!(!source.contains("pub arguments: Vec<u8>"));
-    assert_eq!(source.matches("pub fn invoke(").count(), 1);
+    assert_eq!(source.matches("pub(crate) fn invoke(").count(), 1);
+    assert!(source.contains("pub(crate) struct InvocationRuntime"));
+    assert!(broker.contains("pub fn native("));
+    assert!(!broker.contains("fn direct("));
 }

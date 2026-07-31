@@ -32,6 +32,7 @@ use crate::{
             InvocationResult, InvocationStatus, InvokeError, RetrySafety,
         },
     },
+    capabilities::schema::NormalizedSchema,
     domain::{
         config::RunConfigSnapshot,
         events::{TraceId, UtcDateTime},
@@ -58,6 +59,7 @@ type CostEstimator = Arc<dyn Fn(&Value) -> Result<Spend, String> + Send + Sync>;
 pub struct ToolBinding {
     spec: ToolSpec,
     capability: CapabilityIdentity,
+    schema: NormalizedSchema,
     discovered_schema_digest: Digest,
     bound_schema_digest: Digest,
     effect: EffectClass,
@@ -73,6 +75,7 @@ impl ToolBinding {
     pub fn new(
         spec: ToolSpec,
         capability: CapabilityIdentity,
+        schema: NormalizedSchema,
         discovered_schema_digest: Digest,
         bound_schema_digest: Digest,
         effect: EffectClass,
@@ -84,6 +87,7 @@ impl ToolBinding {
         Self {
             spec,
             capability,
+            schema,
             discovered_schema_digest,
             bound_schema_digest,
             effect,
@@ -307,40 +311,42 @@ impl ToolExecutorAdapter {
         }
         let mut bounded_capability =
             |authorized: &AuthorizedInvocation| bound_dispatch(capability(authorized));
-        let result = crate::capabilities::native::orchestrate::OrchestratedNativeInvocation::new(
-            InvocationEnvelope {
-                authenticated: &self.context.authenticated,
-                config: &self.context.config,
-                grants: &self.context.grants,
-                delegation: self.context.delegation.as_ref(),
-                extension: crate::capabilities::kernel::grant_ext::RequestExtension::default(),
-                capability: &binding.capability,
-                discovered_schema_digest: binding.discovered_schema_digest,
-                bound_schema_digest: binding.bound_schema_digest,
-                effect: binding.effect,
-                argument_constraints: &binding.argument_constraints,
-                arguments: &arguments,
-                workspace_id: self.context.workspace_id,
-                project_id: self.context.project_id,
-                invocation_id: ids.invocation_id,
-                idempotency_key: &ids.idempotency_key,
-                reservation,
-                retry_safety: binding.retry_safety,
-                approval,
-                cancellation: &self.context.cancellation,
-                attempt: self.context.attempt,
-                driver_claim: Some(self.context.claim),
-                current_fence: &self.context.current_fence,
-                command_id: ids.command_id,
-                intent_event_id: ids.intent_event_id,
-                outcome_event_id: ids.outcome_event_id,
-                occurred_at: &ids.occurred_at,
-                trace_id: &ids.trace_id,
-            },
-            store,
-            &self.context.budget,
-        )
-        .execute(&mut bounded_capability);
+        let result =
+            crate::capabilities::native::orchestrate::OrchestratedCapabilityInvocation::new(
+                InvocationEnvelope {
+                    authenticated: &self.context.authenticated,
+                    config: &self.context.config,
+                    grants: &self.context.grants,
+                    delegation: self.context.delegation.as_ref(),
+                    extension: crate::capabilities::kernel::grant_ext::RequestExtension::default(),
+                    capability: &binding.capability,
+                    discovered_schema_digest: binding.discovered_schema_digest,
+                    bound_schema_digest: binding.bound_schema_digest,
+                    effect: binding.effect,
+                    argument_constraints: &binding.argument_constraints,
+                    arguments: &arguments,
+                    workspace_id: self.context.workspace_id,
+                    project_id: self.context.project_id,
+                    invocation_id: ids.invocation_id,
+                    idempotency_key: &ids.idempotency_key,
+                    reservation,
+                    retry_safety: binding.retry_safety,
+                    approval,
+                    cancellation: &self.context.cancellation,
+                    attempt: self.context.attempt,
+                    driver_claim: Some(self.context.claim),
+                    current_fence: &self.context.current_fence,
+                    command_id: ids.command_id,
+                    intent_event_id: ids.intent_event_id,
+                    outcome_event_id: ids.outcome_event_id,
+                    occurred_at: &ids.occurred_at,
+                    trace_id: &ids.trace_id,
+                },
+                &binding.schema,
+                store,
+                &self.context.budget,
+            )
+            .execute(&mut bounded_capability);
         match result {
             Ok(result) => {
                 let status = match result.canonical.status {
@@ -1002,7 +1008,12 @@ fn map_invoke_error(error: InvokeError) -> ToolExecutionOutcome {
         ),
         InvokeError::SchemaBindingMismatch => invalid_input("tool schema binding mismatch"),
         InvokeError::InvalidArguments => invalid_input("tool arguments are not valid JSON"),
-        InvokeError::StaleFence => internal("tool attempt fence is stale"),
+        InvokeError::UnsupportedValidation => {
+            invalid_input("tool schema validation is unsupported")
+        }
+        InvokeError::MissingDriverClaim | InvokeError::StaleFence => {
+            internal("tool attempt authority is stale")
+        }
         InvokeError::Budget(error) => ToolExecutionOutcome::FailedBeforeInvocation(
             ToolError::Unavailable(format!("tool budget unavailable: {error:?}")),
         ),
@@ -1014,6 +1025,10 @@ fn map_invoke_error(error: InvokeError) -> ToolExecutionOutcome {
         InvokeError::InjectedCrash(point) => {
             internal(format!("tool invocation interrupted at {point:?}"))
         }
+        InvokeError::NativeCapabilityBinding => internal("native tool binding is unknown"),
+        InvokeError::BrokerAuth => internal("native tool entered broker auth handling"),
+        InvokeError::Accounting(error) => internal(format!("tool accounting failed: {error}")),
+        InvokeError::ToolReservationRequired => invalid_input("tool reservation is missing"),
     }
 }
 

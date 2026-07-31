@@ -6,6 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent::accounting::AccountingError,
     api::{auth::contract::AuthenticatedPrincipal, service::AttemptDriverClaim},
     domain::{
         commands::ExpectedVersion,
@@ -16,7 +17,7 @@ use crate::{
     },
     runtime::scheduler::{
         limits::Spend,
-        reserve::{BudgetError, BudgetLedger, ReservationId},
+        reserve::{BudgetError, BudgetLedger, ReservationId, ReservationSnapshot},
     },
     store::sqlite::{
         append::{
@@ -43,6 +44,7 @@ const OUTCOME_COMMAND: &str = "capability.invoke.outcome";
 const INTENT_EVENT: &str = "capability.invocation_intent";
 const DISPATCH_EVENT: &str = "capability.invocation_dispatched";
 const OUTCOME_EVENT: &str = "capability.invocation_outcome";
+pub const MAX_INVOCATION_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +112,7 @@ pub struct InvocationResult {
     pub canonical: CanonicalInvocationResult,
     pub presentation: PresentationPlaceholder,
     pub replayed: bool,
+    pub reservation: ReservationSnapshot,
 }
 
 pub struct InvocationEnvelope<'a> {
@@ -140,6 +143,74 @@ pub struct InvocationEnvelope<'a> {
     pub outcome_event_id: EventId,
     pub occurred_at: &'a UtcDateTime,
     pub trace_id: &'a TraceId,
+}
+
+impl InvocationEnvelope<'_> {
+    pub(crate) fn grant_request(&self) -> GrantRequest<'_> {
+        self.grant_request_for(self.authenticated)
+    }
+
+    pub(crate) fn grant_request_for<'a>(
+        &'a self,
+        authenticated: &'a AuthenticatedPrincipal,
+    ) -> GrantRequest<'a> {
+        GrantRequest {
+            authenticated,
+            capability: self.capability,
+            schema_digest: self.bound_schema_digest,
+            effect: self.effect,
+            argument_constraints: self.argument_constraints,
+            workspace_id: self.workspace_id,
+            project_id: self.project_id,
+            config: self.config,
+            grants: self.grants,
+            delegation: self.delegation,
+            extension: self.extension.clone(),
+        }
+    }
+
+    pub(crate) fn canonical_request_digest(
+        &self,
+        decision_digest: Digest,
+    ) -> CanonicalRequestDigest {
+        request_digest(self, decision_digest)
+    }
+
+    pub(crate) fn preflight_authority(
+        &self,
+        store: &mut SqliteStore,
+        allow_quiescent_driver_claim: bool,
+    ) -> Result<(), InvokeError> {
+        ensure_current_fence(self)?;
+        if self.attempt.principal_id != self.authenticated.principal_id() {
+            return Err(InvokeError::StaleFence);
+        }
+        let claim = self.driver_claim.ok_or(InvokeError::MissingDriverClaim)?;
+        if claim.owner() != self.attempt || claim.run_id != self.config.run_id() {
+            return Err(InvokeError::StaleFence);
+        }
+        if !allow_quiescent_driver_claim {
+            store.verify_driver_claim(claim)?;
+        }
+        Ok(())
+    }
+
+    fn preflight(
+        &self,
+        store: &mut SqliteStore,
+        allow_quiescent_driver_claim: bool,
+    ) -> Result<(), InvokeError> {
+        self.preflight_authority(store, allow_quiescent_driver_claim)?;
+        if self.discovered_schema_digest != self.bound_schema_digest {
+            return Err(InvokeError::SchemaBindingMismatch);
+        }
+        if self.arguments.len() > MAX_INVOCATION_ARGUMENT_BYTES {
+            return Err(InvokeError::InvalidArguments);
+        }
+        serde_json::from_slice::<serde_json::Value>(self.arguments)
+            .map_err(|_| InvokeError::InvalidArguments)?;
+        Ok(())
+    }
 }
 
 pub struct AuthorizedInvocation {
@@ -187,7 +258,7 @@ impl AuthorizedInvocation {
     }
 }
 
-pub struct InvocationRuntime<'a> {
+pub(crate) struct InvocationRuntime<'a> {
     store: &'a mut SqliteStore,
     budget: &'a BudgetLedger,
     backend: &'a mut dyn FnMut(&AuthorizedInvocation) -> DispatchOutcome,
@@ -195,7 +266,7 @@ pub struct InvocationRuntime<'a> {
 }
 
 impl<'a> InvocationRuntime<'a> {
-    pub fn new(
+    pub(crate) fn new(
         store: &'a mut SqliteStore,
         budget: &'a BudgetLedger,
         backend: &'a mut dyn FnMut(&AuthorizedInvocation) -> DispatchOutcome,
@@ -208,7 +279,7 @@ impl<'a> InvocationRuntime<'a> {
         }
     }
 
-    pub fn with_crash_at(mut self, crash_at: InvocationCrashPoint) -> Self {
+    pub(crate) fn with_crash_at(mut self, crash_at: InvocationCrashPoint) -> Self {
         self.crash_at = Some(crash_at);
         self
     }
@@ -229,12 +300,18 @@ pub enum InvokeError {
     AuthorizationDenied(GrantReasonCode),
     SchemaBindingMismatch,
     InvalidArguments,
+    MissingDriverClaim,
     StaleFence,
     Budget(BudgetError),
     Store(StoreError),
     InvalidPersistedOutcome,
     Serialization(serde_json::Error),
     InjectedCrash(InvocationCrashPoint),
+    NativeCapabilityBinding,
+    UnsupportedValidation,
+    BrokerAuth,
+    Accounting(AccountingError),
+    ToolReservationRequired,
 }
 
 impl fmt::Display for InvokeError {
@@ -247,6 +324,9 @@ impl fmt::Display for InvokeError {
                 f.write_str("discovered and bound capability schema digests differ")
             }
             Self::InvalidArguments => f.write_str("capability arguments are not valid JSON"),
+            Self::MissingDriverClaim => {
+                f.write_str("capability invocation requires an attempt driver claim")
+            }
             Self::StaleFence => f.write_str("capability invocation attempt fence is stale"),
             Self::Budget(error) => write!(f, "capability invocation budget error: {error:?}"),
             Self::Store(error) => error.fmt(f),
@@ -256,6 +336,17 @@ impl fmt::Display for InvokeError {
             }
             Self::InjectedCrash(point) => {
                 write!(f, "injected capability invocation crash at {point:?}")
+            }
+            Self::NativeCapabilityBinding => {
+                f.write_str("native capability is not bound to an exact descriptor")
+            }
+            Self::UnsupportedValidation => {
+                f.write_str("normalized schema validation is unsupported")
+            }
+            Self::BrokerAuth => f.write_str("native invocation entered broker auth handling"),
+            Self::Accounting(error) => error.fmt(f),
+            Self::ToolReservationRequired => {
+                f.write_str("capability invocation requires at least one reserved tool")
             }
         }
     }
@@ -281,31 +372,13 @@ impl From<serde_json::Error> for InvokeError {
     }
 }
 
-pub fn invoke(
+pub(crate) fn invoke(
     envelope: InvocationEnvelope<'_>,
     mut runtime: InvocationRuntime<'_>,
 ) -> Result<InvocationResult, InvokeError> {
-    ensure_current_fence(&envelope)?;
-    ensure_current_claim(&envelope, runtime.store)?;
-    if envelope.discovered_schema_digest != envelope.bound_schema_digest {
-        return Err(InvokeError::SchemaBindingMismatch);
-    }
-    serde_json::from_slice::<serde_json::Value>(envelope.arguments)
-        .map_err(|_| InvokeError::InvalidArguments)?;
+    envelope.preflight(runtime.store, false)?;
 
-    let decision = grant::decide(GrantRequest {
-        authenticated: envelope.authenticated,
-        capability: envelope.capability,
-        schema_digest: envelope.bound_schema_digest,
-        effect: envelope.effect,
-        argument_constraints: envelope.argument_constraints,
-        workspace_id: envelope.workspace_id,
-        project_id: envelope.project_id,
-        config: envelope.config,
-        grants: envelope.grants,
-        delegation: envelope.delegation,
-        extension: envelope.extension.clone(),
-    });
+    let decision = grant::decide(envelope.grant_request());
     let decision_digest = decision.snapshot_digest();
     let reason = decision.reason();
     let authorized_inputs = decision
@@ -464,10 +537,13 @@ fn ensure_current_claim(
     envelope: &InvocationEnvelope<'_>,
     store: &mut SqliteStore,
 ) -> Result<(), InvokeError> {
-    match envelope.driver_claim {
-        Some(claim) => store.verify_driver_claim(claim).map_err(InvokeError::Store),
-        None => Ok(()),
-    }
+    store
+        .verify_driver_claim(
+            envelope
+                .driver_claim
+                .ok_or(InvokeError::MissingDriverClaim)?,
+        )
+        .map_err(InvokeError::Store)
 }
 
 fn terminal(
@@ -494,15 +570,16 @@ fn settle(
     canonical: CanonicalInvocationResult,
     replayed: bool,
 ) -> Result<InvocationResult, InvokeError> {
-    if canonical.charged {
-        budget.commit(reservation_id)?;
+    let reservation = if canonical.charged {
+        budget.commit(reservation_id)?
     } else {
-        budget.release(reservation_id)?;
-    }
+        budget.release(reservation_id)?
+    };
     Ok(InvocationResult {
         canonical,
         presentation: PresentationPlaceholder::NotRendered,
         replayed,
+        reservation,
     })
 }
 

@@ -48,6 +48,7 @@ use kit::{
         },
         invoke::{ApprovalState, CanonicalOutput, DispatchOutcome, RetrySafety},
     },
+    capabilities::schema::{JSON_SCHEMA_2020_12, NormalizedSchema},
     domain::{
         config::{
             BudgetLayer, CONFIG_SCHEMA_VERSION, ConcurrencyLayer, ConfigLayer, Executor, Grant,
@@ -194,7 +195,14 @@ fn harness_with_outcome(route: Route, capability_outcome: DispatchOutcome) -> Ha
     let mut authenticated = authenticate(principal_id, project_id, authority.clone());
     let granted_capability = identity("read", b"implementation-v1");
     let mut capability = granted_capability.clone();
-    let schema = Digest::of(DigestAlgorithm::Sha256, b"schema-v1");
+    let normalized_schema = NormalizedSchema::ingest(
+        br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+        JSON_SCHEMA_2020_12,
+        b"read a workspace file",
+        DigestAlgorithm::Sha256,
+    )
+    .unwrap();
+    let schema = normalized_schema.source().normalized_digest();
     let mut discovered_schema = schema;
     let constraints = ArgumentConstraints::new([b"workspace=root".as_slice()]);
     let mut requested_constraints = constraints.clone();
@@ -266,9 +274,10 @@ fn harness_with_outcome(route: Route, capability_outcome: DispatchOutcome) -> Ha
         ToolSpec::new(
             "workspace.read",
             "read a workspace file",
-            serde_json::json!({"type": "object"}),
+            normalized_schema.value().clone(),
         ),
         capability,
+        normalized_schema,
         discovered_schema,
         schema,
         effect,
@@ -945,7 +954,9 @@ fn adapter_has_no_alternate_dispatcher_or_basic_executor_path() {
     assert!(!source.contains("pub struct Dispatcher"));
     assert!(!source.contains("pub fn dispatch"));
     assert_eq!(
-        source.matches("OrchestratedNativeInvocation::new(").count(),
+        source
+            .matches("OrchestratedCapabilityInvocation::new(")
+            .count(),
         1
     );
     assert!(!source.contains("invoke::invoke("));

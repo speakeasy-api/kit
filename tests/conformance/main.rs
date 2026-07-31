@@ -2,6 +2,7 @@
 
 mod agentkit_mapping;
 mod artifact_gc;
+mod broker_paths;
 mod cap_grant;
 mod cap_invoke;
 mod cli_parity;

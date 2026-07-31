@@ -29,8 +29,16 @@ const MAX_POINTER_BYTES: usize = 16 * 1024;
 pub struct NormalizedSchema {
     source: SourceSchema,
     value: Value,
+    validator: Option<Arc<jsonschema::Validator>>,
     dialect_digest: Digest,
     documentation_digest: Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchemaValidation {
+    Unsupported,
+    Valid,
+    Invalid,
 }
 
 impl NormalizedSchema {
@@ -62,11 +70,11 @@ impl NormalizedSchema {
         {
             return Err(ProjectionError::DialectMismatch);
         }
-        if dialect == JSON_SCHEMA_2020_12 {
-            jsonschema::draft202012::options()
-                .build(&value)
-                .map_err(|_| ProjectionError::InvalidSchema)?;
-        }
+        let validator = (dialect == JSON_SCHEMA_2020_12)
+            .then(|| jsonschema::draft202012::options().build(&value))
+            .transpose()
+            .map_err(|_| ProjectionError::InvalidSchema)?
+            .map(Arc::new);
         let normalized = serde_json::to_vec(&value).map_err(|_| ProjectionError::InvalidJson)?;
         let source_schema = SourceSchema::new(
             Arc::<[u8]>::from(source),
@@ -81,6 +89,7 @@ impl NormalizedSchema {
             documentation_digest: Digest::of(algorithm, documentation),
             source: source_schema,
             value,
+            validator,
         })
     }
 
@@ -98,6 +107,14 @@ impl NormalizedSchema {
 
     pub const fn documentation_digest(&self) -> Digest {
         self.documentation_digest
+    }
+
+    pub(crate) fn validate(&self, instance: &Value) -> SchemaValidation {
+        match &self.validator {
+            Some(validator) if validator.is_valid(instance) => SchemaValidation::Valid,
+            Some(_) => SchemaValidation::Invalid,
+            None => SchemaValidation::Unsupported,
+        }
     }
 }
 

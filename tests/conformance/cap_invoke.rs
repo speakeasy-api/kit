@@ -13,17 +13,24 @@ use kit::{
         contract::{AuthenticatedPrincipal, Authenticator, GrantSnapshot},
         local_peer::{LocalPeerAuthenticator, LocalPeerObservation},
     },
-    capabilities::kernel::{
-        grant::{ArgumentConstraints, CapabilityGrant, CapabilityGrantSnapshot, EffectClass},
-        identity::{
-            CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
-            CapabilityVersion, Digest, DigestAlgorithm,
+    api::service::AttemptDriverClaim,
+    capabilities::{
+        broker::{
+            BrokerError, BrokerInvocation, BrokerOutcome, BrokerRuntime, invoke as broker_invoke,
         },
-        invoke::{
-            ApprovalState, AuthorizedInvocation, CanonicalOutput, DispatchOutcome,
-            InvocationCrashPoint, InvocationEnvelope, InvocationResult, InvocationRuntime,
-            InvocationStatus, InvokeError, PresentationPlaceholder, RetrySafety, invoke,
+        kernel::{
+            grant::{ArgumentConstraints, CapabilityGrant, CapabilityGrantSnapshot, EffectClass},
+            identity::{
+                CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
+                CapabilityVersion, Digest, DigestAlgorithm,
+            },
+            invoke::{
+                ApprovalState, AuthorizedInvocation, CanonicalOutput, DispatchOutcome,
+                InvocationCrashPoint, InvocationEnvelope, InvocationResult, InvocationStatus,
+                InvokeError, PresentationPlaceholder, RetrySafety,
+            },
         },
+        schema::{JSON_SCHEMA_2020_12, NormalizedSchema},
     },
     domain::{
         config::{
@@ -76,6 +83,7 @@ struct Fixture {
     grants: CapabilityGrantSnapshot,
     capability: CapabilityIdentity,
     schema: Digest,
+    normalized_schema: NormalizedSchema,
     discovered_schema: Digest,
     constraints: ArgumentConstraints,
     arguments: Vec<u8>,
@@ -87,6 +95,7 @@ struct Fixture {
     cancellation: Arc<AtomicBool>,
     fence: Arc<AtomicU64>,
     attempt: AttemptOwnership,
+    claim: Option<AttemptDriverClaim>,
     command_id: CommandId,
     intent_event_id: EventId,
     outcome_event_id: EventId,
@@ -108,7 +117,14 @@ impl Fixture {
         .authenticate(&LocalPeerObservation::from_transport(UID, 42, UID))
         .unwrap();
         let capability = identity("read");
-        let schema = Digest::of(DigestAlgorithm::Sha256, b"read schema");
+        let normalized_schema = NormalizedSchema::ingest(
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            JSON_SCHEMA_2020_12,
+            b"read schema",
+            DigestAlgorithm::Sha256,
+        )
+        .unwrap();
+        let schema = normalized_schema.source().normalized_digest();
         let constraints = ArgumentConstraints::new([b"workspace=root".as_slice()]);
         let grants = CapabilityGrantSnapshot::new(
             &config,
@@ -124,12 +140,22 @@ impl Fixture {
             DigestAlgorithm::Sha256,
         );
         let database = TestDatabase::new();
-        let store = test_support::open_sqlite_store(database.path()).unwrap();
+        let mut store = test_support::open_sqlite_store(database.path()).unwrap();
         let attempt = AttemptOwnership::new(
             AttemptId::generate().unwrap(),
             principal_id,
             FencingToken::new(7),
         );
+        let claim = store
+            .install_driver_claim_for_test(AttemptDriverClaim {
+                run_id: config.run_id(),
+                attempt_id: attempt.attempt_id,
+                principal_id,
+                fence: attempt.fencing_token,
+                lease_version: 1,
+                expires_at_unix_micros: 0,
+            })
+            .unwrap();
         Self {
             store,
             _database: database,
@@ -138,6 +164,7 @@ impl Fixture {
             grants,
             capability,
             schema,
+            normalized_schema,
             discovered_schema: schema,
             constraints,
             arguments: br#"{"path":"README.md"}"#.to_vec(),
@@ -149,6 +176,7 @@ impl Fixture {
             cancellation: Arc::new(AtomicBool::new(false)),
             fence: Arc::new(AtomicU64::new(7)),
             attempt,
+            claim: Some(claim),
             command_id: CommandId::generate().unwrap(),
             intent_event_id: EventId::generate().unwrap(),
             outcome_event_id: EventId::generate().unwrap(),
@@ -164,7 +192,7 @@ fn call(
     approval: ApprovalState,
     crash_at: Option<InvocationCrashPoint>,
     backend: &mut dyn FnMut(&AuthorizedInvocation) -> DispatchOutcome,
-) -> Result<InvocationResult, InvokeError> {
+) -> Result<InvocationResult, BrokerError> {
     let Fixture {
         store,
         authenticated,
@@ -172,6 +200,7 @@ fn call(
         grants,
         capability,
         schema,
+        normalized_schema,
         discovered_schema,
         constraints,
         arguments,
@@ -183,6 +212,7 @@ fn call(
         cancellation,
         fence,
         attempt,
+        claim,
         command_id,
         intent_event_id,
         outcome_event_id,
@@ -211,7 +241,7 @@ fn call(
         approval,
         cancellation,
         attempt: *attempt,
-        driver_claim: None,
+        driver_claim: *claim,
         current_fence: fence,
         command_id: *command_id,
         intent_event_id: *intent_event_id,
@@ -219,12 +249,19 @@ fn call(
         occurred_at,
         trace_id,
     };
-    let runtime = InvocationRuntime::new(store, budget, backend);
+    let runtime = BrokerRuntime::new(store, budget, backend);
     let runtime = match crash_at {
         Some(point) => runtime.with_crash_at(point),
         None => runtime,
     };
-    invoke(envelope, runtime)
+    broker_invoke(
+        BrokerInvocation::generic(envelope, normalized_schema),
+        runtime,
+    )
+    .map(|outcome| match outcome {
+        BrokerOutcome::Completed(result) => result.invocation,
+        BrokerOutcome::AuthRequired(_) => unreachable!("direct invocation cannot require auth"),
+    })
 }
 
 fn config(
@@ -445,7 +482,10 @@ fn stale_fence_never_completes_a_dispatched_effect_as_success() {
         &mut success,
     )
     .unwrap_err();
-    assert!(matches!(error, InvokeError::StaleFence));
+    assert!(matches!(
+        error,
+        BrokerError::Invoke(InvokeError::StaleFence)
+    ));
     assert!(stale.store.events().unwrap().is_empty());
 }
 
@@ -471,7 +511,10 @@ fn crash_points_never_invent_success_or_blindly_redispatch() {
             &mut backend,
         )
         .unwrap_err();
-        assert!(matches!(error, InvokeError::InjectedCrash(found) if found == point));
+        assert!(matches!(
+            error,
+            BrokerError::Invoke(InvokeError::InjectedCrash(found)) if found == point
+        ));
         assert_eq!(
             dispatches,
             usize::from(matches!(
@@ -551,7 +594,7 @@ fn schema_arguments_authority_and_budget_fail_before_dispatch() {
             None,
             &mut success,
         ),
-        Err(InvokeError::SchemaBindingMismatch)
+        Err(BrokerError::Invoke(InvokeError::SchemaBindingMismatch))
     ));
 
     let mut arguments = Fixture::new();
@@ -564,7 +607,7 @@ fn schema_arguments_authority_and_budget_fail_before_dispatch() {
             None,
             &mut success,
         ),
-        Err(InvokeError::InvalidArguments)
+        Err(BrokerError::Invoke(InvokeError::InvalidArguments))
     ));
 
     let mut authority = Fixture::new();
@@ -577,7 +620,7 @@ fn schema_arguments_authority_and_budget_fail_before_dispatch() {
             None,
             &mut success,
         ),
-        Err(InvokeError::AuthorizationDenied(_))
+        Err(BrokerError::Invoke(InvokeError::AuthorizationDenied(_)))
     ));
 
     let mut budget = Fixture::new();
@@ -590,7 +633,24 @@ fn schema_arguments_authority_and_budget_fail_before_dispatch() {
             None,
             &mut success,
         ),
-        Err(InvokeError::Budget(_))
+        Err(BrokerError::Invoke(InvokeError::Budget(_)))
     ));
     assert!(budget.store.events().unwrap().is_empty());
+}
+
+#[test]
+fn missing_driver_claim_is_a_typed_denial() {
+    let mut fixture = Fixture::new();
+    fixture.claim = None;
+    assert!(matches!(
+        call(
+            &mut fixture,
+            RetrySafety::Idempotent,
+            ApprovalState::NotRequired,
+            None,
+            &mut success,
+        ),
+        Err(BrokerError::Invoke(InvokeError::MissingDriverClaim))
+    ));
+    assert!(fixture.store.events().unwrap().is_empty());
 }

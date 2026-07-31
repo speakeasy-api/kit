@@ -3,6 +3,7 @@
 mod artifact_crash;
 #[path = "../integration/backup_restore.rs"]
 mod backup_restore;
+mod broker_auth_interrupt;
 #[path = "../fixtures/clock/mod.rs"]
 mod clock;
 #[path = "../fixtures/crashpoints/mod.rs"]

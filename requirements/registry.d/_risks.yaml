@@ -425,9 +425,12 @@
   - G06
   - G07
   - G12
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/broker/mod.rs
+  - src/capabilities/kernel/grant.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/broker_paths.rs
   evidence_type: conformance
   evidence_id: EV-8.09-C-102
   evidence_job: adversarial

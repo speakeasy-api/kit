@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use kit::{
+    api::service::AttemptDriverClaim,
     capabilities::{
+        broker::{BrokerInvocation, BrokerRuntime, invoke as broker_invoke},
         kernel::{
             grant::{
                 self, ArgumentConstraints, CapabilityGrant, CapabilityGrantSnapshot, EffectClass,
@@ -10,10 +12,11 @@ use kit::{
             identity::{CapabilityIdentity, Digest, DigestAlgorithm},
             invoke::{
                 ApprovalState, AuthorizedInvocation, DispatchOutcome, InvocationEnvelope,
-                InvocationRuntime, RetrySafety, invoke,
+                RetrySafety,
             },
         },
         native::NativeCatalog,
+        schema::NormalizedSchema,
     },
     domain::{
         events::{TraceId, UtcDateTime},
@@ -126,15 +129,34 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
                 selected_authenticated.principal_id(),
                 FencingToken::new(1),
             );
+            let claim = store
+                .install_driver_claim_for_test(AttemptDriverClaim {
+                    run_id: config.run_id(),
+                    attempt_id: owner.attempt_id,
+                    principal_id: owner.principal_id,
+                    fence: owner.fencing_token,
+                    lease_version: u64::try_from(attempts).unwrap(),
+                    expires_at_unix_micros: 0,
+                })
+                .unwrap();
             let invocation_id = ToolCallId::generate().unwrap();
             let key = IdempotencyKey::parse(&format!("native-bypass-{attempts}")).unwrap();
+            let occurred_at = UtcDateTime::parse("2026-07-26T00:00:00Z").unwrap();
+            let trace_id = TraceId::parse(&format!("native-bypass-{attempts}")).unwrap();
             let mut dispatch = |_: &AuthorizedInvocation| {
                 effects.fetch_add(1, Ordering::SeqCst);
                 DispatchOutcome::Failed {
                     code: "bypass_reached_dispatch".to_owned(),
                 }
             };
-            let result = invoke(
+            let normalized_schema = NormalizedSchema::ingest(
+                descriptor.schema().source_bytes(),
+                descriptor.schema().dialect(),
+                descriptor.schema().documentation(),
+                DigestAlgorithm::Sha256,
+            )
+            .unwrap();
+            let request = BrokerInvocation::generic(
                 InvocationEnvelope {
                     authenticated: &selected_authenticated,
                     config: &config,
@@ -156,15 +178,19 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
                     approval: ApprovalState::NotRequired,
                     cancellation: &cancellation,
                     attempt: owner,
-                    driver_claim: None,
+                    driver_claim: Some(claim),
                     current_fence: &fence,
                     command_id: CommandId::generate().unwrap(),
                     intent_event_id: EventId::generate().unwrap(),
                     outcome_event_id: EventId::generate().unwrap(),
-                    occurred_at: &UtcDateTime::parse("2026-07-26T00:00:00Z").unwrap(),
-                    trace_id: &TraceId::parse(&format!("native-bypass-{attempts}")).unwrap(),
+                    occurred_at: &occurred_at,
+                    trace_id: &trace_id,
                 },
-                InvocationRuntime::new(&mut store, &budget, &mut dispatch),
+                &normalized_schema,
+            );
+            let result = broker_invoke(
+                request,
+                BrokerRuntime::new(&mut store, &budget, &mut dispatch),
             );
             assert!(
                 result.is_err(),

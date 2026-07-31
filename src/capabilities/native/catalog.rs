@@ -13,7 +13,7 @@ use crate::{
             CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
             CapabilityVersion, Digest, DigestAlgorithm, SourceSchema,
         },
-        invoke::{ApprovalState, RetrySafety},
+        invoke::{ApprovalState, MAX_INVOCATION_ARGUMENT_BYTES, RetrySafety},
     },
     capabilities::schema::NormalizedSchema,
     domain::config::{Grant, RunConfigSnapshot},
@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub const JSON_SCHEMA_DIALECT: &str = crate::capabilities::schema::JSON_SCHEMA_2020_12;
-pub const MAX_NATIVE_INPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_NATIVE_INPUT_BYTES: usize = MAX_INVOCATION_ARGUMENT_BYTES;
 pub const MAX_NATIVE_OUTPUT_BYTES: usize = 64 * 1024;
 const VERSION: &str = "1.0.0";
 pub(crate) const NATIVE_MAP_MAX_ITEMS: usize = 200;
@@ -79,7 +79,7 @@ impl NativeTool {
 pub struct NativeToolDescriptor {
     tool: NativeTool,
     spec: ToolSpec,
-    schema: SourceSchema,
+    schema: NormalizedSchema,
     identity: CapabilityIdentity,
     effect: EffectClass,
     required_grants: &'static [Grant],
@@ -98,6 +98,10 @@ impl NativeToolDescriptor {
     }
 
     pub const fn schema(&self) -> &SourceSchema {
+        self.schema.source()
+    }
+
+    pub const fn normalized_schema(&self) -> &NormalizedSchema {
         &self.schema
     }
 
@@ -208,6 +212,14 @@ impl NativeCatalog {
             .iter()
             .find(|descriptor| descriptor.canonical_name() == name)
     }
+
+    pub(crate) fn by_identity(
+        identity: &CapabilityIdentity,
+    ) -> Option<&'static NativeToolDescriptor> {
+        Self::all()
+            .iter()
+            .find(|descriptor| descriptor.identity() == identity)
+    }
 }
 
 fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
@@ -219,9 +231,7 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
         description(tool).as_bytes(),
         DigestAlgorithm::Sha256,
     )
-    .expect("native schemas are valid JSON Schema")
-    .source()
-    .clone();
+    .expect("native schemas are valid JSON Schema");
     let (effect, grants, annotations, retry_safety, reservation, approval) = match tool {
         NativeTool::Discover | NativeTool::Search | NativeTool::Read => (
             EffectClass::WorkspaceRead,
@@ -263,7 +273,7 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
     metadata.insert("kit.schema.dialect".to_owned(), json!(JSON_SCHEMA_DIALECT));
     metadata.insert(
         "kit.schema.digest".to_owned(),
-        json!(schema.normalized_digest().to_string()),
+        json!(schema.source().normalized_digest().to_string()),
     );
     metadata.insert(
         "kit.output.max_bytes".to_owned(),

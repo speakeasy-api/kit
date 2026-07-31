@@ -1519,6 +1519,7 @@ fn tool_adapter(
             let binding = ToolBinding::new(
                 descriptor.spec().clone(),
                 descriptor.identity().clone(),
+                descriptor.normalized_schema().clone(),
                 descriptor.schema().normalized_digest(),
                 descriptor.schema().normalized_digest(),
                 descriptor.effect(),
