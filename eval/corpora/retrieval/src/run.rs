@@ -82,12 +82,7 @@ pub(crate) struct SignatureMessage<'a> {
 }
 
 pub fn run_local(vendor: &Path) -> Result<()> {
-    if !vendor.is_dir() {
-        return Err(ProtocolError(
-            "run-local requires cargo vendor --locked --versioned-dirs output".into(),
-        )
-        .into());
-    }
+    let vendor = crate::canonicalize_vendor_root(vendor)?;
     let root = workspace_root();
     let preregistration_bytes =
         read_bounded(&root.join(PREREG_PATH), crate::MAX_JSON_BYTES as u64)?;
@@ -125,7 +120,7 @@ pub fn run_local(vendor: &Path) -> Result<()> {
     fs::create_dir(&temporary)?;
     let result = run_local_inner(
         &root,
-        vendor,
+        &vendor,
         &run_root,
         &temporary,
         &schedule,

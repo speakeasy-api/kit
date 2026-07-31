@@ -93,11 +93,9 @@ pub(crate) struct PinnedPublicKey {
 }
 
 pub fn prepare(vendor: &Path) -> Result<()> {
-    if !vendor.is_dir() {
-        return Err(ProtocolError("vendor directory does not exist".into()).into());
-    }
+    let vendor = crate::canonicalize_vendor_root(vendor)?;
     let root = workspace_root();
-    let mut candidates = discover_candidates(&root, vendor)
+    let mut candidates = discover_candidates(&root, &vendor)
         .map_err(|error| ProtocolError(format!("candidate discovery failed: {error}")))?;
     if candidates.len() < UNIT_COUNT {
         return Err(ProtocolError(format!(

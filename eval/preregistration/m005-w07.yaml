@@ -6,7 +6,7 @@
   "language": "rust",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
   "immutable_inputs": {
-    "build_inputs": "sha256:90d763daed0f6481a1e97e26d7fff218f1062c545388386e23a1d06d3cd86a84"
+    "build_inputs": "sha256:e54ccafdf766c86ba10446db69f0ceac7abf0b08ad514542999739c4966659b0"
   },
   "runtime_environment": {
     "manifest_digest": "sha256:9196ec006f89f8a6244b20f393077cceb443815e80b0d26ea3d834a29fc3a31a",

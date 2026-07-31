@@ -24,12 +24,7 @@ pub(crate) fn verify_measured(
     public_key: &crate::protocol::PinnedPublicKey,
     report: &MeasuredReport,
 ) -> Result<()> {
-    if !vendor.is_dir() {
-        return Err(ProtocolError(
-            "measured verification requires the original versioned cargo vendor directory".into(),
-        )
-        .into());
-    }
+    let vendor = crate::canonicalize_vendor_root(vendor)?;
     crate::run::verify_postcommit_git(root, preregistration)?;
     let run_root = root.join(RUN_PATH);
     let registration: RegistrationRecord =
@@ -115,7 +110,7 @@ pub(crate) fn verify_measured(
     {
         return Err(ProtocolError("registration/report immutable binding mismatch".into()).into());
     }
-    verify_receipts(vendor, manifest, preregistration, &receipts)?;
+    verify_receipts(&vendor, manifest, preregistration, &receipts)?;
     verify_ledger(
         &ledger,
         public_key,
@@ -157,7 +152,7 @@ pub(crate) fn verify_measured(
             }
             let source = scratch.join(format!("source-{index:04}"));
             fs::create_dir(&source)?;
-            crate::run::materialize_full(vendor, &source, unit)?;
+            crate::run::materialize_full(&vendor, &source, unit)?;
             let computed = grade(unit, raw, &source)?;
             fs::remove_dir_all(&source)?;
             if &computed != retained_grade

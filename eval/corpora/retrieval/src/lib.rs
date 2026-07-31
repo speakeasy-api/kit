@@ -60,6 +60,18 @@ pub(crate) fn valid_digest(value: &str) -> bool {
         && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+pub(crate) fn canonicalize_vendor_root(path: &Path) -> Result<PathBuf> {
+    if !path.is_dir() {
+        return Err(ProtocolError("vendor root is not an existing directory".into()).into());
+    }
+    let root = path.canonicalize()?;
+    reject_symlink_components(&root, false)?;
+    if !fs::symlink_metadata(&root)?.file_type().is_dir() {
+        return Err(ProtocolError("canonical vendor root is not a directory".into()).into());
+    }
+    Ok(root)
+}
+
 pub(crate) fn reject_symlink_components(path: &Path, allow_missing: bool) -> Result<()> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -107,6 +119,26 @@ mod io_tests {
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        assert!(reject_symlink_components(&root.join("link/file"), true).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonicalizes_system_root_alias_but_rejects_descendant_symlinks() {
+        let alias = PathBuf::from("/var/tmp").join(format!(
+            "kit-w07-vendor-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(alias.join("real")).unwrap();
+        assert!(reject_symlink_components(&alias, false).is_err());
+
+        let root = canonicalize_vendor_root(&alias).unwrap();
+        assert!(root.starts_with("/private/var/"));
+        reject_symlink_components(&root.join("real"), false).unwrap();
+
         std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
         assert!(reject_symlink_components(&root.join("link/file"), true).is_err());
         fs::remove_dir_all(root).unwrap();
