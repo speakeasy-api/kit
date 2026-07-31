@@ -1,6 +1,6 @@
 use kit_retrieval_eval::{
     cleanup_failed_run, prepare, refresh_frozen, run_local, run_trusted, run_worker,
-    verify_with_vendor,
+    run_worker_startup_probe, verify_with_vendor,
 };
 use std::{env, error::Error, path::PathBuf};
 
@@ -66,6 +66,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             run_worker(
                 &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], &paths[5],
             )?;
+        }
+        "worker-startup-probe" => {
+            let paths = arguments.map(PathBuf::from).collect::<Vec<_>>();
+            if paths.len() != 2 {
+                return Err("invalid hidden worker startup probe invocation".into());
+            }
+            run_worker_startup_probe(&paths[0], &paths[1])?;
         }
         _ => return Err(format!("unknown command: {command}").into()),
     }

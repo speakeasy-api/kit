@@ -8,3 +8,5 @@ their upstream VCS commits/subdirectories, and deterministically selected tasks/
 The prior generated-template trials, grades, HMAC receipts, checksums, and PASS report were invalid
 and have been removed. Future evidence is admissible only under the v2 raw-trial and public Ed25519
 ledger schemas after the preregistration is committed and the production execution blockers clear.
+The sanitized v2 worker-abort incident is retained under `source-semantics/incidents/`; the v3
+preregistration binds its digest and does not treat the aborted startup attempts as observations.

@@ -593,6 +593,7 @@ pub struct Preregistration {
     pub state: String,
     pub language: String,
     pub corpus_manifest_digest: String,
+    pub prior_invalid_experiment: PriorInvalidExperiment,
     pub immutable_inputs: ImmutableInputs,
     pub runtime_environment: RuntimeEnvironment,
     pub public_receipt_key: PublicReceiptKey,
@@ -600,6 +601,15 @@ pub struct Preregistration {
     pub trial_protocol: TrialProtocol,
     pub analysis: AnalysisPlan,
     pub external_blockers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorInvalidExperiment {
+    pub experiment_id: String,
+    pub status: String,
+    pub incident_path: String,
+    pub incident_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

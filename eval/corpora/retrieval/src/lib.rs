@@ -5,6 +5,7 @@ mod model;
 mod protocol;
 mod run;
 mod sandbox;
+mod startup_probe;
 mod verifier;
 mod worker;
 
@@ -13,6 +14,7 @@ pub use model::*;
 pub use protocol::{prepare, refresh_frozen, verify, verify_with_vendor};
 pub use run::{cleanup_failed_run, run_local, run_trusted};
 pub use sandbox::{LocalSandboxRequest, SandboxOutcome, run_local_sandbox};
+pub use startup_probe::run_worker_startup_probe;
 pub use worker::run_worker;
 
 use serde::Serialize;

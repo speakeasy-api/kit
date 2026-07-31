@@ -1,9 +1,9 @@
 use crate::{
     AnalysisPlan, Arm, ClassDefinition, CorpusManifest, CorpusUnit, ImmutableInputs,
     MAX_JSON_BYTES, MAX_SNAPSHOT_BYTES, MAX_SOURCE_FILE_BYTES, OraclePin, OracleSelection,
-    PackagePin, Preregistration, ProtocolError, PublicReceiptKey, ReferenceEdit, RepositoryClass,
-    Result, RuntimeEnvironment, StatusReport, SymbolPin, TaskPin, TrialProtocol, UNIT_COUNT,
-    UNITS_PER_CLASS, canonical, sha256, valid_digest,
+    PackagePin, Preregistration, PriorInvalidExperiment, ProtocolError, PublicReceiptKey,
+    ReferenceEdit, RepositoryClass, Result, RuntimeEnvironment, StatusReport, SymbolPin, TaskPin,
+    TrialProtocol, UNIT_COUNT, UNITS_PER_CLASS, canonical, sha256, valid_digest,
 };
 use ed25519_dalek::{
     VerifyingKey,
@@ -28,6 +28,8 @@ const MANIFEST_PATH: &str = "eval/reports/m005/source-semantics/corpus-manifest.
 const PREREG_PATH: &str = "eval/preregistration/m005-w07.yaml";
 const REPORT_PATH: &str = "eval/reports/m005/source-semantics/retrieval-report.json";
 const PUBLIC_KEY_PATH: &str = "eval/corpora/retrieval/public-key.pem";
+const INCIDENT_PATH: &str =
+    "eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json";
 const CHECKSUM_FILE: &str = ".cargo-checksum.json";
 const VCS_INFO_FILE: &str = ".cargo_vcs_info.json";
 const MAX_FILES: usize = 100_000;
@@ -206,6 +208,11 @@ pub fn verify_with_vendor(vendor: Option<&Path>) -> Result<()> {
     validate_schema_definition(include_bytes!("../schema/v2/measured-report.schema.json"))?;
     validate_schema_definition(include_bytes!("../schema/v2/blocked-report.schema.json"))?;
     validate_schema_definition(include_bytes!("../schema/v2/signed-ledger.schema.json"))?;
+    let incident = read_bounded(&root.join(INCIDENT_PATH), 64 * 1024)?;
+    validate_schema(
+        include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
+        &incident,
+    )?;
     let manifest: CorpusManifest = serde_json::from_slice(&manifest_bytes)?;
     let preregistration: Preregistration = serde_json::from_slice(&preregistration_bytes)?;
     validate_manifest(&manifest)?;
@@ -244,7 +251,7 @@ pub fn verify_with_vendor(vendor: Option<&Path>) -> Result<()> {
         let expected = crate::BlockedReport {
             schema_version: "2.0".into(),
             kind: "m005_w07_blocked_report".into(),
-            experiment_id: "m005-w07-rust-registry-v2".into(),
+            experiment_id: "m005-w07-rust-registry-v3".into(),
             status: "BLOCKED_G03_G04".into(),
             gate_claim: "NONE_BLOCKED_EXTERNAL".into(),
             measured_trials: 0,
@@ -726,10 +733,11 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
     Ok(Preregistration {
         schema_version: "2.0".into(),
         kind: "m005_w07_preregistration".into(),
-        experiment_id: "m005-w07-rust-registry-v2".into(),
+        experiment_id: "m005-w07-rust-registry-v3".into(),
         state: "PRE_RUN_FROZEN".into(),
         language: "rust".into(),
         corpus_manifest_digest,
+        prior_invalid_experiment: prior_invalid_experiment(root)?,
         immutable_inputs,
         runtime_environment,
         public_receipt_key: PublicReceiptKey {
@@ -770,6 +778,21 @@ fn make_preregistration(root: &Path, corpus_manifest_digest: String) -> Result<P
         },
         analysis: analysis_plan(),
         external_blockers: vec!["G03 production executor availability".into(), "G04 prerequisite gate".into(), "BLK-14 production LSP pins".into(), "EXT-15 trusted-model credentials/spend".into()],
+    })
+}
+
+fn prior_invalid_experiment(root: &Path) -> Result<PriorInvalidExperiment> {
+    let bytes = read_bounded(&root.join(INCIDENT_PATH), 64 * 1024)?;
+    validate_schema(
+        include_bytes!("../schema/v2/worker-abort-incident.schema.json"),
+        &bytes,
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(PriorInvalidExperiment {
+        experiment_id: "m005-w07-rust-registry-v2".into(),
+        status: "INVALID_HARNESS".into(),
+        incident_path: INCIDENT_PATH.into(),
+        incident_digest: sha256(&canonical(&value)?),
     })
 }
 
@@ -883,9 +906,10 @@ fn validate_preregistration(plan: &Preregistration, manifest: &CorpusManifest) -
     runtime.manifest_digest.clear();
     if plan.schema_version != "2.0"
         || plan.kind != "m005_w07_preregistration"
-        || plan.experiment_id != "m005-w07-rust-registry-v2"
+        || plan.experiment_id != "m005-w07-rust-registry-v3"
         || plan.state != "PRE_RUN_FROZEN"
         || plan.corpus_manifest_digest != sha256(&canonical(manifest)?)
+        || plan.prior_invalid_experiment != prior_invalid_experiment(&workspace_root())?
         || plan.public_receipt_key.algorithm != "Ed25519"
         || !plan.oracle_selection.outcome_independent
         || plan.analysis.contrast != "C-L"
@@ -971,7 +995,7 @@ fn not_run_report(
     StatusReport {
         schema_version: "2.0".into(),
         kind: "m005_w07_status_report".into(),
-        experiment_id: "m005-w07-rust-registry-v2".into(),
+        experiment_id: "m005-w07-rust-registry-v3".into(),
         status: "NOT_RUN_PRECOMMIT".into(),
         statistical_verdict: None,
         gate_claim: "NONE; C-L and G05 are not claimed".into(),

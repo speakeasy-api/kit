@@ -309,15 +309,16 @@ fn run_local_inner(
                 forbidden_paths: vec![root.to_path_buf(), key_path.to_path_buf()],
                 expected_executable_digest: executable_digest.clone(),
                 max_duration: Duration::from_secs(120),
+                capture_stderr: false,
             })?;
             let raw = match outcome {
-                SandboxOutcome::Exited(status) if status.success() => {
+                SandboxOutcome::Exited { status, .. } if status.success() => {
                     fs::set_permissions(&worker_output, fs::Permissions::from_mode(0o400))?;
                     let sealed = read_bounded(&worker_output, crate::MAX_JSON_BYTES as u64)?;
                     let _sealed_digest = sha256(&sealed);
                     serde_json::from_slice::<RawTrial>(&sealed)?
                 }
-                SandboxOutcome::Exited(status) => failed_raw(
+                SandboxOutcome::Exited { status, .. } => failed_raw(
                     unit,
                     *arm,
                     admission_digest,
@@ -327,7 +328,7 @@ fn run_local_inner(
                     TrialTerminal::Error,
                     format!("worker exited with {status}"),
                 )?,
-                SandboxOutcome::TimedOut => failed_raw(
+                SandboxOutcome::TimedOut { .. } => failed_raw(
                     unit,
                     *arm,
                     admission_digest,
@@ -425,7 +426,7 @@ pub fn run_trusted() -> Result<()> {
     let report = crate::BlockedReport {
         schema_version: "2.0".into(),
         kind: "m005_w07_blocked_report".into(),
-        experiment_id: "m005-w07-rust-registry-v2".into(),
+        experiment_id: "m005-w07-rust-registry-v3".into(),
         status: "BLOCKED_G03_G04".into(),
         gate_claim: "NONE_BLOCKED_EXTERNAL".into(),
         measured_trials: 0,
@@ -714,6 +715,7 @@ fn prepare_checkouts(
         for command in &commands[1..] {
             git_status_owned(git, &checkout, command)?;
         }
+        let receipt_commands = materialization_receipt_commands(&commands)?;
         let files = validate_checkout(git, vendor, &checkout, unit).map_err(|error| {
             ProtocolError(format!(
                 "failed to validate package/VCS materialization for {}: {error}",
@@ -747,7 +749,7 @@ fn prepare_checkouts(
                 git_digest: git.digest.clone(),
                 git_version: git.version.clone(),
                 fetch_depth: 100,
-                commands,
+                commands: receipt_commands,
                 result: "FETCH_HEAD_DETACHED_EXACT".into(),
                 repository_url: unit.package.normalized_repository_url.clone(),
                 vcs_commit: unit.package.vcs_commit.clone(),
@@ -765,6 +767,17 @@ fn prepare_checkouts(
         });
     }
     Ok((checkouts, file_digest(&receipts)?, schedule.units.len()))
+}
+
+fn materialization_receipt_commands(commands: &[Vec<String>]) -> Result<Vec<Vec<String>>> {
+    if commands.first().map(Vec::as_slice).is_none_or(|command| {
+        command.len() != 2 || command.first().map(String::as_str) != Some("init")
+    }) {
+        return Err(ProtocolError("invalid Git init materialization command".into()).into());
+    }
+    let mut receipt = commands.to_vec();
+    receipt[0][1] = "$CHECKOUT".into();
+    Ok(receipt)
 }
 
 fn validate_checkout(
@@ -1812,6 +1825,28 @@ mod tests {
             &analyses,
             treatment_guardrails_pass(&grades)
         ));
+    }
+
+    #[test]
+    fn materialization_receipt_replaces_only_machine_local_checkout_target() {
+        let commands = vec![
+            vec!["init".into(), "/private/tmp/m005/checkouts/unit-00".into()],
+            vec!["fetch".into(), "origin".into()],
+        ];
+        let receipt = materialization_receipt_commands(&commands).unwrap();
+        assert_eq!(
+            receipt,
+            vec![
+                vec!["init".to_owned(), "$CHECKOUT".to_owned()],
+                vec!["fetch".to_owned(), "origin".to_owned()],
+            ]
+        );
+        assert_eq!(commands[0][1], "/private/tmp/m005/checkouts/unit-00");
+        assert!(
+            !serde_json::to_string(&receipt)
+                .unwrap()
+                .contains("/private/")
+        );
     }
 
     #[test]

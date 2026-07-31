@@ -233,7 +233,7 @@ fn verify_receipts(
             || receipt.package_files != package_files
             || !valid_normalizations
             || receipt.commands.len() != 4
-            || receipt.commands[0].first().map(String::as_str) != Some("init")
+            || receipt.commands[0] != ["init".to_owned(), "$CHECKOUT".to_owned()]
             || receipt.commands[1]
                 != [
                     "remote".to_owned(),

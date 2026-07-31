@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -21,12 +21,18 @@ pub struct LocalSandboxRequest {
     pub writable_roots: Vec<PathBuf>,
     pub forbidden_paths: Vec<PathBuf>,
     pub max_duration: Duration,
+    pub capture_stderr: bool,
 }
 
 #[derive(Debug)]
 pub enum SandboxOutcome {
-    Exited(ExitStatus),
-    TimedOut,
+    Exited {
+        status: ExitStatus,
+        stderr_first_line: Option<String>,
+    },
+    TimedOut {
+        stderr_first_line: Option<String>,
+    },
 }
 
 pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome> {
@@ -87,7 +93,7 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
         return Err(ProtocolError("sandbox inputs and writable roots overlap".into()).into());
     }
     let mut profile = String::from(
-        "(version 1)\n(deny default)\n(deny network*)\n(allow process-fork)\n(allow signal (target self))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.iossupportversion\") (sysctl-name \"kern.osvariant_status\") (sysctl-name \"hw.ephemeral_storage\"))\n(allow file-read* (literal \"/\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/private/var/db/timezone\") (literal \"/dev/null\") (literal \"/dev/urandom\"))\n",
+        "(version 1)\n(deny default)\n(deny network*)\n(allow process-fork)\n(allow signal (target self))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"kern.osproductversion\") (sysctl-name \"kern.iossupportversion\") (sysctl-name \"kern.osvariant_status\") (sysctl-name \"hw.ephemeral_storage\") (sysctl-name \"hw.pagesize_compat\"))\n(allow file-read* (literal \"/\") (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/private/var/db/timezone\") (literal \"/dev/null\") (literal \"/dev/urandom\"))\n",
     );
     profile.push_str(&format!(
         "(allow process-exec (literal {}))\n(allow file-read* (literal {}) (subpath {}))\n",
@@ -135,7 +141,8 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
         .first()
         .and_then(|executable| executable.parent())
         .unwrap_or_else(|| Path::new("/usr/bin"));
-    let mut child = Command::new("/usr/bin/sandbox-exec")
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
         .args(["-p", &profile])
         .arg(&executable)
         .args(request.arguments)
@@ -147,8 +154,27 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
         .current_dir(source)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(if request.capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command.spawn()?;
+    let stderr = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut retained = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stderr.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                let remaining = 4096_usize.saturating_sub(retained.len());
+                retained.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+            Ok(retained)
+        })
+    });
     if identity(&executable)? != executable_identity
         || file_digest(&executable, 256 << 20)? != request.expected_executable_digest
     {
@@ -159,15 +185,53 @@ pub fn run_local_sandbox(request: LocalSandboxRequest) -> Result<SandboxOutcome>
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(SandboxOutcome::Exited(status));
+            return Ok(SandboxOutcome::Exited {
+                status,
+                stderr_first_line: finish_stderr(stderr)?,
+            });
         }
         if started.elapsed() >= request.max_duration {
             child.kill()?;
             let _ = child.wait();
-            return Ok(SandboxOutcome::TimedOut);
+            return Ok(SandboxOutcome::TimedOut {
+                stderr_first_line: finish_stderr(stderr)?,
+            });
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn finish_stderr(stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>) -> Result<Option<String>> {
+    let Some(stderr) = stderr else {
+        return Ok(None);
+    };
+    let bytes = stderr
+        .join()
+        .map_err(|_| ProtocolError("sandbox stderr diagnostic thread failed".into()))??;
+    Ok(sanitize_stderr_first_line(&bytes))
+}
+
+fn sanitize_stderr_first_line(bytes: &[u8]) -> Option<String> {
+    let line = String::from_utf8_lossy(bytes)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|token| {
+            if token.contains(['/', '\\', '=']) {
+                "$REDACTED"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = line
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect::<String>();
+    (!line.is_empty()).then_some(line)
 }
 
 fn existing_file(path: &Path) -> Result<PathBuf> {
@@ -237,6 +301,22 @@ mod tests {
     static ORDINAL: AtomicU64 = AtomicU64::new(1);
 
     #[test]
+    fn startup_diagnostic_is_single_line_bounded_and_path_free() {
+        let diagnostic = sanitize_stderr_first_line(
+            b"fatal runtime error: /private/tmp/worker TOKEN=secret\nignored /other/path",
+        )
+        .unwrap();
+        assert_eq!(diagnostic, "fatal runtime error: $REDACTED $REDACTED");
+        assert!(!diagnostic.contains(['/', '=']));
+        assert_eq!(
+            sanitize_stderr_first_line("x".repeat(300).as_bytes())
+                .unwrap()
+                .len(),
+            256
+        );
+    }
+
+    #[test]
     fn local_backend_runs_and_denies_oracle() {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "kit-m005-sandbox-{}-{}",
@@ -262,9 +342,10 @@ mod tests {
             writable_roots: vec![output.clone()],
             forbidden_paths: vec![forbidden.clone()],
             max_duration: Duration::from_secs(1),
+            capture_stderr: false,
         })
         .unwrap();
-        assert!(matches!(status, SandboxOutcome::Exited(status) if status.success()));
+        assert!(matches!(status, SandboxOutcome::Exited { status, .. } if status.success()));
         let secret = forbidden.join("oracle.json");
         fs::write(&secret, "hidden").unwrap();
         let denied = run_local_sandbox(LocalSandboxRequest {
@@ -278,9 +359,10 @@ mod tests {
             writable_roots: vec![output],
             forbidden_paths: vec![forbidden],
             max_duration: Duration::from_secs(1),
+            capture_stderr: false,
         })
         .unwrap();
-        assert!(matches!(denied, SandboxOutcome::Exited(status) if !status.success()));
+        assert!(matches!(denied, SandboxOutcome::Exited { status, .. } if !status.success()));
 
         let home_secret = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
             ".kit-w07-sandbox-secret-{}-{}",
@@ -299,9 +381,10 @@ mod tests {
             writable_roots: vec![root.join("output")],
             forbidden_paths: vec![root.join("forbidden")],
             max_duration: Duration::from_secs(1),
+            capture_stderr: false,
         })
         .unwrap();
-        assert!(matches!(home_denied, SandboxOutcome::Exited(status) if !status.success()));
+        assert!(matches!(home_denied, SandboxOutcome::Exited { status, .. } if !status.success()));
         fs::remove_file(home_secret).unwrap();
 
         let network_denied = run_local_sandbox(LocalSandboxRequest {
@@ -315,9 +398,12 @@ mod tests {
             writable_roots: vec![root.join("output")],
             forbidden_paths: vec![root.join("forbidden")],
             max_duration: Duration::from_secs(1),
+            capture_stderr: false,
         })
         .unwrap();
-        assert!(matches!(network_denied, SandboxOutcome::Exited(status) if !status.success()));
+        assert!(
+            matches!(network_denied, SandboxOutcome::Exited { status, .. } if !status.success())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

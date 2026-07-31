@@ -1,0 +1,13 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "type":"object","additionalProperties":false,
+  "required":["schema_version","kind","experiment_id","preregistration_digest","status","route","scheduled_trials","aborted_trials","signal","failure_phase","observations","root_cause","claims","measured_started_at","measured_ended_at","artifact_sha256"],
+  "properties":{
+    "schema_version":{"const":"1.0"},"kind":{"const":"m005_w07_worker_abort_incident"},"experiment_id":{"const":"m005-w07-rust-registry-v2"},"preregistration_digest":{"const":"sha256:68def4141404f99704822ee6752e0f68fbf19ea6ef70db967d8d1d33013b2787"},
+    "status":{"const":"INVALID_HARNESS"},"route":{"const":"LOCAL_SANDBOX_NOT_TRUSTED"},"scheduled_trials":{"const":504},"aborted_trials":{"const":504},"signal":{"const":"SIGABRT"},"failure_phase":{"const":"BEFORE_MAIN"},"observations":{"const":0},
+    "root_cause":{"type":"object","additionalProperties":false,"required":["code","sysctl"],"properties":{"code":{"const":"DENIED_SYSCTL"},"sysctl":{"const":"hw.pagesize_compat"}}},
+    "claims":{"type":"object","additionalProperties":false,"required":["retrieval","statistical","g05"],"properties":{"retrieval":{"const":false},"statistical":{"const":false},"g05":{"const":false}}},
+    "measured_started_at":{"const":"2026-07-31T04:40:23.784083Z"},"measured_ended_at":{"const":"2026-07-31T05:22:02.472128Z"},
+    "artifact_sha256":{"type":"object","additionalProperties":false,"required":["report","raw_trials","signed_ledger","git_materialization"],"properties":{"report":{"const":"84c345cf402095535d3908d971705569e4109fd88ab67330993705544f53a9d2"},"raw_trials":{"const":"e164784b323a2a1b8f66b3b3621bacaa2326ab6fdc98968d96293f5f3119d3a7"},"signed_ledger":{"const":"74b7c51b36e157b5d5be6014820344be3c7e08986f18b2a871aa6ecfb36fd4d8"},"git_materialization":{"const":"f50c494020859f9bbc58243a7d240c2e61a86bdaf6adec2ae61d6a16a31c8d58"}}}
+  }
+}

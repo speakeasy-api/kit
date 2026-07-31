@@ -1,12 +1,18 @@
 {
   "schema_version": "2.0",
   "kind": "m005_w07_preregistration",
-  "experiment_id": "m005-w07-rust-registry-v2",
+  "experiment_id": "m005-w07-rust-registry-v3",
   "state": "PRE_RUN_FROZEN",
   "language": "rust",
   "corpus_manifest_digest": "sha256:edb275e46eae8a74f3beed1144c64ab9e3117a21dfa522cc0be005d201fbd35e",
+  "prior_invalid_experiment": {
+    "experiment_id": "m005-w07-rust-registry-v2",
+    "status": "INVALID_HARNESS",
+    "incident_path": "eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json",
+    "incident_digest": "sha256:9b90c4a2236a5bce8e8c96c4fdbad3e788b642dc0ed1a3e56c17e8901b1fb445"
+  },
   "immutable_inputs": {
-    "build_inputs": "sha256:0725eebb155b75b5d0694c2b0f823243678c175edb545d13380497c54d73935f"
+    "build_inputs": "sha256:1ee7929122b32d768c86d3def95766a53e4cd10ad2097c12ec99aaff4b420abb"
   },
   "runtime_environment": {
     "manifest_digest": "sha256:9196ec006f89f8a6244b20f393077cceb443815e80b0d26ea3d834a29fc3a31a",

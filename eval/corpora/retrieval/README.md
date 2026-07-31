@@ -3,6 +3,8 @@
 This crate freezes an honest Rust retrieval corpus from published crates that are already present in
 the root `Cargo.lock`. It contains no generated repositories, target symbols, answer-bearing paths,
 or measured result. The retained report is `NOT_RUN_PRECOMMIT` and makes no C-L or G05 claim.
+The v3 preregistration binds the sanitized `INVALID_HARNESS` incident from the v2 worker-abort run;
+that incident contains no retrieval observation or machine-local path.
 
 ## Frozen Corpus
 

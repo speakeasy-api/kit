@@ -603,7 +603,7 @@ fn graph_observation(
                 Some(graph),
             ))
         }
-        Err(error) => Ok((
+        Err(_) => Ok((
             error_observation(
                 RetrievalSource::StructureGraph,
                 "kit::workspace::graph::structure::StructureGraphProvider::refresh",
@@ -611,7 +611,6 @@ fn graph_observation(
                 started_at,
                 started,
                 "STRUCTURE_GRAPH_ERROR",
-                &error.to_string(),
                 SourceStatus::Error,
             )?,
             None,
@@ -933,14 +932,13 @@ where
                 error,
             })
         }
-        Err(error) => error_observation(
+        Err(_) => error_observation(
             source,
             api,
             revision_digest,
             started_at,
             started,
             "KIT_API_ERROR",
-            &error.to_string(),
             SourceStatus::Error,
         ),
     }
@@ -977,7 +975,6 @@ fn error_observation(
     started_at: String,
     started: Instant,
     code: &str,
-    error: &str,
     status: SourceStatus,
 ) -> Result<SourceObservation> {
     Ok(SourceObservation {
@@ -992,7 +989,7 @@ fn error_observation(
         truncated: false,
         source_revision_digest: revision_digest.into(),
         error_code: Some(code.into()),
-        error: Some(error.chars().take(4096).collect()),
+        error: Some(code.into()),
     })
 }
 

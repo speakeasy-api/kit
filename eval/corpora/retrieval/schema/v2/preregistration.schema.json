@@ -29,6 +29,10 @@
         "pem_path":{"const":"eval/corpora/retrieval/public-key.pem"}
       }
     },
+    "prior_invalid_experiment": {
+      "type":"object","additionalProperties":false,"required":["experiment_id","status","incident_path","incident_digest"],
+      "properties":{"experiment_id":{"const":"m005-w07-rust-registry-v2"},"status":{"const":"INVALID_HARNESS"},"incident_path":{"const":"eval/reports/m005/source-semantics/incidents/m005-w07-v2-worker-abort.json"},"incident_digest":{"$ref":"#/$defs/digest"}}
+    },
     "oracle_selection": {
       "type":"object","additionalProperties":false,"required":["algorithm","eligibility","query_derivation","decoy_count","outcome_independent"],
       "properties": {
@@ -77,12 +81,12 @@
     }
   },
   "type":"object","additionalProperties":false,
-  "required":["schema_version","kind","experiment_id","state","language","corpus_manifest_digest","immutable_inputs","runtime_environment","public_receipt_key","oracle_selection","trial_protocol","analysis","external_blockers"],
+  "required":["schema_version","kind","experiment_id","state","language","corpus_manifest_digest","prior_invalid_experiment","immutable_inputs","runtime_environment","public_receipt_key","oracle_selection","trial_protocol","analysis","external_blockers"],
   "properties": {
     "schema_version":{"const":"2.0"},"kind":{"const":"m005_w07_preregistration"},
-    "experiment_id":{"const":"m005-w07-rust-registry-v2"},"state":{"const":"PRE_RUN_FROZEN"},
+    "experiment_id":{"const":"m005-w07-rust-registry-v3"},"state":{"const":"PRE_RUN_FROZEN"},
     "language":{"const":"rust"},"corpus_manifest_digest":{"$ref":"#/$defs/digest"},
-    "immutable_inputs":{"$ref":"#/$defs/immutable_inputs"},"runtime_environment":{"$ref":"#/$defs/runtime"},
+    "prior_invalid_experiment":{"$ref":"#/$defs/prior_invalid_experiment"},"immutable_inputs":{"$ref":"#/$defs/immutable_inputs"},"runtime_environment":{"$ref":"#/$defs/runtime"},
     "public_receipt_key":{"$ref":"#/$defs/public_key"},"oracle_selection":{"$ref":"#/$defs/oracle_selection"},
     "trial_protocol":{"$ref":"#/$defs/trial_protocol"},"analysis":{"$ref":"#/$defs/analysis"},
     "external_blockers":{"type":"array","minItems":4,"maxItems":4,"uniqueItems":true,"items":{"type":"string","minLength":2,"maxLength":256}}
