@@ -53,6 +53,15 @@ pub enum RetrySafety {
     NonIdempotent,
 }
 
+impl RetrySafety {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::Idempotent => 0,
+            Self::NonIdempotent => 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalState {
@@ -612,7 +621,7 @@ fn request_digest(
     put_bytes(&mut bytes, envelope.invocation_id.to_string().as_bytes());
     envelope.capability.write_canonical(&mut bytes);
     put_digest(&mut bytes, envelope.bound_schema_digest);
-    bytes.push(effect_tag(envelope.effect));
+    bytes.push(envelope.effect.tag());
     bytes.extend_from_slice(
         &(envelope.argument_constraints.predicates().len() as u64).to_be_bytes(),
     );
@@ -630,10 +639,7 @@ fn request_digest(
         }
         None => bytes.push(0),
     }
-    bytes.push(match envelope.retry_safety {
-        RetrySafety::Idempotent => 0,
-        RetrySafety::NonIdempotent => 1,
-    });
+    bytes.push(envelope.retry_safety.tag());
     bytes.push(match envelope.approval {
         ApprovalState::NotRequired => 0,
         ApprovalState::Pending => 1,
@@ -880,16 +886,6 @@ fn spend_value(spend: Spend) -> serde_json::Value {
         "tools": spend.tools(),
         "processes": spend.processes(),
     })
-}
-
-fn effect_tag(effect: EffectClass) -> u8 {
-    match effect {
-        EffectClass::ModelCall => 0,
-        EffectClass::WorkspaceRead => 1,
-        EffectClass::WorkspaceWrite => 2,
-        EffectClass::ProcessSpawn => 3,
-        EffectClass::NetworkEgress => 4,
-    }
 }
 
 fn effect_name(effect: EffectClass) -> &'static str {

@@ -279,6 +279,7 @@ impl ProviderSchemaProjection {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct SchemaProjectionSet {
     schema: Arc<NormalizedSchema>,
     projections: BTreeMap<ProjectionTarget, ProviderSchemaProjection>,
@@ -345,6 +346,16 @@ impl SchemaProjectionSet {
 
     pub fn projection(&self, target: &ProjectionTarget) -> Option<&ProviderSchemaProjection> {
         self.projections.get(target)
+    }
+
+    pub fn schema(&self) -> &NormalizedSchema {
+        &self.schema
+    }
+
+    pub fn projections(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&ProjectionTarget, &ProviderSchemaProjection)> {
+        self.projections.iter()
     }
 
     pub fn len(&self) -> usize {

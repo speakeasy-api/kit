@@ -33,7 +33,7 @@ impl EffectClass {
         }
     }
 
-    const fn tag(self) -> u8 {
+    pub(crate) const fn tag(self) -> u8 {
         match self {
             Self::ModelCall => 0,
             Self::WorkspaceRead => 1,
@@ -531,7 +531,7 @@ pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
     );
     canonical.extend_from_slice(&(authenticated.grants().len() as u64).to_be_bytes());
     for grant in authenticated.grants() {
-        canonical.push(grant_tag(*grant));
+        canonical.push(grant.tag());
     }
     let snapshot_digest = Digest::of(request.grants.digest().algorithm(), &canonical);
 
@@ -595,18 +595,5 @@ pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
         reason,
         snapshot_digest,
         binding_inputs,
-    }
-}
-
-const fn grant_tag(grant: Grant) -> u8 {
-    match grant {
-        Grant::ModelCall => 0,
-        Grant::WorkspaceRead => 1,
-        Grant::WorkspaceWrite => 2,
-        Grant::ProcessSpawn => 3,
-        Grant::NetworkEgress => 4,
-        Grant::VerificationTargeted => 5,
-        Grant::VerificationFull => 6,
-        Grant::HostProcessCompatibility => 7,
     }
 }

@@ -838,7 +838,7 @@ impl LayerKind {
 macro_rules! tagged_enum {
     ($type:ty, $($tag:literal => $variant:path),+ $(,)?) => {
         impl $type {
-            const fn tag(self) -> u8 {
+            pub(crate) const fn tag(self) -> u8 {
                 match self {
                     $($variant => $tag),+
                 }

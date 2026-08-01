@@ -69,4 +69,8 @@ impl MoneyMicros {
                 .ok_or(AccountingError::MoneyOverflow)?,
         )
     }
+
+    pub(crate) fn is_canonical(&self) -> bool {
+        self.currency.len() == 3 && self.currency.bytes().all(|byte| byte.is_ascii_uppercase())
+    }
 }
