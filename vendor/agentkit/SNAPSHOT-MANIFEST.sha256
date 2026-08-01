@@ -121,7 +121,7 @@ ac033dd4478024a652aa6c178c5c86cf8013bbd309933a15e595ff3498062952  100644  crates
 dd59f9f3e553cb1c753bb46faed8fd294558e5891cfd596d060f7d58ed5549d8  100644  crates/agentkit-capabilities/src/lib.rs
 3d5621aa5809c1eb958708a46116a79a9fe80b1e4720689c5a33c6de0dda1a1c  100644  crates/agentkit-compaction/Cargo.toml
 934657911cda47ad42349748d7f583d7d64ed7a67cbaa17c631e9250f547d67f  100644  crates/agentkit-compaction/README.md
-b40f4177a021fbcc56465ae0fe48739b853290b56b421f3f98d2fc453c488092  100644  crates/agentkit-compaction/src/lib.rs
+cf73c6ceae28d53dd8bcf229c9ad6ee3ad1bd56597642c464f642e3d52a0b1b7  100644  crates/agentkit-compaction/src/lib.rs
 60921777837dc7fc994dc3d7e23d300dd5500615679a7807dbeff54868d57c73  100644  crates/agentkit-context/Cargo.toml
 f428daa725d5a04c24e53eb15a2c1da39bb83f0f6a3c47450bbfbe0315799fda  100644  crates/agentkit-context/README.md
 22a986c0879bb12d164eeacb1bd2037b11ebdc517761f9fad9083dbb9e923a42  100644  crates/agentkit-context/src/lib.rs
@@ -181,7 +181,7 @@ f6cf06007fb4123b59cd0437e365c2515ebe7abba296ecb02cbf3753fa15ed60  100644  crates
 77067e6194f27823927c4272afda4792d72bfb174edb43ce0ea73042b6916f9a  100644  crates/agentkit-integration-tests/tests/tool_macro.rs
 0c8084347f654867a3c3bf8db63ff7dc5e01f1fba26bb5c697e6eb69761de5ec  100644  crates/agentkit-loop/Cargo.toml
 7f3f839ee6d60d1806532d176b7c62c3198603d3da784cc4a105b8b5e322ce9d  100644  crates/agentkit-loop/README.md
-7ab194a38136f6d43f44192edc9022ef2e055baf72a817775412ea0ec9a6004f  100644  crates/agentkit-loop/src/lib.rs
+ddb75c55cc30bc81a4b5517246ae0f9e98ad77b12752e28a5930fc31da054f75  100644  crates/agentkit-loop/src/lib.rs
 60addd2667e04d4ff9703c41cb35f61870e223df23d22a382df1318f9f414337  100644  crates/agentkit-mcp/Cargo.toml
 d334d6bae3ceea005f2effe6b8d8b8579ee74a14d1b6bc7557d194b4e40f983b  100644  crates/agentkit-mcp/README.md
 e5f18868ced9493573a8eae0c12afd7f4d41cfbfdc4daba6f0c16d915930edf0  100644  crates/agentkit-mcp/src/lib.rs
@@ -291,7 +291,7 @@ d9deb6206ff0013bcc3d2079c35cea5111d575c9b247e0725af8c7e8138eb62a  100644  docs/v
 13ce3af0f0b2ba4fcf249715dfbb13463dbf759eb58b6b42303413ebe4bdf997  100644  examples/anthropic-chat/Cargo.toml
 8351d8b98ca31329a873c8a038eb7c120cd5d719d06b369df681e4ccf118784b  100644  examples/anthropic-chat/src/main.rs
 e4afd0f139a8d4e460db7b784ed77734203b6513ba518391ffb6d16cb17d7d85  100644  examples/cerebras-batch/Cargo.toml
-0bdad35202e90c5e92ef815f9f7e8769a1041f7528f838b007fab3aff2877937  100644  examples/cerebras-batch/src/main.rs
+4fa456f81ff1d752a25bcbfff6980bdef62f3f28ddab72cfdf874288b825bf56  100644  examples/cerebras-batch/src/main.rs
 6c2065e340b1b9ac46217f8f4f11fab271af03e6193ac20babec6f7cc2a21e93  100644  examples/cerebras-chat/Cargo.toml
 4a8ffc1bd0b68ccb788f3c2afb556f6cdaf1faf5797b4558ceb0aa28eb92faf5  100644  examples/cerebras-chat/src/main.rs
 2162436049fd8b4208c32674cd073bb9ebbe395f925887f3aa844e8f1738cfaf  100644  examples/mcp-dynamic-auth/Cargo.toml

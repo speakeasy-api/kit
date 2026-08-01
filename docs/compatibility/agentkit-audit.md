@@ -10,7 +10,7 @@ Kit targets only the repository-vendored snapshot in `vendor/agentkit/`:
 | Source tree | `5befb5676ea31703f4485e2d4b5869c39a39cb0f` |
 | Dirty overlay SHA-256 | `92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1` |
 | Excluded generated-path list SHA-256 | `6013053000cc27b0e77ed61964266ff38e246bee41fee9ef829c0d8763ecd3ae` |
-| Agentkit aggregate SHA-256 | `7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a` |
+| Agentkit aggregate SHA-256 | `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2` |
 | Runlet aggregate SHA-256 | `fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef` |
 | Agentkit version | `0.10.2` |
 | Runlet version/source | `0.1.0`, repository path `vendor/runlet` |
@@ -21,13 +21,11 @@ These values equal `docs/compatibility/pins/agentkit-snapshot.yaml`,
 the bridge constants to both preflight records. `scripts/verify_pins.sh`
 recomputes the payload digests and verifies the manifests.
 
-The four post-capture changes are rustfmt-only. Formatting the reconstructed
-recorded files with the pinned Rust 1.94.0 rustfmt produces the payload files
-byte-for-byte. The deterministic Agentkit and Runlet formatting patch digests
-are `6e598fadf82872029ac172008e03f7d9d2795e54d985d545509ea55cbaea5ef4`
-and `da354fef9418f6f54bcb95349e7f5da6da92d2970e2ae8620a1a9a9ca14ad12e`;
-the snapshot metadata records every prior and normalized file hash. Only line
-wrapping changed, with no token, behavior, schema, or public API change.
+The base snapshot retains its recorded rustfmt normalization evidence. M009-W01 adds the reviewed
+behavioral overlay `m009-post-validation-checkpoint` in the loop and compaction crates. Its exact prior
+and current file hashes are recorded in `src/agent/agentkit_patch/manifest.yaml`; the current aggregate
+above binds the complete payload. `docs/compatibility/agentkit-hook.md` defines the compatibility and
+authority contract.
 
 ## Mapping Contract
 
@@ -129,12 +127,11 @@ operations cannot be reconstructed from `LoopSnapshot`. Before restart, an
 uncertain dispatched operation must be committed as a durable error result or
 `outcome_unknown`; it must not be blindly repeated or reported as success.
 
-The reviewed loop invokes mutators and only then validates transcript pairing.
-It has no fallible post-validation checkpoint-promotion hook. Semantic
-compaction is therefore disabled at this boundary. Only independently
-validated, versioned structural mutation is safe until agentkit provides a
-hook that atomically promotes the validated transcript before the next model
-call.
+The patched loop invokes mutators on a copy-on-write candidate, validates transcript pairing, and then
+calls a fallible post-validation checkpoint hook before promotion or model dispatch. Exact pending
+candidates survive unknown outcomes and dropped futures for idempotent reconciliation. The hook API is
+present and pinned, but semantic compaction remains disabled until M009-W02 supplies durable checkpoint
+states and M009-W06 installs the authoritative Kit hook and proves atomic promotion.
 
 ## Dependency Needs
 

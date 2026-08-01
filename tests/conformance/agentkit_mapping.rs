@@ -6,7 +6,10 @@ use agentkit_core::{
     MetadataMap, Modality, Part, PartId, PartKind, ReasoningPart, StructuredPart, TextPart,
     TokenUsage, ToolCallPart, ToolOutput, ToolResultPart, Usage,
 };
-use agentkit_loop::{InputRequest, LoopInterrupt, PendingApproval, ToolRoundInfo, TranscriptEvent};
+use agentkit_loop::{
+    InputRequest, LoopInterrupt, PendingApproval, PostValidationCheckpoint,
+    PostValidationCheckpointCursor, PostValidationCheckpointHook, ToolRoundInfo, TranscriptEvent,
+};
 use agentkit_tools_core::{ApprovalReason, ApprovalRequest, ToolInterruption};
 use mapping::{
     AGENTKIT_BASE_COMMIT, AGENTKIT_BASE_TREE, AGENTKIT_DIRTY_OVERLAY_SHA256,
@@ -48,6 +51,39 @@ fn upstream_variant_counts_and_transcript_shape_are_pinned() {
     let transcript = source_item(LOOP_SOURCE, "pub struct TranscriptEvent");
     assert!(transcript.contains("pub session_id: &'a SessionId"));
     assert!(transcript.contains("pub item: &'a Item"));
+}
+
+#[test]
+fn post_validation_checkpoint_hook_is_pinned() {
+    assert!(std::mem::size_of::<PostValidationCheckpoint<'static>>() > 0);
+    let _: Option<&dyn PostValidationCheckpointHook> = None;
+    let cursor = PostValidationCheckpointCursor::new("attempt", 9, "driver", 6, 7);
+    assert_eq!(cursor.attempt_id(), "attempt");
+    assert_eq!(cursor.fence(), 9);
+    assert_eq!(cursor.driver_id(), "driver");
+    assert_eq!(cursor.durable_head_sequence(), 6);
+    assert_eq!(cursor.next_sequence(), 7);
+    for field in [
+        "pub id:",
+        "pub session_id:",
+        "pub turn_id:",
+        "pub point:",
+        "pub transcript:",
+        "pub base_transcript:",
+        "pub expected_previous_sequence:",
+    ] {
+        assert!(source_item(LOOP_SOURCE, "pub struct PostValidationCheckpoint").contains(field));
+    }
+
+    let validate = LOOP_SOURCE
+        .find("validate_transcript_invariants(cursor.as_slice())?")
+        .unwrap();
+    let checkpoint = LOOP_SOURCE.find("hook.checkpoint(").unwrap();
+    let promote = LOOP_SOURCE
+        .find("self.transcript = pending.candidate")
+        .unwrap();
+    let dispatch = LOOP_SOURCE.find("let request = TurnRequest").unwrap();
+    assert!(validate < checkpoint && checkpoint < promote && promote < dispatch);
 }
 
 #[test]

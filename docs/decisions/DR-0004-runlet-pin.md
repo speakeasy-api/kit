@@ -108,3 +108,6 @@ digests; Agentkit's independently normalized payload digest is
 The Runlet API mismatch is resolved by the immutable vendored tree-digest pin,
 the stale corpus expectation is explicitly normalized, and all required suites
 and digest checks pass. `BLK-01` is closed.
+
+The Agentkit digest above is the historical payload used to close this Runlet decision. M009-W01
+later adds a separately recorded Agentkit hook overlay; it does not modify the pinned Runlet payload.

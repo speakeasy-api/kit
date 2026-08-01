@@ -409,15 +409,10 @@
   evidence_id: EV-3.02-C-202
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises agentkit_loop_authority exits 0 with 0 failed tests
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run on loop driver or model/tool turn orchestration changes.
   decision_record: null
   deviation_record: null
@@ -2466,15 +2461,10 @@
   evidence_id: EV-1.04-C-834
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_802 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-802 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2517,15 +2507,10 @@
   evidence_id: EV-1.04-C-835
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_803 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-803 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2568,15 +2553,10 @@
   evidence_id: EV-1.04-C-836
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_804 exits 0 with 1 passed and 0 failed
-  artifact_digest: 9798f6138dcec703ac218ced07f6721a0a0175087480a6f43c19f5cdb311dd3a
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-804 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2619,15 +2599,10 @@
   evidence_id: EV-1.04-C-837
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_805 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-805 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2650,7 +2625,8 @@
   acceptance_criteria:
   - cargo test --test conformance architectural_promises -- kit_agentkit_806 exits 0 with 1 passed and 0 failed
   primary_milestone: M002
-  contributing_milestones: []
+  contributing_milestones:
+  - M009
   dependencies: []
   owner: Agent integration owner
   criticality: high
@@ -2663,22 +2639,21 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - vendor/agentkit/crates/agentkit-loop/src/lib.rs
+  - src/agent/agentkit_patch/manifest.yaml
+  public_contract_links:
+  - docs/compatibility/agentkit-hook.md
+  telemetry_links:
+  - tests/conformance/agentkit_mapping.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-838
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_806 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-806 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2692,7 +2667,7 @@
   source_quote: The reviewed agentkit loop validates transcript invariants only after mutators return. Kit therefore requires an agentkit post-validation, fallible checkpoint hook before semantic compaction is enabled. A mutator writes only a candidate artifact; the hook atomically promotes the validated final transcript/checkpoint before the next model call. Until that hook exists, Kit may perform only structural mutations whose complete invariants it independently duplicates and versions.
   source_fingerprint: b7e8d24d1de16b1ee0efb0105cfd82c1fcc6e63c9e1bc8d767da125c90491992
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: implemented
+  status: proposed
   supersedes: null
   tombstone_reason: null
   area: KIT-AGENTKIT
@@ -2721,15 +2696,10 @@
   evidence_id: EV-1.04-C-839
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_807 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-807 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2743,7 +2713,7 @@
   source_quote: The reviewed agentkit loop validates transcript invariants only after mutators return. Kit therefore requires an agentkit post-validation, fallible checkpoint hook before semantic compaction is enabled. A mutator writes only a candidate artifact; the hook atomically promotes the validated final transcript/checkpoint before the next model call. Until that hook exists, Kit may perform only structural mutations whose complete invariants it independently duplicates and versions.
   source_fingerprint: b7e8d24d1de16b1ee0efb0105cfd82c1fcc6e63c9e1bc8d767da125c90491992
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: implemented
+  status: proposed
   supersedes: null
   tombstone_reason: null
   area: KIT-AGENTKIT
@@ -2752,7 +2722,8 @@
   acceptance_criteria:
   - cargo test --test conformance architectural_promises -- kit_agentkit_808 exits 0 with 1 passed and 0 failed
   primary_milestone: M002
-  contributing_milestones: []
+  contributing_milestones:
+  - M009
   dependencies: []
   owner: Agent integration owner
   criticality: high
@@ -2765,22 +2736,21 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - vendor/agentkit/crates/agentkit-loop/src/lib.rs
+  - src/agent/agentkit_patch/manifest.yaml
+  public_contract_links:
+  - docs/compatibility/agentkit-hook.md
+  telemetry_links:
+  - tests/conformance/agentkit_mapping.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-840
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_808 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-808 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2823,15 +2793,10 @@
   evidence_id: EV-1.04-C-841
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_809 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-809 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2874,15 +2839,10 @@
   evidence_id: EV-1.04-C-842
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_810 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-810 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2925,15 +2885,10 @@
   evidence_id: EV-1.04-C-843
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_811 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-811 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -2976,15 +2931,10 @@
   evidence_id: EV-1.04-C-844
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_812 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-812 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -3027,15 +2977,10 @@
   evidence_id: EV-1.04-C-845
   evidence_job: integration
   expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_813 exits 0 with 1 passed and 0 failed
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-AGENTKIT-813 or its source contract changes.
   decision_record: null
   deviation_record: null

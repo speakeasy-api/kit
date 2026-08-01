@@ -105,3 +105,10 @@ suite and digest check passes. `BLK-02` is closed.
 ## Timestamp
 
 2026-07-21 (UTC)
+
+## Current Overlay
+
+M009-W01 retains this historical source capture and adds the pinned
+`m009-post-validation-checkpoint` overlay. The current complete Agentkit payload digest is
+`cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`; exact changed-file hashes are
+recorded in `src/agent/agentkit_patch/manifest.yaml`.

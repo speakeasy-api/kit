@@ -74,6 +74,12 @@ normalization:
     rationale: "canonical rustfmt line wrapping only; no behavior, schema, or API change"
 maintenance:
   generated_build_output: "workspace target is excluded only as a declared generated target root; verification uses external CARGO_TARGET_DIR"
+  post_validation_checkpoint_hook:
+    patch_id: "m009-post-validation-checkpoint"
+    files:
+      - "crates/agentkit-loop/src/lib.rs"
+      - "crates/agentkit-compaction/src/lib.rs"
+    evidence: "src/agent/agentkit_patch/manifest.yaml;docs/compatibility/agentkit-hook.md"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -89,7 +95,7 @@ final_snapshot:
   manifest: "vendor/agentkit/SNAPSHOT-MANIFEST.sha256"
   generated_target_roots_excluded:
     - "target"
-  aggregate_sha256: "7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a"
+  aggregate_sha256: "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   symlink_hashing: "SHA-256 of link target bytes"
   license_preserved: "LICENSE"
@@ -102,7 +108,7 @@ final_snapshot:
 verification:
   test_command: "CARGO_TARGET_DIR=/tmp/kit-agentkit-target cargo test --locked --workspace --all-features"
   source_reconstruction: "pass"
-  vendored_no_index_diff: "pass: identical to captured tracked source"
+  vendored_no_index_diff: "pass: base capture reconstructs; declared M009 overlay file hashes verify"
   manifest: "pass"
   cargo_metadata_locked: "pass: runlet 0.1.0 resolves inside kit/vendor with expected source=null"
   compose_runlet_tests: "pass: 23 unit tests and 1 doctest"
@@ -483,7 +489,7 @@ files:
     sha256: "934657911cda47ad42349748d7f583d7d64ed7a67cbaa17c631e9250f547d67f"
   - path: "crates/agentkit-compaction/src/lib.rs"
     mode: "100644"
-    sha256: "b40f4177a021fbcc56465ae0fe48739b853290b56b421f3f98d2fc453c488092"
+    sha256: "cf73c6ceae28d53dd8bcf229c9ad6ee3ad1bd56597642c464f642e3d52a0b1b7"
   - path: "crates/agentkit-context/Cargo.toml"
     mode: "100644"
     sha256: "60921777837dc7fc994dc3d7e23d300dd5500615679a7807dbeff54868d57c73"
@@ -663,7 +669,7 @@ files:
     sha256: "7f3f839ee6d60d1806532d176b7c62c3198603d3da784cc4a105b8b5e322ce9d"
   - path: "crates/agentkit-loop/src/lib.rs"
     mode: "100644"
-    sha256: "7ab194a38136f6d43f44192edc9022ef2e055baf72a817775412ea0ec9a6004f"
+    sha256: "ddb75c55cc30bc81a4b5517246ae0f9e98ad77b12752e28a5930fc31da054f75"
   - path: "crates/agentkit-mcp/Cargo.toml"
     mode: "100644"
     sha256: "60addd2667e04d4ff9703c41cb35f61870e223df23d22a382df1318f9f414337"
@@ -993,7 +999,7 @@ files:
     sha256: "e4afd0f139a8d4e460db7b784ed77734203b6513ba518391ffb6d16cb17d7d85"
   - path: "examples/cerebras-batch/src/main.rs"
     mode: "100644"
-    sha256: "0bdad35202e90c5e92ef815f9f7e8769a1041f7528f838b007fab3aff2877937"
+    sha256: "4fa456f81ff1d752a25bcbfff6980bdef62f3f28ddab72cfdf874288b825bf56"
   - path: "examples/cerebras-chat/Cargo.toml"
     mode: "100644"
     sha256: "6c2065e340b1b9ac46217f8f4f11fab271af03e6193ac20babec6f7cc2a21e93"

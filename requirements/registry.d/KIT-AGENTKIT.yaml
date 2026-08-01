@@ -37,15 +37,10 @@
   evidence_id: EV-M002-W01-C-001
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -88,15 +83,10 @@
   evidence_id: EV-M002-W01-C-002
   evidence_job: reproducible-build
   expected_result: '`cargo build --locked` exits 0 and the pre/post `Cargo.lock` SHA-256 digests are equal.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -139,15 +129,10 @@
   evidence_id: EV-M002-W01-C-003
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit feature-set entries.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -192,15 +177,10 @@
   evidence_id: EV-M002-W01-C-004
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty selected Runlet revision fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -243,15 +223,10 @@
   evidence_id: EV-M002-W02-C-001
   evidence_job: fault
   expected_result: '`cargo test --test fault agentkit_restart` exits 0 with 0 failed restart fixtures.'
-  artifact_digest: 7b833cf24e00428b0ffa759304fc02a24846b2e8ee29dbce51632df6b39db0dc
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when LoopDriver ownership, snapshots, or restart behavior changes.
   decision_record: null
   deviation_record: null
@@ -294,15 +269,10 @@
   evidence_id: EV-M002-W03-C-001
   evidence_job: fault
   expected_result: '`cargo test --test fault agentkit_effect_boundaries` exits 0 with 0 intent-order violations.'
-  artifact_digest: f30f39155b0d2db4895722d733dd654b8fcdf6ff59430c44f188080915c99a57
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when an agentkit effect wrapper or dispatch path changes.
   decision_record: null
   deviation_record: null
@@ -345,15 +315,10 @@
   evidence_id: EV-M002-W03-C-002
   evidence_job: fault
   expected_result: '`cargo test --test fault agentkit_effect_boundaries` exits 0 with 0 outcome-order violations.'
-  artifact_digest: f30f39155b0d2db4895722d733dd654b8fcdf6ff59430c44f188080915c99a57
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when an agentkit effect wrapper or return path changes.
   decision_record: null
   deviation_record: null
@@ -396,15 +361,10 @@
   evidence_id: EV-M002-W03-C-009
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -447,15 +407,10 @@
   evidence_id: EV-M002-W03-C-010
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -498,15 +453,10 @@
   evidence_id: EV-M002-W03-C-011
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -549,15 +499,10 @@
   evidence_id: EV-M002-W03-C-012
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -600,15 +545,10 @@
   evidence_id: EV-M002-W03-C-013
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -651,15 +591,10 @@
   evidence_id: EV-M002-W03-C-014
   evidence_job: reproducible-build
   expected_result: '`scripts/verify_pins.sh` exits 0 with 0 empty agentkit source digest fields.'
-  artifact_digest: 6ab8a53e7c29631c8f56103fba29137ed593274bcaa38bd9d78fb8d2e3cbd9e0
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when agentkit source, dependency metadata, or build pins change.
   decision_record: null
   deviation_record: null
@@ -695,9 +630,12 @@
   - hostile
   release_gates:
   - G09
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/agent/agentkit_patch/manifest.yaml
+  public_contract_links:
+  - docs/compatibility/agentkit-hook.md
+  telemetry_links:
+  - tests/conformance/agentkit_mapping.rs
   evidence_type: manual_review
   evidence_id: EV-M009-W01-M-001
   evidence_job: evidence-report

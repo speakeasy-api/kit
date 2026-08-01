@@ -62,7 +62,10 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use agentkit_core::{
     CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TaskId,
@@ -882,20 +885,38 @@ pub struct LoopCtx<'a> {
 /// mutator dirtied the transcript and hard-fails on protocol violations.
 pub struct TranscriptCursor<'a> {
     items: &'a mut Vec<Item>,
+    candidate: Option<Vec<Item>>,
+    transactional: bool,
     pub(crate) dirty: bool,
+}
+
+impl TranscriptCursor<'_> {
+    /// Replace the entire transcript candidate without cloning the prior value.
+    pub fn replace(&mut self, items: Vec<Item>) {
+        self.dirty = true;
+        if self.transactional {
+            self.candidate = Some(items);
+        } else {
+            *self.items = items;
+        }
+    }
 }
 
 impl<'a> std::ops::Deref for TranscriptCursor<'a> {
     type Target = Vec<Item>;
     fn deref(&self) -> &Vec<Item> {
-        self.items
+        self.candidate.as_ref().unwrap_or(self.items)
     }
 }
 
 impl<'a> std::ops::DerefMut for TranscriptCursor<'a> {
     fn deref_mut(&mut self) -> &mut Vec<Item> {
         self.dirty = true;
-        self.items
+        if self.transactional {
+            self.candidate.get_or_insert_with(|| self.items.clone())
+        } else {
+            self.items
+        }
     }
 }
 
@@ -920,6 +941,148 @@ pub trait LoopMutator: Send + Sync {
         let _ = (cursor, ctx);
         Ok(())
     }
+}
+
+/// A transcript candidate after all mutators and protocol validation complete.
+///
+/// Registered hosts may durably checkpoint this candidate before the loop
+/// promotes it and dispatches the next model request.
+#[non_exhaustive]
+pub struct PostValidationCheckpoint<'a> {
+    /// Stable process-local identity retained across retries of this candidate.
+    pub id: &'a PostValidationCheckpointId,
+    /// Session this checkpoint belongs to.
+    pub session_id: &'a SessionId,
+    /// Turn the mutation is associated with, if any.
+    pub turn_id: Option<&'a agentkit_core::TurnId>,
+    /// Where in the loop the mutation occurred.
+    pub point: MutationPoint,
+    /// Validated candidate transcript that will be promoted on success.
+    pub transcript: &'a [Item],
+    /// Exact transcript from which the candidate was derived.
+    pub base_transcript: &'a [Item],
+    /// Sequence the durable checkpoint head must have before this commit.
+    pub expected_previous_sequence: u64,
+}
+
+/// Restart-stable identity for one checkpoint candidate.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PostValidationCheckpointId {
+    attempt_id: Arc<str>,
+    fence: u64,
+    driver_id: Arc<str>,
+    sequence: u64,
+}
+
+impl PostValidationCheckpointId {
+    /// Host attempt that owns this checkpoint.
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Fencing token for the owning attempt.
+    pub const fn fence(&self) -> u64 {
+        self.fence
+    }
+
+    /// Unique durable lease instance presenting this checkpoint.
+    pub fn driver_id(&self) -> &str {
+        &self.driver_id
+    }
+
+    /// Monotonic checkpoint sequence within the namespace.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// Restart cursor supplied by the durable host when installing the hook.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PostValidationCheckpointCursor {
+    attempt_id: Arc<str>,
+    fence: u64,
+    driver_id: Arc<str>,
+    durable_head_sequence: u64,
+    next_sequence: u64,
+}
+
+impl PostValidationCheckpointCursor {
+    /// Create a cursor reconstructed from the authoritative durable head.
+    pub fn new(
+        attempt_id: impl Into<Arc<str>>,
+        fence: u64,
+        driver_id: impl Into<Arc<str>>,
+        durable_head_sequence: u64,
+        next_sequence: u64,
+    ) -> Self {
+        Self {
+            attempt_id: attempt_id.into(),
+            fence,
+            driver_id: driver_id.into(),
+            durable_head_sequence,
+            next_sequence,
+        }
+    }
+
+    /// Host attempt that owns this cursor.
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Fencing token for the owning attempt.
+    pub const fn fence(&self) -> u64 {
+        self.fence
+    }
+
+    /// Unique durable lease instance for this driver.
+    pub fn driver_id(&self) -> &str {
+        &self.driver_id
+    }
+
+    /// Sequence at the authoritative durable checkpoint head.
+    pub const fn durable_head_sequence(&self) -> u64 {
+        self.durable_head_sequence
+    }
+
+    /// Sequence that will identify the next new candidate.
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    fn clone_for_driver(&self) -> Self {
+        Self {
+            attempt_id: Arc::clone(&self.attempt_id),
+            fence: self.fence,
+            driver_id: Arc::clone(&self.driver_id),
+            durable_head_sequence: self.durable_head_sequence,
+            next_sequence: self.next_sequence,
+        }
+    }
+}
+
+/// Authoritative result of attempting or reconciling a checkpoint operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostValidationCheckpointOutcome {
+    /// The exact candidate is durably committed at its checkpoint ID.
+    Committed,
+    /// The operation definitely did not commit and may be safely abandoned.
+    NotCommitted(String),
+    /// Commit status is unknown; retry must reconcile the same ID and candidate.
+    Unknown(String),
+}
+
+/// Fallible durability hook invoked after transcript mutation and validation.
+///
+/// Failure leaves the live transcript unchanged and aborts model dispatch.
+/// Implementations must not retain checkpoint references or re-enter the same
+/// loop driver.
+#[async_trait]
+pub trait PostValidationCheckpointHook: Send + Sync {
+    /// Durably checkpoint the validated transcript candidate.
+    async fn checkpoint(
+        &self,
+        checkpoint: PostValidationCheckpoint<'_>,
+    ) -> PostValidationCheckpointOutcome;
 }
 
 /// Lifecycle and streaming events emitted by the [`LoopDriver`].
@@ -1300,6 +1463,22 @@ struct PendingApprovalToolCall {
     cancellation: Option<TurnCancellation>,
 }
 
+struct PendingCheckpoint {
+    id: PostValidationCheckpointId,
+    expected_previous_sequence: u64,
+    turn_id: agentkit_core::TurnId,
+    point: MutationPoint,
+    emit_started: bool,
+    cancellation: Option<TurnCancellation>,
+    candidate: Vec<Item>,
+    ambiguous: bool,
+}
+
+struct PendingTurnResume {
+    turn_id: agentkit_core::TurnId,
+    cancellation: Option<TurnCancellation>,
+}
+
 #[derive(Clone, Default)]
 struct ActiveToolRound {
     turn_id: agentkit_core::TurnId,
@@ -1307,6 +1486,25 @@ struct ActiveToolRound {
     cancellation: Option<TurnCancellation>,
     background_pending: bool,
     foreground_progressed: bool,
+}
+
+struct CheckpointStartGuard<'a> {
+    started: &'a AtomicBool,
+    armed: bool,
+}
+
+impl CheckpointStartGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CheckpointStartGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.started.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// A configured agent ready to start a session.
@@ -1362,6 +1560,9 @@ where
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     mutators: Vec<Arc<dyn LoopMutator>>,
+    post_validation_checkpoint_hook: Option<Arc<dyn PostValidationCheckpointHook>>,
+    post_validation_checkpoint_cursor: Option<PostValidationCheckpointCursor>,
+    post_validation_checkpoint_started: AtomicBool,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
@@ -1396,7 +1597,25 @@ where
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
         let default_structured_output = config.structured_output.clone();
+        let checkpoint_start = self.post_validation_checkpoint_hook.is_some();
+        if checkpoint_start
+            && self
+                .post_validation_checkpoint_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(LoopError::InvalidState(
+                "checkpoint-enabled agent already started a driver".into(),
+            ));
+        }
+        let mut checkpoint_guard = checkpoint_start.then(|| CheckpointStartGuard {
+            started: &self.post_validation_checkpoint_started,
+            armed: true,
+        });
         let session = self.model.start_session(config).await?;
+        if let Some(guard) = checkpoint_guard.as_mut() {
+            guard.disarm();
+        }
         let tool_executor = self
             .tool_executor
             .clone()
@@ -1415,6 +1634,11 @@ where
             resources: self.resources.clone(),
             cancellation: self.cancellation.clone(),
             mutators: self.mutators.clone(),
+            post_validation_checkpoint_hook: self.post_validation_checkpoint_hook.clone(),
+            post_validation_checkpoint_cursor: self
+                .post_validation_checkpoint_cursor
+                .as_ref()
+                .map(PostValidationCheckpointCursor::clone_for_driver),
             observers: self.observers.clone(),
             transcript_observers: self.transcript_observers.clone(),
             transcript: self.transcript.clone(),
@@ -1423,6 +1647,7 @@ where
             pending_approval_order: VecDeque::new(),
             active_tool_round: None,
             pending_round_resume: None,
+            pending_checkpoint: None,
             next_turn_index: 1,
             detached_call_ids: HashSet::new(),
             tool_cancellations: HashMap::new(),
@@ -1449,6 +1674,8 @@ where
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     mutators: Vec<Arc<dyn LoopMutator>>,
+    post_validation_checkpoint_hook: Option<Arc<dyn PostValidationCheckpointHook>>,
+    post_validation_checkpoint_cursor: Option<PostValidationCheckpointCursor>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
@@ -1469,6 +1696,8 @@ where
             resources: Arc::new(()),
             cancellation: None,
             mutators: Vec::new(),
+            post_validation_checkpoint_hook: None,
+            post_validation_checkpoint_cursor: None,
             observers: Vec::new(),
             transcript_observers: Vec::new(),
             transcript: Vec::new(),
@@ -1555,6 +1784,24 @@ where
         self
     }
 
+    /// Register the sole durability hook run after mutation and validation.
+    ///
+    /// When installed, dirty mutation passes operate on a candidate transcript.
+    /// The candidate replaces the live transcript only after validation and
+    /// this hook both succeed. Clean passes do not invoke the hook.
+    pub fn post_validation_checkpoint_hook<H>(
+        mut self,
+        cursor: PostValidationCheckpointCursor,
+        hook: H,
+    ) -> Self
+    where
+        H: PostValidationCheckpointHook + 'static,
+    {
+        self.post_validation_checkpoint_hook = Some(Arc::new(hook));
+        self.post_validation_checkpoint_cursor = Some(cursor);
+        self
+    }
+
     /// Register a [`LoopObserver`] that receives [`AgentEvent`]s.
     ///
     /// Multiple observers may be registered; they are called in order.
@@ -1607,6 +1854,19 @@ where
     ///
     /// Returns [`LoopError::InvalidState`] if no model adapter was provided.
     pub fn build(self) -> Result<Agent<M>, LoopError> {
+        if let Some(cursor) = &self.post_validation_checkpoint_cursor
+            && (cursor.attempt_id.is_empty()
+                || cursor.attempt_id.len() > 256
+                || cursor.fence == 0
+                || cursor.driver_id.is_empty()
+                || cursor.driver_id.len() > 256
+                || cursor.next_sequence <= cursor.durable_head_sequence)
+        {
+            return Err(LoopError::InvalidState(
+                "checkpoint cursor requires a bounded attempt, fence, unique driver, and sequence after its durable head"
+                    .into(),
+            ));
+        }
         let model = self
             .model
             .ok_or_else(|| LoopError::InvalidState("model adapter is required".into()))?;
@@ -1621,6 +1881,9 @@ where
             resources: self.resources,
             cancellation: self.cancellation,
             mutators: self.mutators,
+            post_validation_checkpoint_hook: self.post_validation_checkpoint_hook,
+            post_validation_checkpoint_cursor: self.post_validation_checkpoint_cursor,
+            post_validation_checkpoint_started: AtomicBool::new(false),
             observers: self.observers,
             transcript_observers: self.transcript_observers,
             transcript: self.transcript,
@@ -1676,6 +1939,8 @@ where
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     mutators: Vec<Arc<dyn LoopMutator>>,
+    post_validation_checkpoint_hook: Option<Arc<dyn PostValidationCheckpointHook>>,
+    post_validation_checkpoint_cursor: Option<PostValidationCheckpointCursor>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
@@ -1683,7 +1948,8 @@ where
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
     pending_approval_order: VecDeque<ToolCallId>,
     active_tool_round: Option<ActiveToolRound>,
-    pending_round_resume: Option<agentkit_core::TurnId>,
+    pending_round_resume: Option<PendingTurnResume>,
+    pending_checkpoint: Option<PendingCheckpoint>,
     next_turn_index: u64,
     /// Call ids whose original tool_use was already paired with a
     /// synthetic detach tool_result. When the real result eventually
@@ -1938,7 +2204,8 @@ where
     async fn run_mutators(
         &mut self,
         point: MutationPoint,
-        turn_id: Option<&agentkit_core::TurnId>,
+        turn_id: &agentkit_core::TurnId,
+        emit_started: bool,
         cancellation: Option<TurnCancellation>,
     ) -> Result<(), LoopError> {
         if self.mutators.is_empty() {
@@ -1951,6 +2218,7 @@ where
             return Err(LoopError::Cancelled);
         }
         let mutators = self.mutators.clone();
+        let checkpoint_hook = self.post_validation_checkpoint_hook.clone();
         let session_id = self.session_id.clone();
         let observed_session_id = Arc::clone(&self.observed_session_id);
         let observers = self.observers.clone();
@@ -1960,6 +2228,8 @@ where
         };
         let mut cursor = TranscriptCursor {
             items: &mut self.transcript,
+            candidate: None,
+            transactional: checkpoint_hook.is_some(),
             dirty: false,
         };
         for mutator in &mutators {
@@ -1971,17 +2241,115 @@ where
             }
             let ctx = LoopCtx {
                 session_id: &session_id,
-                turn_id,
+                turn_id: Some(turn_id),
                 point,
                 cancellation: cancellation.clone(),
                 emitter: &emitter,
             };
             mutator.mutate(&mut cursor, ctx).await?;
         }
-        if cursor.dirty {
-            validate_transcript_invariants(cursor.items)?;
+        let dirty = cursor.dirty;
+        if dirty {
+            validate_transcript_invariants(cursor.as_slice())?;
+        }
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(LoopError::Cancelled);
+        }
+        let candidate = cursor.candidate.take();
+        drop(cursor);
+        if dirty && let Some(candidate) = candidate {
+            let checkpoint_cursor = self
+                .post_validation_checkpoint_cursor
+                .as_mut()
+                .ok_or_else(|| LoopError::InvalidState("missing checkpoint cursor".into()))?;
+            let sequence = checkpoint_cursor.next_sequence;
+            checkpoint_cursor.next_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| LoopError::InvalidState("checkpoint sequence exhausted".into()))?;
+            self.pending_checkpoint = Some(PendingCheckpoint {
+                id: PostValidationCheckpointId {
+                    attempt_id: Arc::clone(&checkpoint_cursor.attempt_id),
+                    fence: checkpoint_cursor.fence,
+                    driver_id: Arc::clone(&checkpoint_cursor.driver_id),
+                    sequence,
+                },
+                expected_previous_sequence: checkpoint_cursor.durable_head_sequence,
+                turn_id: turn_id.clone(),
+                point,
+                emit_started,
+                cancellation,
+                candidate,
+                ambiguous: false,
+            });
         }
         Ok(())
+    }
+
+    async fn complete_pending_checkpoint(&mut self) -> Result<(), LoopError> {
+        let Some(pending) = self.pending_checkpoint.as_ref() else {
+            return Ok(());
+        };
+        if !pending.ambiguous
+            && pending
+                .cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled)
+        {
+            self.pending_checkpoint = None;
+            return Err(LoopError::Cancelled);
+        }
+
+        let hook = self
+            .post_validation_checkpoint_hook
+            .clone()
+            .ok_or_else(|| LoopError::InvalidState("missing checkpoint hook".into()))?;
+        self.pending_checkpoint
+            .as_mut()
+            .expect("pending checkpoint exists")
+            .ambiguous = true;
+        let result = {
+            let pending = self
+                .pending_checkpoint
+                .as_ref()
+                .expect("pending checkpoint exists");
+            hook.checkpoint(PostValidationCheckpoint {
+                id: &pending.id,
+                session_id: &self.session_id,
+                turn_id: Some(&pending.turn_id),
+                point: pending.point,
+                transcript: &pending.candidate,
+                base_transcript: &self.transcript,
+                expected_previous_sequence: pending.expected_previous_sequence,
+            })
+            .await
+        };
+        match result {
+            PostValidationCheckpointOutcome::Committed => {
+                let pending = self
+                    .pending_checkpoint
+                    .take()
+                    .expect("pending checkpoint exists");
+                self.post_validation_checkpoint_cursor
+                    .as_mut()
+                    .expect("checkpoint cursor exists")
+                    .durable_head_sequence = pending.id.sequence;
+                self.transcript = pending.candidate;
+                Ok(())
+            }
+            PostValidationCheckpointOutcome::NotCommitted(reason) => {
+                self.pending_checkpoint
+                    .as_mut()
+                    .expect("pending checkpoint exists")
+                    .ambiguous = false;
+                Err(LoopError::PostValidationCheckpoint(reason))
+            }
+            PostValidationCheckpointOutcome::Unknown(reason) => {
+                Err(LoopError::PostValidationCheckpointUnknown(reason))
+            }
+        }
     }
 
     async fn continue_active_tool_round(&mut self) -> Result<Option<LoopStep>, LoopError> {
@@ -2164,7 +2532,10 @@ where
                         turn_id: turn_id.clone(),
                         transcript_len: self.transcript.len(),
                     };
-                    self.pending_round_resume = Some(turn_id);
+                    self.pending_round_resume = Some(PendingTurnResume {
+                        turn_id,
+                        cancellation: active.cancellation,
+                    });
                     return Ok(Some(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(
                         info,
                     ))));
@@ -2196,23 +2567,43 @@ where
         turn_id: agentkit_core::TurnId,
         emit_started: bool,
         mutation_point: MutationPoint,
+        requested_cancellation: Option<TurnCancellation>,
     ) -> Result<LoopStep, LoopError> {
         if let Some(provider) = &self.provider_name {
             tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
         }
-        let cancellation = self
-            .cancellation
-            .as_ref()
-            .map(CancellationHandle::checkpoint);
-        match self
-            .run_mutators(mutation_point, Some(&turn_id), cancellation.clone())
-            .await
+        let cancellation = if let Some(pending) = self.pending_checkpoint.as_ref() {
+            if pending.turn_id != turn_id
+                || pending.point != mutation_point
+                || pending.emit_started != emit_started
+            {
+                return Err(LoopError::InvalidState(
+                    "checkpoint resume does not match the pending turn".into(),
+                ));
+            }
+            pending.cancellation.clone()
+        } else {
+            requested_cancellation
+        };
+        if self.pending_checkpoint.is_none() {
+            match self
+                .run_mutators(mutation_point, &turn_id, emit_started, cancellation.clone())
+                .await
+            {
+                Ok(()) => {}
+                Err(LoopError::Cancelled) => {
+                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.pending_checkpoint.is_some()
+            && let Err(error) = self.complete_pending_checkpoint().await
         {
-            Ok(()) => {}
-            Err(LoopError::Cancelled) => {
+            if matches!(error, LoopError::Cancelled) {
                 return self.finish_cancelled(turn_id, interrupted_assistant_items());
             }
-            Err(error) => return Err(error),
+            return Err(error);
         }
 
         // A mutator may have removed the freshly-submitted input (e.g. a
@@ -2490,10 +2881,7 @@ where
                 self.emit(AgentEvent::ToolExecutionStarted(pending.call.clone()));
                 let dispatch_span =
                     self.execute_tool_span(&pending.tool_request, &pending.turn_id, "approved");
-                let cancellation = self
-                    .cancellation
-                    .as_ref()
-                    .map(CancellationHandle::checkpoint);
+                let cancellation = pending.cancellation.clone();
                 self.register_tool_cancellation(&pending.call.id, cancellation.clone());
                 match self
                     .start_task_via_manager(
@@ -2550,8 +2938,13 @@ where
         } else if let Some(step) = self.next_unresolved_approval_interrupt() {
             Ok(step)
         } else {
-            self.drive_turn(pending.turn_id, false, MutationPoint::AfterToolResult)
-                .await
+            self.drive_turn(
+                pending.turn_id,
+                false,
+                MutationPoint::AfterToolResult,
+                pending.cancellation,
+            )
+            .await
         }
     }
 
@@ -2770,12 +3163,12 @@ where
     /// Returns [`LoopError::InvalidState`] if called while an unresolved
     /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if let Some(pending) = self.take_next_resolved_approval() {
-            return self.resume_after_approval(pending).await;
-        }
-
         if let Some(step) = self.finish_cancelled_pending_approval().await? {
             return Ok(step);
+        }
+
+        if let Some(pending) = self.take_next_resolved_approval() {
+            return self.resume_after_approval(pending).await;
         }
 
         if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
@@ -2784,6 +3177,16 @@ where
 
         if let Some(step) = self.next_unresolved_approval_interrupt() {
             return Ok(step);
+        }
+
+        if let Some(resume) = self.pending_checkpoint.as_ref() {
+            let turn_id = resume.turn_id.clone();
+            let emit_started = resume.emit_started;
+            let point = resume.point;
+            let cancellation = resume.cancellation.clone();
+            return self
+                .drive_turn(turn_id, emit_started, point, cancellation)
+                .await;
         }
 
         if let Some(step) = self.continue_active_tool_round().await? {
@@ -2799,11 +3202,16 @@ where
         // host during the yield is folded into the transcript as part of the
         // continuation turn; background task results drained just above are
         // already in the transcript.
-        if let Some(turn_id) = self.pending_round_resume.take() {
+        if let Some(resume) = self.pending_round_resume.take() {
             let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
             self.extend_transcript(drained);
             return self
-                .drive_turn(turn_id, false, MutationPoint::AfterToolResult)
+                .drive_turn(
+                    resume.turn_id,
+                    false,
+                    MutationPoint::AfterToolResult,
+                    resume.cancellation,
+                )
                 .await;
         }
 
@@ -2820,7 +3228,11 @@ where
         self.next_turn_index += 1;
         let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
         self.extend_transcript(drained);
-        self.drive_turn(turn_id, true, MutationPoint::AfterTurnEnded)
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationHandle::checkpoint);
+        self.drive_turn(turn_id, true, MutationPoint::AfterTurnEnded, cancellation)
             .await
     }
 
@@ -3068,6 +3480,12 @@ pub enum LoopError {
     /// An error reported by a [`LoopMutator`] (compaction, redaction, repair).
     #[error("mutator error: {0}")]
     Mutator(String),
+    /// A validated transcript candidate was rejected by its durability hook.
+    #[error("post-validation checkpoint error: {0}")]
+    PostValidationCheckpoint(String),
+    /// Durable commit status remains unknown and requires reconciliation.
+    #[error("post-validation checkpoint outcome unknown: {0}")]
+    PostValidationCheckpointUnknown(String),
     /// The requested operation is not supported.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
@@ -3186,6 +3604,9 @@ mod tests {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
         seen_caches: StdArc<StdMutex<Vec<Option<PromptCacheRequest>>>>,
     }
+    struct CheckpointDispatchAdapter {
+        transcripts: StdArc<StdMutex<Vec<Vec<Item>>>>,
+    }
     struct MultiToolAdapter;
     struct DualApprovalAdapter;
 
@@ -3194,6 +3615,9 @@ mod tests {
     struct RecordingSession {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
         seen_caches: StdArc<StdMutex<Vec<Option<PromptCacheRequest>>>>,
+    }
+    struct CheckpointDispatchSession {
+        transcripts: StdArc<StdMutex<Vec<Vec<Item>>>>,
     }
     struct MultiToolSession;
     struct DualApprovalSession;
@@ -3299,6 +3723,17 @@ mod tests {
             Ok(RecordingSession {
                 seen_descriptions: self.seen_descriptions.clone(),
                 seen_caches: self.seen_caches.clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for CheckpointDispatchAdapter {
+        type Session = CheckpointDispatchSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(CheckpointDispatchSession {
+                transcripts: self.transcripts.clone(),
             })
         }
     }
@@ -3462,6 +3897,29 @@ mod tests {
             self.seen_caches.lock().unwrap().push(request.cache.clone());
 
             Ok(RecordingTurn { emitted: false })
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for CheckpointDispatchSession {
+        type Turn = FakeTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            self.transcripts.lock().unwrap().push(request.transcript);
+            Ok(FakeTurn {
+                events: VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item::text(ItemKind::Assistant, "done")],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })]),
+            })
         }
     }
 
@@ -4029,6 +4487,152 @@ mod tests {
         }
     }
 
+    struct PrependSystemMutator;
+
+    #[async_trait]
+    impl LoopMutator for PrependSystemMutator {
+        async fn mutate(
+            &self,
+            cursor: &mut TranscriptCursor<'_>,
+            _ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            cursor.insert(0, Item::text(ItemKind::System, "checkpointed"));
+            Ok(())
+        }
+    }
+
+    struct AppendOrphanResultMutator;
+
+    #[async_trait]
+    impl LoopMutator for AppendOrphanResultMutator {
+        async fn mutate(
+            &self,
+            cursor: &mut TranscriptCursor<'_>,
+            _ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            cursor.push(Item {
+                id: None,
+                kind: ItemKind::Tool,
+                parts: vec![Part::ToolResult(ToolResultPart {
+                    call_id: ToolCallId::new("orphan"),
+                    output: ToolOutput::Text("invalid".into()),
+                    is_error: true,
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            });
+            Ok(())
+        }
+    }
+
+    struct CancellingMutator {
+        controller: CancellationController,
+    }
+
+    #[async_trait]
+    impl LoopMutator for CancellingMutator {
+        async fn mutate(
+            &self,
+            cursor: &mut TranscriptCursor<'_>,
+            _ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            cursor.insert(0, Item::text(ItemKind::System, "cancelled candidate"));
+            self.controller.interrupt();
+            Ok(())
+        }
+    }
+
+    struct RecordingCheckpoint {
+        transcripts: StdArc<StdMutex<Vec<Vec<Item>>>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl PostValidationCheckpointHook for RecordingCheckpoint {
+        async fn checkpoint(
+            &self,
+            checkpoint: PostValidationCheckpoint<'_>,
+        ) -> PostValidationCheckpointOutcome {
+            self.transcripts
+                .lock()
+                .unwrap()
+                .push(checkpoint.transcript.to_vec());
+            if self.fail {
+                return PostValidationCheckpointOutcome::NotCommitted("checkpoint rejected".into());
+            }
+            PostValidationCheckpointOutcome::Committed
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CheckpointObservation {
+        id: PostValidationCheckpointId,
+        expected_previous_sequence: u64,
+        base: Vec<Item>,
+        candidate: Vec<Item>,
+    }
+
+    struct BlockingCheckpoint {
+        calls: StdArc<AtomicUsize>,
+        entered: StdArc<Notify>,
+        release: StdArc<Notify>,
+        observations: StdArc<StdMutex<Vec<CheckpointObservation>>>,
+    }
+
+    #[async_trait]
+    impl PostValidationCheckpointHook for BlockingCheckpoint {
+        async fn checkpoint(
+            &self,
+            checkpoint: PostValidationCheckpoint<'_>,
+        ) -> PostValidationCheckpointOutcome {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(CheckpointObservation {
+                    id: checkpoint.id.clone(),
+                    expected_previous_sequence: checkpoint.expected_previous_sequence,
+                    base: checkpoint.base_transcript.to_vec(),
+                    candidate: checkpoint.transcript.to_vec(),
+                });
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            PostValidationCheckpointOutcome::Committed
+        }
+    }
+
+    struct UnknownThenCommittedCheckpoint {
+        calls: StdArc<AtomicUsize>,
+        observations: StdArc<StdMutex<Vec<CheckpointObservation>>>,
+    }
+
+    #[async_trait]
+    impl PostValidationCheckpointHook for UnknownThenCommittedCheckpoint {
+        async fn checkpoint(
+            &self,
+            checkpoint: PostValidationCheckpoint<'_>,
+        ) -> PostValidationCheckpointOutcome {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(CheckpointObservation {
+                    id: checkpoint.id.clone(),
+                    expected_previous_sequence: checkpoint.expected_previous_sequence,
+                    base: checkpoint.base_transcript.to_vec(),
+                    candidate: checkpoint.transcript.to_vec(),
+                });
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                PostValidationCheckpointOutcome::Unknown("commit timed out".into())
+            } else {
+                PostValidationCheckpointOutcome::Committed
+            }
+        }
+    }
+
     struct RecordingObserver {
         events: StdArc<StdMutex<Vec<AgentEvent>>>,
     }
@@ -4271,6 +4875,16 @@ mod tests {
                 step => return step,
             }
         }
+    }
+
+    fn checkpoint_cursor(name: &str) -> PostValidationCheckpointCursor {
+        PostValidationCheckpointCursor::new(
+            format!("attempt-{name}"),
+            7,
+            format!("driver-{name}"),
+            0,
+            1,
+        )
     }
 
     /// A mutator runs at the top of every `drive_turn`, and the loop labels
@@ -5260,7 +5874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_approval_runs_even_if_cancellation_also_fired() {
+    async fn cancellation_wins_a_resolved_approval_race() {
         let controller = CancellationController::new();
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
@@ -5295,11 +5909,7 @@ mod tests {
 
         match driver.next().await.unwrap() {
             LoopStep::Finished(turn) => {
-                assert_eq!(turn.finish_reason, FinishReason::Completed);
-                match &turn.items[0].parts[0] {
-                    Part::Text(text) => assert_eq!(text.text, "tool said: pong"),
-                    other => panic!("unexpected part after approval: {other:?}"),
-                }
+                assert_eq!(turn.finish_reason, FinishReason::Cancelled);
             }
             other => panic!("unexpected loop step after approved cancel race: {other:?}"),
         }
@@ -5562,6 +6172,392 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::MutationFinished { dirty: true, .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn post_validation_checkpoint_promotes_valid_candidate() {
+        let transcripts = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .mutator(PrependSystemMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("promote"),
+                RecordingCheckpoint {
+                    transcripts: transcripts.clone(),
+                    fail: false,
+                },
+            )
+            .transcript(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-promote"))
+            .await
+            .unwrap();
+        let turn_id = agentkit_core::TurnId::new("turn-promote");
+
+        driver
+            .run_mutators(MutationPoint::AfterTurnEnded, &turn_id, false, None)
+            .await
+            .unwrap();
+        driver.complete_pending_checkpoint().await.unwrap();
+
+        let recorded = transcripts.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], driver.snapshot().transcript);
+        assert_eq!(recorded[0][0].kind, ItemKind::System);
+    }
+
+    #[tokio::test]
+    async fn post_validation_checkpoint_failure_rolls_back_candidate() {
+        let transcripts = StdArc::new(StdMutex::new(Vec::new()));
+        let original = vec![Item::text(ItemKind::User, "hello")];
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .mutator(PrependSystemMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("rollback"),
+                RecordingCheckpoint {
+                    transcripts: transcripts.clone(),
+                    fail: true,
+                },
+            )
+            .transcript(original.clone())
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-rollback"))
+            .await
+            .unwrap();
+        let turn_id = agentkit_core::TurnId::new("turn-rollback");
+
+        driver
+            .run_mutators(MutationPoint::AfterTurnEnded, &turn_id, false, None)
+            .await
+            .unwrap();
+        let error = driver.complete_pending_checkpoint().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "post-validation checkpoint error: checkpoint rejected"
+        );
+        assert_eq!(transcripts.lock().unwrap().len(), 1);
+        assert_eq!(driver.snapshot().transcript, original);
+    }
+
+    #[tokio::test]
+    async fn invalid_candidate_never_reaches_post_validation_checkpoint() {
+        let transcripts = StdArc::new(StdMutex::new(Vec::new()));
+        let original = vec![Item::text(ItemKind::User, "hello")];
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .mutator(AppendOrphanResultMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("invalid"),
+                RecordingCheckpoint {
+                    transcripts: transcripts.clone(),
+                    fail: false,
+                },
+            )
+            .transcript(original.clone())
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-invalid"))
+            .await
+            .unwrap();
+        let turn_id = agentkit_core::TurnId::new("turn-invalid");
+
+        let error = driver
+            .run_mutators(MutationPoint::AfterTurnEnded, &turn_id, false, None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("orphaned tool_result"));
+        assert!(transcripts.lock().unwrap().is_empty());
+        assert_eq!(driver.snapshot().transcript, original);
+    }
+
+    #[tokio::test]
+    async fn clean_mutation_pass_skips_post_validation_checkpoint() {
+        let transcripts = StdArc::new(StdMutex::new(Vec::new()));
+        let points = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .mutator(PointRecordingMutator { points })
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("clean"),
+                RecordingCheckpoint {
+                    transcripts: transcripts.clone(),
+                    fail: false,
+                },
+            )
+            .transcript(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-clean"))
+            .await
+            .unwrap();
+        let turn_id = agentkit_core::TurnId::new("turn-clean");
+
+        driver
+            .run_mutators(MutationPoint::AfterTurnEnded, &turn_id, false, None)
+            .await
+            .unwrap();
+
+        assert!(transcripts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_preserves_turn_and_prevents_model_dispatch() {
+        let checkpoints = StdArc::new(StdMutex::new(Vec::new()));
+        let dispatched = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(CheckpointDispatchAdapter {
+                transcripts: dispatched.clone(),
+            })
+            .mutator(PrependSystemMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("no-dispatch"),
+                RecordingCheckpoint {
+                    transcripts: checkpoints.clone(),
+                    fail: true,
+                },
+            )
+            .input(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-no-dispatch"))
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let error = driver.next().await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "post-validation checkpoint error: checkpoint rejected"
+            );
+            assert!(dispatched.lock().unwrap().is_empty());
+            let snapshot = driver.snapshot();
+            assert_eq!(snapshot.transcript.len(), 1);
+            assert_eq!(snapshot.transcript[0].kind, ItemKind::User);
+        }
+        assert_eq!(checkpoints.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_success_dispatches_exact_promoted_transcript() {
+        let checkpoints = StdArc::new(StdMutex::new(Vec::new()));
+        let dispatched = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(CheckpointDispatchAdapter {
+                transcripts: dispatched.clone(),
+            })
+            .mutator(PrependSystemMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("dispatch"),
+                RecordingCheckpoint {
+                    transcripts: checkpoints.clone(),
+                    fail: false,
+                },
+            )
+            .input(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-dispatch"))
+            .await
+            .unwrap();
+
+        assert!(matches!(driver.next().await, Ok(LoopStep::Finished(_))));
+
+        let checkpoints = checkpoints.lock().unwrap();
+        let dispatched = dispatched.lock().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(dispatched.as_slice(), checkpoints.as_slice());
+        assert_eq!(driver.snapshot().transcript[0].kind, ItemKind::System);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_final_mutator_skips_checkpoint_and_dispatch() {
+        let controller = CancellationController::new();
+        let checkpoints = StdArc::new(StdMutex::new(Vec::new()));
+        let dispatched = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(CheckpointDispatchAdapter {
+                transcripts: dispatched.clone(),
+            })
+            .cancellation(controller.handle())
+            .mutator(CancellingMutator {
+                controller: controller.clone(),
+            })
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("cancel"),
+                RecordingCheckpoint {
+                    transcripts: checkpoints.clone(),
+                    fail: false,
+                },
+            )
+            .input(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-cancel"))
+            .await
+            .unwrap();
+
+        let result = driver.next().await.unwrap();
+
+        assert!(matches!(result, LoopStep::Finished(_)));
+        assert!(checkpoints.lock().unwrap().is_empty());
+        assert!(dispatched.lock().unwrap().is_empty());
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.transcript[0].kind, ItemKind::User);
+        assert_eq!(snapshot.transcript[1].kind, ItemKind::Assistant);
+    }
+
+    #[tokio::test]
+    async fn dropped_checkpoint_future_reconciles_exact_candidate_before_cancellation() {
+        let controller = CancellationController::new();
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let entered = StdArc::new(Notify::new());
+        let release = StdArc::new(Notify::new());
+        let observations = StdArc::new(StdMutex::new(Vec::new()));
+        let dispatched = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(CheckpointDispatchAdapter {
+                transcripts: dispatched.clone(),
+            })
+            .cancellation(controller.handle())
+            .mutator(PrependSystemMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("dropped"),
+                BlockingCheckpoint {
+                    calls: calls.clone(),
+                    entered: entered.clone(),
+                    release,
+                    observations: observations.clone(),
+                },
+            )
+            .input(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-dropped"))
+            .await
+            .unwrap();
+
+        let mut first = Box::pin(driver.next());
+        tokio::select! {
+            () = entered.notified() => {}
+            result = &mut first => panic!("checkpoint did not block: {result:?}"),
+        }
+        drop(first);
+        controller.interrupt();
+
+        let result = driver.next().await.unwrap();
+
+        assert!(matches!(result, LoopStep::Finished(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(dispatched.lock().unwrap().is_empty());
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0], observations[1]);
+        assert_eq!(observations[0].base.len(), 1);
+        assert_eq!(observations[0].candidate[0].kind, ItemKind::System);
+        let snapshot = driver.snapshot();
+        assert_eq!(snapshot.transcript[0].kind, ItemKind::System);
+        assert_eq!(
+            snapshot.transcript.last().unwrap().kind,
+            ItemKind::Assistant
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_checkpoint_outcome_reconciles_before_dispatch() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let observations = StdArc::new(StdMutex::new(Vec::new()));
+        let dispatched = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(CheckpointDispatchAdapter {
+                transcripts: dispatched.clone(),
+            })
+            .mutator(PrependSystemMutator)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("unknown"),
+                UnknownThenCommittedCheckpoint {
+                    calls: calls.clone(),
+                    observations: observations.clone(),
+                },
+            )
+            .input(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("checkpoint-unknown"))
+            .await
+            .unwrap();
+
+        let error = driver.next().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "post-validation checkpoint outcome unknown: commit timed out"
+        );
+        assert!(dispatched.lock().unwrap().is_empty());
+
+        assert!(matches!(driver.next().await, Ok(LoopStep::Finished(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0], observations[1]);
+        assert_eq!(observations[0].expected_previous_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_cursor_starts_exactly_one_driver() {
+        let transcripts = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .post_validation_checkpoint_hook(
+                checkpoint_cursor("single-driver"),
+                RecordingCheckpoint {
+                    transcripts,
+                    fail: false,
+                },
+            )
+            .build()
+            .unwrap();
+
+        let _driver = agent
+            .start(SessionConfig::new("checkpoint-driver-one"))
+            .await
+            .unwrap();
+        let error = match agent
+            .start(SessionConfig::new("checkpoint-driver-two"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("checkpoint cursor started a second driver"),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "invalid driver state: checkpoint-enabled agent already started a driver"
+        );
+    }
+
+    #[test]
+    fn dropped_checkpoint_start_guard_releases_claim() {
+        let started = AtomicBool::new(true);
+        drop(CheckpointStartGuard {
+            started: &started,
+            armed: true,
+        });
+        assert!(!started.load(Ordering::Acquire));
     }
 
     #[test]

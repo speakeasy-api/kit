@@ -903,7 +903,7 @@ impl<C: Compactor + 'static> LoopMutator for CompactorMutator<C> {
             Ok(new_items) => {
                 let replaced = before_len.saturating_sub(new_items.len());
                 metadata.insert("replaced_items".into(), (replaced as u64).into());
-                **cursor = new_items;
+                cursor.replace(new_items);
                 ctx.emitter.emit(AgentEvent::MutationFinished {
                     session_id: ctx.session_id.clone(),
                     turn_id: ctx.turn_id.cloned(),

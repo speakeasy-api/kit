@@ -51,6 +51,15 @@ maintenance:
       - "crates/agentkit-provider-cerebras/src/request.rs"
       - "crates/agentkit-provider-openai/src/lib.rs"
       - "crates/agentkit-provider-openrouter/src/lib.rs"
+      - "examples/cerebras-batch/src/main.rs"
+  post_validation_checkpoint_hook:
+    patch_id: "m009-post-validation-checkpoint"
+    rationale: "fallible validated transcript promotion boundary required before semantic compaction"
+    files:
+      - "crates/agentkit-loop/src/lib.rs"
+      - "crates/agentkit-compaction/src/lib.rs"
+    contract: "attempt/fence/driver-bound CAS; exact candidate reconciliation; typed committed/not-committed/unknown outcomes"
+    evidence: "src/agent/agentkit_patch/manifest.yaml;docs/compatibility/agentkit-hook.md"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -65,8 +74,8 @@ dependency_graph:
 final_snapshot:
   payload_file_count: 356
   manifest: "SNAPSHOT-MANIFEST.sha256"
-  manifest_sha256: "7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a"
-  aggregate_sha256: "7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a"
+  manifest_sha256: "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
+  aggregate_sha256: "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   attestation_files_excluded_from_payload_digest:
     - "SNAPSHOT-MANIFEST.sha256"
