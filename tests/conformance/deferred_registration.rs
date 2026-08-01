@@ -649,6 +649,25 @@ mod deferred_registration_tests {
             .unwrap();
         assert_eq!(portable_count.get(), 1);
 
+        let padded_input = format!("{boundary_input} ");
+        assert_eq!(padded_input.len(), MAX_BOUND_INPUT_BYTES + 1);
+        assert_rejected(
+            direct,
+            registry,
+            &fixture.session(),
+            DirectInvokeCall::new(wire, padded_input.as_bytes()).into(),
+            InvocationError::InputTooLarge,
+        );
+        let padded_wrapper = format!(r#"{{"binding_id":"{id}","input":{padded_input}}}"#);
+        assert_eq!(padded_wrapper.len(), MAX_INVOCATION_ARGUMENT_BYTES + 1);
+        assert_rejected(
+            portable,
+            registry,
+            &fixture.session(),
+            PortableInvokeCall::new(padded_wrapper.as_bytes()).into(),
+            InvocationError::WrapperTooLarge,
+        );
+
         let mut oversized_input = boundary_input.clone();
         oversized_input.insert(oversized_input.rfind('"').unwrap(), 'x');
         assert_eq!(oversized_input.len(), MAX_BOUND_INPUT_BYTES + 1);

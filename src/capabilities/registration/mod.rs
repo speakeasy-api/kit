@@ -633,7 +633,7 @@ struct NormalizedCall {
 
 impl NormalizedCall {
     fn direct(binding_id: BindingId, bytes: &[u8]) -> Result<Self, InvocationError> {
-        if bytes.len() > MAX_INVOCATION_ARGUMENT_BYTES {
+        if bytes.len() > MAX_BOUND_INPUT_BYTES {
             return Err(InvocationError::InputTooLarge);
         }
         preflight_input(bytes, MAX_INPUT_DEPTH, MAX_INPUT_NODES)
