@@ -7,6 +7,7 @@ mod broker_paths;
 mod cap_grant;
 mod cap_invoke;
 mod catalog_identity;
+include!("canonical_result.rs");
 mod cli_parity;
 mod config_layering;
 mod container_limits;

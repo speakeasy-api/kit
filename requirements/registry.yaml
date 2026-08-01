@@ -20506,7 +20506,8 @@
   acceptance_criteria:
   - cargo test --test conformance architectural_promises -- kit_encode_804 exits 0 with 1 passed and 0 failed
   primary_milestone: M007
-  contributing_milestones: []
+  contributing_milestones:
+  - M006
   dependencies: []
   owner: Encoding owner
   criticality: high
@@ -20519,9 +20520,12 @@
   - hostile
   release_gates:
   - G07
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/capabilities/result/mod.rs
+  public_contract_links:
+  - src/capabilities/result/mod.rs
+  telemetry_links:
+  - tests/conformance/canonical_result.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1059
   evidence_job: integration
