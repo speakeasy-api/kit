@@ -8,6 +8,7 @@ mod cap_grant;
 mod cap_invoke;
 mod catalog_identity;
 include!("canonical_result.rs");
+mod checkpoint_states;
 mod cli_parity;
 mod config_layering;
 mod container_limits;

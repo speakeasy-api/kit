@@ -576,7 +576,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-839
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_807 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --test conformance checkpoint_states::kit_agentkit_807 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

@@ -2667,16 +2667,17 @@
   source_quote: The reviewed agentkit loop validates transcript invariants only after mutators return. Kit therefore requires an agentkit post-validation, fallible checkpoint hook before semantic compaction is enabled. A mutator writes only a candidate artifact; the hook atomically promotes the validated final transcript/checkpoint before the next model call. Until that hook exists, Kit may perform only structural mutations whose complete invariants it independently duplicates and versions.
   source_fingerprint: b7e8d24d1de16b1ee0efb0105cfd82c1fcc6e63c9e1bc8d767da125c90491992
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-AGENTKIT
   applicability: mandatory
   interpretation: A semantic mutator writes only a candidate checkpoint artifact.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_agentkit_807 exits 0 with 1 passed and 0 failed
-  primary_milestone: M002
-  contributing_milestones: []
+  - cargo test --test conformance checkpoint_states::kit_agentkit_807 exits 0 with 1 passed and 0 failed
+  primary_milestone: M009
+  contributing_milestones:
+  - M002
   dependencies: []
   owner: Agent integration owner
   criticality: high
@@ -2689,13 +2690,16 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/agent/compaction/states.rs
+  public_contract_links:
+  - docs/compatibility/agentkit-hook.md
+  telemetry_links:
+  - tests/conformance/checkpoint_states.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-839
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_agentkit_807 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --test conformance checkpoint_states::kit_agentkit_807 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
