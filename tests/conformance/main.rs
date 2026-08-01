@@ -2,6 +2,7 @@
 
 mod agentkit_mapping;
 mod artifact_gc;
+include!("binding_schema_immutable.rs");
 mod broker_paths;
 mod cap_grant;
 mod cap_invoke;

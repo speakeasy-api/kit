@@ -11,6 +11,7 @@ mod affected_floor;
 mod auth_local;
 mod auth_remote;
 mod cap_bypass;
+mod catalog_visibility;
 mod container_fs;
 mod container_net;
 mod exec_secret_leak;

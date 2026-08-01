@@ -24,9 +24,12 @@
   platforms: [all]
   deployment_tiers: [local, restricted, clustered, hostile]
   release_gates: [G06]
-  implementation_links: []
+  implementation_links:
+    - src/capabilities/discovery/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+    - tests/conformance/binding_schema_immutable.rs
+    - tests/adversarial/catalog_visibility.rs
   evidence_type: conformance
   evidence_id: EV-M006-W05-C-001
   evidence_job: integration
