@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use kit::{
     api::auth::{
@@ -294,20 +291,9 @@ fn catalog_visibility() {
     );
     let replacement_result = replacement.search("forbidden-000", 1).unwrap().remove(0);
     assert_eq!(replacement_result.handle(), allowed_result.handle());
-    let validated = binding.validate(&replacement).unwrap();
-    let original_entry = catalog
-        .entries()
-        .iter()
-        .find(|entry| entry.identity().name().as_str() == "forbidden-000")
-        .unwrap();
-    assert!(Arc::ptr_eq(validated.entry(), original_entry));
-    assert!(!Arc::ptr_eq(
-        validated.entry(),
-        replacement_catalog
-            .entries()
-            .iter()
-            .find(|entry| entry.identity().name().as_str() == "forbidden-000")
-            .unwrap()
+    assert!(matches!(
+        binding.validate(&replacement),
+        Err(BindingExpired)
     ));
     for _ in 0..100 {
         let changed_grants = CapabilityGrantSnapshot::new(&config, [], DigestAlgorithm::Sha256);

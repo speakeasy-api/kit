@@ -229,6 +229,7 @@ fn binding_schema_immutable() {
         let binding = original_session.bind(&inspection).unwrap();
         let old_id = binding.id();
         let old_schema = binding.input_schema_digest();
+        assert_eq!(binding.catalog_digest(), original_catalog.digest());
         assert!(Arc::ptr_eq(
             binding.pinned_entry(),
             &original_catalog.entries()[0]
@@ -355,6 +356,7 @@ fn binding_schema_immutable() {
         let binding = original_session.bind(&inspection).unwrap();
         let old_id = binding.id();
         let old_schema = binding.input_schema_digest();
+        assert_eq!(binding.catalog_digest(), original_catalog.digest());
         assert!(Arc::ptr_eq(
             binding.pinned_entry(),
             original_catalog
@@ -406,8 +408,8 @@ fn binding_schema_immutable() {
         assert_eq!(changed_binding.id(), old_id);
         assert_eq!(changed_binding.input_schema_digest(), old_schema);
         assert_ne!(
-            changed_binding.catalog_view_digest(),
-            binding.catalog_view_digest()
+            changed_binding.catalog_digest(),
+            binding.catalog_digest()
         );
         assert!(!Arc::ptr_eq(
             changed_binding.pinned_entry(),

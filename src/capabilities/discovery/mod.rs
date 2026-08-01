@@ -94,7 +94,7 @@ pub struct CapabilityBinding {
     entry: Arc<CatalogEntry>,
     input_schema_digest: Digest,
     entry_digest: Digest,
-    catalog_view_digest: Digest,
+    catalog_digest: Digest,
     authorization_snapshot_digest: Digest,
 }
 
@@ -111,8 +111,8 @@ impl CapabilityBinding {
         self.entry_digest
     }
 
-    pub const fn catalog_view_digest(&self) -> Digest {
-        self.catalog_view_digest
+    pub const fn catalog_digest(&self) -> Digest {
+        self.catalog_digest
     }
 
     pub const fn authorization_snapshot_digest(&self) -> Digest {
@@ -127,6 +127,9 @@ impl CapabilityBinding {
         &self,
         current: &DiscoverySession<'_>,
     ) -> Result<ValidatedBinding, BindingExpired> {
+        if current.catalog.digest() != self.catalog_digest {
+            return Err(BindingExpired);
+        }
         let Some(entry) = current.catalog.get_identity(self.entry.identity()) else {
             return Err(BindingExpired);
         };
@@ -139,9 +142,6 @@ impl CapabilityBinding {
             return Err(BindingExpired);
         };
         if decision.snapshot_digest() != self.authorization_snapshot_digest {
-            return Err(BindingExpired);
-        }
-        if current.catalog_view_digest() != self.catalog_view_digest {
             return Err(BindingExpired);
         }
         Ok(ValidatedBinding {
@@ -301,7 +301,7 @@ impl<'a> DiscoverySession<'a> {
             .ok_or(InspectionUnavailable)?;
         let input_schema_digest = input_schema_digest(&inspected.entry);
         let entry_digest = inspected.entry.digest();
-        let catalog_view_digest = self.catalog_view_digest();
+        let catalog_digest = self.catalog.digest();
         let authorization_snapshot_digest = decision.snapshot_digest();
         let id = binding_id(
             &inspected.entry,
@@ -313,7 +313,7 @@ impl<'a> DiscoverySession<'a> {
             entry: inspected.entry,
             input_schema_digest,
             entry_digest,
-            catalog_view_digest,
+            catalog_digest,
             authorization_snapshot_digest,
         })
     }
@@ -340,18 +340,6 @@ impl<'a> DiscoverySession<'a> {
             extension: self.extension.clone(),
         });
         decision.is_allowed().then_some(decision)
-    }
-
-    fn catalog_view_digest(&self) -> Digest {
-        let mut canonical = Vec::new();
-        canonical.extend_from_slice(b"KIT-AUTHORIZED-CATALOG-VIEW\0");
-        canonical.extend_from_slice(&DISCOVERY_FORMAT_VERSION.to_be_bytes());
-        for entry in self.catalog.entries() {
-            if self.authorize(entry).is_some() {
-                put_digest(&mut canonical, entry.digest());
-            }
-        }
-        Digest::of(DigestAlgorithm::Sha256, &canonical)
     }
 }
 
