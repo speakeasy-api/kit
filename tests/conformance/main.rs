@@ -12,6 +12,7 @@ mod config_layering;
 mod container_limits;
 mod context_projection;
 mod deletion_api;
+include!("deferred_registration.rs");
 mod domain_envelope;
 mod domain_ids;
 mod domain_lifecycle;

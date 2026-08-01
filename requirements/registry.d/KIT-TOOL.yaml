@@ -864,9 +864,11 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/registration/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/deferred_registration.rs
   evidence_type: conformance
   evidence_id: EV-M006-W06-C-001
   evidence_job: integration

@@ -40,10 +40,34 @@ impl DiscoveryHandle {
 pub struct BindingId([u8; 32]);
 
 impl BindingId {
+    pub fn parse(value: &str) -> Result<Self, InvalidBindingId> {
+        let hex = value.strip_prefix("binding_v1_").ok_or(InvalidBindingId)?;
+        if hex.len() != 64 {
+            return Err(InvalidBindingId);
+        }
+        let mut bytes = [0_u8; 32];
+        for (output, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            *output = (hex_nibble(pair[0]).ok_or(InvalidBindingId)? << 4)
+                | hex_nibble(pair[1]).ok_or(InvalidBindingId)?;
+        }
+        Ok(Self(bytes))
+    }
+
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidBindingId;
+
+impl fmt::Display for InvalidBindingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid capability binding ID")
+    }
+}
+
+impl std::error::Error for InvalidBindingId {}
 
 impl fmt::Display for BindingId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -384,4 +408,12 @@ fn matches_entry(entry: &CatalogEntry, lowercase_query: &str) -> bool {
     .into_iter()
     .chain(entry.search().terms().iter().map(AsRef::as_ref))
     .any(|value| value.to_ascii_lowercase().contains(lowercase_query))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }

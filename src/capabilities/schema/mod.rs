@@ -510,7 +510,7 @@ fn preflight_nodes(bytes: &[u8]) -> Result<(), ProjectionError> {
     Ok(())
 }
 
-fn number_is_lossless(bytes: &[u8]) -> bool {
+pub(crate) fn number_is_lossless(bytes: &[u8]) -> bool {
     let Ok(value) = std::str::from_utf8(bytes) else {
         return false;
     };

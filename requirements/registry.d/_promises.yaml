@@ -12052,9 +12052,13 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/registration/mod.rs
+  - src/capabilities/discovery/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/deferred_registration.rs
+  - tests/conformance/binding_schema_immutable.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1024
   evidence_job: integration
@@ -12199,9 +12203,11 @@
   - src/capabilities/broker/mod.rs
   - src/capabilities/schema/mod.rs
   - src/agent/adapters/tool.rs
+  - src/capabilities/registration/mod.rs
   public_contract_links: []
   telemetry_links:
   - tests/conformance/broker_paths.rs
+  - tests/conformance/deferred_registration.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1027
   evidence_job: integration
@@ -12294,9 +12300,12 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/registration/mod.rs
+  - src/capabilities/schema/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/deferred_registration.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1029
   evidence_job: integration
@@ -12340,9 +12349,11 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/registration/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/deferred_registration.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1030
   evidence_job: integration
