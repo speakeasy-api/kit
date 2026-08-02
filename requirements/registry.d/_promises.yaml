@@ -1788,14 +1788,14 @@
   source_quote: Kit stores complete authorized events and artifacts outside model context. Model context is a revocable, compact view over that state. Compaction never destroys the source record.
   source_fingerprint: 1e0094613854330d0853e05000f274098d0608dd931ddcba2a55d2a9333ba173
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-COMPACT
   applicability: mandatory
   interpretation: Compaction does not destroy its source record.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_compact_800 exits 0 with 1 passed and 0 failed
+  - cargo test --test conformance evict_determinism::kit_compact_800_eviction_never_mutates_its_source_transcript exits 0 with 1 passed and 0 failed
   primary_milestone: M009
   contributing_milestones: []
   dependencies: []
@@ -1810,13 +1810,15 @@
   - hostile
   release_gates:
   - G09
-  implementation_links: []
+  implementation_links:
+  - src/agent/compaction/evict.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/evict_determinism.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-820
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_compact_800 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --test conformance evict_determinism::kit_compact_800_eviction_never_mutates_its_source_transcript exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -18232,14 +18234,14 @@
   source_quote: 'Agentkit’s `LoopMutator` and compaction pipeline provide structural and semantic fallback when the model does not call `yield`. Kit first clears low-risk material: stale raw logs, superseded maps, duplicate reads, reasoning parts, and successful command noise. It summarizes only after deterministic eviction is insufficient.'
   source_fingerprint: 2123067ea8a50ae73b0771113e333353318ba308870291d085121f4d9171af7f
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-COMPACT
   applicability: mandatory
   interpretation: Automatic compaction first removes stale logs, superseded maps, duplicate reads, reasoning parts, and successful command noise before summarizing.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_compact_823 exits 0 with 1 passed and 0 failed
+  - cargo test --test conformance evict_determinism::kit_compact_823_evicts_every_category_in_the_declared_order exits 0 with 1 passed and 0 failed
   primary_milestone: M009
   contributing_milestones: []
   dependencies: []
@@ -18254,13 +18256,15 @@
   - hostile
   release_gates:
   - G09
-  implementation_links: []
+  implementation_links:
+  - src/agent/compaction/evict.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/evict_determinism.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1151
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_compact_823 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --test conformance evict_determinism::kit_compact_823_evicts_every_category_in_the_declared_order exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

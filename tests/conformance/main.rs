@@ -23,6 +23,7 @@ mod edit_ir;
 mod edit_validate;
 mod eval_manifest;
 mod eval_stats_report;
+mod evict_determinism;
 mod exec_api;
 mod exec_contracts;
 mod exec_profile;
