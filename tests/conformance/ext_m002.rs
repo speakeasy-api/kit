@@ -131,7 +131,7 @@ fn every_m002_extension_point_has_a_versioned_compatible_pin() {
     );
     assert_eq!(
         manifest.vendor_pins.agentkit.snapshot_sha256,
-        "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
+        "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
     );
     assert_eq!(
         manifest.vendor_pins.agentkit.source,

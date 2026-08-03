@@ -19,7 +19,9 @@
 //! agentkit-side vocabulary. As `rmcp` tracks new MCP spec revisions, those
 //! types and their fields propagate into agentkit unchanged.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -34,11 +36,14 @@ use agentkit_core::{
     ToolResultPart,
 };
 use agentkit_tools_core::{
-    AllowAllPermissions, CatalogReader, CatalogWriter, PermissionChecker, Tool, ToolAnnotations,
-    ToolCapabilityProvider, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest,
-    ToolResult, ToolSpec, dynamic_catalog,
+    AllowAllPermissions, PermissionChecker, Tool, ToolAnnotations, ToolCapabilityProvider,
+    ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
 };
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
+use agentkit_tools_core::{CatalogReader, CatalogWriter, dynamic_catalog};
 use async_trait::async_trait;
+use futures_util::StreamExt;
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 use futures_util::future::{join_all, try_join_all};
 use futures_util::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
@@ -46,6 +51,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model as rmcp_model;
 use rmcp::service::{ClientInitializeError, Peer, RoleClient, RunningService, ServiceError};
+use rmcp::transport::common::client_side_sse::FixedInterval;
 use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError, StreamableHttpClient as RmcpStreamableHttpClient,
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
@@ -53,6 +59,7 @@ use rmcp::transport::streamable_http_client::{
 };
 use rmcp::transport::{
     ConfigureCommandExt, DynamicTransportError, StreamableHttpClientTransport, TokioChildProcess,
+    Transport,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -78,9 +85,10 @@ pub use rmcp::model::{
     LoggingLevel as McpLoggingLevel,
     LoggingMessageNotificationParam as McpLoggingMessageNotificationParam,
     ProgressNotificationParam as McpProgressNotificationParam, Prompt as McpPrompt, PromptArgument,
-    PromptMessage, PromptMessageContent, PromptMessageRole, RawAudioContent, RawContent,
-    RawEmbeddedResource, RawImageContent, RawResource as McpRawResource, RawTextContent,
-    ReadResourceResult, Resource as McpResource, ResourceContents as McpResourceContents,
+    PromptMessage, PromptMessageContent, PromptMessageRole, ProtocolVersion as McpProtocolVersion,
+    RawAudioContent, RawContent, RawEmbeddedResource, RawImageContent,
+    RawResource as McpRawResource, RawTextContent, ReadResourceResult, Resource as McpResource,
+    ResourceContents as McpResourceContents,
     ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Root as McpRoot,
     RootsCapabilities as McpRootsCapabilities, SamplingCapability as McpSamplingCapability,
     SamplingMessage as McpSamplingMessage, SetLevelRequestParams as McpSetLevelRequestParams,
@@ -108,6 +116,90 @@ pub type McpToolDescriptor = McpTool;
 pub type McpResourceDescriptor = McpResource;
 /// Alias for [`McpPrompt`].
 pub type McpPromptDescriptor = McpPrompt;
+
+/// The MCP protocol revision this crate pins for every rmcp connect path.
+///
+/// This is an explicit adapter-owned constant rather than upstream rmcp's
+/// floating `LATEST` alias, so an rmcp upgrade cannot silently move the
+/// advertised or accepted revision without a review signal at this
+/// definition. Every stdio and Streamable HTTP connect (initial connect and
+/// reconnect alike) advertises exactly this revision and refuses any server
+/// that negotiates a different one with
+/// [`McpError::UnsupportedProtocolVersion`].
+pub const PINNED_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion::V_2025_11_25;
+
+/// Exact `initialize` params emitted by Kit's authorized connect paths.
+#[cfg(feature = "kit-authorized")]
+pub fn kit_authorized_initialize_arguments() -> Value {
+    serde_json::to_value(
+        rmcp_model::InitializeRequestParams::new(
+            rmcp_model::ClientCapabilities::default(),
+            rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
+                .with_title("agentkit MCP client"),
+        )
+        .with_protocol_version(PINNED_PROTOCOL_VERSION),
+    )
+    .expect("static Kit initialize arguments serialize")
+}
+
+struct PinnedTransport<T> {
+    inner: T,
+    refused: Arc<std::sync::Mutex<Option<Option<McpProtocolVersion>>>>,
+}
+
+impl<T> Transport<RoleClient> for PinnedTransport<T>
+where
+    T: Transport<RoleClient>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleClient>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleClient>> {
+        let message = self.inner.receive().await?;
+        if let rmcp_model::ServerJsonRpcMessage::Response(response) = &message
+            && let rmcp_model::ServerResult::InitializeResult(result) = &response.result
+            && result.protocol_version != PINNED_PROTOCOL_VERSION
+        {
+            *self.refused.lock().expect("MCP refusal lock poisoned") =
+                Some(Some(result.protocol_version.clone()));
+            return None;
+        }
+        Some(message)
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
+/// Transport-independent enforcement of [`PINNED_PROTOCOL_VERSION`].
+///
+/// Both rmcp connect paths — stdio (`connect_rmcp_stdio`) and Streamable
+/// HTTP (`connect_rmcp_streamable_http`), and therefore every initial
+/// connect and every reconnect — pass the freshly negotiated revision
+/// through this single contract before any capability, discovery, catalog,
+/// or auth state is built. `None` (no `initialize` result available) and
+/// any revision other than the pin both refuse.
+#[allow(clippy::result_large_err)]
+pub fn enforce_pinned_protocol_version(
+    server_id: &McpServerId,
+    negotiated: Option<&McpProtocolVersion>,
+) -> Result<McpProtocolVersion, McpError> {
+    match negotiated {
+        Some(version) if *version == PINNED_PROTOCOL_VERSION => Ok(version.clone()),
+        other => Err(McpError::UnsupportedProtocolVersion {
+            server: server_id.clone(),
+            expected: PINNED_PROTOCOL_VERSION,
+            negotiated: other.cloned(),
+        }),
+    }
+}
 
 /// An auth challenge raised by an MCP server during a tool call, resource
 /// read, prompt fetch, or connection handshake.
@@ -518,6 +610,10 @@ pub struct StreamableHttpTransportConfig {
     /// This is the seam to inject dynamic bearers, request signing, retry
     /// middleware, custom TLS, and so on. See [`McpHttpClient`].
     pub http_client: Option<Arc<dyn McpHttpClient>>,
+    /// Maximum reconnect attempts for a broken server-sent event stream.
+    pub max_sse_reconnects: usize,
+    /// Capacity of each internal transport channel.
+    pub channel_buffer_capacity: usize,
 }
 
 impl fmt::Debug for StreamableHttpTransportConfig {
@@ -533,6 +629,8 @@ impl fmt::Debug for StreamableHttpTransportConfig {
                 "http_client",
                 &self.http_client.as_ref().map(|_| "<custom>"),
             )
+            .field("max_sse_reconnects", &self.max_sse_reconnects)
+            .field("channel_buffer_capacity", &self.channel_buffer_capacity)
             .finish()
     }
 }
@@ -545,6 +643,8 @@ impl StreamableHttpTransportConfig {
             bearer_token: None,
             headers: Vec::new(),
             http_client: None,
+            max_sse_reconnects: 3,
+            channel_buffer_capacity: 16,
         }
     }
 
@@ -570,10 +670,29 @@ impl StreamableHttpTransportConfig {
         self
     }
 
+    /// Sets the finite number of SSE reconnect attempts. Zero disables reconnects.
+    pub fn with_max_sse_reconnects(mut self, max: usize) -> Self {
+        self.max_sse_reconnects = max;
+        self
+    }
+
+    /// Sets the bounded internal transport channel capacity.
+    #[allow(clippy::result_large_err)]
+    pub fn with_channel_buffer_capacity(mut self, capacity: usize) -> Result<Self, McpError> {
+        if capacity == 0 {
+            return Err(McpError::Protocol(
+                "Streamable HTTP channel capacity must be non-zero".into(),
+            ));
+        }
+        self.channel_buffer_capacity = capacity;
+        Ok(self)
+    }
+
     /// Adds a static HTTP header for every Streamable HTTP request.
     ///
     /// Reserved MCP session and protocol headers are still managed by RMCP.
     /// Ignored when a custom [`McpHttpClient`] is installed.
+    #[allow(clippy::result_large_err)]
     pub fn with_header<N, V>(mut self, name: N, value: V) -> Result<Self, McpError>
     where
         N: TryInto<HeaderName>,
@@ -646,12 +765,35 @@ pub trait McpHttpClient: Send + Sync + 'static {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<McpSseStream, StreamableHttpError<reqwest::Error>>;
+
+    /// Closes sessions retained by a custom client when initialization fails
+    /// before rmcp can construct a running service. Implementations that do
+    /// not retain session state may use the default no-op.
+    async fn close_open_sessions(&self) -> Result<(), StreamableHttpError<reqwest::Error>> {
+        Ok(())
+    }
 }
 
 /// Internal newtype that adapts an `Arc<dyn McpHttpClient>` to rmcp's
 /// generic, non-dyn-compatible [`RmcpStreamableHttpClient`] trait.
 #[derive(Clone)]
-struct DynHttpClient(Arc<dyn McpHttpClient>);
+struct DynHttpClient {
+    inner: Arc<dyn McpHttpClient>,
+    refused: Arc<std::sync::Mutex<Option<Option<McpProtocolVersion>>>>,
+    sse_connections: Arc<std::sync::atomic::AtomicUsize>,
+    max_sse_reconnects: usize,
+}
+
+#[derive(Debug)]
+struct ProtocolRevisionRefused;
+
+impl fmt::Display for ProtocolRevisionRefused {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unsupported MCP protocol revision")
+    }
+}
+
+impl std::error::Error for ProtocolRevisionRefused {}
 
 impl RmcpStreamableHttpClient for DynHttpClient {
     type Error = reqwest::Error;
@@ -664,9 +806,82 @@ impl RmcpStreamableHttpClient for DynHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
-        self.0
-            .post_message(uri, message, session_id, auth_header, custom_headers)
-            .await
+        let initialize = matches!(
+            &message,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(request.request, rmcp_model::ClientRequest::InitializeRequest(_))
+        );
+        let response = self
+            .inner
+            .post_message(
+                uri.clone(),
+                message,
+                session_id,
+                auth_header,
+                custom_headers,
+            )
+            .await?;
+        if initialize {
+            if let StreamableHttpPostResponse::Json(
+                rmcp_model::ServerJsonRpcMessage::Response(response_message),
+                response_session,
+            ) = &response
+                && let rmcp_model::ServerResult::InitializeResult(result) = &response_message.result
+                && result.protocol_version != PINNED_PROTOCOL_VERSION
+            {
+                *self.refused.lock().expect("MCP refusal lock poisoned") =
+                    Some(Some(result.protocol_version.clone()));
+                if let Some(session) = response_session {
+                    let mut headers = HashMap::new();
+                    headers.insert(
+                        HeaderName::from_static("mcp-protocol-version"),
+                        HeaderValue::from_static("2025-11-25"),
+                    );
+                    self.inner
+                        .delete_session(uri, Arc::from(session.as_str()), None, headers)
+                        .await?;
+                }
+                return Err(StreamableHttpError::UnexpectedServerResponse(
+                    "unsupported MCP protocol revision".into(),
+                ));
+            }
+            if let StreamableHttpPostResponse::Sse(stream, session) = response {
+                let refused = Arc::clone(&self.refused);
+                let client = Arc::clone(&self.inner);
+                let cleanup_uri = uri;
+                let cleanup_session = session.clone();
+                let checked = stream.then(move |event| {
+                    let refused = Arc::clone(&refused);
+                    let client = Arc::clone(&client);
+                    let uri = Arc::clone(&cleanup_uri);
+                    let session = cleanup_session.clone();
+                    async move {
+                        let event = event?;
+                        if let Some(negotiated) =
+                            event.data.as_deref().and_then(initialize_protocol_version)
+                            && negotiated.as_ref() != Some(&PINNED_PROTOCOL_VERSION)
+                        {
+                            *refused.lock().expect("MCP refusal lock poisoned") = Some(negotiated);
+                            if let Some(session) = session {
+                                let mut headers = HashMap::new();
+                                headers.insert(
+                                    HeaderName::from_static("mcp-protocol-version"),
+                                    HeaderValue::from_static("2025-11-25"),
+                                );
+                                client
+                                    .delete_session(uri, Arc::from(session), None, headers)
+                                    .await
+                                    .map_err(|error| SseError::Body(Box::new(error)))?;
+                            }
+                            return Err(SseError::Body(Box::new(ProtocolRevisionRefused)));
+                        }
+                        Ok(event)
+                    }
+                });
+                return Ok(StreamableHttpPostResponse::Sse(checked.boxed(), session));
+            }
+        }
+        Ok(response)
     }
 
     async fn delete_session(
@@ -676,7 +891,7 @@ impl RmcpStreamableHttpClient for DynHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<reqwest::Error>> {
-        self.0
+        self.inner
             .delete_session(uri, session_id, auth_header, custom_headers)
             .await
     }
@@ -689,9 +904,98 @@ impl RmcpStreamableHttpClient for DynHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<McpSseStream, StreamableHttpError<reqwest::Error>> {
-        self.0
+        if !spend_sse_connection(&self.sse_connections, self.max_sse_reconnects) {
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                "MCP SSE reconnect budget exhausted".into(),
+            ));
+        }
+        self.inner
             .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
             .await
+    }
+}
+
+fn spend_sse_connection(
+    connections: &std::sync::atomic::AtomicUsize,
+    max_reconnects: usize,
+) -> bool {
+    // The first GET opens the common stream; only subsequent GETs spend the
+    // reconnect budget shared by graceful and error-driven reconnects.
+    connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel) <= max_reconnects
+}
+
+fn initialize_protocol_version(data: &str) -> Option<Option<McpProtocolVersion>> {
+    let value: Value = serde_json::from_str(data).ok()?;
+    let result = value.get("result")?.as_object()?;
+    if !result.contains_key("capabilities") || !result.contains_key("serverInfo") {
+        return None;
+    }
+    Some(
+        result
+            .get("protocolVersion")
+            .and_then(|version| serde_json::from_value(version.clone()).ok()),
+    )
+}
+
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
+struct DefaultHttpClient(reqwest::Client);
+
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
+#[async_trait]
+impl McpHttpClient for DefaultHttpClient {
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
+        RmcpStreamableHttpClient::post_message(
+            &self.0,
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+        )
+        .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<reqwest::Error>> {
+        RmcpStreamableHttpClient::delete_session(
+            &self.0,
+            uri,
+            session_id,
+            auth_header,
+            custom_headers,
+        )
+        .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<McpSseStream, StreamableHttpError<reqwest::Error>> {
+        RmcpStreamableHttpClient::get_stream(
+            &self.0,
+            uri,
+            session_id,
+            last_event_id,
+            auth_header,
+            custom_headers,
+        )
+        .await
     }
 }
 
@@ -1031,7 +1335,7 @@ const DEFAULT_EVENTS_CAPACITY: usize = 128;
 /// [`McpConnection::from_running_service_with_events_and_handler_config`].
 pub struct McpClientChannels {
     /// Legacy mpsc receiver for catalog list-changed announcements.
-    pub notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+    pub notifications: mpsc::Receiver<McpServerNotification>,
     /// Broadcast sender that forwards every [`McpServerEvent`] to subscribers.
     pub events: broadcast::Sender<McpServerEvent>,
 }
@@ -1048,7 +1352,7 @@ pub struct McpClientChannels {
 #[derive(Clone)]
 pub struct McpClientHandler {
     info: rmcp_model::ClientInfo,
-    notifications: mpsc::UnboundedSender<McpServerNotification>,
+    notifications: mpsc::Sender<McpServerNotification>,
     events: broadcast::Sender<McpServerEvent>,
     sampling: Option<Arc<dyn McpSamplingResponder>>,
     elicitation: Option<Arc<dyn McpElicitationResponder>>,
@@ -1154,7 +1458,9 @@ impl ClientHandler for McpClientHandler {
         &self,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
-        let _ = self.notifications.send(McpServerNotification::ToolsChanged);
+        let _ = self
+            .notifications
+            .try_send(McpServerNotification::ToolsChanged);
         let _ = self.events.send(McpServerEvent::ToolListChanged);
         std::future::ready(())
     }
@@ -1165,7 +1471,7 @@ impl ClientHandler for McpClientHandler {
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
         let _ = self
             .notifications
-            .send(McpServerNotification::ResourcesChanged);
+            .try_send(McpServerNotification::ResourcesChanged);
         let _ = self.events.send(McpServerEvent::ResourceListChanged);
         std::future::ready(())
     }
@@ -1176,7 +1482,7 @@ impl ClientHandler for McpClientHandler {
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
         let _ = self
             .notifications
-            .send(McpServerNotification::PromptsChanged);
+            .try_send(McpServerNotification::PromptsChanged);
         let _ = self.events.send(McpServerEvent::PromptListChanged);
         std::future::ready(())
     }
@@ -1294,9 +1600,9 @@ impl McpHandlerConfig {
         &self,
         events: Option<broadcast::Sender<McpServerEvent>>,
     ) -> (McpClientHandler, McpClientChannels) {
-        let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
+        let capacity = self.events_capacity.unwrap_or(DEFAULT_EVENTS_CAPACITY);
+        let (notifications_tx, notifications_rx) = mpsc::channel(capacity);
         let events_tx = events.unwrap_or_else(|| {
-            let capacity = self.events_capacity.unwrap_or(DEFAULT_EVENTS_CAPACITY);
             let (tx, _) = broadcast::channel(capacity);
             tx
         });
@@ -1321,7 +1627,7 @@ impl McpHandlerConfig {
                 rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("agentkit MCP client"),
             )
-            .with_protocol_version(rmcp_model::ProtocolVersion::LATEST),
+            .with_protocol_version(PINNED_PROTOCOL_VERSION),
             notifications: notifications_tx,
             events: events_tx.clone(),
             sampling: self.sampling.clone(),
@@ -1347,10 +1653,11 @@ pub struct McpConnection {
     inner: Mutex<RmcpClientService>,
     peer: RwLock<Peer<RoleClient>>,
     auth: Mutex<Option<MetadataMap>>,
-    notifications: Mutex<mpsc::UnboundedReceiver<McpServerNotification>>,
+    notifications: Mutex<mpsc::Receiver<McpServerNotification>>,
     events: broadcast::Sender<McpServerEvent>,
     handler_config: McpHandlerConfig,
     capabilities: McpServerCapabilities,
+    protocol_version: RwLock<Option<McpProtocolVersion>>,
 }
 
 /// The result of replaying an MCP operation after auth resolution.
@@ -1371,16 +1678,87 @@ impl McpConnection {
     /// and returns a ready-to-use connection. No sampling / elicitation /
     /// roots responders are wired; use [`Self::connect_with_handler`] when
     /// the server may issue those requests.
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
         Self::connect_with_auth(config, None, McpHandlerConfig::default()).await
     }
 
     /// Connects to an MCP server with a fully configured [`McpHandlerConfig`].
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     pub async fn connect_with_handler(
         config: &McpServerConfig,
         handler_config: McpHandlerConfig,
     ) -> Result<Self, McpError> {
         Self::connect_with_auth(config, None, handler_config).await
+    }
+
+    /// Kit production entry point. It accepts only Streamable HTTP configs
+    /// carrying an injected, policy-owned HTTP client.
+    #[cfg(feature = "kit-authorized")]
+    pub async fn connect_authorized_http(config: &McpServerConfig) -> Result<Self, McpError> {
+        match &config.transport {
+            McpTransportBinding::StreamableHttp(binding) if binding.http_client.is_some() => {
+                Self::connect_with_auth(config, None, McpHandlerConfig::default()).await
+            }
+            _ => Err(McpError::Protocol(
+                "Kit requires an authorized adopted HTTP client".into(),
+            )),
+        }
+    }
+
+    /// Connects through a caller-owned transport that has already crossed its
+    /// host authorization boundary. This is the stdio seam used by Kit's
+    /// sandbox-owned launcher; it accepts transport I/O, never a host command.
+    #[cfg(feature = "kit-authorized")]
+    #[doc(hidden)]
+    pub async fn connect_kit_authorized_transport<T>(
+        server_id: impl Into<McpServerId>,
+        transport: T,
+        handler_config: McpHandlerConfig,
+    ) -> Result<Self, McpError>
+    where
+        T: rmcp::transport::Transport<RoleClient> + 'static,
+    {
+        let server_id = server_id.into();
+        let (handler, channels) = handler_config.build();
+        let McpClientChannels {
+            notifications,
+            events,
+        } = channels;
+        let refused = Arc::new(std::sync::Mutex::new(None));
+        let service = handler
+            .serve(PinnedTransport {
+                inner: transport,
+                refused: refused.clone(),
+            })
+            .await
+            .map_err(|error| {
+                refused
+                    .lock()
+                    .expect("MCP refusal lock poisoned")
+                    .clone()
+                    .map(|negotiated| McpError::UnsupportedProtocolVersion {
+                        server: server_id.clone(),
+                        expected: PINNED_PROTOCOL_VERSION,
+                        negotiated,
+                    })
+                    .unwrap_or_else(|| rmcp_initialize_error_for_server(&server_id, error))
+            })?;
+        let (service, capabilities, protocol_version) =
+            enforce_negotiated_protocol_version(&server_id, service).await?;
+        let peer = service.peer().clone();
+        Ok(Self {
+            server_id,
+            config: None,
+            inner: Mutex::new(service),
+            peer: RwLock::new(peer),
+            auth: Mutex::new(None),
+            notifications: Mutex::new(notifications),
+            events,
+            handler_config,
+            capabilities,
+            protocol_version: RwLock::new(Some(protocol_version)),
+        })
     }
 
     async fn connect_with_auth(
@@ -1393,7 +1771,7 @@ impl McpConnection {
             notifications: notification_rx,
             events: events_tx,
         } = channels;
-        let (service, capabilities) = match &config.transport {
+        let (service, capabilities, protocol_version) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(config, binding, handler).await?
             }
@@ -1413,6 +1791,7 @@ impl McpConnection {
             events: events_tx,
             handler_config,
             capabilities,
+            protocol_version: RwLock::new(Some(protocol_version)),
         })
     }
 
@@ -1431,10 +1810,17 @@ impl McpConnection {
     /// handler are *not* forwarded to subscribers — use
     /// [`Self::from_running_service_with_events`] paired with the broadcast
     /// sender from [`McpClientChannels`] when you need event delivery.
+    ///
+    /// Adopting a service also bypasses the [`PINNED_PROTOCOL_VERSION`]
+    /// refusal applied by every [`Self::connect`]-family path: the caller
+    /// that constructed the running service owns revision policy for it.
+    /// [`Self::negotiated_protocol_version`] still reports what the adopted
+    /// service negotiated.
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     pub fn from_running_service(
         server_id: impl Into<McpServerId>,
         service: RmcpClientService,
-        notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+        notifications: mpsc::Receiver<McpServerNotification>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(DEFAULT_EVENTS_CAPACITY);
         Self::from_running_service_with_events(server_id, service, notifications, events_tx)
@@ -1446,10 +1832,11 @@ impl McpConnection {
     /// handler is publishing into.
     ///
     /// [`build_with`]: McpHandlerConfig::build_with
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     pub fn from_running_service_with_events(
         server_id: impl Into<McpServerId>,
         service: RmcpClientService,
-        notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+        notifications: mpsc::Receiver<McpServerNotification>,
         events: broadcast::Sender<McpServerEvent>,
     ) -> Self {
         Self::from_running_service_with_events_and_handler_config(
@@ -1467,10 +1854,11 @@ impl McpConnection {
     /// Use this when the connection needs to reach client-side hooks that are
     /// not carried by the rmcp handler itself, such as [`McpAuthResponder`] and
     /// [`McpErrorResponder`] during [`McpToolAdapter`] invocation.
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     pub fn from_running_service_with_events_and_handler_config(
         server_id: impl Into<McpServerId>,
         service: RmcpClientService,
-        notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+        notifications: mpsc::Receiver<McpServerNotification>,
         events: broadcast::Sender<McpServerEvent>,
         handler_config: McpHandlerConfig,
     ) -> Self {
@@ -1478,6 +1866,9 @@ impl McpConnection {
             .peer_info()
             .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
             .unwrap_or_default();
+        let protocol_version = service
+            .peer_info()
+            .map(|info| info.protocol_version.clone());
         let peer = service.peer().clone();
         Self {
             server_id: server_id.into(),
@@ -1489,6 +1880,7 @@ impl McpConnection {
             events,
             handler_config,
             capabilities,
+            protocol_version: RwLock::new(protocol_version),
         }
     }
 
@@ -1501,7 +1893,7 @@ impl McpConnection {
             notifications: notification_rx,
             ..
         } = channels;
-        let (service, _capabilities) = match &config.transport {
+        let (service, _capabilities, protocol_version) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(&config, binding, handler).await?
             }
@@ -1513,6 +1905,10 @@ impl McpConnection {
         *self.notifications.lock().await = notification_rx;
         *self.inner.lock().await = service;
         *self.peer.write().expect("MCP peer lock poisoned") = new_peer;
+        *self
+            .protocol_version
+            .write()
+            .expect("MCP protocol version lock poisoned") = Some(protocol_version);
         Ok(())
     }
 
@@ -1528,6 +1924,24 @@ impl McpConnection {
     /// Returns the capabilities advertised by the server during `initialize`.
     pub fn capabilities(&self) -> &McpServerCapabilities {
         &self.capabilities
+    }
+
+    /// Returns the MCP protocol revision negotiated during `initialize`.
+    ///
+    /// Every connection built through [`Self::connect`],
+    /// [`Self::connect_with_handler`], or a [`McpServerManager`]
+    /// connect/reconnect path is guaranteed to report
+    /// `Some(`[`PINNED_PROTOCOL_VERSION`]`)` — those paths refuse any other
+    /// negotiation with [`McpError::UnsupportedProtocolVersion`] before the
+    /// connection is constructed. Connections adopted through
+    /// [`Self::from_running_service`] report whatever the adopted service
+    /// negotiated, or `None` when the service exposes no `initialize`
+    /// result.
+    pub fn negotiated_protocol_version(&self) -> Option<McpProtocolVersion> {
+        self.protocol_version
+            .read()
+            .expect("MCP protocol version lock poisoned")
+            .clone()
     }
 
     /// Returns the [`McpHandlerConfig`] this connection was built with.
@@ -1656,6 +2070,13 @@ impl McpConnection {
         Ok(())
     }
 
+    /// Reinitializes an adopted Kit HTTP connection. The adopted transport
+    /// must independently authorize the fresh initialize exchange.
+    #[cfg(feature = "kit-authorized")]
+    pub async fn reinitialize_authorized(&self) -> Result<(), McpError> {
+        self.reconnect_inner(None).await
+    }
+
     /// Discovers tools, resources, and prompts that the server advertised.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
         let tools = async {
@@ -1686,6 +2107,7 @@ impl McpConnection {
         })
     }
 
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     async fn drain_notifications(&self) -> Vec<McpServerNotification> {
         let mut notifications = self.notifications.lock().await;
         let mut drained = Vec::new();
@@ -1703,6 +2125,23 @@ impl McpConnection {
             .map_err(rmcp_service_error)
     }
 
+    /// Lists exactly one tool page. Kit uses this instead of the aggregate
+    /// helper so every cursor-bearing wire request has its own authorization.
+    #[cfg(feature = "kit-authorized")]
+    pub async fn list_tools_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpTool>, Option<String>), McpError> {
+        let result = self
+            .peer()
+            .list_tools(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.tools, result.next_cursor))
+    }
+
     /// Lists all resources advertised by the connected MCP server.
     pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
         self.peer()
@@ -1711,12 +2150,44 @@ impl McpConnection {
             .map_err(rmcp_service_error)
     }
 
+    /// Lists exactly one resource page.
+    #[cfg(feature = "kit-authorized")]
+    pub async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpResource>, Option<String>), McpError> {
+        let result = self
+            .peer()
+            .list_resources(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.resources, result.next_cursor))
+    }
+
     /// Lists all prompts advertised by the connected MCP server.
     pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, McpError> {
         self.peer()
             .list_all_prompts()
             .await
             .map_err(rmcp_service_error)
+    }
+
+    /// Lists exactly one prompt page.
+    #[cfg(feature = "kit-authorized")]
+    pub async fn list_prompts_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpPrompt>, Option<String>), McpError> {
+        let result = self
+            .peer()
+            .list_prompts(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.prompts, result.next_cursor))
     }
 
     /// Invokes a tool on the MCP server.
@@ -1823,11 +2294,41 @@ impl McpConnection {
     }
 }
 
+/// Applies [`enforce_pinned_protocol_version`] to a freshly initialized rmcp
+/// service. On refusal the service is closed first, so no capability,
+/// discovery, catalog, or auth state ever exists for a connection whose
+/// negotiated revision differs from the pin. Both transport connect paths
+/// (and therefore reconnects) terminate here.
+async fn enforce_negotiated_protocol_version(
+    server_id: &McpServerId,
+    mut service: RmcpClientService,
+) -> Result<(RmcpClientService, McpServerCapabilities, McpProtocolVersion), McpError> {
+    let negotiated = service
+        .peer_info()
+        .map(|info| info.protocol_version.clone());
+    match enforce_pinned_protocol_version(server_id, negotiated.as_ref()) {
+        Ok(version) => {
+            let capabilities = service
+                .peer_info()
+                .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
+                .unwrap_or_default();
+            Ok((service, capabilities, version))
+        }
+        Err(error) => match service.close().await {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(McpError::ProtocolRefusalCleanupFailed {
+                refusal: error.to_string(),
+                cleanup: cleanup.to_string(),
+            }),
+        },
+    }
+}
+
 async fn connect_rmcp_stdio(
     config: &McpServerConfig,
     binding: &StdioTransportConfig,
     handler: McpClientHandler,
-) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
+) -> Result<(RmcpClientService, McpServerCapabilities, McpProtocolVersion), McpError> {
     let transport = TokioChildProcess::new(
         tokio::process::Command::new(&binding.command).configure(|command| {
             command.args(&binding.args);
@@ -1841,16 +2342,26 @@ async fn connect_rmcp_stdio(
     )
     .map_err(McpError::Io)?;
 
+    let refused = Arc::new(std::sync::Mutex::new(None));
     let service = handler
-        .serve(transport)
+        .serve(PinnedTransport {
+            inner: transport,
+            refused: refused.clone(),
+        })
         .await
-        .map_err(|error| rmcp_initialize_error(config, error))?;
-    let capabilities = service
-        .peer_info()
-        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
-        .unwrap_or_default();
-
-    Ok((service, capabilities))
+        .map_err(|error| {
+            refused
+                .lock()
+                .expect("MCP refusal lock poisoned")
+                .clone()
+                .map(|negotiated| McpError::UnsupportedProtocolVersion {
+                    server: config.id.clone(),
+                    expected: PINNED_PROTOCOL_VERSION,
+                    negotiated,
+                })
+                .unwrap_or_else(|| rmcp_initialize_error(config, error))
+        })?;
+    enforce_negotiated_protocol_version(&config.id, service).await
 }
 
 async fn connect_rmcp_streamable_http(
@@ -1858,36 +2369,77 @@ async fn connect_rmcp_streamable_http(
     binding: &StreamableHttpTransportConfig,
     auth: Option<&MetadataMap>,
     handler: McpClientHandler,
-) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
+) -> Result<(RmcpClientService, McpServerCapabilities, McpProtocolVersion), McpError> {
     let auth_header = auth
         .and_then(bearer_token_from_metadata)
         .or_else(|| binding.bearer_token.clone());
     let mut rmcp_config = RmcpStreamableHttpClientTransportConfig::with_uri(binding.url.clone());
+    let mut retry = FixedInterval::default();
+    retry.max_times = Some(binding.max_sse_reconnects);
+    retry.duration = Duration::from_secs(1);
+    rmcp_config.retry_config = Arc::new(retry);
+    rmcp_config.channel_buffer_capacity = binding.channel_buffer_capacity;
+    // A fresh initialize must return through agentkit's negotiated-version
+    // refusal instead of being replayed invisibly inside rmcp.
+    rmcp_config.reinit_on_expired_session = false;
     if let Some(auth_header) = auth_header {
         rmcp_config = rmcp_config.auth_header(auth_header);
     }
     rmcp_config = rmcp_config.custom_headers(binding.headers.iter().cloned().collect());
 
-    let result = match binding.http_client.as_ref() {
-        Some(client) => {
-            let transport = StreamableHttpClientTransport::with_client(
-                DynHttpClient(client.clone()),
-                rmcp_config,
-            );
-            handler.serve(transport).await
-        }
+    let client: Arc<dyn McpHttpClient> = match binding.http_client.as_ref() {
+        Some(client) => client.clone(),
+        #[cfg(all(feature = "kit-authorized", not(feature = "unmediated-dev")))]
         None => {
-            let transport = StreamableHttpClientTransport::from_config(rmcp_config);
-            handler.serve(transport).await
+            return Err(McpError::Protocol(
+                "Kit requires an authorized adopted HTTP client".into(),
+            ));
+        }
+        #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
+        None => Arc::new(DefaultHttpClient(
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .map_err(|error| McpError::Transport(error.to_string()))?,
+        )),
+    };
+    let refused = Arc::new(std::sync::Mutex::new(None));
+    let transport = StreamableHttpClientTransport::with_client(
+        DynHttpClient {
+            inner: client.clone(),
+            refused: refused.clone(),
+            sse_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_sse_reconnects: binding.max_sse_reconnects,
+        },
+        rmcp_config,
+    );
+    let result = handler
+        .serve(PinnedTransport {
+            inner: transport,
+            refused: refused.clone(),
+        })
+        .await;
+    let service = match result {
+        Ok(service) => service,
+        Err(error) => {
+            let cleanup =
+                tokio::time::timeout(Duration::from_secs(5), client.close_open_sessions()).await;
+            if !matches!(cleanup, Ok(Ok(()))) {
+                return Err(McpError::Transport(format!(
+                    "{error}; failed-initialize session cleanup failed: {cleanup:?}"
+                )));
+            }
+            if let Some(negotiated) = refused.lock().expect("MCP refusal lock poisoned").clone() {
+                return Err(McpError::UnsupportedProtocolVersion {
+                    server: config.id.clone(),
+                    expected: PINNED_PROTOCOL_VERSION,
+                    negotiated,
+                });
+            }
+            return Err(rmcp_initialize_error(config, error));
         }
     };
-    let service = result.map_err(|error| rmcp_initialize_error(config, error))?;
-    let capabilities = service
-        .peer_info()
-        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
-        .unwrap_or_default();
-
-    Ok((service, capabilities))
+    enforce_negotiated_protocol_version(&config.id, service).await
 }
 
 /// Adapter exposing a single MCP resource as a [`ResourceProvider`].
@@ -2054,6 +2606,7 @@ impl McpCapabilityProvider {
     }
 
     /// Connects to an MCP server, performs discovery, and builds a provider.
+    #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
     pub async fn connect(
         config: &McpServerConfig,
     ) -> Result<(Arc<McpConnection>, Self, McpDiscoverySnapshot), McpError> {
@@ -2239,6 +2792,7 @@ impl McpServerOptions {
 }
 
 /// Manages the lifecycle of one or more MCP servers.
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 pub struct McpServerManager {
     configs: BTreeMap<McpServerId, McpServerConfig>,
     options: BTreeMap<McpServerId, McpServerOptions>,
@@ -2255,6 +2809,7 @@ pub struct McpServerManager {
     server_tools: BTreeMap<McpServerId, BTreeSet<ToolName>>,
 }
 
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 impl Default for McpServerManager {
     fn default() -> Self {
         let (catalog_tx, _) = broadcast::channel(128);
@@ -2273,6 +2828,7 @@ impl Default for McpServerManager {
     }
 }
 
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 impl McpServerManager {
     /// Creates an empty server manager with no registered servers.
     pub fn new() -> Self {
@@ -2392,12 +2948,21 @@ impl McpServerManager {
         handler_config: McpHandlerConfig,
         options: &McpServerOptions,
     ) -> Result<(Arc<McpConnection>, McpDiscoverySnapshot), McpError> {
+        #[cfg(all(feature = "kit-authorized", not(feature = "unmediated-dev")))]
+        {
+            let _ = (config, auth, handler_config, options);
+            return Err(McpError::Protocol(
+                "Kit disables AgentKit manager-owned transport construction".into(),
+            ));
+        }
+        #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
         let connect = async {
             let connection =
                 Arc::new(McpConnection::connect_with_auth(config, auth, handler_config).await?);
             let snapshot = connection.discover().await?;
             Ok((connection, snapshot))
         };
+        #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
         match options.connect_timeout {
             Some(timeout) => {
                 tokio::time::timeout(timeout, connect)
@@ -2937,6 +3502,7 @@ impl McpServerManager {
     }
 }
 
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 fn diff_discovery_snapshots(
     server_id: &McpServerId,
     previous: &McpDiscoverySnapshot,
@@ -3000,6 +3566,7 @@ fn diff_discovery_snapshots(
 /// Merge-walks two name-keyed sequences and produces added/removed/changed
 /// name lists. Each side is sorted in place; no intermediate maps are
 /// allocated. Names are cloned only at output time.
+#[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 fn diff_named_items<'a, T>(
     previous: impl IntoIterator<Item = (&'a str, &'a T)>,
     current: impl IntoIterator<Item = (&'a str, &'a T)>,
@@ -3325,6 +3892,7 @@ fn prompt_descriptor_from_rmcp(prompt: McpPrompt) -> PromptDescriptor {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn read_resource_result_to_capabilities(
     result: ReadResourceResult,
 ) -> Result<ResourceContents, McpError> {
@@ -3463,6 +4031,7 @@ fn content_to_part(content: Content) -> Part {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn value_to_json_object(value: Value, context: &str) -> Result<rmcp_model::JsonObject, McpError> {
     match value {
         Value::Object(object) => Ok(object),
@@ -3480,6 +4049,13 @@ fn bearer_token_from_metadata(metadata: &MetadataMap) -> Option<String> {
 }
 
 fn rmcp_initialize_error(config: &McpServerConfig, error: ClientInitializeError) -> McpError {
+    rmcp_initialize_error_for_server(&config.id, error)
+}
+
+fn rmcp_initialize_error_for_server(
+    server_id: &McpServerId,
+    error: ClientInitializeError,
+) -> McpError {
     if let Some(signal) = match &error {
         ClientInitializeError::TransportError { error: dyn_err, .. } => {
             transport_auth_signal(dyn_err)
@@ -3487,13 +4063,34 @@ fn rmcp_initialize_error(config: &McpServerConfig, error: ClientInitializeError)
         _ => None,
     } {
         return McpError::AuthRequired(Box::new(auth_request_from_signal(
-            &config.id,
+            server_id,
             McpMethod::Initialize,
             signal,
             &error.to_string(),
         )));
     }
+    if missing_protocol_negotiation(&error) {
+        return McpError::UnsupportedProtocolVersion {
+            server: server_id.clone(),
+            expected: PINNED_PROTOCOL_VERSION,
+            negotiated: None,
+        };
+    }
     McpError::Transport(error.to_string())
+}
+
+fn missing_protocol_negotiation(error: &ClientInitializeError) -> bool {
+    match error {
+        ClientInitializeError::ExpectedInitResult(_) => true,
+        ClientInitializeError::TransportError { error, .. } => error
+            .error
+            .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+            .is_some_and(|error| {
+                matches!(error, StreamableHttpError::Deserialize(error) if error.to_string().contains("protocolVersion"))
+                    || matches!(error, StreamableHttpError::UnexpectedServerResponse(message) if message == "initialize did not return InitializeResult")
+            }),
+        _ => false,
+    }
 }
 
 fn rmcp_service_error(error: ServiceError) -> McpError {
@@ -3517,6 +4114,16 @@ fn rmcp_operation_error(
 }
 
 fn service_error_to_mcp_error(error: ServiceError) -> McpError {
+    if matches!(
+        &error,
+        ServiceError::TransportSend(dynamic)
+            if dynamic
+                .error
+                .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+                .is_some_and(|inner| matches!(inner, StreamableHttpError::SessionExpired))
+    ) {
+        return McpError::SessionExpired;
+    }
     match error {
         ServiceError::McpError(data) => {
             McpError::Invocation(McpInvocationError::from_error_data(data))
@@ -3750,6 +4357,30 @@ pub enum McpError {
     /// The MCP server returned a JSON-RPC error for the invoked method.
     #[error("invocation error: {0}")]
     Invocation(McpInvocationError),
+    /// The server negotiated (or omitted) an MCP protocol revision other
+    /// than [`PINNED_PROTOCOL_VERSION`]. The transport is closed before this
+    /// error is returned, so no discovery, catalog, or auth state exists for
+    /// the refused connection.
+    #[error(
+        "unsupported MCP protocol revision from server {server}: negotiated {negotiated:?}, pinned {expected:?}"
+    )]
+    UnsupportedProtocolVersion {
+        /// Server that produced the unsupported negotiation.
+        server: McpServerId,
+        /// The revision this crate pins and advertises.
+        expected: McpProtocolVersion,
+        /// The revision the server negotiated; `None` when no `initialize`
+        /// result was available.
+        negotiated: Option<McpProtocolVersion>,
+    },
+    /// Closing a transport after protocol refusal failed. Both failures are
+    /// retained because callers must not treat the refused transport as clean.
+    #[error("MCP protocol refusal cleanup failed: refusal={refusal}; cleanup={cleanup}")]
+    ProtocolRefusalCleanupFailed { refusal: String, cleanup: String },
+    /// The server rejected the previously established Streamable HTTP session
+    /// with HTTP 404. Kit must explicitly authorize a fresh initialize.
+    #[error("MCP HTTP session expired")]
+    SessionExpired,
     /// The referenced server ID is not registered in the [`McpServerManager`].
     #[error("unknown MCP server: {0}")]
     UnknownServer(String),
@@ -3770,6 +4401,16 @@ impl From<String> for McpServerId {
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn sse_reconnect_budget_is_total_and_bounded() {
+        let connections = std::sync::atomic::AtomicUsize::new(0);
+        assert!(spend_sse_connection(&connections, 2));
+        assert!(spend_sse_connection(&connections, 2));
+        assert!(spend_sse_connection(&connections, 2));
+        assert!(!spend_sse_connection(&connections, 2));
+        assert!(!spend_sse_connection(&connections, 2));
+    }
 
     #[test]
     fn transport_class_errors_map_to_unavailable() {

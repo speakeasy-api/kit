@@ -11947,60 +11947,40 @@ records:
   evidence_id: EV-1.09-C-001
   evidence_job: schema-compat
   expected_result: '`scripts/verify_pins.sh` exits 0 with `unpinned.mutable_protocols=0` and 0 protocol-version mismatches.'
-  artifact_digest: 2f8598d9f092f265db873b83db66731f43dead441a57905b7d639dae72dcd5ea
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when RFC.md:1505, a protocol dependency, a protocol adapter, an experiment manifest schema, or the build manifest changes.
 - requirement_id: KIT-VERSION-002
   evidence_type: conformance
   evidence_id: EV-1.09-C-002
   evidence_job: schema-compat
   expected_result: '`scripts/verify_pins.sh` exits 0 with `unpinned.mutable_datasets=0` and 0 dataset-version or instance-set-digest mismatches.'
-  artifact_digest: a2fce7d45148cc4cf34f1be9101da41cf55c1174a7ddc2320d2df69a7964d7f9
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when RFC.md:1505, a dataset release, an instance set, an experiment manifest schema, or the build manifest changes.
 - requirement_id: KIT-VERSION-003
   evidence_type: conformance
   evidence_id: EV-1.09-C-003
   evidence_job: schema-compat
   expected_result: '`scripts/verify_pins.sh` exits 0 with `unpinned.mutable_models=0` and 0 model-snapshot or feature-version mismatches.'
-  artifact_digest: cf3b828248f71abfe274aaa8ae4fc3654d696464be81d29557efb2af310e85e8
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when RFC.md:1505, a model snapshot, a model feature version, an experiment manifest schema, or the build manifest changes.
 - requirement_id: KIT-VERSION-004
   evidence_type: conformance
   evidence_id: EV-1.09-C-004
   evidence_job: schema-compat
   expected_result: '`scripts/verify_pins.sh` exits 0 with `unpinned.mutable_harnesses=0` and 0 harness-version mismatches.'
-  artifact_digest: f02fb17a40c458adfcdcc097917ebc099bddb4a6d00f877acee8ff6d0a1835e7
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when RFC.md:1505, a harness source or release, an experiment manifest schema, or the build manifest changes.
 - requirement_id: KIT-VERSION-800
   evidence_type: conformance

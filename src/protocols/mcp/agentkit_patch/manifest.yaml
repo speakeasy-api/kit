@@ -1,0 +1,63 @@
+schema_version: 1
+patch_id: m006-mcp-protocol-revision-pin
+work_package: M006-W07a
+agentkit_version: 0.10.2
+base_commit: c3926f1c4f3c945d400c8b6ef039da1f84826fcd
+base_tree: 5befb5676ea31703f4485e2d4b5869c39a39cb0f
+previous_snapshot_sha256: cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2
+patched_snapshot_sha256: 0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2
+files:
+  - path: vendor/agentkit/crates/agentkit-mcp/Cargo.toml
+    previous_sha256: 60addd2667e04d4ff9703c41cb35f61870e223df23d22a382df1318f9f414337
+    patched_sha256: f261f25abd55cdaeba3c77962ff3f962b1cc98caa0d54c1c407ef344a012ec4f
+    reason: exact transport dependency pins plus separate kit-authorized and unmediated-dev features
+  - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+    previous_sha256: e5f18868ced9493573a8eae0c12afd7f4d41cfbfdc4daba6f0c16d915930edf0
+    patched_sha256: c1de64070578b3c0526f0919d8cc49a420d93ecb1be0c0eb53457eb7ae2e8af3
+    reason: Kit-authorized initialize arguments and restricted transport constructors
+  - path: vendor/agentkit/crates/agentkit-integration-tests/Cargo.toml
+    previous_sha256: 1cb66244e92fd9574c6fd51676228e8d56bb2225c617352ed3b8b4345902c0eb
+    patched_sha256: ad4b46904a1fbc14ad74afe0a824976350d0860d915f3a562200da0d5da26cab
+    reason: explicit development-only opt-in for unmediated MCP constructors
+  - path: vendor/agentkit/examples/mcp-dynamic-auth/Cargo.toml
+    previous_sha256: 2162436049fd8b4208c32674cd073bb9ebbe395f925887f3aa844e8f1738cfaf
+    patched_sha256: 8f2daff5273c60c0b95f8320fd9b34c8a5648e245c002d9574c02289d067179c
+    reason: explicit development-only opt-in for unmediated MCP constructors
+  - path: vendor/agentkit/examples/mcp-reference-interop/Cargo.toml
+    previous_sha256: 56468798e4ab46e1c6e7b1bdb9ab711e431c2c7f3eccba64e2ec7d9c5860f706
+    patched_sha256: de1f9e6209da780c027a3cb3c4c0fa30efe438780be09f35949094095d53bc39
+    reason: explicit development-only opt-in for unmediated MCP constructors
+  - path: vendor/agentkit/examples/openrouter-agent-cli/Cargo.toml
+    previous_sha256: 98130a5d157fb3bd907c7a329206ad489187d2935ee965681b64c3e429b2fe3f
+    patched_sha256: 9038207e36ae1bfccec53d05c342bb6adf7678943f9bed4818ea3d4d7f98c8aa
+    reason: explicit development-only opt-in for unmediated MCP constructors
+  - path: vendor/agentkit/examples/openrouter-mcp-tool/Cargo.toml
+    previous_sha256: 2e2ee9f7207699cbb754e602e68b5f6c588c552e96614d4e3d7a6c1819ede06f
+    patched_sha256: 48640ad6d2d9c25676e777c9d4be7a080680999f2237c53583051bfa3088fa6b
+    reason: explicit development-only opt-in for unmediated MCP constructors
+  - path: vendor/agentkit/crates/agentkit-mcp/tests/dynamic_http_client.rs
+    previous_sha256: 404206adf2b6d03558777ed165706477e604047a7bb78052bcab62482a7fe04f
+    patched_sha256: c8d9af93264df4dec6af89bfa2e24a1be22f05a7e017c0d1b6c4f2d5575f78ea
+    reason: existing mock server negotiated 2024-11-05 and is now refused; mock updated to the pinned revision
+  - path: vendor/agentkit/crates/agentkit-mcp/tests/protocol_revision_pin.rs
+    previous_sha256: null
+    patched_sha256: dd12653ee97f08c41ac3f45b414585bd02286b1903524c8c560738fa18fba165
+    reason: added focused conformance suite for the pinned revision and both call-site refusals
+public_contract:
+  - PINNED_PROTOCOL_VERSION
+  - enforce_pinned_protocol_version
+  - McpProtocolVersion
+  - McpError::UnsupportedProtocolVersion
+  - McpConnection::negotiated_protocol_version
+  - McpConnection::connect_kit_authorized_transport
+  - StreamableHttpTransportConfig::with_max_sse_reconnects
+  - StreamableHttpTransportConfig::with_channel_buffer_capacity
+  - McpHttpClient::close_open_sessions
+upstream:
+  status: pending_submission
+  blocking: false
+verification:
+  - CARGO_TARGET_DIR=<external> cargo test --locked --manifest-path vendor/agentkit/Cargo.toml -p agentkit-mcp
+  - CARGO_TARGET_DIR=<external> cargo clippy --locked --manifest-path vendor/agentkit/Cargo.toml -p agentkit-mcp --all-targets -- -D warnings
+  - cargo fmt --manifest-path vendor/agentkit/Cargo.toml -p agentkit-mcp -- --check
+  - sh scripts/verify_pins.sh

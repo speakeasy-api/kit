@@ -9,6 +9,30 @@ dirty_overlay:
   format: "git diff HEAD --binary --no-ext-diff"
   sha256: "92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1"
   tracked_modification_count: 23
+  tracked_files:
+    - "Cargo.lock"
+    - "Cargo.toml"
+    - "benchmarks/compose-bench/src/metrics.rs"
+    - "benchmarks/compose-bench/src/scenario.rs"
+    - "benchmarks/compose-bench/src/scenarios/calendar_scheduling.rs"
+    - "crates/agentkit-adapter-completions/src/request.rs"
+    - "crates/agentkit-compaction/src/lib.rs"
+    - "crates/agentkit-loop/Cargo.toml"
+    - "crates/agentkit-loop/src/lib.rs"
+    - "crates/agentkit-provider-anthropic/Cargo.toml"
+    - "crates/agentkit-provider-anthropic/src/lib.rs"
+    - "crates/agentkit-provider-anthropic/src/request.rs"
+    - "crates/agentkit-provider-cerebras/src/batch.rs"
+    - "crates/agentkit-provider-cerebras/src/request.rs"
+    - "crates/agentkit-provider-openai/src/lib.rs"
+    - "crates/agentkit-provider-openrouter/src/lib.rs"
+    - "crates/agentkit-tool-compose/Cargo.toml"
+    - "crates/agentkit-tool-compose/src/lib.rs"
+    - "crates/agentkit-tool-compose/src/runlet_backend.rs"
+    - "crates/agentkit-tool-compose/src/tests.rs"
+    - "crates/agentkit-tool-compose/src/tests/runlet.rs"
+    - "docs/runlet-case-study.md"
+    - "examples/cerebras-batch/src/main.rs"
 exclusions:
   root: "benchmarks/compose-bench/results/2026-07-runlet-toon"
   reason: "untracked generated benchmark result outputs"
@@ -60,6 +84,21 @@ maintenance:
       - "crates/agentkit-compaction/src/lib.rs"
     contract: "attempt/fence/driver-bound CAS; exact candidate reconciliation; typed committed/not-committed/unknown outcomes"
     evidence: "src/agent/agentkit_patch/manifest.yaml;docs/compatibility/agentkit-hook.md"
+  mcp_protocol_revision_pin:
+    patch_id: "m006-mcp-protocol-revision-pin"
+    rationale: "explicit MCP revision 2025-11-25 pin and negotiated-revision refusal required by Kit BLK-05"
+    files:
+      - "crates/agentkit-integration-tests/Cargo.toml"
+      - "crates/agentkit-mcp/Cargo.toml"
+      - "crates/agentkit-mcp/src/lib.rs"
+      - "crates/agentkit-mcp/tests/dynamic_http_client.rs"
+      - "crates/agentkit-mcp/tests/protocol_revision_pin.rs"
+      - "examples/mcp-dynamic-auth/Cargo.toml"
+      - "examples/mcp-reference-interop/Cargo.toml"
+      - "examples/openrouter-agent-cli/Cargo.toml"
+      - "examples/openrouter-mcp-tool/Cargo.toml"
+    contract: "exact rmcp/http/SSE dependencies; explicit ProtocolVersion 2025-11-25 on every connect; unequal or missing negotiation closes before Ready; finite SSE reconnects; no transparent session reinitialize; unmediated-dev is explicit and Kit production enables only kit-authorized"
+    evidence: "src/protocols/mcp/agentkit_patch/manifest.yaml;docs/compatibility/agentkit-mcp-pin.md"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -72,10 +111,10 @@ dependency_graph:
   cargo_metadata_source: null
   source_null_reason: "Cargo path sources use null; immutability is supplied by the repository-vendored digest-verified payload"
 final_snapshot:
-  payload_file_count: 356
+  payload_file_count: 357
   manifest: "SNAPSHOT-MANIFEST.sha256"
-  manifest_sha256: "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
-  aggregate_sha256: "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
+  manifest_sha256: "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
+  aggregate_sha256: "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   attestation_files_excluded_from_payload_digest:
     - "SNAPSHOT-MANIFEST.sha256"

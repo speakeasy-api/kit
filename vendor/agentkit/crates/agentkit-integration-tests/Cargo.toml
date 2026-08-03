@@ -15,7 +15,7 @@ doctest = false
 agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities" }
 agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
 agentkit-loop = { version = "0.10.2", path = "../agentkit-loop" }
-agentkit-mcp = { version = "0.10.2", path = "../agentkit-mcp" }
+agentkit-mcp = { version = "0.10.2", path = "../agentkit-mcp", features = ["unmediated-dev"] }
 agentkit-task-manager = { version = "0.10.2", path = "../agentkit-task-manager" }
 agentkit-tool-compose = { version = "0.10.2", path = "../agentkit-tool-compose" }
 agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core", features = ["schemars"] }

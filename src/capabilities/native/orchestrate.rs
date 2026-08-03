@@ -65,11 +65,19 @@ fn map_broker_error(error: BrokerError) -> InvokeError {
         BrokerError::Accounting(error) => InvokeError::Accounting(error),
         BrokerError::ToolReservationRequired => InvokeError::ToolReservationRequired,
         BrokerError::InvalidAuthRequirement
+        | BrokerError::InvalidTransportOperation
         | BrokerError::AuthCredentialMismatch
         | BrokerError::AuthNotRequired
         | BrokerError::AuthResolutionCancelled
+        | BrokerError::TransportAuthCancelled
         | BrokerError::AuthPrincipalMismatch
+        | BrokerError::AuthScopeMismatch
         | BrokerError::AuthDenied
+        | BrokerError::RepeatedAuthChallenge
+        | BrokerError::ReplayNotAuthorized
+        | BrokerError::ReplayPermitConsumed
+        | BrokerError::TransportAlreadyCompleted
+        | BrokerError::TransportOutcomeUnknown
         | BrokerError::InvalidAuthState => InvokeError::BrokerAuth,
     }
 }

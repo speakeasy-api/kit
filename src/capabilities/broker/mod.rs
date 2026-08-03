@@ -24,12 +24,16 @@ use crate::{
     },
     runtime::scheduler::reserve::BudgetLedger,
     store::sqlite::{
-        append::{AppendCommand, ExpectedStreamVersion, NewEvent, SqliteStore, StoreError},
+        append::{
+            AppendCommand, AppendOutcome, ExpectedStreamVersion, NewEvent, SqliteStore, StoreError,
+        },
         idempotency::{
             CanonicalRequestDigest, IdempotencyKey, IdempotencyScope, IdempotencyStatus,
         },
     },
 };
+
+pub mod transport_auth;
 
 const AUTH_RECORD_VERSION: u16 = 1;
 const AUTH_CHALLENGE_COMMAND: &str = "capability.broker_auth.challenge";
@@ -38,6 +42,20 @@ const AUTH_CHALLENGE_EVENT: &str = "capability.broker_auth_challenged";
 const AUTH_RESOLUTION_EVENT: &str = "capability.broker_auth_resolved";
 const MAX_AUTH_SCOPE_BYTES: usize = 512;
 const MAX_AUTH_RECORD_BYTES: usize = 8192;
+
+struct AuthChannel {
+    challenge_command: &'static str,
+    resolution_command: &'static str,
+    challenge_event: &'static str,
+    resolution_event: &'static str,
+}
+
+const REQUIREMENT_CHANNEL: AuthChannel = AuthChannel {
+    challenge_command: AUTH_CHALLENGE_COMMAND,
+    resolution_command: AUTH_RESOLUTION_COMMAND,
+    challenge_event: AUTH_CHALLENGE_EVENT,
+    resolution_event: AUTH_RESOLUTION_EVENT,
+};
 
 pub struct BrokerInvocation<'a> {
     envelope: InvocationEnvelope<'a>,
@@ -81,6 +99,10 @@ impl<'a> BrokerInvocation<'a> {
         self.auth = Some(auth);
         self
     }
+
+    pub(crate) fn arguments(&self) -> &[u8] {
+        self.envelope.arguments
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,7 +114,12 @@ pub struct BrokerAuthRequirement {
 impl BrokerAuthRequirement {
     pub fn new(scope: impl Into<String>) -> Result<Self, BrokerError> {
         let scope = scope.into();
-        if scope.is_empty() || scope.len() > MAX_AUTH_SCOPE_BYTES {
+        if scope.is_empty()
+            || scope.len() > MAX_AUTH_SCOPE_BYTES
+            || scope
+                .bytes()
+                .any(|byte| !(byte.is_ascii_graphic() || byte == b' '))
+        {
             return Err(BrokerError::InvalidAuthRequirement);
         }
         Ok(Self {
@@ -188,11 +215,19 @@ pub enum BrokerError {
     UnsupportedValidation,
     InvalidArguments,
     InvalidAuthRequirement,
+    InvalidTransportOperation,
     AuthCredentialMismatch,
     AuthNotRequired,
     AuthResolutionCancelled,
+    TransportAuthCancelled,
     AuthPrincipalMismatch,
+    AuthScopeMismatch,
     AuthDenied,
+    RepeatedAuthChallenge,
+    ReplayNotAuthorized,
+    ReplayPermitConsumed,
+    TransportAlreadyCompleted,
+    TransportOutcomeUnknown,
     InvalidAuthState,
     AuthStore(StoreError),
     Invoke(InvokeError),
@@ -216,6 +251,9 @@ impl fmt::Display for BrokerError {
                 formatter.write_str("arguments do not satisfy the normalized schema")
             }
             Self::InvalidAuthRequirement => formatter.write_str("invalid broker auth requirement"),
+            Self::InvalidTransportOperation => {
+                formatter.write_str("transport operation must contain 1 to 128 visible ASCII bytes")
+            }
             Self::AuthCredentialMismatch => {
                 formatter.write_str("broker auth credential does not match the invocation")
             }
@@ -223,10 +261,30 @@ impl fmt::Display for BrokerError {
             Self::AuthResolutionCancelled => {
                 formatter.write_str("broker auth cannot be resolved for a cancelled invocation")
             }
+            Self::TransportAuthCancelled => formatter
+                .write_str("broker transport auth cannot proceed for a cancelled invocation"),
             Self::AuthPrincipalMismatch => {
                 formatter.write_str("broker auth principal or project does not match")
             }
+            Self::AuthScopeMismatch => {
+                formatter.write_str("broker transport auth scope does not match")
+            }
             Self::AuthDenied => formatter.write_str("broker auth was denied"),
+            Self::RepeatedAuthChallenge => {
+                formatter.write_str("broker transport auth was challenged again after resolution")
+            }
+            Self::ReplayNotAuthorized => {
+                formatter.write_str("broker transport replay requires a granted auth resolution")
+            }
+            Self::ReplayPermitConsumed => {
+                formatter.write_str("broker transport replay permit was already consumed")
+            }
+            Self::TransportAlreadyCompleted => {
+                formatter.write_str("broker transport operation already completed")
+            }
+            Self::TransportOutcomeUnknown => {
+                formatter.write_str("broker transport operation requires outcome reconciliation")
+            }
             Self::InvalidAuthState => formatter.write_str("invalid persisted broker auth state"),
             Self::AuthStore(error) => error.fmt(formatter),
             Self::Invoke(error) => error.fmt(formatter),
@@ -268,9 +326,19 @@ pub fn invoke(
             )));
         }
         let binding = AuthBinding::new(&request, requirement, decision.snapshot_digest())?;
-        match auth_state(runtime.store, &request.envelope, &binding)? {
+        match auth_state(
+            runtime.store,
+            &request.envelope,
+            &binding,
+            &REQUIREMENT_CHANNEL,
+        )? {
             AuthState::Missing => {
-                append_challenge(runtime.store, &request.envelope, &binding)?;
+                append_challenge(
+                    runtime.store,
+                    &request.envelope,
+                    &binding,
+                    &REQUIREMENT_CHANNEL,
+                )?;
                 return Ok(BrokerOutcome::AuthRequired(binding.challenge()));
             }
             AuthState::Waiting => {
@@ -330,11 +398,17 @@ pub fn resolve_auth(
         )));
     }
     let binding = AuthBinding::new(request, requirement, decision.snapshot_digest())?;
-    match auth_state(store, &request.envelope, &binding)? {
+    match auth_state(store, &request.envelope, &binding, &REQUIREMENT_CHANNEL)? {
         AuthState::Missing => return Err(BrokerError::InvalidAuthState),
         AuthState::Waiting | AuthState::Granted | AuthState::Denied => {}
     }
-    append_resolution(store, &request.envelope, &binding, resolution)
+    append_resolution(
+        store,
+        &request.envelope,
+        &binding,
+        resolution,
+        &REQUIREMENT_CHANNEL,
+    )
 }
 
 fn preflight(request: &BrokerInvocation<'_>) -> Result<(), BrokerError> {
@@ -361,6 +435,7 @@ fn ensure_auth_credential(
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AuthRecord {
     schema_version: u16,
     kind: String,
@@ -379,6 +454,12 @@ struct AuthRecord {
     scope: String,
     credential_id: Option<String>,
     trace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_binding: Option<transport_auth::TransportBinding>,
     resolution: Option<String>,
 }
 
@@ -394,8 +475,20 @@ impl AuthBinding {
         requirement: &BrokerAuthRequirement,
         decision_digest: Digest,
     ) -> Result<Self, BrokerError> {
+        Self::build(request, requirement, decision_digest, "stream", None, None)
+    }
+
+    fn build(
+        request: &BrokerInvocation<'_>,
+        requirement: &BrokerAuthRequirement,
+        decision_digest: Digest,
+        stream_kind: &str,
+        transport: Option<(&str, &str)>,
+        transport_binding: Option<&transport_auth::TransportBinding>,
+    ) -> Result<Self, BrokerError> {
         let envelope = &request.envelope;
-        let stream = ApprovalId::from_stable_bytes(auth_identity(envelope, "stream").as_bytes());
+        let identity = auth_identity(envelope, stream_kind);
+        let stream = ApprovalId::from_stable_bytes(identity.as_bytes());
         let request_digest = envelope.canonical_request_digest(decision_digest);
         let record = AuthRecord {
             schema_version: AUTH_RECORD_VERSION,
@@ -421,6 +514,9 @@ impl AuthBinding {
                 .as_ref()
                 .map(|credential| credential.identifier().to_owned()),
             trace_id: envelope.trace_id.as_str().to_owned(),
+            transport_kind: transport.map(|(kind, _)| kind.to_owned()),
+            transport_operation: transport.map(|(_, operation)| operation.to_owned()),
+            transport_binding: transport_binding.cloned(),
             resolution: None,
         };
         let bytes = record_bytes(&record)?;
@@ -487,17 +583,18 @@ fn auth_state(
     store: &mut SqliteStore,
     envelope: &InvocationEnvelope<'_>,
     binding: &AuthBinding,
+    channel: &AuthChannel,
 ) -> Result<AuthState, BrokerError> {
     let key = auth_key(envelope)?;
     let challenge = store
         .idempotency_status(
-            &auth_scope(envelope, binding.stream, AUTH_CHALLENGE_COMMAND)?,
+            &auth_scope(envelope, binding.stream, channel.challenge_command)?,
             &key,
         )
         .map_err(BrokerError::AuthStore)?;
     let resolution = store
         .idempotency_status(
-            &auth_scope(envelope, binding.stream, AUTH_RESOLUTION_COMMAND)?,
+            &auth_scope(envelope, binding.stream, channel.resolution_command)?,
             &key,
         )
         .map_err(BrokerError::AuthStore)?;
@@ -554,19 +651,21 @@ fn append_challenge(
     store: &mut SqliteStore,
     envelope: &InvocationEnvelope<'_>,
     binding: &AuthBinding,
+    channel: &AuthChannel,
 ) -> Result<(), BrokerError> {
     let bytes = record_bytes(&binding.record)?;
     append_auth(
         store,
         envelope,
         binding.stream,
-        AUTH_CHALLENGE_COMMAND,
-        AUTH_CHALLENGE_EVENT,
+        channel.challenge_command,
+        channel.challenge_event,
         0,
         binding.digest,
         bytes,
         false,
     )
+    .map(|_| ())
 }
 
 fn append_resolution(
@@ -574,19 +673,21 @@ fn append_resolution(
     envelope: &InvocationEnvelope<'_>,
     binding: &AuthBinding,
     resolution: AuthResolution,
+    channel: &AuthChannel,
 ) -> Result<(), BrokerError> {
     let (_, bytes, digest) = binding.resolution(resolution)?;
     append_auth(
         store,
         envelope,
         binding.stream,
-        AUTH_RESOLUTION_COMMAND,
-        AUTH_RESOLUTION_EVENT,
+        channel.resolution_command,
+        channel.resolution_event,
         1,
         digest,
         bytes,
         true,
     )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -600,8 +701,10 @@ fn append_auth(
     digest: CanonicalRequestDigest,
     payload: Vec<u8>,
     allow_quiescent_driver_claim: bool,
-) -> Result<(), BrokerError> {
-    let event_id = EventId::from_stable_bytes(auth_identity(envelope, event_type).as_bytes());
+) -> Result<AppendOutcome, BrokerError> {
+    let event_id = EventId::from_stable_bytes(
+        format!("{}:{stream}", auth_identity(envelope, event_type)).as_bytes(),
+    );
     store
         .append(AppendCommand {
             idempotency_scope: auth_scope(envelope, stream, command)?,
@@ -629,8 +732,7 @@ fn append_auth(
             }],
             response: payload,
         })
-        .map_err(BrokerError::AuthStore)?;
-    Ok(())
+        .map_err(BrokerError::AuthStore)
 }
 
 fn auth_identity(envelope: &InvocationEnvelope<'_>, kind: &str) -> String {

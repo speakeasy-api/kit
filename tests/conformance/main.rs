@@ -38,6 +38,7 @@ mod harness_selfcheck;
 mod health_readiness;
 mod http_contract;
 mod lsp_facts;
+mod mcp_transport;
 mod native_tools;
 mod process_output;
 mod prompt_determinism;

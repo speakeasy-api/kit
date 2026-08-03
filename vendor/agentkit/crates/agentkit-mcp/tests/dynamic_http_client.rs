@@ -77,7 +77,7 @@ async fn handle_mcp(State(state): State<MockState>, headers: HeaderMap, body: St
 
     let result = match method {
         "initialize" => json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-11-25",
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "mock", "version": "0.0.0" }
         }),

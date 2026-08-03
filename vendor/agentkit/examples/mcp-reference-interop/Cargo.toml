@@ -8,7 +8,7 @@ version.workspace = true
 
 [dependencies]
 agentkit-core = { path = "../../crates/agentkit-core" }
-agentkit-mcp = { path = "../../crates/agentkit-mcp" }
+agentkit-mcp = { path = "../../crates/agentkit-mcp", features = ["unmediated-dev"] }
 axum = "0.8.4"
 rmcp = { version = "1.5.0", features = ["server", "transport-streamable-http-server"] }
 schemars = "1.0.4"

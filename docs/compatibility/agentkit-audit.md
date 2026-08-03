@@ -10,7 +10,7 @@ Kit targets only the repository-vendored snapshot in `vendor/agentkit/`:
 | Source tree | `5befb5676ea31703f4485e2d4b5869c39a39cb0f` |
 | Dirty overlay SHA-256 | `92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1` |
 | Excluded generated-path list SHA-256 | `6013053000cc27b0e77ed61964266ff38e246bee41fee9ef829c0d8763ecd3ae` |
-| Agentkit aggregate SHA-256 | `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2` |
+| Agentkit aggregate SHA-256 | `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2` |
 | Runlet aggregate SHA-256 | `fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef` |
 | Agentkit version | `0.10.2` |
 | Runlet version/source | `0.1.0`, repository path `vendor/runlet` |

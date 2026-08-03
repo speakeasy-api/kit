@@ -11,7 +11,7 @@ name = "mcp-dynamic-auth"
 path = "src/main.rs"
 
 [dependencies]
-agentkit-mcp = { path = "../../crates/agentkit-mcp" }
+agentkit-mcp = { path = "../../crates/agentkit-mcp", features = ["unmediated-dev"] }
 async-trait.workspace = true
 axum = "0.8.4"
 reqwest.workspace = true

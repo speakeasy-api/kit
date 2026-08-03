@@ -11,6 +11,8 @@ rust-version.workspace = true
 
 [features]
 default = []
+kit-authorized = []
+unmediated-dev = []
 
 [dependencies]
 agentkit-capabilities = { version = "0.10.2", path = "../agentkit-capabilities" }
@@ -18,12 +20,12 @@ agentkit-core = { version = "0.10.2", path = "../agentkit-core" }
 agentkit-tools-core = { version = "0.10.2", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 futures-util.workspace = true
-http = "1"
+http = "=1.4.0"
 reqwest.workspace = true
-rmcp = { version = "1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
+rmcp = { version = "=1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 serde.workspace = true
 serde_json.workspace = true
-sse-stream = "0.2"
+sse-stream = "=0.2.1"
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }

@@ -14,7 +14,7 @@ The snapshot in `vendor/agentkit/` was built without modifying
 - commit: `c3926f1c4f3c945d400c8b6ef039da1f84826fcd`
 - tree: `5befb5676ea31703f4485e2d4b5869c39a39cb0f`
 - tracked files: `356`
-- tracked dirty modifications: `10`
+- tracked dirty modifications: `23`
 - dirty binary patch SHA-256:
   `92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1`
 
@@ -62,10 +62,10 @@ floating source. The Runlet bytes are repository-vendored and digest-verified.
 
 ## Snapshot Identity
 
-- payload files: `356`
+- payload files: `357`
 - manifest: `vendor/agentkit/SNAPSHOT-MANIFEST.sha256`
 - aggregate SHA-256:
-  `7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a`
+  `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`
 - license preserved: `vendor/agentkit/LICENSE`
 
 `vendor/agentkit/SNAPSHOT-METADATA.yaml` records the source identity, patch,
@@ -89,7 +89,7 @@ Only line wrapping changed; tokens, behavior, schemas, and public API did not.
 - Source reconstruction and both deterministic manifests: pass. The Runlet
   digest is `fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef`;
   the normalized Agentkit digest is
-  `7a04d34e1509a0325bba5bd804f4d76afb6662ee7754d4ee903aa59b51867d0a`.
+  `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`.
 - `CARGO_TARGET_DIR=/tmp/kit-agentkit-target cargo test --locked --workspace
   --all-features`: pass, including
   `compose_source_tracks_dynamic_child_catalog`.
@@ -104,11 +104,13 @@ suite and digest check passes. `BLK-02` is closed.
 
 ## Timestamp
 
-2026-07-21 (UTC)
+2026-08-02 (UTC)
 
 ## Current Overlay
 
 M009-W01 retains this historical source capture and adds the pinned
-`m009-post-validation-checkpoint` overlay. The current complete Agentkit payload digest is
-`cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`; exact changed-file hashes are
-recorded in `src/agent/agentkit_patch/manifest.yaml`.
+`m009-post-validation-checkpoint` overlay; M006-W07a adds the pinned
+`m006-mcp-protocol-revision-pin` overlay. The current complete Agentkit payload digest is
+`0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`; exact changed-file hashes are
+recorded in `src/agent/agentkit_patch/manifest.yaml` and
+`src/protocols/mcp/agentkit_patch/manifest.yaml`.

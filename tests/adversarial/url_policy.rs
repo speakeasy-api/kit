@@ -1,4 +1,5 @@
 #[path = "../../src/domain/egress/mod.rs"]
+#[allow(dead_code)]
 mod egress;
 
 use std::net::IpAddr;

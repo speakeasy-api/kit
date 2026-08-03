@@ -3,9 +3,12 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str::FromStr,
+    time::Duration,
 };
 
 pub const MAX_REDIRECTS: usize = 5;
+pub const MAX_RESOLVED_ADDRESSES: usize = 64;
+const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Scheme {
@@ -121,30 +124,36 @@ impl DestinationGrant {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolverObservation {
+pub(crate) struct ResolverObservation {
     addresses: Vec<IpAddr>,
 }
 
 impl ResolverObservation {
-    pub fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
+    pub(crate) fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Self {
         Self {
             addresses: addresses.into_iter().collect(),
         }
     }
 
-    pub fn addresses(&self) -> &[IpAddr] {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn addresses(&self) -> &[IpAddr] {
         &self.addresses
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectObservation {
+pub(crate) struct ConnectObservation {
     resolution: ResolverObservation,
     connected: IpAddr,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl ConnectObservation {
-    pub fn new(resolution: ResolverObservation, connected: IpAddr) -> Self {
+    pub(crate) fn new(resolution: ResolverObservation, connected: IpAddr) -> Self {
         Self {
             resolution,
             connected,
@@ -172,6 +181,34 @@ impl Authorization {
     pub fn redirect_count(&self) -> usize {
         self.redirects
     }
+
+    pub fn resolved_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.resolved.iter().copied()
+    }
+
+    pub fn authorizes_peer(&self, address: IpAddr) -> bool {
+        self.resolved.contains(&address)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        scheme: Scheme,
+        host: &str,
+        port: u16,
+        credential: CredentialHandle,
+        addresses: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        Self {
+            destination: Destination {
+                scheme,
+                host: Host::Domain(host.to_owned()),
+                port,
+            },
+            credential,
+            resolved: addresses.into_iter().collect(),
+            redirects: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -186,7 +223,48 @@ impl EgressPolicy {
         }
     }
 
-    pub fn authorize_initial(
+    /// Resolves through the policy-owned system resolver and pins the complete
+    /// validated address set into the returned authorization.
+    pub async fn resolve_initial(
+        &self,
+        url: &str,
+        credential: &CredentialHandle,
+    ) -> Result<Authorization, Denial> {
+        let destination = parse_url(url)?;
+        let resolution = resolve_destination(&destination).await?;
+        self.authorize(url, credential, &resolution, 0)
+    }
+
+    pub async fn resolve_redirect(
+        &self,
+        previous: &Authorization,
+        url: &str,
+        credential: &CredentialHandle,
+    ) -> Result<Authorization, Denial> {
+        if previous.redirects >= MAX_REDIRECTS {
+            return Err(Denial::RedirectLimit);
+        }
+        let destination = parse_url(url)?;
+        let resolution = resolve_destination(&destination).await?;
+        self.authorize(url, credential, &resolution, previous.redirects + 1)
+    }
+
+    pub fn validate_peer(
+        &self,
+        authorization: &Authorization,
+        connected: IpAddr,
+    ) -> Result<(), Denial> {
+        if !public_ip(connected) {
+            return Err(Denial::PrivateAddress);
+        }
+        if !authorization.resolved.contains(&connected) {
+            return Err(Denial::ConnectedAddressMismatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authorize_initial(
         &self,
         url: &str,
         credential: &CredentialHandle,
@@ -195,7 +273,9 @@ impl EgressPolicy {
         self.authorize(url, credential, resolution, 0)
     }
 
-    pub fn authorize_redirect(
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn authorize_redirect(
         &self,
         previous: &Authorization,
         url: &str,
@@ -208,7 +288,9 @@ impl EgressPolicy {
         self.authorize(url, credential, resolution, previous.redirects + 1)
     }
 
-    pub fn authorize_connect(
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn authorize_connect(
         &self,
         authorization: &Authorization,
         observation: &ConnectObservation,
@@ -252,6 +334,25 @@ impl EgressPolicy {
     }
 }
 
+async fn resolve_destination(destination: &Destination) -> Result<ResolverObservation, Denial> {
+    let host = destination.host.canonical();
+    let resolved = tokio::time::timeout(
+        DNS_RESOLUTION_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), destination.port)),
+    )
+    .await
+    .map_err(|_| Denial::ResolverUnavailable)?
+    .map_err(|_| Denial::ResolverUnavailable)?;
+    let addresses = resolved
+        .take(MAX_RESOLVED_ADDRESSES + 1)
+        .map(|address| address.ip())
+        .collect::<Vec<_>>();
+    if addresses.len() > MAX_RESOLVED_ADDRESSES {
+        return Err(Denial::ResolutionLimit);
+    }
+    Ok(ResolverObservation::new(addresses))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Denial {
     InvalidUrl,
@@ -267,6 +368,8 @@ pub enum Denial {
     InvalidCredentialHandle,
     DestinationNotGranted,
     EmptyResolution,
+    ResolverUnavailable,
+    ResolutionLimit,
     DnsRebinding,
     ConnectedAddressMismatch,
     RedirectLimit,

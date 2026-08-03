@@ -189,3 +189,81 @@ notes: |
   blocker. 11.02 and 7.05 remain blocked on BLK-06 and BLK-05 respectively
   until the owning fixes land and are verified per the criteria above.
 ```
+
+---
+
+## BLK-05 resolution — M006-W07a vendored patch (2026-08-02)
+
+Patch `m006-mcp-protocol-revision-pin` (recorded in
+`src/protocols/mcp/agentkit_patch/manifest.yaml`, documented in
+`docs/compatibility/agentkit-mcp-pin.md`) closes BLK-05's required action
+inside the vendored `agentkit-mcp 0.10.2` crate.
+
+### Change
+
+- `vendor/agentkit/crates/agentkit-mcp/src/lib.rs` — adapter-owned
+  `pub const PINNED_PROTOCOL_VERSION: McpProtocolVersion =
+  McpProtocolVersion::V_2025_11_25`.
+- The former
+  `.with_protocol_version(rmcp_model::ProtocolVersion::LATEST)` call site
+  (previously `:1324`) now advertises `PINNED_PROTOCOL_VERSION`.
+- Shared
+  transport-independent contract `enforce_pinned_protocol_version`:
+  negotiated revision unequal to the pin, or missing, returns the new typed
+  `McpError::UnsupportedProtocolVersion` (`:4330-4374`) carrying server id,
+  expected pin, and the offending negotiation.
+- `enforce_negotiated_protocol_version` applies that contract to every
+  freshly initialized rmcp service and closes the transport on refusal
+  before any capability, discovery, catalog, or auth state exists. Both
+  transport connect functions (`connect_rmcp_stdio` at `:2327-2366`,
+  `connect_rmcp_streamable_http` at `:2367-2450`, and
+  `connect_kit_authorized_transport` at `:1714-1761`)
+  terminate in it. This covers initial stdio and Streamable HTTP connects and
+  every adapter reconnect. Transparent rmcp session reinitialize is disabled,
+  and SSE retries/channels are finite so no hidden handshake bypasses refusal.
+- `McpConnection::negotiated_protocol_version` exposes the
+  negotiated revision; connect-family constructions are guaranteed to
+  report the pin.
+- Kit compiles the crate with `kit-authorized`: public command-bearing/default
+  client connect entry points are absent, stdio accepts only an executor token
+  through the injected durable owned-process service, and HTTP construction
+  requires Kit's injected policy-owned client. Missing stdio runtime service is
+  a typed unavailable result; no live Kit stdio launch evidence is claimed.
+  AgentKit examples and integration tests explicitly enable `unmediated-dev`,
+  while Kit production enables only `kit-authorized`. Kit's
+  `ReadyConnection` keeps the raw AgentKit connection private and mediates
+  every exposed post-Ready request through the broker.
+
+### `LATEST` elimination
+
+`grep -rn "ProtocolVersion::LATEST" vendor/agentkit/crates/ src/` matches
+exactly one line: the drift-canary test
+`vendor/agentkit/crates/agentkit-mcp/tests/protocol_revision_pin.rs:78-81`
+(`upstream_default_revision_still_matches_pin`), which asserts upstream's
+alias still equals the pin so an rmcp upgrade that moves it fails loudly.
+Zero occurrences remain in any production path.
+
+### Verification observed
+
+`CARGO_TARGET_DIR=<external> cargo test --locked --manifest-path
+vendor/agentkit/Cargo.toml -p agentkit-mcp` — 43 tests pass (5 unit, 2
+`dynamic_http_client`, 23 `in_memory`, 13 `protocol_revision_pin`), 0
+failed. The `protocol_revision_pin` suite covers: exact-revision acceptance
+and refusal of `2025-06-18`, `2025-03-26`, `2024-11-05` at both real call
+sites (stdio child process and Streamable HTTP), refusal before any
+discovery request plus HTTP session close on refusal, reconnect refusal
+after a server downgrade, missing-negotiation refusal, a 1200-value
+generated corpus of unequal revisions through the shared contract, and the
+`LATEST`-drift canary. `cargo clippy -p agentkit-mcp --all-targets -- -D
+warnings` and the `kit-authorized` library clippy target both pass cleanly.
+
+Kit's registered `cargo test --locked --test conformance mcp_transport` suite
+passes 5/5, and the focused Kit MCP suite passes 18/18. These cover the
+authorized stdio and HTTP seams, refusal ordering, broker mediation and durable
+operation state, session/peer/header behavior, SSE edge cases, and CRLF bounds.
+
+### Status
+
+BLK-05 required action is implemented and locally verified. This record
+claims no gate: `G06`/`G10` remain owned by their conformance and release
+units (`M010-W06`, `M010-W09`), and `BLK-06` is unchanged and open.

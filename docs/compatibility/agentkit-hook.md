@@ -3,7 +3,7 @@
 - Work package: `M009-W01`
 - Agentkit release: `0.10.2`
 - Patch ID: `m009-post-validation-checkpoint`
-- Snapshot SHA-256: `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`
+- Snapshot SHA-256: `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2` (carried forward by patch `m006-mcp-protocol-revision-pin`; the hook patch itself last produced `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`)
 - Upstream status: pending submission; upstream acceptance is non-blocking
 - Semantic compaction: disabled until `M009-W06`
 

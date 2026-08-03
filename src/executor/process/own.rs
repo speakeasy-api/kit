@@ -235,6 +235,10 @@ impl PreparedCommandToken {
         self.profile = Some(profile);
         self
     }
+
+    pub(crate) fn stdio_identity(&self) -> String {
+        self.claim.process_id.to_string()
+    }
 }
 
 impl fmt::Debug for PreparedCommandToken {

@@ -137,7 +137,7 @@ bf3ffb5c0fbd29d0cf32ef9730a9fe90ef794fc89c6a885314605815eda60f95  100644  crates
 fab219cf767122dd93009e3280c6c3b526545b365a56a8a66e45627efdf090cc  100644  crates/agentkit-http/src/reqwest_impl.rs
 e2dc9d8bead2df566527a8a8c1bfa3dcb2de0dca7e9a19d1374718a464c81b2a  100644  crates/agentkit-http/src/reqwest_middleware_impl.rs
 c26cd349d61b9247fc0a88d516d9f95bdea1836720b69eda8fede02536f26f7e  100644  crates/agentkit-http/src/response.rs
-1cb66244e92fd9574c6fd51676228e8d56bb2225c617352ed3b8b4345902c0eb  100644  crates/agentkit-integration-tests/Cargo.toml
+ad4b46904a1fbc14ad74afe0a824976350d0860d915f3a562200da0d5da26cab  100644  crates/agentkit-integration-tests/Cargo.toml
 d182ae6fa1be773f1cd562b696e37cb7a6ace10f5383ade34c016d7ae286191a  100644  crates/agentkit-integration-tests/src/http_mcp_server.rs
 3ad45d254c0d70a573ef5c996330237da0cdcd69f8bbe6e2c39a0450720f91ef  100644  crates/agentkit-integration-tests/src/lib.rs
 b0f95216fdeba22ba46494e62627443c7ba6e0e2fcd6e7f0d3d0cc6350271555  100644  crates/agentkit-integration-tests/src/mcp_server.rs
@@ -182,11 +182,12 @@ f6cf06007fb4123b59cd0437e365c2515ebe7abba296ecb02cbf3753fa15ed60  100644  crates
 0c8084347f654867a3c3bf8db63ff7dc5e01f1fba26bb5c697e6eb69761de5ec  100644  crates/agentkit-loop/Cargo.toml
 7f3f839ee6d60d1806532d176b7c62c3198603d3da784cc4a105b8b5e322ce9d  100644  crates/agentkit-loop/README.md
 ddb75c55cc30bc81a4b5517246ae0f9e98ad77b12752e28a5930fc31da054f75  100644  crates/agentkit-loop/src/lib.rs
-60addd2667e04d4ff9703c41cb35f61870e223df23d22a382df1318f9f414337  100644  crates/agentkit-mcp/Cargo.toml
+f261f25abd55cdaeba3c77962ff3f962b1cc98caa0d54c1c407ef344a012ec4f  100644  crates/agentkit-mcp/Cargo.toml
 d334d6bae3ceea005f2effe6b8d8b8579ee74a14d1b6bc7557d194b4e40f983b  100644  crates/agentkit-mcp/README.md
-e5f18868ced9493573a8eae0c12afd7f4d41cfbfdc4daba6f0c16d915930edf0  100644  crates/agentkit-mcp/src/lib.rs
-404206adf2b6d03558777ed165706477e604047a7bb78052bcab62482a7fe04f  100644  crates/agentkit-mcp/tests/dynamic_http_client.rs
+c1de64070578b3c0526f0919d8cc49a420d93ecb1be0c0eb53457eb7ae2e8af3  100644  crates/agentkit-mcp/src/lib.rs
+c8d9af93264df4dec6af89bfa2e24a1be22f05a7e017c0d1b6c4f2d5575f78ea  100644  crates/agentkit-mcp/tests/dynamic_http_client.rs
 ca7790c34934c6ab8eb09e684367668a96f0b5e60ef33c46c1e09a4a1e335f2f  100644  crates/agentkit-mcp/tests/in_memory.rs
+dd12653ee97f08c41ac3f45b414585bd02286b1903524c8c560738fa18fba165  100644  crates/agentkit-mcp/tests/protocol_revision_pin.rs
 7364b768d482a85604b316813ad071314fb1d4e549d6f3b451f8968138d5efa0  100644  crates/agentkit-provider-anthropic/Cargo.toml
 b24300e4eab8d28bc913a5fd3259000e6e1bac6c2e7f269f77b490497ce6de92  100644  crates/agentkit-provider-anthropic/README.md
 a6430ca644cbca888be8d16548c310e20e5ee80105713219b8a777a245abf651  100644  crates/agentkit-provider-anthropic/src/config.rs
@@ -294,9 +295,9 @@ e4afd0f139a8d4e460db7b784ed77734203b6513ba518391ffb6d16cb17d7d85  100644  exampl
 4fa456f81ff1d752a25bcbfff6980bdef62f3f28ddab72cfdf874288b825bf56  100644  examples/cerebras-batch/src/main.rs
 6c2065e340b1b9ac46217f8f4f11fab271af03e6193ac20babec6f7cc2a21e93  100644  examples/cerebras-chat/Cargo.toml
 4a8ffc1bd0b68ccb788f3c2afb556f6cdaf1faf5797b4558ceb0aa28eb92faf5  100644  examples/cerebras-chat/src/main.rs
-2162436049fd8b4208c32674cd073bb9ebbe395f925887f3aa844e8f1738cfaf  100644  examples/mcp-dynamic-auth/Cargo.toml
+8f2daff5273c60c0b95f8320fd9b34c8a5648e245c002d9574c02289d067179c  100644  examples/mcp-dynamic-auth/Cargo.toml
 d749e2d91177cc0b93844786adad993afb392db7556d350a39180bfd32a34fa0  100644  examples/mcp-dynamic-auth/src/main.rs
-56468798e4ab46e1c6e7b1bdb9ab711e431c2c7f3eccba64e2ec7d9c5860f706  100644  examples/mcp-reference-interop/Cargo.toml
+de1f9e6209da780c027a3cb3c4c0fa30efe438780be09f35949094095d53bc39  100644  examples/mcp-reference-interop/Cargo.toml
 b6dbaa79a754c33702eee53474c8be630eabd407fce5e8e5ef5ddfae9118db02  100644  examples/mcp-reference-interop/README.md
 c034273af0bb5200d2dbca9f26241cbf5fafcb1e1f8e298edcfce6f2da81e12c  100644  examples/mcp-reference-interop/src/bin/mcp-reference-server.rs
 c956dcd4cda278dfeeb459e16242dff28ebefee897f695368b899d22207e4593  100644  examples/mcp-reference-interop/src/lib.rs
@@ -305,7 +306,7 @@ c956dcd4cda278dfeeb459e16242dff28ebefee897f695368b899d22207e4593  100644  exampl
 670e9e68852830b687c2f22b08ef948ba7464b3e3b7f8c9b01a6501df84503ed  100644  examples/openrouter-acp-trio/Cargo.toml
 70a76952625a122acc5d4b34c2dc878a7a0096cb210a9c2648fa3226bf4dc471  100644  examples/openrouter-acp-trio/README.md
 f0924c8bc9db19a76af52972578cd2ad4b4dc66d83dd12a3baf32654a8fcde8d  100644  examples/openrouter-acp-trio/src/main.rs
-98130a5d157fb3bd907c7a329206ad489187d2935ee965681b64c3e429b2fe3f  100644  examples/openrouter-agent-cli/Cargo.toml
+9038207e36ae1bfccec53d05c342bb6adf7678943f9bed4818ea3d4d7f98c8aa  100644  examples/openrouter-agent-cli/Cargo.toml
 28232c68681e2cf78160fb252b887dede8ccd0a6a04fd9e4ffb39617475cb248  100644  examples/openrouter-agent-cli/README.md
 403a99a9269af078b9c154f633083a2b9a89889c164a40cd41b9623426447bba  100644  examples/openrouter-agent-cli/src/main.rs
 c0303ce60e060a67880ced37e615da686847ec1a3bdbab9364fb8a6e62805ebd  100644  examples/openrouter-chat/Cargo.toml
@@ -334,7 +335,7 @@ d22297b929cf491bfeebf3eae12998e6cda5b5f368191e64d640e4f0bcdf325a  100644  exampl
 7fb90d100fcdb7ff24b30f10191650645177bab9f47b0974c9fc52dc151d0285  100644  examples/openrouter-context-window-compaction/src/story.txt
 9c6d3a1041ab8ca2cd27c4f57020bc7aff28e1ed37d82b77f36a9e399269a777  100644  examples/openrouter-macro-tool/Cargo.toml
 64d21f6bb965591eae33bc622f0a8d482e2900281b83e579050881d47a22dd6b  100644  examples/openrouter-macro-tool/src/main.rs
-2e2ee9f7207699cbb754e602e68b5f6c588c552e96614d4e3d7a6c1819ede06f  100644  examples/openrouter-mcp-tool/Cargo.toml
+48640ad6d2d9c25676e777c9d4be7a080680999f2237c53583051bfa3088fa6b  100644  examples/openrouter-mcp-tool/Cargo.toml
 7221a466674b0702e5db1e8e80d89f1d621c1b2d7324da8c78e409867438ba44  100644  examples/openrouter-mcp-tool/README.md
 6af9e1f1dd17cd2af0c9a04e05f1c5869ab2169bad79fdb5eeb8d704fe753529  100644  examples/openrouter-mcp-tool/src/lib.rs
 a9acdd7e6dfeb60369ea417b5b788ea4fed9d12cdaa399d1e9eb9ff8aa7f8289  100644  examples/openrouter-mcp-tool/src/main.rs

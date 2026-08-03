@@ -111,7 +111,7 @@ complete boundary before release, and clean the selected process boundary on com
 They are not published through the process registry or public API and are therefore not
 API-cancellable. Attempt ownership remains rejected because it requires the cancellation
 coordinator; attempt-owned execution remains on the container backend. Local credential custody is
-unavailable and fails closed.
+unavailable and fails closed. This worktree claims no live Kit stdio launch evidence.
 
 ## PTY availability
 
