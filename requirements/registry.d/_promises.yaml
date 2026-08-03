@@ -12326,14 +12326,14 @@
   source_quote: Negotiated MCP `notifications/tools/list_changed`, `notifications/resources/list_changed`, and `notifications/prompts/list_changed` events trigger coalesced refresh of the corresponding catalogs. They do not dictate what enters model context.
   source_fingerprint: a24b37deb3fef89e6cbaa580d8155a9f0ae24fd2f97f046e3bf1786683182da8
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
-  interpretation: Negotiated MCP tool-list changes trigger coalesced tool-catalog refresh.
+  interpretation: Negotiated MCP tool-list changes trigger bounded, coalesced, broker-authorized tool-catalog refresh and atomic publication.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_821 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -12348,13 +12348,16 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/features/discovery.rs
+  - src/protocols/mcp/transport/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/fault/mcp_listchange_storm.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1031
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_821 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -12372,14 +12375,14 @@
   source_quote: Negotiated MCP `notifications/tools/list_changed`, `notifications/resources/list_changed`, and `notifications/prompts/list_changed` events trigger coalesced refresh of the corresponding catalogs. They do not dictate what enters model context.
   source_fingerprint: a24b37deb3fef89e6cbaa580d8155a9f0ae24fd2f97f046e3bf1786683182da8
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
-  interpretation: Negotiated MCP resource-list changes trigger coalesced resource-catalog refresh.
+  interpretation: Negotiated MCP resource-list changes trigger bounded, coalesced, broker-authorized resource and resource-template catalog refresh and atomic publication.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_822 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -12394,13 +12397,16 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/features/discovery.rs
+  - src/protocols/mcp/transport/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/fault/mcp_listchange_storm.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1032
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_822 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -12418,14 +12424,14 @@
   source_quote: Negotiated MCP `notifications/tools/list_changed`, `notifications/resources/list_changed`, and `notifications/prompts/list_changed` events trigger coalesced refresh of the corresponding catalogs. They do not dictate what enters model context.
   source_fingerprint: a24b37deb3fef89e6cbaa580d8155a9f0ae24fd2f97f046e3bf1786683182da8
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
-  interpretation: Negotiated MCP prompt-list changes trigger coalesced prompt-catalog refresh.
+  interpretation: Negotiated MCP prompt-list changes trigger bounded, coalesced, broker-authorized prompt-catalog refresh and atomic publication.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_823 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -12440,13 +12446,16 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/features/discovery.rs
+  - src/protocols/mcp/transport/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/fault/mcp_listchange_storm.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1033
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_823 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -19846,14 +19855,14 @@
   source_quote: Kit connects stdio and Streamable HTTP MCP servers through `agentkit-mcp`, preserving tools, resources, and prompts as distinct capability types. It supports explicit discovery, list-change refresh, auth interruption/resume, and configured client-side sampling, elicitation, and roots responders.
   source_fingerprint: 2fce9901bb757c1c8d04ada8501cf260c70c83e0c05963ddfb9a810745484a9b
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
   interpretation: Kit preserves MCP tools, resources, and prompts as distinct capability types.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_800 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance mcp_features::mcp_feature_dtos_normalize_four_kinds_without_inventing_output_schemas -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -19868,13 +19877,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/features/mod.rs
+  - src/protocols/mcp/features/discovery.rs
+  - src/protocols/mcp/transport/invocation.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/mcp_features.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1186
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_800 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance mcp_features::mcp_feature_dtos_normalize_four_kinds_without_inventing_output_schemas -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -19892,14 +19905,14 @@
   source_quote: Kit connects stdio and Streamable HTTP MCP servers through `agentkit-mcp`, preserving tools, resources, and prompts as distinct capability types. It supports explicit discovery, list-change refresh, auth interruption/resume, and configured client-side sampling, elicitation, and roots responders.
   source_fingerprint: 2fce9901bb757c1c8d04ada8501cf260c70c83e0c05963ddfb9a810745484a9b
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: Kit supports MCP discovery, list-change refresh, auth resume, sampling, elicitation, and roots responders.
+  interpretation: W07a and W07b implement discovery, list-change refresh, and auth resume; sampling, elicitation, and roots responders remain W07c, so this promise is active rather than implemented.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_801 exits 0 with 1 passed and 0 failed
+  - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -19914,13 +19927,19 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/features/discovery.rs
+  - src/protocols/mcp/transport/mod.rs
+  - src/protocols/mcp/transport/http.rs
+  - src/protocols/mcp/transport/stdio.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/mcp_features.rs
+  - tests/fault/mcp_listchange_storm.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1187
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_801 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -19938,14 +19957,14 @@
   source_quote: MCP servers and their descriptions are untrusted unless explicitly trusted. Tools execute through Kit’s normal broker with pinned schema digests. Credentials never enter model context or composition programs.
   source_fingerprint: d5110c56967f20a6f8b7f16a1faa8a24070e2190c521ad7f68039955eacf14fa
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
   interpretation: MCP servers and descriptions are untrusted unless explicitly trusted.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_802 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance mcp_features::mcp_schema_dialects_and_advisory_annotations_remain_truthful_and_fail_closed -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -19960,13 +19979,18 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/features/mod.rs
+  - src/protocols/mcp/features/discovery.rs
+  - src/protocols/mcp/transport/invocation.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/mcp_features.rs
+  - tests/adversarial/mcp_result_authority.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1188
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_802 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance mcp_features::mcp_schema_dialects_and_advisory_annotations_remain_truthful_and_fail_closed -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -19984,14 +20008,14 @@
   source_quote: MCP servers and their descriptions are untrusted unless explicitly trusted. Tools execute through Kit’s normal broker with pinned schema digests. Credentials never enter model context or composition programs.
   source_fingerprint: d5110c56967f20a6f8b7f16a1faa8a24070e2190c521ad7f68039955eacf14fa
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
   interpretation: MCP tools execute through the Kit broker with pinned schema digests.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_803 exits 0 with 1 passed and 0 failed
+  - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -20006,13 +20030,18 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/transport/mod.rs
+  - src/protocols/mcp/transport/invocation.rs
+  - src/capabilities/broker/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/mcp_invocation.rs
+  - tests/adversarial/mcp_result_authority.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1189
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_803 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -20030,14 +20059,14 @@
   source_quote: MCP servers and their descriptions are untrusted unless explicitly trusted. Tools execute through Kit’s normal broker with pinned schema digests. Credentials never enter model context or composition programs.
   source_fingerprint: d5110c56967f20a6f8b7f16a1faa8a24070e2190c521ad7f68039955eacf14fa
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
   interpretation: MCP credentials do not enter model context or composition programs.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_804 exits 0 with 1 passed and 0 failed
+  - cargo test --locked protocols::mcp::transport::http::tests::active_http_credential_scanner_rejects_raw_percent_and_base64_reflection --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -20052,13 +20081,19 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/protocols/mcp/config.rs
+  - src/protocols/mcp/transport/http.rs
+  - src/protocols/mcp/transport/stdio.rs
+  - src/telemetry/redact.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/mcp_invocation.rs
+  - tests/adversarial/mcp_result_authority.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1190
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_804 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::http::tests::active_http_credential_scanner_rejects_raw_percent_and_base64_reflection --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -20076,14 +20111,14 @@
   source_quote: Kit’s capability broker is the sole policy and dispatch authority for native tools, MCP tools/resources/prompts, ACP callbacks, and MCP sampling/elicitation/roots. Agentkit permission types adapt broker decisions into loop interrupts; they are not a second authority. Protocol permission or elicitation responses resolve a durable Kit request only after actor authentication and grant validation, with their own causation, budget, and cancellation records.
   source_fingerprint: 99f98d1f9f36de799f957befce239ab061b5cd2d83d69744b261222fa0aece7d
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: The capability broker is the sole policy and dispatch authority for native, MCP, ACP callback, sampling, elicitation, and roots capabilities.
+  interpretation: W07b makes the Kit broker the sole authority for MCP tools, resources, prompts, discovery, refresh, auth, and dispatch; sampling, elicitation, roots, and ACP callback coverage remain W07c, so this promise is active rather than implemented.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_805 exits 0 with 1 passed and 0 failed
+  - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -20098,13 +20133,18 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/broker/mod.rs
+  - src/protocols/mcp/transport/mod.rs
+  - src/protocols/mcp/transport/invocation.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/mcp_invocation.rs
+  - tests/adversarial/mcp_result_authority.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1191
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_805 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

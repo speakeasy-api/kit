@@ -2,7 +2,10 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    },
 };
 
 use kit::{
@@ -285,8 +288,8 @@ fn run_with_preexisting(
         budget.reserve(id, reservation).unwrap();
         budget.commit(id).unwrap();
     }
-    let cancellation = AtomicBool::new(false);
-    let fence = AtomicU64::new(7);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let fence = Arc::new(AtomicU64::new(7));
     let envelope = InvocationEnvelope {
         authenticated: &inputs.authenticated,
         config: &inputs.config,
@@ -446,6 +449,7 @@ fn success(_: &AuthorizedInvocation) -> DispatchOutcome {
     DispatchOutcome::Succeeded(CanonicalOutput {
         media_type: "application/json".to_owned(),
         body: br#"{"bytes":12}"#.to_vec(),
+        artifact_digests: Vec::new(),
     })
 }
 
@@ -457,8 +461,8 @@ fn auth_request<'a>(
     inputs: &'a Inputs,
     schema: &'a NormalizedSchema,
     arguments: &'a [u8],
-    cancellation: &'a AtomicBool,
-    fence: &'a AtomicU64,
+    cancellation: &'a Arc<AtomicBool>,
+    fence: &'a Arc<AtomicU64>,
 ) -> BrokerInvocation<'a> {
     auth_request_with(
         inputs,
@@ -478,8 +482,8 @@ fn auth_request_with<'a>(
     inputs: &'a Inputs,
     schema: &'a NormalizedSchema,
     arguments: &'a [u8],
-    cancellation: &'a AtomicBool,
-    fence: &'a AtomicU64,
+    cancellation: &'a Arc<AtomicBool>,
+    fence: &'a Arc<AtomicU64>,
     request_credential: &SecretHandle,
     required_credential: &SecretHandle,
     reservation: Spend,
@@ -795,8 +799,8 @@ fn broker_paths_nested_requires_and_uses_real_delegation() {
 fn broker_rejects_invalid_auth_inputs_before_challenge() {
     let (inputs, schema) = Inputs::new();
     let database = TestDatabase::new();
-    let cancellation = AtomicBool::new(false);
-    let fence = AtomicU64::new(7);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let fence = Arc::new(AtomicU64::new(7));
     let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
     let mut store = test_support::open_sqlite_store(database.path()).unwrap();
     install_claim(&mut store, &inputs);
@@ -865,8 +869,8 @@ fn broker_rejects_invalid_auth_inputs_before_challenge() {
 fn cancelled_broker_invocation_never_creates_or_resolves_auth() {
     let (inputs, schema) = Inputs::new();
     let database = TestDatabase::new();
-    let cancellation = AtomicBool::new(true);
-    let fence = AtomicU64::new(7);
+    let cancellation = Arc::new(AtomicBool::new(true));
+    let fence = Arc::new(AtomicU64::new(7));
     let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
     let mut store = test_support::open_sqlite_store(database.path()).unwrap();
     install_claim(&mut store, &inputs);
@@ -928,8 +932,8 @@ fn pending_and_denied_approval_skip_broker_auth() {
     ] {
         let (inputs, schema) = Inputs::new();
         let database = TestDatabase::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
         let mut store = test_support::open_sqlite_store(database.path()).unwrap();
         install_claim(&mut store, &inputs);
@@ -969,8 +973,8 @@ fn broker_auth_ids_are_scoped_beyond_invocation_id() {
     let (first_inputs, first_schema) = Inputs::new();
     let (mut second_inputs, second_schema) = Inputs::new();
     second_inputs.invocation_id = first_inputs.invocation_id;
-    let cancellation = AtomicBool::new(false);
-    let fence = AtomicU64::new(7);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let fence = Arc::new(AtomicU64::new(7));
     let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
     let first_database = TestDatabase::new();
     let second_database = TestDatabase::new();
@@ -1020,8 +1024,8 @@ fn broker_auth_ids_are_scoped_beyond_invocation_id() {
 fn broker_auth_is_bound_durable_and_precedes_kernel_effects() {
     let (inputs, schema) = Inputs::new();
     let database = TestDatabase::new();
-    let cancellation = AtomicBool::new(false);
-    let fence = AtomicU64::new(7);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let fence = Arc::new(AtomicU64::new(7));
     let arguments = br#"{"path":"README.md"}"#;
     let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
     let dispatches = Cell::new(0);
@@ -1241,8 +1245,8 @@ fn broker_auth_is_bound_durable_and_precedes_kernel_effects() {
 #[test]
 fn broker_auth_denial_and_corruption_fail_closed() {
     let (inputs, schema) = Inputs::new();
-    let cancellation = AtomicBool::new(false);
-    let fence = AtomicU64::new(7);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let fence = Arc::new(AtomicU64::new(7));
     let arguments = br#"{"path":"README.md"}"#;
 
     let mut grant_denied = inputs.clone();
@@ -1339,5 +1343,6 @@ fn success_unchecked() -> DispatchOutcome {
     DispatchOutcome::Succeeded(CanonicalOutput {
         media_type: "application/json".to_owned(),
         body: br#"{"bytes":12}"#.to_vec(),
+        artifact_digests: Vec::new(),
     })
 }

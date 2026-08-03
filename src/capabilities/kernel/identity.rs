@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, str::FromStr, sync::Arc};
 
 use crate::{domain::crypto::sha256, store::artifacts::ArtifactId};
 
@@ -60,6 +60,55 @@ impl Digest {
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.algorithm.name(), self.hex())
+    }
+}
+
+impl FromStr for Digest {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (algorithm, hex) = value.split_once(':').ok_or("invalid digest")?;
+        if hex.len() != 64 {
+            return Err("invalid digest");
+        }
+        let mut bytes = [0_u8; 32];
+        for (output, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            let nibble = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                _ => None,
+            };
+            *output = (nibble(pair[0]).ok_or("invalid digest")? << 4)
+                | nibble(pair[1]).ok_or("invalid digest")?;
+        }
+        Ok(Self {
+            algorithm: match algorithm {
+                "sha256" => DigestAlgorithm::Sha256,
+                "blake3" => DigestAlgorithm::Blake3,
+                _ => return Err("invalid digest"),
+            },
+            bytes,
+        })
+    }
+}
+
+impl serde::Serialize for Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <String as serde::Deserialize>::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

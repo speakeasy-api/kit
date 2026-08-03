@@ -9,7 +9,7 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 - RFC sections: 37/37
 - Historical IDs: 1038
 - Unmapped registry records: 0
-- Architectural promises resolved: 246/655
+- Architectural promises resolved: 253/655
 
 ## Record Classes
 
@@ -20,10 +20,10 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 
 ## Lifecycle
 
-- active: 69
-- implemented: 383
+- active: 71
+- implemented: 390
 - mitigated: 6
-- proposed: 579
+- proposed: 570
 - tombstoned: 1
 
 ## Applicability

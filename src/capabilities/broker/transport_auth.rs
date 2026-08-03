@@ -25,7 +25,7 @@ use super::{
     AUTH_RECORD_VERSION, AuthBinding, AuthChallenge, AuthChannel, AuthRecord, AuthResolution,
     AuthState, BrokerAuthRequirement, BrokerError, BrokerInvocation, append_auth,
     append_resolution, auth_identity, auth_key, auth_scope, canonical_digest, checked_record,
-    digest_hex, ensure_auth_credential, preflight, record_bytes,
+    digest_hex, ensure_auth_credential, record_bytes,
 };
 
 pub const MAX_TRANSPORT_OPERATION_BYTES: usize = 128;
@@ -93,6 +93,7 @@ pub(crate) struct TransportBinding {
     endpoint: String,
     session_id: Option<String>,
     workspace_id: String,
+    workspace_revision: Option<String>,
     principal_id: String,
     project_id: String,
     capability_source: String,
@@ -119,7 +120,7 @@ impl TransportBinding {
     pub(crate) fn new(
         request: &BrokerInvocation<'_>,
         server_id: impl Into<String>,
-        transport: &'static str,
+        transport: impl Into<String>,
         endpoint: impl Into<String>,
         session_id: Option<String>,
     ) -> Self {
@@ -132,10 +133,11 @@ impl TransportBinding {
         });
         Self {
             server_id: server_id.into(),
-            transport: transport.to_owned(),
+            transport: transport.into(),
             endpoint: endpoint.into(),
             session_id,
             workspace_id: envelope.workspace_id.to_string(),
+            workspace_revision: envelope.extension.workspace_revision().map(str::to_owned),
             principal_id: envelope.authenticated.principal_id().to_string(),
             project_id: envelope.project_id.to_string(),
             capability_source: envelope.capability.source().as_str().to_owned(),
@@ -171,17 +173,76 @@ impl TransportBinding {
         binding
     }
 
+    pub(crate) fn with_request(&self, request: &BrokerInvocation<'_>) -> Self {
+        let envelope = &request.envelope;
+        let mut binding = self.clone();
+        binding.workspace_id = envelope.workspace_id.to_string();
+        binding.workspace_revision = envelope.extension.workspace_revision().map(str::to_owned);
+        binding.principal_id = envelope.authenticated.principal_id().to_string();
+        binding.project_id = envelope.project_id.to_string();
+        binding.capability_source = envelope.capability.source().as_str().to_owned();
+        binding.capability_namespace = envelope.capability.namespace().as_str().to_owned();
+        binding.capability_name = envelope.capability.name().as_str().to_owned();
+        binding.capability_version = envelope.capability.version().as_str().to_owned();
+        binding.capability_implementation_digest =
+            envelope.capability.implementation_digest().to_string();
+        binding.discovered_schema_digest = envelope.discovered_schema_digest.to_string();
+        binding.bound_schema_digest = envelope.bound_schema_digest.to_string();
+        binding.credential_id = envelope
+            .extension
+            .credential()
+            .cloned()
+            .or_else(|| {
+                envelope
+                    .extension
+                    .egress()
+                    .map(|egress| egress.credential().clone())
+            })
+            .map(|credential| credential.identifier().to_owned());
+        binding.egress = envelope
+            .extension
+            .egress()
+            .map(|egress| TransportEgressBinding {
+                scheme: match egress.scheme() {
+                    crate::domain::egress::Scheme::Http => "http",
+                    crate::domain::egress::Scheme::Https => "https",
+                }
+                .to_owned(),
+                host: egress.host().to_owned(),
+                port: egress.port(),
+                credential_id: egress.credential().identifier().to_owned(),
+            });
+        binding
+    }
+
     fn digest(&self) -> Result<String, BrokerError> {
         let bytes = serde_json::to_vec(self).map_err(|_| BrokerError::InvalidAuthState)?;
         Ok(digest_hex(canonical_digest(&bytes)))
     }
 
-    fn same_connection(&self, other: &Self) -> bool {
-        let mut left = self.clone();
-        let mut right = other.clone();
-        left.session_id = None;
-        right.session_id = None;
-        left == right
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        self.server_id == other.server_id
+            && self.transport == other.transport
+            && self.endpoint == other.endpoint
+            && self.workspace_id == other.workspace_id
+            && self.workspace_revision == other.workspace_revision
+            && self.principal_id == other.principal_id
+            && self.project_id == other.project_id
+            && self.credential_id == other.credential_id
+            && self.egress == other.egress
+    }
+
+    pub(crate) fn owned_by(
+        &self,
+        principal_id: &str,
+        project_id: &str,
+        workspace_id: &str,
+        workspace_revision: Option<&str>,
+    ) -> bool {
+        self.principal_id == principal_id
+            && self.project_id == project_id
+            && self.workspace_id == workspace_id
+            && self.workspace_revision.as_deref() == workspace_revision
     }
 
     #[cfg(test)]
@@ -197,6 +258,7 @@ impl TransportBinding {
             endpoint: endpoint.into(),
             session_id,
             workspace_id: "test-workspace".to_owned(),
+            workspace_revision: Some("test-revision".to_owned()),
             principal_id: "test-principal".to_owned(),
             project_id: "test-project".to_owned(),
             capability_source: "test".to_owned(),
@@ -233,6 +295,7 @@ pub struct TransportDispatch {
     digest: CanonicalRequestDigest,
     operation: TransportOperation,
     binding: TransportBinding,
+    allow_quiescent_driver_claim: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -269,17 +332,9 @@ struct TransportDispatchRecord {
 pub struct TransportAuthorization {
     principal_id: String,
     project_id: String,
-    workspace_id: String,
     invocation_id: String,
     decision_digest: String,
     request_digest: String,
-    capability_source: String,
-    capability_namespace: String,
-    capability_name: String,
-    capability_version: String,
-    capability_implementation_digest: String,
-    discovered_schema_digest: String,
-    bound_schema_digest: String,
     scope: Option<String>,
     credential: Option<SecretHandle>,
     egress: Option<EgressConstraint>,
@@ -336,14 +391,6 @@ impl TransportAuthorization {
     pub(crate) fn same_connection(&self, other: &Self) -> bool {
         self.principal_id == other.principal_id
             && self.project_id == other.project_id
-            && self.workspace_id == other.workspace_id
-            && self.capability_source == other.capability_source
-            && self.capability_namespace == other.capability_namespace
-            && self.capability_name == other.capability_name
-            && self.capability_version == other.capability_version
-            && self.capability_implementation_digest == other.capability_implementation_digest
-            && self.discovered_schema_digest == other.discovered_schema_digest
-            && self.bound_schema_digest == other.bound_schema_digest
             && self.credential == other.credential
             && self.egress == other.egress
             && self.binding.same_connection(&other.binding)
@@ -373,17 +420,9 @@ impl TransportAuthorization {
         Self {
             principal_id: "test-principal".to_owned(),
             project_id: "test-project".to_owned(),
-            workspace_id: "test-workspace".to_owned(),
             invocation_id: "test-invocation".to_owned(),
             decision_digest: "sha256:test-decision".to_owned(),
             request_digest: "sha256:test-request".to_owned(),
-            capability_source: "test".to_owned(),
-            capability_namespace: "test.mcp".to_owned(),
-            capability_name: "invoke".to_owned(),
-            capability_version: "1.0.0".to_owned(),
-            capability_implementation_digest: "sha256:test-implementation".to_owned(),
-            discovered_schema_digest: "sha256:test-schema".to_owned(),
-            bound_schema_digest: "sha256:test-schema".to_owned(),
             scope: Some("mcp.connect".to_owned()),
             credential,
             egress,
@@ -432,9 +471,9 @@ impl TransportAuthorization {
         capability_name: &str,
         binding: TransportBinding,
     ) -> Self {
-        let mut authorization = Self::for_test_binding(operation, None, None, binding);
-        authorization.capability_name = capability_name.to_owned();
-        authorization
+        let mut binding = binding;
+        binding.capability_name = capability_name.to_owned();
+        Self::for_test_binding(operation, None, None, binding)
     }
 }
 
@@ -444,7 +483,24 @@ pub(crate) fn authorize(
     binding: &TransportBinding,
     store: &mut SqliteStore,
 ) -> Result<TransportAuthorization, BrokerError> {
-    authorize_inner(request, operation, binding, store, false)
+    authorize_inner(
+        request,
+        operation,
+        binding,
+        request.envelope.arguments,
+        store,
+        false,
+    )
+}
+
+pub(crate) fn authorize_operation(
+    request: &BrokerInvocation<'_>,
+    operation: &TransportOperation,
+    binding: &TransportBinding,
+    arguments: &[u8],
+    store: &mut SqliteStore,
+) -> Result<TransportAuthorization, BrokerError> {
+    authorize_inner(request, operation, binding, arguments, store, false)
 }
 
 pub(crate) fn authorize_replay(
@@ -453,22 +509,40 @@ pub(crate) fn authorize_replay(
     binding: &TransportBinding,
     store: &mut SqliteStore,
 ) -> Result<TransportAuthorization, BrokerError> {
-    authorize_inner(request, operation, binding, store, true)
+    authorize_inner(
+        request,
+        operation,
+        binding,
+        request.envelope.arguments,
+        store,
+        true,
+    )
+}
+
+pub(crate) fn authorize_operation_replay(
+    request: &BrokerInvocation<'_>,
+    operation: &TransportOperation,
+    binding: &TransportBinding,
+    arguments: &[u8],
+    store: &mut SqliteStore,
+) -> Result<TransportAuthorization, BrokerError> {
+    authorize_inner(request, operation, binding, arguments, store, true)
 }
 
 fn authorize_inner(
     request: &BrokerInvocation<'_>,
     operation: &TransportOperation,
     binding: &TransportBinding,
+    arguments: &[u8],
     store: &mut SqliteStore,
-    allow_quiescent_driver_claim: bool,
+    _allow_replay: bool,
 ) -> Result<TransportAuthorization, BrokerError> {
     request
         .envelope
-        .preflight_authority(store, allow_quiescent_driver_claim)
+        .preflight_authority(store, request.lifecycle_shutdown())
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
-    if request.envelope.cancellation.load(Ordering::Acquire) {
+    request.preflight_transport()?;
+    if request.envelope.cancellation.load(Ordering::Acquire) && !request.lifecycle_shutdown() {
         return Err(BrokerError::TransportAuthCancelled);
     }
     if let Some(requirement) = &request.auth {
@@ -484,17 +558,9 @@ fn authorize_inner(
     Ok(TransportAuthorization {
         principal_id: envelope.authenticated.principal_id().to_string(),
         project_id: envelope.project_id.to_string(),
-        workspace_id: envelope.workspace_id.to_string(),
         invocation_id: envelope.invocation_id.to_string(),
         decision_digest: decision.snapshot_digest().to_string(),
         request_digest: digest_hex(envelope.canonical_request_digest(decision.snapshot_digest())),
-        capability_source: envelope.capability.source().as_str().to_owned(),
-        capability_namespace: envelope.capability.namespace().as_str().to_owned(),
-        capability_name: envelope.capability.name().as_str().to_owned(),
-        capability_version: envelope.capability.version().as_str().to_owned(),
-        capability_implementation_digest: envelope.capability.implementation_digest().to_string(),
-        discovered_schema_digest: envelope.discovered_schema_digest.to_string(),
-        bound_schema_digest: envelope.bound_schema_digest.to_string(),
         scope: request
             .auth
             .as_ref()
@@ -508,7 +574,7 @@ fn authorize_inner(
         egress: envelope.extension.egress().cloned(),
         binding: binding.clone(),
         operation: operation.clone(),
-        arguments: envelope.arguments.to_vec(),
+        arguments: arguments.to_vec(),
     })
 }
 
@@ -676,14 +742,14 @@ fn prepare_challenge(
         .envelope
         .preflight_authority(store, false)
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
+    request.preflight_transport()?;
     if request.envelope.cancellation.load(Ordering::Acquire) {
         return Err(BrokerError::TransportAuthCancelled);
     }
     let requirement = auth_requirement(request)?;
     match (kind, challenged_scope) {
         (TransportAuthKind::Forbidden, None) => return Err(BrokerError::AuthScopeMismatch),
-        (_, Some(scope)) if scope != requirement.scope() => {
+        (_, Some(scope)) if !requirement.contains_scope(scope) => {
             return Err(BrokerError::AuthScopeMismatch);
         }
         _ => {}
@@ -729,7 +795,7 @@ pub(crate) fn state(
         .envelope
         .preflight_authority(store, true)
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
+    request.preflight_transport()?;
     if request.envelope.cancellation.load(Ordering::Acquire) {
         return Err(BrokerError::TransportAuthCancelled);
     }
@@ -766,16 +832,32 @@ pub(crate) fn resume(
     request: &BrokerInvocation<'_>,
     actor: &AuthenticatedPrincipal,
     server_id: &str,
-    transport: &'static str,
+    transport: &str,
     endpoint: &str,
     resolution: AuthResolution,
+    store: &mut SqliteStore,
+) -> Result<(), BrokerError> {
+    resume_expected(
+        request, actor, server_id, transport, endpoint, resolution, None, store,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_expected(
+    request: &BrokerInvocation<'_>,
+    actor: &AuthenticatedPrincipal,
+    server_id: &str,
+    transport: &str,
+    endpoint: &str,
+    resolution: AuthResolution,
+    expected: Option<(ApprovalId, &str, u64)>,
     store: &mut SqliteStore,
 ) -> Result<(), BrokerError> {
     request
         .envelope
         .preflight_authority(store, true)
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
+    request.preflight_transport()?;
     if request.envelope.cancellation.load(Ordering::Acquire) {
         return Err(BrokerError::AuthResolutionCancelled);
     }
@@ -794,6 +876,13 @@ pub(crate) fn resume(
     let Some(record) = stored_challenge(store, &request.envelope)? else {
         return Err(BrokerError::InvalidAuthState);
     };
+    if let Some((challenge_id, kind, generation)) = expected
+        && (record.challenge_id != challenge_id.to_string()
+            || record.challenge_kind != kind
+            || record.generation != generation)
+    {
+        return Err(BrokerError::InvalidAuthState);
+    }
     let kind = TransportAuthKind::from_record(record.transport_kind.as_deref())?;
     let operation = record_operation(&record)?;
     let persisted_binding = record
@@ -828,6 +917,26 @@ pub(crate) fn resume(
     )
 }
 
+pub(crate) fn resume_bound_expected(
+    request: &BrokerInvocation<'_>,
+    actor: &AuthenticatedPrincipal,
+    binding: &TransportBinding,
+    resolution: AuthResolution,
+    expected: (ApprovalId, &str, u64),
+    store: &mut SqliteStore,
+) -> Result<(), BrokerError> {
+    resume_expected(
+        request,
+        actor,
+        &binding.server_id,
+        &binding.transport,
+        &binding.endpoint,
+        resolution,
+        Some(expected),
+        store,
+    )
+}
+
 pub(crate) fn begin_dispatch(
     request: &BrokerInvocation<'_>,
     operation: &TransportOperation,
@@ -837,13 +946,17 @@ pub(crate) fn begin_dispatch(
 ) -> Result<TransportDispatch, BrokerError> {
     request
         .envelope
-        .preflight_authority(store, replay)
+        .preflight_authority(store, request.lifecycle_shutdown())
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
-    if request.envelope.cancellation.load(Ordering::Acquire) {
+    request.preflight_transport()?;
+    if request.envelope.cancellation.load(Ordering::Acquire) && !request.lifecycle_shutdown() {
         return Err(BrokerError::TransportAuthCancelled);
     }
     if replay {
+        if request.retry_safety() == crate::capabilities::kernel::invoke::RetrySafety::NonIdempotent
+        {
+            return Err(BrokerError::TransportOutcomeUnknown);
+        }
         let requirement = auth_requirement(request)?;
         let record =
             stored_challenge(store, &request.envelope)?.ok_or(BrokerError::ReplayNotAuthorized)?;
@@ -901,7 +1014,7 @@ pub(crate) fn begin_dispatch(
             request_digest: canonical_digest(&durable_dispatch),
             claim: None,
             driver_claim: envelope.driver_claim,
-            allow_quiescent_driver_claim: replay,
+            allow_quiescent_driver_claim: request.lifecycle_shutdown(),
             expected_versions: vec![ExpectedStreamVersion {
                 stream: EntityId::Approval(stream),
                 version: ExpectedVersion::new(0),
@@ -935,6 +1048,7 @@ pub(crate) fn begin_dispatch(
         digest,
         operation: operation.clone(),
         binding: transport_binding.clone(),
+        allow_quiescent_driver_claim: request.lifecycle_shutdown(),
     })
 }
 
@@ -968,7 +1082,7 @@ pub(crate) fn finish_dispatch(
         2,
         dispatch.digest,
         payload,
-        true,
+        dispatch.allow_quiescent_driver_claim,
     )
     .map(|_| ())
 }
@@ -1379,7 +1493,10 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         path::{Path, PathBuf},
-        sync::atomic::{AtomicBool, AtomicU64},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64},
+        },
     };
 
     use super::*;
@@ -1613,16 +1730,16 @@ mod tests {
 
         fn request<'a>(
             &'a self,
-            cancellation: &'a AtomicBool,
-            fence: &'a AtomicU64,
+            cancellation: &'a Arc<AtomicBool>,
+            fence: &'a Arc<AtomicU64>,
         ) -> BrokerInvocation<'a> {
             self.request_scoped(cancellation, fence, &self.grants, SCOPE)
         }
 
         fn request_scoped<'a>(
             &'a self,
-            cancellation: &'a AtomicBool,
-            fence: &'a AtomicU64,
+            cancellation: &'a Arc<AtomicBool>,
+            fence: &'a Arc<AtomicU64>,
             grants: &'a CapabilityGrantSnapshot,
             scope: &str,
         ) -> BrokerInvocation<'a> {
@@ -1768,12 +1885,125 @@ mod tests {
         )
     }
 
+    fn replace_attempt(inputs: &mut Inputs) -> Arc<AtomicU64> {
+        let fence = inputs.attempt.fencing_token.get() + 1;
+        inputs.attempt = AttemptOwnership::new(
+            AttemptId::generate().unwrap(),
+            inputs.authenticated.principal_id(),
+            FencingToken::new(fence),
+        );
+        inputs.claim = AttemptDriverClaim {
+            run_id: inputs.config.run_id(),
+            attempt_id: inputs.attempt.attempt_id,
+            principal_id: inputs.authenticated.principal_id(),
+            fence: inputs.attempt.fencing_token,
+            lease_version: inputs.claim.lease_version + 1,
+            expires_at_unix_micros: 0,
+        };
+        Arc::new(AtomicU64::new(fence))
+    }
+
+    #[test]
+    fn crash_then_replacement_attempt_consumes_grant_once() {
+        let database = TestDatabase::new();
+        let mut inputs = Inputs::new();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let old_fence = Arc::new(AtomicU64::new(inputs.attempt.fencing_token.get()));
+        let mut store = open(&inputs, database.path());
+        let request = inputs.request(&cancellation, &old_fence);
+        let transport_binding = binding(&request);
+        let dispatch = begin_dispatch(
+            &request,
+            &operation(),
+            &transport_binding,
+            false,
+            &mut store,
+        )
+        .unwrap();
+        interrupt_dispatch(
+            &request,
+            dispatch,
+            TransportAuthKind::Unauthorized,
+            &operation(),
+            Some(SCOPE),
+            &mut store,
+        )
+        .unwrap();
+        drop(store);
+
+        let new_fence = replace_attempt(&mut inputs);
+        let mut store = open(&inputs, database.path());
+        let request = inputs.request(&cancellation, &new_fence);
+        resume_granted(&request, &inputs.authenticated, &mut store).unwrap();
+        assert!(matches!(
+            state(&request, &binding(&request), &mut store),
+            Ok(TransportAuthState::Granted(_))
+        ));
+        let replay =
+            begin_dispatch(&request, &operation(), &binding(&request), true, &mut store).unwrap();
+        finish_dispatch(
+            &request,
+            replay,
+            TransportDispatchOutcome::Completed,
+            &mut store,
+        )
+        .unwrap();
+        assert!(matches!(
+            begin_dispatch(&request, &operation(), &binding(&request), true, &mut store),
+            Err(BrokerError::ReplayPermitConsumed)
+        ));
+    }
+
+    #[test]
+    fn crash_then_replacement_attempt_consumes_denial_once() {
+        let database = TestDatabase::new();
+        let mut inputs = Inputs::new();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let old_fence = Arc::new(AtomicU64::new(inputs.attempt.fencing_token.get()));
+        let mut store = open(&inputs, database.path());
+        let request = inputs.request(&cancellation, &old_fence);
+        interrupt_with(&request, TransportAuthKind::Unauthorized, &mut store).unwrap();
+        drop(store);
+
+        let new_fence = replace_attempt(&mut inputs);
+        let mut store = open(&inputs, database.path());
+        let request = inputs.request(&cancellation, &new_fence);
+        resume(
+            &request,
+            &inputs.authenticated,
+            "test-server",
+            "http",
+            "https://example.test/mcp",
+            AuthResolution::Denied,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(
+            state(&request, &binding(&request), &mut store).unwrap(),
+            TransportAuthState::Denied
+        );
+        assert!(matches!(
+            begin_dispatch(&request, &operation(), &binding(&request), true, &mut store),
+            Err(BrokerError::AuthDenied)
+        ));
+        resume(
+            &request,
+            &inputs.authenticated,
+            "test-server",
+            "http",
+            "https://example.test/mcp",
+            AuthResolution::Denied,
+            &mut store,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn pending_interruption_survives_reopen_then_resumes_and_replays_once() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
 
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
@@ -1781,6 +2011,7 @@ mod tests {
             &request,
             &operation(),
             &binding(&request),
+            request.arguments(),
             &mut store,
         )
         .unwrap();
@@ -1837,6 +2068,27 @@ mod tests {
             state(&request, &binding(&request), &mut store).unwrap(),
             TransportAuthState::Pending(challenge.clone())
         );
+        assert!(matches!(
+            resume_expected(
+                &request,
+                &inputs.authenticated,
+                "test-server",
+                "http",
+                "https://example.test/mcp",
+                AuthResolution::Granted,
+                Some((
+                    challenge.challenge.challenge_id,
+                    "transport",
+                    challenge.challenge.generation + 1,
+                )),
+                &mut store,
+            ),
+            Err(BrokerError::InvalidAuthState)
+        ));
+        assert_eq!(
+            state(&request, &binding(&request), &mut store).unwrap(),
+            TransportAuthState::Pending(challenge.clone())
+        );
         store.quiesce_driver_claim(inputs.claim).unwrap();
         resume_granted(&request, &inputs.authenticated, &mut store).unwrap();
         resume_granted(&request, &inputs.authenticated, &mut store).unwrap();
@@ -1863,6 +2115,7 @@ mod tests {
             &request,
             &operation(),
             &replay_binding,
+            request.arguments(),
             &mut store,
         )
         .unwrap();
@@ -1911,6 +2164,7 @@ mod tests {
                 &request,
                 &operation(),
                 &binding(&request),
+                request.arguments(),
                 &mut store,
             ),
             Err(crate::protocols::mcp::transport::TransportError::Broker(
@@ -1920,11 +2174,47 @@ mod tests {
     }
 
     #[test]
+    fn non_idempotent_auth_interruption_requires_reconciliation() {
+        let database = TestDatabase::new();
+        let inputs = Inputs::new();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
+        let mut store = open(&inputs, database.path());
+        let mut request = inputs.request(&cancellation, &fence);
+        request.envelope.retry_safety = RetrySafety::NonIdempotent;
+        let transport_binding = binding(&request);
+        let dispatch = begin_dispatch(
+            &request,
+            &operation(),
+            &transport_binding,
+            false,
+            &mut store,
+        )
+        .unwrap();
+        interrupt_dispatch(
+            &request,
+            dispatch,
+            TransportAuthKind::Unauthorized,
+            &operation(),
+            Some(SCOPE),
+            &mut store,
+        )
+        .unwrap();
+        store.quiesce_driver_claim(inputs.claim).unwrap();
+        resume_granted(&request, &inputs.authenticated, &mut store).unwrap();
+        store.install_driver_claim_for_test(inputs.claim).unwrap();
+        assert!(matches!(
+            begin_dispatch(&request, &operation(), &transport_binding, true, &mut store,),
+            Err(BrokerError::TransportOutcomeUnknown)
+        ));
+    }
+
+    #[test]
     fn resume_rejects_wrong_actor() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
         interrupt_with(&request, TransportAuthKind::Forbidden, &mut store).unwrap();
@@ -1958,8 +2248,8 @@ mod tests {
         ] {
             let database = TestDatabase::new();
             let inputs = Inputs::new();
-            let cancellation = AtomicBool::new(false);
-            let fence = AtomicU64::new(7);
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let fence = Arc::new(AtomicU64::new(7));
             let mut store = open(&inputs, database.path());
             let request = inputs.request(&cancellation, &fence);
             let session_binding =
@@ -1994,8 +2284,8 @@ mod tests {
     fn resume_rejects_grant_mutation_revocation_and_scope_change() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
         interrupt_with(&request, TransportAuthKind::Unauthorized, &mut store).unwrap();
@@ -2040,13 +2330,13 @@ mod tests {
     fn cancellation_fails_closed() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let live = inputs.request(&cancellation, &fence);
         interrupt_with(&live, TransportAuthKind::Unauthorized, &mut store).unwrap();
 
-        let cancelled = AtomicBool::new(true);
+        let cancelled = Arc::new(AtomicBool::new(true));
         let request = inputs.request(&cancelled, &fence);
         assert!(matches!(
             state(&request, &binding(&request), &mut store),
@@ -2074,8 +2364,8 @@ mod tests {
     fn denied_resolution_and_conflicting_or_mutated_challenges_fail_closed() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
 
@@ -2162,8 +2452,8 @@ mod tests {
     fn bounded_records_persist_opaque_handles_without_secret_bytes() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let scope = "s".repeat(super::super::MAX_AUTH_SCOPE_BYTES);
         let request = inputs.request_scoped(&cancellation, &fence, &inputs.grants, &scope);
@@ -2203,8 +2493,8 @@ mod tests {
     fn challenged_scope_must_be_known_and_equal() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
 
@@ -2228,8 +2518,8 @@ mod tests {
     fn dispatch_lifecycle_is_durable_and_requires_reconciliation_after_interruption() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
 
@@ -2283,8 +2573,8 @@ mod tests {
     #[test]
     fn every_dispatch_record_field_is_validated_on_read() {
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let request = inputs.request(&cancellation, &fence);
         let operation = operation();
         let binding = binding(&request);
@@ -2317,14 +2607,15 @@ mod tests {
     fn granted_challenge_without_atomic_interrupted_outcome_cannot_replay() {
         let database = TestDatabase::new();
         let inputs = Inputs::new();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let mut store = open(&inputs, database.path());
         let request = inputs.request(&cancellation, &fence);
 
         interrupt_with(&request, TransportAuthKind::Unauthorized, &mut store).unwrap();
         store.quiesce_driver_claim(inputs.claim).unwrap();
         resume_granted(&request, &inputs.authenticated, &mut store).unwrap();
+        store.install_driver_claim_for_test(inputs.claim).unwrap();
         assert!(matches!(
             begin_dispatch(&request, &operation(), &binding(&request), true, &mut store,),
             Err(BrokerError::ReplayNotAuthorized)
@@ -2349,8 +2640,8 @@ mod tests {
         ] {
             let database = TestDatabase::new();
             let inputs = Inputs::new();
-            let cancellation = AtomicBool::new(false);
-            let fence = AtomicU64::new(7);
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let fence = Arc::new(AtomicU64::new(7));
             let mut store = open(&inputs, database.path());
             let request = inputs.request(&cancellation, &fence);
             let dispatch = begin_dispatch(

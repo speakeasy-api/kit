@@ -484,6 +484,7 @@ fn at_least_twenty_bypass_routes_cannot_reach_dispatch() {
             DispatchOutcome::Succeeded(CanonicalOutput {
                 media_type: "application/json".to_owned(),
                 body: b"{}".to_vec(),
+                artifact_digests: Vec::new(),
             })
         });
         assert_eq!(dispatches, 0, "bypass route reached dispatcher: {route:?}");

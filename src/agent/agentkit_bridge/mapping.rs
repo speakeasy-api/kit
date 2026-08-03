@@ -13,7 +13,7 @@ pub const AGENTKIT_DIRTY_OVERLAY_SHA256: &str =
 pub const AGENTKIT_EXCLUDED_PATHS_SHA256: &str =
     "6013053000cc27b0e77ed61964266ff38e246bee41fee9ef829c0d8763ecd3ae";
 pub const AGENTKIT_SNAPSHOT_SHA256: &str =
-    "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2";
+    "3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077";
 pub const RUNLET_SNAPSHOT_SHA256: &str =
     "fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef";
 

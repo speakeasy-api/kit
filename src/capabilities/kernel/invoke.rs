@@ -1,6 +1,9 @@
 use std::{
     fmt,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -8,10 +11,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent::accounting::AccountingError,
     api::{auth::contract::AuthenticatedPrincipal, service::AttemptDriverClaim},
+    capabilities::result::Presentation,
     domain::{
         commands::ExpectedVersion,
         config::RunConfigSnapshot,
-        events::{EntityId, EventType, SchemaVersion, TraceId, UtcDateTime},
+        events::{ArtifactRef, EntityId, EventType, SchemaVersion, TraceId, UtcDateTime},
         ids::{CommandId, EventId, ProjectId, ToolCallId, WorkspaceId},
         lifecycle::AttemptOwnership,
     },
@@ -45,8 +49,9 @@ const INTENT_EVENT: &str = "capability.invocation_intent";
 const DISPATCH_EVENT: &str = "capability.invocation_dispatched";
 const OUTCOME_EVENT: &str = "capability.invocation_outcome";
 pub const MAX_INVOCATION_ARGUMENT_BYTES: usize = 1024 * 1024;
+pub const MAX_INVOCATION_ARTIFACT_DIGESTS: usize = 128;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrySafety {
     Idempotent,
@@ -83,13 +88,24 @@ pub enum InvocationCrashPoint {
 pub struct CanonicalOutput {
     pub media_type: String,
     pub body: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_digests: Vec<ArtifactRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchOutcome {
     Succeeded(CanonicalOutput),
     DurablyCommitted(CanonicalOutput),
-    Failed { code: String },
+    Failed {
+        code: String,
+    },
+    DurablyFailed {
+        code: String,
+        output: CanonicalOutput,
+    },
+    OutcomeUnknown {
+        code: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -111,19 +127,15 @@ pub struct CanonicalInvocationResult {
     pub charged: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PresentationPlaceholder {
-    NotRendered,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationResult {
     pub canonical: CanonicalInvocationResult,
-    pub presentation: PresentationPlaceholder,
+    pub presentation: Option<Presentation>,
     pub replayed: bool,
     pub reservation: ReservationSnapshot,
 }
 
+#[derive(Clone)]
 pub struct InvocationEnvelope<'a> {
     pub authenticated: &'a AuthenticatedPrincipal,
     pub config: &'a RunConfigSnapshot,
@@ -143,10 +155,10 @@ pub struct InvocationEnvelope<'a> {
     pub reservation: Spend,
     pub retry_safety: RetrySafety,
     pub approval: ApprovalState,
-    pub cancellation: &'a AtomicBool,
+    pub cancellation: &'a Arc<AtomicBool>,
     pub attempt: AttemptOwnership,
     pub driver_claim: Option<AttemptDriverClaim>,
-    pub current_fence: &'a AtomicU64,
+    pub current_fence: &'a Arc<AtomicU64>,
     pub command_id: CommandId,
     pub intent_event_id: EventId,
     pub outcome_event_id: EventId,
@@ -198,7 +210,9 @@ impl InvocationEnvelope<'_> {
         if claim.owner() != self.attempt || claim.run_id != self.config.run_id() {
             return Err(InvokeError::StaleFence);
         }
-        if !allow_quiescent_driver_claim {
+        if allow_quiescent_driver_claim {
+            store.verify_quiescent_driver_claim(claim)?;
+        } else {
             store.verify_driver_claim(claim)?;
         }
         Ok(())
@@ -222,6 +236,88 @@ impl InvocationEnvelope<'_> {
     }
 }
 
+impl<'a> InvocationEnvelope<'a> {
+    pub(crate) fn bind_transport_arguments<'b>(
+        &'b self,
+        arguments: &'b [u8],
+    ) -> InvocationEnvelope<'b>
+    where
+        'a: 'b,
+    {
+        InvocationEnvelope {
+            authenticated: self.authenticated,
+            config: self.config,
+            grants: self.grants,
+            delegation: self.delegation,
+            extension: self.extension.clone(),
+            capability: self.capability,
+            discovered_schema_digest: self.discovered_schema_digest,
+            bound_schema_digest: self.bound_schema_digest,
+            effect: self.effect,
+            argument_constraints: self.argument_constraints,
+            arguments,
+            workspace_id: self.workspace_id,
+            project_id: self.project_id,
+            invocation_id: self.invocation_id,
+            idempotency_key: self.idempotency_key,
+            reservation: self.reservation,
+            retry_safety: self.retry_safety,
+            approval: self.approval,
+            cancellation: self.cancellation,
+            attempt: self.attempt,
+            driver_claim: self.driver_claim,
+            current_fence: self.current_fence,
+            command_id: self.command_id,
+            intent_event_id: self.intent_event_id,
+            outcome_event_id: self.outcome_event_id,
+            occurred_at: self.occurred_at,
+            trace_id: self.trace_id,
+        }
+    }
+
+    pub(crate) fn bind_external<'b>(
+        self,
+        capability: &'b CapabilityIdentity,
+        schema_digest: Digest,
+        effect: EffectClass,
+        retry_safety: RetrySafety,
+        arguments: &'b [u8],
+    ) -> InvocationEnvelope<'b>
+    where
+        'a: 'b,
+    {
+        InvocationEnvelope {
+            authenticated: self.authenticated,
+            config: self.config,
+            grants: self.grants,
+            delegation: self.delegation,
+            extension: self.extension,
+            capability,
+            discovered_schema_digest: schema_digest,
+            bound_schema_digest: schema_digest,
+            effect,
+            argument_constraints: self.argument_constraints,
+            arguments,
+            workspace_id: self.workspace_id,
+            project_id: self.project_id,
+            invocation_id: self.invocation_id,
+            idempotency_key: self.idempotency_key,
+            reservation: self.reservation,
+            retry_safety,
+            approval: self.approval,
+            cancellation: self.cancellation,
+            attempt: self.attempt,
+            driver_claim: self.driver_claim,
+            current_fence: self.current_fence,
+            command_id: self.command_id,
+            intent_event_id: self.intent_event_id,
+            outcome_event_id: self.outcome_event_id,
+            occurred_at: self.occurred_at,
+            trace_id: self.trace_id,
+        }
+    }
+}
+
 pub struct AuthorizedInvocation {
     capability: CapabilityIdentity,
     schema_digest: Digest,
@@ -231,6 +327,8 @@ pub struct AuthorizedInvocation {
     idempotency_key: String,
     attempt: AttemptOwnership,
     extension: RequestExtension,
+    request_digest: CanonicalRequestDigest,
+    reservation_id: ReservationId,
 }
 
 impl AuthorizedInvocation {
@@ -267,11 +365,36 @@ impl AuthorizedInvocation {
     }
 }
 
+pub(crate) enum PrepareOutcome {
+    Authorized(Box<AuthorizedInvocation>),
+    Completed(Box<InvocationResult>),
+}
+
 pub(crate) struct InvocationRuntime<'a> {
     store: &'a mut SqliteStore,
     budget: &'a BudgetLedger,
     backend: &'a mut dyn FnMut(&AuthorizedInvocation) -> DispatchOutcome,
     crash_at: Option<InvocationCrashPoint>,
+}
+
+pub(crate) struct InvocationPhaseRuntime<'a> {
+    store: &'a mut SqliteStore,
+    budget: &'a BudgetLedger,
+    crash_at: Option<InvocationCrashPoint>,
+}
+
+impl<'a> InvocationPhaseRuntime<'a> {
+    pub(crate) const fn new(
+        store: &'a mut SqliteStore,
+        budget: &'a BudgetLedger,
+        crash_at: Option<InvocationCrashPoint>,
+    ) -> Self {
+        Self {
+            store,
+            budget,
+            crash_at,
+        }
+    }
 }
 
 impl<'a> InvocationRuntime<'a> {
@@ -314,6 +437,7 @@ pub enum InvokeError {
     Budget(BudgetError),
     Store(StoreError),
     InvalidPersistedOutcome,
+    ArtifactDigestLimit,
     Serialization(serde_json::Error),
     InjectedCrash(InvocationCrashPoint),
     NativeCapabilityBinding,
@@ -340,6 +464,9 @@ impl fmt::Display for InvokeError {
             Self::Budget(error) => write!(f, "capability invocation budget error: {error:?}"),
             Self::Store(error) => error.fmt(f),
             Self::InvalidPersistedOutcome => f.write_str("persisted capability outcome is invalid"),
+            Self::ArtifactDigestLimit => {
+                f.write_str("capability outcome artifact digest limit exceeded")
+            }
             Self::Serialization(error) => {
                 write!(f, "capability event serialization failed: {error}")
             }
@@ -383,8 +510,68 @@ impl From<serde_json::Error> for InvokeError {
 
 pub(crate) fn invoke(
     envelope: InvocationEnvelope<'_>,
-    mut runtime: InvocationRuntime<'_>,
+    runtime: InvocationRuntime<'_>,
 ) -> Result<InvocationResult, InvokeError> {
+    let authorized = match prepare(
+        &envelope,
+        &mut InvocationPhaseRuntime::new(runtime.store, runtime.budget, runtime.crash_at),
+    )? {
+        PrepareOutcome::Authorized(authorized) => *authorized,
+        PrepareOutcome::Completed(result) => return Ok(*result),
+    };
+    let dispatched = Dispatcher {
+        backend: runtime.backend,
+    }
+    .dispatch(&authorized);
+    complete(
+        &envelope,
+        &mut InvocationPhaseRuntime::new(runtime.store, runtime.budget, runtime.crash_at),
+        authorized,
+        dispatched,
+    )
+}
+
+pub(crate) fn prepare(
+    envelope: &InvocationEnvelope<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
+) -> Result<PrepareOutcome, InvokeError> {
+    prepare_inner(envelope, runtime, false)
+}
+
+pub(crate) fn prepare_resuming_dispatch(
+    envelope: &InvocationEnvelope<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
+) -> Result<PrepareOutcome, InvokeError> {
+    prepare_inner(envelope, runtime, true)
+}
+
+pub(crate) fn replay(
+    envelope: &InvocationEnvelope<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
+) -> Result<Option<InvocationResult>, InvokeError> {
+    envelope.preflight(runtime.store, true)?;
+    let decision = grant::decide(envelope.grant_request());
+    let reason = decision.reason();
+    let decision_digest = decision.snapshot_digest();
+    decision
+        .into_authorized_inputs()
+        .ok_or(InvokeError::AuthorizationDenied(reason))?;
+    let request_digest = request_digest(envelope, decision_digest);
+    let Some(result) = persisted_outcome(envelope, runtime.store, request_digest)? else {
+        return Ok(None);
+    };
+    let reservation_id = reservation_id(request_digest);
+    runtime
+        .budget
+        .reserve(reservation_id, envelope.reservation)?;
+    settle(runtime.budget, reservation_id, result, true).map(Some)
+}
+
+fn prepare_inner(
+    envelope: &InvocationEnvelope<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
+    resume_dispatched: bool,
+) -> Result<PrepareOutcome, InvokeError> {
     envelope.preflight(runtime.store, false)?;
 
     let decision = grant::decide(envelope.grant_request());
@@ -394,7 +581,7 @@ pub(crate) fn invoke(
         .into_authorized_inputs()
         .ok_or(InvokeError::AuthorizationDenied(reason))?;
 
-    let request_digest = request_digest(&envelope, decision_digest);
+    let request_digest = request_digest(envelope, decision_digest);
     let reservation_id = reservation_id(request_digest);
     runtime
         .budget
@@ -407,15 +594,17 @@ pub(crate) fn invoke(
         ));
     }
 
-    append_intent(&envelope, runtime.store, request_digest, reservation_id)?;
-    if let Some(result) = persisted_outcome(&envelope, runtime.store, request_digest)? {
-        return settle(runtime.budget, reservation_id, result, true);
+    append_intent(envelope, runtime.store, request_digest, reservation_id)?;
+    if let Some(result) = persisted_outcome(envelope, runtime.store, request_digest)? {
+        return settle(runtime.budget, reservation_id, result, true)
+            .map(Box::new)
+            .map(PrepareOutcome::Completed);
     }
 
     if runtime.crash_at == Some(InvocationCrashPoint::BetweenIntentAndDispatch) {
         persist_injected_crash(
-            &envelope,
-            &mut runtime,
+            envelope,
+            runtime,
             request_digest,
             reservation_id,
             InvocationCrashPoint::BetweenIntentAndDispatch,
@@ -426,8 +615,10 @@ pub(crate) fn invoke(
 
     if envelope.cancellation.load(Ordering::Acquire) {
         let result = terminal(InvocationStatus::Cancelled, None, Some("cancelled"), false);
-        let result = append_outcome(&envelope, runtime.store, request_digest, &result, false)?;
-        return settle(runtime.budget, reservation_id, result, false);
+        let result = append_outcome(envelope, runtime.store, request_digest, &result, false)?;
+        return settle(runtime.budget, reservation_id, result, false)
+            .map(Box::new)
+            .map(PrepareOutcome::Completed);
     }
 
     let interruption = match envelope.approval {
@@ -446,23 +637,29 @@ pub(crate) fn invoke(
         ApprovalState::NotRequired | ApprovalState::Approved => None,
     };
     if let Some(result) = interruption {
-        let result = append_outcome(&envelope, runtime.store, request_digest, &result, false)?;
-        return settle(runtime.budget, reservation_id, result, false);
+        let result = append_outcome(envelope, runtime.store, request_digest, &result, false)?;
+        return settle(runtime.budget, reservation_id, result, false)
+            .map(Box::new)
+            .map(PrepareOutcome::Completed);
     }
 
-    if ensure_current_fence(&envelope).is_err()
-        || ensure_current_claim(&envelope, runtime.store).is_err()
+    if ensure_current_fence(envelope).is_err()
+        || ensure_current_claim(envelope, runtime.store).is_err()
     {
         let result = unknown("stale_fence_before_dispatch", false);
-        let result = append_outcome(&envelope, runtime.store, request_digest, &result, false)?;
-        return settle(runtime.budget, reservation_id, result, false);
+        let result = append_outcome(envelope, runtime.store, request_digest, &result, false)?;
+        return settle(runtime.budget, reservation_id, result, false)
+            .map(Box::new)
+            .map(PrepareOutcome::Completed);
     }
 
-    let dispatch_replayed = append_dispatch(&envelope, runtime.store, request_digest)?;
-    if dispatch_replayed {
+    let dispatch_replayed = append_dispatch(envelope, runtime.store, request_digest)?;
+    if dispatch_replayed && !resume_dispatched {
         let result = unknown("recovery_requires_reconciliation", true);
-        let result = append_outcome(&envelope, runtime.store, request_digest, &result, true)?;
-        return settle(runtime.budget, reservation_id, result, false);
+        let result = append_outcome(envelope, runtime.store, request_digest, &result, true)?;
+        return settle(runtime.budget, reservation_id, result, false)
+            .map(Box::new)
+            .map(PrepareOutcome::Completed);
     }
 
     let authorized = AuthorizedInvocation {
@@ -474,16 +671,26 @@ pub(crate) fn invoke(
         idempotency_key: envelope.idempotency_key.as_str().to_owned(),
         attempt: envelope.attempt,
         extension: authorized_inputs.into_extension(),
+        request_digest,
+        reservation_id,
     };
-    let dispatched = Dispatcher {
-        backend: runtime.backend,
-    }
-    .dispatch(&authorized);
+
+    Ok(PrepareOutcome::Authorized(Box::new(authorized)))
+}
+
+pub(crate) fn complete(
+    envelope: &InvocationEnvelope<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
+    authorized: AuthorizedInvocation,
+    dispatched: DispatchOutcome,
+) -> Result<InvocationResult, InvokeError> {
+    let request_digest = authorized.request_digest;
+    let reservation_id = authorized.reservation_id;
 
     if runtime.crash_at == Some(InvocationCrashPoint::AfterDispatch) {
         persist_injected_crash(
-            &envelope,
-            &mut runtime,
+            envelope,
+            runtime,
             request_digest,
             reservation_id,
             InvocationCrashPoint::AfterDispatch,
@@ -492,25 +699,28 @@ pub(crate) fn invoke(
         )?;
     }
 
-    if ensure_current_fence(&envelope).is_err()
-        || ensure_current_claim(&envelope, runtime.store).is_err()
+    if ensure_current_fence(envelope).is_err()
+        || ensure_current_claim(envelope, runtime.store).is_err()
     {
         let result = unknown("stale_fence_after_dispatch", true);
-        let result = append_outcome(&envelope, runtime.store, request_digest, &result, true)?;
+        let result = append_outcome(envelope, runtime.store, request_digest, &result, true)?;
         return settle(runtime.budget, reservation_id, result, false);
     }
     if envelope.cancellation.load(Ordering::Acquire)
-        && !matches!(&dispatched, DispatchOutcome::DurablyCommitted(_))
+        && !matches!(
+            &dispatched,
+            DispatchOutcome::DurablyCommitted(_) | DispatchOutcome::DurablyFailed { .. }
+        )
     {
         let result = unknown("cancelled_after_dispatch", true);
-        let result = append_outcome(&envelope, runtime.store, request_digest, &result, true)?;
+        let result = append_outcome(envelope, runtime.store, request_digest, &result, true)?;
         return settle(runtime.budget, reservation_id, result, false);
     }
 
     if runtime.crash_at == Some(InvocationCrashPoint::BeforeOutcome) {
         persist_injected_crash(
-            &envelope,
-            &mut runtime,
+            envelope,
+            runtime,
             request_digest,
             reservation_id,
             InvocationCrashPoint::BeforeOutcome,
@@ -519,7 +729,7 @@ pub(crate) fn invoke(
         )?;
     }
 
-    let result = match dispatched {
+    let mut result = match dispatched {
         DispatchOutcome::Succeeded(output) => {
             terminal(InvocationStatus::Succeeded, Some(output), None, true)
         }
@@ -529,8 +739,20 @@ pub(crate) fn invoke(
         DispatchOutcome::Failed { code } => {
             terminal(InvocationStatus::Failed, None, Some(&code), true)
         }
+        DispatchOutcome::DurablyFailed { code, output } => {
+            terminal(InvocationStatus::Failed, Some(output), Some(&code), true)
+        }
+        DispatchOutcome::OutcomeUnknown { code } => unknown(&code, true),
     };
-    let result = append_outcome(&envelope, runtime.store, request_digest, &result, true)?;
+    if output_artifacts(&result).is_err() {
+        result = terminal(
+            InvocationStatus::Failed,
+            None,
+            Some("artifact_digest_limit"),
+            true,
+        );
+    }
+    let result = append_outcome(envelope, runtime.store, request_digest, &result, true)?;
     settle(runtime.budget, reservation_id, result, false)
 }
 
@@ -586,7 +808,7 @@ fn settle(
     };
     Ok(InvocationResult {
         canonical,
-        presentation: PresentationPlaceholder::NotRendered,
+        presentation: None,
         replayed,
         reservation,
     })
@@ -594,7 +816,7 @@ fn settle(
 
 fn persist_injected_crash(
     envelope: &InvocationEnvelope<'_>,
-    runtime: &mut InvocationRuntime<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
     request_digest: CanonicalRequestDigest,
     reservation_id: ReservationId,
     point: InvocationCrashPoint,
@@ -646,11 +868,6 @@ fn request_digest(
         ApprovalState::Approved => 2,
         ApprovalState::Denied => 3,
     });
-    put_bytes(
-        &mut bytes,
-        envelope.attempt.attempt_id.to_string().as_bytes(),
-    );
-    bytes.extend_from_slice(&envelope.attempt.fencing_token.get().to_be_bytes());
     put_spend(&mut bytes, envelope.reservation);
     CanonicalRequestDigest::new(Digest::of(DigestAlgorithm::Sha256, &bytes).as_bytes())
 }
@@ -781,6 +998,7 @@ fn append_outcome(
     result: &CanonicalInvocationResult,
     dispatched: bool,
 ) -> Result<CanonicalInvocationResult, InvokeError> {
+    let artifacts = output_artifacts(result)?;
     let response = serde_json::to_vec(result)?;
     let payload = serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
@@ -806,7 +1024,7 @@ fn append_outcome(
             envelope.outcome_event_id,
             OUTCOME_EVENT,
             payload,
-            output_artifacts(result),
+            artifacts,
         )],
         response,
     })?;
@@ -823,7 +1041,7 @@ fn scope(
     IdempotencyScope::new(
         envelope.authenticated.principal_id(),
         command,
-        EntityId::Attempt(envelope.attempt.attempt_id),
+        EntityId::ToolCall(envelope.invocation_id),
     )
     .map_err(|_| InvokeError::InvalidPersistedOutcome)
 }
@@ -850,20 +1068,16 @@ fn event(
     }
 }
 
-fn output_artifacts(result: &CanonicalInvocationResult) -> Vec<u8> {
+fn output_artifacts(result: &CanonicalInvocationResult) -> Result<Vec<u8>, InvokeError> {
     let artifacts = result
         .output
         .as_ref()
-        .filter(|output| output.media_type == "application/json")
-        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.body).ok())
-        .and_then(|value| value.get("artifacts").cloned())
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::to_owned))
-        .take(128)
-        .collect::<Vec<_>>();
-    serde_json::to_vec(&artifacts).unwrap_or_else(|_| b"[]".to_vec())
+        .map(|output| output.artifact_digests.as_slice())
+        .unwrap_or_default();
+    if artifacts.len() > MAX_INVOCATION_ARTIFACT_DIGESTS {
+        return Err(InvokeError::ArtifactDigestLimit);
+    }
+    serde_json::to_vec(&artifacts).map_err(InvokeError::Serialization)
 }
 
 fn put_spend(bytes: &mut Vec<u8>, spend: Spend) {
@@ -905,4 +1119,28 @@ fn hex(bytes: &[u8]) -> String {
         write!(output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_digest_limit_is_checked_before_event_serialization() {
+        let artifact = ArtifactRef::parse(&format!("blake3:{}", "ab".repeat(32))).unwrap();
+        let result = CanonicalInvocationResult {
+            status: InvocationStatus::Succeeded,
+            output: Some(CanonicalOutput {
+                media_type: "application/json".to_owned(),
+                body: b"{}".to_vec(),
+                artifact_digests: vec![artifact; MAX_INVOCATION_ARTIFACT_DIGESTS + 1],
+            }),
+            code: None,
+            charged: true,
+        };
+        assert!(matches!(
+            output_artifacts(&result),
+            Err(InvokeError::ArtifactDigestLimit)
+        ));
+    }
 }

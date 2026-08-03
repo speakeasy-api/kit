@@ -371,6 +371,49 @@ fn init_git(root: &std::path::Path) {
     }
 }
 
+#[tokio::test]
+async fn daemon_start_only_validates_configured_mcp_servers() {
+    let root = TestRoot::new();
+    let mut config = development_config(&root.0);
+    config.mcp_servers = vec![
+        serde_json::from_value(serde_json::json!({
+            "id": "offline-docs",
+            "transport": {
+                "kind": "http",
+                "endpoint": "https://127.0.0.1:9/mcp"
+            },
+            "owner": {
+                "principal_id": PrincipalId::generate().unwrap(),
+                "project_id": ProjectId::generate().unwrap()
+            },
+            "source": "mcp.docs",
+            "trust_domain": "loopback.invalid",
+            "namespace": "docs",
+            "version": "1",
+            "credential_handle": "env:KIT_TEST_MCP_TOKEN",
+            "credential_scope": {"kind": "project"},
+            "egress": {"scheme": "https", "host": "127.0.0.1", "port": 9},
+            "descriptors": [{
+                "kind": "tool",
+                "remote": "search",
+                "descriptor_digest": format!("sha256:{}", "00".repeat(32)),
+                "effect": "network_egress",
+                "retry_safety": "idempotent",
+                "required_grants": ["network_egress"],
+                "auth_scopes": ["docs.read"],
+                "availability": "available"
+            }]
+        }))
+        .unwrap(),
+    ];
+
+    let daemon = tokio::time::timeout(Duration::from_secs(5), start_daemon(config))
+        .await
+        .expect("daemon startup attempted MCP I/O")
+        .unwrap();
+    daemon.shutdown().await.unwrap();
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_repository_http_structural_preview_applies_the_exact_diff_once() {

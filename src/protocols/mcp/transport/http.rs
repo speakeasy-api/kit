@@ -30,13 +30,17 @@ use crate::{
         },
     },
     domain::{
-        egress::{Authorization as EgressAuthorization, MAX_RESOLVED_ADDRESSES},
+        egress::{
+            Authorization as EgressAuthorization, CredentialHandle, EgressPolicy,
+            MAX_RESOLVED_ADDRESSES,
+        },
         secret::{SecretHandle, SecretLease},
     },
     store::sqlite::append::SqliteStore,
 };
 
 use super::{OperationGate, ReadyConnection, TransportError, TransportFailure, TransportLimits};
+use crate::protocols::mcp::features::{ConfiguredServerIdentity, RawPayload};
 
 const INITIALIZE_OPERATION: &str = "initialize";
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
@@ -116,6 +120,33 @@ pub trait HttpCredentialBroker: Send + Sync + 'static {
     ) -> Result<SecretLease, HttpCredentialError>;
 }
 
+pub(crate) struct EnvironmentHttpCredentialBroker;
+
+#[async_trait::async_trait]
+impl HttpCredentialBroker for EnvironmentHttpCredentialBroker {
+    async fn authorize_and_resolve(
+        &self,
+        handle: &SecretHandle,
+        _context: &HttpSecretContext<'_>,
+    ) -> Result<SecretLease, HttpCredentialError> {
+        let variable = handle
+            .identifier()
+            .strip_prefix("env:")
+            .filter(|value| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+            .ok_or(HttpCredentialError::Denied)?;
+        let value = std::env::var(variable).map_err(|_| HttpCredentialError::Unavailable)?;
+        if value.is_empty() {
+            return Err(HttpCredentialError::Invalid);
+        }
+        Ok(SecretLease::new(value.into_bytes()))
+    }
+}
+
 pub enum StreamableHttpOutcome {
     Ready(Box<ReadyConnection>),
     AuthRequired(Box<TransportAuthChallenge>),
@@ -125,7 +156,7 @@ pub async fn connect_streamable_http(
     server_id: McpServerId,
     endpoint: &str,
     request: &BrokerInvocation<'_>,
-    policy: &EgressAuthorization,
+    policy: &EgressPolicy,
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
@@ -134,7 +165,16 @@ pub async fn connect_streamable_http(
     let operation = TransportOperation::parse(INITIALIZE_OPERATION)?;
     let binding = TransportBinding::new(request, server_id.to_string(), "http", endpoint, None);
     let authorization = transport_auth::authorize(request, &operation, &binding, store)?;
-    validate_policy(endpoint, policy, &authorization, limits)?;
+    let credential = authorization
+        .credential()
+        .ok_or(TransportError::PolicyAuthorizationMismatch)?;
+    let handle = CredentialHandle::new(credential.identifier().to_owned())
+        .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
+    let policy = policy
+        .resolve_initial(endpoint, &handle)
+        .await
+        .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
+    validate_policy(endpoint, &policy, &authorization, limits)?;
     match transport_auth::state(request, &binding, store) {
         Ok(TransportAuthState::Absent) | Err(BrokerError::AuthNotRequired) => {}
         Ok(TransportAuthState::Pending(challenge)) => {
@@ -150,7 +190,7 @@ pub async fn connect_streamable_http(
         endpoint,
         request,
         authorization,
-        policy,
+        &policy,
         credentials,
         store,
         limits,
@@ -163,7 +203,7 @@ pub async fn resume_streamable_http(
     server_id: McpServerId,
     endpoint: &str,
     request: &BrokerInvocation<'_>,
-    policy: &EgressAuthorization,
+    policy: &EgressPolicy,
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
@@ -172,13 +212,22 @@ pub async fn resume_streamable_http(
     let operation = TransportOperation::parse(INITIALIZE_OPERATION)?;
     let binding = TransportBinding::new(request, server_id.to_string(), "http", endpoint, None);
     let authorization = transport_auth::authorize_replay(request, &operation, &binding, store)?;
-    validate_policy(endpoint, policy, &authorization, limits)?;
+    let credential = authorization
+        .credential()
+        .ok_or(TransportError::PolicyAuthorizationMismatch)?;
+    let handle = CredentialHandle::new(credential.identifier().to_owned())
+        .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
+    let policy = policy
+        .resolve_initial(endpoint, &handle)
+        .await
+        .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
+    validate_policy(endpoint, &policy, &authorization, limits)?;
     match connect_once(
         server_id,
         endpoint,
         request,
         authorization,
-        policy,
+        &policy,
         credentials,
         store,
         limits,
@@ -223,9 +272,10 @@ async fn connect_once(
     limits: TransportLimits,
     replay: bool,
 ) -> Result<StreamableHttpOutcome, TransportError> {
+    let configured_server = ConfiguredServerIdentity::new(server_id.to_string())?;
     let operations = OperationGate::new();
     operations.set_binding(authorization.binding().clone())?;
-    operations.install(authorization.clone())?;
+    let generation = operations.install(authorization.clone())?;
     let dispatch_binding = authorization.binding().clone();
     let client = Arc::new(AuthorizedHttpClient::new(
         &server_id,
@@ -251,58 +301,99 @@ async fn connect_once(
         {
             Ok(dispatch) => dispatch,
             Err(error) => {
-                operations.clear();
+                operations.clear_generation(generation)?;
                 return Err(error.into());
             }
         };
-    let result = match tokio::time::timeout(
-        limits.connect_timeout(),
-        McpConnection::connect_authorized_http(&config),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            let cleanup =
-                tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
-            transport_auth::finish_dispatch(
-                request,
-                dispatch,
-                transport_auth::TransportDispatchOutcome::OutcomeUnknown,
-                store,
-            )?;
-            return match cleanup {
-                Ok(Ok(())) => Err(TransportError::Timeout("HTTP initialize")),
-                Ok(Err(error)) => Err(TransportError::Io(std::io::Error::other(error))),
-                Err(_) => Err(TransportError::Timeout("session cleanup")),
-            };
-        }
-    };
-    if result.is_err()
-        && let Some(error) = operations.take_failure()
-    {
-        transport_auth::finish_dispatch(
+    let result = McpConnection::connect_authorized_http(&config).await;
+    if request.cancelled() {
+        let cleanup =
+            tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
+        let persisted = transport_auth::finish_dispatch(
             request,
             dispatch,
             transport_auth::TransportDispatchOutcome::OutcomeUnknown,
             store,
-        )?;
-        return Err(error);
+        );
+        let cleared = operations.clear_generation(generation);
+        persisted?;
+        cleared?;
+        return match cleanup {
+            Ok(Ok(())) => Err(TransportError::Cancelled),
+            Ok(Err(error)) => Err(TransportError::Cleanup {
+                primary: Box::new(TransportError::Cancelled),
+                cleanup: std::io::Error::other(error),
+            }),
+            Err(_) => Err(TransportError::Cleanup {
+                primary: Box::new(TransportError::Cancelled),
+                cleanup: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "MCP HTTP session cleanup timed out",
+                ),
+            }),
+        };
+    }
+    if result.is_err()
+        && let Some(error) = operations.take_failure()
+    {
+        let cleanup =
+            tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
+        let persisted = transport_auth::finish_dispatch(
+            request,
+            dispatch,
+            transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+            store,
+        );
+        let cleared = operations.clear_generation(generation);
+        persisted?;
+        cleared?;
+        return match cleanup {
+            Ok(Ok(())) => Err(error),
+            Ok(Err(cleanup)) => Err(TransportError::Cleanup {
+                primary: Box::new(error),
+                cleanup: std::io::Error::other(cleanup),
+            }),
+            Err(_) => Err(TransportError::Cleanup {
+                primary: Box::new(error),
+                cleanup: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "MCP HTTP session cleanup timed out",
+                ),
+            }),
+        };
     }
     match result {
         Ok(connection) => {
-            transport_auth::finish_dispatch(
-                request,
-                dispatch,
-                transport_auth::TransportDispatchOutcome::Completed,
-                store,
-            )?;
-            let authorization = operations.current_authorization()?;
-            operations.bind_connection(authorization)?;
-            operations.clear();
-            ReadyConnection::new(connection, limits, operations, Some(client), true)
+            let ready = (|| {
+                transport_auth::finish_dispatch(
+                    request,
+                    dispatch,
+                    transport_auth::TransportDispatchOutcome::Completed,
+                    store,
+                )?;
+                let authorization = operations.current_authorization()?;
+                operations.bind_connection(authorization)?;
+                operations.clear_generation(generation)?;
+                ReadyConnection::new(
+                    connection,
+                    configured_server,
+                    limits,
+                    Arc::clone(&operations),
+                    Some(client.clone()),
+                    None,
+                    true,
+                )
+                .map(|connection| connection.with_lifecycle_authority(request))
                 .map(Box::new)
                 .map(StreamableHttpOutcome::Ready)
+            })();
+            match ready {
+                Ok(connection) => Ok(connection),
+                Err(primary) => {
+                    let _ = operations.clear_generation(generation);
+                    Err(cleanup_http_error(client, limits.close_timeout(), primary).await)
+                }
+            }
         }
         Err(McpError::AuthRequired(challenge)) => {
             let (kind, operation, scope) = auth_challenge(&challenge)?;
@@ -314,17 +405,58 @@ async fn connect_once(
                 scope.as_deref(),
                 store,
             )?;
+            operations.clear_generation(generation)?;
             Ok(StreamableHttpOutcome::AuthRequired(Box::new(challenge)))
         }
         Err(error) => {
-            transport_auth::finish_dispatch(
+            let primary = TransportError::from(error);
+            let cleanup =
+                tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
+            let persisted = transport_auth::finish_dispatch(
                 request,
                 dispatch,
                 transport_auth::TransportDispatchOutcome::OutcomeUnknown,
                 store,
-            )?;
-            Err(TransportError::from(error))
+            );
+            let cleared = operations.clear_generation(generation);
+            persisted?;
+            cleared?;
+            match cleanup {
+                Ok(Ok(())) => Err(primary),
+                Ok(Err(error)) => Err(TransportError::Cleanup {
+                    primary: Box::new(primary),
+                    cleanup: std::io::Error::other(error),
+                }),
+                Err(_) => Err(TransportError::Cleanup {
+                    primary: Box::new(primary),
+                    cleanup: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "MCP HTTP session cleanup timed out",
+                    ),
+                }),
+            }
         }
+    }
+}
+
+async fn cleanup_http_error(
+    client: Arc<AuthorizedHttpClient>,
+    timeout: std::time::Duration,
+    primary: TransportError,
+) -> TransportError {
+    match tokio::time::timeout(timeout, client.close_open_sessions()).await {
+        Ok(Ok(())) => primary,
+        Ok(Err(error)) => TransportError::Cleanup {
+            primary: Box::new(primary),
+            cleanup: std::io::Error::other(error),
+        },
+        Err(_) => TransportError::Cleanup {
+            primary: Box::new(primary),
+            cleanup: std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "MCP HTTP session cleanup timed out",
+            ),
+        },
     }
 }
 
@@ -401,6 +533,9 @@ fn validate_policy(
         return Err(TransportError::InvalidEndpoint);
     }
     let host = parsed.host_str().ok_or(TransportError::InvalidEndpoint)?;
+    if parsed.scheme() != "https" && !insecure_test_endpoint(&parsed) {
+        return Err(TransportError::InvalidEndpoint);
+    }
     let port = parsed
         .port_or_known_default()
         .ok_or(TransportError::InvalidEndpoint)?;
@@ -427,6 +562,19 @@ fn validate_policy(
         return Err(TransportError::PolicyAuthorizationMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn insecure_test_endpoint(endpoint: &url::Url) -> bool {
+    endpoint.scheme() == "http"
+        && endpoint
+            .host()
+            .is_some_and(|host| matches!(host, url::Host::Ipv4(ip) if ip.is_loopback()))
+}
+
+#[cfg(not(test))]
+const fn insecure_test_endpoint(_: &url::Url) -> bool {
+    false
 }
 
 struct AuthorizedHttpClient {
@@ -525,6 +673,9 @@ impl AuthorizedHttpClient {
                 self.operations.fail(TransportFailure::InvalidHeader);
                 return Err(unexpected("MCP HTTP response headers exceed bound"));
             }
+            self.operations
+                .scan_ingress(value.as_bytes())
+                .map_err(|_| unexpected("MCP HTTP response contains credential material"))?;
         }
         Ok(())
     }
@@ -609,6 +760,11 @@ impl AuthorizedHttpClient {
         })?;
         bearer.fill(0);
         value.set_sensitive(true);
+        self.operations
+            .install_secret(lease)
+            .map_err(|_| unexpected("credential scanner initialization failed"))?;
+        // reqwest must own one HeaderValue copy until send; it is sensitive,
+        // never formatted or persisted, and the source buffer is already zeroed.
         Ok(request.header(AUTHORIZATION, value))
     }
 
@@ -751,6 +907,7 @@ impl McpHttpClient for AuthorizedHttpClient {
             let expired = session_id.as_deref().expect("checked above");
             self.expire_session(expired)?;
             self.bind_session(None)?;
+            self.operations.fail(TransportFailure::SessionExpired);
             return Err(McpStreamableHttpError::SessionExpired);
         }
         let content_type = content_type(&response);
@@ -796,7 +953,20 @@ impl McpHttpClient for AuthorizedHttpClient {
             Some(JSON_CONTENT_TYPE) => {
                 let body =
                     bounded_body(response, self.limits.max_json_bytes(), &self.operations).await?;
-                let message = serde_json::from_slice(&body)?;
+                let payload =
+                    RawPayload::parse(&body, self.limits.payload_limits()).map_err(|error| {
+                        self.operations.fail(TransportFailure::Payload(error));
+                        unexpected("invalid bounded MCP JSON response")
+                    })?;
+                self.operations.scan_payload(&payload).map_err(|_| {
+                    unexpected("MCP response reflected protected credential material")
+                })?;
+                if payload.value().get("result").is_some() {
+                    self.operations
+                        .capture_payload(payload.clone())
+                        .map_err(|_| unexpected("conflicting MCP response payload"))?;
+                }
+                let message = serde_json::from_value(payload.value().clone())?;
                 if is_initialize
                     && !matches!(
                         &message,
@@ -861,6 +1031,7 @@ impl McpHttpClient for AuthorizedHttpClient {
         if response.status() == StatusCode::NOT_FOUND {
             self.expire_session(&session_id)?;
             self.bind_session(None)?;
+            self.operations.fail(TransportFailure::SessionExpired);
             return Err(McpStreamableHttpError::SessionExpired);
         }
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
@@ -929,6 +1100,7 @@ impl McpHttpClient for AuthorizedHttpClient {
         if response.status() == StatusCode::NOT_FOUND {
             self.expire_session(&session_id)?;
             self.bind_session(None)?;
+            self.operations.fail(TransportFailure::SessionExpired);
             return Err(McpStreamableHttpError::SessionExpired);
         }
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
@@ -1153,6 +1325,9 @@ async fn bounded_body(
             operations.fail(TransportFailure::ResponseTooLarge);
             return Err(unexpected("MCP HTTP body exceeds bound"));
         }
+        operations
+            .scan_ingress(&chunk)
+            .map_err(|_| unexpected("MCP HTTP response contains credential material"))?;
         body.extend_from_slice(&chunk);
     }
     Ok(body)
@@ -1219,6 +1394,10 @@ impl SseState {
             if self.offset == self.chunk.len() {
                 match self.input.next().await {
                     Some(Ok(chunk)) => {
+                        if let Err(error) = self.operations.scan_ingress(&chunk) {
+                            self.terminal = true;
+                            return Some(Err(McpSseError::Body(Box::new(error))));
+                        }
                         self.chunk = chunk;
                         self.offset = 0;
                     }
@@ -1268,6 +1447,31 @@ impl SseState {
                 if empty {
                     self.event_bytes = 0;
                     if let Some(event) = self.take_event() {
+                        if let Some(data) = &event.data
+                            && data.trim_start().starts_with(['{', '['])
+                        {
+                            let payload = match RawPayload::parse(
+                                data.as_bytes(),
+                                self.limits.payload_limits(),
+                            ) {
+                                Ok(payload) => payload,
+                                Err(error) => {
+                                    self.operations.fail(TransportFailure::Payload(error));
+                                    self.terminal = true;
+                                    return Some(Err(McpSseError::Body(Box::new(error))));
+                                }
+                            };
+                            if self.operations.scan_payload(&payload).is_err() {
+                                self.terminal = true;
+                                return Some(Err(McpSseError::Body(Box::new(SsePayloadConflict))));
+                            }
+                            if payload.value().get("result").is_some()
+                                && self.operations.capture_payload(payload).is_err()
+                            {
+                                self.terminal = true;
+                                return Some(Err(McpSseError::Body(Box::new(SsePayloadConflict))));
+                            }
+                        }
                         return Some(Ok(event));
                     }
                 }
@@ -1295,9 +1499,10 @@ impl SseState {
         if value.first() == Some(&b' ') {
             value = &value[1..];
         }
-        let value = String::from_utf8_lossy(value);
         match field {
             b"data" => {
+                // SSE decodes malformed UTF-8 with replacement before JSON parsing.
+                let value = String::from_utf8_lossy(value);
                 let had_data = self.current.data.is_some();
                 let data = self.current.data.get_or_insert_with(String::new);
                 if had_data {
@@ -1306,15 +1511,17 @@ impl SseState {
                 data.push_str(&value);
             }
             b"event" => {
-                self.current.event = Some(value.into_owned());
+                self.current.event = Some(String::from_utf8_lossy(value).into_owned());
             }
-            b"id" if !value.as_bytes().contains(&0) => {
+            b"id" if !value.contains(&0) => {
+                let value = String::from_utf8_lossy(value);
                 if value.len() > self.limits.max_event_id_bytes() {
                     return Err(bound_sse_error());
                 }
                 self.current.id = Some(value.into_owned());
             }
             b"retry" => {
+                let value = String::from_utf8_lossy(value);
                 if let Ok(retry) = value.parse::<u64>()
                     && retry <= self.limits.max_sse_retry_millis()
                 {
@@ -1350,6 +1557,17 @@ impl std::error::Error for SseBoundError {}
 fn bound_sse_error() -> McpSseError {
     McpSseError::Body(Box::new(SseBoundError))
 }
+
+#[derive(Debug)]
+struct SsePayloadConflict;
+
+impl fmt::Display for SsePayloadConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("conflicting MCP SSE response payload")
+    }
+}
+
+impl std::error::Error for SsePayloadConflict {}
 
 #[cfg(test)]
 mod tests {
@@ -1525,6 +1743,19 @@ mod tests {
         }
     }
 
+    async fn duplicate_initialize(body: String) -> Response {
+        let message: Value = serde_json::from_str(&body).unwrap();
+        let id = &message["id"];
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, JSON_CONTENT_TYPE)],
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"capabilities":{{}},"serverInfo":{{"name":"duplicate","version":"1"}}}}}}"#
+            ),
+        )
+            .into_response()
+    }
+
     fn authorization(endpoint: &str, credential: &SecretHandle) -> TransportAuthorization {
         TransportAuthorization::for_test_bound_arguments_binding(
             TransportOperation::parse(INITIALIZE_OPERATION).unwrap(),
@@ -1583,6 +1814,66 @@ mod tests {
             None,
             http.operations.binding().unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn http_and_sse_reject_duplicate_feature_payloads_before_typed_parsing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/mcp", any(duplicate_initialize)),
+            )
+            .await
+            .unwrap();
+        });
+        let endpoint = format!("http://{address}/mcp");
+        let credential = SecretHandle::parse("test:mcp-http-duplicate").unwrap();
+        let http = client(
+            &endpoint,
+            &credential,
+            Arc::new(CredentialBroker {
+                resolutions: AtomicUsize::new(0),
+            }),
+            TransportLimits::default(),
+        );
+        assert!(
+            McpConnection::connect_authorized_http(&McpServerConfig::new(
+                "duplicate-http",
+                McpTransportBinding::StreamableHttp(
+                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http.clone()),
+                ),
+            ))
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            http.operations.take_failure(),
+            Some(TransportError::Payload(
+                crate::protocols::mcp::features::PayloadError::DuplicateKey
+            ))
+        ));
+
+        let operations = OperationGate::new();
+        operations
+            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
+            .unwrap();
+        let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
+            futures_util::stream::once(async {
+                Ok(Bytes::from_static(
+                    b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[],\"tools\":[]}}\n\n",
+                ))
+            })
+            .boxed();
+        let mut state = SseState::new(input, TransportLimits::default(), Arc::clone(&operations));
+        assert!(state.next().await.unwrap().is_err());
+        assert!(matches!(
+            operations.take_failure(),
+            Some(TransportError::Payload(
+                crate::protocols::mcp::features::PayloadError::DuplicateKey
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -2354,7 +2645,11 @@ mod tests {
             )),
         ])
         .boxed();
-        let mut state = SseState::new(input, TransportLimits::default(), OperationGate::new());
+        let operations = OperationGate::new();
+        operations
+            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
+            .unwrap();
+        let mut state = SseState::new(input, TransportLimits::default(), operations);
         let event = state.next().await.unwrap().unwrap();
         assert_eq!(event.event.as_deref(), Some("message"));
         assert_eq!(event.id.as_deref(), Some(""));
@@ -2363,13 +2658,21 @@ mod tests {
 
         let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
             futures_util::stream::iter([Ok(Bytes::from_static(b"data: incomplete"))]).boxed();
-        let mut state = SseState::new(input, TransportLimits::default(), OperationGate::new());
+        let operations = OperationGate::new();
+        operations
+            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
+            .unwrap();
+        let mut state = SseState::new(input, TransportLimits::default(), operations);
         assert!(state.next().await.is_none());
 
         let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
             futures_util::stream::iter([Ok(Bytes::from_static(b"id: control\nretry: 10\n\n"))])
                 .boxed();
-        let mut state = SseState::new(input, TransportLimits::default(), OperationGate::new());
+        let operations = OperationGate::new();
+        operations
+            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
+            .unwrap();
+        let mut state = SseState::new(input, TransportLimits::default(), operations);
         let control = state.next().await.unwrap().unwrap();
         assert_eq!(control.id.as_deref(), Some("control"));
         assert_eq!(control.retry, Some(10));

@@ -1316,7 +1316,7 @@ impl NativeRepoWorker {
         let trace_id =
             TraceId::parse(&format!("repository-{id}")).map_err(|_| RepoError::Internal)?;
         let occurred_at = UtcDateTime::now().map_err(|_| RepoError::Internal)?;
-        let current_fence = AtomicU64::new(operation.attempt.fencing_token.get());
+        let current_fence = Arc::new(AtomicU64::new(operation.attempt.fencing_token.get()));
         let mut state = self.state.lock().map_err(|_| RepoError::Internal)?;
         state.dispatcher.bind_authority(
             operation.principal.clone(),
@@ -4762,6 +4762,7 @@ mod tests {
             output: Some(crate::capabilities::kernel::invoke::CanonicalOutput {
                 media_type: "application/json".to_owned(),
                 body: br#"{"committed":true}"#.to_vec(),
+                artifact_digests: Vec::new(),
             }),
             code: None,
             charged: true,
@@ -4809,6 +4810,7 @@ mod tests {
                     output: Some(crate::capabilities::kernel::invoke::CanonicalOutput {
                         media_type: "application/json".to_owned(),
                         body: br#"{"answer":42}"#.to_vec(),
+                        artifact_digests: Vec::new(),
                     }),
                     code: None,
                     charged: true,
@@ -4882,6 +4884,7 @@ mod tests {
                 output: Some(crate::capabilities::kernel::invoke::CanonicalOutput {
                     media_type: "application/json".to_owned(),
                     body: br#"{"answer":42}"#.to_vec(),
+                    artifact_digests: Vec::new(),
                 }),
                 code: None,
                 charged: true,
@@ -4979,6 +4982,7 @@ mod tests {
                     output: Some(crate::capabilities::kernel::invoke::CanonicalOutput {
                         media_type: "application/json".to_owned(),
                         body: br#"{"committed":true}"#.to_vec(),
+                        artifact_digests: Vec::new(),
                     }),
                     code: None,
                     charged: true,
@@ -5263,6 +5267,7 @@ mod tests {
             output: Some(crate::capabilities::kernel::invoke::CanonicalOutput {
                 media_type: "application/json".to_owned(),
                 body: br#"{"contention":"recovered"}"#.to_vec(),
+                artifact_digests: Vec::new(),
             }),
             code: None,
             charged: true,

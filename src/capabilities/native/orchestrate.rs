@@ -57,6 +57,8 @@ impl<'a> OrchestratedCapabilityInvocation<'a> {
 fn map_broker_error(error: BrokerError) -> InvokeError {
     match error {
         BrokerError::NativeCapabilityBinding => InvokeError::NativeCapabilityBinding,
+        BrokerError::BindingMismatch => InvokeError::SchemaBindingMismatch,
+        BrokerError::InvalidResultProvenance(_) => InvokeError::InvalidPersistedOutcome,
         BrokerError::SchemaBindingMismatch => InvokeError::SchemaBindingMismatch,
         BrokerError::UnsupportedValidation => InvokeError::UnsupportedValidation,
         BrokerError::InvalidArguments => InvokeError::InvalidArguments,

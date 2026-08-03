@@ -14,6 +14,9 @@ mod fencing;
 mod lifecycle_cas;
 mod loop_restart;
 mod lsp_fencing;
+#[path = "../conformance/cap_invoke.rs"]
+mod mcp_invocation_broker_crash;
+mod mcp_listchange_storm;
 mod model_intent_outcome;
 mod process_reap;
 mod provider_interrupt;

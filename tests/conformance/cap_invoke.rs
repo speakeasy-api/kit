@@ -27,7 +27,7 @@ use kit::{
             invoke::{
                 ApprovalState, AuthorizedInvocation, CanonicalOutput, DispatchOutcome,
                 InvocationCrashPoint, InvocationEnvelope, InvocationResult, InvocationStatus,
-                InvokeError, PresentationPlaceholder, RetrySafety,
+                InvokeError, RetrySafety,
             },
         },
         schema::{JSON_SCHEMA_2020_12, NormalizedSchema},
@@ -320,6 +320,7 @@ fn success(_: &AuthorizedInvocation) -> DispatchOutcome {
     DispatchOutcome::Succeeded(CanonicalOutput {
         media_type: "application/json".to_owned(),
         body: br#"{"bytes":12}"#.to_vec(),
+        artifact_digests: Vec::new(),
     })
 }
 
@@ -353,7 +354,7 @@ fn intent_precedes_dispatch_and_structured_outcome_is_durable() {
 
     assert_eq!(dispatches, 1);
     assert_eq!(result.canonical.status, InvocationStatus::Succeeded);
-    assert_eq!(result.presentation, PresentationPlaceholder::NotRendered);
+    assert_eq!(result.presentation, None);
     assert!(!result.replayed);
     assert_eq!(fixture.budget.totals().reserved, Spend::ZERO);
     assert_eq!(fixture.budget.totals().committed, Spend::new(3, 4, 0, 1, 0));
@@ -409,6 +410,42 @@ fn terminal_idempotency_replays_without_dispatch_or_double_charge() {
     assert!(second.replayed);
     assert_eq!(fixture.store.events().unwrap().len(), 3);
     assert_eq!(fixture.budget.totals().committed, Spend::new(3, 4, 0, 1, 0));
+}
+
+#[test]
+fn explicit_unknown_completion_is_durable_charged_and_never_redispatched() {
+    let mut fixture = Fixture::new();
+    let first = call(
+        &mut fixture,
+        RetrySafety::NonIdempotent,
+        ApprovalState::NotRequired,
+        None,
+        &mut |_| DispatchOutcome::OutcomeUnknown {
+            code: "transport_timeout".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(first.canonical.status, InvocationStatus::OutcomeUnknown);
+    assert_eq!(first.canonical.code.as_deref(), Some("transport_timeout"));
+    assert!(first.canonical.charged);
+    assert_eq!(fixture.budget.totals().reserved, Spend::ZERO);
+
+    let mut dispatches = 0;
+    let replay = call(
+        &mut fixture,
+        RetrySafety::NonIdempotent,
+        ApprovalState::NotRequired,
+        None,
+        &mut |_| {
+            dispatches += 1;
+            panic!("persisted unknown outcome was redispatched")
+        },
+    )
+    .unwrap();
+    assert_eq!(dispatches, 0);
+    assert_eq!(replay.canonical, first.canonical);
+    assert!(replay.replayed);
+    assert_eq!(fixture.store.events().unwrap().len(), 3);
 }
 
 #[test]

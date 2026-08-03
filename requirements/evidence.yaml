@@ -1726,7 +1726,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1031
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_821 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1736,7 +1736,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1032
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_822 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1746,7 +1746,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1033
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_823 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test fault mcp_listchange_storm::ten_thousand_notifications_coalesce_to_three_bounded_kinds -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -6671,7 +6671,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1186
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_800 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance mcp_features::mcp_feature_dtos_normalize_four_kinds_without_inventing_output_schemas -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -6681,7 +6681,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1187
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_801 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -6691,7 +6691,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1188
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_802 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance mcp_features::mcp_schema_dialects_and_advisory_annotations_remain_truthful_and_fail_closed -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -6701,7 +6701,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1189
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_803 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -6711,7 +6711,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1190
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_804 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::http::tests::active_http_credential_scanner_rejects_raw_percent_and_base64_reflection --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -6721,7 +6721,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1191
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_805 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

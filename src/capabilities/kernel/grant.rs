@@ -13,7 +13,10 @@ use super::{
     identity::{CapabilityIdentity, Digest, DigestAlgorithm, put_bytes, put_digest},
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, serde::Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectClass {
     ModelCall,
     WorkspaceRead,

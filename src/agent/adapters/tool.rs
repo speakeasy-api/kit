@@ -33,6 +33,7 @@ use crate::{
         },
     },
     capabilities::schema::NormalizedSchema,
+    capabilities::{discovery::CapabilityBinding, registration::BoundRegistrationCall},
     domain::{
         config::RunConfigSnapshot,
         events::{TraceId, UtcDateTime},
@@ -41,6 +42,7 @@ use crate::{
     },
     executor::cancel::ExecutorCancellationCoordinator,
     runtime::scheduler::{limits::Spend, reserve::BudgetLedger},
+    store::artifacts::ArtifactStore,
     store::sqlite::{append::SqliteStore, idempotency::IdempotencyKey},
 };
 
@@ -53,6 +55,11 @@ const APPROVED_IDEMPOTENCY_KEY_METADATA: &str = "kit.approved_idempotency_key";
 const MAX_CANONICAL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_PRESENTATION_BYTES: usize = 16 * 1024;
 const MAX_RESULT_CODE_BYTES: usize = 256;
+const MCP_AUTH_REQUEST_KIND: &str = "kit.mcp.auth";
+const MCP_AUTH_SCOPE_METADATA: &str = "kit.mcp.auth_scope";
+const MCP_AUTH_CHALLENGE_KIND_METADATA: &str = "kit.mcp.auth_challenge_kind";
+const MCP_AUTH_CHALLENGE_GENERATION_METADATA: &str = "kit.mcp.auth_challenge_generation";
+const MCP_AUTH_CHALLENGE_ID_METADATA: &str = "kit.mcp.auth_challenge_id";
 type CostEstimator = Arc<dyn Fn(&Value) -> Result<Spend, String> + Send + Sync>;
 
 #[derive(Clone)]
@@ -68,6 +75,8 @@ pub struct ToolBinding {
     retry_safety: RetrySafety,
     approval: ApprovalState,
     cost_estimator: Option<CostEstimator>,
+    external: Option<Arc<CapabilityBinding>>,
+    extension: crate::capabilities::kernel::grant_ext::RequestExtension,
 }
 
 impl ToolBinding {
@@ -96,6 +105,32 @@ impl ToolBinding {
             retry_safety,
             approval,
             cost_estimator: None,
+            external: None,
+            extension: Default::default(),
+        }
+    }
+
+    pub(crate) fn mcp(
+        spec: ToolSpec,
+        binding: Arc<CapabilityBinding>,
+        constraints: ArgumentConstraints,
+        extension: crate::capabilities::kernel::grant_ext::RequestExtension,
+    ) -> Self {
+        let entry = binding.pinned_entry();
+        Self {
+            spec,
+            capability: entry.identity().clone(),
+            schema: entry.schemas().input().schema().clone(),
+            discovered_schema_digest: binding.input_schema_digest(),
+            bound_schema_digest: binding.input_schema_digest(),
+            effect: entry.side_effects().effect(),
+            argument_constraints: constraints,
+            reservation: Spend::new(0, 0, 0, 1, 0),
+            retry_safety: entry.side_effects().retry_safety(),
+            approval: ApprovalState::NotRequired,
+            cost_estimator: None,
+            external: Some(binding),
+            extension,
         }
     }
 
@@ -142,10 +177,27 @@ struct KernelToolContext {
 }
 
 #[derive(Clone)]
+struct McpToolRuntime {
+    runtime: Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
+    artifacts: Arc<ArtifactStore>,
+    policy: crate::protocols::mcp::transport::McpResultPolicy,
+}
+
+enum ToolInvocation {
+    Completed(
+        InvocationResult,
+        Option<crate::capabilities::result::Presentation>,
+    ),
+    AuthRequired(crate::capabilities::broker::AuthChallenge),
+    Failed(InvokeError),
+}
+
+#[derive(Clone)]
 pub struct ToolExecutorAdapter {
     bindings: BTreeMap<String, ToolBinding>,
     context: ToolKernelContext,
     runtime: Arc<Mutex<KernelRuntime>>,
+    mcp: Option<McpToolRuntime>,
 }
 
 impl ToolExecutorAdapter {
@@ -172,7 +224,22 @@ impl ToolExecutorAdapter {
                 store,
                 capability: Box::new(capability),
             })),
+            mcp: None,
         })
+    }
+
+    pub(crate) fn with_mcp_runtime(
+        mut self,
+        runtime: Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
+        artifacts: Arc<ArtifactStore>,
+        policy: crate::protocols::mcp::transport::McpResultPolicy,
+    ) -> Self {
+        self.mcp = Some(McpToolRuntime {
+            runtime,
+            artifacts,
+            policy,
+        });
+        self
     }
 
     fn execute_kernel(
@@ -309,46 +376,125 @@ impl ToolExecutorAdapter {
         ) {
             return internal(error);
         }
-        let mut bounded_capability =
-            |authorized: &AuthorizedInvocation| bound_dispatch(capability(authorized));
-        let result =
+        let envelope = InvocationEnvelope {
+            authenticated: &self.context.authenticated,
+            config: &self.context.config,
+            grants: &self.context.grants,
+            delegation: self.context.delegation.as_ref(),
+            extension: binding.extension.clone(),
+            capability: &binding.capability,
+            discovered_schema_digest: binding.discovered_schema_digest,
+            bound_schema_digest: binding.bound_schema_digest,
+            effect: binding.effect,
+            argument_constraints: &binding.argument_constraints,
+            arguments: &arguments,
+            workspace_id: self.context.workspace_id,
+            project_id: self.context.project_id,
+            invocation_id: ids.invocation_id,
+            idempotency_key: &ids.idempotency_key,
+            reservation,
+            retry_safety: binding.retry_safety,
+            approval,
+            cancellation: &self.context.cancellation,
+            attempt: self.context.attempt,
+            driver_claim: Some(self.context.claim),
+            current_fence: &self.context.current_fence,
+            command_id: ids.command_id,
+            intent_event_id: ids.intent_event_id,
+            outcome_event_id: ids.outcome_event_id,
+            occurred_at: &ids.occurred_at,
+            trace_id: &ids.trace_id,
+        };
+        let result = if let Some(external) = &binding.external {
+            let Some(mcp) = &self.mcp else {
+                return internal("MCP binding has no executor-owned runtime");
+            };
+            let call = match BoundRegistrationCall::direct(Arc::clone(external), &arguments) {
+                Ok(call) => call,
+                Err(error) => return invalid_input(error.to_string()),
+            };
+            let resolved = match resolved_mcp_auth(store, self.context.attempt, &request.call_id) {
+                Ok(resolution) => resolution,
+                Err(error) => return internal(error),
+            };
+            let invoke = |store: &mut SqliteStore| {
+                tokio::runtime::Handle::current().block_on(mcp.runtime.invoke_registered(
+                    &call,
+                    envelope.clone(),
+                    store,
+                    &self.context.budget,
+                    &mcp.artifacts,
+                    &mcp.policy,
+                ))
+            };
+            let mut outcome = invoke(store);
+            if let Ok(crate::capabilities::broker::BrokerOutcome::AuthRequired(current)) = &outcome
+                && let Some(resolved) = resolved
+            {
+                let resolution = if resolved.granted {
+                    crate::capabilities::broker::AuthResolution::Granted
+                } else {
+                    crate::capabilities::broker::AuthResolution::Denied
+                };
+                outcome = match mcp.runtime.resolve_registered_auth(
+                    &call,
+                    envelope.clone(),
+                    &self.context.authenticated,
+                    resolution,
+                    current,
+                    resolved.challenge_id,
+                    resolved.challenge_kind,
+                    resolved.challenge_generation,
+                    store,
+                ) {
+                    Ok(true) => invoke(store),
+                    Ok(false) => outcome,
+                    Err(error) => Err(error),
+                };
+            }
+            match outcome {
+                Ok(crate::capabilities::broker::BrokerOutcome::Completed(result)) => {
+                    ToolInvocation::Completed(result.invocation, result.presentation)
+                }
+                Ok(crate::capabilities::broker::BrokerOutcome::AuthRequired(challenge)) => {
+                    ToolInvocation::AuthRequired(challenge)
+                }
+                Err(_) => ToolInvocation::Failed(InvokeError::BrokerAuth),
+            }
+        } else {
+            let mut bounded_capability =
+                |authorized: &AuthorizedInvocation| bound_dispatch(capability(authorized));
             crate::capabilities::native::orchestrate::OrchestratedCapabilityInvocation::new(
-                InvocationEnvelope {
-                    authenticated: &self.context.authenticated,
-                    config: &self.context.config,
-                    grants: &self.context.grants,
-                    delegation: self.context.delegation.as_ref(),
-                    extension: crate::capabilities::kernel::grant_ext::RequestExtension::default(),
-                    capability: &binding.capability,
-                    discovered_schema_digest: binding.discovered_schema_digest,
-                    bound_schema_digest: binding.bound_schema_digest,
-                    effect: binding.effect,
-                    argument_constraints: &binding.argument_constraints,
-                    arguments: &arguments,
-                    workspace_id: self.context.workspace_id,
-                    project_id: self.context.project_id,
-                    invocation_id: ids.invocation_id,
-                    idempotency_key: &ids.idempotency_key,
-                    reservation,
-                    retry_safety: binding.retry_safety,
-                    approval,
-                    cancellation: &self.context.cancellation,
-                    attempt: self.context.attempt,
-                    driver_claim: Some(self.context.claim),
-                    current_fence: &self.context.current_fence,
-                    command_id: ids.command_id,
-                    intent_event_id: ids.intent_event_id,
-                    outcome_event_id: ids.outcome_event_id,
-                    occurred_at: &ids.occurred_at,
-                    trace_id: &ids.trace_id,
-                },
+                envelope,
                 &binding.schema,
                 store,
                 &self.context.budget,
             )
-            .execute(&mut bounded_capability);
+            .execute(&mut bounded_capability)
+            .map(|result| ToolInvocation::Completed(result, None))
+            .unwrap_or_else(ToolInvocation::Failed)
+        };
         match result {
-            Ok(result) => {
+            ToolInvocation::AuthRequired(challenge) => {
+                if let Err(error) = append_tool_journal(
+                    store,
+                    &self.context,
+                    &correlation,
+                    "auth-required",
+                    LoopRecord::EffectOutcome(EffectOutcome {
+                        kind: EffectKind::Tool,
+                        correlation: correlation.clone(),
+                        status: EffectStatus::AuthRequired,
+                        snapshot: None,
+                    }),
+                ) {
+                    return internal(error);
+                }
+                ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(
+                    mcp_auth_request(&request, ids.invocation_id, &challenge),
+                ))
+            }
+            ToolInvocation::Completed(result, presentation) => {
                 let status = match result.canonical.status {
                     InvocationStatus::Succeeded => EffectStatus::Succeeded,
                     InvocationStatus::Cancelled => EffectStatus::Cancelled,
@@ -406,10 +552,10 @@ impl ToolExecutorAdapter {
                     }
                     ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(approval))
                 } else {
-                    map_result(request, result, ids.invocation_id)
+                    map_result(request, result, presentation, ids.invocation_id)
                 }
             }
-            Err(error) => {
+            ToolInvocation::Failed(error) => {
                 let status = if matches!(error, InvokeError::InjectedCrash(_)) {
                     EffectStatus::OutcomeUnknown
                 } else {
@@ -433,6 +579,83 @@ impl ToolExecutorAdapter {
             }
         }
     }
+}
+
+fn resolved_mcp_auth(
+    store: &SqliteStore,
+    owner: AttemptOwnership,
+    call_id: &agentkit_core::ToolCallId,
+) -> Result<Option<ResolvedMcpAuth>, String> {
+    let mut waits = BTreeMap::new();
+    let mut resolutions = BTreeMap::new();
+    let mut ordinal = 0_u64;
+    for record in effect_records(store, owner).map_err(|error| error.to_string())? {
+        ordinal = ordinal.saturating_add(1);
+        match record {
+            LoopRecord::Waiting(crate::agent::driver::waiting::WaitingState {
+                wait_id,
+                kind:
+                    crate::agent::driver::waiting::WaitingKind::Auth {
+                        tool_call_id: Some(tool_call_id),
+                        challenge_kind,
+                        challenge_generation,
+                        challenge_id: Some(challenge_id),
+                        ..
+                    },
+                ..
+            }) => {
+                waits.insert(
+                    wait_id,
+                    (
+                        tool_call_id.to_string(),
+                        challenge_id,
+                        challenge_kind,
+                        challenge_generation,
+                        ordinal,
+                    ),
+                );
+            }
+            LoopRecord::WaitingResolved(resolved) if waits.contains_key(&resolved.wait_id) => {
+                if let crate::agent::driver::waiting::WaitingResolution::Auth { granted } =
+                    resolved.resolution
+                {
+                    resolutions.insert(resolved.wait_id, granted);
+                }
+            }
+            _ => {}
+        }
+    }
+    let latest = waits
+        .iter()
+        .filter(|(_, (found, ..))| found == call_id.0.as_str())
+        .max_by_key(|(_, (_, _, _, generation, ordinal))| (*generation, *ordinal));
+    Ok(
+        latest.and_then(|(wait_id, (_, challenge_id, kind, generation, _))| {
+            let granted = *resolutions.get(wait_id)?;
+            Some(ResolvedMcpAuth {
+                granted,
+                challenge_id: *challenge_id,
+                challenge_kind: match kind {
+                    crate::agent::driver::waiting::AuthChallengeKind::Broker => {
+                        crate::capabilities::broker::AuthChallengeKind::Broker
+                    }
+                    crate::agent::driver::waiting::AuthChallengeKind::Transport => {
+                        crate::capabilities::broker::AuthChallengeKind::Transport
+                    }
+                    crate::agent::driver::waiting::AuthChallengeKind::Provider => return None,
+                },
+                challenge_generation: *generation,
+            })
+        }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedMcpAuth {
+    granted: bool,
+    challenge_id: crate::domain::ids::ApprovalId,
+    challenge_kind: crate::capabilities::broker::AuthChallengeKind,
+    challenge_generation: u64,
 }
 
 struct CancellationWatch {
@@ -843,7 +1066,9 @@ fn effect_name(effect: EffectClass) -> &'static str {
 
 fn bound_dispatch(outcome: DispatchOutcome) -> DispatchOutcome {
     match outcome {
-        DispatchOutcome::Succeeded(output) | DispatchOutcome::DurablyCommitted(output)
+        DispatchOutcome::Succeeded(output)
+        | DispatchOutcome::DurablyCommitted(output)
+        | DispatchOutcome::DurablyFailed { output, .. }
             if output.body.len() > MAX_CANONICAL_OUTPUT_BYTES
                 || output.media_type.len() > MAX_RESULT_CODE_BYTES =>
         {
@@ -856,16 +1081,26 @@ fn bound_dispatch(outcome: DispatchOutcome) -> DispatchOutcome {
         DispatchOutcome::Failed { code } => DispatchOutcome::Failed {
             code: clip_utf8(&code, MAX_RESULT_CODE_BYTES).to_owned(),
         },
+        DispatchOutcome::DurablyFailed { code, output } => DispatchOutcome::DurablyFailed {
+            code: clip_utf8(&code, MAX_RESULT_CODE_BYTES).to_owned(),
+            output,
+        },
+        DispatchOutcome::OutcomeUnknown { code } => DispatchOutcome::OutcomeUnknown {
+            code: clip_utf8(&code, MAX_RESULT_CODE_BYTES).to_owned(),
+        },
     }
 }
 
 fn map_result(
     request: ToolRequest,
     result: InvocationResult,
+    presentation: Option<crate::capabilities::result::Presentation>,
     invocation_id: ToolCallId,
 ) -> ToolExecutionOutcome {
     match result.canonical.status {
-        InvocationStatus::Succeeded => completed(request, result, invocation_id),
+        InvocationStatus::Succeeded => {
+            completed(request, result, presentation, false, invocation_id)
+        }
         InvocationStatus::ApprovalRequired => {
             internal("approval result was not intercepted by the durable adapter")
         }
@@ -883,6 +1118,9 @@ fn map_result(
                 result.canonical.code.as_deref().unwrap_or("unknown")
             )))
         }
+        InvocationStatus::Failed if presentation.is_some() => {
+            completed(request, result, presentation, true, invocation_id)
+        }
         InvocationStatus::Failed => ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(
             result
                 .canonical
@@ -895,13 +1133,20 @@ fn map_result(
 fn completed(
     request: ToolRequest,
     result: InvocationResult,
+    presentation: Option<crate::capabilities::result::Presentation>,
+    is_error: bool,
     invocation_id: ToolCallId,
 ) -> ToolExecutionOutcome {
+    let broker_presentation = presentation;
     let Some(output) = result.canonical.output else {
-        return internal("successful kernel result has no canonical output");
+        return internal("presented kernel result has no canonical output");
     };
     let clipped = clip_utf8_bytes(&output.body, MAX_PRESENTATION_BYTES);
-    let presentation = if output.media_type == "application/json" && !clipped.1 {
+    let presentation = if let Some(presentation) = &broker_presentation {
+        ToolOutput::Text(presentation.body().to_owned())
+    } else if output.media_type == "application/vnd.kit.canonical-result+json" {
+        return internal("MCP result has no broker-authoritative presentation");
+    } else if output.media_type == "application/json" && !clipped.1 {
         serde_json::from_slice(&output.body)
             .map(ToolOutput::Structured)
             .unwrap_or_else(|_| {
@@ -913,7 +1158,7 @@ fn completed(
     let mut metadata = MetadataMap::new();
     metadata.insert(
         "kit.kernel_status".to_owned(),
-        Value::String("succeeded".to_owned()),
+        Value::String(if is_error { "failed" } else { "succeeded" }.to_owned()),
     );
     metadata.insert("kit.replayed".to_owned(), Value::Bool(result.replayed));
     metadata.insert(
@@ -926,7 +1171,7 @@ fn completed(
     );
     metadata.insert(
         "kit.presentation_truncated".to_owned(),
-        Value::Bool(clipped.1),
+        Value::Bool(broker_presentation.is_none() && clipped.1),
     );
     metadata.insert(
         "kit.native_operation_id".to_owned(),
@@ -940,7 +1185,7 @@ fn completed(
         ToolResult::new(ToolResultPart {
             call_id: request.call_id,
             output: presentation,
-            is_error: false,
+            is_error,
             metadata: metadata.clone(),
         })
         .with_metadata(metadata),
@@ -989,6 +1234,43 @@ fn approval_request(
     approval
 }
 
+fn mcp_auth_request(
+    request: &ToolRequest,
+    invocation_id: ToolCallId,
+    challenge: &crate::capabilities::broker::AuthChallenge,
+) -> ApprovalRequest {
+    let mut auth = ApprovalRequest::new(
+        approval_id(invocation_id),
+        MCP_AUTH_REQUEST_KIND,
+        ApprovalReason::SensitiveAuthScope,
+        "Authorize the configured MCP server connection",
+    )
+    .with_call_id(request.call_id.clone());
+    auth.metadata.insert(
+        MCP_AUTH_SCOPE_METADATA.to_owned(),
+        Value::String(challenge.scope.clone()),
+    );
+    auth.metadata.insert(
+        MCP_AUTH_CHALLENGE_KIND_METADATA.to_owned(),
+        Value::String(
+            match challenge.kind {
+                crate::capabilities::broker::AuthChallengeKind::Broker => "broker",
+                crate::capabilities::broker::AuthChallengeKind::Transport => "transport",
+            }
+            .to_owned(),
+        ),
+    );
+    auth.metadata.insert(
+        MCP_AUTH_CHALLENGE_GENERATION_METADATA.to_owned(),
+        Value::from(challenge.generation),
+    );
+    auth.metadata.insert(
+        MCP_AUTH_CHALLENGE_ID_METADATA.to_owned(),
+        Value::String(challenge.challenge_id.to_string()),
+    );
+    auth
+}
+
 fn approval_id(invocation_id: ToolCallId) -> String {
     format!("kit-approval:{invocation_id}")
 }
@@ -1019,6 +1301,7 @@ fn map_invoke_error(error: InvokeError) -> ToolExecutionOutcome {
         ),
         InvokeError::Store(error) => internal(format!("tool outcome persistence failed: {error}")),
         InvokeError::InvalidPersistedOutcome => internal("invalid persisted tool outcome"),
+        InvokeError::ArtifactDigestLimit => internal("tool outcome contains too many artifacts"),
         InvokeError::Serialization(error) => {
             internal(format!("tool outcome serialization failed: {error}"))
         }

@@ -17,6 +17,25 @@ use crate::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthChallengeKind {
+    #[default]
+    Provider,
+    Broker,
+    Transport,
+}
+
+impl AuthChallengeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Broker => "broker",
+            Self::Transport => "transport",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitingKind {
@@ -28,6 +47,14 @@ pub enum WaitingKind {
     Auth {
         run_id: RunId,
         scope: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<ToolCallId>,
+        #[serde(default)]
+        challenge_kind: AuthChallengeKind,
+        #[serde(default)]
+        challenge_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        challenge_id: Option<ApprovalId>,
     },
 }
 

@@ -24,7 +24,7 @@ mod deferred_registration_tests {
         },
         capabilities::{
             catalog::{
-                Availability, CatalogAuthority, CatalogEntry, CatalogSchemas, CatalogSearch,
+                Availability, CapabilityKind, CatalogAuthority, CatalogEntry, CatalogSchemas, CatalogSearch,
                 CatalogSnapshot, CatalogSource, CostStats, LatencyStats, MAX_CATALOG_ENTRIES,
                 MAX_CATALOG_PAYLOAD_BYTES, MAX_SUMMARY_BYTES, ReliabilityStats, SideEffects,
                 SourceKind, TrustDomain,
@@ -83,6 +83,18 @@ mod deferred_registration_tests {
         }
 
         fn with_documentation(names: &[&str], projected: bool, documentation_bytes: usize) -> Self {
+            let entries = names
+                .iter()
+                .map(|name| (*name, CapabilityKind::Tool))
+                .collect::<Vec<_>>();
+            Self::with_kinds(&entries, projected, documentation_bytes)
+        }
+
+        fn with_kinds(
+            entries: &[(&str, CapabilityKind)],
+            projected: bool,
+            documentation_bytes: usize,
+        ) -> Self {
             let target = target("model-a");
             let profile = profile(target.clone(), false);
             let principal_id = PrincipalId::generate().unwrap();
@@ -91,9 +103,10 @@ mod deferred_registration_tests {
             let config = config(principal_id, project_id, 100);
             let authenticated = authenticate(principal_id, project_id);
             let catalog = CatalogSnapshot::new(
-                names.iter().map(|name| {
+                entries.iter().map(|(name, kind)| {
                     entry(
                         name,
+                        *kind,
                         name,
                         &target,
                         &profile,
@@ -124,9 +137,9 @@ mod deferred_registration_tests {
                     project_id,
                     &constraints,
                 );
-                names
+                entries
                     .iter()
-                    .map(|name| bind_named(&session, name))
+                    .map(|(name, _)| bind_named(&session, name))
                     .collect()
             };
             Self {
@@ -174,6 +187,7 @@ mod deferred_registration_tests {
     #[derive(Debug, Eq, PartialEq)]
     struct Observation {
         binding_id: BindingId,
+        kind: CapabilityKind,
         capability: CapabilityIdentity,
         schema_digest: Digest,
         authorization_snapshot_digest: Digest,
@@ -199,7 +213,10 @@ mod deferred_registration_tests {
                 .plan(&fixture.supported(), &fixture.session())
                 .unwrap();
             assert_eq!(plan.mode(), RegistrationMode::Deferred);
-            assert_eq!(operations(&plan), ["tools.bind", "tools.inspect", "tools.search"]);
+            assert_eq!(
+                operations(&plan),
+                ["tools.bind", "tools.inspect", "tools.invoke", "tools.search"]
+            );
             let definitions = plan
                 .deferred_tools(&registry, &fixture.session())
                 .unwrap();
@@ -282,6 +299,53 @@ mod deferred_registration_tests {
         expiry_cases(&fixture, &registry);
         registry_generation(&fixture, &registry);
         registry_bounds(&fixture);
+        kind_aware_routes();
+    }
+
+    fn kind_aware_routes() {
+        let fixture = Fixture::with_kinds(
+            &[
+                ("tool-kind", CapabilityKind::Tool),
+                ("resource-kind", CapabilityKind::Resource),
+                ("template-kind", CapabilityKind::ResourceTemplate),
+                ("prompt-kind", CapabilityKind::Prompt),
+            ],
+            true,
+            0,
+        );
+        let registry = fixture.registry();
+        let plan = registry
+            .plan(&fixture.supported(), &fixture.session())
+            .unwrap();
+        let definitions = plan
+            .deferred_tools(&registry, &fixture.session())
+            .unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            fixture
+                .bindings
+                .iter()
+                .find(|binding| binding.id() == definitions[0].binding_id())
+                .unwrap()
+                .pinned_entry()
+                .kind(),
+            CapabilityKind::Tool
+        );
+        for binding in &fixture.bindings {
+            let wrapper = format!(
+                r#"{{"binding_id":"{}","input":{{"count":1,"value":"valid"}}}}"#,
+                binding.id()
+            );
+            let observed = plan
+                .invoke(
+                    &registry,
+                    &fixture.session(),
+                    PortableInvokeCall::new(wrapper.into_bytes()).into(),
+                )
+                .map(|bound| observe(&bound.context()))
+                .unwrap();
+            assert_eq!(observed.kind, binding.pinned_entry().kind());
+        }
     }
 
     pub fn eager_tools() {
@@ -293,14 +357,17 @@ mod deferred_registration_tests {
         let portable = registry
             .plan(&fixture.portable(), &fixture.session())
             .unwrap();
-        assert_eq!(operations(&deferred), ["tools.bind", "tools.inspect", "tools.search"]);
+        assert_eq!(
+            operations(&deferred),
+            ["tools.bind", "tools.inspect", "tools.invoke", "tools.search"]
+        );
         assert_eq!(
             operations(&portable),
             ["tools.bind", "tools.inspect", "tools.invoke", "tools.search"]
         );
         assert_eq!(
             names(&deferred),
-            ["tools_bind", "tools_inspect", "tools_search"]
+            ["tools_bind", "tools_inspect", "tools_invoke", "tools_search"]
         );
         assert_eq!(
             names(&portable),
@@ -400,8 +467,8 @@ mod deferred_registration_tests {
                     registry,
                     &fixture.session(),
                     DirectInvokeCall::new(definition.wire_name(), direct_bytes.as_bytes()).into(),
-                    observe,
                 )
+                .map(|bound| observe(&bound.context()))
                 .unwrap();
             let wrapper = format!(
                 r#"{{"input":{},"binding_id":"{}"}}"#,
@@ -413,8 +480,8 @@ mod deferred_registration_tests {
                     registry,
                     &fixture.session(),
                     PortableInvokeCall::new(wrapper.as_bytes()).into(),
-                    observe,
                 )
+                .map(|bound| observe(&bound.context()))
                 .unwrap();
             assert_eq!(direct, portable);
             assert_eq!(direct.binding_id, binding.id());
@@ -518,7 +585,7 @@ mod deferred_registration_tests {
             registry,
             &fixture.session(),
             PortableInvokeCall::new(b"{}".as_slice()).into(),
-            InvocationError::WrongMode,
+            InvocationError::MalformedGenericWrapper,
         );
         assert_rejected(
             &portable,
@@ -625,29 +692,23 @@ mod deferred_registration_tests {
             "x".repeat(MAX_BOUND_INPUT_BYTES - input_overhead)
         );
         assert_eq!(boundary_input.len(), MAX_BOUND_INPUT_BYTES);
-        let direct_count = Cell::new(0);
         direct
             .invoke(
                 registry,
                 &fixture.session(),
                 DirectInvokeCall::new(wire, boundary_input.as_bytes()).into(),
-                |_| direct_count.set(direct_count.get() + 1),
             )
             .unwrap();
-        assert_eq!(direct_count.get(), 1);
 
         let wrapper = format!(r#"{{"binding_id":"{id}","input":{boundary_input}}}"#);
         assert_eq!(wrapper.len(), MAX_INVOCATION_ARGUMENT_BYTES);
-        let portable_count = Cell::new(0);
         portable
             .invoke(
                 registry,
                 &fixture.session(),
                 PortableInvokeCall::new(wrapper.as_bytes()).into(),
-                |_| portable_count.set(portable_count.get() + 1),
             )
             .unwrap();
-        assert_eq!(portable_count.get(), 1);
 
         let padded_input = format!("{boundary_input} ");
         assert_eq!(padded_input.len(), MAX_BOUND_INPUT_BYTES + 1);
@@ -919,12 +980,8 @@ mod deferred_registration_tests {
         call: RegistrationCall,
         expected: InvocationError,
     ) {
-        let count = Cell::new(0);
-        let result = plan.invoke(registry, current, call, |_| {
-            count.set(count.get() + 1);
-        });
+        let result = plan.invoke(registry, current, call);
         assert_eq!(result.unwrap_err(), expected);
-        assert_eq!(count.get(), 0);
     }
 
     fn observe(context: &InvocationContext<'_>) -> Observation {
@@ -936,6 +993,7 @@ mod deferred_registration_tests {
         assert_eq!(context.retry_safety(), RetrySafety::Idempotent);
         Observation {
             binding_id: context.binding_id(),
+            kind: context.kind(),
             capability: context.capability().clone(),
             schema_digest: context.schema_digest(),
             authorization_snapshot_digest: context.authorization_snapshot_digest(),
@@ -1053,6 +1111,7 @@ mod deferred_registration_tests {
     #[allow(clippy::too_many_arguments)]
     fn entry(
         name: &str,
+        kind: CapabilityKind,
         schema_label: &str,
         target: &ProjectionTarget,
         profile: &ProjectionProfile,
@@ -1081,9 +1140,10 @@ mod deferred_registration_tests {
                 TrustDomain::new("registration-trust").unwrap(),
             )
             .unwrap(),
+            kind,
             CatalogSchemas::new(
                 input,
-                SchemaProjectionSet::new(schema("output", documentation_bytes)),
+                Some(SchemaProjectionSet::new(schema("output", documentation_bytes))),
             ),
             CatalogSearch::new(summary, ["registration", name]).unwrap(),
             SideEffects::new(EffectClass::WorkspaceRead, RetrySafety::Idempotent),

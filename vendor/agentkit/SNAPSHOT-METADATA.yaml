@@ -86,6 +86,9 @@ maintenance:
     evidence: "src/agent/agentkit_patch/manifest.yaml;docs/compatibility/agentkit-hook.md"
   mcp_protocol_revision_pin:
     patch_id: "m006-mcp-protocol-revision-pin"
+    work_package: "M006-W07a"
+    previous_snapshot_sha256: "cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2"
+    patched_snapshot_sha256: "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
     rationale: "explicit MCP revision 2025-11-25 pin and negotiated-revision refusal required by Kit BLK-05"
     files:
       - "crates/agentkit-integration-tests/Cargo.toml"
@@ -99,6 +102,21 @@ maintenance:
       - "examples/openrouter-mcp-tool/Cargo.toml"
     contract: "exact rmcp/http/SSE dependencies; explicit ProtocolVersion 2025-11-25 on every connect; unequal or missing negotiation closes before Ready; finite SSE reconnects; no transparent session reinitialize; unmediated-dev is explicit and Kit production enables only kit-authorized"
     evidence: "src/protocols/mcp/agentkit_patch/manifest.yaml;docs/compatibility/agentkit-mcp-pin.md"
+  mcp_feature_adaptation:
+    patch_id: "m006-mcp-feature-adaptation"
+    work_package: "M006-W07b"
+    classification: "local_only"
+    previous_snapshot_sha256: "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
+    patched_snapshot_sha256: "3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077"
+    files:
+      - path: "crates/agentkit-mcp/src/lib.rs"
+        previous_sha256: "c1de64070578b3c0526f0919d8cc49a420d93ecb1be0c0eb53457eb7ae2e8af3"
+        patched_sha256: "7bf9cc7c627fcaff97d1fcd67031bcb0a9251180b12bf196c2fbfbf0871ff933"
+      - path: "crates/agentkit-mcp/tests/protocol_revision_pin.rs"
+        previous_sha256: "dd12653ee97f08c41ac3f45b414585bd02286b1903524c8c560738fa18fba165"
+        patched_sha256: "6753afa18b530fa73e6feef41390a15bf6c95b6b8d3a38d2ca5ac767a107faf3"
+    contract: "typed resource-template pages; cloned current server capabilities; reconnect atomically replaces rather than merges capability advertisements"
+    evidence: "src/protocols/mcp/agentkit_patch/manifest.yaml;requirements/reports/m006-w07b.md"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -113,8 +131,8 @@ dependency_graph:
 final_snapshot:
   payload_file_count: 357
   manifest: "SNAPSHOT-MANIFEST.sha256"
-  manifest_sha256: "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
-  aggregate_sha256: "0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2"
+  manifest_sha256: "3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077"
+  aggregate_sha256: "3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   attestation_files_excluded_from_payload_digest:
     - "SNAPSHOT-MANIFEST.sha256"

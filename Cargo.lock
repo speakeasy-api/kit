@@ -1465,6 +1465,7 @@ dependencies = [
  "agentkit-provider-openai",
  "agentkit-provider-openrouter",
  "agentkit-tools-core",
+ "aho-corasick",
  "ast-grep-core",
  "ast-grep-language",
  "async-trait",

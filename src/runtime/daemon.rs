@@ -283,6 +283,7 @@ pub struct DaemonConfig {
     pub auth_replay_window: Duration,
     pub auth_replay_capacity: usize,
     pub model_adapter: Option<DaemonModelAdapterConfig>,
+    pub mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
     pub evaluation_anchor: Option<Arc<dyn crate::evaluation::reports::LedgerAnchor>>,
     pub native_container_image: Option<String>,
     pub verification_registry: crate::verify::profiles::VerificationRegistry,
@@ -293,6 +294,7 @@ pub struct DaemonConfig {
     pub native_edit_validation_time: Duration,
     native_config_error: Option<String>,
     model_config_error: Option<String>,
+    mcp_config_error: Option<String>,
     #[cfg(debug_assertions)]
     pub native_check_completions: Vec<crate::executor::check::ConformanceCheck>,
 }
@@ -340,6 +342,10 @@ impl DaemonConfig {
             Ok(config) => (config, None),
             Err(error) => (None, Some(error)),
         };
+        let (mcp_servers, mcp_config_error) = match configured_mcp_servers() {
+            Ok(servers) => (servers, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         let project_root = std::env::var_os("KIT_PROJECT_ROOT")
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
@@ -382,6 +388,7 @@ impl DaemonConfig {
             auth_replay_window: Duration::from_secs(60),
             auth_replay_capacity: 4_096,
             model_adapter,
+            mcp_servers,
             evaluation_anchor: None,
             native_container_image: std::env::var("KIT_NATIVE_CONTAINER_IMAGE").ok(),
             verification_registry,
@@ -392,6 +399,7 @@ impl DaemonConfig {
             native_edit_validation_time,
             native_config_error,
             model_config_error,
+            mcp_config_error,
             #[cfg(debug_assertions)]
             native_check_completions: match std::env::var("KIT_FAKE_CHECKS").as_deref() {
                 Ok("pass") => (0..64)
@@ -561,6 +569,22 @@ fn configured_model_adapter() -> Result<Option<DaemonModelAdapterConfig>, String
         provider,
         BTreeMap::from([(provider, implementation)]),
     )))
+}
+
+fn configured_mcp_servers() -> Result<Vec<crate::protocols::mcp::config::McpServerConfig>, String> {
+    let servers = crate::agent::providers::config::ProviderRegistry::load()
+        .map_err(|error| format!("persistent MCP configuration: {error}"))?
+        .map(|registry| registry.mcp_servers().to_vec())
+        .unwrap_or_default();
+    if servers.is_empty() {
+        return Ok(Vec::new());
+    }
+    for server in &servers {
+        server
+            .validate()
+            .map_err(|error| format!("persistent MCP configuration: {error}"))?;
+    }
+    Ok(servers)
 }
 
 fn configured_environment_model_adapter() -> Option<DaemonModelAdapterConfig> {
@@ -822,6 +846,9 @@ impl Daemon {
         if let Some(error) = &config.model_config_error {
             return Err(DaemonError::Setup(error.clone()));
         }
+        if let Some(error) = &config.mcp_config_error {
+            return Err(DaemonError::Setup(error.clone()));
+        }
         let authority = ControlPlaneAuthority::new();
         secure_state_root(&config.state_root)?;
         let mut lease_runtime =
@@ -946,6 +973,45 @@ impl Daemon {
         }
         let native_semantic_evidence =
             crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default();
+        #[cfg(not(windows))]
+        let mcp_stdio_profiles = if config.mcp_servers.iter().any(|server| {
+            matches!(
+                server.transport,
+                crate::protocols::mcp::config::McpTransportConfig::Stdio { .. }
+            )
+        }) {
+            let build = state_root.join("mcp-build");
+            let temp = state_root.join("mcp-temp");
+            fs::create_dir_all(&build).map_err(DaemonError::Io)?;
+            fs::create_dir_all(&temp).map_err(DaemonError::Io)?;
+            crate::protocols::mcp::transport::ProductionStdioProfiles::new(
+                &config.mcp_servers,
+                &config.project_root,
+                &build,
+                &temp,
+                exec_manager.clone(),
+                identity.principal_id,
+                identity.project_id,
+            )
+            .map_err(DaemonError::Setup)?
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let mcp_stdio_profiles: Option<
+            Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>,
+        > = if config.mcp_servers.iter().any(|server| {
+            matches!(
+                server.transport,
+                crate::protocols::mcp::config::McpTransportConfig::Stdio { .. }
+            )
+        }) {
+            return Err(DaemonError::Setup(
+                "MCP stdio profiles are unavailable on Windows".to_owned(),
+            ));
+        } else {
+            None
+        };
         let mut executor_config = RunExecutorConfig::new(
             &database,
             Arc::clone(&artifact_store),
@@ -961,7 +1027,11 @@ impl Daemon {
             config.native_feedback_limits.clone(),
         )
         .with_native_semantic_evidence(native_semantic_evidence.clone())
-        .with_native_edit_validation_time(config.native_edit_validation_time);
+        .with_native_edit_validation_time(config.native_edit_validation_time)
+        .with_mcp_servers(config.mcp_servers);
+        if let Some(profiles) = mcp_stdio_profiles {
+            executor_config = executor_config.with_mcp_stdio_profiles(profiles);
+        }
         if let Some(descriptor) = &config.native_formatter_descriptor {
             executor_config = executor_config
                 .with_native_formatter(descriptor.clone(), config.native_formatter_required);

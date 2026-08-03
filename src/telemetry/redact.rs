@@ -1,5 +1,11 @@
 use std::{collections::BTreeMap, fmt};
 
+use aho_corasick::{
+    AhoCorasick, AhoCorasickBuilder, Anchored, MatchKind,
+    automaton::{Automaton, StateID},
+    nfa::contiguous::NFA,
+};
+
 use crate::domain::{
     lifecycle::ProcessClaim,
     secret::{DataClass, REDACTED, SecretLease, classify_field, classify_header},
@@ -93,7 +99,10 @@ impl<'a> CaptureRedactor<'a> {
 
     pub fn redact_text(&self, _boundary: CaptureBoundary, value: &str) -> String {
         let patterns = SecretPatterns::new(self.secrets);
-        redact_patterns(value, &patterns.values)
+        if patterns.truncated {
+            return REDACTED.to_owned();
+        }
+        redact_patterns(value, &patterns)
     }
 
     pub fn sanitize(&self, boundary: CaptureBoundary, value: &[u8]) -> SanitizedCapture {
@@ -115,11 +124,7 @@ impl<'a> CaptureRedactor<'a> {
     }
 
     pub fn scanner(&self) -> SensitiveDataScanner {
-        SensitiveDataScanner {
-            patterns: SecretPatterns::new(self.secrets),
-            pending: Vec::new(),
-            found: false,
-        }
+        SensitiveDataScanner::new(SecretPatterns::new(self.secrets))
     }
 
     pub fn redact_field(&self, boundary: CaptureBoundary, name: &str, value: &str) -> String {
@@ -202,42 +207,141 @@ impl<'a> CaptureRedactor<'a> {
 
 pub struct SensitiveDataScanner {
     patterns: SecretPatterns,
-    pending: Vec<u8>,
+    state: Option<StateID>,
+    decoded_states: Vec<StateID>,
+    decoders: [PercentDecoder; 4],
     found: bool,
 }
 
 impl SensitiveDataScanner {
+    fn new(patterns: SecretPatterns) -> Self {
+        let state = patterns
+            .stream_matcher
+            .as_ref()
+            .and_then(|matcher| matcher.start_state(Anchored::No).ok());
+        let decoded_states = patterns
+            .raw_stream_matcher
+            .as_ref()
+            .and_then(|matcher| matcher.start_state(Anchored::No).ok())
+            .map(|state| vec![state; 4])
+            .unwrap_or_default();
+        Self {
+            found: patterns.truncated
+                || (patterns.stream_matcher.is_some() && state.is_none())
+                || (patterns.raw_stream_matcher.is_some() && decoded_states.is_empty()),
+            patterns,
+            state,
+            decoded_states,
+            decoders: std::array::from_fn(|_| PercentDecoder::default()),
+        }
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
-        if self.found || self.patterns.values.is_empty() {
+        if self.found {
             return;
         }
-        self.pending.extend_from_slice(bytes);
-        self.found = self.patterns.values.iter().any(|pattern| {
-            self.pending
-                .windows(pattern.len())
-                .any(|window| window == pattern)
-        });
-        let retain = self
-            .patterns
-            .values
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .saturating_sub(1);
-        if self.pending.len() > retain {
-            let drain = self.pending.len() - retain;
-            self.pending[..drain].fill(0);
-            self.pending.drain(..drain);
+        let Some(mut state) = self.state else {
+            return;
+        };
+        for &byte in bytes {
+            let matched = {
+                let Some(matcher) = &self.patterns.stream_matcher else {
+                    return;
+                };
+                state = matcher.next_state(Anchored::No, state, byte);
+                matcher.is_match(state)
+            };
+            if matched {
+                self.found = true;
+                break;
+            }
+            self.scan_decoded_byte(0, byte);
+            if self.found {
+                break;
+            }
         }
+        self.state = Some(state);
     }
 
     pub const fn found(&self) -> bool {
         self.found
     }
+
+    fn scan_decoded_byte(&mut self, layer: usize, byte: u8) {
+        if layer == self.decoders.len() || self.decoded_states.is_empty() {
+            return;
+        }
+        let mut output = [0_u8; 3];
+        let count = self.decoders[layer].push(byte, &mut output);
+        for &decoded in &output[..count] {
+            let (state, matched) = {
+                let matcher = self
+                    .patterns
+                    .raw_stream_matcher
+                    .as_ref()
+                    .expect("decoded states require a matcher");
+                let state = matcher.next_state(Anchored::No, self.decoded_states[layer], decoded);
+                (state, matcher.is_match(state))
+            };
+            self.decoded_states[layer] = state;
+            if matched {
+                self.found = true;
+                return;
+            }
+            self.scan_decoded_byte(layer + 1, decoded);
+            if self.found {
+                return;
+            }
+        }
+    }
 }
 
-impl Drop for SensitiveDataScanner {
+#[derive(Default)]
+struct PercentDecoder {
+    pending: [u8; 2],
+    len: u8,
+}
+
+impl PercentDecoder {
+    fn push(&mut self, byte: u8, output: &mut [u8; 3]) -> usize {
+        match self.len {
+            0 if byte == b'%' => {
+                self.len = 1;
+                0
+            }
+            0 => {
+                output[0] = byte;
+                1
+            }
+            1 if hex_value(byte).is_some() => {
+                self.pending[0] = byte;
+                self.len = 2;
+                0
+            }
+            1 => {
+                self.len = 0;
+                output[0] = b'%';
+                output[1] = byte;
+                2
+            }
+            2 => {
+                self.len = 0;
+                if let (Some(high), Some(low)) = (hex_value(self.pending[0]), hex_value(byte)) {
+                    output[0] = high << 4 | low;
+                    1
+                } else {
+                    output[0] = b'%';
+                    output[1] = self.pending[0];
+                    output[2] = byte;
+                    3
+                }
+            }
+            _ => unreachable!("percent decoder state is bounded"),
+        }
+    }
+}
+
+impl Drop for PercentDecoder {
     fn drop(&mut self) {
         self.pending.fill(0);
     }
@@ -377,7 +481,14 @@ impl SanitizedCapture {
         }
         Some(Self {
             boundary: self.boundary,
-            patterns: SecretPatterns { values: Vec::new() },
+            patterns: SecretPatterns {
+                values: Vec::new(),
+                raw: Vec::new(),
+                matcher: None,
+                stream_matcher: None,
+                raw_stream_matcher: None,
+                truncated: false,
+            },
             pending: Vec::new(),
             sanitized: std::mem::take(&mut self.sanitized),
             provenance: self.provenance,
@@ -440,30 +551,131 @@ impl Drop for SanitizedCapture {
 
 struct SecretPatterns {
     values: Vec<Vec<u8>>,
+    raw: Vec<Vec<u8>>,
+    matcher: Option<AhoCorasick>,
+    stream_matcher: Option<NFA>,
+    raw_stream_matcher: Option<NFA>,
+    truncated: bool,
 }
 
 impl SecretPatterns {
     fn new(secrets: &[SecretLease]) -> Self {
+        const MAX_PATTERNS: usize = 4096;
+        const MAX_PATTERN_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_RAW_BYTES: usize = 256 * 1024;
+        const ENCODING_PASSES: usize = 3;
         let mut values = Vec::new();
-        for secret in secrets {
-            let source = secret.expose();
-            if source.is_empty() {
-                continue;
+        let mut raw = Vec::new();
+        let mut total_bytes = 0_usize;
+        let mut raw_bytes = 0_usize;
+        let mut truncated = false;
+        {
+            let mut add = |value: Vec<u8>| {
+                if value.is_empty() || values.iter().any(|existing| existing == &value) {
+                    return true;
+                }
+                let Some(next_bytes) = total_bytes.checked_add(value.len()) else {
+                    truncated = true;
+                    return false;
+                };
+                if values.len() == MAX_PATTERNS || next_bytes > MAX_PATTERN_BYTES {
+                    truncated = true;
+                    return false;
+                }
+                total_bytes = next_bytes;
+                values.push(value);
+                true
+            };
+            for secret in secrets {
+                let source = secret.expose();
+                if source.is_empty() {
+                    continue;
+                }
+                let Some(next_raw_bytes) = raw_bytes.checked_add(source.len()) else {
+                    truncated = true;
+                    break;
+                };
+                if raw.len() == MAX_PATTERNS || next_raw_bytes > MAX_RAW_BYTES {
+                    truncated = true;
+                    break;
+                }
+                raw_bytes = next_raw_bytes;
+                raw.push(source.to_vec());
+                let mut frontier = vec![source.to_vec()];
+                for _ in 0..ENCODING_PASSES {
+                    let mut next = Vec::new();
+                    for item in frontier {
+                        if !add(item.clone()) {
+                            break;
+                        }
+                        for encoded in [
+                            percent_encode(&item, false, true),
+                            percent_encode(&item, true, true),
+                            json_byte_escape(&item, true),
+                            json_byte_escape(&item, false),
+                            base64(&item, false, true),
+                            base64(&item, false, false),
+                            base64(&item, true, true),
+                            base64(&item, true, false),
+                        ] {
+                            if add(encoded.clone()) {
+                                next.push(encoded);
+                            }
+                        }
+                    }
+                    frontier = next;
+                    if frontier.is_empty() {
+                        break;
+                    }
+                }
             }
-            values.push(source.to_vec());
-            values.push(percent_encode(source, false, true));
-            values.push(percent_encode(source, false, false));
-            values.push(percent_encode(source, true, true));
-            values.push(percent_encode(source, true, false));
-            values.push(base64(source, false, true));
-            values.push(base64(source, false, false));
-            values.push(base64(source, true, true));
-            values.push(base64(source, true, false));
         }
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
         values.dedup();
-        Self { values }
+        let matcher = (!truncated && !values.is_empty())
+            .then(|| build_matcher(&values))
+            .transpose()
+            .unwrap_or_else(|_| {
+                truncated = true;
+                None
+            });
+        let stream_matcher = (!truncated && !values.is_empty())
+            .then(|| build_stream_matcher(&values))
+            .transpose()
+            .unwrap_or_else(|_| {
+                truncated = true;
+                None
+            });
+        let raw_stream_matcher = (!truncated && !raw.is_empty())
+            .then(|| build_stream_matcher(&raw))
+            .transpose()
+            .unwrap_or_else(|_| {
+                truncated = true;
+                None
+            });
+        Self {
+            values,
+            raw,
+            matcher,
+            stream_matcher,
+            raw_stream_matcher,
+            truncated,
+        }
     }
+}
+
+fn build_matcher(patterns: &[Vec<u8>]) -> Result<AhoCorasick, aho_corasick::BuildError> {
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(patterns)
+}
+
+fn build_stream_matcher(patterns: &[Vec<u8>]) -> Result<NFA, aho_corasick::BuildError> {
+    NFA::builder()
+        .ascii_case_insensitive(true)
+        .match_kind(MatchKind::Standard)
+        .build(patterns)
 }
 
 impl Drop for SecretPatterns {
@@ -472,27 +684,29 @@ impl Drop for SecretPatterns {
             value.fill(0);
             std::hint::black_box(value);
         }
+        for value in &mut self.raw {
+            value.fill(0);
+            std::hint::black_box(value);
+        }
     }
 }
 
-fn redact_patterns(value: &str, patterns: &[Vec<u8>]) -> String {
+fn redact_patterns(value: &str, patterns: &SecretPatterns) -> String {
+    if patterns.truncated {
+        return REDACTED.to_owned();
+    }
+    let Some(matcher) = &patterns.matcher else {
+        return value.to_owned();
+    };
     let input = value.as_bytes();
     let mut output = Vec::with_capacity(input.len());
-    let mut offset = 0;
-    while offset < input.len() {
-        if let Some(length) = patterns
-            .iter()
-            .filter(|pattern| input[offset..].starts_with(pattern))
-            .map(Vec::len)
-            .max()
-        {
-            output.extend_from_slice(REDACTED.as_bytes());
-            offset += length;
-        } else {
-            output.push(input[offset]);
-            offset += 1;
-        }
+    let mut offset = 0_usize;
+    for matched in matcher.find_iter(input) {
+        output.extend_from_slice(&input[offset..matched.start()]);
+        output.extend_from_slice(REDACTED.as_bytes());
+        offset = matched.end();
     }
+    output.extend_from_slice(&input[offset..]);
     String::from_utf8(output).expect("redacting UTF-8 preserves UTF-8")
 }
 
@@ -588,6 +802,26 @@ fn percent_encode(source: &[u8], all: bool, uppercase: bool) -> Vec<u8> {
     output
 }
 
+fn json_byte_escape(source: &[u8], uppercase: bool) -> Vec<u8> {
+    let hex = if uppercase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut output = Vec::with_capacity(source.len().saturating_mul(6));
+    for &byte in source {
+        output.extend_from_slice(&[
+            b'\\',
+            b'u',
+            b'0',
+            b'0',
+            hex[(byte >> 4) as usize],
+            hex[(byte & 15) as usize],
+        ]);
+    }
+    output
+}
+
 fn base64(source: &[u8], url_safe: bool, padded: bool) -> Vec<u8> {
     let alphabet = if url_safe {
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -652,6 +886,42 @@ mod scanner_tests {
                 scanner.push(&[byte]);
             }
             assert!(scanner.found());
+        }
+    }
+
+    #[test]
+    fn scanner_finds_mixed_case_nested_percent_and_json_encodings() {
+        let secret = SecretLease::new(b"credential-canary".to_vec());
+        let redactor = CaptureRedactor::new(std::slice::from_ref(&secret));
+        for encoded in [
+            b"%2563%2572%2565%2564%2565%256E%2574%2569%2561%256c%252D%2563%2561%256E%2561%2572%2579".as_slice(),
+            b"\\u0063\\u0072\\u0065\\u0064\\u0065\\u006e\\u0074\\u0069\\u0061\\u006c\\u002d\\u0063\\u0061\\u006e\\u0061\\u0072\\u0079".as_slice(),
+        ] {
+            let mut scanner = redactor.scanner();
+            for chunk in encoded.chunks(1) {
+                scanner.push(chunk);
+            }
+            assert!(scanner.found(), "missed {}", String::from_utf8_lossy(encoded));
+        }
+    }
+
+    #[test]
+    fn scanner_finds_partial_mixed_and_four_level_percent_encodings() {
+        let secret = SecretLease::new(b"credential-canary".to_vec());
+        let redactor = CaptureRedactor::new(std::slice::from_ref(&secret));
+        for encoded in [
+            b"cred%65ntial%2dcanary".as_slice(),
+            b"%25252563redential-canary".as_slice(),
+        ] {
+            let mut scanner = redactor.scanner();
+            for chunk in encoded.chunks(1) {
+                scanner.push(chunk);
+            }
+            assert!(
+                scanner.found(),
+                "missed {}",
+                String::from_utf8_lossy(encoded)
+            );
         }
     }
 }

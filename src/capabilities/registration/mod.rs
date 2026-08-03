@@ -13,7 +13,7 @@ use serde::{
 use serde_json::{Map, Number, Value, json};
 
 use crate::capabilities::{
-    catalog::{MAX_CATALOG_ENTRIES, MAX_CATALOG_PAYLOAD_BYTES},
+    catalog::{CapabilityKind, MAX_CATALOG_ENTRIES, MAX_CATALOG_PAYLOAD_BYTES},
     discovery::{BindingId, CapabilityBinding, DiscoverySession},
     kernel::{
         grant::EffectClass,
@@ -248,13 +248,12 @@ impl RegistrationPlan {
         Ok(&self.deferred)
     }
 
-    pub fn invoke<R>(
+    pub fn invoke(
         &self,
         registry: &BindingRegistry,
         current: &DiscoverySession<'_>,
         call: RegistrationCall,
-        dispatch: impl FnOnce(&InvocationContext<'_>) -> R,
-    ) -> Result<R, InvocationError> {
+    ) -> Result<BoundRegistrationCall, InvocationError> {
         if self.registry_digest != registry.digest {
             return Err(InvocationError::RegistryMismatch);
         }
@@ -268,9 +267,7 @@ impl RegistrationPlan {
                     .ok_or(InvocationError::UnknownWireName)?;
                 NormalizedCall::direct(binding_id, &call.bytes)?
             }
-            (RegistrationMode::PortableGeneric, RegistrationCall::Portable(call)) => {
-                NormalizedCall::portable(&call.bytes)?
-            }
+            (_, RegistrationCall::Portable(call)) => NormalizedCall::portable(&call.bytes)?,
             _ => return Err(InvocationError::WrongMode),
         };
         let binding = registry
@@ -291,12 +288,11 @@ impl RegistrationPlan {
             SchemaValidation::Invalid => return Err(InvocationError::SchemaInvalid),
             SchemaValidation::Unsupported => return Err(InvocationError::SchemaUnsupported),
         }
-        let context = InvocationContext {
-            binding,
-            input: &normalized.input,
-            input_bytes: &normalized.bytes,
-        };
-        Ok(dispatch(&context))
+        Ok(BoundRegistrationCall {
+            binding: Arc::clone(binding),
+            input: normalized.input,
+            input_bytes: normalized.bytes,
+        })
     }
 }
 
@@ -387,17 +383,20 @@ impl BindingRegistry {
             .deferred_evidence()
             .map(|(declaration, _)| declaration);
         let deferred = declaration.is_some_and(|declaration| {
-            self.bindings.values().all(|binding| {
-                binding
-                    .pinned_entry()
-                    .schemas()
-                    .input()
-                    .projection(declaration.target())
-                    .is_some_and(|projection| {
-                        projection.profile_digest() == declaration.profile_digest()
-                            && projection.digest() == binding.input_schema_digest()
-                    })
-            })
+            self.bindings
+                .values()
+                .filter(|binding| binding.pinned_entry().kind() == CapabilityKind::Tool)
+                .all(|binding| {
+                    binding
+                        .pinned_entry()
+                        .schemas()
+                        .input()
+                        .projection(declaration.target())
+                        .is_some_and(|projection| {
+                            projection.profile_digest() == declaration.profile_digest()
+                                && projection.digest() == binding.input_schema_digest()
+                        })
+                })
         });
         let mode = if deferred {
             RegistrationMode::Deferred
@@ -408,9 +407,6 @@ impl BindingRegistry {
             .validated_support()
             .tools
             .iter()
-            .filter(|tool| {
-                mode == RegistrationMode::PortableGeneric || operation(tool) != "tools.invoke"
-            })
             .cloned()
             .collect::<Vec<_>>();
 
@@ -422,6 +418,9 @@ impl BindingRegistry {
                 .collect::<BTreeSet<_>>();
             definitions.reserve(self.bindings.len());
             for binding in self.bindings.values() {
+                if binding.pinned_entry().kind() != CapabilityKind::Tool {
+                    continue;
+                }
                 let projection = binding
                     .pinned_entry()
                     .schemas()
@@ -506,6 +505,53 @@ pub enum RegistrationCall {
     Portable(PortableInvokeCall),
 }
 
+#[derive(Clone, Debug)]
+pub struct BoundRegistrationCall {
+    binding: Arc<CapabilityBinding>,
+    input: Value,
+    input_bytes: Vec<u8>,
+}
+
+impl BoundRegistrationCall {
+    pub(crate) fn direct(
+        binding: Arc<CapabilityBinding>,
+        bytes: &[u8],
+    ) -> Result<Self, InvocationError> {
+        let normalized = NormalizedCall::direct(binding.id(), bytes)?;
+        match binding
+            .pinned_entry()
+            .schemas()
+            .input()
+            .schema()
+            .validate(&normalized.input)
+        {
+            SchemaValidation::Valid => Ok(Self {
+                binding,
+                input: normalized.input,
+                input_bytes: normalized.bytes,
+            }),
+            SchemaValidation::Invalid => Err(InvocationError::SchemaInvalid),
+            SchemaValidation::Unsupported => Err(InvocationError::SchemaUnsupported),
+        }
+    }
+
+    pub fn context(&self) -> InvocationContext<'_> {
+        InvocationContext {
+            binding: &self.binding,
+            input: &self.input,
+            input_bytes: &self.input_bytes,
+        }
+    }
+
+    pub fn binding(&self) -> &CapabilityBinding {
+        &self.binding
+    }
+
+    pub fn input_bytes(&self) -> &[u8] {
+        &self.input_bytes
+    }
+}
+
 impl From<DirectInvokeCall> for RegistrationCall {
     fn from(value: DirectInvokeCall) -> Self {
         Self::Direct(value)
@@ -525,13 +571,21 @@ pub struct InvocationContext<'a> {
     input_bytes: &'a [u8],
 }
 
-impl InvocationContext<'_> {
+impl<'a> InvocationContext<'a> {
     pub const fn binding_id(&self) -> BindingId {
         self.binding.id()
     }
 
     pub fn capability(&self) -> &CapabilityIdentity {
         self.binding.pinned_entry().identity()
+    }
+
+    pub const fn binding(&self) -> &'a CapabilityBinding {
+        self.binding
+    }
+
+    pub fn kind(&self) -> CapabilityKind {
+        self.binding.pinned_entry().kind()
     }
 
     pub const fn schema_digest(&self) -> Digest {
@@ -546,6 +600,14 @@ impl InvocationContext<'_> {
         self.binding.pinned_entry().schemas().input().schema()
     }
 
+    pub fn output_schema(&self) -> Option<&NormalizedSchema> {
+        self.binding
+            .pinned_entry()
+            .schemas()
+            .output()
+            .map(SchemaProjectionSet::schema)
+    }
+
     pub fn effect(&self) -> EffectClass {
         self.binding.pinned_entry().side_effects().effect()
     }
@@ -554,11 +616,11 @@ impl InvocationContext<'_> {
         self.binding.pinned_entry().side_effects().retry_safety()
     }
 
-    pub const fn input(&self) -> &Value {
+    pub const fn input(&self) -> &'a Value {
         self.input
     }
 
-    pub const fn input_bytes(&self) -> &[u8] {
+    pub const fn input_bytes(&self) -> &'a [u8] {
         self.input_bytes
     }
 }
@@ -903,7 +965,7 @@ fn operation(tool: &ToolSpec) -> &str {
         .expect("host tool operation metadata is a string")
 }
 
-fn direct_wire_name(binding_id: BindingId) -> String {
+pub(crate) fn direct_wire_name(binding_id: BindingId) -> String {
     let digest = binding_id.to_string();
     format!("kit_{}", &digest[digest.len() - 60..])
 }

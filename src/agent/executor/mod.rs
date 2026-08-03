@@ -136,6 +136,9 @@ pub struct RunExecutorConfig {
     pub model_reservation: Spend,
     pub cancellation_coordinator: Arc<dyn ExecutorCancellationCoordinator>,
     pub telemetry: Option<Arc<crate::runtime::telemetry::TelemetryRuntime<'static>>>,
+    mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
+    mcp_stdio_profiles:
+        Option<Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>>,
     project_root: PathBuf,
     workspace_scratch: PathBuf,
     edit_workspace: Option<PathBuf>,
@@ -183,6 +186,8 @@ impl RunExecutorConfig {
             claim_renewal_interval: Duration::from_secs(1),
             model_reservation: Spend::new(0, 1, 1, 0, 0),
             telemetry: None,
+            mcp_servers: Vec::new(),
+            mcp_stdio_profiles: None,
             project_root,
             workspace_scratch,
             edit_workspace: None,
@@ -204,6 +209,22 @@ impl RunExecutorConfig {
 
     pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.project_root = root.into();
+        self
+    }
+
+    pub fn with_mcp_servers(
+        mut self,
+        servers: impl IntoIterator<Item = crate::protocols::mcp::config::McpServerConfig>,
+    ) -> Self {
+        self.mcp_servers = servers.into_iter().collect();
+        self
+    }
+
+    pub fn with_mcp_stdio_profiles(
+        mut self,
+        profiles: Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>,
+    ) -> Self {
+        self.mcp_stdio_profiles = Some(profiles);
         self
     }
 
@@ -323,6 +344,21 @@ impl RunExecutor {
                 "claim renewal interval must not exceed one third of the lease duration",
             ));
         }
+        if config.mcp_stdio_profiles.is_none()
+            && let Some(profile) =
+                config
+                    .mcp_servers
+                    .iter()
+                    .find_map(|server| match &server.transport {
+                        crate::protocols::mcp::config::McpTransportConfig::Stdio {
+                            owned_process_profile,
+                            ..
+                        } => Some(owned_process_profile.clone()),
+                        crate::protocols::mcp::config::McpTransportConfig::Http { .. } => None,
+                    })
+        {
+            return Err(ExecutorError::McpStdioServiceUnavailable { profile });
+        }
         SqliteStreamCommitFactory::open(&config.database, StreamLimits::default())?;
         let (wake, wake_rx) = mpsc::channel(config.queue_capacity);
         let (stop, stop_rx) = watch::channel(false);
@@ -364,9 +400,10 @@ impl RunExecutor {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        if let Some(task) = task {
-            task.await
-                .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+        if let Some(task) = task
+            && let Err(error) = task.await
+        {
+            return Err(ExecutorError::Worker(format!("worker join: {error}")));
         }
         Ok(())
     }
@@ -518,6 +555,97 @@ enum AttemptExit {
     Waiting,
 }
 
+struct AttemptMcpRuntime {
+    runtime: Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
+    shutdown: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
+    store: SharedWorkerStore,
+}
+
+impl AttemptMcpRuntime {
+    fn start(
+        runtime: Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
+        config: &RunExecutorConfig,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, ExecutorError> {
+        let (shutdown, _) = watch::channel(false);
+        let mut tasks = Vec::new();
+        for (server, generation) in runtime
+            .refresh_registrations()
+            .map_err(|error| ExecutorError::Worker(error.to_string()))?
+        {
+            let mut store = append_store(config)?;
+            let runtime = Arc::clone(&runtime);
+            let mut stopped = shutdown.subscribe();
+            let cancellation = Arc::clone(&cancellation);
+            tasks.push(tokio::spawn(async move {
+                let result = runtime
+                    .drive_refresh_owned(
+                        &server,
+                        generation,
+                        crate::protocols::mcp::features::RefreshLimits::default(),
+                        &mut store,
+                        &mut stopped,
+                    )
+                    .await;
+                if *stopped.borrow() {
+                    return;
+                }
+                if result.is_ok()
+                    && !matches!(runtime.refresh_is_current(&server, generation), Ok(true))
+                {
+                    return;
+                }
+                cancellation.store(true, Ordering::Release);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    runtime.retire_and_close_owned(&server, generation, &mut store),
+                )
+                .await;
+                let _ = result;
+            }));
+        }
+        Ok(Self {
+            runtime,
+            shutdown,
+            tasks,
+            store: Arc::clone(&config.store),
+        })
+    }
+
+    async fn shutdown(mut self) -> Result<(), ExecutorError> {
+        let _ = self.shutdown.send(true);
+        for mut task in self.tasks.drain(..) {
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        let mut append = self
+            .store
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .worker_append_store()
+            .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+        tokio::time::timeout(Duration::from_secs(5), self.runtime.shutdown(&mut append))
+            .await
+            .map_err(|_| ExecutorError::Worker("MCP runtime cleanup timed out".to_owned()))?
+            .map_err(|error| ExecutorError::Worker(error.to_string()))
+    }
+}
+
+impl Drop for AttemptMcpRuntime {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 struct ClaimHeartbeat {
     stop: Arc<(Mutex<bool>, Condvar)>,
     failure: watch::Receiver<Option<String>>,
@@ -637,6 +765,18 @@ async fn while_claimed<T>(
     }
 }
 
+async fn wait_for_run_cancellation(config: &RunExecutorConfig, run_id: RunId) -> ExecutorError {
+    loop {
+        match load_job(config, run_id) {
+            Ok(job) if job.run.state == RunState::Cancelling => {
+                return ExecutorError::Worker("run cancelled during MCP bootstrap".to_owned());
+            }
+            Err(error) => return error,
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+}
+
 async fn execute_attempt(
     config: &RunExecutorConfig,
     mut job: WorkerRun,
@@ -661,8 +801,21 @@ async fn execute_attempt(
         );
     }
     config.model_adapter.select(snapshot.effective().provider)?;
-    let (tool, native_revision) = tool_adapter(config, &job, &snapshot, true)?;
-    let prepared_prompt = prepare_prompt(config, &job, &snapshot, native_revision.as_deref())?;
+    let authority_revision = if config.mcp_servers.is_empty() {
+        None
+    } else {
+        let root = std::fs::canonicalize(&config.project_root).map_err(|error| {
+            ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
+        })?;
+        Some(
+            crate::workspace::revision::ManagedWorkspace::open(root)
+                .and_then(|workspace| workspace.current_revision())
+                .map_err(|error| ExecutorError::Worker(error.to_string()))?
+                .id()
+                .to_string(),
+        )
+    };
+    let prepared_prompt = prepare_prompt(config, &job, &snapshot, authority_revision.as_deref())?;
     config.scheduler.register_run_with_snapshot(
         job.run.id,
         job.principal_id,
@@ -753,6 +906,129 @@ async fn execute_attempt(
         return Ok(AttemptExit::Waiting);
     }
 
+    let live_cancellation = Arc::new(AtomicBool::new(false));
+    let budget = durable_tool_budget(config, &snapshot)?;
+    let mut mcp_runtime = None;
+    let mut mcp_attempt_runtime = None;
+    if !config.mcp_servers.is_empty() {
+        let authenticated = AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
+            job.principal_id,
+            job.project_id,
+            snapshot.effective_authority().iter().copied(),
+        ));
+        let workspace = workspace_id(job.attempt.id)?;
+        let mut store = append_store(config)?;
+        let mut resolved_auth = BTreeMap::new();
+        let mcp_stdio_secrets = config
+            .model_adapter
+            .secret_leases(snapshot.effective().provider);
+        for server in &config.mcp_servers {
+            if let Some(resolved) = crate::agent::driver::restart::resolved_mcp_bootstrap_auth(
+                &store, job.run.id, &server.id,
+            )
+            .map_err(ExecutorError::Store)?
+            {
+                resolved_auth.insert(server.id.clone(), resolved);
+            }
+        }
+        let bootstrap_context = crate::protocols::mcp::config::McpBootstrapContext {
+            authenticated: &authenticated,
+            config: &snapshot,
+            workspace_id: workspace,
+            workspace_revision: authority_revision.as_deref().ok_or_else(|| {
+                ExecutorError::Worker("MCP workspace revision is unavailable".to_owned())
+            })?,
+            attempt: job.attempt.owner,
+            claim: job.claim,
+            current_fence: Arc::new(AtomicU64::new(job.attempt.owner.fencing_token.get())),
+            cancellation: Arc::clone(&live_cancellation),
+            budget: Arc::clone(&budget),
+            occurred_at: &job.occurred_at,
+            resolved_auth: &resolved_auth,
+            stdio_profiles: config.mcp_stdio_profiles.as_deref(),
+            stdio_secrets: &mcp_stdio_secrets,
+        };
+        let (bootstrap, claim_error) = {
+            let bootstrap = crate::protocols::mcp::config::bootstrap(
+                &config.mcp_servers,
+                &bootstrap_context,
+                &mut store,
+            );
+            tokio::pin!(bootstrap);
+            tokio::select! {
+                biased;
+                error = heartbeat.failed() => {
+                    live_cancellation.store(true, Ordering::Release);
+                    (bootstrap.await, Some(error))
+                }
+                error = wait_for_run_cancellation(config, job.run.id) => {
+                    live_cancellation.store(true, Ordering::Release);
+                    (bootstrap.await, Some(error))
+                }
+                result = &mut bootstrap => (result, None),
+            }
+        };
+        if let Some(error) = claim_error {
+            match bootstrap {
+                Ok(crate::protocols::mcp::config::McpBootstrapOutcome::Ready(runtime)) => {
+                    if let Err(cleanup) = runtime.shutdown(&mut store).await {
+                        return Err(ExecutorError::Worker(format!(
+                            "{error}; MCP bootstrap cleanup: {cleanup}"
+                        )));
+                    }
+                }
+                Ok(crate::protocols::mcp::config::McpBootstrapOutcome::AuthRequired(_)) => {}
+                Err(cleanup) => {
+                    return Err(ExecutorError::Worker(format!(
+                        "{error}; MCP bootstrap cleanup: {cleanup}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
+        let bootstrap = bootstrap.map_err(ExecutorError::McpBootstrap)?;
+        match bootstrap {
+            crate::protocols::mcp::config::McpBootstrapOutcome::Ready(runtime) => {
+                let owned = AttemptMcpRuntime::start(
+                    Arc::clone(&runtime),
+                    config,
+                    Arc::clone(&live_cancellation),
+                )?;
+                mcp_runtime = Some(runtime);
+                mcp_attempt_runtime = Some(owned);
+            }
+            crate::protocols::mcp::config::McpBootstrapOutcome::AuthRequired(challenge) => {
+                let record = crate::agent::providers::interrupt::challenge_auth_waiting_record(
+                    &job.attempt,
+                    job.run.id,
+                    &challenge,
+                    plan.snapshot.clone(),
+                )?;
+                let LoopRecord::Waiting(waiting) = &record else {
+                    unreachable!("auth waiting helper always returns a waiting record")
+                };
+                let waiting = waiting.clone();
+                append_hashed_record(config, &job, "waiting-mcp-bootstrap-auth", record)?;
+                heartbeat.stop()?;
+                ensure_waiting(config, job.run.id, &waiting)?;
+                append_store(config)?
+                    .quiesce_driver_claim(job.claim)
+                    .map_err(ExecutorError::Store)?;
+                return Ok(AttemptExit::Waiting);
+            }
+        }
+    }
+    let attempt_result = async {
+    let (tool, native_revision) = tool_adapter(
+        config,
+        &job,
+        &snapshot,
+        true,
+        mcp_runtime.as_ref(),
+        Arc::clone(&live_cancellation),
+        budget,
+    )?;
+
     let transcript = TranscriptCapture::new(&plan.snapshot)?;
     if snapshot.effective().grammar_edit.enabled && config.edit_workspace.is_none() {
         heartbeat.stop()?;
@@ -829,11 +1105,11 @@ async fn execute_attempt(
     };
 
     enum DriverExit {
-        Completed(TurnResult),
+        Completed(Box<TurnResult>),
         Cancelled,
         Failed(&'static str),
         Waiting {
-            waiting: crate::agent::driver::waiting::WaitingState,
+            waiting: Box<crate::agent::driver::waiting::WaitingState>,
             target: RunState,
         },
     }
@@ -854,6 +1130,12 @@ async fn execute_attempt(
                         error = heartbeat.failed() => return Err(error),
                         result = &mut poll => break Tick::Step(Box::new(result)),
                         _ = tokio::time::sleep(config.poll_interval) => {
+                            if live_cancellation.load(Ordering::Acquire) {
+                                let _ = config
+                                    .cancellation_coordinator
+                                    .cancel_attempt(job.attempt.owner);
+                                break Tick::CheckCancellation;
+                            }
                             if load_job(config, job.run.id)?.run.state == RunState::Cancelling {
                                 break Tick::CheckCancellation;
                             }
@@ -953,7 +1235,7 @@ async fn execute_attempt(
                     {
                         continue;
                     }
-                    return Ok(DriverExit::Completed(result));
+                    return Ok(DriverExit::Completed(Box::new(result)));
                 }
                 LoopStep::Interrupt(LoopInterrupt::AfterToolResult(round)) => {
                     let snapshot = transcript.after_tool_snapshot(round.transcript_len)?;
@@ -1009,7 +1291,10 @@ async fn execute_attempt(
                             ));
                         }
                     };
-                    return Ok(DriverExit::Waiting { waiting, target });
+                    return Ok(DriverExit::Waiting {
+                        waiting: Box::new(waiting),
+                        target,
+                    });
                 }
             }
         }
@@ -1061,6 +1346,19 @@ async fn execute_attempt(
             Ok(AttemptExit::Waiting)
         }
     }
+    }
+    .await;
+    if let Some(runtime) = mcp_attempt_runtime
+        && let Err(cleanup) = runtime.shutdown().await
+    {
+        return match attempt_result {
+            Ok(_) => Err(cleanup),
+            Err(primary) => Err(ExecutorError::Worker(format!(
+                "{primary}; MCP attempt cleanup: {cleanup}"
+            ))),
+        };
+    }
+    attempt_result
 }
 
 #[derive(Clone)]
@@ -1478,8 +1776,29 @@ fn tool_adapter(
     job: &WorkerRun,
     snapshot: &RunConfigSnapshot,
     resolve_native_revision: bool,
+    mcp_runtime: Option<&Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>>,
+    live_cancellation: Arc<AtomicBool>,
+    budget: Arc<BudgetLedger>,
 ) -> Result<(ToolExecutorAdapter, Option<String>), ExecutorError> {
     let workspace = workspace_id(job.attempt.id)?;
+    let project_root = std::fs::canonicalize(&config.project_root).map_err(|error| {
+        ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
+    })?;
+    let mcp_workspace = mcp_runtime
+        .map(|_| {
+            crate::workspace::revision::ManagedWorkspace::open(&project_root)
+                .map_err(|error| ExecutorError::Worker(error.to_string()))
+        })
+        .transpose()?;
+    let mcp_revision = mcp_workspace
+        .as_ref()
+        .map(|workspace| {
+            workspace
+                .current_revision()
+                .map(|revision| revision.id().to_string())
+                .map_err(|error| ExecutorError::Worker(error.to_string()))
+        })
+        .transpose()?;
     let descriptors = crate::capabilities::native::NativeCatalog::enabled(snapshot);
     let configured = descriptors
         .iter()
@@ -1493,19 +1812,81 @@ fn tool_adapter(
             (descriptor.clone(), constraints)
         })
         .collect::<Vec<_>>();
-    let grants = CapabilityGrantSnapshot::new(
-        snapshot,
-        configured.iter().map(|(descriptor, constraints)| {
-            CapabilityGrant::new(
+    let mcp_catalog = mcp_runtime
+        .map(|runtime| {
+            runtime.catalog_snapshot_for(
                 job.principal_id,
                 job.project_id,
                 workspace,
-                descriptor.identity().clone(),
-                descriptor.schema().normalized_digest(),
-                descriptor.effect(),
-                constraints.clone(),
+                mcp_revision.as_deref(),
             )
-        }),
+        })
+        .transpose()
+        .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    let mcp_configured = mcp_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    let target = entry.external_target()?;
+                    let (grant_extension, request_extension) = mcp_runtime
+                        .expect("MCP catalog requires its runtime")
+                        .authority_for(target.configured_server())
+                        .ok()?;
+                    let constraints = ArgumentConstraints::new([format!(
+                        "mcp={}@{}",
+                        target.configured_server(),
+                        target.descriptor_digest()
+                    )
+                    .into_bytes()]);
+                    Some((
+                        Arc::clone(entry),
+                        constraints,
+                        grant_extension,
+                        request_extension,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let grants = CapabilityGrantSnapshot::new(
+        snapshot,
+        configured
+            .iter()
+            .map(|(descriptor, constraints)| {
+                CapabilityGrant::new(
+                    job.principal_id,
+                    job.project_id,
+                    workspace,
+                    descriptor.identity().clone(),
+                    descriptor.schema().normalized_digest(),
+                    descriptor.effect(),
+                    constraints.clone(),
+                )
+            })
+            .chain(
+                mcp_configured
+                    .iter()
+                    .map(|(entry, constraints, extension, _)| {
+                        CapabilityGrant::new(
+                            job.principal_id,
+                            job.project_id,
+                            workspace,
+                            entry.identity().clone(),
+                            entry
+                                .schemas()
+                                .input()
+                                .schema()
+                                .source()
+                                .normalized_digest(),
+                            entry.side_effects().effect(),
+                            constraints.clone(),
+                        )
+                        .with_extension(extension.clone())
+                    }),
+            ),
         DigestAlgorithm::Sha256,
     );
     let authenticated = AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
@@ -1513,7 +1894,7 @@ fn tool_adapter(
         job.project_id,
         snapshot.effective_authority().iter().copied(),
     ));
-    let bindings = configured
+    let mut bindings = configured
         .iter()
         .map(|(descriptor, constraints)| {
             let binding = ToolBinding::new(
@@ -1558,6 +1939,39 @@ fn tool_adapter(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(catalog) = &mcp_catalog {
+        for (entry, constraints, _, extension) in &mcp_configured {
+            let session = crate::capabilities::discovery::DiscoverySession::new(
+                catalog,
+                &authenticated,
+                snapshot,
+                &grants,
+                None,
+                workspace,
+                job.project_id,
+                constraints,
+                extension.clone(),
+            );
+            let binding = session.bind_identity(entry.identity()).ok_or_else(|| {
+                ExecutorError::Worker("configured MCP capability is not authorized".to_owned())
+            })?;
+            let spec = agentkit_tools_core::ToolSpec::new(
+                agentkit_tools_core::ToolName::new(
+                    crate::capabilities::registration::direct_wire_name(binding.id()),
+                ),
+                entry.search().summary(),
+                crate::protocols::mcp::features::model_schema_projection(
+                    entry.schemas().input().schema().value().clone(),
+                ),
+            );
+            bindings.push(ToolBinding::mcp(
+                spec,
+                Arc::new(binding),
+                constraints.clone(),
+                extension.clone(),
+            ));
+        }
+    }
     let scratch = config
         .workspace_scratch
         .join(job.attempt.owner.attempt_id.to_string());
@@ -1568,9 +1982,6 @@ fn tool_adapter(
         std::fs::canonicalize(scratch).map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let acquired_root = std::fs::canonicalize(config.workspace_scratch.join("acquired"))
         .map_err(|error| ExecutorError::Worker(error.to_string()))?;
-    let project_root = std::fs::canonicalize(&config.project_root).map_err(|error| {
-        ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
-    })?;
     let acquisition = Some(
         crate::workspace::acquire::acquire(crate::workspace::acquire::AcquisitionRequest::new(
             project_root.clone(),
@@ -1635,7 +2046,6 @@ fn tool_adapter(
                     ),
             }
         });
-    let live_cancellation = Arc::new(AtomicBool::new(false));
     let mut syntax_executors = vec![
         crate::executor::syntax::SyntaxExecutor::production(
             "text",
@@ -1711,8 +2121,13 @@ fn tool_adapter(
     let native_revision = resolve_native_revision
         .then(|| dispatcher.revision().map_err(ExecutorError::Worker))
         .transpose()?;
-    let budget = durable_tool_budget(config, snapshot)?;
-    ToolExecutorAdapter::new(
+    if mcp_revision.is_some() && mcp_revision != native_revision {
+        return Err(ExecutorError::Worker(
+            "MCP owner workspace revision changed during executor initialization".to_owned(),
+        ));
+    }
+    drop(mcp_workspace);
+    let adapter = ToolExecutorAdapter::new(
         bindings,
         ToolKernelContext {
             authenticated,
@@ -1731,8 +2146,16 @@ fn tool_adapter(
         append_store(config)?,
         move |invocation| dispatcher.dispatch(invocation),
     )
-    .map(|adapter| (adapter, native_revision))
-    .map_err(|error| ExecutorError::Worker(error.to_string()))
+    .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    let adapter = match mcp_runtime {
+        Some(runtime) => adapter.with_mcp_runtime(
+            Arc::clone(runtime),
+            Arc::clone(&config.artifacts),
+            crate::protocols::mcp::transport::McpResultPolicy::default(),
+        ),
+        None => adapter,
+    };
+    Ok((adapter, native_revision))
 }
 
 fn durable_tool_budget(
@@ -3430,6 +3853,8 @@ impl ModelTurn for FakeTurn {
 pub enum ExecutorError {
     Config(&'static str),
     ProviderUnavailable(ConfigProvider),
+    McpStdioServiceUnavailable { profile: String },
+    McpBootstrap(crate::protocols::mcp::config::McpBootstrapError),
     Service(ServiceError),
     Store(crate::store::sqlite::append::StoreError),
     Scheduler(SchedulerError),
@@ -3450,6 +3875,11 @@ impl fmt::Display for ExecutorError {
             Self::ProviderUnavailable(provider) => {
                 write!(formatter, "model provider {provider:?} is not configured")
             }
+            Self::McpStdioServiceUnavailable { profile } => write!(
+                formatter,
+                "MCP owned-process service is unavailable for profile {profile:?}"
+            ),
+            Self::McpBootstrap(error) => error.fmt(formatter),
             Self::Service(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
             Self::Scheduler(error) => error.fmt(formatter),

@@ -231,6 +231,7 @@ impl EgressPolicy {
         credential: &CredentialHandle,
     ) -> Result<Authorization, Denial> {
         let destination = parse_url(url)?;
+        self.authorize_destination(&destination, credential)?;
         let resolution = resolve_destination(&destination).await?;
         self.authorize(url, credential, &resolution, 0)
     }
@@ -245,6 +246,7 @@ impl EgressPolicy {
             return Err(Denial::RedirectLimit);
         }
         let destination = parse_url(url)?;
+        self.authorize_destination(&destination, credential)?;
         let resolution = resolve_destination(&destination).await?;
         self.authorize(url, credential, &resolution, previous.redirects + 1)
     }
@@ -317,13 +319,7 @@ impl EgressPolicy {
         redirects: usize,
     ) -> Result<Authorization, Denial> {
         let destination = parse_url(url)?;
-        let grant = DestinationGrant {
-            destination: destination.clone(),
-            credential: credential.clone(),
-        };
-        if !self.grants.contains(&grant) {
-            return Err(Denial::DestinationNotGranted);
-        }
+        self.authorize_destination(&destination, credential)?;
         let resolved = validated_addresses(&destination.host, resolution)?;
         Ok(Authorization {
             destination,
@@ -331,6 +327,21 @@ impl EgressPolicy {
             resolved,
             redirects,
         })
+    }
+
+    fn authorize_destination(
+        &self,
+        destination: &Destination,
+        credential: &CredentialHandle,
+    ) -> Result<(), Denial> {
+        let grant = DestinationGrant {
+            destination: destination.clone(),
+            credential: credential.clone(),
+        };
+        if !self.grants.contains(&grant) {
+            return Err(Denial::DestinationNotGranted);
+        }
+        Ok(())
     }
 }
 
@@ -631,4 +642,21 @@ fn public_ipv6(address: Ipv6Addr) -> bool {
 fn in_v6_network(address: u128, network: u128, prefix: u32) -> bool {
     let mask = u128::MAX << (128 - prefix);
     address & mask == network
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ungranted_destination_is_denied_before_dns() {
+        let policy = EgressPolicy::new([]);
+        let credential = CredentialHandle::new("test:credential").unwrap();
+        assert_eq!(
+            policy
+                .resolve_initial("https://must-not-resolve.invalid/mcp", &credential)
+                .await,
+            Err(Denial::DestinationNotGranted)
+        );
+    }
 }

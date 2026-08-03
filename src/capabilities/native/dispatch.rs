@@ -513,8 +513,8 @@ impl NativeDispatcher {
         }
         if descriptor.tool() == NativeTool::Edit {
             return match self.edit(invocation.arguments(), invocation.attempt()) {
-                Ok((data, artifacts, true)) => committed_output(data, artifacts),
-                Ok((data, artifacts, false)) => output(data, artifacts),
+                Ok((data, artifacts, true)) => committed_output(data, artifacts, &self.artifacts),
+                Ok((data, artifacts, false)) => output(data, artifacts, &self.artifacts),
                 Err(code) => failed(&code),
             };
         }
@@ -528,7 +528,7 @@ impl NativeDispatcher {
         };
         match result {
             Ok((_data, _artifacts)) if self.cancelled() => failed("cancelled_after_dispatch"),
-            Ok((data, artifacts)) => output(data, artifacts),
+            Ok((data, artifacts)) => output(data, artifacts, &self.artifacts),
             Err(code) => failed(&code),
         }
     }
@@ -2740,7 +2740,26 @@ fn code<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> String 
     move |_| prefix.to_owned()
 }
 
-fn output(data: Value, artifacts: Vec<String>) -> DispatchOutcome {
+fn output(data: Value, artifacts: Vec<String>, store: &ArtifactStore) -> DispatchOutcome {
+    let artifact_digests = match artifacts
+        .iter()
+        .map(|artifact| {
+            crate::domain::events::ArtifactRef::parse(artifact).or_else(|_| {
+                let reference = crate::store::artifacts::ArtifactReference::parse(artifact)
+                    .map_err(|_| crate::domain::events::DigestError)?;
+                let digest = store
+                    .open_reference(reference)
+                    .map_err(|_| crate::domain::events::DigestError)?
+                    .digest()
+                    .to_string();
+                crate::domain::events::ArtifactRef::parse(&digest)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(artifacts) => artifacts,
+        Err(_) => return failed("invalid_artifact_digest"),
+    };
     let body = serde_json::to_vec(&json!({
         "artifacts": artifacts,
         "data": data,
@@ -2754,12 +2773,13 @@ fn output(data: Value, artifacts: Vec<String>) -> DispatchOutcome {
         DispatchOutcome::Succeeded(CanonicalOutput {
             media_type: "application/json".to_owned(),
             body,
+            artifact_digests,
         })
     }
 }
 
-fn committed_output(data: Value, artifacts: Vec<String>) -> DispatchOutcome {
-    match output(data, artifacts) {
+fn committed_output(data: Value, artifacts: Vec<String>, store: &ArtifactStore) -> DispatchOutcome {
+    match output(data, artifacts, store) {
         DispatchOutcome::Succeeded(output) => DispatchOutcome::DurablyCommitted(output),
         outcome => outcome,
     }
@@ -3501,7 +3521,9 @@ mod tests {
             )),
             Err("map_invalid_request".to_owned())
         );
-        let DispatchOutcome::Succeeded(canonical) = output(first, Vec::new()) else {
+        let DispatchOutcome::Succeeded(canonical) =
+            output(first, Vec::new(), &dispatcher.artifacts)
+        else {
             panic!("bounded map output failed");
         };
         assert!(canonical.body.len() <= MAX_NATIVE_OUTPUT_BYTES);

@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use crate::{
     api::auth::contract::AuthenticatedPrincipal,
     capabilities::{
-        catalog::{CatalogEntry, CatalogSnapshot},
+        catalog::{Availability, CatalogEntry, CatalogSnapshot},
         kernel::{
             grant::{
                 self, ArgumentConstraints, CapabilityGrantSnapshot, DelegationSnapshot,
@@ -342,9 +342,27 @@ impl<'a> DiscoverySession<'a> {
         })
     }
 
+    pub(crate) fn bind_identity(&self, identity: &CapabilityIdentity) -> Option<CapabilityBinding> {
+        let entry = self
+            .catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.identity() == identity)?;
+        let decision = self.authorize(entry)?;
+        let input_schema_digest = input_schema_digest(entry);
+        Some(CapabilityBinding {
+            id: binding_id(entry, input_schema_digest, decision.snapshot_digest()),
+            entry: Arc::clone(entry),
+            input_schema_digest,
+            entry_digest: entry.digest(),
+            catalog_digest: self.catalog.digest(),
+            authorization_snapshot_digest: decision.snapshot_digest(),
+        })
+    }
+
     fn authorize(&self, entry: &CatalogEntry) -> Option<GrantDecision> {
         let required = entry.authority().required_grants();
-        if !entry.authority().auth_scopes().is_empty()
+        if entry.availability() == Availability::Unavailable
             || !required.is_subset(self.authenticated.grant_snapshot().grants())
             || !required.is_subset(self.config.effective_authority())
         {
@@ -394,6 +412,13 @@ fn binding_id(
     canonical.extend_from_slice(b"KIT-CAPABILITY-BINDING\0");
     canonical.extend_from_slice(&DISCOVERY_FORMAT_VERSION.to_be_bytes());
     entry.identity().write_canonical(&mut canonical);
+    canonical.push(match entry.kind() {
+        crate::capabilities::catalog::CapabilityKind::Tool => 0,
+        crate::capabilities::catalog::CapabilityKind::Resource => 1,
+        crate::capabilities::catalog::CapabilityKind::ResourceTemplate => 2,
+        crate::capabilities::catalog::CapabilityKind::Prompt => 3,
+    });
+    put_digest(&mut canonical, entry.digest());
     put_digest(&mut canonical, schema_digest);
     put_digest(&mut canonical, authorization_snapshot_digest);
     BindingId(Digest::of(DigestAlgorithm::Sha256, &canonical).as_bytes())

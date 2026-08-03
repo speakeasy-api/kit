@@ -4,9 +4,9 @@ use kit::{
     agent::accounting::MoneyMicros,
     capabilities::{
         catalog::{
-            Availability, CatalogAuthority, CatalogEntry, CatalogError, CatalogLimit,
-            CatalogSchemas, CatalogSearch, CatalogSnapshot, CatalogSource, CostStats, LatencyStats,
-            MAX_AUTH_SCOPES, MAX_CATALOG_ENTRIES, MAX_CATALOG_ENTRY_PAYLOAD_BYTES,
+            Availability, CapabilityKind, CatalogAuthority, CatalogEntry, CatalogError,
+            CatalogLimit, CatalogSchemas, CatalogSearch, CatalogSnapshot, CatalogSource, CostStats,
+            LatencyStats, MAX_AUTH_SCOPES, MAX_CATALOG_ENTRIES, MAX_CATALOG_ENTRY_PAYLOAD_BYTES,
             MAX_CATALOG_PAYLOAD_BYTES, MAX_CATALOG_SOURCES, MAX_CATALOG_TEXT_BYTES,
             MAX_SEARCH_TERMS, MAX_SUMMARY_BYTES, ReliabilityStats, SideEffects, SourceKind,
             TrustDomain,
@@ -104,11 +104,12 @@ where
     );
     let schemas = CatalogSchemas::new(
         SchemaProjectionSet::new(schema(schema_label)),
-        SchemaProjectionSet::new(schema("output")),
+        Some(SchemaProjectionSet::new(schema("output"))),
     );
     CatalogEntry::new(
         identity,
         CatalogSource::new(kind, source_id, TrustDomain::new(trust).unwrap()).unwrap(),
+        CapabilityKind::Tool,
         schemas,
         CatalogSearch::new(summary, ["fixture", name]).unwrap(),
         SideEffects::new(effect, retry),
@@ -133,6 +134,7 @@ fn rebuild(
     CatalogEntry::new(
         base.identity().clone(),
         base.source().clone(),
+        base.kind(),
         schemas,
         base.search().clone(),
         side_effects,
@@ -152,6 +154,7 @@ fn native_catalog_entries_preserve_complete_metadata() {
         let entry = snapshot.get_identity(descriptor.identity()).unwrap();
         assert_eq!(entry.identity(), descriptor.identity());
         assert_eq!(entry.source().kind(), SourceKind::Native);
+        assert_eq!(entry.kind(), CapabilityKind::Tool);
         assert_eq!(entry.source().id(), descriptor.identity().source());
         assert!(!entry.source().trust_domain().as_str().is_empty());
         assert_eq!(
@@ -159,11 +162,12 @@ fn native_catalog_entries_preserve_complete_metadata() {
             descriptor.normalized_schema().source()
         );
         assert!(entry.schemas().input().is_empty());
-        assert!(entry.schemas().output().is_empty());
+        assert!(entry.schemas().output().unwrap().is_empty());
         let output: serde_json::Value = serde_json::from_slice(
             entry
                 .schemas()
                 .output()
+                .unwrap()
                 .schema()
                 .source()
                 .normalized_bytes(),
@@ -197,6 +201,67 @@ fn native_catalog_entries_preserve_complete_metadata() {
             descriptor.identity().implementation_digest()
         );
     }
+}
+
+#[test]
+fn catalog_preserves_capability_kinds_and_absent_declared_outputs() {
+    let entries = [
+        CapabilityKind::Tool,
+        CapabilityKind::Resource,
+        CapabilityKind::ResourceTemplate,
+        CapabilityKind::Prompt,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, capability_kind)| {
+        let source_id = CapabilitySource::new(format!("kind-{index}")).unwrap();
+        CatalogEntry::new(
+            CapabilityIdentity::new(
+                source_id.clone(),
+                CapabilityNamespace::new("fixture.kinds").unwrap(),
+                CapabilityName::new(format!("kind-{index}")).unwrap(),
+                CapabilityVersion::new("1").unwrap(),
+                Digest::of(DigestAlgorithm::Sha256, format!("kind-{index}").as_bytes()),
+            ),
+            CatalogSource::new(
+                SourceKind::Mcp,
+                source_id,
+                TrustDomain::new("fixture-trust").unwrap(),
+            )
+            .unwrap(),
+            capability_kind,
+            CatalogSchemas::new(SchemaProjectionSet::new(schema("input")), None),
+            CatalogSearch::new("fixture kind", [format!("kind-{index}")]).unwrap(),
+            SideEffects::new(EffectClass::WorkspaceRead, RetrySafety::Idempotent),
+            CatalogAuthority::new([Grant::WorkspaceRead], Vec::<String>::new()).unwrap(),
+            Availability::Available,
+            ReliabilityStats::default(),
+            LatencyStats::Unobserved,
+            CostStats::Unobserved,
+        )
+        .unwrap()
+    })
+    .collect::<Vec<_>>();
+    let snapshot = CatalogSnapshot::new(entries, DigestAlgorithm::Sha256).unwrap();
+    assert_eq!(
+        snapshot
+            .entries()
+            .iter()
+            .map(|entry| entry.kind())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            CapabilityKind::Tool,
+            CapabilityKind::Resource,
+            CapabilityKind::ResourceTemplate,
+            CapabilityKind::Prompt,
+        ])
+    );
+    assert!(
+        snapshot
+            .entries()
+            .iter()
+            .all(|entry| entry.schemas().output().is_none())
+    );
 }
 
 #[test]
@@ -469,7 +534,7 @@ fn compositional_schema_digest_covers_exact_forms_and_projection_metadata() {
     fn schemas(input: NormalizedSchema) -> CatalogSchemas {
         CatalogSchemas::new(
             SchemaProjectionSet::new(input),
-            SchemaProjectionSet::new(schema("output")),
+            Some(SchemaProjectionSet::new(schema("output"))),
         )
     }
 
@@ -542,7 +607,7 @@ fn compositional_schema_digest_covers_exact_forms_and_projection_metadata() {
         unprojected_digest,
         entry_digest(
             &base,
-            CatalogSchemas::new(projected, SchemaProjectionSet::new(schema("output")))
+            CatalogSchemas::new(projected, Some(SchemaProjectionSet::new(schema("output"))))
         )
     );
 }
@@ -665,6 +730,7 @@ fn catalog_bounds_count_raw_items_before_deduplication() {
             CatalogEntry::new(
                 identity.clone(),
                 base.source().clone(),
+                base.kind(),
                 base.schemas().clone(),
                 base.search().clone(),
                 base.side_effects(),
@@ -765,7 +831,7 @@ fn catalog_payload_limits_reject_before_publication() {
             &base,
             CatalogSchemas::new(
                 SchemaProjectionSet::new(large_input),
-                SchemaProjectionSet::new(large_output),
+                Some(SchemaProjectionSet::new(large_output)),
             ),
             base.side_effects(),
             base.authority().clone(),
@@ -797,6 +863,7 @@ fn catalog_payload_limits_reject_before_publication() {
                 Digest::of(DigestAlgorithm::Blake3, b"implementation"),
             ),
             source.clone(),
+            CapabilityKind::Tool,
             schemas.clone(),
             search.clone(),
             SideEffects::new(EffectClass::WorkspaceRead, RetrySafety::Idempotent),
@@ -883,6 +950,7 @@ fn malformed_statistics_currency_and_source_reject() {
         CatalogEntry::new(
             identity.clone(),
             bad_source,
+            entry.kind(),
             schemas.clone(),
             entry.search().clone(),
             entry.side_effects(),

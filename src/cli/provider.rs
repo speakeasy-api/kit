@@ -163,7 +163,8 @@ impl ProviderAdd {
                 credential(self.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY"))?,
                 self.model.clone(),
                 self.base_url.clone(),
-            ),
+            )
+            .map_err(invalid)?,
             ProviderKind::Anthropic => {
                 let (api_key, auth_token) = if let Some(variable) = &self.auth_token_env {
                     (None, Some(credential(variable)?))
@@ -187,6 +188,7 @@ impl ProviderAdd {
                     self.version.clone(),
                     self.beta.clone(),
                 )
+                .map_err(invalid)?
             }
             ProviderKind::OpenRouter => ProviderProfile::openrouter(
                 credential(self.api_key_env.as_deref().unwrap_or("OPENROUTER_API_KEY"))?,
@@ -197,7 +199,8 @@ impl ProviderAdd {
                 self.max_completion_tokens,
                 self.temperature,
                 self.reasoning_effort.clone(),
-            ),
+            )
+            .map_err(invalid)?,
             ProviderKind::Ollama => ProviderProfile::ollama(
                 self.model.clone().expect("validated"),
                 self.base_url.clone(),

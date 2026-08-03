@@ -286,10 +286,25 @@ impl SqliteStore {
     }
 
     pub fn verify_driver_claim(&mut self, claim: AttemptDriverClaim) -> Result<(), StoreError> {
+        self.verify_driver_claim_inner(claim, false)
+    }
+
+    pub(crate) fn verify_quiescent_driver_claim(
+        &mut self,
+        claim: AttemptDriverClaim,
+    ) -> Result<(), StoreError> {
+        self.verify_driver_claim_inner(claim, true)
+    }
+
+    fn verify_driver_claim_inner(
+        &mut self,
+        claim: AttemptDriverClaim,
+        allow_quiescent: bool,
+    ) -> Result<(), StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        guard_driver_claim(&transaction, claim, false)?;
+        guard_driver_claim(&transaction, claim, allow_quiescent)?;
         transaction.commit()?;
         Ok(())
     }
@@ -667,10 +682,10 @@ fn guard_driver_claim(
     let owns: bool = transaction.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM attempt_driver_claims
-             WHERE run_id = ?1 AND attempt_id = ?2 AND principal_id = ?3
-               AND fence = ?4 AND lease_version = ?5
-               AND (?7 OR expires_at_unix_micros > ?6)
-               AND (?7 OR quiescent = 0)
+              WHERE run_id = ?1 AND attempt_id = ?2 AND principal_id = ?3
+                AND fence = ?4 AND lease_version = ?5
+                AND ((expires_at_unix_micros > ?6 AND quiescent = 0)
+                     OR (?7 AND quiescent = 1))
          )",
         params![
             claim.run_id.to_string(),

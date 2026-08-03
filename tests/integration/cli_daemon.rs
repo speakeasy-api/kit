@@ -44,6 +44,31 @@ fn parse_errors_preserve_authoritative_json_format() {
     assert!(String::from_utf8_lossy(&malformed.stderr).starts_with("error: "));
 }
 
+#[test]
+fn daemon_cli_rejects_raw_mcp_secret_configuration_before_startup() {
+    let root = TestRoot::new("mcp-config-contract");
+    let config = root.0.join("config.json");
+    fs::create_dir_all(&root.0).unwrap();
+    fs::write(
+        &config,
+        br#"{"current":"local","providers":{"local":{"provider":"ollama","model":"test"}},"mcp_servers":[{"id":"docs","transport":{"kind":"http","endpoint":"https://example.com/mcp"},"owner":{"principal_id":"principal_00000000000000000000000001","project_id":"project_00000000000000000000000001"},"source":"mcp.docs","trust_domain":"example.com","namespace":"docs","version":"1","credential":"raw-secret","egress":{"scheme":"https","host":"example.com","port":443},"descriptors":[]}]}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = kit_command()
+        .args(["daemon", "--state-root"])
+        .arg(&root.0)
+        .env("KIT_CONFIG_FILE", &config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("persistent MCP configuration: invalid provider config")
+    );
+    assert!(!root.0.join("daemon.json").exists());
+}
+
 struct TestRoot(PathBuf);
 
 impl TestRoot {

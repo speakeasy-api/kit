@@ -1199,6 +1199,7 @@ const fn effect_status_name(status: EffectStatus) -> &'static str {
         EffectStatus::Succeeded => "succeeded",
         EffectStatus::Failed => "failed",
         EffectStatus::Cancelled => "cancelled",
+        EffectStatus::AuthRequired => "auth_required",
         EffectStatus::OutcomeUnknown => "outcome_unknown",
     }
 }

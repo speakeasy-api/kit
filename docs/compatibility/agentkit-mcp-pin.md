@@ -3,8 +3,9 @@
 - Work package: `M006-W07a`
 - Agentkit release: `0.10.2`
 - Patch ID: `m006-mcp-protocol-revision-pin`
-- Snapshot SHA-256: `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`
+- W07a snapshot SHA-256: `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`
 - Previous snapshot SHA-256: `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`
+- Current snapshot SHA-256: `3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077` (local-only `M006-W07b` overlay)
 - Upstream status: pending submission; upstream acceptance is non-blocking
 - Blocker closed locally: `BLK-05` (`docs/decisions/PRE-0005-protocol-revisions.md`)
 
@@ -63,7 +64,7 @@ deadlines, disabled redirects, pinned
 policy-authorized addresses, actual-peer validation on every response, and a
 fresh operation-bound opaque-handle credential lease per request.
 
-Kit now directly uses `agentkit-mcp` only behind `ReadyConnection`. That type
+M006-W07b directly uses `agentkit-mcp` only behind `ReadyConnection`. That type
 does not expose the raw connection: list/tool/resource/prompt operations must
 present a current broker envelope whose method and JSON arguments match the
 wire request. Intent, dispatch, and completed/auth-interrupted/outcome-unknown
@@ -76,8 +77,10 @@ Expired HTTP sessions recover only through the explicit broker-authorized
 
 ## Tests
 
-`crates/agentkit-mcp/tests/protocol_revision_pin.rs` (13 tests, all passing
-with the focused suite's 43/43):
+The W07a `crates/agentkit-mcp/tests/protocol_revision_pin.rs` snapshot contains
+13 tests and its focused package suite passed 43/43. The W07b overlay adds
+`http_reconnect_replaces_server_capabilities`, so the current file has 14 tests
+and the current focused package suite passes 44/44:
 
 - exact-revision acceptance over real stdio (python3 child process) and real
   Streamable HTTP (axum mock), including `negotiated_protocol_version`
@@ -89,6 +92,7 @@ with the focused suite's 43/43):
 - missing `protocolVersion` refusal at both real call sites with
   `negotiated: None`;
 - reconnect refusal after a server downgrades between negotiations;
+- reconnect replacement of the complete negotiated server capability set;
 - missing-negotiation refusal;
 - a 1200-value generated corpus of unequal revisions driven through the
   shared contract both call sites terminate in;
@@ -132,11 +136,12 @@ disabled rather than partially authorized.
 
 ## Snapshot Accounting
 
-Payload file count 356 -> 357 (added test file). Changed-file digests, including
-the MCP crate and explicit development opt-in manifests, are
-recorded in `src/protocols/mcp/agentkit_patch/manifest.yaml`; the snapshot
-manifest, `vendor/agentkit/SNAPSHOT-METADATA.yaml`,
-`docs/compatibility/pins/agentkit-snapshot.yaml`, and
-`build-manifest.yaml:agentkit.snapshot_sha256` all carry the patched
-aggregate digest above. `vendor/agentkit/Cargo.lock` is unchanged; no new
-vendor dependency was added.
+W07a changed payload file count 356 -> 357 by adding the protocol test file and
+produced aggregate `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`.
+W07b keeps 357 payload files and modifies exactly the MCP library and that test
+file, producing current aggregate
+`3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`.
+Both overlay steps and their exact before/after file hashes are recorded in
+`src/protocols/mcp/agentkit_patch/manifest.yaml`; the snapshot manifest,
+metadata, pin document, and build manifest carry the current aggregate.
+`vendor/agentkit/Cargo.lock` is unchanged; no new vendor dependency was added.

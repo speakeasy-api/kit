@@ -107,13 +107,14 @@ impl GrantExtension {
     pub(super) fn allows_except_depth(&self, request: &RequestExtension) -> bool {
         request.egress.as_ref().is_none_or(|egress| {
             self.egress.contains(egress) && self.credentials.contains(egress.credential())
-        }) && request.credential.as_ref().is_none_or(|credential| {
-            self.credentials.contains(credential)
-                && request
-                    .egress
-                    .as_ref()
-                    .is_none_or(|egress| egress.credential() == credential)
-        })
+        }) && request.credentials.is_subset(&self.credentials)
+            && request.credential.as_ref().is_none_or(|credential| {
+                self.credentials.contains(credential)
+                    && request
+                        .egress
+                        .as_ref()
+                        .is_none_or(|egress| egress.credential() == credential)
+            })
     }
 
     pub(super) fn write_canonical(&self, output: &mut Vec<u8>) {
@@ -146,11 +147,37 @@ fn collect_bounded<T: Ord>(
 pub struct RequestExtension {
     egress: Option<EgressConstraint>,
     credential: Option<SecretHandle>,
+    credentials: BTreeSet<SecretHandle>,
+    workspace_revision: Option<String>,
 }
 
 impl RequestExtension {
     pub fn new(egress: Option<EgressConstraint>, credential: Option<SecretHandle>) -> Self {
-        Self { egress, credential }
+        Self {
+            egress,
+            credential,
+            credentials: BTreeSet::new(),
+            workspace_revision: None,
+        }
+    }
+
+    pub fn with_credentials(
+        mut self,
+        credentials: impl IntoIterator<Item = SecretHandle>,
+    ) -> Result<Self, GrantExtensionError> {
+        self.credentials = collect_bounded(credentials)?;
+        if let Some(credential) = &self.credential {
+            self.credentials.remove(credential);
+        }
+        if self.credentials.len() + usize::from(self.credential.is_some()) > MAX_EXTENSION_ITEMS {
+            return Err(GrantExtensionError::LimitExceeded);
+        }
+        Ok(self)
+    }
+
+    pub fn with_workspace_revision(mut self, revision: impl Into<String>) -> Self {
+        self.workspace_revision = Some(revision.into());
+        self
     }
 
     pub const fn egress(&self) -> Option<&EgressConstraint> {
@@ -159,6 +186,14 @@ impl RequestExtension {
 
     pub const fn credential(&self) -> Option<&SecretHandle> {
         self.credential.as_ref()
+    }
+
+    pub fn credentials(&self) -> &BTreeSet<SecretHandle> {
+        &self.credentials
+    }
+
+    pub fn workspace_revision(&self) -> Option<&str> {
+        self.workspace_revision.as_deref()
     }
 
     pub(super) fn write_canonical(&self, output: &mut Vec<u8>) {
@@ -176,6 +211,19 @@ impl RequestExtension {
             }
             None => output.push(0),
         }
+        match &self.workspace_revision {
+            Some(revision) => {
+                output.push(1);
+                put_bytes(output, revision.as_bytes());
+            }
+            None => output.push(0),
+        }
+        if !self.credentials.is_empty() {
+            output.extend_from_slice(&(self.credentials.len() as u64).to_be_bytes());
+            for credential in &self.credentials {
+                put_bytes(output, credential.identifier().as_bytes());
+            }
+        }
     }
 }
 
@@ -183,4 +231,28 @@ impl RequestExtension {
 pub enum GrantExtensionError {
     InvalidEgress,
     LimitExceeded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_extension_requires_every_requested_credential() {
+        let first = SecretHandle::parse("env:FIRST").unwrap();
+        let second = SecretHandle::parse("env:SECOND").unwrap();
+        let request = RequestExtension::new(None, None)
+            .with_credentials([first.clone(), second.clone()])
+            .unwrap();
+        assert!(
+            GrantExtension::new([], [first.clone(), second], 0)
+                .unwrap()
+                .allows_except_depth(&request)
+        );
+        assert!(
+            !GrantExtension::new([], [first], 0)
+                .unwrap()
+                .allows_except_depth(&request)
+        );
+    }
 }

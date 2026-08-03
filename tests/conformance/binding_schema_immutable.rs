@@ -10,7 +10,7 @@ use kit::{
     },
     capabilities::{
         catalog::{
-            Availability, CatalogAuthority, CatalogEntry, CatalogSchemas, CatalogSearch,
+            Availability, CapabilityKind, CatalogAuthority, CatalogEntry, CatalogSchemas, CatalogSearch,
             CatalogSnapshot, CatalogSource, CostStats, LatencyStats, ReliabilityStats, SideEffects,
             SourceKind, TrustDomain,
         },
@@ -127,6 +127,22 @@ fn entry(
     required: &[Grant],
     scopes: &[&str],
 ) -> CatalogEntry {
+    entry_of_kind(
+        name,
+        schema_label,
+        required,
+        scopes,
+        CapabilityKind::Tool,
+    )
+}
+
+fn entry_of_kind(
+    name: &str,
+    schema_label: &str,
+    required: &[Grant],
+    scopes: &[&str],
+    kind: CapabilityKind,
+) -> CatalogEntry {
     let source_id = CapabilitySource::new("discovery-source").unwrap();
     CatalogEntry::new(
         CapabilityIdentity::new(
@@ -142,9 +158,10 @@ fn entry(
             TrustDomain::new("discovery-trust").unwrap(),
         )
         .unwrap(),
+        kind,
         CatalogSchemas::new(
             SchemaProjectionSet::new(schema(schema_label)),
-            SchemaProjectionSet::new(schema("output")),
+            Some(SchemaProjectionSet::new(schema("output"))),
         ),
         CatalogSearch::new(format!("summary for {name}"), ["discovery", name]).unwrap(),
         SideEffects::new(EffectClass::WorkspaceRead, RetrySafety::Idempotent),
@@ -155,6 +172,63 @@ fn entry(
         CostStats::Unobserved,
     )
     .unwrap()
+}
+
+#[test]
+fn binding_id_covers_semantic_kind_and_full_entry_digest() {
+    let principal_id = PrincipalId::generate().unwrap();
+    let project_id = ProjectId::generate().unwrap();
+    let workspace_id = WorkspaceId::generate().unwrap();
+    let authority = authority(&[Grant::WorkspaceRead]);
+    let config = discovery_config(
+        principal_id,
+        project_id,
+        RunId::generate().unwrap(),
+        authority.clone(),
+        100,
+    );
+    let authenticated = authenticate(principal_id, project_id, authority);
+    let constraints = ArgumentConstraints::default();
+    let bind = |kind| {
+        let catalog = CatalogSnapshot::new(
+            [entry_of_kind(
+                "semantic",
+                "same-schema",
+                &[Grant::WorkspaceRead],
+                &[],
+                kind,
+            )],
+            DigestAlgorithm::Sha256,
+        )
+        .unwrap();
+        let grants = CapabilityGrantSnapshot::new(
+            &config,
+            [grant(
+                principal_id,
+                project_id,
+                workspace_id,
+                &catalog.entries()[0],
+                constraints.clone(),
+                GrantExtension::default(),
+            )],
+            DigestAlgorithm::Sha256,
+        );
+        let session = DiscoverySession::new(
+            &catalog,
+            &authenticated,
+            &config,
+            &grants,
+            None,
+            workspace_id,
+            project_id,
+            &constraints,
+            RequestExtension::default(),
+        );
+        let result = session.search("semantic", 1).unwrap().remove(0);
+        session.bind(&session.inspect(result.handle()).unwrap()).unwrap().id()
+    };
+
+    assert_ne!(bind(CapabilityKind::Tool), bind(CapabilityKind::Resource));
 }
 
 fn grant(
@@ -495,13 +569,14 @@ fn capability_discovery() {
         session.search("alpha", MAX_SEARCH_RESULTS + 1),
         Err(SearchError::InvalidLimit)
     ));
-    assert!(session.search("scoped-canary", 10).unwrap().is_empty());
+    assert_eq!(session.search("scoped-canary", 10).unwrap().len(), 1);
     assert!(session.search("narrowed-canary", 10).unwrap().is_empty());
 
     let ordered = session.search("summary", 10).unwrap();
-    assert_eq!(ordered.len(), 2);
+    assert_eq!(ordered.len(), 3);
     assert_eq!(ordered[0].identity().name().as_str(), "alpha");
     assert_eq!(ordered[1].identity().name().as_str(), "beta");
+    assert_eq!(ordered[2].identity().name().as_str(), "scoped-canary");
     assert_eq!(ordered[0].summary(), "summary for alpha");
     let inspection = session.inspect(ordered[0].handle()).unwrap();
     assert_eq!(inspection.definition().identity(), ordered[0].identity());

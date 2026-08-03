@@ -79,28 +79,39 @@ fn phase0_governance_contracts_hold_and_release_pending_fails() {
 }
 
 #[test]
-fn phase0_g00_attestations_report_current_or_historical_stale() {
+fn phase0_g00_attestations_report_current_or_deliberately_pending() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let current = run(root, "python3", &["scripts/validate_g00_attestations.py"]);
     let current_diagnostic = diagnostic(&current);
-    if current.status.success() {
-        assert!(current_diagnostic.contains("status=current"));
-        return;
-    }
-    assert!(current_diagnostic.contains("is not bound to the current source/record/command"));
-
-    let historical = run(
-        root,
-        "python3",
-        &["scripts/validate_g00_attestations.py", "--historical"],
-    );
-    let historical_diagnostic = diagnostic(&historical);
     assert!(
-        historical.status.success(),
-        "historical G00 validation failed\n{historical_diagnostic}"
+        !current.status.success(),
+        "G00 evidence must remain pending"
     );
-    assert!(historical_diagnostic.contains("status=stale"));
-    assert!(historical_diagnostic.contains("does not validate the current tree"));
+    assert!(
+        current_diagnostic.contains("passing evidence set differs from G00 commands")
+            && current_diagnostic.contains("EV-1.09-C-001")
+            && current_diagnostic.contains("EV-1.09-C-002")
+            && current_diagnostic.contains("EV-1.09-C-003")
+            && current_diagnostic.contains("EV-1.09-C-004"),
+        "unexpected pending G00 diagnostic\n{current_diagnostic}"
+    );
+
+    let records: Vec<serde_yaml::Value> = serde_yaml::from_slice(
+        &fs::read(root.join("requirements/registry.d/KIT-VERSION.yaml")).unwrap(),
+    )
+    .unwrap();
+    for id in [
+        "KIT-VERSION-001",
+        "KIT-VERSION-002",
+        "KIT-VERSION-003",
+        "KIT-VERSION-004",
+    ] {
+        let record = records.iter().find(|record| record["id"] == id).unwrap();
+        assert_eq!(record["latest_result"], "pending");
+        for field in ["artifact_digest", "environment_digest", "versions"] {
+            assert!(record[field].is_null(), "{id}.{field} must remain null");
+        }
+    }
 }
 
 #[test]

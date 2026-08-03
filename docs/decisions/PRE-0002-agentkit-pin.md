@@ -110,7 +110,10 @@ suite and digest check passes. `BLK-02` is closed.
 
 M009-W01 retains this historical source capture and adds the pinned
 `m009-post-validation-checkpoint` overlay; M006-W07a adds the pinned
-`m006-mcp-protocol-revision-pin` overlay. The current complete Agentkit payload digest is
-`0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`; exact changed-file hashes are
+`m006-mcp-protocol-revision-pin` overlay and produces aggregate
+`0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`.
+The local-only M006-W07b `m006-mcp-feature-adaptation` overlay produces the current complete
+Agentkit payload digest `3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`;
+exact changed-file hashes are
 recorded in `src/agent/agentkit_patch/manifest.yaml` and
 `src/protocols/mcp/agentkit_patch/manifest.yaml`.

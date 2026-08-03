@@ -19,7 +19,7 @@ use crate::{
         agentkit_bridge::mapping::{CanonicalItem, from_agentkit_item, to_agentkit_item},
         driver::{
             attempt::{AttemptDriver, AttemptDriverError},
-            waiting::{WaitingResolved, WaitingState},
+            waiting::{WaitingKind, WaitingResolution, WaitingResolved, WaitingState},
         },
     },
     api::service::{AttemptDriverClaim, AttemptProjection},
@@ -263,6 +263,7 @@ pub enum EffectStatus {
     Succeeded,
     Failed,
     Cancelled,
+    AuthRequired,
     OutcomeUnknown,
 }
 
@@ -283,6 +284,15 @@ impl EffectOutcome {
                 ));
             }
             return Ok(());
+        }
+        if self.status == EffectStatus::AuthRequired {
+            return if self.kind == EffectKind::Tool && self.snapshot.is_none() {
+                Ok(())
+            } else {
+                Err(RestartError::InvalidRecord(
+                    "auth interruption must be a snapshot-free tool outcome",
+                ))
+            };
         }
         let Some(snapshot) = self.snapshot.as_ref() else {
             return if self.status == EffectStatus::Succeeded && self.kind == EffectKind::Model {
@@ -517,6 +527,143 @@ pub fn effect_records(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+pub struct ResolvedMcpBootstrapAuth {
+    pub owner: AttemptOwnership,
+    pub claim: AttemptDriverClaim,
+    pub granted: bool,
+    pub challenge_id: crate::domain::ids::ApprovalId,
+    pub challenge_kind: &'static str,
+    pub challenge_generation: u64,
+}
+
+pub fn resolved_mcp_bootstrap_auth(
+    store: &SqliteStore,
+    run_id: crate::domain::ids::RunId,
+    server: &str,
+) -> Result<Option<ResolvedMcpBootstrapAuth>, StoreError> {
+    let events = store.events()?;
+    let challenges = events
+        .iter()
+        .filter(|event| {
+            event.event.event_type.as_str() == "capability.broker_transport_auth_challenged"
+                && event.event.correlation_id == EntityId::Run(run_id)
+        })
+        .filter_map(|event| {
+            let record = serde_json::from_slice::<serde_json::Value>(&event.event.payload).ok()?;
+            if record
+                .get("transport_binding")
+                .and_then(|binding| binding.get("server_id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(server)
+            {
+                return None;
+            }
+            let challenge_id = record
+                .get("challenge_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| crate::domain::ids::ApprovalId::parse(value).ok())?;
+            let kind = record
+                .get("challenge_kind")
+                .and_then(serde_json::Value::as_str)?;
+            let generation = record
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)?;
+            Some((
+                challenge_id,
+                (event.event.attempt_id?, kind.to_owned(), generation),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut waits = BTreeMap::new();
+    let mut resolved: Option<ResolvedMcpBootstrapAuth> = None;
+    for event in events {
+        if event.event.event_type.as_str() == "capability.broker_transport_outcome"
+            && resolved.is_some()
+            && event.event.correlation_id == EntityId::Run(run_id)
+        {
+            let completed = serde_json::from_slice::<serde_json::Value>(&event.event.payload)
+                .ok()
+                .is_some_and(|record| {
+                    record.get("operation").and_then(serde_json::Value::as_str)
+                        == Some("initialize")
+                        && record.get("status").and_then(serde_json::Value::as_str)
+                            == Some("completed")
+                        && record
+                            .get("binding")
+                            .and_then(|binding| binding.get("server_id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(server)
+                });
+            if completed {
+                resolved = None;
+            }
+            continue;
+        }
+        if event.event.event_type.as_str() != EFFECT_JOURNAL_EVENT {
+            continue;
+        }
+        let durable: DurableRecord = serde_json::from_slice(&event.event.payload)
+            .map_err(|_| StoreError::CorruptData("invalid effect journal record"))?;
+        match durable.record {
+            EffectJournalRecord::Waiting(WaitingState {
+                wait_id,
+                kind:
+                    WaitingKind::Auth {
+                        run_id: found,
+                        tool_call_id: None,
+                        challenge_kind,
+                        challenge_generation,
+                        challenge_id: Some(challenge_id),
+                        ..
+                    },
+                ..
+            }) if found == run_id => {
+                if let Some(claim) = durable.claim
+                    && challenges
+                        .get(&challenge_id)
+                        .is_some_and(|(attempt, kind, generation)| {
+                            *attempt == durable.owner.attempt_id
+                                && kind == challenge_kind.as_str()
+                                && *generation == challenge_generation
+                        })
+                {
+                    waits.insert(
+                        wait_id,
+                        (
+                            durable.owner,
+                            claim,
+                            challenge_id,
+                            challenge_kind,
+                            challenge_generation,
+                        ),
+                    );
+                }
+            }
+            EffectJournalRecord::WaitingResolved(waiting) => {
+                if let Some((owner, claim, challenge_id, kind, generation)) =
+                    waits.get(&waiting.wait_id)
+                    && let WaitingResolution::Auth { granted } = waiting.resolution
+                    && resolved
+                        .as_ref()
+                        .is_none_or(|current| *generation >= current.challenge_generation)
+                {
+                    resolved = Some(ResolvedMcpBootstrapAuth {
+                        owner: *owner,
+                        claim: *claim,
+                        granted,
+                        challenge_id: *challenge_id,
+                        challenge_kind: kind.as_str(),
+                        challenge_generation: *generation,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(resolved)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RestartPlan {
     pub owner: AttemptOwnership,
@@ -653,7 +800,9 @@ impl RestartProjection {
                     if !dispatched
                         && !matches!(
                             outcome.status,
-                            EffectStatus::Cancelled | EffectStatus::Failed
+                            EffectStatus::Cancelled
+                                | EffectStatus::Failed
+                                | EffectStatus::AuthRequired
                         )
                     {
                         return Err(RestartError::InvalidRecord(
@@ -662,6 +811,9 @@ impl RestartProjection {
                     }
                     if outcome.status == EffectStatus::OutcomeUnknown {
                         unknown.push(outcome);
+                    } else if outcome.status == EffectStatus::AuthRequired {
+                        // The matching waiting record owns resumption; this is
+                        // deliberately non-terminal for the tool operation.
                     } else {
                         if outcome.snapshot.is_some() {
                             snapshot = outcome.snapshot.clone();

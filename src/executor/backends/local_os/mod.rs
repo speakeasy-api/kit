@@ -13,7 +13,10 @@ use crate::{
     domain::lifecycle::ProcessOwnership,
     executor::{
         process::{
-            own::{PreparedCommandToken, ProcessOutput, ProcessState, spawn_owned},
+            own::{
+                PreparedCommandToken, ProcessOutput, ProcessRegistryRegistration, ProcessState,
+                spawn_owned,
+            },
             tree::{
                 BoundaryControl, BoundaryIdentity, BoundaryKind, Containment, Inspection,
                 PersistedBoundary,
@@ -1043,6 +1046,36 @@ impl PreparedCommand {
 
     pub const fn label(&self) -> ExecutionLabel {
         self.label
+    }
+
+    pub(crate) fn into_owned_token(
+        self,
+        owner: ProcessOwnership,
+        registration: ProcessRegistryRegistration,
+        profile: ExecutorProfile,
+    ) -> Result<PreparedCommandToken, LocalExecutionError> {
+        self.validate_launch()?;
+        let (control, process_group) =
+            ProcessGroupBoundary::start(&self.boundary_root, self.label)?;
+        let mut command = self.command();
+        configure_owned_process(&mut command, process_group);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(self.resources.wall_time_millis))
+            .ok_or_else(|| {
+                LocalExecutionError::InvalidRequest("wall-time limit overflows clock".to_owned())
+            })?;
+        let record = control.record.clone();
+        Ok(PreparedCommandToken::issue_observed_registered(
+            command,
+            owner,
+            control,
+            move |boundary: &PersistedBoundary| persist_boundary(&record, boundary),
+            |_, _| Ok(()),
+            Some(registration),
+            deadline,
+            self.resources,
+        )?
+        .bind_profile(profile))
     }
 
     /// Runs host compatibility work to completion without publishing it through the process API.

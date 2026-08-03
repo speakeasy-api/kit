@@ -157,6 +157,39 @@ impl UtcDateTime {
         &self.0
     }
 
+    pub(crate) fn unix_micros(&self) -> i64 {
+        let bytes = self.0.as_bytes();
+        let number = |start: usize, len: usize| -> i64 {
+            bytes[start..start + len]
+                .iter()
+                .fold(0, |value, byte| value * 10 + i64::from(byte - b'0'))
+        };
+        let year = number(0, 4);
+        let month = number(5, 2);
+        let day = number(8, 2);
+        let year = year - i64::from(month <= 2);
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let month_prime = month + if month > 2 { -3 } else { 9 };
+        let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        let days = era * 146_097 + day_of_era - 719_468;
+        let seconds =
+            days * 86_400 + number(11, 2) * 3_600 + number(14, 2) * 60 + number(17, 2).min(59);
+        let fraction = self
+            .0
+            .get(20..self.0.len().saturating_sub(1))
+            .unwrap_or_default();
+        let mut micros = fraction
+            .bytes()
+            .take(6)
+            .fold(0_i64, |value, byte| value * 10 + i64::from(byte - b'0'));
+        for _ in fraction.len().min(6)..6 {
+            micros *= 10;
+        }
+        seconds * 1_000_000 + micros
+    }
+
     pub(crate) fn now() -> Result<Self, TimestampError> {
         let seconds = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

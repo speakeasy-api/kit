@@ -92,6 +92,8 @@ pub(crate) struct ProviderRegistry {
     current: String,
     #[serde(deserialize_with = "deserialize_profiles")]
     providers: BTreeMap<String, ProviderProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
 }
 
 pub(crate) enum ConfiguredProvider {
@@ -128,12 +130,17 @@ impl fmt::Display for ProviderConfigError {
 impl std::error::Error for ProviderConfigError {}
 
 impl ProviderProfile {
-    pub fn openai(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
-        Self::OpenAi {
+    pub fn openai(
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+    ) -> Result<Self, ProviderConfigError> {
+        validate_credential_endpoint(base_url.as_deref())?;
+        Ok(Self::OpenAi {
             api_key: SecretValue(api_key),
             model: model.unwrap_or_else(default_openai_model),
             base_url,
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -145,8 +152,9 @@ impl ProviderProfile {
         base_url: Option<String>,
         version: Option<String>,
         beta: Option<String>,
-    ) -> Self {
-        Self::Anthropic {
+    ) -> Result<Self, ProviderConfigError> {
+        validate_credential_endpoint(base_url.as_deref())?;
+        Ok(Self::Anthropic {
             api_key: api_key.map(SecretValue),
             auth_token: auth_token.map(SecretValue),
             model,
@@ -154,7 +162,7 @@ impl ProviderProfile {
             base_url,
             version,
             beta,
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -167,8 +175,9 @@ impl ProviderProfile {
         max_completion_tokens: Option<u32>,
         temperature: Option<f32>,
         reasoning_effort: Option<String>,
-    ) -> Self {
-        Self::OpenRouter {
+    ) -> Result<Self, ProviderConfigError> {
+        validate_credential_endpoint(base_url.as_deref())?;
+        Ok(Self::OpenRouter {
             api_key: SecretValue(api_key),
             model: model.unwrap_or_else(default_openrouter_model),
             base_url,
@@ -177,7 +186,7 @@ impl ProviderProfile {
             max_completion_tokens,
             temperature,
             reasoning_effort,
-        }
+        })
     }
 
     pub fn ollama(model: String, base_url: Option<String>) -> Self {
@@ -213,15 +222,21 @@ impl ProviderProfile {
             }
         };
         match self {
-            Self::OpenAi { api_key, model, .. } => {
+            Self::OpenAi {
+                api_key,
+                model,
+                base_url,
+            } => {
                 required("openai api_key", &api_key.0)?;
-                required("openai model", model)
+                required("openai model", model)?;
+                validate_credential_endpoint(base_url.as_deref())
             }
             Self::Anthropic {
                 api_key,
                 auth_token,
                 model,
                 max_tokens,
+                base_url,
                 ..
             } => {
                 if api_key.is_some() == auth_token.is_some() {
@@ -238,9 +253,14 @@ impl ProviderProfile {
                         "anthropic max_tokens must be greater than zero",
                     ));
                 }
-                Ok(())
+                validate_credential_endpoint(base_url.as_deref())
             }
-            Self::OpenRouter { api_key, model, .. } => {
+            Self::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                ..
+            } => {
                 required("openrouter api_key", &api_key.0)?;
                 required("openrouter model", model)?;
                 if let Self::OpenRouter {
@@ -253,7 +273,7 @@ impl ProviderProfile {
                         "openrouter temperature must be finite",
                     ));
                 }
-                Ok(())
+                validate_credential_endpoint(base_url.as_deref())
             }
             Self::Ollama { model, .. } => required("ollama model", model),
         }
@@ -361,6 +381,25 @@ impl ProviderProfile {
     }
 }
 
+fn validate_credential_endpoint(base_url: Option<&str>) -> Result<(), ProviderConfigError> {
+    let Some(base_url) = base_url else {
+        return Ok(());
+    };
+    let endpoint = url::Url::parse(base_url)
+        .map_err(|_| ProviderConfigError::new("credential-bearing endpoint is invalid"))?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(ProviderConfigError::new(
+            "credential-bearing endpoint must use HTTPS",
+        ));
+    }
+    Ok(())
+}
+
 impl ProviderRegistry {
     pub fn new(name: String, profile: ProviderProfile) -> Result<Self, ProviderConfigError> {
         validate_name(&name)?;
@@ -368,6 +407,7 @@ impl ProviderRegistry {
         Ok(Self {
             current: name.clone(),
             providers: BTreeMap::from([(name, profile)]),
+            mcp_servers: Vec::new(),
         })
     }
 
@@ -525,6 +565,10 @@ impl ProviderRegistry {
             .map(|(name, profile)| (name.as_str(), profile))
     }
 
+    pub fn mcp_servers(&self) -> &[crate::protocols::mcp::config::McpServerConfig] {
+        &self.mcp_servers
+    }
+
     pub fn add(
         &mut self,
         name: String,
@@ -569,6 +613,16 @@ impl ProviderRegistry {
                 "current provider profile {:?} does not exist",
                 self.current
             )));
+        }
+        let mut server_ids = std::collections::BTreeSet::new();
+        for server in &self.mcp_servers {
+            server.validate().map_err(ProviderConfigError::new)?;
+            if !server_ids.insert(server.id.as_str()) {
+                return Err(ProviderConfigError::new(format!(
+                    "duplicate MCP server {:?}",
+                    server.id
+                )));
+            }
         }
         Ok(())
     }
@@ -871,12 +925,13 @@ mod tests {
 
     #[test]
     fn every_profile_builds_the_expected_concrete_agentkit_config() {
-        let openai = ProviderProfile::openai(CANARY.into(), None, Some("http://openai".into()));
+        let openai =
+            ProviderProfile::openai(CANARY.into(), None, Some("https://openai".into())).unwrap();
         let ConfiguredProvider::OpenAi { config, credential } = openai.configure().unwrap() else {
             panic!("expected openai")
         };
         assert_eq!(config.model, "gpt-4o");
-        assert_eq!(config.base_url, "http://openai");
+        assert_eq!(config.base_url, "https://openai");
         assert!(!format!("{credential:?}").contains(CANARY));
 
         let anthropic = ProviderProfile::anthropic(
@@ -884,17 +939,18 @@ mod tests {
             Some(CANARY.into()),
             "claude-test".into(),
             123,
-            Some("http://anthropic".into()),
+            Some("https://anthropic".into()),
             Some("test-version".into()),
             Some("one, two".into()),
-        );
+        )
+        .unwrap();
         let ConfiguredProvider::Anthropic { config, credential } = anthropic.configure().unwrap()
         else {
             panic!("expected anthropic")
         };
         assert_eq!(config.model, "claude-test");
         assert_eq!(config.max_tokens, 123);
-        assert_eq!(config.base_url, "http://anthropic");
+        assert_eq!(config.base_url, "https://anthropic");
         assert_eq!(config.anthropic_version, "test-version");
         assert_eq!(config.anthropic_beta, ["one", "two"]);
         assert!(config.api_key.is_none());
@@ -904,19 +960,20 @@ mod tests {
         let openrouter = ProviderProfile::openrouter(
             CANARY.into(),
             None,
-            Some("http://openrouter".into()),
+            Some("https://openrouter".into()),
             Some("kit-test".into()),
             Some("https://kit.test".into()),
             Some(456),
             Some(0.25),
             Some("high".into()),
-        );
+        )
+        .unwrap();
         let ConfiguredProvider::OpenRouter { config, credential } = openrouter.configure().unwrap()
         else {
             panic!("expected openrouter")
         };
         assert_eq!(config.model, "openrouter/auto");
-        assert_eq!(config.base_url, "http://openrouter");
+        assert_eq!(config.base_url, "https://openrouter");
         assert_eq!(config.app_name.as_deref(), Some("kit-test"));
         assert_eq!(config.site_url.as_deref(), Some("https://kit.test"));
         assert_eq!(config.max_completion_tokens, Some(456));
@@ -936,6 +993,41 @@ mod tests {
         for profile in [openai, anthropic, openrouter] {
             assert!(!format!("{profile:?}").contains(CANARY));
         }
+    }
+
+    #[test]
+    fn credential_bearing_provider_constructors_require_https() {
+        assert!(ProviderProfile::openai("key".into(), None, Some("http://openai".into())).is_err());
+        assert!(
+            ProviderProfile::anthropic(
+                Some("key".into()),
+                None,
+                "model".into(),
+                1,
+                Some("http://anthropic".into()),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            ProviderProfile::openrouter(
+                "key".into(),
+                None,
+                Some("http://openrouter".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            ProviderProfile::ollama("model".into(), Some("http://127.0.0.1:11434".into()))
+                .configure()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1055,6 +1147,174 @@ mod tests {
                 .contains("64 KiB")
         );
         assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_contract_loads_typed_mcp_and_rejects_raw_secrets_and_duplicates() {
+        use crate::domain::ids::{PrincipalId, ProjectId, WorkspaceId};
+
+        let root = temporary("mcp-contract");
+        let path = root.join("config.json");
+        let server = serde_json::json!({
+            "id": "docs",
+            "transport": {"kind": "http", "endpoint": "https://example.com/mcp"},
+            "owner": {
+                "principal_id": PrincipalId::generate().unwrap(),
+                "project_id": ProjectId::generate().unwrap(),
+                "workspace_id": WorkspaceId::generate().unwrap()
+            },
+            "source": "mcp.docs",
+            "trust_domain": "example.com",
+            "namespace": "docs",
+            "version": "1",
+            "credential_handle": "env:KIT_MCP_DOCS_TOKEN",
+            "credential_scope": {"kind": "project"},
+            "egress": {"scheme": "https", "host": "example.com", "port": 443},
+            "descriptors": [{
+                "kind": "tool",
+                "remote": "search",
+                "descriptor_digest": format!("sha256:{}", "00".repeat(32)),
+                "effect": "network_egress",
+                "retry_safety": "idempotent",
+                "required_grants": ["network_egress"],
+                "auth_scopes": ["docs.read"],
+                "availability": "available"
+            }]
+        });
+        let document = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [server.clone()]
+        });
+        secure_write(&path, &serde_json::to_vec(&document).unwrap());
+        let loaded = ProviderRegistry::load_from(&path).unwrap().unwrap();
+        assert_eq!(loaded.mcp_servers().len(), 1);
+        assert_eq!(loaded.mcp_servers()[0].id, "docs");
+
+        let mut implicit_scope = server.clone();
+        implicit_scope
+            .as_object_mut()
+            .unwrap()
+            .remove("credential_scope");
+        let invalid = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [implicit_scope]
+        });
+        secure_write(&path, &serde_json::to_vec(&invalid).unwrap());
+        assert!(ProviderRegistry::load_from(&path).is_err());
+
+        let mut plaintext = server.clone();
+        plaintext["transport"]["endpoint"] = serde_json::json!("http://example.com/mcp");
+        plaintext["egress"]["scheme"] = serde_json::json!("http");
+        plaintext["egress"]["port"] = serde_json::json!(80);
+        let invalid = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [plaintext]
+        });
+        secure_write(&path, &serde_json::to_vec(&invalid).unwrap());
+        assert!(ProviderRegistry::load_from(&path).is_err());
+
+        let mut stdio = server.clone();
+        let stdio_profile = crate::executor::profile::ProfileSpec::isolated(
+            crate::executor::profile::TrustTier::TrustedLocal,
+            if cfg!(target_os = "windows") {
+                crate::executor::profile::Platform::Windows
+            } else if cfg!(target_os = "macos") {
+                crate::executor::profile::Platform::MacOs
+            } else {
+                crate::executor::profile::Platform::Linux
+            },
+            if cfg!(target_arch = "aarch64") {
+                crate::executor::profile::Architecture::Aarch64
+            } else {
+                crate::executor::profile::Architecture::X86_64
+            },
+            crate::executor::profile::ResourceLimits::new(
+                10_000,
+                256 * 1024 * 1024,
+                16,
+                16 * 1024 * 1024,
+                64 * 1024 * 1024,
+                64 * 1024 * 1024,
+                16 * 1024 * 1024,
+                30_000,
+            ),
+        );
+        let stdio_profile_digest =
+            crate::executor::profile::ExecutorProfile::new(stdio_profile.clone())
+                .unwrap()
+                .digest()
+                .to_string();
+        stdio["transport"] = serde_json::json!({
+            "kind": "stdio",
+            "owned_process_profile": "mcp-docs",
+            "argv": [std::env::current_exe().unwrap().to_string_lossy()],
+            "profile": stdio_profile,
+            "profile_digest": stdio_profile_digest,
+            "environment": {
+                "MCP_TOKEN": {
+                    "handle": "env:KIT_MCP_STDIO_TOKEN",
+                    "credential_scope": {"kind": "project"}
+                },
+                "MCP_AUX_TOKEN": {
+                    "handle": "env:KIT_MCP_STDIO_AUX_TOKEN",
+                    "credential_scope": {"kind": "project"}
+                }
+            }
+        });
+        let object = stdio.as_object_mut().unwrap();
+        object.remove("credential_handle");
+        object.remove("credential_scope");
+        object.remove("egress");
+        let valid = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [stdio.clone()]
+        });
+        secure_write(&path, &serde_json::to_vec(&valid).unwrap());
+        assert!(ProviderRegistry::load_from(&path).unwrap().is_some());
+
+        let mut unscoped_stdio = stdio.clone();
+        unscoped_stdio["transport"]["environment"]["MCP_TOKEN"] =
+            serde_json::json!({"handle": "env:KIT_MCP_STDIO_TOKEN"});
+        let invalid = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [unscoped_stdio]
+        });
+        secure_write(&path, &serde_json::to_vec(&invalid).unwrap());
+        assert!(ProviderRegistry::load_from(&path).is_err());
+
+        let mut arbitrary_handle = server.clone();
+        arbitrary_handle["credential_handle"] = serde_json::json!("token:secret");
+        let invalid = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [arbitrary_handle]
+        });
+        secure_write(&path, &serde_json::to_vec(&invalid).unwrap());
+        assert!(ProviderRegistry::load_from(&path).is_err());
+
+        let mut raw_secret = server.clone();
+        raw_secret["credential"] = serde_json::json!("raw-token");
+        let invalid = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [raw_secret]
+        });
+        secure_write(&path, &serde_json::to_vec(&invalid).unwrap());
+        assert!(ProviderRegistry::load_from(&path).is_err());
+
+        let duplicate = serde_json::json!({
+            "current": "local",
+            "providers": {"local": {"provider": "ollama", "model": "test"}},
+            "mcp_servers": [server.clone(), server]
+        });
+        secure_write(&path, &serde_json::to_vec(&duplicate).unwrap());
+        assert!(ProviderRegistry::load_from(&path).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

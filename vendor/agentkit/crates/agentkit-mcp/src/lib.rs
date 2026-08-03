@@ -88,7 +88,7 @@ pub use rmcp::model::{
     PromptMessage, PromptMessageContent, PromptMessageRole, ProtocolVersion as McpProtocolVersion,
     RawAudioContent, RawContent, RawEmbeddedResource, RawImageContent,
     RawResource as McpRawResource, RawTextContent, ReadResourceResult, Resource as McpResource,
-    ResourceContents as McpResourceContents,
+    ResourceContents as McpResourceContents, ResourceTemplate as McpResourceTemplate,
     ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Root as McpRoot,
     RootsCapabilities as McpRootsCapabilities, SamplingCapability as McpSamplingCapability,
     SamplingMessage as McpSamplingMessage, SetLevelRequestParams as McpSetLevelRequestParams,
@@ -1656,7 +1656,7 @@ pub struct McpConnection {
     notifications: Mutex<mpsc::Receiver<McpServerNotification>>,
     events: broadcast::Sender<McpServerEvent>,
     handler_config: McpHandlerConfig,
-    capabilities: McpServerCapabilities,
+    capabilities: RwLock<McpServerCapabilities>,
     protocol_version: RwLock<Option<McpProtocolVersion>>,
 }
 
@@ -1756,7 +1756,7 @@ impl McpConnection {
             notifications: Mutex::new(notifications),
             events,
             handler_config,
-            capabilities,
+            capabilities: RwLock::new(capabilities),
             protocol_version: RwLock::new(Some(protocol_version)),
         })
     }
@@ -1790,7 +1790,7 @@ impl McpConnection {
             notifications: Mutex::new(notification_rx),
             events: events_tx,
             handler_config,
-            capabilities,
+            capabilities: RwLock::new(capabilities),
             protocol_version: RwLock::new(Some(protocol_version)),
         })
     }
@@ -1879,7 +1879,7 @@ impl McpConnection {
             notifications: Mutex::new(notifications),
             events,
             handler_config,
-            capabilities,
+            capabilities: RwLock::new(capabilities),
             protocol_version: RwLock::new(protocol_version),
         }
     }
@@ -1893,7 +1893,7 @@ impl McpConnection {
             notifications: notification_rx,
             ..
         } = channels;
-        let (service, _capabilities, protocol_version) = match &config.transport {
+        let (service, capabilities, protocol_version) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(&config, binding, handler).await?
             }
@@ -1905,6 +1905,10 @@ impl McpConnection {
         *self.notifications.lock().await = notification_rx;
         *self.inner.lock().await = service;
         *self.peer.write().expect("MCP peer lock poisoned") = new_peer;
+        *self
+            .capabilities
+            .write()
+            .expect("MCP capabilities lock poisoned") = capabilities;
         *self
             .protocol_version
             .write()
@@ -1922,8 +1926,11 @@ impl McpConnection {
     }
 
     /// Returns the capabilities advertised by the server during `initialize`.
-    pub fn capabilities(&self) -> &McpServerCapabilities {
-        &self.capabilities
+    pub fn capabilities(&self) -> McpServerCapabilities {
+        self.capabilities
+            .read()
+            .expect("MCP capabilities lock poisoned")
+            .clone()
     }
 
     /// Returns the MCP protocol revision negotiated during `initialize`.
@@ -2079,20 +2086,21 @@ impl McpConnection {
 
     /// Discovers tools, resources, and prompts that the server advertised.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
+        let capabilities = self.capabilities();
         let tools = async {
-            match self.capabilities.tools {
+            match capabilities.tools {
                 Some(_) => self.list_tools().await,
                 None => Ok(Vec::new()),
             }
         };
         let resources = async {
-            match self.capabilities.resources {
+            match capabilities.resources {
                 Some(_) => self.list_resources().await,
                 None => Ok(Vec::new()),
             }
         };
         let prompts = async {
-            match self.capabilities.prompts {
+            match capabilities.prompts {
                 Some(_) => self.list_prompts().await,
                 None => Ok(Vec::new()),
             }
@@ -2164,6 +2172,22 @@ impl McpConnection {
             .await
             .map_err(rmcp_service_error)?;
         Ok((result.resources, result.next_cursor))
+    }
+
+    /// Lists exactly one resource-template page.
+    #[cfg(feature = "kit-authorized")]
+    pub async fn list_resource_templates_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpResourceTemplate>, Option<String>), McpError> {
+        let result = self
+            .peer()
+            .list_resource_templates(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.resource_templates, result.next_cursor))
     }
 
     /// Lists all prompts advertised by the connected MCP server.

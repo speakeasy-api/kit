@@ -205,9 +205,14 @@ async fn handle_mcp(State(state): State<MockState>, body: String) -> Response {
         "initialize" => {
             let index = state.initialize_count.fetch_add(1, Ordering::SeqCst);
             let version = state.versions[index.min(state.versions.len() - 1)].clone();
+            let capabilities = if index == 0 {
+                json!({ "tools": { "listChanged": false } })
+            } else {
+                json!({ "resources": { "listChanged": true } })
+            };
             let mut result = json!({
                 "protocolVersion": version,
-                "capabilities": { "tools": {} },
+                "capabilities": capabilities,
                 "serverInfo": { "name": "pin-mock", "version": "0.0.0" }
             });
             if result["protocolVersion"] == "missing" {
@@ -355,6 +360,36 @@ async fn http_reconnect_refuses_revision_downgrade() {
         json!("2025-06-18")
     );
     assert_eq!(state.initialize_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn http_reconnect_replaces_server_capabilities() {
+    let state = MockState::new(&[PIN, PIN]);
+    let addr = spawn_mock(state).await;
+    let connection = McpConnection::connect(&http_config(addr))
+        .await
+        .expect("initial connect succeeds");
+    let initial = connection.capabilities();
+    assert_eq!(initial.tools.unwrap().list_changed, Some(false));
+    assert!(initial.resources.is_none());
+
+    let request = AuthRequest {
+        id: "capability-reauth".into(),
+        provider: "test".into(),
+        operation: AuthOperation::McpConnect {
+            server_id: "pin-http".into(),
+            metadata: MetadataMap::new(),
+        },
+        challenge: MetadataMap::new(),
+    };
+    connection
+        .resolve_auth(AuthResolution::provided(request, MetadataMap::new()))
+        .await
+        .expect("reinitialize succeeds");
+
+    let replaced = connection.capabilities();
+    assert!(replaced.tools.is_none());
+    assert_eq!(replaced.resources.unwrap().list_changed, Some(true));
 }
 
 const STDIO_FAKE_SERVER: &str = r#"

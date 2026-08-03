@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 use kit::{
     api::service::AttemptDriverClaim,
@@ -43,8 +46,8 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
     std::fs::create_dir(&directory).unwrap();
     let mut store = test_support::open_sqlite_store(directory.join("store.sqlite3")).unwrap();
     let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
-    let cancellation = AtomicBool::new(false);
-    let fence = AtomicU64::new(1);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let fence = Arc::new(AtomicU64::new(1));
 
     for descriptor in NativeCatalog::all() {
         let constraints = ArgumentConstraints::new([b"native-bound".as_slice()]);

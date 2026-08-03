@@ -181,6 +181,7 @@ fn harness(route: Route) -> Harness {
         DispatchOutcome::Succeeded(CanonicalOutput {
             media_type: "application/json".to_owned(),
             body: br#"{"ok":true}"#.to_vec(),
+            artifact_digests: Vec::new(),
         }),
     )
 }
@@ -798,6 +799,7 @@ async fn canonical_and_model_facing_outputs_are_bounded() {
         DispatchOutcome::Succeeded(CanonicalOutput {
             media_type: "text/plain".to_owned(),
             body: vec![b'x'; 20 * 1024],
+            artifact_digests: Vec::new(),
         }),
     );
     let outcome = presentation
@@ -824,6 +826,7 @@ async fn canonical_and_model_facing_outputs_are_bounded() {
         DispatchOutcome::Succeeded(CanonicalOutput {
             media_type: "application/octet-stream".to_owned(),
             body: vec![0; 64 * 1024 + 1],
+            artifact_digests: Vec::new(),
         }),
     );
     let outcome = canonical

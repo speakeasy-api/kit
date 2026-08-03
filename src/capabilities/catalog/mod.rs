@@ -4,6 +4,8 @@ use std::{
     sync::Arc,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     agent::accounting::MoneyMicros,
     capabilities::{
@@ -18,10 +20,10 @@ use crate::{
         native::NativeToolDescriptor,
         schema::{JSON_SCHEMA_2020_12, NormalizedSchema, SchemaProjectionSet},
     },
-    domain::config::Grant,
+    domain::{config::Grant, secret::SecretHandle},
 };
 
-pub const CATALOG_FORMAT_VERSION: u16 = 1;
+pub const CATALOG_FORMAT_VERSION: u16 = 4;
 pub const MAX_CATALOG_ENTRIES: usize = 4096;
 pub const MAX_CATALOG_SOURCES: usize = 512;
 pub const MAX_SUMMARY_BYTES: usize = 1024;
@@ -39,6 +41,65 @@ pub enum SourceKind {
     Acp,
     A2a,
     ProviderNative,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    Tool,
+    Resource,
+    ResourceTemplate,
+    Prompt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalTarget {
+    configured_server: Arc<str>,
+    kind: CapabilityKind,
+    remote: Arc<str>,
+    descriptor_digest: Digest,
+}
+
+impl ExternalTarget {
+    pub(crate) fn mcp(
+        configured_server: impl AsRef<str>,
+        kind: CapabilityKind,
+        remote: impl AsRef<str>,
+        descriptor_digest: Digest,
+    ) -> Result<Self, CatalogError> {
+        let configured_server = configured_server.as_ref();
+        let remote = remote.as_ref();
+        validate_text(
+            "configured server",
+            configured_server,
+            MAX_CATALOG_TEXT_BYTES,
+        )?;
+        if remote.is_empty() || remote.len() > 16 * 1024 || remote.chars().any(char::is_control) {
+            return Err(CatalogError::InvalidText("external target"));
+        }
+        Ok(Self {
+            configured_server: Arc::from(configured_server),
+            kind,
+            remote: Arc::from(remote),
+            descriptor_digest,
+        })
+    }
+
+    pub fn configured_server(&self) -> &str {
+        &self.configured_server
+    }
+
+    pub const fn kind(&self) -> CapabilityKind {
+        self.kind
+    }
+
+    pub fn remote(&self) -> &str {
+        &self.remote
+    }
+
+    pub const fn descriptor_digest(&self) -> Digest {
+        self.descriptor_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -93,18 +154,24 @@ impl CatalogSource {
 #[derive(Clone, Debug)]
 pub struct CatalogSchemas {
     input: SchemaProjectionSet,
-    output: SchemaProjectionSet,
+    output: Option<SchemaProjectionSet>,
     digest: Digest,
 }
 
 impl CatalogSchemas {
-    pub fn new(input: SchemaProjectionSet, output: SchemaProjectionSet) -> Self {
+    pub fn new(input: SchemaProjectionSet, output: Option<SchemaProjectionSet>) -> Self {
         let algorithm = input.schema().source().normalized_digest().algorithm();
         let mut canonical = Vec::new();
         canonical.extend_from_slice(b"KIT-CATALOG-SCHEMAS\0");
         canonical.extend_from_slice(&CATALOG_FORMAT_VERSION.to_be_bytes());
         write_projection_set(&mut canonical, &input);
-        write_projection_set(&mut canonical, &output);
+        match &output {
+            Some(output) => {
+                canonical.push(1);
+                write_projection_set(&mut canonical, output);
+            }
+            None => canonical.push(0),
+        }
         let digest = Digest::of(algorithm, &canonical);
         Self {
             input,
@@ -117,8 +184,8 @@ impl CatalogSchemas {
         &self.input
     }
 
-    pub const fn output(&self) -> &SchemaProjectionSet {
-        &self.output
+    pub const fn output(&self) -> Option<&SchemaProjectionSet> {
+        self.output.as_ref()
     }
 
     pub const fn digest(&self) -> Digest {
@@ -203,11 +270,27 @@ impl SideEffects {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogAuthority {
     required_grants: BTreeSet<Grant>,
+    /// External invocation metadata learned after authenticated discovery.
+    /// These scopes never grant or suppress Kit-local discovery authority.
     auth_scopes: BTreeSet<Arc<str>>,
+    credential: Option<SecretHandle>,
 }
 
 impl CatalogAuthority {
     pub fn new<G, I, S>(required_grants: G, auth_scopes: I) -> Result<Self, CatalogError>
+    where
+        G: IntoIterator<Item = Grant>,
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::new_with_credential(required_grants, auth_scopes, None)
+    }
+
+    pub fn new_with_credential<G, I, S>(
+        required_grants: G,
+        auth_scopes: I,
+        credential: Option<SecretHandle>,
+    ) -> Result<Self, CatalogError>
     where
         G: IntoIterator<Item = Grant>,
         I: IntoIterator<Item = S>,
@@ -232,6 +315,7 @@ impl CatalogAuthority {
                 "auth scope",
                 CatalogLimit::AuthScopes,
             )?,
+            credential,
         })
     }
 
@@ -242,9 +326,14 @@ impl CatalogAuthority {
     pub const fn auth_scopes(&self) -> &BTreeSet<Arc<str>> {
         &self.auth_scopes
     }
+
+    pub const fn credential(&self) -> Option<&SecretHandle> {
+        self.credential.as_ref()
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Availability {
     Available,
     Degraded,
@@ -407,6 +496,8 @@ impl CollisionKey {
 pub struct CatalogEntry {
     identity: CapabilityIdentity,
     source: CatalogSource,
+    kind: CapabilityKind,
+    external_target: Option<ExternalTarget>,
     schemas: CatalogSchemas,
     search: CatalogSearch,
     digests: CatalogDigests,
@@ -425,6 +516,69 @@ impl CatalogEntry {
     pub fn new(
         identity: CapabilityIdentity,
         source: CatalogSource,
+        kind: CapabilityKind,
+        schemas: CatalogSchemas,
+        search: CatalogSearch,
+        side_effects: SideEffects,
+        authority: CatalogAuthority,
+        availability: Availability,
+        reliability: ReliabilityStats,
+        latency: LatencyStats,
+        cost: CostStats,
+    ) -> Result<Self, CatalogError> {
+        Self::build(
+            identity,
+            source,
+            kind,
+            None,
+            schemas,
+            search,
+            side_effects,
+            authority,
+            availability,
+            reliability,
+            latency,
+            cost,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_external(
+        identity: CapabilityIdentity,
+        source: CatalogSource,
+        kind: CapabilityKind,
+        external_target: ExternalTarget,
+        schemas: CatalogSchemas,
+        search: CatalogSearch,
+        side_effects: SideEffects,
+        authority: CatalogAuthority,
+        availability: Availability,
+        reliability: ReliabilityStats,
+        latency: LatencyStats,
+        cost: CostStats,
+    ) -> Result<Self, CatalogError> {
+        Self::build(
+            identity,
+            source,
+            kind,
+            Some(external_target),
+            schemas,
+            search,
+            side_effects,
+            authority,
+            availability,
+            reliability,
+            latency,
+            cost,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        identity: CapabilityIdentity,
+        source: CatalogSource,
+        kind: CapabilityKind,
+        external_target: Option<ExternalTarget>,
         schemas: CatalogSchemas,
         search: CatalogSearch,
         side_effects: SideEffects,
@@ -445,15 +599,31 @@ impl CatalogEntry {
         {
             return Err(CatalogError::AuthorityMismatch);
         }
+        if external_target.as_ref().is_some_and(|target| {
+            source.kind != SourceKind::Mcp
+                || target.kind != kind
+                || target.descriptor_digest != identity.implementation_digest()
+        }) {
+            return Err(CatalogError::AuthorityMismatch);
+        }
         let digests = CatalogDigests {
             schema: schemas.digest(),
             implementation: identity.implementation_digest(),
         };
-        let payload_bytes =
-            catalog_entry_payload_bytes(&identity, &source, &schemas, &search, &authority, &cost)?;
+        let payload_bytes = catalog_entry_payload_bytes(
+            &identity,
+            &source,
+            external_target.as_ref(),
+            &schemas,
+            &search,
+            &authority,
+            &cost,
+        )?;
         let mut entry = Self {
             identity,
             source,
+            kind,
+            external_target,
             schemas,
             search,
             digests,
@@ -497,12 +667,13 @@ impl CatalogEntry {
         .map_err(|_| CatalogError::Schema)?;
         let schemas = CatalogSchemas::new(
             SchemaProjectionSet::new(descriptor.normalized_schema().clone()),
-            SchemaProjectionSet::new(output),
+            Some(SchemaProjectionSet::new(output)),
         );
         let search = native_search(descriptor)?;
         Self::new(
             identity,
             source,
+            CapabilityKind::Tool,
             schemas,
             search,
             SideEffects::new(descriptor.effect(), descriptor.retry_safety()),
@@ -523,6 +694,14 @@ impl CatalogEntry {
 
     pub const fn source(&self) -> &CatalogSource {
         &self.source
+    }
+
+    pub const fn kind(&self) -> CapabilityKind {
+        self.kind
+    }
+
+    pub const fn external_target(&self) -> Option<&ExternalTarget> {
+        self.external_target.as_ref()
     }
 
     pub const fn schemas(&self) -> &CatalogSchemas {
@@ -547,6 +726,26 @@ impl CatalogEntry {
 
     pub const fn availability(&self) -> Availability {
         self.availability
+    }
+
+    pub(crate) fn with_availability(
+        &self,
+        availability: Availability,
+    ) -> Result<Self, CatalogError> {
+        Self::build(
+            self.identity.clone(),
+            self.source.clone(),
+            self.kind,
+            self.external_target.clone(),
+            self.schemas.clone(),
+            self.search.clone(),
+            self.side_effects,
+            self.authority.clone(),
+            availability,
+            self.reliability,
+            self.latency,
+            self.cost.clone(),
+        )
     }
 
     pub const fn reliability(&self) -> ReliabilityStats {
@@ -580,6 +779,17 @@ impl CatalogEntry {
     fn write_canonical(&self, output: &mut Vec<u8>) {
         self.identity.write_canonical(output);
         output.push(source_kind_tag(self.source.kind));
+        output.push(capability_kind_tag(self.kind));
+        match &self.external_target {
+            Some(target) => {
+                output.push(1);
+                put_bytes(output, target.configured_server.as_bytes());
+                output.push(capability_kind_tag(target.kind));
+                put_bytes(output, target.remote.as_bytes());
+                put_digest(output, target.descriptor_digest);
+            }
+            None => output.push(0),
+        }
         put_bytes(output, self.source.id.as_str().as_bytes());
         put_bytes(output, self.source.trust_domain.as_str().as_bytes());
         put_digest(output, self.schemas.digest);
@@ -592,6 +802,13 @@ impl CatalogEntry {
             output.push(grant.tag());
         }
         write_text_set(output, &self.authority.auth_scopes);
+        match &self.authority.credential {
+            Some(credential) => {
+                output.push(1);
+                put_bytes(output, credential.identifier().as_bytes());
+            }
+            None => output.push(0),
+        }
         output.push(availability_tag(self.availability));
         output.extend_from_slice(&self.reliability.attempts.to_be_bytes());
         output.extend_from_slice(&self.reliability.succeeded.to_be_bytes());
@@ -702,6 +919,17 @@ impl CatalogSnapshot {
 
     pub fn entries(&self) -> &[Arc<CatalogEntry>] {
         &self.entries
+    }
+
+    pub(crate) fn filtered(
+        &self,
+        include: impl Fn(&CatalogEntry) -> bool,
+    ) -> Result<Self, CatalogError> {
+        Self::from_shared(
+            self.entries.iter().filter(|entry| include(entry)).cloned(),
+            self.digest.algorithm(),
+            BTreeMap::new(),
+        )
     }
 
     pub const fn digest(&self) -> Digest {
@@ -858,6 +1086,7 @@ where
 fn catalog_entry_payload_bytes(
     identity: &CapabilityIdentity,
     source: &CatalogSource,
+    external_target: Option<&ExternalTarget>,
     schemas: &CatalogSchemas,
     search: &CatalogSearch,
     authority: &CatalogAuthority,
@@ -878,9 +1107,18 @@ fn catalog_entry_payload_bytes(
     for text in search.terms().iter().chain(authority.auth_scopes().iter()) {
         add_entry_bytes(&mut total, text.len())?;
     }
+    if let Some(credential) = authority.credential() {
+        add_entry_bytes(&mut total, credential.identifier().len())?;
+    }
+    if let Some(target) = external_target {
+        add_entry_bytes(&mut total, target.configured_server.len())?;
+        add_entry_bytes(&mut total, target.remote.len())?;
+    }
     add_entry_bytes(&mut total, authority.required_grants().len())?;
     add_schema_set_bytes(&mut total, schemas.input())?;
-    add_schema_set_bytes(&mut total, schemas.output())?;
+    if let Some(output) = schemas.output() {
+        add_schema_set_bytes(&mut total, output)?;
+    }
     if let CostStats::Measured {
         minimum,
         maximum,
@@ -1182,6 +1420,15 @@ const fn source_kind_tag(kind: SourceKind) -> u8 {
         SourceKind::Acp => 3,
         SourceKind::A2a => 4,
         SourceKind::ProviderNative => 5,
+    }
+}
+
+const fn capability_kind_tag(kind: CapabilityKind) -> u8 {
+    match kind {
+        CapabilityKind::Tool => 0,
+        CapabilityKind::Resource => 1,
+        CapabilityKind::ResourceTemplate => 2,
+        CapabilityKind::Prompt => 3,
     }
 }
 

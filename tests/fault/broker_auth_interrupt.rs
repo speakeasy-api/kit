@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    },
 };
 
 use kit::{
@@ -182,8 +185,8 @@ impl Inputs {
 
     fn request<'a>(
         &'a self,
-        cancellation: &'a AtomicBool,
-        fence: &'a AtomicU64,
+        cancellation: &'a Arc<AtomicBool>,
+        fence: &'a Arc<AtomicU64>,
     ) -> BrokerInvocation<'a> {
         BrokerInvocation::generic(
             InvocationEnvelope {
@@ -233,8 +236,8 @@ fn broker_auth_interrupt_is_durable_for_exactly_100_restarts() {
 
         let mut store = test_support::open_sqlite_store(database.path()).unwrap();
         store.install_driver_claim_for_test(inputs.claim).unwrap();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
         let mut backend = |_: &AuthorizedInvocation| panic!("challenge phase dispatched");
         assert!(matches!(
@@ -257,8 +260,8 @@ fn broker_auth_interrupt_is_durable_for_exactly_100_restarts() {
         let mut store = test_support::open_sqlite_store(database.path()).unwrap();
         store.install_driver_claim_for_test(inputs.claim).unwrap();
         store.quiesce_driver_claim(inputs.claim).unwrap();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         resolve_auth(
             &inputs.request(&cancellation, &fence),
             &inputs.authenticated,
@@ -271,8 +274,8 @@ fn broker_auth_interrupt_is_durable_for_exactly_100_restarts() {
 
         let mut store = test_support::open_sqlite_store(database.path()).unwrap();
         store.install_driver_claim_for_test(inputs.claim).unwrap();
-        let cancellation = AtomicBool::new(false);
-        let fence = AtomicU64::new(7);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let fence = Arc::new(AtomicU64::new(7));
         let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
         let mut dispatches = 0;
         let mut backend = |_: &AuthorizedInvocation| {
@@ -280,6 +283,7 @@ fn broker_auth_interrupt_is_durable_for_exactly_100_restarts() {
             DispatchOutcome::Succeeded(CanonicalOutput {
                 media_type: "application/json".to_owned(),
                 body: br#"{"bytes":12}"#.to_vec(),
+                artifact_digests: Vec::new(),
             })
         };
         let result = invoke(
@@ -298,6 +302,7 @@ fn broker_auth_interrupt_is_durable_for_exactly_100_restarts() {
                 output: Some(CanonicalOutput {
                     media_type: "application/json".to_owned(),
                     body: br#"{"bytes":12}"#.to_vec(),
+                    artifact_digests: Vec::new(),
                 }),
                 code: None,
                 charged: true,

@@ -9,6 +9,7 @@ publish = false
 external-git-sandbox = []
 
 [dependencies]
+aho-corasick = "=1.1.4"
 agentkit-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-core" }
 agentkit-loop = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-loop" }
 agentkit-mcp = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-mcp", features = ["kit-authorized"] }

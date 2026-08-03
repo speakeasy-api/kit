@@ -590,6 +590,10 @@ async fn input_approval_and_auth_waits_survive_and_require_authenticated_resolut
         kind: WaitingKind::Auth {
             run_id: projection.run_id,
             scope: "provider.read".into(),
+            tool_call_id: None,
+            challenge_kind: kit::agent::driver::waiting::AuthChallengeKind::Provider,
+            challenge_generation: 0,
+            challenge_id: None,
         },
         snapshot: boundary(
             SafeBoundary::BeforeModelDispatch,

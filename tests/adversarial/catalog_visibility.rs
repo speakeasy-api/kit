@@ -7,9 +7,9 @@ use kit::{
     },
     capabilities::{
         catalog::{
-            Availability, CatalogAuthority, CatalogEntry, CatalogSchemas, CatalogSearch,
-            CatalogSnapshot, CatalogSource, CostStats, LatencyStats, ReliabilityStats, SideEffects,
-            SourceKind, TrustDomain,
+            Availability, CapabilityKind, CatalogAuthority, CatalogEntry, CatalogSchemas,
+            CatalogSearch, CatalogSnapshot, CatalogSource, CostStats, LatencyStats,
+            ReliabilityStats, SideEffects, SourceKind, TrustDomain,
         },
         discovery::{BindingExpired, DiscoveryHandle, DiscoverySession},
         kernel::{
@@ -105,6 +105,10 @@ fn schema(canary: &str) -> NormalizedSchema {
 }
 
 fn forbidden_entry(index: usize) -> CatalogEntry {
+    forbidden_entry_of_kind(index, CapabilityKind::Tool)
+}
+
+fn forbidden_entry_of_kind(index: usize, kind: CapabilityKind) -> CatalogEntry {
     let canary = format!("forbidden-{index:03}");
     let source_id = CapabilitySource::new("forbidden-source-canary").unwrap();
     CatalogEntry::new(
@@ -121,9 +125,10 @@ fn forbidden_entry(index: usize) -> CatalogEntry {
             TrustDomain::new("forbidden-trust-canary").unwrap(),
         )
         .unwrap(),
+        kind,
         CatalogSchemas::new(
             SchemaProjectionSet::new(schema(&format!("schema-{canary}"))),
-            SchemaProjectionSet::new(schema("forbidden-output-canary")),
+            Some(SchemaProjectionSet::new(schema("forbidden-output-canary"))),
         ),
         CatalogSearch::new(format!("summary-{canary}"), [format!("term-{canary}")]).unwrap(),
         SideEffects::new(EffectClass::WorkspaceRead, RetrySafety::Idempotent),
@@ -213,7 +218,6 @@ fn catalog_visibility() {
         catalog
             .entries()
             .iter()
-            .filter(|entry| entry.authority().auth_scopes().is_empty())
             .map(|entry| grant(principal_id, project_id, workspace_id, entry)),
         DigestAlgorithm::Sha256,
     );
@@ -251,11 +255,12 @@ fn catalog_visibility() {
     }
     assert!(handle_probes >= 512);
     for index in (1..512).step_by(2) {
-        assert!(
+        assert_eq!(
             privileged
                 .search(&format!("forbidden-{index:03}"), 1)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
     }
 
@@ -274,7 +279,7 @@ fn catalog_visibility() {
         replacement_catalog
             .entries()
             .iter()
-            .filter(|entry| entry.authority().auth_scopes().is_empty())
+            .filter(|entry| entry.identity().name().as_str() != "forbidden-513")
             .map(|entry| grant(principal_id, project_id, workspace_id, entry)),
         DigestAlgorithm::Sha256,
     );
@@ -309,5 +314,62 @@ fn catalog_visibility() {
             RequestExtension::default(),
         );
         assert!(matches!(binding.validate(&changed), Err(BindingExpired)));
+    }
+}
+
+#[test]
+fn five_hundred_unauthorized_probes_per_mcp_kind_reveal_nothing() {
+    let principal_id = PrincipalId::generate().unwrap();
+    let project_id = ProjectId::generate().unwrap();
+    let workspace_id = WorkspaceId::generate().unwrap();
+    let authority = BTreeSet::from([Grant::WorkspaceRead]);
+    let config = config(principal_id, project_id, authority.clone());
+    let authenticated = authenticate(principal_id, project_id, authority);
+    let constraints = ArgumentConstraints::default();
+    for kind in [
+        CapabilityKind::Tool,
+        CapabilityKind::Resource,
+        CapabilityKind::ResourceTemplate,
+        CapabilityKind::Prompt,
+    ] {
+        let catalog =
+            CatalogSnapshot::new([forbidden_entry_of_kind(0, kind)], DigestAlgorithm::Sha256)
+                .unwrap();
+        let denied_grants = CapabilityGrantSnapshot::new(&config, [], DigestAlgorithm::Sha256);
+        let allowed_grants = CapabilityGrantSnapshot::new(
+            &config,
+            catalog
+                .entries()
+                .iter()
+                .map(|entry| grant(principal_id, project_id, workspace_id, entry)),
+            DigestAlgorithm::Sha256,
+        );
+        let denied = DiscoverySession::new(
+            &catalog,
+            &authenticated,
+            &config,
+            &denied_grants,
+            None,
+            workspace_id,
+            project_id,
+            &constraints,
+            RequestExtension::default(),
+        );
+        let allowed = DiscoverySession::new(
+            &catalog,
+            &authenticated,
+            &config,
+            &allowed_grants,
+            None,
+            workspace_id,
+            project_id,
+            &constraints,
+            RequestExtension::default(),
+        );
+        let handle = allowed.search("forbidden-000", 1).unwrap()[0].handle();
+        for _ in 0..500 {
+            assert!(denied.search("forbidden-000", 1).unwrap().is_empty());
+            assert!(denied.inspect(handle).is_none());
+        }
     }
 }

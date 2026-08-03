@@ -1,9 +1,9 @@
 use std::{
     fmt,
-    io::{self, Read},
+    io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -238,6 +238,251 @@ impl PreparedCommandToken {
 
     pub(crate) fn stdio_identity(&self) -> String {
         self.claim.process_id.to_string()
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) struct OwnedStdioChild {
+    reader: Mutex<OwnedStdioReader>,
+    writer: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    lifecycle: Mutex<OwnedStdioLifecycle>,
+}
+
+#[cfg(not(windows))]
+struct OwnedStdioReader {
+    stdout: BufReader<std::process::ChildStdout>,
+    max_frame_bytes: usize,
+}
+
+#[cfg(not(windows))]
+struct OwnedStdioLifecycle {
+    child: Child,
+    stderr: Option<JoinHandle<()>>,
+    record: ProcessRecord,
+    ownership: Ownership,
+    boundary: ProcessTree<Box<dyn BoundaryControl>>,
+    observer: Option<ProcessRegistryRegistration>,
+    registry_terminal: bool,
+    closed: bool,
+}
+
+#[cfg(not(windows))]
+struct ChildReapGuard(Option<Child>);
+
+#[cfg(not(windows))]
+impl Drop for ChildReapGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct OwnedStdioChild;
+
+#[cfg(not(windows))]
+impl OwnedStdioChild {
+    pub(crate) fn spawn_with_environment(
+        mut prepared: PreparedCommandToken,
+        max_frame_bytes: usize,
+        environment: &[(String, crate::domain::secret::SecretLease)],
+    ) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            for (variable, lease) in environment {
+                prepared
+                    .command
+                    .env(variable, std::ffi::OsStr::from_bytes(lease.expose()));
+            }
+        }
+        #[cfg(windows)]
+        for (variable, lease) in environment {
+            let value = std::str::from_utf8(lease.expose()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid MCP stdio environment value",
+                )
+            })?;
+            prepared.command.env(variable, value);
+        }
+        prepared
+            .command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ChildReapGuard(Some(prepared.command.spawn()?));
+        prepared.command.env_clear();
+        let stdin = child
+            .0
+            .as_mut()
+            .expect("spawned child exists")
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("MCP stdio stdin unavailable"))?;
+        let stdout = child
+            .0
+            .as_mut()
+            .expect("spawned child exists")
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("MCP stdio stdout unavailable"))?;
+        let mut stderr = child
+            .0
+            .as_mut()
+            .expect("spawned child exists")
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("MCP stdio stderr unavailable"))?;
+        let stderr = thread::Builder::new()
+            .name("kit-mcp-stderr".to_owned())
+            .spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                while stderr.read(&mut buffer).is_ok_and(|read| read != 0) {}
+                buffer.fill(0);
+            })?;
+        let record = ProcessRecord {
+            claim: prepared.claim,
+            execution_id: child.0.as_ref().expect("spawned child exists").id(),
+            boundary_token: prepared.boundary_token,
+            state: ProcessState::Started,
+        };
+        if let Some(observer) = &prepared.observer {
+            observer.registry.started(observer.context, &record)?;
+        }
+        let child = child.0.take().expect("spawned child exists");
+        Ok(Self {
+            reader: Mutex::new(OwnedStdioReader {
+                stdout: BufReader::new(stdout),
+                max_frame_bytes,
+            }),
+            writer: Arc::new(Mutex::new(Some(stdin))),
+            lifecycle: Mutex::new(OwnedStdioLifecycle {
+                child,
+                stderr: Some(stderr),
+                record,
+                ownership: prepared.ownership.clone(),
+                boundary: prepared.boundary.take().expect("prepared boundary exists"),
+                observer: prepared.observer.take(),
+                registry_terminal: false,
+                closed: false,
+            }),
+        })
+    }
+
+    pub(crate) fn send_frame(&self, frame: &[u8]) -> io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("MCP stdio writer lock poisoned"))?;
+        let stdin = writer.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "MCP stdio process is closed")
+        })?;
+        stdin.write_all(frame)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+
+    pub(crate) fn receive_frame(&self) -> io::Result<Option<Vec<u8>>> {
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| io::Error::other("MCP stdio reader lock poisoned"))?;
+        let mut frame = Vec::new();
+        let max_frame_bytes = reader.max_frame_bytes;
+        let read = reader
+            .stdout
+            .by_ref()
+            .take(
+                u64::try_from(max_frame_bytes)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(2),
+            )
+            .read_until(b'\n', &mut frame)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if frame.last() == Some(&b'\n') {
+            frame.pop();
+            if frame.last() == Some(&b'\r') {
+                frame.pop();
+            }
+        }
+        if frame.len() > max_frame_bytes {
+            frame.fill(0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP stdio frame exceeds bound",
+            ));
+        }
+        Ok(Some(frame))
+    }
+
+    pub(crate) fn close_and_reap(&self) -> io::Result<()> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("MCP stdio lifecycle lock poisoned"))?;
+        if lifecycle.closed {
+            return Ok(());
+        }
+        self.writer
+            .lock()
+            .map_err(|_| io::Error::other("MCP stdio writer lock poisoned"))?
+            .take();
+        let deadline = cleanup_deadline();
+        let ownership = lifecycle.ownership.clone();
+        let mut error = lifecycle
+            .boundary
+            .cancel(&ownership, deadline)
+            .err()
+            .map(|error| io::Error::other(error.to_string()));
+        if let Err(kill) = lifecycle.child.kill()
+            && kill.kind() != io::ErrorKind::InvalidInput
+        {
+            error.get_or_insert(kill);
+        }
+        match lifecycle.child.wait() {
+            Ok(status) => lifecycle.record.state = exit_state(status),
+            Err(wait) => {
+                error.get_or_insert(wait);
+            }
+        }
+        if let Some(stderr) = lifecycle.stderr.take()
+            && stderr.join().is_err()
+        {
+            error.get_or_insert_with(|| io::Error::other("MCP stderr drain panicked"));
+        }
+        if !lifecycle.registry_terminal
+            && let Some(observer) = &lifecycle.observer
+        {
+            let result = if error.is_none() {
+                observer
+                    .registry
+                    .exited(observer.context, &lifecycle.record)
+            } else {
+                observer
+                    .registry
+                    .outcome_unknown(observer.context, lifecycle.record.process_id())
+            };
+            lifecycle.registry_terminal = result.is_ok();
+            if let Err(registry) = result {
+                error.get_or_insert(registry);
+            }
+        }
+        if error.is_none() {
+            lifecycle.closed = true;
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for OwnedStdioChild {
+    fn drop(&mut self) {
+        let _ = self.close_and_reap();
     }
 }
 
@@ -2750,6 +2995,37 @@ mod tests {
     }
 
     static CUSTODY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_environment_secret_exists_only_in_spawned_child() {
+        let variable =
+            format!("KIT_MCP_CHILD_ONLY_{}", ProcessId::generate().unwrap()).replace('-', "_");
+        assert!(std::env::var_os(&variable).is_none());
+        let owner = ProcessOwnership::DaemonService(DaemonServiceId::generate().unwrap());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &format!("printf '%s\\n' \"${variable}\"")]);
+        let token = PreparedCommandToken::issue(
+            command,
+            owner,
+            TestBoundary::new(Arc::new(Mutex::new(Vec::new()))),
+            |_: &PersistedBoundary| Ok(()),
+            Instant::now() + Duration::from_secs(2),
+            limits(256),
+        )
+        .unwrap();
+        let environment = [(
+            variable.clone(),
+            crate::domain::secret::SecretLease::new(b"child-only-canary".to_vec()),
+        )];
+        let child = OwnedStdioChild::spawn_with_environment(token, 256, &environment).unwrap();
+        assert_eq!(
+            child.receive_frame().unwrap().unwrap(),
+            b"child-only-canary"
+        );
+        child.close_and_reap().unwrap();
+        assert!(std::env::var_os(variable).is_none());
+    }
 
     #[cfg(unix)]
     #[test]
