@@ -374,7 +374,9 @@ impl UsageEnvelope {
         };
         let debited = matches!(
             reservation.status(),
-            ReservationStatus::Debited | ReservationStatus::Reconciled
+            ReservationStatus::Debited
+                | ReservationStatus::Reconciled
+                | ReservationStatus::ActualOverage
         );
         let released = reservation.status() == ReservationStatus::Released;
         if (!debited && !released) || charged != debited {
@@ -690,4 +692,37 @@ fn add_cost(left: &CategoryCost, right: &CategoryCost) -> Result<CategoryCost, A
 fn add(left: u64, right: u64) -> Result<u64, AccountingError> {
     left.checked_add(right)
         .ok_or(AccountingError::UsageOverflow)
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use agentkit_core::{TokenUsage, Usage};
+
+    use super::*;
+
+    #[test]
+    fn accounting_consumes_each_normalized_provider_category_once() {
+        let provider = Usage::new(
+            TokenUsage::new(50, 25)
+                .with_cached_input_tokens(30)
+                .with_cache_write_input_tokens(20)
+                .with_reasoning_tokens(15),
+        );
+        let canonical = from_agentkit_usage(&provider);
+        let envelope = UsageEnvelope::from_model_usage(
+            Some(&canonical),
+            &LogicalModelUsage::default(),
+            ModelOutcome::Succeeded,
+            true,
+            SpeculationOutcome::None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(envelope.categories.uncached_input.billed_tokens, Some(50));
+        assert_eq!(envelope.categories.cache_read.billed_tokens, Some(30));
+        assert_eq!(envelope.categories.cache_write.billed_tokens, Some(20));
+        assert_eq!(envelope.categories.visible_output.billed_tokens, Some(25));
+        assert_eq!(envelope.categories.reasoning.billed_tokens, Some(15));
+    }
 }

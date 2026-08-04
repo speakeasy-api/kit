@@ -140,6 +140,27 @@ pub const ROUTES: &[RouteDescriptor] = &[
         false,
     ),
     route(
+        "GET",
+        "/v1/projects/{project_id}/mcp-callbacks",
+        "mcp_callback.pending",
+        false,
+        false,
+    ),
+    route(
+        "GET",
+        "/v1/mcp-callbacks/{mcp_callback_id}",
+        "mcp_callback.get",
+        false,
+        false,
+    ),
+    route(
+        "POST",
+        "/v1/mcp-callbacks/{mcp_callback_id}/resolve",
+        "mcp_callback.resolve",
+        true,
+        false,
+    ),
+    route(
         "POST",
         "/v1/runs/{run_id}/auth/resolve",
         "auth.resolve",

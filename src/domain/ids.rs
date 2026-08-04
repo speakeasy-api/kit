@@ -204,5 +204,6 @@ typed_id!(ApprovalId, "approval");
 typed_id!(CheckpointId, "checkpoint");
 typed_id!(ArtifactId, "artifact");
 typed_id!(ExperimentId, "experiment");
+typed_id!(McpCallbackId, "mcp_callback");
 typed_id!(CommandId, "cmd");
 typed_id!(EventId, "evt");

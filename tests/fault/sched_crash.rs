@@ -176,3 +176,41 @@ fn restart_preserves_attempt_fence_and_prevents_double_debit() {
     ));
     assert_eq!(restarted.totals(run).unwrap().committed, reservation.spend);
 }
+
+#[test]
+fn restart_preserves_known_debited_callback_usage() {
+    let db = TestDb::new();
+    let principal = PrincipalId::generate().unwrap();
+    let run = RunId::generate().unwrap();
+    let scheduler = open_scheduler(&db.path);
+    scheduler
+        .register_run(run, principal, "callback-run")
+        .unwrap();
+    scheduler.admit_run(run).unwrap();
+    let id = ReservationId::new(41);
+    scheduler
+        .reserve(&ReservationRequest {
+            id,
+            run_id: run,
+            principal_id: principal,
+            attempt: None,
+            idempotency_key: "callback-41".to_owned(),
+            kind: AdmissionKind::Callback,
+            spend: Spend::new(0, 0, 1, 0, 0),
+        })
+        .unwrap();
+    scheduler.mark_dispatched(id).unwrap();
+    scheduler.debit(id).unwrap();
+    drop(scheduler);
+
+    let restarted = open_scheduler(&db.path);
+    assert_eq!(restarted.reconcile_startup().unwrap().dispatched_unknown, 0);
+    assert_eq!(
+        restarted.snapshot(id).unwrap().status(),
+        ReservationStatus::Debited
+    );
+    assert_eq!(
+        restarted.totals(run).unwrap().committed,
+        Spend::new(0, 0, 1, 0, 0)
+    );
+}

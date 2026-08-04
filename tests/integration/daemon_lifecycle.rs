@@ -1000,6 +1000,7 @@ fn assert_stale_stream_fence(database: &std::path::Path, correlation: EffectCorr
         available_tools: Vec::new(),
         cache: None,
         structured_output: None,
+        generation: Default::default(),
         metadata: agentkit_core::MetadataMap::new(),
     };
     request.metadata.insert(

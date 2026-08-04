@@ -116,6 +116,8 @@ fn projection_value(projection: QueryProjection) -> Result<Value, ClientError> {
         QueryProjection::Attempt(value) => json!(value),
         QueryProjection::Approvals(value) => json!({ "items": value }),
         QueryProjection::AuthRequests(value) => json!({ "items": value }),
+        QueryProjection::McpCallbacks(value) => json!({ "items": value }),
+        QueryProjection::McpCallback(value) => json!(value),
         QueryProjection::ArtifactMetadata(value) => json!(value),
         QueryProjection::Capabilities(value) => json!({ "items": value }),
         QueryProjection::CursorStatus(value) => json!({

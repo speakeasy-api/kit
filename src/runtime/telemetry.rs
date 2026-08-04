@@ -544,6 +544,47 @@ impl<R: ArtifactService> ArtifactService for InstrumentedRuntime<'_, R> {
     fn metadata_registered(&self, metadata: &crate::api::service::ArtifactMetadataProjection) {
         self.inner.metadata_registered(metadata);
     }
+
+    fn store_mcp_callback_content(
+        &self,
+        principal_id: PrincipalId,
+        project_id: ProjectId,
+        run_id: crate::domain::ids::RunId,
+        callback_id: crate::domain::ids::McpCallbackId,
+        idempotency_key: &crate::store::sqlite::idempotency::IdempotencyKey,
+        bytes: &[u8],
+        expires_at_unix_micros: i64,
+    ) -> Result<crate::domain::mcp_callback::McpCallbackArtifactRef, ServiceError> {
+        self.inner.store_mcp_callback_content(
+            principal_id,
+            project_id,
+            run_id,
+            callback_id,
+            idempotency_key,
+            bytes,
+            expires_at_unix_micros,
+        )
+    }
+
+    fn mcp_callback_revision_live(&self, revision: &str) -> bool {
+        self.inner.mcp_callback_revision_live(revision)
+    }
+
+    fn mcp_callback_content_public(
+        &self,
+        callback: &crate::domain::mcp_callback::McpCallbackProjection,
+        content: &serde_json::Value,
+    ) -> bool {
+        self.inner.mcp_callback_content_public(callback, content)
+    }
+
+    fn with_mcp_callback_revision<T>(
+        &self,
+        revision: &str,
+        commit: impl FnOnce(&str) -> Result<T, ServiceError>,
+    ) -> Result<T, ServiceError> {
+        self.inner.with_mcp_callback_revision(revision, commit)
+    }
 }
 
 fn otel_trace_id(source: &str) -> String {

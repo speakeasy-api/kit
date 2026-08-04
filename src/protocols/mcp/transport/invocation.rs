@@ -17,7 +17,9 @@ use crate::{
         schema::SchemaValidation,
     },
     domain::events::ArtifactRef,
-    store::artifacts::{ArtifactDigest, ArtifactError, ArtifactReference, ArtifactStore},
+    store::artifacts::{
+        ArtifactDigest, ArtifactError, ArtifactPublication, ArtifactReference, ArtifactStore,
+    },
 };
 
 const MAX_INLINE_PRESENTATION_BYTES: usize = 8 * 1024;
@@ -187,6 +189,7 @@ pub(super) struct NormalizedMcpResult {
     canonical: Arc<CanonicalResult>,
     presentation: Presentation,
     artifact_digest: ArtifactRef,
+    publication: ArtifactPublication,
 }
 
 impl NormalizedMcpResult {
@@ -216,6 +219,10 @@ impl NormalizedMcpResult {
 
     pub(crate) const fn presentation(&self) -> &Presentation {
         &self.presentation
+    }
+
+    pub(crate) const fn publication(&self) -> &ArtifactPublication {
+        &self.publication
     }
 }
 
@@ -309,14 +316,15 @@ pub(crate) fn normalize_invocation_result(
         McpTypedResult::Resource(_) | McpTypedResult::Prompt(_) => None,
     };
 
-    let payload_digest = ArtifactDigest::digest(&payload_bytes);
+    let envelope_bytes = authority.artifact_binding().seal(&payload_bytes)?;
+    let payload_digest = ArtifactDigest::digest(&envelope_bytes);
     let payload_reference = result_reference(authority.provenance(), payload_digest);
-    let payload_artifact = artifacts.put_with_reference(
-        &payload_bytes,
+    let payload_artifact = artifacts.stage_publication(
+        &envelope_bytes,
         authority.metadata().clone(),
         payload_reference,
     )?;
-    if payload_artifact.digest() != ArtifactDigest::digest(&payload_bytes) {
+    if payload_artifact.digest() != ArtifactDigest::digest(&envelope_bytes) {
         return Err(McpResultError::Artifact(ArtifactError::DigestMismatch(
             payload_artifact.digest(),
         )));
@@ -349,6 +357,7 @@ pub(crate) fn normalize_invocation_result(
         canonical,
         presentation,
         artifact_digest,
+        publication: payload_artifact,
     })
 }
 

@@ -173,6 +173,105 @@ pub struct ArtifactMetadata {
     pub stored_at_unix_micros: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactEnvelopeBinding {
+    pub principal: String,
+    pub project: String,
+    pub run: String,
+    pub purpose: String,
+    pub invocation_id: Option<String>,
+    pub callback_id: Option<String>,
+}
+
+impl ArtifactEnvelopeBinding {
+    fn validate(&self) -> Result<(), ArtifactError> {
+        if !valid_field(&self.principal, 128)
+            || !valid_field(&self.project, 128)
+            || !valid_field(&self.run, 128)
+            || !valid_field(&self.purpose, 128)
+            || self.invocation_id.is_some() == self.callback_id.is_some()
+            || self
+                .invocation_id
+                .as_deref()
+                .or(self.callback_id.as_deref())
+                .is_none_or(|id| !valid_field(id, 256))
+        {
+            return Err(ArtifactError::InvalidManifest(
+                "invalid artifact envelope binding",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn seal(&self, payload: &[u8]) -> Result<Vec<u8>, ArtifactError> {
+        self.validate()?;
+        let mut bytes = b"kit-artifact-envelope-v1\0".to_vec();
+        for field in [
+            self.principal.as_bytes(),
+            self.project.as_bytes(),
+            self.run.as_bytes(),
+            self.purpose.as_bytes(),
+            self.invocation_id.as_deref().unwrap_or("").as_bytes(),
+            self.callback_id.as_deref().unwrap_or("").as_bytes(),
+            payload,
+        ] {
+            bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(field);
+        }
+        Ok(bytes)
+    }
+
+    pub fn open<'a>(&self, envelope: &'a [u8]) -> Result<&'a [u8], ArtifactError> {
+        self.validate()?;
+        let mut rest = envelope.strip_prefix(b"kit-artifact-envelope-v1\0").ok_or(
+            ArtifactError::InvalidManifest("unknown artifact envelope version"),
+        )?;
+        let mut fields = Vec::with_capacity(7);
+        for _ in 0..7 {
+            let length = rest
+                .get(..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .and_then(|length| usize::try_from(length).ok())
+                .ok_or(ArtifactError::InvalidManifest(
+                    "invalid artifact envelope length",
+                ))?;
+            rest = &rest[8..];
+            let (field, remaining) =
+                rest.split_at_checked(length)
+                    .ok_or(ArtifactError::InvalidManifest(
+                        "truncated artifact envelope",
+                    ))?;
+            fields.push(field);
+            rest = remaining;
+        }
+        if !rest.is_empty()
+            || fields[..6]
+                != [
+                    self.principal.as_bytes(),
+                    self.project.as_bytes(),
+                    self.run.as_bytes(),
+                    self.purpose.as_bytes(),
+                    self.invocation_id.as_deref().unwrap_or("").as_bytes(),
+                    self.callback_id.as_deref().unwrap_or("").as_bytes(),
+                ]
+        {
+            return Err(ArtifactError::InvalidManifest(
+                "artifact envelope binding mismatch",
+            ));
+        }
+        Ok(fields[6])
+    }
+
+    pub(crate) fn matches(&self, envelope: &[u8]) -> Result<bool, ArtifactError> {
+        match self.open(envelope) {
+            Ok(_) => Ok(true),
+            Err(ArtifactError::InvalidManifest(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl ArtifactMetadata {
     pub fn new(
         media_type: impl Into<String>,
@@ -516,6 +615,27 @@ pub struct StagedArtifact<'a> {
     object_temp: PathBuf,
     manifest_temp: PathBuf,
     complete: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArtifactPublication {
+    reference: ArtifactReference,
+    digest: ArtifactDigest,
+    manifest: ArtifactManifest,
+}
+
+impl ArtifactPublication {
+    pub fn reference(&self) -> ArtifactReference {
+        self.reference
+    }
+
+    pub fn digest(&self) -> ArtifactDigest {
+        self.digest
+    }
+
+    pub fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
 }
 
 pub struct PendingArtifact<'a> {
@@ -875,6 +995,398 @@ impl ArtifactStore {
         metadata: ArtifactMetadata,
     ) -> Result<VerifiedArtifact, ArtifactError> {
         self.stage(bytes, metadata)?.promote()
+    }
+
+    pub fn stage_publication(
+        &self,
+        bytes: &[u8],
+        metadata: ArtifactMetadata,
+        reference: ArtifactReference,
+    ) -> Result<ArtifactPublication, ArtifactError> {
+        metadata.validate()?;
+        if !metadata.retention.blocks_at(now_unix_micros()?) {
+            return Err(ArtifactError::InvalidManifest(
+                "expired artifact publication",
+            ));
+        }
+        self.check_layout()?;
+        let digest = ArtifactDigest::digest(bytes);
+        let manifest = ArtifactManifest {
+            size: bytes.len() as u64,
+            media_type: metadata.media_type,
+            class: metadata.class,
+            principal: metadata.principal,
+            project: metadata.project,
+            retention: metadata.retention,
+            stored_at_unix_micros: metadata.stored_at_unix_micros,
+        };
+        let publication = ArtifactPublication {
+            reference,
+            digest,
+            manifest,
+        };
+        let path = self.publication_stage_path(reference)?;
+        let record = publication_stage_bytes(&publication, bytes);
+        let _guard = self
+            .reference_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if path.exists() {
+            if read_regular_file_bounded(&path, record.len())? == record {
+                return Ok(publication);
+            }
+            return Err(ArtifactError::InvalidManifest(
+                "artifact publication stage collision",
+            ));
+        }
+        let temp = self.temp_path("publication-stage");
+        let result = (|| {
+            let mut file = secure_create_new(&temp)?;
+            file.write_all(&record)?;
+            file.sync_all()?;
+            rename_until(&temp, &path, None)?;
+            sync_directory(path.parent().expect("publication stage has parent"))
+        })();
+        if result.is_err() {
+            let _ = self.quarantine_remove_file(&temp, None, None);
+        }
+        result.map(|()| publication)
+    }
+
+    pub fn promote_publication(
+        &self,
+        publication: &ArtifactPublication,
+    ) -> Result<VerifiedArtifact, ArtifactError> {
+        if !publication.manifest.retention.blocks_at(now_unix_micros()?) {
+            return Err(ArtifactError::InvalidManifest(
+                "expired artifact publication",
+            ));
+        }
+        let path = self.publication_stage_path(publication.reference)?;
+        let maximum = usize::try_from(publication.manifest.size)
+            .ok()
+            .and_then(|size| size.checked_add(8192))
+            .ok_or(ArtifactError::TooLarge {
+                size: publication.manifest.size,
+                max: usize::MAX as u64,
+            })?;
+        let bytes = read_regular_file_bounded(&path, maximum)?;
+        let (found, payload) = decode_publication_stage(&bytes)?;
+        if found.reference != publication.reference
+            || found.digest != publication.digest
+            || found.manifest != publication.manifest
+            || ArtifactDigest::digest(payload) != publication.digest
+        {
+            return Err(ArtifactError::InvalidManifest(
+                "artifact publication stage binding mismatch",
+            ));
+        }
+        let metadata = ArtifactMetadata::new(
+            publication.manifest.media_type.clone(),
+            publication.manifest.class,
+            publication.manifest.principal.clone(),
+            publication.manifest.project.clone(),
+            publication.manifest.retention,
+            publication.manifest.stored_at_unix_micros,
+        )?;
+        let artifact = self.put_with_reference(payload, metadata, publication.reference)?;
+        self.remove_publication_stage(publication.reference)?;
+        Ok(artifact)
+    }
+
+    pub fn publication(
+        &self,
+        reference: ArtifactReference,
+        digest: ArtifactDigest,
+    ) -> Result<ArtifactPublication, ArtifactError> {
+        let publication = self.staged_publication(reference)?;
+        let bytes =
+            read_regular_file_bounded(&self.publication_stage_path(reference)?, 64 * 1024 * 1024)?;
+        let (_, payload) = decode_publication_stage(&bytes)?;
+        if publication.reference != reference
+            || publication.digest != digest
+            || ArtifactDigest::digest(payload) != digest
+        {
+            return Err(ArtifactError::InvalidManifest(
+                "artifact publication journal binding mismatch",
+            ));
+        }
+        Ok(publication)
+    }
+
+    pub fn staged_publication(
+        &self,
+        reference: ArtifactReference,
+    ) -> Result<ArtifactPublication, ArtifactError> {
+        let bytes =
+            read_regular_file_bounded(&self.publication_stage_path(reference)?, 64 * 1024 * 1024)?;
+        let (publication, payload) = decode_publication_stage(&bytes)?;
+        if publication.reference != reference
+            || ArtifactDigest::digest(payload) != publication.digest
+        {
+            return Err(ArtifactError::InvalidManifest(
+                "artifact publication stage binding mismatch",
+            ));
+        }
+        Ok(publication)
+    }
+
+    pub fn read_staged_publication(
+        &self,
+        publication: &ArtifactPublication,
+        binding: &ArtifactEnvelopeBinding,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<u8>, ArtifactError> {
+        let maximum = max_payload_bytes
+            .checked_add(16 * 1024)
+            .ok_or(ArtifactError::TooLarge {
+                size: u64::MAX,
+                max: max_payload_bytes as u64,
+            })?;
+        let bytes = read_regular_file_bounded(
+            &self.publication_stage_path(publication.reference)?,
+            maximum,
+        )?;
+        let (found, envelope) = decode_publication_stage(&bytes)?;
+        if found.reference != publication.reference
+            || found.digest != publication.digest
+            || found.manifest != publication.manifest
+        {
+            return Err(ArtifactError::InvalidManifest(
+                "artifact publication stage binding mismatch",
+            ));
+        }
+        let payload = binding.open(envelope)?;
+        if payload.len() > max_payload_bytes {
+            return Err(ArtifactError::TooLarge {
+                size: payload.len() as u64,
+                max: max_payload_bytes as u64,
+            });
+        }
+        Ok(payload.to_vec())
+    }
+
+    pub fn remove_publication_stage(
+        &self,
+        reference: ArtifactReference,
+    ) -> Result<bool, ArtifactError> {
+        self.quarantine_remove_file(&self.publication_stage_path(reference)?, None, None)
+    }
+
+    pub(crate) fn callback_references(
+        &self,
+        principal: &str,
+        project: &str,
+        run: &str,
+        callback_id: &str,
+    ) -> Result<Vec<ArtifactReference>, ArtifactError> {
+        let mut references = BTreeSet::new();
+        for reference in self.staged_publications()? {
+            let bytes = read_regular_file_bounded(
+                &self.publication_stage_path(reference)?,
+                64 * 1024 * 1024,
+            )?;
+            let (publication, envelope) = decode_publication_stage(&bytes)?;
+            if publication.manifest.principal == principal
+                && publication.manifest.project == project
+                && callback_binding(principal, project, run, callback_id).matches(envelope)?
+            {
+                references.insert(reference);
+            }
+        }
+        for shard in fs::read_dir(self.root.join("records"))? {
+            let shard = shard?;
+            let Some(shard_name) = shard.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !fs::symlink_metadata(shard.path())?.file_type().is_dir()
+                || !valid_hex(&shard_name, 2)
+            {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path())? {
+                let entry = entry?;
+                let Some(rest) = entry.file_name().to_str().and_then(|name| {
+                    name.strip_suffix(".reference")
+                        .or_else(|| name.strip_suffix(".pending"))
+                        .map(str::to_owned)
+                }) else {
+                    continue;
+                };
+                if !valid_hex(&rest, 62)
+                    || !fs::symlink_metadata(entry.path())?.file_type().is_file()
+                {
+                    continue;
+                }
+                let record = ArtifactReferenceManifest::decode(&read_regular_file_bounded(
+                    &entry.path(),
+                    8192,
+                )?)?;
+                if record.artifact.principal != principal || record.artifact.project != project {
+                    continue;
+                }
+                let Ok(envelope) = self.open_bytes_bounded(record.digest, 64 * 1024 * 1024) else {
+                    continue;
+                };
+                if callback_binding(principal, project, run, callback_id).matches(&envelope)? {
+                    references.insert(ArtifactReference::parse(&format!(
+                        "artifact-ref:{shard_name}{rest}"
+                    ))?);
+                }
+            }
+        }
+        Ok(references.into_iter().collect())
+    }
+
+    pub(crate) fn erase_owned_reference(
+        &self,
+        reference: ArtifactReference,
+        principal: &str,
+        project: &str,
+    ) -> Result<(), ArtifactError> {
+        let _guard = self
+            .reference_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut digests = BTreeSet::new();
+        let stage_path = self.publication_stage_path(reference)?;
+        if stage_path.exists() {
+            let bytes = read_regular_file_bounded(&stage_path, 64 * 1024 * 1024)?;
+            let (publication, _) = decode_publication_stage(&bytes)?;
+            if publication.manifest.principal != principal
+                || publication.manifest.project != project
+            {
+                return Err(ArtifactError::AccessDenied);
+            }
+            digests.insert(publication.digest);
+            self.quarantine_remove_file(&stage_path, None, None)?;
+        }
+        for path in [
+            self.pending_reference_manifest_path(reference)?,
+            self.reference_manifest_path(reference)?,
+        ] {
+            if path.exists() {
+                let record =
+                    ArtifactReferenceManifest::decode(&read_regular_file_bounded(&path, 8192)?)?;
+                if record.artifact.principal != principal || record.artifact.project != project {
+                    return Err(ArtifactError::AccessDenied);
+                }
+                digests.insert(record.digest);
+                self.quarantine_remove_file(&path, None, None)?;
+            }
+        }
+        for digest in digests {
+            if self.any_reference_manifest(digest)? || self.has_persistent_owner(digest)? {
+                continue;
+            }
+            for path in [
+                self.object_path(digest)?,
+                self.manifest_path(digest)?,
+                self.pending_manifest_path(digest)?,
+                self.issued_path(digest)?,
+            ] {
+                self.quarantine_remove_file(&path, None, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn erase_callback_reference(
+        &self,
+        reference: ArtifactReference,
+        binding: &ArtifactEnvelopeBinding,
+    ) -> Result<bool, ArtifactError> {
+        let _guard = self
+            .reference_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stage_path = self.publication_stage_path(reference)?;
+        let mut found = false;
+        if stage_path.exists() {
+            let bytes = read_regular_file_bounded(&stage_path, 64 * 1024 * 1024)?;
+            let (publication, envelope) = decode_publication_stage(&bytes)?;
+            if publication.manifest.principal != binding.principal
+                || publication.manifest.project != binding.project
+                || !binding.matches(envelope)?
+            {
+                return Ok(false);
+            }
+            found = true;
+        }
+        for path in [
+            self.pending_reference_manifest_path(reference)?,
+            self.reference_manifest_path(reference)?,
+        ] {
+            if path.exists() {
+                let record =
+                    ArtifactReferenceManifest::decode(&read_regular_file_bounded(&path, 8192)?)?;
+                if record.artifact.principal != binding.principal
+                    || record.artifact.project != binding.project
+                {
+                    return Ok(false);
+                }
+                let envelope = self.open_bytes_bounded(record.digest, 64 * 1024 * 1024)?;
+                if !binding.matches(&envelope)? {
+                    return Ok(false);
+                }
+                found = true;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+        let mut digests = BTreeSet::new();
+        if stage_path.exists() {
+            let bytes = read_regular_file_bounded(&stage_path, 64 * 1024 * 1024)?;
+            let (publication, _) = decode_publication_stage(&bytes)?;
+            digests.insert(publication.digest);
+            self.quarantine_remove_file(&stage_path, None, None)?;
+        }
+        for path in [
+            self.pending_reference_manifest_path(reference)?,
+            self.reference_manifest_path(reference)?,
+        ] {
+            if path.exists() {
+                let record =
+                    ArtifactReferenceManifest::decode(&read_regular_file_bounded(&path, 8192)?)?;
+                digests.insert(record.digest);
+                self.quarantine_remove_file(&path, None, None)?;
+            }
+        }
+        for digest in digests {
+            if self.any_reference_manifest(digest)? || self.has_persistent_owner(digest)? {
+                continue;
+            }
+            for path in [
+                self.object_path(digest)?,
+                self.manifest_path(digest)?,
+                self.pending_manifest_path(digest)?,
+                self.issued_path(digest)?,
+            ] {
+                self.quarantine_remove_file(&path, None, None)?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn staged_publications(&self) -> Result<Vec<ArtifactReference>, ArtifactError> {
+        let mut publications = Vec::new();
+        for entry in fs::read_dir(self.root.join("staging"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(hex) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("publication-"))
+                .and_then(|name| name.strip_suffix(".stage"))
+            else {
+                continue;
+            };
+            if fs::symlink_metadata(entry.path())?.file_type().is_file() && valid_hex(hex, 64) {
+                publications.push(ArtifactReference::parse(&format!("artifact-ref:{hex}"))?);
+            }
+        }
+        publications.sort_unstable();
+        Ok(publications)
     }
 
     pub(crate) fn put_with_reference(
@@ -1465,6 +1977,20 @@ impl ArtifactStore {
     ) -> Result<(), ArtifactError> {
         let pending = self.pending_reference_manifest_path(reference)?;
         let published = self.reference_manifest_path(reference)?;
+        if published.exists() {
+            if read_regular_file_bounded_until(&pending, 8192, deadline)?
+                != read_regular_file_bounded_until(&published, 8192, deadline)?
+            {
+                return Err(ArtifactError::InvalidManifest(
+                    "artifact reference collision",
+                ));
+            }
+            self.quarantine_remove_file(&pending, None, deadline)?;
+            return sync_directory_until(
+                published.parent().expect("reference has parent"),
+                deadline,
+            );
+        }
         rename_until(&pending, &published, deadline)?;
         sync_directory_until(published.parent().expect("reference has parent"), deadline)
     }
@@ -2226,6 +2752,15 @@ impl ArtifactStore {
         Ok(path)
     }
 
+    fn publication_stage_path(
+        &self,
+        reference: ArtifactReference,
+    ) -> Result<PathBuf, ArtifactError> {
+        let staging = self.root.join("staging");
+        check_directory(&staging)?;
+        Ok(staging.join(format!("publication-{}.stage", reference.hex())))
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -2428,6 +2963,90 @@ impl ArtifactStore {
         self.root
             .join("staging")
             .join(format!(".{kind}-{}-{sequence}.tmp", std::process::id()))
+    }
+}
+
+fn publication_stage_bytes(publication: &ArtifactPublication, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = b"kit-artifact-publication-stage-v1\0".to_vec();
+    for field in [
+        publication.reference.to_string().into_bytes(),
+        publication.digest.to_string().into_bytes(),
+        publication.manifest.canonical_bytes(),
+        payload.to_vec(),
+    ] {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&field);
+    }
+    bytes
+}
+
+fn decode_publication_stage(bytes: &[u8]) -> Result<(ArtifactPublication, &[u8]), ArtifactError> {
+    let mut rest = bytes
+        .strip_prefix(b"kit-artifact-publication-stage-v1\0")
+        .ok_or(ArtifactError::InvalidManifest(
+            "unknown artifact publication stage version",
+        ))?;
+    let mut fields = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let length = rest
+            .get(..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_be_bytes)
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or(ArtifactError::InvalidManifest(
+                "invalid artifact publication stage length",
+            ))?;
+        rest = &rest[8..];
+        let (field, remaining) =
+            rest.split_at_checked(length)
+                .ok_or(ArtifactError::InvalidManifest(
+                    "truncated artifact publication stage",
+                ))?;
+        fields.push(field);
+        rest = remaining;
+    }
+    if !rest.is_empty() {
+        return Err(ArtifactError::InvalidManifest(
+            "trailing artifact publication stage bytes",
+        ));
+    }
+    let reference = ArtifactReference::parse(
+        std::str::from_utf8(fields[0])
+            .map_err(|_| ArtifactError::InvalidManifest("invalid publication reference"))?,
+    )?;
+    let digest = ArtifactDigest::parse(
+        std::str::from_utf8(fields[1])
+            .map_err(|_| ArtifactError::InvalidManifest("invalid publication digest"))?,
+    )?;
+    let manifest = ArtifactManifest::decode(fields[2])?;
+    if manifest.size != fields[3].len() as u64 {
+        return Err(ArtifactError::InvalidManifest(
+            "artifact publication payload size mismatch",
+        ));
+    }
+    Ok((
+        ArtifactPublication {
+            reference,
+            digest,
+            manifest,
+        },
+        fields[3],
+    ))
+}
+
+fn callback_binding(
+    principal: &str,
+    project: &str,
+    run: &str,
+    callback_id: &str,
+) -> ArtifactEnvelopeBinding {
+    ArtifactEnvelopeBinding {
+        principal: principal.to_owned(),
+        project: project.to_owned(),
+        run: run.to_owned(),
+        purpose: "mcp_callback_content".to_owned(),
+        invocation_id: None,
+        callback_id: Some(callback_id.to_owned()),
     }
 }
 
@@ -2788,5 +3407,87 @@ fn hex_digit(byte: u8) -> Result<u8, ArtifactError> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         _ => Err(ArtifactError::InvalidArtifactDigest),
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    #[test]
+    fn bound_envelopes_separate_owners_and_purposes_but_retry_exactly() {
+        let payload = br#"{"same":true}"#;
+        let binding = ArtifactEnvelopeBinding {
+            principal: "principal_a".to_owned(),
+            project: "project_a".to_owned(),
+            run: "run_a".to_owned(),
+            purpose: "mcp_invocation_result".to_owned(),
+            invocation_id: Some("invocation_a".to_owned()),
+            callback_id: None,
+        };
+        let retry = binding.seal(payload).unwrap();
+        assert_eq!(retry, binding.seal(payload).unwrap());
+        assert_eq!(binding.open(&retry).unwrap(), payload);
+
+        let mut other_owner = binding.clone();
+        other_owner.principal = "principal_b".to_owned();
+        let mut other_purpose = binding.clone();
+        other_purpose.purpose = "mcp_callback_content".to_owned();
+        other_purpose.invocation_id = None;
+        other_purpose.callback_id = Some("callback_a".to_owned());
+        assert_ne!(
+            ArtifactDigest::digest(&retry),
+            ArtifactDigest::digest(&other_owner.seal(payload).unwrap())
+        );
+        assert_ne!(
+            ArtifactDigest::digest(&retry),
+            ArtifactDigest::digest(&other_purpose.seal(payload).unwrap())
+        );
+        assert!(other_owner.open(&retry).is_err());
+        assert!(other_purpose.open(&retry).is_err());
+
+        let root = std::env::temp_dir().join(format!(
+            "kit-artifact-shared-ref-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let store = ArtifactStore::open(&root).unwrap();
+        let metadata = ArtifactMetadata::new(
+            "application/vnd.kit.artifact-envelope",
+            ArtifactClass::File,
+            "principal_a",
+            "project_a",
+            ArtifactRetention::UntilUnixMicros(i64::MAX),
+            1,
+        )
+        .unwrap();
+        let first = ArtifactReference::derive(b"shared-ref-test", b"first");
+        let second = ArtifactReference::derive(b"shared-ref-test", b"second");
+        let first_publication = store
+            .stage_publication(&retry, metadata.clone(), first)
+            .unwrap();
+        let second_publication = store.stage_publication(&retry, metadata, second).unwrap();
+        let digest = store
+            .promote_publication(&first_publication)
+            .unwrap()
+            .digest();
+        store.promote_publication(&second_publication).unwrap();
+        store
+            .erase_owned_reference(first, "principal_a", "project_a")
+            .unwrap();
+        assert!(store.open_reference(first).is_err());
+        assert!(store.open_reference(second).is_ok());
+        assert!(store.open_bytes(digest).is_ok());
+        assert!(matches!(
+            store.erase_owned_reference(second, "principal_b", "project_a"),
+            Err(ArtifactError::AccessDenied)
+        ));
+        assert!(store.open_reference(second).is_ok());
+        store
+            .erase_owned_reference(second, "principal_a", "project_a")
+            .unwrap();
+        assert!(store.open_bytes(digest).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

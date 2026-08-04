@@ -44,6 +44,8 @@ pub(crate) enum ProviderProfile {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_completion_tokens: Option<u32>,
     },
     #[serde(rename = "anthropic")]
     Anthropic {
@@ -83,6 +85,8 @@ pub(crate) enum ProviderProfile {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u32>,
     },
 }
 
@@ -134,12 +138,14 @@ impl ProviderProfile {
         api_key: String,
         model: Option<String>,
         base_url: Option<String>,
+        max_completion_tokens: Option<u32>,
     ) -> Result<Self, ProviderConfigError> {
         validate_credential_endpoint(base_url.as_deref())?;
         Ok(Self::OpenAi {
             api_key: SecretValue(api_key),
             model: model.unwrap_or_else(default_openai_model),
             base_url,
+            max_completion_tokens,
         })
     }
 
@@ -189,8 +195,12 @@ impl ProviderProfile {
         })
     }
 
-    pub fn ollama(model: String, base_url: Option<String>) -> Self {
-        Self::Ollama { model, base_url }
+    pub fn ollama(model: String, base_url: Option<String>, max_tokens: Option<u32>) -> Self {
+        Self::Ollama {
+            model,
+            base_url,
+            max_tokens,
+        }
     }
 
     pub fn provider_name(&self) -> &'static str {
@@ -226,9 +236,15 @@ impl ProviderProfile {
                 api_key,
                 model,
                 base_url,
+                max_completion_tokens,
             } => {
                 required("openai api_key", &api_key.0)?;
                 required("openai model", model)?;
+                if max_completion_tokens == &Some(0) {
+                    return Err(ProviderConfigError::new(
+                        "openai max_completion_tokens must be greater than zero",
+                    ));
+                }
                 validate_credential_endpoint(base_url.as_deref())
             }
             Self::Anthropic {
@@ -275,7 +291,17 @@ impl ProviderProfile {
                 }
                 validate_credential_endpoint(base_url.as_deref())
             }
-            Self::Ollama { model, .. } => required("ollama model", model),
+            Self::Ollama {
+                model, max_tokens, ..
+            } => {
+                required("ollama model", model)?;
+                if max_tokens == &Some(0) {
+                    return Err(ProviderConfigError::new(
+                        "ollama max_tokens must be greater than zero",
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -286,10 +312,14 @@ impl ProviderProfile {
                 api_key,
                 model,
                 base_url,
+                max_completion_tokens,
             } => {
                 let mut config = OpenAIConfig::new(api_key.0.clone(), model.clone());
                 if let Some(base_url) = base_url {
                     config = config.with_base_url(base_url.clone());
+                }
+                if let Some(maximum) = max_completion_tokens {
+                    config = config.with_max_completion_tokens(*maximum);
                 }
                 ConfiguredProvider::OpenAi {
                     config,
@@ -370,10 +400,17 @@ impl ProviderProfile {
                     credential: lease(api_key),
                 }
             }
-            Self::Ollama { model, base_url } => {
+            Self::Ollama {
+                model,
+                base_url,
+                max_tokens,
+            } => {
                 let mut config = OllamaConfig::new(model.clone());
                 if let Some(base_url) = base_url {
                     config = config.with_base_url(base_url.clone());
+                }
+                if let Some(maximum) = max_tokens {
+                    config = config.with_max_tokens(*maximum);
                 }
                 ConfiguredProvider::Ollama(config)
             }
@@ -917,21 +954,30 @@ mod tests {
         }
         for name in ["", "bad name", "slash/name", &"a".repeat(65)] {
             assert!(
-                ProviderRegistry::new(name.to_owned(), ProviderProfile::ollama("m".into(), None))
-                    .is_err()
+                ProviderRegistry::new(
+                    name.to_owned(),
+                    ProviderProfile::ollama("m".into(), None, None),
+                )
+                .is_err()
             );
         }
     }
 
     #[test]
     fn every_profile_builds_the_expected_concrete_agentkit_config() {
-        let openai =
-            ProviderProfile::openai(CANARY.into(), None, Some("https://openai".into())).unwrap();
+        let openai = ProviderProfile::openai(
+            CANARY.into(),
+            None,
+            Some("https://openai".into()),
+            Some(321),
+        )
+        .unwrap();
         let ConfiguredProvider::OpenAi { config, credential } = openai.configure().unwrap() else {
             panic!("expected openai")
         };
         assert_eq!(config.model, "gpt-4o");
         assert_eq!(config.base_url, "https://openai");
+        assert_eq!(config.max_completion_tokens, Some(321));
         assert!(!format!("{credential:?}").contains(CANARY));
 
         let anthropic = ProviderProfile::anthropic(
@@ -980,7 +1026,7 @@ mod tests {
         assert_eq!(config.temperature, Some(0.25));
         assert!(!format!("{credential:?}").contains(CANARY));
 
-        let ollama = ProviderProfile::ollama("llama-test".into(), None);
+        let ollama = ProviderProfile::ollama("llama-test".into(), None, Some(654));
         let ConfiguredProvider::Ollama(config) = ollama.configure().unwrap() else {
             panic!("expected ollama")
         };
@@ -989,6 +1035,7 @@ mod tests {
             config.base_url,
             "http://localhost:11434/v1/chat/completions"
         );
+        assert_eq!(config.max_tokens, Some(654));
 
         for profile in [openai, anthropic, openrouter] {
             assert!(!format!("{profile:?}").contains(CANARY));
@@ -997,7 +1044,10 @@ mod tests {
 
     #[test]
     fn credential_bearing_provider_constructors_require_https() {
-        assert!(ProviderProfile::openai("key".into(), None, Some("http://openai".into())).is_err());
+        assert!(
+            ProviderProfile::openai("key".into(), None, Some("http://openai".into()), None)
+                .is_err()
+        );
         assert!(
             ProviderProfile::anthropic(
                 Some("key".into()),
@@ -1024,7 +1074,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            ProviderProfile::ollama("model".into(), Some("http://127.0.0.1:11434".into()))
+            ProviderProfile::ollama("model".into(), Some("http://127.0.0.1:11434".into()), None,)
                 .configure()
                 .is_ok()
         );
@@ -1034,13 +1084,15 @@ mod tests {
     fn multiple_profiles_switch_replace_and_round_trip_atomically() {
         let root = temporary("round-trip");
         let path = root.join("kit/config.json");
-        let mut registry =
-            ProviderRegistry::new("local".into(), ProviderProfile::ollama("one".into(), None))
-                .unwrap();
+        let mut registry = ProviderRegistry::new(
+            "local".into(),
+            ProviderProfile::ollama("one".into(), None, None),
+        )
+        .unwrap();
         registry
             .add(
                 "local.two".into(),
-                ProviderProfile::ollama("two".into(), None),
+                ProviderProfile::ollama("two".into(), None, None),
                 false,
             )
             .unwrap();
@@ -1048,7 +1100,7 @@ mod tests {
             registry
                 .add(
                     "local".into(),
-                    ProviderProfile::ollama("replacement".into(), None),
+                    ProviderProfile::ollama("replacement".into(), None, None),
                     false,
                 )
                 .is_err()
@@ -1056,7 +1108,7 @@ mod tests {
         registry
             .add(
                 "local".into(),
-                ProviderProfile::ollama("replacement".into(), None),
+                ProviderProfile::ollama("replacement".into(), None, None),
                 true,
             )
             .unwrap();
@@ -1136,7 +1188,7 @@ mod tests {
         let path = root.join("kit/config.json");
         let registry = ProviderRegistry::new(
             "large".into(),
-            ProviderProfile::ollama("m".repeat(MAX_CONFIG_BYTES as usize), None),
+            ProviderProfile::ollama("m".repeat(MAX_CONFIG_BYTES as usize), None, None),
         )
         .unwrap();
         assert!(

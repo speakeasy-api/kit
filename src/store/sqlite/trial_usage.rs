@@ -581,8 +581,14 @@ fn canonical_evidence(
         .map(|call| call.reservation_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     if reservations.iter().any(|reservation| {
-        !matches!(reservation.state.as_str(), "reconciled" | "released")
-            || reservation.state == "reconciled" && reservation.dispatch_state != "dispatched"
+        !matches!(
+            reservation.state.as_str(),
+            "reconciled" | "actual_overage" | "released" | "debited"
+        ) || matches!(
+            reservation.state.as_str(),
+            "reconciled" | "actual_overage" | "debited"
+        ) && reservation.dispatch_state != "dispatched"
+            || reservation.state == "debited" && reservation.kind != "callback"
             || reservation.state == "released"
                 && !matches!(
                     reservation.dispatch_state.as_str(),
@@ -605,7 +611,23 @@ fn canonical_evidence(
     {
         return Err(TrialError::UsageReceiptMismatch);
     }
-    let turns = u64::try_from(calls.len()).map_err(|_| TrialError::UsageReceiptMismatch)?;
+    let model_turns = u64::try_from(calls.len()).map_err(|_| TrialError::UsageReceiptMismatch)?;
+    let callback_turns = reservations
+        .iter()
+        .filter(|reservation| {
+            reservation.kind == "callback"
+                && matches!(
+                    reservation.state.as_str(),
+                    "debited" | "reconciled" | "actual_overage"
+                )
+        })
+        .try_fold(0_u64, |total, reservation| {
+            total.checked_add(reservation.turns)
+        })
+        .ok_or(TrialError::UsageReceiptMismatch)?;
+    let turns = model_turns
+        .checked_add(callback_turns)
+        .ok_or(TrialError::UsageReceiptMismatch)?;
     let tool_event_count = positions
         .len()
         .checked_sub(
@@ -641,23 +663,26 @@ fn canonical_evidence(
         .iter()
         .filter(|reservation| {
             reservation.kind == "process"
-                && matches!(reservation.state.as_str(), "debited" | "reconciled")
+                && matches!(
+                    reservation.state.as_str(),
+                    "debited" | "reconciled" | "actual_overage"
+                )
         })
         .try_fold(0_u64, |total, reservation| {
             total.checked_add(reservation.processes)
         })
         .ok_or(TrialError::UsageReceiptMismatch)?;
     let total_tokens = input_tokens.checked_add(output_tokens);
-    if turns > 0
+    if model_turns > 0
         && (request_ids.len() != calls.len()
             || model_reservations.iter().any(|reservation| {
-                reservation.state != "reconciled"
+                !matches!(reservation.state.as_str(), "reconciled" | "actual_overage")
                     || reservation.dispatch_state != "dispatched"
                     || reservation.kind != "model"
             })
             || reservation_cost != Some(cost_microusd)
             || reservation_tokens != total_tokens
-            || reservation_turns != Some(turns))
+            || reservation_turns != Some(model_turns))
     {
         return Err(TrialError::UsageReceiptMismatch);
     }

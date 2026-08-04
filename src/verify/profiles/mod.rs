@@ -208,6 +208,10 @@ impl VerificationRegistry {
         {
             return Err(VerificationError::AuthorityRequired);
         }
+        let stored_at_unix_micros = now_unix_micros()
+            .map_err(|error| VerificationError::ArtifactPersistence(error.to_string()))?;
+        let retention_micros = i64::from(config.effective().artifact_retention_days)
+            .saturating_mul(24 * 60 * 60 * 1_000_000);
         let authorized = |grant| {
             grants.grants().contains(&grant) && config.effective_authority().contains(&grant)
         };
@@ -227,8 +231,10 @@ impl VerificationRegistry {
                     max_preview_bytes: MAX_PREVIEW_BYTES,
                     aggregate: hard_resource_ceiling(),
                 },
-                retention: ArtifactRetention::Forever,
-                stored_at_unix_micros: 0,
+                retention: ArtifactRetention::UntilUnixMicros(
+                    stored_at_unix_micros.saturating_add(retention_micros),
+                ),
+                stored_at_unix_micros,
             },
         )
     }

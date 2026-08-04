@@ -98,7 +98,7 @@ The `Config` type is where providers differ most. Each provider has different pa
 | Provider | max_tokens field        | Extra fields                            |
 | -------- | ----------------------- | --------------------------------------- |
 | OpenAI   | `max_completion_tokens` | `frequency_penalty`, `presence_penalty` |
-| Ollama   | `num_predict`           | `top_k`                                 |
+| Ollama   | `max_tokens`            | `top_k`                                 |
 | Mistral  | `max_tokens`            | —                                       |
 | Groq     | `max_completion_tokens` | —                                       |
 | vLLM     | `max_tokens`            | —                                       |
@@ -125,7 +125,7 @@ The user-facing API:
 let adapter = OllamaAdapter::new(
     OllamaConfig::new("llama3.1:8b")
         .with_temperature(0.0)
-        .with_num_predict(4096),
+        .with_max_tokens(4096),
 )?;
 
 let agent = Agent::builder()

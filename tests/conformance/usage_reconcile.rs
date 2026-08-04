@@ -104,7 +104,7 @@ fn usage_reconcile_every_provider_fixture_and_all_categories() {
 }
 
 #[test]
-fn mapped_partial_usage_stays_null_and_estimates_are_labeled() {
+fn mapped_normalized_input_and_partial_usage_are_labeled() {
     let mapped = from_agentkit_usage(&Usage::new(
         TokenUsage::new(10, 4).with_cached_input_tokens(3),
     ));
@@ -118,7 +118,7 @@ fn mapped_partial_usage_stays_null_and_estimates_are_labeled() {
         None,
     )
     .unwrap();
-    assert_eq!(envelope.categories.uncached_input.billed_tokens, None);
+    assert_eq!(envelope.categories.uncached_input.billed_tokens, Some(10));
     assert_eq!(envelope.categories.cache_write.billed_tokens, None);
     assert_eq!(envelope.categories.reasoning.billed_tokens, None);
     assert_eq!(envelope.categories.cache_read.billed_tokens, Some(3));
@@ -128,7 +128,7 @@ fn mapped_partial_usage_stays_null_and_estimates_are_labeled() {
     ));
     assert_eq!(envelope.provider_cost, None);
     let json = serde_json::to_value(envelope).unwrap();
-    assert!(json["categories"]["uncached_input"]["billed_tokens"].is_null());
+    assert_eq!(json["categories"]["uncached_input"]["billed_tokens"], 10);
     assert!(json["provider_cost"].is_null());
 }
 

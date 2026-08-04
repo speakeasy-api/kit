@@ -40,7 +40,8 @@ use crate::{
     },
     domain::{
         events::{ApprovalDecision, ArtifactRef, SchemaVersion, TraceId},
-        ids::{ApprovalId, ArtifactId, ProjectId, RunId, TerminalId, ThreadId},
+        ids::{ApprovalId, ArtifactId, McpCallbackId, ProjectId, RunId, TerminalId, ThreadId},
+        mcp_callback::McpCallbackAction,
     },
     store::sqlite::idempotency::IdempotencyKey,
 };
@@ -321,6 +322,15 @@ fn build_router_with_exec(
         .route(
             "/v1/projects/{project_id}/auth-requests",
             get(list_pending_auth_requests),
+        )
+        .route(
+            "/v1/projects/{project_id}/mcp-callbacks",
+            get(list_pending_mcp_callbacks),
+        )
+        .route("/v1/mcp-callbacks/{callback_id}", get(get_mcp_callback))
+        .route(
+            "/v1/mcp-callbacks/{callback_id}/resolve",
+            post(resolve_mcp_callback),
         )
         .route(
             "/v1/projects/{project_id}/artifacts",
@@ -1163,6 +1173,136 @@ async fn list_pending_approvals(
         },
     )
     .await
+}
+
+async fn list_pending_mcp_callbacks(
+    State(state): State<ApiState>,
+    Path(project_id): Path<String>,
+    request: Request,
+) -> Response {
+    query_id(
+        state,
+        request,
+        &project_id,
+        "project_id",
+        ProjectId::from_str,
+        |project_id| Query::PendingMcpCallbacks { project_id },
+        |projection| match projection {
+            QueryProjection::McpCallbacks(value) => Some(json!({ "items": value })),
+            _ => None,
+        },
+    )
+    .await
+}
+
+async fn get_mcp_callback(
+    State(state): State<ApiState>,
+    Path(callback_id): Path<String>,
+    request: Request,
+) -> Response {
+    query_id(
+        state,
+        request,
+        &callback_id,
+        "mcp_callback_id",
+        McpCallbackId::from_str,
+        |callback_id| Query::GetMcpCallback { callback_id },
+        |projection| match projection {
+            QueryProjection::McpCallback(value) => Some(json!(value)),
+            _ => None,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveMcpCallbackBody {
+    kind: crate::domain::mcp_callback::McpCallbackKind,
+    mode: crate::domain::mcp_callback::McpCallbackMode,
+    expected_version: u64,
+    challenge_generation: u64,
+    schema_digest: String,
+    action: McpCallbackAction,
+    #[serde(default)]
+    content: Option<Value>,
+}
+
+async fn resolve_mcp_callback(
+    State(state): State<ApiState>,
+    Path(callback_id): Path<String>,
+    request: Request,
+) -> Response {
+    let instance = request.uri().to_string();
+    let (body, context) = match command_body::<ResolveMcpCallbackBody>(request, state.config).await
+    {
+        Ok(value) => value,
+        Err(problem) => return problem.into_response(),
+    };
+    let callback_id = match parse_id(
+        &callback_id,
+        "mcp_callback_id",
+        &instance,
+        McpCallbackId::from_str,
+    ) {
+        Ok(id) => id,
+        Err(problem) => return problem.into_response(),
+    };
+    let valid_content = match (body.kind, body.mode, body.action) {
+        (
+            crate::domain::mcp_callback::McpCallbackKind::Elicitation,
+            crate::domain::mcp_callback::McpCallbackMode::Form,
+            McpCallbackAction::Accept,
+        ) => body.content.is_some(),
+        (
+            crate::domain::mcp_callback::McpCallbackKind::Elicitation,
+            crate::domain::mcp_callback::McpCallbackMode::Form,
+            McpCallbackAction::Decline | McpCallbackAction::Cancel,
+        )
+        | (
+            crate::domain::mcp_callback::McpCallbackKind::Sampling,
+            crate::domain::mcp_callback::McpCallbackMode::SamplingRequest
+            | crate::domain::mcp_callback::McpCallbackMode::SamplingResponse,
+            _,
+        ) => body.content.is_none(),
+        _ => false,
+    };
+    if !valid_content {
+        return ProblemDetails::service(
+            ServiceError::Invalid(
+                "callback kind, mode, action, and content do not match".to_owned(),
+            ),
+            instance,
+        )
+        .into_response();
+    }
+    let id = callback_id.to_string();
+    match execute(
+        &state,
+        context,
+        Command::ResolveMcpCallback {
+            schema_version: SchemaVersion::CURRENT,
+            callback_id,
+            kind: body.kind,
+            mode: body.mode,
+            expected_version: body.expected_version,
+            challenge_generation: body.challenge_generation,
+            schema_digest: body.schema_digest,
+            action: body.action,
+            content: body.content,
+            artifact_refs: Vec::new(),
+        },
+    )
+    .await
+    {
+        Ok(receipt) => resource_response(
+            StatusCode::OK,
+            &format!("/v1/mcp-callbacks/{id}"),
+            id,
+            receipt,
+        ),
+        Err(error) => ProblemDetails::service(error, instance).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

@@ -5,7 +5,7 @@
 - Patch ID: `m006-mcp-protocol-revision-pin`
 - W07a snapshot SHA-256: `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`
 - Previous snapshot SHA-256: `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`
-- Current snapshot SHA-256: `3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077` (local-only `M006-W07b` overlay)
+- Current snapshot SHA-256: `0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0` (local overlays)
 - Upstream status: pending submission; upstream acceptance is non-blocking
 - Blocker closed locally: `BLK-05` (`docs/decisions/PRE-0005-protocol-revisions.md`)
 
@@ -73,14 +73,14 @@ resolved 401/403 replay reservation is the replay dispatch transaction itself;
 unknown outcomes require reconciliation and are never replayed automatically.
 Expired HTTP sessions recover only through the explicit broker-authorized
 `reinitialize_expired_session` path; the interrupted operation remains
-`outcome_unknown` and is never transparently replayed.
+`delivery_unknown` and is never transparently replayed.
 
 ## Tests
 
 The W07a `crates/agentkit-mcp/tests/protocol_revision_pin.rs` snapshot contains
 13 tests and its focused package suite passed 43/43. The W07b overlay adds
-`http_reconnect_replaces_server_capabilities`, so the current file has 14 tests
-and the current focused package suite passes 44/44:
+`http_reconnect_replaces_server_capabilities` and candidate-abort coverage, so
+the current file has 15 tests and the current focused package suite passes 48/48:
 
 - exact-revision acceptance over real stdio (python3 child process) and real
   Streamable HTTP (axum mock), including `negotiated_protocol_version`
@@ -138,10 +138,14 @@ disabled rather than partially authorized.
 
 W07a changed payload file count 356 -> 357 by adding the protocol test file and
 produced aggregate `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`.
-W07b keeps 357 payload files and modifies exactly the MCP library and that test
-file, producing current aggregate
-`3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`.
-Both overlay steps and their exact before/after file hashes are recorded in
+W07b keeps 357 payload files and modifies the MCP library and revision test.
+The contiguous local-only W07c chain adds sanitized responder delivery,
+reconnect commit fencing, generation controls, durable callback accounting,
+provider usage normalization, and the Ollama output cap while retaining 357
+payload files, producing current aggregate
+`0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0`.
+All overlay steps and their exact before/after file hashes are recorded in
 `src/protocols/mcp/agentkit_patch/manifest.yaml`; the snapshot manifest,
-metadata, pin document, and build manifest carry the current aggregate.
+metadata, pin document, build manifest, and `requirements/reports/m006-w07c.md`
+carry the current aggregate.
 `vendor/agentkit/Cargo.lock` is unchanged; no new vendor dependency was added.

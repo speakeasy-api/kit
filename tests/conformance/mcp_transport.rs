@@ -8,10 +8,13 @@ use std::{
 };
 
 use agentkit_mcp::{
-    ClientJsonRpcMessage, McpConnection, McpError, McpHandlerConfig, McpHttpClient,
-    McpServerConfig, McpServerId, McpSse, McpSseStream, McpStreamableHttpError,
-    McpStreamableHttpPostResponse, McpTransportBinding, PINNED_PROTOCOL_VERSION,
-    StreamableHttpTransportConfig,
+    ClientJsonRpcMessage, McpConnection, McpCreateElicitationRequestParams,
+    McpCreateElicitationResult, McpCreateMessageRequestParams, McpCreateMessageResult,
+    McpElicitationAction, McpElicitationResponder, McpError, McpHandlerConfig, McpHttpClient,
+    McpListRootsResult, McpResponderRequestContext, McpRoot, McpRootsProvider, McpSamplingMessage,
+    McpSamplingResponder, McpServerConfig, McpServerId, McpSse, McpSseStream,
+    McpStreamableHttpError, McpStreamableHttpPostResponse, McpTransportBinding,
+    PINNED_PROTOCOL_VERSION, StreamableHttpTransportConfig,
 };
 use futures_util::{StreamExt, stream};
 use http::{HeaderName, HeaderValue};
@@ -49,11 +52,151 @@ impl WireLog {
             .map(str::to_owned)
             .collect()
     }
+
+    fn initialize_capabilities(&self) -> Value {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|message| message.get("method").and_then(Value::as_str) == Some("initialize"))
+            .and_then(|message| message.pointer("/params/capabilities"))
+            .cloned()
+            .expect("initialize capabilities recorded")
+    }
+
+    fn response_ids(&self) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.get("method").is_none() && message.get("result").is_some())
+            .filter_map(|message| message.get("id").cloned())
+            .collect()
+    }
+}
+
+struct EmptyRoots;
+
+#[async_trait::async_trait]
+impl McpRootsProvider for EmptyRoots {
+    async fn list_roots(
+        &self,
+        _context: McpResponderRequestContext,
+    ) -> Result<Vec<McpRoot>, McpError> {
+        Ok(Vec::new())
+    }
+}
+
+fn track_response<T: serde::Serialize>(context: &McpResponderRequestContext, result: &T) {
+    context
+        .on_delivery(
+            context
+                .callback_delivery_token("transport-test", [1; 32], [2; 32])
+                .unwrap(),
+            result,
+            || true,
+            |_, delivered| assert!(delivered),
+        )
+        .unwrap();
+}
+
+struct TrackedResponders;
+
+#[async_trait::async_trait]
+impl McpSamplingResponder for TrackedResponders {
+    async fn create_message(
+        &self,
+        _params: McpCreateMessageRequestParams,
+        context: McpResponderRequestContext,
+    ) -> Result<McpCreateMessageResult, McpError> {
+        let result = McpCreateMessageResult::new(
+            McpSamplingMessage::assistant_text("sampled"),
+            "test-model".to_owned(),
+        );
+        track_response(&context, &result);
+        Ok(result)
+    }
+}
+
+struct GuardedRoots {
+    authority: Arc<AtomicBool>,
+    delivery: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl McpRootsProvider for GuardedRoots {
+    async fn list_roots(
+        &self,
+        context: McpResponderRequestContext,
+    ) -> Result<Vec<McpRoot>, McpError> {
+        let roots = vec![McpRoot::new("file:///workspace")];
+        let result = McpListRootsResult::new(roots.clone());
+        let authority = Arc::clone(&self.authority);
+        let delivery = Arc::clone(&self.delivery);
+        context.on_delivery(
+            context.callback_delivery_token("guarded-roots", [1; 32], [2; 32])?,
+            &result,
+            move || authority.load(Ordering::Acquire),
+            move |_, delivered| {
+                delivery.store(if delivered { 1 } else { 2 }, Ordering::Release);
+            },
+        )?;
+        Ok(roots)
+    }
+}
+
+#[async_trait::async_trait]
+impl McpElicitationResponder for TrackedResponders {
+    async fn create_elicitation(
+        &self,
+        _params: McpCreateElicitationRequestParams,
+        context: McpResponderRequestContext,
+    ) -> Result<McpCreateElicitationResult, McpError> {
+        let result = McpCreateElicitationResult::new(McpElicitationAction::Decline);
+        track_response(&context, &result);
+        Ok(result)
+    }
+}
+
+#[async_trait::async_trait]
+impl McpRootsProvider for TrackedResponders {
+    async fn list_roots(
+        &self,
+        context: McpResponderRequestContext,
+    ) -> Result<Vec<McpRoot>, McpError> {
+        let roots = vec![McpRoot::new("file:///workspace")];
+        track_response(&context, &McpListRootsResult::new(roots.clone()));
+        Ok(roots)
+    }
+}
+
+fn tracked_handler() -> McpHandlerConfig {
+    let responders = Arc::new(TrackedResponders);
+    McpHandlerConfig::new()
+        .with_sampling_responder(responders.clone())
+        .with_elicitation_responder(responders.clone())
+        .with_roots_provider(responders)
+}
+
+fn callback_requests() -> [Value; 3] {
+    let sampling = McpCreateMessageRequestParams::new(vec![McpSamplingMessage::user_text("hi")], 8);
+    [
+        json!({
+            "jsonrpc":"2.0", "id":101, "method":"sampling/createMessage",
+            "params": serde_json::to_value(sampling).unwrap()
+        }),
+        json!({
+            "jsonrpc":"2.0", "id":102, "method":"elicitation/create",
+            "params":{"message":"Name","requestedSchema":{"type":"object","properties":{}}}
+        }),
+        json!({"jsonrpc":"2.0", "id":103, "method":"roots/list", "params":{}}),
+    ]
 }
 
 struct MemoryTransport {
     version: &'static str,
     log: WireLog,
+    fail_responses: bool,
     tx: mpsc::UnboundedSender<RxJsonRpcMessage<RoleClient>>,
     rx: mpsc::UnboundedReceiver<RxJsonRpcMessage<RoleClient>>,
 }
@@ -64,9 +207,19 @@ impl MemoryTransport {
         Self {
             version,
             log,
+            fail_responses: false,
             tx,
             rx,
         }
+    }
+
+    fn sender(&self) -> mpsc::UnboundedSender<RxJsonRpcMessage<RoleClient>> {
+        self.tx.clone()
+    }
+
+    fn with_failed_responses(mut self) -> Self {
+        self.fail_responses = true;
+        self
     }
 }
 
@@ -79,10 +232,23 @@ impl Transport<RoleClient> for MemoryTransport {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
         let version = self.version;
         let log = self.log.clone();
+        let fail_responses = self.fail_responses;
         let tx = self.tx.clone();
         async move {
             log.push(&item);
             let request = serde_json::to_value(&item).map_err(std::io::Error::other)?;
+            if request.get("method").is_none() && request.get("result").is_some() {
+                if !agentkit_mcp::has_responder_delivery_permit(&item) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "methodless response lacked responder permit",
+                    ));
+                }
+                if fail_responses {
+                    return Err(std::io::Error::other("response send failed"));
+                }
+                return Ok(());
+            }
             let Some(id) = request.get("id").cloned() else {
                 return Ok(());
             };
@@ -133,6 +299,8 @@ struct MemoryHttpClient {
     open_session: AtomicBool,
     auth_initialize: bool,
     expire_tools: bool,
+    fail_responses: bool,
+    callback_rx: Mutex<Option<mpsc::UnboundedReceiver<McpSse>>>,
 }
 
 impl MemoryHttpClient {
@@ -145,6 +313,8 @@ impl MemoryHttpClient {
             open_session: AtomicBool::new(false),
             auth_initialize: false,
             expire_tools: false,
+            fail_responses: false,
+            callback_rx: Mutex::new(None),
         }
     }
 
@@ -156,6 +326,17 @@ impl MemoryHttpClient {
     fn with_expired_tools(mut self) -> Self {
         self.expire_tools = true;
         self
+    }
+
+    fn with_failed_responses(mut self) -> Self {
+        self.fail_responses = true;
+        self
+    }
+
+    fn with_callback_stream(mut self) -> (Self, mpsc::UnboundedSender<McpSse>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.callback_rx = Mutex::new(Some(rx));
+        (self, tx)
     }
 
     fn response(&self, request: &Value, result: Value) -> Value {
@@ -179,6 +360,19 @@ impl McpHttpClient for MemoryHttpClient {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if method.is_empty() && request.get("result").is_some() {
+            if !agentkit_mcp::has_responder_delivery_permit(&message) {
+                return Err(McpStreamableHttpError::UnexpectedServerResponse(
+                    "methodless response lacked responder permit".into(),
+                ));
+            }
+            if self.fail_responses {
+                return Err(McpStreamableHttpError::UnexpectedServerResponse(
+                    "response send failed".into(),
+                ));
+            }
+            return Ok(McpStreamableHttpPostResponse::Accepted);
+        }
         if method == "initialize" && self.auth_initialize {
             return Err(McpStreamableHttpError::AuthRequired(
                 rmcp::transport::streamable_http_client::AuthRequiredError::new(
@@ -258,7 +452,14 @@ impl McpHttpClient for MemoryHttpClient {
         _auth_header: Option<String>,
         _custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<McpSseStream, McpStreamableHttpError<reqwest::Error>> {
-        Err(McpStreamableHttpError::ServerDoesNotSupportSse)
+        let receiver = self.callback_rx.lock().unwrap().take();
+        let Some(receiver) = receiver else {
+            return Err(McpStreamableHttpError::ServerDoesNotSupportSse);
+        };
+        Ok(stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|event| (Ok(event), receiver))
+        })
+        .boxed())
     }
 
     async fn close_open_sessions(&self) -> Result<(), McpStreamableHttpError<reqwest::Error>> {
@@ -288,6 +489,30 @@ fn assert_typed_refusal(error: McpError) {
     ));
 }
 
+async fn wait_for_callback_responses(log: &WireLog) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if log.response_ids().len() == 3 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("callback responses reached transport");
+    assert_eq!(log.response_ids(), [json!(101), json!(102), json!(103)]);
+}
+
+async fn wait_for_delivery(delivery: &AtomicUsize) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while delivery.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("callback delivery settled");
+}
+
 #[tokio::test]
 async fn both_authorized_transports_refuse_before_initialized_or_discovery() {
     assert_eq!(PROTOCOL_REVISION, PINNED_PROTOCOL_VERSION);
@@ -310,17 +535,181 @@ async fn both_authorized_transports_refuse_before_initialized_or_discovery() {
         for encoding in [InitEncoding::Json, InitEncoding::Sse] {
             let log = WireLog::new();
             let client = Arc::new(MemoryHttpClient::new(version, encoding, log.clone()));
-            let error =
-                match McpConnection::connect_authorized_http(&http_config(Arc::clone(&client)))
-                    .await
-                {
-                    Ok(_) => panic!("unsupported HTTP revision connected"),
-                    Err(error) => error,
-                };
+            let error = match McpConnection::connect_authorized_http(
+                &http_config(Arc::clone(&client)),
+                McpHandlerConfig::new(),
+            )
+            .await
+            {
+                Ok(_) => panic!("unsupported HTTP revision connected"),
+                Err(error) => error,
+            };
             assert_typed_refusal(error);
             assert_eq!(log.methods(), ["initialize"]);
             assert_eq!(client.deletes.load(Ordering::SeqCst), 1);
         }
+    }
+}
+
+#[tokio::test]
+async fn stdio_and_http_advertise_only_the_installed_roots_responder() {
+    let handler = McpHandlerConfig::new().with_roots_provider(Arc::new(EmptyRoots));
+    let stdio_log = WireLog::new();
+    let stdio = McpConnection::connect_kit_authorized_transport(
+        McpServerId::new("roots-stdio"),
+        MemoryTransport::new("2025-11-25", stdio_log.clone()),
+        handler.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stdio_log.initialize_capabilities(),
+        json!({"roots":{"listChanged":false}})
+    );
+    stdio.close().await.unwrap();
+
+    let http_log = WireLog::new();
+    let client = Arc::new(MemoryHttpClient::new(
+        "2025-11-25",
+        InitEncoding::Json,
+        http_log.clone(),
+    ));
+    let http = McpConnection::connect_authorized_http(&http_config(client), handler)
+        .await
+        .unwrap();
+    assert_eq!(
+        http_log.initialize_capabilities(),
+        json!({"roots":{"listChanged":false}})
+    );
+    http.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stdio_sampling_elicitation_and_roots_responses_require_delivery_permits() {
+    let log = WireLog::new();
+    let transport = MemoryTransport::new("2025-11-25", log.clone());
+    let peer = transport.sender();
+    let connection = McpConnection::connect_kit_authorized_transport(
+        McpServerId::new("callback-stdio"),
+        transport,
+        tracked_handler(),
+    )
+    .await
+    .unwrap();
+    for request in callback_requests() {
+        peer.send(serde_json::from_value(request).unwrap()).unwrap();
+    }
+    wait_for_callback_responses(&log).await;
+    connection.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn http_sampling_elicitation_and_roots_responses_require_delivery_permits() {
+    let log = WireLog::new();
+    let (client, peer) =
+        MemoryHttpClient::new("2025-11-25", InitEncoding::Json, log.clone()).with_callback_stream();
+    let connection =
+        McpConnection::connect_authorized_http(&http_config(Arc::new(client)), tracked_handler())
+            .await
+            .unwrap();
+    for request in callback_requests() {
+        peer.send(McpSse {
+            data: Some(request.to_string()),
+            ..McpSse::default()
+        })
+        .unwrap();
+    }
+    wait_for_callback_responses(&log).await;
+    connection.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stdio_and_http_roots_authority_is_rechecked_before_methodless_send() {
+    for http in [false, true] {
+        let log = WireLog::new();
+        let authority = Arc::new(AtomicBool::new(false));
+        let delivery = Arc::new(AtomicUsize::new(0));
+        let handler = McpHandlerConfig::new().with_roots_provider(Arc::new(GuardedRoots {
+            authority,
+            delivery: Arc::clone(&delivery),
+        }));
+        let request = json!({"jsonrpc":"2.0", "id":103, "method":"roots/list", "params":{}});
+        if http {
+            let (client, peer) =
+                MemoryHttpClient::new("2025-11-25", InitEncoding::Json, log.clone())
+                    .with_callback_stream();
+            let connection =
+                McpConnection::connect_authorized_http(&http_config(Arc::new(client)), handler)
+                    .await
+                    .unwrap();
+            peer.send(McpSse {
+                data: Some(request.to_string()),
+                ..McpSse::default()
+            })
+            .unwrap();
+            wait_for_delivery(&delivery).await;
+            connection.close().await.unwrap();
+        } else {
+            let transport = MemoryTransport::new("2025-11-25", log.clone());
+            let peer = transport.sender();
+            let connection = McpConnection::connect_kit_authorized_transport(
+                McpServerId::new("guarded-roots-stdio"),
+                transport,
+                handler,
+            )
+            .await
+            .unwrap();
+            peer.send(serde_json::from_value(request).unwrap()).unwrap();
+            wait_for_delivery(&delivery).await;
+            connection.close().await.unwrap();
+        }
+        assert_eq!(delivery.load(Ordering::Acquire), 2);
+        assert!(log.response_ids().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stdio_and_http_roots_send_failures_settle_delivery_unknown() {
+    for http in [false, true] {
+        let log = WireLog::new();
+        let delivery = Arc::new(AtomicUsize::new(0));
+        let handler = McpHandlerConfig::new().with_roots_provider(Arc::new(GuardedRoots {
+            authority: Arc::new(AtomicBool::new(true)),
+            delivery: Arc::clone(&delivery),
+        }));
+        let request = json!({"jsonrpc":"2.0", "id":103, "method":"roots/list", "params":{}});
+        if http {
+            let (client, peer) =
+                MemoryHttpClient::new("2025-11-25", InitEncoding::Json, log.clone())
+                    .with_failed_responses()
+                    .with_callback_stream();
+            let connection =
+                McpConnection::connect_authorized_http(&http_config(Arc::new(client)), handler)
+                    .await
+                    .unwrap();
+            peer.send(McpSse {
+                data: Some(request.to_string()),
+                ..McpSse::default()
+            })
+            .unwrap();
+            wait_for_delivery(&delivery).await;
+            let _ = connection.close().await;
+        } else {
+            let transport = MemoryTransport::new("2025-11-25", log.clone()).with_failed_responses();
+            let peer = transport.sender();
+            let connection = McpConnection::connect_kit_authorized_transport(
+                McpServerId::new("failed-roots-stdio"),
+                transport,
+                handler,
+            )
+            .await
+            .unwrap();
+            peer.send(serde_json::from_value(request).unwrap()).unwrap();
+            wait_for_delivery(&delivery).await;
+            let _ = connection.close().await;
+        }
+        assert_eq!(delivery.load(Ordering::Acquire), 2);
+        assert_eq!(log.response_ids(), [json!(103)]);
     }
 }
 
@@ -332,9 +721,12 @@ async fn http_pages_are_single_wire_calls_with_exact_cursor_and_cleanup() {
         InitEncoding::Json,
         log.clone(),
     ));
-    let connection = McpConnection::connect_authorized_http(&http_config(Arc::clone(&client)))
-        .await
-        .unwrap();
+    let connection = McpConnection::connect_authorized_http(
+        &http_config(Arc::clone(&client)),
+        McpHandlerConfig::new(),
+    )
+    .await
+    .unwrap();
 
     let (first, cursor) = connection.list_tools_page(None).await.unwrap();
     assert_eq!(first[0].name, "first");
@@ -365,19 +757,23 @@ async fn http_auth_and_session_failures_remain_typed() {
         MemoryHttpClient::new("2025-11-25", InitEncoding::Json, WireLog::new())
             .with_auth_initialize(),
     );
-    let error = match McpConnection::connect_authorized_http(&http_config(auth)).await {
-        Ok(_) => panic!("auth challenge connected"),
-        Err(error) => error,
-    };
+    let error =
+        match McpConnection::connect_authorized_http(&http_config(auth), McpHandlerConfig::new())
+            .await
+        {
+            Ok(_) => panic!("auth challenge connected"),
+            Err(error) => error,
+        };
     assert!(matches!(error, McpError::AuthRequired(_)));
 
     let expired = Arc::new(
         MemoryHttpClient::new("2025-11-25", InitEncoding::Json, WireLog::new())
             .with_expired_tools(),
     );
-    let connection = McpConnection::connect_authorized_http(&http_config(expired))
-        .await
-        .unwrap();
+    let connection =
+        McpConnection::connect_authorized_http(&http_config(expired), McpHandlerConfig::new())
+            .await
+            .unwrap();
     assert!(matches!(
         connection.list_tools_page(None).await,
         Err(McpError::SessionExpired)
@@ -471,12 +867,13 @@ fn raw_agentkit_mcp_use_is_confined_to_the_transport_adapter() {
     }
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let allowed = root.join("src/protocols/mcp/transport");
+    let transport = root.join("src/protocols/mcp/transport");
+    let responders = root.join("src/protocols/mcp/responders");
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
     let offenders = files
         .into_iter()
-        .filter(|path| !path.starts_with(&allowed))
+        .filter(|path| !path.starts_with(&transport) && !path.starts_with(&responders))
         .filter_map(|path| {
             let uses = raw_uses(&std::fs::read_to_string(&path).unwrap());
             (!uses.is_empty()).then_some((path, uses))
@@ -485,7 +882,7 @@ fn raw_agentkit_mcp_use_is_confined_to_the_transport_adapter() {
     assert!(offenders.is_empty(), "raw AgentKit MCP use: {offenders:?}");
 
     for path in ["mod.rs", "http.rs", "stdio.rs"] {
-        let source = std::fs::read_to_string(allowed.join(path)).unwrap();
+        let source = std::fs::read_to_string(transport.join(path)).unwrap();
         let syntax = syn::parse_file(&source).unwrap();
         for item in syntax.items {
             if let syn::Item::Use(item) = item
@@ -504,7 +901,7 @@ fn raw_agentkit_mcp_use_is_confined_to_the_transport_adapter() {
     assert!(detected.iter().any(|path| path == "agentkit_mcp"));
     assert!(detected.iter().any(|path| path.starts_with("rmcp")));
 
-    let stdio = std::fs::read_to_string(allowed.join("stdio.rs")).unwrap();
+    let stdio = std::fs::read_to_string(transport.join("stdio.rs")).unwrap();
     assert!(!stdio.contains("trait AuthorizedStdioLauncher"));
     assert!(!stdio.contains("from_authorized_parts"));
 }

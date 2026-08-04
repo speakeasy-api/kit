@@ -40,6 +40,7 @@ use crate::{
     },
     runtime::scheduler::{
         AdmissionKind, DurableScheduler, ReservationRequest,
+        budget::RunBudget,
         limits::Spend,
         reserve::{ReservationId, ReservationStatus},
     },
@@ -59,12 +60,16 @@ const DISPATCH_EVENT: &str = "model_call.dispatched";
 const OUTCOME_EVENT: &str = "model_call.outcome";
 const PROVIDER_IDEMPOTENCY_KEY: &str = "kit.model_call.idempotency_key";
 
+pub type ModelOutcomeValidator =
+    Arc<dyn Fn(&ModelTurnResult) -> Result<(), LoopError> + Send + Sync + 'static>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelCrashPoint {
     BeforeIntent,
     BetweenIntentAndDispatch,
     AfterDispatch,
     BeforeOutcome,
+    AfterOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +98,7 @@ pub struct ModelPolicy {
     pub provider_idempotency: ProviderIdempotency,
     pub max_buffered_bytes: usize,
     pub max_delta_bytes: usize,
+    pub detached: bool,
 }
 
 impl Default for ModelPolicy {
@@ -102,6 +108,7 @@ impl Default for ModelPolicy {
             provider_idempotency: ProviderIdempotency::Unproven,
             max_buffered_bytes: 8 * 1024 * 1024,
             max_delta_bytes: 16 * 1024,
+            detached: false,
         }
     }
 }
@@ -114,6 +121,7 @@ struct ModelKernel {
     occurred_at: UtcDateTime,
     trace_id: TraceId,
     crash_at: Option<ModelCrashPoint>,
+    outcome_validator: Option<ModelOutcomeValidator>,
 }
 
 pub struct DurableModelAdapter<M> {
@@ -141,6 +149,7 @@ impl<M> DurableModelAdapter<M> {
                 occurred_at,
                 trace_id,
                 crash_at: None,
+                outcome_validator: None,
             }),
         }
     }
@@ -149,6 +158,13 @@ impl<M> DurableModelAdapter<M> {
         Arc::get_mut(&mut self.kernel)
             .expect("crash point must be configured before the adapter is shared")
             .crash_at = Some(point);
+        self
+    }
+
+    pub fn with_outcome_validator(mut self, validator: ModelOutcomeValidator) -> Self {
+        Arc::get_mut(&mut self.kernel)
+            .expect("outcome validator must be configured before the adapter is shared")
+            .outcome_validator = Some(validator);
         self
     }
 }
@@ -168,7 +184,7 @@ where
         Self: 'async_trait,
     {
         Box::pin(async move {
-            self.kernel.authorize()?;
+            self.kernel.authorize_dispatch()?;
             let provider = self.inner.provider_name().map(str::to_owned);
             let config_bytes = serde_json::to_vec(&config).map_err(model_error)?;
             let session = self.inner.start_session(config).await?;
@@ -214,7 +230,7 @@ where
         Self: 'async_trait,
     {
         Box::pin(async move {
-            self.kernel.authorize()?;
+            self.kernel.authorize_dispatch()?;
             self.kernel.validate_policy()?;
             self.inner.prepare_turn(&mut request)?;
 
@@ -235,7 +251,7 @@ where
             let key = IdempotencyKey::parse(&format!("model-{}", hex(&identity_digest)))
                 .map_err(model_error)?;
             let original_reservation = reservation_id(identity_digest, 0);
-            let reservation = request_reservation(self.kernel.policy.reservation, &request)?;
+            let reservation = self.kernel.request_reservation(&request)?;
 
             let existing_intent = self.kernel.intent(&key, request_digest)?;
             let (intent, intent_replayed) = match existing_intent {
@@ -270,10 +286,9 @@ where
                     &key,
                     &intent,
                     &outcome,
-                    model_boundary(&request, outcome.result.as_ref()),
+                    self.kernel.boundary(&request, outcome.result.as_ref()),
                 )?;
-                self.kernel
-                    .settle(outcome.reservation_id, outcome.charged)?;
+                self.kernel.settle_outcome(&outcome)?;
                 return outcome.into_turn(Arc::clone(&self.kernel));
             }
 
@@ -355,7 +370,24 @@ where
                 serde_json::to_value(&intent.correlation).map_err(model_error)?,
             );
             self.kernel.verify_claim()?;
-            let turn = match self.inner.begin_turn(request, cancellation.clone()).await {
+            let provider = self.inner.begin_turn(request, cancellation.clone());
+            let turn = match if let Some(cancellation) = cancellation.as_ref() {
+                tokio::select! {
+                    result = provider => result,
+                    _ = cancellation.cancelled() => {
+                        self.kernel.commit_unknown(
+                            &key,
+                            request_digest,
+                            &intent,
+                            dispatch.reservation_id,
+                            "cancelled_during_provider_begin",
+                        )?;
+                        return Err(outcome_unknown());
+                    }
+                }
+            } else {
+                provider.await
+            } {
                 Ok(turn) => turn,
                 Err(error) => {
                     self.kernel.commit_unknown(
@@ -419,6 +451,21 @@ pub struct DurableModelTurn<T> {
     request: TurnRequest,
     cancellation: Option<TurnCancellation>,
     terminal: bool,
+}
+
+impl<T> Drop for DurableModelTurn<T> {
+    fn drop(&mut self) {
+        if !self.terminal {
+            let _ = self.kernel.commit_unknown(
+                &self.key,
+                self.request_digest,
+                &self.intent,
+                self.dispatch.reservation_id,
+                "model_turn_dropped_after_dispatch",
+            );
+            self.terminal = true;
+        }
+    }
 }
 
 impl<T> ModelTurn for DurableModelTurn<T>
@@ -487,7 +534,25 @@ where
                 self.terminal = true;
                 return Err(outcome_unknown());
             }
-            let event = match turn.next_event(cancellation.clone()).await {
+            let next = turn.next_event(cancellation.clone());
+            let event = match if let Some(cancellation) = cancellation.as_ref() {
+                tokio::select! {
+                    result = next => result,
+                    _ = cancellation.cancelled() => {
+                        self.kernel.commit_unknown(
+                            &self.key,
+                            self.request_digest,
+                            &self.intent,
+                            self.dispatch.reservation_id,
+                            "cancelled_during_provider_stream",
+                        )?;
+                        self.terminal = true;
+                        return Err(outcome_unknown());
+                    }
+                }
+            } else {
+                next.await
+            } {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(error) => {
@@ -524,17 +589,53 @@ where
                         self.kernel.policy.max_buffered_bytes,
                     )?;
                 }
-                ModelTurnEvent::ToolCall(call) => push_bounded(
-                    &mut self.buffered,
-                    ModelTurnEvent::ToolCall(call),
-                    &mut bytes,
-                    self.kernel.policy.max_buffered_bytes,
-                )?,
+                ModelTurnEvent::ToolCall(call) => {
+                    if self.kernel.outcome_validator.is_some() {
+                        self.kernel.commit_unknown(
+                            &self.key,
+                            self.request_digest,
+                            &self.intent,
+                            self.dispatch.reservation_id,
+                            "provider_tool_call_rejected",
+                        )?;
+                        self.buffered.clear();
+                        self.terminal = true;
+                        return Err(LoopError::Unsupported(
+                            "detached model output rejected".to_owned(),
+                        ));
+                    }
+                    push_bounded(
+                        &mut self.buffered,
+                        ModelTurnEvent::ToolCall(call),
+                        &mut bytes,
+                        self.kernel.policy.max_buffered_bytes,
+                    )?;
+                }
                 ModelTurnEvent::Finished(mut result) => {
-                    discard_reasoning(&mut result);
                     if result.usage.is_none() {
                         result.usage = latest_usage.clone();
                     }
+                    if self
+                        .kernel
+                        .outcome_validator
+                        .as_ref()
+                        .is_some_and(|validator| validator(&result).is_err())
+                    {
+                        self.kernel.commit_rejected(
+                            &self.key,
+                            self.request_digest,
+                            &self.intent,
+                            self.dispatch.reservation_id,
+                            result.usage.as_ref(),
+                            "provider_output_rejected",
+                        )?;
+                        self.buffered.clear();
+                        self.terminal = true;
+                        return Err(LoopError::Unsupported(
+                            "detached model output rejected".to_owned(),
+                        ));
+                    }
+                    discard_reasoning(&mut result);
                     push_bounded(
                         &mut self.buffered,
                         ModelTurnEvent::Finished(result.clone()),
@@ -585,8 +686,14 @@ where
             return Err(injected(ModelCrashPoint::BeforeOutcome));
         }
 
-        let outcome = PersistedOutcome::succeeded(self.dispatch.reservation_id, result);
-        let boundary = model_boundary(&self.request, outcome.result.as_ref());
+        let reserved = self
+            .kernel
+            .scheduler
+            .snapshot(self.dispatch.reservation_id)
+            .map_err(model_error)?
+            .spend();
+        let outcome = PersistedOutcome::succeeded(self.dispatch.reservation_id, result, reserved);
+        let boundary = self.kernel.boundary(&self.request, outcome.result.as_ref());
         let (committed, replayed) = self.kernel.append_outcome(
             &self.key,
             self.request_digest,
@@ -595,8 +702,13 @@ where
             &outcome,
             boundary,
         )?;
-        self.kernel
-            .settle(committed.reservation_id, committed.charged)?;
+        if self.kernel.crash_at == Some(ModelCrashPoint::AfterOutcome) {
+            self.buffered.clear();
+            self.inner = None;
+            self.terminal = true;
+            return Err(injected(ModelCrashPoint::AfterOutcome));
+        }
+        self.kernel.settle_outcome(&committed)?;
         if committed.status != ModelOutcomeStatus::Succeeded {
             self.buffered.clear();
             self.terminal = true;
@@ -664,6 +776,20 @@ impl ModelKernel {
         }
     }
 
+    fn authorize_dispatch(&self) -> Result<(), LoopError> {
+        self.authorize()
+    }
+
+    fn boundary(
+        &self,
+        request: &TurnRequest,
+        result: Option<&ModelTurnResult>,
+    ) -> Option<BoundarySnapshot> {
+        (!self.policy.detached)
+            .then(|| model_boundary(request, result))
+            .flatten()
+    }
+
     fn verify_claim(&self) -> Result<(), LoopError> {
         self.store
             .lock()
@@ -724,7 +850,9 @@ impl ModelKernel {
                     Err(outcome_unknown())
                 }
             }
-            ReservationStatus::Debited | ReservationStatus::Reconciled => Err(outcome_unknown()),
+            ReservationStatus::Debited
+            | ReservationStatus::Reconciled
+            | ReservationStatus::ActualOverage => Err(outcome_unknown()),
         }
     }
 
@@ -738,6 +866,49 @@ impl ModelKernel {
         } else {
             self.release(id)
         }
+    }
+
+    fn settle_outcome(&self, outcome: &PersistedOutcome) -> Result<(), LoopError> {
+        self.settle(outcome.reservation_id, outcome.charged)?;
+        if !outcome.charged
+            || (!self.policy.detached && self.policy.reservation.cost_microusd() != 0)
+        {
+            return Ok(());
+        }
+        let actual = outcome.settlement.as_ref().map_or_else(
+            || {
+                self.scheduler
+                    .snapshot(outcome.reservation_id)
+                    .map(|snapshot| snapshot.spend())
+                    .map_err(model_error)
+            },
+            |settlement| Ok(settlement.spend()),
+        )?;
+        self.scheduler
+            .reconcile(outcome.reservation_id, actual)
+            .map(|_| ())
+            .map_err(model_error)
+    }
+
+    fn request_reservation(&self, request: &TurnRequest) -> Result<Spend, LoopError> {
+        let base = if self.policy.detached || self.policy.reservation.cost_microusd() != 0 {
+            self.policy.reservation
+        } else {
+            let totals = self
+                .scheduler
+                .totals(self.security.config.run_id())
+                .map_err(model_error)?;
+            let remaining = RunBudget::from_effective_config(self.security.config.effective())
+                .remaining(totals.committed, totals.reserved);
+            Spend::new(
+                remaining.cost_microusd(),
+                self.policy.reservation.tokens(),
+                self.policy.reservation.turns(),
+                self.policy.reservation.tools(),
+                self.policy.reservation.processes(),
+            )
+        };
+        request_reservation(base, request)
     }
 
     fn intent(
@@ -823,22 +994,24 @@ impl ModelKernel {
         };
         let mut receipt = receipt;
         receipt.correlation.operation_id = receipt.model_call_id.to_string();
-        self.append_journal(
-            &format!("effect:{}:intent", key.as_str()),
-            receipt.correlation.command_id,
-            LoopRecord::EffectIntent(EffectIntent {
-                kind: EffectKind::Model,
-                correlation: receipt.correlation.clone(),
-                payload: EffectIntentPayload::Model {
-                    provider: provider.map(str::to_owned),
-                    model: model.map(str::to_owned),
-                    prompt_digest: format!("sha256:{}", hex(&prompt_digest)),
-                    config_digest: format!("sha256:{}", self.security.config.digest_hex()),
-                    model_digest: format!("sha256:{}", hex(&model_snapshot_digest)),
-                    model_intent: request.metadata.get("kit.grammar_edit.intent").cloned(),
-                },
-            }),
-        )?;
+        if !self.policy.detached {
+            self.append_journal(
+                &format!("effect:{}:intent", key.as_str()),
+                receipt.correlation.command_id,
+                LoopRecord::EffectIntent(EffectIntent {
+                    kind: EffectKind::Model,
+                    correlation: receipt.correlation.clone(),
+                    payload: EffectIntentPayload::Model {
+                        provider: provider.map(str::to_owned),
+                        model: model.map(str::to_owned),
+                        prompt_digest: format!("sha256:{}", hex(&prompt_digest)),
+                        config_digest: format!("sha256:{}", self.security.config.digest_hex()),
+                        model_digest: format!("sha256:{}", hex(&model_snapshot_digest)),
+                        model_intent: request.metadata.get("kit.grammar_edit.intent").cloned(),
+                    },
+                }),
+            )?;
+        }
         let payload = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "model_call_id": receipt.model_call_id,
@@ -860,6 +1033,7 @@ impl ModelKernel {
                 ProviderIdempotency::Unproven => "unproven",
                 ProviderIdempotency::Enforced => "enforced",
             },
+            "detached": self.policy.detached,
         }))
         .map_err(model_error)?;
         self.append_record(
@@ -883,14 +1057,16 @@ impl ModelKernel {
         intent: &IntentReceipt,
         reservation_id: ReservationId,
     ) -> Result<(DispatchReceipt, bool), LoopError> {
-        self.append_journal(
-            &format!("effect:{}:dispatch", key.as_str()),
-            intent.correlation.command_id,
-            LoopRecord::EffectDispatched(EffectDispatched {
-                kind: EffectKind::Model,
-                correlation: intent.correlation.clone(),
-            }),
-        )?;
+        if !self.policy.detached {
+            self.append_journal(
+                &format!("effect:{}:dispatch", key.as_str()),
+                intent.correlation.command_id,
+                LoopRecord::EffectDispatched(EffectDispatched {
+                    kind: EffectKind::Model,
+                    correlation: intent.correlation.clone(),
+                }),
+            )?;
+        }
         let receipt = DispatchReceipt { reservation_id };
         let payload = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
@@ -938,6 +1114,8 @@ impl ModelKernel {
             "finish_reason": outcome.result.as_ref().map(|result| &result.finish_reason),
             "provider_request_id": outcome.result.as_ref().and_then(|result| result.response_id.as_deref()),
             "usage": outcome.usage,
+            "settlement": outcome.settlement,
+            "policy_violation": outcome.policy_violation,
             "artifacts": artifacts,
             "result_digest": outcome.result.as_ref().map(|result| {
                 serde_json::to_vec(result).map(|bytes| format!("sha256:{}", hex(&sha256(&bytes))))
@@ -1052,9 +1230,33 @@ impl ModelKernel {
         reservation_id: ReservationId,
         code: &str,
     ) -> Result<(), LoopError> {
-        let outcome = PersistedOutcome::unknown(reservation_id, code);
+        let reserved = self
+            .scheduler
+            .snapshot(reservation_id)
+            .map_err(model_error)?
+            .spend();
+        let outcome = PersistedOutcome::unknown(reservation_id, code, reserved);
         let (committed, _) = self.append_outcome(key, digest, intent, true, &outcome, None)?;
         self.settle(committed.reservation_id, committed.charged)
+    }
+
+    fn commit_rejected(
+        &self,
+        key: &IdempotencyKey,
+        digest: CanonicalRequestDigest,
+        intent: &IntentReceipt,
+        reservation_id: ReservationId,
+        usage: Option<&Usage>,
+        code: &str,
+    ) -> Result<(), LoopError> {
+        let reserved = self
+            .scheduler
+            .snapshot(reservation_id)
+            .map_err(model_error)?
+            .spend();
+        let outcome = PersistedOutcome::rejected(reservation_id, code, reserved, usage);
+        let (committed, _) = self.append_outcome(key, digest, intent, true, &outcome, None)?;
+        self.settle_outcome(&committed)
     }
 
     fn append_journal_outcome(
@@ -1064,6 +1266,9 @@ impl ModelKernel {
         outcome: &PersistedOutcome,
         snapshot: Option<BoundarySnapshot>,
     ) -> Result<(), LoopError> {
+        if self.policy.detached {
+            return Ok(());
+        }
         let status = match outcome.status {
             ModelOutcomeStatus::Succeeded => EffectStatus::Succeeded,
             ModelOutcomeStatus::Cancelled => EffectStatus::Cancelled,
@@ -1137,12 +1342,17 @@ struct PersistedOutcome {
     artifacts: Vec<String>,
     error: Option<String>,
     charged: bool,
+    #[serde(default)]
+    settlement: Option<ModelSettlement>,
+    #[serde(default)]
+    policy_violation: Option<String>,
     #[serde(with = "reservation_serde")]
     reservation_id: ReservationId,
 }
 
 impl PersistedOutcome {
-    fn succeeded(reservation_id: ReservationId, result: ModelTurnResult) -> Self {
+    fn succeeded(reservation_id: ReservationId, result: ModelTurnResult, reserved: Spend) -> Self {
+        let settlement = actual_spend(reserved, result.usage.as_ref());
         Self {
             status: ModelOutcomeStatus::Succeeded,
             usage: result.usage.clone(),
@@ -1150,6 +1360,8 @@ impl PersistedOutcome {
             result: Some(result),
             error: None,
             charged: true,
+            policy_violation: settlement.policy_violation.clone(),
+            settlement: Some(settlement),
             reservation_id,
         }
     }
@@ -1162,11 +1374,13 @@ impl PersistedOutcome {
             artifacts: Vec::new(),
             error: Some("cancelled_before_dispatch".to_owned()),
             charged: false,
+            settlement: None,
+            policy_violation: None,
             reservation_id,
         }
     }
 
-    fn unknown(reservation_id: ReservationId, code: &str) -> Self {
+    fn unknown(reservation_id: ReservationId, code: &str, reserved: Spend) -> Self {
         Self {
             status: ModelOutcomeStatus::OutcomeUnknown,
             result: None,
@@ -1174,6 +1388,31 @@ impl PersistedOutcome {
             artifacts: Vec::new(),
             error: Some(code.to_owned()),
             charged: true,
+            settlement: Some(ModelSettlement::from_spend(reserved)),
+            policy_violation: None,
+            reservation_id,
+        }
+    }
+
+    fn rejected(
+        reservation_id: ReservationId,
+        code: &str,
+        reserved: Spend,
+        usage: Option<&Usage>,
+    ) -> Self {
+        let settlement = actual_spend(reserved, usage);
+        Self {
+            status: ModelOutcomeStatus::OutcomeUnknown,
+            result: None,
+            usage: None,
+            artifacts: Vec::new(),
+            error: Some(code.to_owned()),
+            charged: true,
+            policy_violation: Some(settlement.policy_violation.clone().map_or_else(
+                || code.to_owned(),
+                |violation| format!("{code},{violation}"),
+            )),
+            settlement: Some(settlement),
             reservation_id,
         }
     }
@@ -1219,6 +1458,7 @@ impl PersistedOutcome {
                         available_tools: Vec::new(),
                         cache: None,
                         structured_output: None,
+                        generation: Default::default(),
                         metadata: agentkit_core::MetadataMap::new(),
                     },
                     cancellation: None,
@@ -1287,7 +1527,13 @@ fn operation_identity_digest(
 fn request_reservation(base: Spend, request: &TurnRequest) -> Result<Spend, LoopError> {
     let projected_bytes = serde_json::to_vec(request).map_err(model_error)?.len();
     let tokens = u64::try_from(projected_bytes.div_ceil(3))
-        .map_err(|_| LoopError::Provider("model prompt token estimate overflowed".to_owned()))?;
+        .ok()
+        .and_then(|input| {
+            input.checked_add(u64::from(
+                request.generation.max_output_tokens.unwrap_or_default(),
+            ))
+        })
+        .ok_or_else(|| LoopError::Provider("model prompt token estimate overflowed".to_owned()))?;
     Ok(Spend::new(
         base.cost_microusd(),
         base.tokens().max(tokens),
@@ -1295,6 +1541,85 @@ fn request_reservation(base: Spend, request: &TurnRequest) -> Result<Spend, Loop
         base.tools(),
         base.processes(),
     ))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ModelSettlement {
+    cost_microusd: u64,
+    tokens: u64,
+    turns: u64,
+    tools: u64,
+    processes: u64,
+    #[serde(skip)]
+    policy_violation: Option<String>,
+}
+
+impl ModelSettlement {
+    fn from_spend(spend: Spend) -> Self {
+        Self {
+            cost_microusd: spend.cost_microusd(),
+            tokens: spend.tokens(),
+            turns: spend.turns(),
+            tools: spend.tools(),
+            processes: spend.processes(),
+            policy_violation: None,
+        }
+    }
+
+    fn spend(&self) -> Spend {
+        Spend::new(
+            self.cost_microusd,
+            self.tokens,
+            self.turns,
+            self.tools,
+            self.processes,
+        )
+    }
+}
+
+fn actual_spend(reserved: Spend, usage: Option<&Usage>) -> ModelSettlement {
+    let tokens = usage
+        .and_then(|usage| usage.tokens.as_ref())
+        .and_then(|tokens| {
+            tokens
+                .input_tokens
+                .checked_add(tokens.cached_input_tokens.unwrap_or_default())?
+                .checked_add(tokens.cache_write_input_tokens.unwrap_or_default())?
+                .checked_add(tokens.output_tokens)?
+                .checked_add(tokens.reasoning_tokens.unwrap_or_default())
+        });
+    let cost = usage
+        .and_then(|usage| usage.cost.as_ref())
+        .filter(|cost| cost.currency.eq_ignore_ascii_case("USD"))
+        .and_then(|cost| {
+            let micros = cost.amount * 1_000_000.0;
+            (micros.is_finite() && micros >= 0.0 && micros <= u64::MAX as f64)
+                .then(|| micros.ceil() as u64)
+        });
+    let mut violations = Vec::new();
+    if usage.and_then(|usage| usage.cost.as_ref()).is_none() {
+        violations.push("provider_cost_missing");
+    } else if cost.is_none() {
+        violations.push("provider_cost_invalid");
+    } else if cost.is_some_and(|cost| cost > reserved.cost_microusd()) {
+        violations.push("provider_cost_overage");
+    }
+    if tokens.is_none() {
+        violations.push("provider_tokens_missing_or_invalid");
+    } else if tokens.is_some_and(|tokens| tokens > reserved.tokens()) {
+        violations.push("provider_token_overage");
+    }
+    let spend = Spend::new(
+        cost.unwrap_or(reserved.cost_microusd()),
+        tokens.unwrap_or(reserved.tokens()),
+        1,
+        0,
+        0,
+    );
+    ModelSettlement {
+        policy_violation: (!violations.is_empty()).then(|| violations.join(",")),
+        ..ModelSettlement::from_spend(spend)
+    }
 }
 
 fn model_snapshot_digest(provider: Option<&str>, model: Option<&str>, config: &[u8]) -> [u8; 32] {
@@ -1498,7 +1823,7 @@ mod reservation_serde {
 
 #[cfg(test)]
 mod tests {
-    use agentkit_core::{Item, ItemKind, MetadataMap};
+    use agentkit_core::{CostUsage, Item, ItemKind, MetadataMap, TokenUsage};
     use agentkit_loop::{StructuredOutputRequest, TurnRequest};
 
     use super::*;
@@ -1515,6 +1840,7 @@ mod tests {
             available_tools: Vec::new(),
             cache: None,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         };
         let ordinary = request_reservation(Spend::new(0, 1, 1, 0, 0), &request).unwrap();
@@ -1536,5 +1862,46 @@ mod tests {
             constrained.tokens(),
             u64::try_from(serde_json::to_vec(&request).unwrap().len().div_ceil(3)).unwrap()
         );
+    }
+
+    #[test]
+    fn detached_cost_settlement_is_exact_or_conservatively_full() {
+        let reserved = Spend::new(10, 100, 1, 0, 0);
+        let exact_usage =
+            Usage::new(TokenUsage::new(12, 3)).with_cost(CostUsage::new(0.000_006, "USD"));
+        let exact = actual_spend(reserved, Some(&exact_usage));
+        assert_eq!(exact.spend(), Spend::new(6, 15, 1, 0, 0));
+        assert!(exact.policy_violation.is_none());
+
+        let missing = actual_spend(reserved, None);
+        assert_eq!(missing.spend(), reserved);
+        assert!(missing.policy_violation.is_some());
+        for usage in [
+            Usage::new(TokenUsage::new(12, 3)),
+            Usage::new(TokenUsage::new(12, 3)).with_cost(CostUsage::new(0.000_006, "EUR")),
+        ] {
+            let settlement = actual_spend(reserved, Some(&usage));
+            assert_eq!(settlement.spend(), Spend::new(10, 15, 1, 0, 0));
+            assert!(settlement.policy_violation.is_some());
+        }
+
+        let overage = actual_spend(
+            reserved,
+            Some(&Usage::new(TokenUsage::new(120, 30)).with_cost(CostUsage::new(0.000_011, "USD"))),
+        );
+        assert_eq!(overage.spend(), Spend::new(11, 150, 1, 0, 0));
+        assert_eq!(
+            overage.policy_violation.as_deref(),
+            Some("provider_cost_overage,provider_token_overage")
+        );
+
+        let cached = Usage::new(
+            TokenUsage::new(12, 3)
+                .with_cached_input_tokens(4)
+                .with_cache_write_input_tokens(5)
+                .with_reasoning_tokens(2),
+        )
+        .with_cost(CostUsage::new(0.000_006, "USD"));
+        assert_eq!(actual_spend(reserved, Some(&cached)).spend().tokens(), 26);
     }
 }

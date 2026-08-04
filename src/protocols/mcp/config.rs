@@ -39,6 +39,97 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<McpEgressConfig>,
     pub descriptors: Vec<McpDescriptorPolicyConfig>,
+    #[serde(default, skip_serializing_if = "McpResponderConfig::is_disabled")]
+    pub responders: McpResponderConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpResponderConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<McpSamplingResponderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<McpFormElicitationResponderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<McpRootsResponderConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSamplingResponderConfig {
+    pub model_id: String,
+    #[serde(default)]
+    pub approval: McpSamplingApprovalMode,
+    pub timeout_millis: u64,
+    pub max_cost_microusd: u64,
+    pub max_tokens: u32,
+    pub max_messages: usize,
+    pub max_content_items: usize,
+    pub max_content_bytes: usize,
+    pub max_output_bytes: usize,
+    pub max_output_content_items: usize,
+    pub max_system_prompt_bytes: usize,
+    pub max_stop_sequences: usize,
+    pub max_stop_sequence_bytes: usize,
+    pub max_temperature: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<McpSamplingPricingPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSamplingPricingPolicy {
+    pub version: String,
+    pub provider: String,
+    pub model: String,
+    pub tokenizer_bytes_per_token: u32,
+    pub input: crate::agent::accounting::CostRate,
+    pub cache_read: crate::agent::accounting::CostRate,
+    pub cache_write: crate::agent::accounting::CostRate,
+    pub output: crate::agent::accounting::CostRate,
+    pub reasoning: crate::agent::accounting::CostRate,
+    #[serde(default)]
+    pub local_free: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSamplingApprovalMode {
+    #[default]
+    None,
+    RequestOnly,
+    RequestAndResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpFormElicitationResponderConfig {
+    pub timeout_millis: u64,
+    pub max_message_bytes: usize,
+    pub max_schema_bytes: usize,
+    pub max_properties: usize,
+    pub max_property_name_bytes: usize,
+    pub max_response_bytes: usize,
+    pub public_data_only: bool,
+    pub safe_fields: BTreeSet<String>,
+    pub allowed_schema: crate::protocols::mcp::responders::FormElicitationSchema,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRootsResponderConfig {
+    pub timeout_millis: u64,
+    pub max_roots: usize,
+    pub max_uri_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_shared_filesystem: Option<McpSharedFilesystemConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSharedFilesystemConfig {
+    pub local_source: std::path::PathBuf,
+    pub server_source: std::path::PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -246,8 +337,169 @@ impl McpServerConfig {
                 return Err("duplicate MCP descriptor policy".to_owned());
             }
         }
+        self.responders.validate(&self.transport)?;
         Ok(())
     }
+}
+
+impl McpResponderConfig {
+    fn is_disabled(&self) -> bool {
+        self.sampling.is_none() && self.elicitation.is_none() && self.roots.is_none()
+    }
+
+    fn validate(&self, transport: &McpTransportConfig) -> Result<(), String> {
+        if let Some(policy) = &self.sampling
+            && (!(1..=300_000).contains(&policy.timeout_millis)
+                || policy.model_id.is_empty()
+                || policy.model_id.len() > 256
+                || policy.model_id.chars().any(char::is_control)
+                || policy.pricing.as_ref().is_none_or(|pricing| {
+                    !pricing.valid() || (policy.max_cost_microusd == 0 && !pricing.local_free)
+                })
+                || policy.max_tokens == 0
+                || policy.max_tokens > 1_000_000
+                || !bounded(policy.max_messages, 1024)
+                || !bounded(policy.max_content_items, 64)
+                || !bounded(policy.max_content_bytes, 1024 * 1024)
+                || !(1024..=1024 * 1024).contains(&policy.max_output_bytes)
+                || !bounded(policy.max_output_content_items, 64)
+                || !bounded(policy.max_system_prompt_bytes, 1024 * 1024)
+                || policy.max_stop_sequences > 64
+                || !bounded(policy.max_stop_sequence_bytes, 16 * 1024)
+                || !policy.max_temperature.is_finite()
+                || !(0.0..=2.0).contains(&policy.max_temperature))
+        {
+            return Err("MCP sampling responder limits are invalid".to_owned());
+        }
+        if let Some(policy) = &self.elicitation
+            && (!(1..=300_000).contains(&policy.timeout_millis)
+                || !bounded(policy.max_message_bytes, 64 * 1024)
+                || !bounded(policy.max_schema_bytes, 1024 * 1024)
+                || !bounded(policy.max_properties, 256)
+                || !bounded(policy.max_property_name_bytes, 256)
+                || !(1024..=1024 * 1024).contains(&policy.max_response_bytes)
+                || !policy.public_data_only
+                || policy.allowed_schema.properties.is_empty()
+                || policy.allowed_schema.properties.len() > policy.max_properties
+                || !serde_json::to_vec(&policy.allowed_schema)
+                    .is_ok_and(|schema| schema.len() <= policy.max_schema_bytes)
+                || policy.allowed_schema.title.as_deref().is_some_and(|value| {
+                    !crate::protocols::mcp::responders::public_form_text(value)
+                })
+                || policy
+                    .allowed_schema
+                    .description
+                    .as_deref()
+                    .is_some_and(|value| {
+                        !crate::protocols::mcp::responders::public_form_text(value)
+                    })
+                || policy.safe_fields.len() != policy.allowed_schema.properties.len()
+                || policy.safe_fields.iter().any(|name| {
+                    name.len() > policy.max_property_name_bytes
+                        || !crate::protocols::mcp::responders::public_form_text(name)
+                })
+                || policy
+                    .allowed_schema
+                    .properties
+                    .keys()
+                    .any(|name| !policy.safe_fields.contains(name))
+                || policy
+                    .allowed_schema
+                    .properties
+                    .iter()
+                    .any(|(name, schema)| {
+                        name.is_empty()
+                            || name.len() > policy.max_property_name_bytes
+                            || name.chars().any(char::is_control)
+                            || !crate::protocols::mcp::responders::public_form_property(
+                                name, schema,
+                            )
+                            || !crate::protocols::mcp::responders::supported_form_property(schema)
+                    })
+                || policy
+                    .allowed_schema
+                    .required
+                    .as_ref()
+                    .is_some_and(|required| {
+                        let unique = required.iter().collect::<BTreeSet<_>>();
+                        unique.len() != required.len()
+                            || required
+                                .iter()
+                                .any(|name| !policy.allowed_schema.properties.contains_key(name))
+                    }))
+        {
+            return Err("MCP form elicitation responder limits are invalid".to_owned());
+        }
+        if let Some(policy) = &self.roots {
+            if !(1..=300_000).contains(&policy.timeout_millis)
+                || policy.max_roots != 1
+                || !bounded(policy.max_uri_bytes, 16 * 1024)
+            {
+                return Err("MCP roots responder limits are invalid".to_owned());
+            }
+            match (transport, &policy.http_shared_filesystem) {
+                (McpTransportConfig::Stdio { .. }, None) => {}
+                (McpTransportConfig::Stdio { .. }, Some(_)) => {
+                    return Err("MCP stdio roots cannot configure an HTTP mapping".to_owned());
+                }
+                (McpTransportConfig::Http { .. }, None) => {}
+                (McpTransportConfig::Http { .. }, Some(mapping))
+                    if mapping.local_source.is_absolute()
+                        && mapping.server_source.is_absolute()
+                        && safe_absolute_path(&mapping.local_source)
+                        && safe_absolute_path(&mapping.server_source) => {}
+                (McpTransportConfig::Http { .. }, Some(_)) => {
+                    return Err("MCP HTTP shared-filesystem mapping is invalid".to_owned());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl McpSamplingPricingPolicy {
+    pub fn valid_for(&self, provider: &str, model: &str) -> bool {
+        self.valid()
+            && self.provider == provider
+            && self.model == model
+            && (!self.local_free || provider == "ollama")
+    }
+
+    fn valid(&self) -> bool {
+        let rates = [
+            self.input,
+            self.cache_read,
+            self.cache_write,
+            self.output,
+            self.reasoning,
+        ];
+        let all_zero = rates.iter().all(|rate| rate.currency_micros == 0);
+        !self.version.is_empty()
+            && self.version.len() <= 256
+            && self.version.bytes().all(|byte| byte.is_ascii_graphic())
+            && !self.provider.is_empty()
+            && self.provider.len() <= 256
+            && !self.model.is_empty()
+            && self.model.len() <= 256
+            && self.tokenizer_bytes_per_token > 0
+            && rates.iter().all(|rate| rate.per_units > 0)
+            && self.local_free == all_zero
+    }
+}
+
+fn bounded(value: usize, maximum: usize) -> bool {
+    (1..=maximum).contains(&value)
+}
+
+fn safe_absolute_path(path: &std::path::Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )
+    })
 }
 
 fn valid_stdio_argv(argv: &[String]) -> bool {
@@ -286,16 +538,25 @@ pub struct McpBootstrapContext<'a> {
     pub config: &'a RunConfigSnapshot,
     pub workspace_id: WorkspaceId,
     pub workspace_revision: &'a str,
+    pub project_root: &'a std::path::Path,
     pub attempt: AttemptOwnership,
     pub claim: AttemptDriverClaim,
     pub current_fence: Arc<std::sync::atomic::AtomicU64>,
+    pub current_claim_generation: Arc<std::sync::atomic::AtomicU64>,
+    pub revision_live: Arc<std::sync::atomic::AtomicBool>,
     pub cancellation: Arc<std::sync::atomic::AtomicBool>,
     pub budget: Arc<BudgetLedger>,
+    pub scheduler: crate::runtime::scheduler::DurableScheduler,
+    pub responder_outcomes: &'a crate::protocols::mcp::responders::ResponderOutcomes,
+    pub callback_database: &'a std::path::Path,
+    pub artifacts: Arc<crate::store::artifacts::ArtifactStore>,
+    pub claim_verifier: crate::protocols::mcp::responders::ClaimVerifier,
     pub occurred_at: &'a crate::domain::events::UtcDateTime,
     pub resolved_auth:
         &'a BTreeMap<String, crate::agent::driver::restart::ResolvedMcpBootstrapAuth>,
     pub stdio_profiles: Option<&'a dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>,
-    pub stdio_secrets: &'a [Arc<crate::domain::secret::SecretLease>],
+    pub resolved_secrets: &'a Arc<BTreeMap<SecretHandle, Arc<crate::domain::secret::SecretLease>>>,
+    pub callback_secrets: &'a BTreeMap<String, Vec<Arc<crate::domain::secret::SecretLease>>>,
 }
 
 pub enum McpBootstrapOutcome {
@@ -473,6 +734,56 @@ pub(crate) async fn bootstrap(
                 )
                 .into());
             }
+            let responder_authority = crate::protocols::mcp::responders::ResponderAuthority::new(
+                context.attempt,
+                context.claim,
+                Arc::clone(&context.current_fence),
+                Arc::clone(&context.current_claim_generation),
+                {
+                    let root = context.project_root.to_owned();
+                    let expected = context.workspace_revision.to_owned();
+                    Arc::new(move || {
+                        crate::workspace::revision::ManagedWorkspace::open(&root)
+                            .and_then(|workspace| workspace.current_revision())
+                            .is_ok_and(|revision| revision.id().to_string() == expected)
+                    })
+                },
+                configured.id.clone(),
+                Arc::clone(&context.budget),
+                Arc::clone(&context.cancellation),
+                Arc::clone(&context.claim_verifier),
+            )
+            .with_scheduler(context.scheduler.clone());
+            let root_proof = crate::protocols::mcp::responders::SourceRootProof::issue(
+                configured,
+                context.project_root,
+            )?;
+            let responder_outcomes = context
+                .responder_outcomes
+                .clone()
+                .with_default_elicitation(
+                    configured,
+                    context.callback_database,
+                    Arc::clone(&context.artifacts),
+                    context.project_root,
+                    context.authenticated.principal_id(),
+                    context.config.project_id(),
+                    context.attempt,
+                    context.claim,
+                    context.workspace_id,
+                    context.workspace_revision,
+                    context.config.effective().artifact_retention_days,
+                    Arc::clone(&context.cancellation),
+                )?;
+            let responders = crate::protocols::mcp::responders::install(
+                configured,
+                responder_authority,
+                &responder_outcomes,
+                root_proof,
+                TransportLimits::default().channel_capacity(),
+            )?;
+            let handler = responders.handler_config();
+            let initialize_arguments = handler.initialize_arguments();
             let (extension, grant_extension, connection) = match &configured.transport {
                 McpTransportConfig::Http { endpoint } => {
                     let credential = configured.credential_handle.clone().ok_or_else(|| {
@@ -496,6 +807,7 @@ pub(crate) async fn bootstrap(
                     let lifecycle =
                         crate::capabilities::broker::OwnedBrokerInvocation::run_lifecycle(
                             &configured.id,
+                            initialize_arguments.clone(),
                             context.authenticated,
                             context.config,
                             context.workspace_id,
@@ -558,10 +870,15 @@ pub(crate) async fn bootstrap(
                                     &request,
                                     &policy,
                                     Arc::new(
-                                        crate::protocols::mcp::transport::EnvironmentHttpCredentialBroker,
+                                        crate::protocols::mcp::transport::EnvironmentHttpCredentialBroker::new(
+                                            context.authenticated.principal_id(),
+                                            context.config.project_id(),
+                                            Arc::clone(context.resolved_secrets),
+                                        ),
                                     ),
                                     store,
                                     TransportLimits::default(),
+                                    handler.clone(),
                                 ),
                             )
                             .await
@@ -571,7 +888,8 @@ pub(crate) async fn bootstrap(
                                         .into(),
                                 ),
                                 error => error,
-                            })?,
+                            })?
+                            .with_responders(responders.clone()),
                         )
                     } else {
                         match await_bootstrap(
@@ -582,15 +900,22 @@ pub(crate) async fn bootstrap(
                                 &request,
                                 &policy,
                                 Arc::new(
-                                    crate::protocols::mcp::transport::EnvironmentHttpCredentialBroker,
+                                    crate::protocols::mcp::transport::EnvironmentHttpCredentialBroker::new(
+                                        context.authenticated.principal_id(),
+                                        context.config.project_id(),
+                                        Arc::clone(context.resolved_secrets),
+                                    ),
                                 ),
                                 store,
                                 TransportLimits::default(),
+                                handler.clone(),
                             ),
                         )
                         .await?
                         {
-                            StreamableHttpOutcome::Ready(connection) => Arc::new(*connection),
+                            StreamableHttpOutcome::Ready(connection) => Arc::new(
+                                (*connection).with_responders(responders.clone()),
+                            ),
                             StreamableHttpOutcome::AuthRequired(challenge) => {
                                 return Err(BootstrapStepError::AuthRequired(Box::new(
                                     challenge.challenge,
@@ -614,7 +939,14 @@ pub(crate) async fn bootstrap(
                         }
                     })?;
                     let scanner_leases = context
-                        .stdio_secrets
+                        .callback_secrets
+                        .get(&configured.id)
+                        .ok_or_else(|| {
+                            format!(
+                                "MCP server {:?} callback secret scope is unavailable",
+                                configured.id
+                            )
+                        })?
                         .iter()
                         .map(|secret| {
                             crate::domain::secret::SecretLease::new(secret.expose().to_vec())
@@ -645,6 +977,7 @@ pub(crate) async fn bootstrap(
                     let lifecycle =
                         crate::capabilities::broker::OwnedBrokerInvocation::run_lifecycle(
                             &configured.id,
+                            initialize_arguments.clone(),
                             context.authenticated,
                             context.config,
                             context.workspace_id,
@@ -673,7 +1006,7 @@ pub(crate) async fn bootstrap(
                                     let mut launcher = profiles.prepare(
                                         owned_process_profile,
                                         context.attempt,
-                                        &credentials,
+                                        context.resolved_secrets,
                                     )?;
                                     launcher.add_scanner(
                                         crate::telemetry::redact::CaptureRedactor::new(
@@ -685,9 +1018,11 @@ pub(crate) async fn bootstrap(
                                 },
                                 store,
                                 TransportLimits::default(),
+                                handler.clone(),
                             ),
                         )
-                        .await?,
+                        .await?
+                        .with_responders(responders.clone()),
                     );
                     opened.push(Arc::clone(&connection));
                     let grant_extension = GrantExtension::new([], credentials, 0)
@@ -883,5 +1218,146 @@ mod tests {
     #[tokio::test]
     async fn cancel_during_stdio_initialize_drains_bootstrap() {
         cancellation_drains_phase().await;
+    }
+
+    #[test]
+    fn responder_config_is_strict_and_deny_by_default() {
+        let empty: McpResponderConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, McpResponderConfig::default());
+        assert!(serde_json::from_str::<McpResponderConfig>(r#"{"url_elicitation":{}}"#).is_err());
+        assert!(
+            serde_json::from_str::<McpSamplingResponderConfig>(
+                r#"{"timeout_millis":1,"max_tokens":1,"max_messages":1,"max_content_items":1,"max_content_bytes":1,"max_system_prompt_bytes":1,"max_stop_sequences":0,"max_stop_sequence_bytes":1,"max_temperature":1.0,"unknown":true}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn responder_limits_fail_closed() {
+        let responders = McpResponderConfig {
+            sampling: Some(McpSamplingResponderConfig {
+                model_id: "test-model".to_owned(),
+                approval: McpSamplingApprovalMode::None,
+                timeout_millis: 0,
+                max_cost_microusd: 1,
+                max_tokens: 1,
+                max_messages: 1,
+                max_content_items: 1,
+                max_content_bytes: 1,
+                max_output_bytes: 1,
+                max_output_content_items: 1,
+                max_system_prompt_bytes: 1,
+                max_stop_sequences: 0,
+                max_stop_sequence_bytes: 1,
+                max_temperature: 1.0,
+                pricing: None,
+            }),
+            elicitation: None,
+            roots: None,
+        };
+        assert!(
+            responders
+                .validate(&McpTransportConfig::Http {
+                    endpoint: "https://example.invalid/mcp".to_owned(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sampling_requires_complete_pinned_pricing() {
+        let pricing = McpSamplingPricingPolicy {
+            version: "price-v1".to_owned(),
+            provider: "openai".to_owned(),
+            model: "model".to_owned(),
+            tokenizer_bytes_per_token: 4,
+            input: crate::agent::accounting::CostRate::new(1, 1),
+            cache_read: crate::agent::accounting::CostRate::new(1, 1),
+            cache_write: crate::agent::accounting::CostRate::new(1, 1),
+            output: crate::agent::accounting::CostRate::new(1, 1),
+            reasoning: crate::agent::accounting::CostRate::new(1, 1),
+            local_free: false,
+        };
+        assert!(pricing.valid_for("openai", "model"));
+        assert!(!pricing.valid_for("openrouter", "model"));
+        let mut missing = pricing;
+        missing.tokenizer_bytes_per_token = 0;
+        assert!(!missing.valid());
+
+        let without_pricing = McpResponderConfig {
+            sampling: Some(McpSamplingResponderConfig {
+                model_id: "model".to_owned(),
+                approval: McpSamplingApprovalMode::None,
+                timeout_millis: 1_000,
+                max_cost_microusd: 100,
+                max_tokens: 32,
+                max_messages: 4,
+                max_content_items: 4,
+                max_content_bytes: 1_024,
+                max_output_bytes: 1_024,
+                max_output_content_items: 4,
+                max_system_prompt_bytes: 1_024,
+                max_stop_sequences: 4,
+                max_stop_sequence_bytes: 64,
+                max_temperature: 1.0,
+                pricing: None,
+            }),
+            ..McpResponderConfig::default()
+        };
+        assert!(
+            without_pricing
+                .validate(&McpTransportConfig::Http {
+                    endpoint: "https://example.invalid/mcp".to_owned(),
+                })
+                .is_err()
+        );
+
+        let zero = crate::agent::accounting::CostRate::new(0, 1);
+        let free_local = McpSamplingPricingPolicy {
+            version: "local-free-v1".to_owned(),
+            provider: "ollama".to_owned(),
+            model: "llama".to_owned(),
+            tokenizer_bytes_per_token: 4,
+            input: zero,
+            cache_read: zero,
+            cache_write: zero,
+            output: zero,
+            reasoning: zero,
+            local_free: true,
+        };
+        assert!(free_local.valid_for("ollama", "llama"));
+        assert!(!free_local.valid_for("openai", "llama"));
+    }
+
+    #[test]
+    fn elicitation_allowlist_rejects_unicode_secret_fields() {
+        let field = "ѕecret".to_owned();
+        let responders = McpResponderConfig {
+            sampling: None,
+            elicitation: Some(McpFormElicitationResponderConfig {
+                timeout_millis: 100,
+                max_message_bytes: 128,
+                max_schema_bytes: 1024,
+                max_properties: 1,
+                max_property_name_bytes: 64,
+                max_response_bytes: 1024,
+                public_data_only: true,
+                safe_fields: BTreeSet::from([field.clone()]),
+                allowed_schema: serde_json::from_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {(field): {"type": "string"}}
+                }))
+                .unwrap(),
+            }),
+            roots: None,
+        };
+        assert!(
+            responders
+                .validate(&McpTransportConfig::Http {
+                    endpoint: "https://example.invalid/mcp".to_owned(),
+                })
+                .is_err()
+        );
     }
 }

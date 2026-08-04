@@ -32,6 +32,8 @@ pub(crate) enum BuildError {
     CacheViolation(String),
     #[error("turn structured output conflicts with configured output_format")]
     StructuredOutputConflict,
+    #[error("Anthropic cannot honor the requested generation controls")]
+    UnsupportedGenerationControls,
 }
 
 impl From<BuildError> for LoopError {
@@ -49,6 +51,19 @@ pub(crate) fn build_request_body(
     request: &TurnRequest,
 ) -> Result<Value, BuildError> {
     validate_thinking_budget(config)?;
+    if request.generation.max_output_tokens == Some(0)
+        || request
+            .generation
+            .max_output_tokens
+            .is_some_and(|maximum| maximum > config.max_tokens)
+        || request
+            .generation
+            .temperature
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        || (config.thinking.is_some() && request.generation.temperature.is_some())
+    {
+        return Err(BuildError::UnsupportedGenerationControls);
+    }
 
     // Split the transcript up front into system blocks + interleaved messages.
     let mut system_blocks: Vec<Value> = Vec::new();
@@ -105,7 +120,15 @@ pub(crate) fn build_request_body(
     // Assemble body
     let mut body = Map::new();
     body.insert("model".into(), Value::String(config.model.clone()));
-    body.insert("max_tokens".into(), Value::from(config.max_tokens));
+    body.insert(
+        "max_tokens".into(),
+        Value::from(
+            request
+                .generation
+                .max_output_tokens
+                .unwrap_or(config.max_tokens),
+        ),
+    );
 
     if !system_blocks.is_empty() {
         body.insert("system".into(), Value::Array(system_blocks));
@@ -125,7 +148,7 @@ pub(crate) fn build_request_body(
         );
     }
 
-    if let Some(temp) = config.temperature {
+    if let Some(temp) = request.generation.temperature.or(config.temperature) {
         body.insert("temperature".into(), json_number(temp as f64));
     }
     if let Some(top_p) = config.top_p {
@@ -134,7 +157,12 @@ pub(crate) fn build_request_body(
     if let Some(top_k) = config.top_k {
         body.insert("top_k".into(), Value::from(top_k));
     }
-    if let Some(stops) = &config.stop_sequences {
+    if let Some(stops) = request
+        .generation
+        .stop_sequences
+        .as_ref()
+        .or(config.stop_sequences.as_ref())
+    {
         body.insert(
             "stop_sequences".into(),
             Value::Array(stops.iter().cloned().map(Value::String).collect()),
@@ -670,6 +698,7 @@ mod tests {
             available_tools: Vec::new(),
             cache: None,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         }
     }
@@ -688,6 +717,20 @@ mod tests {
         assert_eq!(body["system"][0]["text"], "be concise");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn per_turn_generation_controls_override_the_exact_request_fields() {
+        let mut request = base_request(vec![Item::text(ItemKind::User, "hello")]);
+        request.generation = agentkit_loop::GenerationControls {
+            max_output_tokens: Some(32),
+            temperature: Some(0.25),
+            stop_sequences: Some(vec!["STOP".into()]),
+        };
+        let body = build_request_body(&cfg(), &request).unwrap();
+        assert_eq!(body["max_tokens"], 32);
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["stop_sequences"], serde_json::json!(["STOP"]));
     }
 
     #[test]

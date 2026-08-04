@@ -302,6 +302,7 @@ fn load_prompts(path: &str) -> Result<Vec<PromptEntry>, BoxErr> {
             available_tools: Vec::new(),
             cache: None,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         };
         let overrides = entry.get("overrides").map(parse_overrides).transpose()?;

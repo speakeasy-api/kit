@@ -23,6 +23,7 @@ pub enum ReservationStatus {
     Debited,
     Released,
     Reconciled,
+    ActualOverage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,7 +142,9 @@ impl BudgetLedger {
             .copied()
             .ok_or(BudgetError::UnknownReservation { id })?;
         match snapshot.status {
-            ReservationStatus::Debited | ReservationStatus::Reconciled => Ok(snapshot),
+            ReservationStatus::Debited
+            | ReservationStatus::Reconciled
+            | ReservationStatus::ActualOverage => Ok(snapshot),
             ReservationStatus::Released => Err(BudgetError::InvalidTransition {
                 id,
                 from: snapshot.status,
@@ -176,13 +179,13 @@ impl BudgetLedger {
             .ok_or(BudgetError::UnknownReservation { id })?;
         match snapshot.status {
             ReservationStatus::Released => Ok(snapshot),
-            ReservationStatus::Debited | ReservationStatus::Reconciled => {
-                Err(BudgetError::InvalidTransition {
-                    id,
-                    from: snapshot.status,
-                    to: ReservationStatus::Released,
-                })
-            }
+            ReservationStatus::Debited
+            | ReservationStatus::Reconciled
+            | ReservationStatus::ActualOverage => Err(BudgetError::InvalidTransition {
+                id,
+                from: snapshot.status,
+                to: ReservationStatus::Released,
+            }),
             ReservationStatus::Reserved => {
                 state.reserved = state
                     .reserved
@@ -206,9 +209,11 @@ impl BudgetLedger {
         let mut state = self.lock();
         let Some(existing) = state.reservations.get(&incoming.id).copied() else {
             if incoming.status != ReservationStatus::Released {
-                self.budget
-                    .check(state.committed, state.reserved, incoming.spend)
-                    .map_err(BudgetError::Exhausted)?;
+                if incoming.status != ReservationStatus::ActualOverage {
+                    self.budget
+                        .check(state.committed, state.reserved, incoming.spend)
+                        .map_err(BudgetError::Exhausted)?;
+                }
                 match incoming.status {
                     ReservationStatus::Reserved => {
                         state.reserved = state
@@ -216,7 +221,9 @@ impl BudgetLedger {
                             .checked_add(incoming.spend)
                             .expect("budget check overflowed");
                     }
-                    ReservationStatus::Debited | ReservationStatus::Reconciled => {
+                    ReservationStatus::Debited
+                    | ReservationStatus::Reconciled
+                    | ReservationStatus::ActualOverage => {
                         state.committed = state
                             .committed
                             .checked_add(incoming.spend)
@@ -239,7 +246,9 @@ impl BudgetLedger {
         match (existing.status, incoming.status) {
             (
                 ReservationStatus::Reserved,
-                ReservationStatus::Debited | ReservationStatus::Reconciled,
+                ReservationStatus::Debited
+                | ReservationStatus::Reconciled
+                | ReservationStatus::ActualOverage,
             ) => {
                 state.reserved = state
                     .reserved
@@ -261,7 +270,9 @@ impl BudgetLedger {
                 Ok(incoming)
             }
             (
-                ReservationStatus::Debited | ReservationStatus::Reconciled,
+                ReservationStatus::Debited
+                | ReservationStatus::Reconciled
+                | ReservationStatus::ActualOverage,
                 ReservationStatus::Reserved,
             )
             | (ReservationStatus::Released, ReservationStatus::Reserved) => Ok(existing),

@@ -92,6 +92,11 @@ impl AnthropicAdapter {
             config: Arc::new(config),
         }
     }
+
+    /// Configured provider output-token ceiling.
+    pub fn max_output_tokens(&self) -> u32 {
+        self.config.max_tokens
+    }
 }
 
 /// An active session with the Anthropic Messages API.

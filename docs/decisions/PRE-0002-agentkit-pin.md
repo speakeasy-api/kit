@@ -112,8 +112,11 @@ M009-W01 retains this historical source capture and adds the pinned
 `m009-post-validation-checkpoint` overlay; M006-W07a adds the pinned
 `m006-mcp-protocol-revision-pin` overlay and produces aggregate
 `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`.
-The local-only M006-W07b `m006-mcp-feature-adaptation` overlay produces the current complete
-Agentkit payload digest `3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`;
+The local-only M006-W07b `m006-mcp-feature-adaptation` overlay produced
+`3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`;
+the complete payload after the local M006-W07c overlays is
+`0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0`;
 exact changed-file hashes are
 recorded in `src/agent/agentkit_patch/manifest.yaml` and
-`src/protocols/mcp/agentkit_patch/manifest.yaml`.
+`src/protocols/mcp/agentkit_patch/manifest.yaml`, and the local-only scope and
+complete chain are recorded in `requirements/reports/m006-w07c.md`.

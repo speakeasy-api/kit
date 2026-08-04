@@ -25,12 +25,17 @@ use crate::domain::events::{
     ApprovalDecision, ArtifactRecordId, ArtifactRef, AttemptState, CommitPosition, RunState,
     TraceId,
 };
-use crate::domain::ids::{ApprovalId, AttemptId, PrincipalId, ProjectId, RunId, ThreadId};
+use crate::domain::ids::{
+    ApprovalId, AttemptId, McpCallbackId, PrincipalId, ProjectId, RunId, ThreadId,
+};
 use crate::domain::lifecycle::{AttemptOwnership, FencingToken};
+use crate::domain::mcp_callback::{
+    McpCallbackAction, McpCallbackArtifactRef, McpCallbackProjection,
+};
 use crate::domain::retention::{RetentionObjectId, StoreTimestamp};
 use crate::store::artifacts::{
-    ArtifactClass, ArtifactDigest, ArtifactError, ArtifactMetadata, ArtifactRetention,
-    ArtifactStore, ReferenceError, now_unix_micros,
+    ArtifactClass, ArtifactDigest, ArtifactError, ArtifactMetadata, ArtifactReference,
+    ArtifactRetention, ArtifactStore, ReferenceError, now_unix_micros,
 };
 use crate::store::sqlite::idempotency::IdempotencyKey;
 
@@ -63,6 +68,17 @@ pub struct PromptReceipt {
 
 thread_local! {
     static PENDING_PROMPT_BYTES: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static PENDING_CALLBACK_ARTIFACT: RefCell<Option<PendingCallbackArtifact>> = const { RefCell::new(None) };
+}
+
+struct PendingCallbackArtifact {
+    bytes: Vec<u8>,
+    principal_id: PrincipalId,
+    project_id: ProjectId,
+    run_id: RunId,
+    callback_id: McpCallbackId,
+    reference: ArtifactReference,
+    expires_at_unix_micros: i64,
 }
 
 struct PendingPromptGuard;
@@ -170,6 +186,12 @@ pub enum Query {
     },
     PendingAuthRequests {
         project_id: ProjectId,
+    },
+    PendingMcpCallbacks {
+        project_id: ProjectId,
+    },
+    GetMcpCallback {
+        callback_id: McpCallbackId,
     },
     GetArtifactMetadata {
         artifact_id: ArtifactRecordId,
@@ -435,6 +457,8 @@ pub enum QueryProjection {
     Attempt(AttemptProjection),
     Approvals(Vec<ApprovalProjection>),
     AuthRequests(Vec<AuthRequestProjection>),
+    McpCallbacks(Vec<McpCallbackProjection>),
+    McpCallback(Box<McpCallbackProjection>),
     ArtifactMetadata(ArtifactMetadataProjection),
     Capabilities(Vec<CapabilityProjection>),
     CursorStatus(CursorStatusProjection),
@@ -531,6 +555,7 @@ service_registry! {
         ResolveApproval => ("approval.resolve", ModelCall),
         RequestAuth => ("auth.request", ModelCall),
         ResolveAuth => ("auth.resolve", ModelCall),
+        ResolveMcpCallback => ("mcp_callback.resolve", ModelCall),
         RegisterArtifactMetadata => ("artifact.metadata.register", WorkspaceWrite),
     }
     queries {
@@ -549,6 +574,8 @@ service_registry! {
         RunTimeline => ("run.timeline", WorkspaceRead),
         PendingApprovals => ("approval.pending", WorkspaceRead),
         PendingAuthRequests => ("auth.pending", WorkspaceRead),
+        PendingMcpCallbacks => ("mcp_callback.pending", WorkspaceRead),
+        GetMcpCallback => ("mcp_callback.get", WorkspaceRead),
         GetArtifactMetadata => ("artifact.metadata.get", WorkspaceRead),
         ListCapabilities => ("capability.list", WorkspaceRead),
         EventCursorStatus => ("event.cursor.status", WorkspaceRead),
@@ -596,15 +623,19 @@ pub enum Resource {
     Approval(ApprovalId),
     AuthRequest(RunId),
     Artifact(ArtifactRecordId),
+    McpCallback(McpCallbackId),
 }
 
-#[derive(Clone, Debug)]
 pub struct WriteRequest<'a> {
     pub principal_id: PrincipalId,
     pub idempotency_key: &'a IdempotencyKey,
     pub trace_id: &'a TraceId,
     pub command: &'a Command,
     pub driver_claim: Option<AttemptDriverClaim>,
+    pub mcp_callback_request_digest: Option<[u8; 32]>,
+    pub mcp_callback_authority: Option<&'a McpCallbackProjection>,
+    pub mcp_callback_recheck: Option<&'a dyn Fn(&McpCallbackProjection) -> bool>,
+    pub mcp_callback_workspace_revision: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -622,6 +653,23 @@ pub trait ServiceStore {
     ) -> Result<ResourceScope, ServiceError>;
     fn query_scope(&mut self, query: &Query) -> Result<ResourceScope, ServiceError>;
     fn execute(&mut self, request: WriteRequest<'_>) -> Result<CommandReceipt, ServiceError>;
+    fn replay_mcp_callback_resolution(
+        &mut self,
+        _principal_id: PrincipalId,
+        _idempotency_key: &IdempotencyKey,
+        _command: &Command,
+    ) -> Result<Option<CommandReceipt>, ServiceError> {
+        Ok(None)
+    }
+    fn reserve_mcp_callback_resolution(
+        &mut self,
+        _principal_id: PrincipalId,
+        _project_id: ProjectId,
+        _idempotency_key: &IdempotencyKey,
+        _command: &Command,
+    ) -> Result<Option<CommandReceipt>, ServiceError> {
+        Ok(None)
+    }
     fn query(&mut self, query: &Query) -> Result<QueryProjection, ServiceError>;
     fn deletion_job(
         &mut self,
@@ -764,6 +812,48 @@ pub trait ArtifactService {
     ) -> Result<T, ServiceError>;
 
     fn metadata_registered(&self, _metadata: &ArtifactMetadataProjection) {}
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_mcp_callback_content(
+        &self,
+        _principal_id: PrincipalId,
+        _project_id: ProjectId,
+        _run_id: RunId,
+        _callback_id: McpCallbackId,
+        _idempotency_key: &IdempotencyKey,
+        _bytes: &[u8],
+        _expires_at_unix_micros: i64,
+    ) -> Result<McpCallbackArtifactRef, ServiceError> {
+        Err(ServiceError::Store(
+            "MCP callback artifact storage is unavailable".to_owned(),
+        ))
+    }
+
+    fn mcp_callback_revision_live(&self, _revision: &str) -> bool {
+        false
+    }
+
+    fn mcp_callback_content_public(
+        &self,
+        _callback: &McpCallbackProjection,
+        _content: &serde_json::Value,
+    ) -> bool {
+        false
+    }
+
+    fn with_mcp_callback_revision<T>(
+        &self,
+        revision: &str,
+        commit: impl FnOnce(&str) -> Result<T, ServiceError>,
+    ) -> Result<T, ServiceError> {
+        if self.mcp_callback_revision_live(revision) {
+            commit(revision)
+        } else {
+            Err(ServiceError::Conflict(
+                "callback workspace revision is stale".to_owned(),
+            ))
+        }
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -961,6 +1051,9 @@ fn settle_model_reservation(
             scheduler.debit(id).map(|_| ()).map_err(scheduler_error)
         }
         ReservationStatus::Debited | ReservationStatus::Reconciled => Ok(()),
+        ReservationStatus::ActualOverage => Err(ServiceError::Conflict(
+            "provider actual usage exceeded its reservation".to_owned(),
+        )),
         ReservationStatus::Released => Ok(()),
     }
 }
@@ -982,6 +1075,46 @@ impl ArtifactService for ArtifactStore {
         command: &Command,
         commit: impl FnOnce() -> Result<T, ServiceError>,
     ) -> Result<T, ServiceError> {
+        if matches!(command, Command::ResolveMcpCallback { .. }) {
+            let pending = PENDING_CALLBACK_ARTIFACT.with(|pending| pending.borrow_mut().take());
+            let Some(pending) = pending else {
+                return commit();
+            };
+            if pending.principal_id != principal_id || pending.project_id != project_id {
+                return Err(invalid_artifact_reference());
+            }
+            let stored_at = pending.expires_at_unix_micros.saturating_sub(1);
+            let metadata = ArtifactMetadata::new(
+                "application/vnd.kit.artifact-envelope",
+                ArtifactClass::File,
+                principal_id.to_string(),
+                project_id.to_string(),
+                ArtifactRetention::UntilUnixMicros(pending.expires_at_unix_micros),
+                stored_at,
+            )
+            .map_err(artifact_error)?;
+            let envelope = crate::store::artifacts::ArtifactEnvelopeBinding {
+                principal: pending.principal_id.to_string(),
+                project: pending.project_id.to_string(),
+                run: pending.run_id.to_string(),
+                purpose: "mcp_callback_content".to_owned(),
+                invocation_id: None,
+                callback_id: Some(pending.callback_id.to_string()),
+            }
+            .seal(&pending.bytes)
+            .map_err(artifact_error)?;
+            let publication = self
+                .stage_publication(&envelope, metadata, pending.reference)
+                .map_err(artifact_error)?;
+            return match commit() {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    self.remove_publication_stage(publication.reference())
+                        .map_err(artifact_error)?;
+                    Err(error)
+                }
+            };
+        }
         let Some(reference) = command.artifact_reference() else {
             return commit();
         };
@@ -1039,6 +1172,62 @@ impl ArtifactService for ArtifactStore {
                 ReferenceError::Artifact(error) => artifact_error(error),
                 ReferenceError::Commit(error) => error,
             })
+    }
+
+    fn store_mcp_callback_content(
+        &self,
+        principal_id: PrincipalId,
+        project_id: ProjectId,
+        run_id: RunId,
+        callback_id: McpCallbackId,
+        idempotency_key: &IdempotencyKey,
+        bytes: &[u8],
+        expires_at_unix_micros: i64,
+    ) -> Result<McpCallbackArtifactRef, ServiceError> {
+        let mut identity = Vec::new();
+        for field in [
+            principal_id.to_string(),
+            project_id.to_string(),
+            run_id.to_string(),
+            callback_id.to_string(),
+            idempotency_key.as_str().to_owned(),
+            ArtifactDigest::digest(bytes).to_string(),
+        ] {
+            identity.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            identity.extend_from_slice(field.as_bytes());
+        }
+        let reference = ArtifactReference::derive(b"kit-mcp-callback-artifact-v1", &identity);
+        PENDING_CALLBACK_ARTIFACT.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if let Some(existing) = pending.as_ref() {
+                if existing.bytes == bytes
+                    && existing.principal_id == principal_id
+                    && existing.project_id == project_id
+                    && existing.run_id == run_id
+                    && existing.callback_id == callback_id
+                    && existing.reference == reference
+                    && existing.expires_at_unix_micros == expires_at_unix_micros
+                {
+                    return McpCallbackArtifactRef::parse(&reference.to_string()).map_err(|_| {
+                        ServiceError::Store("failed to encode callback artifact".to_owned())
+                    });
+                }
+                return Err(ServiceError::Store(
+                    "nested callback artifact preparation is not supported".to_owned(),
+                ));
+            }
+            *pending = Some(PendingCallbackArtifact {
+                bytes: bytes.to_vec(),
+                principal_id,
+                project_id,
+                run_id,
+                callback_id,
+                reference,
+                expires_at_unix_micros,
+            });
+            McpCallbackArtifactRef::parse(&reference.to_string())
+                .map_err(|_| ServiceError::Store("failed to encode callback artifact".to_owned()))
+        })
     }
 }
 
@@ -1190,6 +1379,129 @@ where
             self.authorizer
                 .authorize(context.principal(), scope, descriptor.required_grant)
                 .map_err(ServiceError::Authentication)?;
+            let mut mcp_callback_request_digest = None;
+            let mut mcp_callback_authority = None;
+            let original_callback_command =
+                matches!(command, Command::ResolveMcpCallback { .. }).then(|| command.clone());
+            if let Command::ResolveMcpCallback {
+                callback_id,
+                kind,
+                mode,
+                challenge_generation,
+                schema_digest,
+                action,
+                content,
+                artifact_refs,
+                ..
+            } = &mut command
+            {
+                let idempotency_key = context
+                    .idempotency_key()
+                    .ok_or(ServiceError::MissingIdempotencyKey)?;
+                let replay = self.store.replay_mcp_callback_resolution(
+                    context.principal_id(),
+                    idempotency_key,
+                    original_callback_command
+                        .as_ref()
+                        .expect("callback command was captured"),
+                )?;
+                if let Some(replay) = replay {
+                    return Ok(replay);
+                }
+                let request_bytes = serde_json::to_vec(
+                    original_callback_command
+                        .as_ref()
+                        .expect("callback command was captured"),
+                )
+                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                let request_digest = crate::capabilities::kernel::identity::Digest::of(
+                    crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                    &request_bytes,
+                );
+                let mut request_digest_bytes = [0_u8; 32];
+                request_digest_bytes.copy_from_slice(&request_digest.as_bytes());
+                mcp_callback_request_digest = Some(request_digest_bytes);
+                if !artifact_refs.is_empty() {
+                    return Err(ServiceError::Invalid(
+                        "callback artifact references are service-owned".to_owned(),
+                    ));
+                }
+                let callback = match self.store.query(&Query::GetMcpCallback {
+                    callback_id: *callback_id,
+                })? {
+                    QueryProjection::McpCallback(callback) => callback,
+                    _ => {
+                        return Err(ServiceError::Store(
+                            "invalid callback projection".to_owned(),
+                        ));
+                    }
+                };
+                if callback.principal_id != context.principal_id()
+                    || callback.project_id != context.grant().project_id()
+                    || callback.kind != *kind
+                    || callback.mode != *mode
+                    || callback.challenge_generation != *challenge_generation
+                    || callback.schema_digest != *schema_digest
+                {
+                    return Err(ServiceError::Conflict(
+                        "callback challenge authority does not match".to_owned(),
+                    ));
+                }
+                let content_bytes = match (callback.mode, action) {
+                    (
+                        crate::domain::mcp_callback::McpCallbackMode::SamplingRequest
+                        | crate::domain::mcp_callback::McpCallbackMode::SamplingResponse,
+                        _,
+                    ) => {
+                        if content.is_some() {
+                            return Err(ServiceError::Invalid(
+                                "sampling approval resolution cannot include content".to_owned(),
+                            ));
+                        }
+                        None
+                    }
+                    (_, McpCallbackAction::Accept) => {
+                        let value = content.as_ref().ok_or_else(|| {
+                            ServiceError::Invalid(
+                                "accepted callback resolution requires content".to_owned(),
+                            )
+                        })?;
+                        Some(validate_mcp_callback_content(
+                            value,
+                            &callback.schema,
+                            callback.max_content_bytes,
+                            self.runtime.mcp_callback_content_public(&callback, value),
+                        )?)
+                    }
+                    (_, McpCallbackAction::Decline | McpCallbackAction::Cancel) => {
+                        if content.is_some() {
+                            return Err(ServiceError::Invalid(
+                                "declined or cancelled callback resolution cannot include content"
+                                    .to_owned(),
+                            ));
+                        }
+                        None
+                    }
+                };
+                if let Some(bytes) = content_bytes {
+                    artifact_refs.push(self.runtime.with_mcp_callback_revision(
+                        &callback.workspace_revision,
+                        |_| {
+                            self.runtime.store_mcp_callback_content(
+                                callback.principal_id,
+                                callback.project_id,
+                                callback.run_id,
+                                callback.id,
+                                idempotency_key,
+                                &bytes,
+                                callback.artifact_expires_at.unix_micros(),
+                            )
+                        },
+                    )?);
+                    *content = None;
+                }
+                mcp_callback_authority = Some(*callback);
+            }
             if let Command::StartRun {
                 run_id,
                 run_config,
@@ -1225,16 +1537,48 @@ where
             let project_id = scope.project_id();
             let runtime = &self.runtime;
             let store = &mut self.store;
+            let workspace_revision = mcp_callback_authority
+                .as_ref()
+                .map(|callback| callback.workspace_revision.clone());
+            let callback_recheck = |callback: &McpCallbackProjection| {
+                callback.principal_id == context.principal_id()
+                    && callback.project_id == context.grant().project_id()
+                    && runtime.mcp_callback_revision_live(&callback.workspace_revision)
+            };
             runtime.admit_command(principal_id, idempotency_key, &command)?;
-            let receipt = match runtime.commit_verified(principal_id, project_id, &command, || {
-                store.execute(WriteRequest {
-                    principal_id: context.principal_id(),
-                    idempotency_key,
-                    trace_id: context.trace_id(),
-                    command: &command,
-                    driver_claim: None,
+            let mut commit = || {
+                if let Some(callback) = mcp_callback_authority.as_ref() {
+                    store.reserve_mcp_callback_resolution(
+                        context.principal_id(),
+                        callback.project_id,
+                        idempotency_key,
+                        original_callback_command
+                            .as_ref()
+                            .expect("callback command was captured"),
+                    )?;
+                }
+                runtime.commit_verified(principal_id, project_id, &command, || {
+                    store.execute(WriteRequest {
+                        principal_id: context.principal_id(),
+                        idempotency_key,
+                        trace_id: context.trace_id(),
+                        command: &command,
+                        driver_claim: None,
+                        mcp_callback_request_digest,
+                        mcp_callback_authority: mcp_callback_authority.as_ref(),
+                        mcp_callback_recheck: Some(&callback_recheck),
+                        mcp_callback_workspace_revision: workspace_revision.as_deref(),
+                    })
                 })
-            }) {
+            };
+            let receipt = match if let Some(callback) = mcp_callback_authority.as_ref() {
+                runtime.with_mcp_callback_revision(&callback.workspace_revision, |revision| {
+                    let _ = revision;
+                    commit()
+                })
+            } else {
+                commit()
+            } {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     runtime.command_rejected(principal_id, idempotency_key, &command);
@@ -1247,6 +1591,7 @@ where
             }
             Ok(receipt)
         })();
+        PENDING_CALLBACK_ARTIFACT.with(|pending| pending.borrow_mut().take());
         self.runtime.command_completed(CommandObservation {
             trace_id: context.trace_id(),
             operation,
@@ -1448,6 +1793,55 @@ impl Command {
     }
 }
 
+fn validate_mcp_callback_content(
+    content: &serde_json::Value,
+    schema: &serde_json::Value,
+    maximum: usize,
+    content_is_public: bool,
+) -> Result<Vec<u8>, ServiceError> {
+    let object = content.as_object().ok_or_else(|| {
+        ServiceError::Invalid("callback content must be a JSON object".to_owned())
+    })?;
+    let allowed = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| ServiceError::Store("callback schema properties are invalid".to_owned()))?;
+    if object.keys().any(|name| !allowed.contains_key(name)) {
+        return Err(ServiceError::Invalid(
+            "callback content contains a field outside the configured safe allowlist".to_owned(),
+        ));
+    }
+    let bytes =
+        serde_json::to_vec(content).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    if bytes.len() > maximum {
+        return Err(ServiceError::Invalid(
+            "callback content exceeds the configured size limit".to_owned(),
+        ));
+    }
+    if !content_is_public {
+        return Err(ServiceError::Invalid(
+            "callback content contains configured secret material".to_owned(),
+        ));
+    }
+    let mut schema = schema.clone();
+    schema
+        .as_object_mut()
+        .ok_or_else(|| ServiceError::Store("callback schema is not an object".to_owned()))?
+        .insert(
+            "additionalProperties".to_owned(),
+            serde_json::Value::Bool(false),
+        );
+    if !jsonschema::validator_for(&schema)
+        .map_err(|_| ServiceError::Store("callback schema is invalid".to_owned()))?
+        .is_valid(content)
+    {
+        return Err(ServiceError::Invalid(
+            "callback content does not match the pinned schema".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
 fn invalid_artifact_reference() -> ServiceError {
     ServiceError::Invalid("artifact reference is not a verified published artifact".to_owned())
 }
@@ -1560,3 +1954,468 @@ impl fmt::Display for ServiceError {
 }
 
 impl std::error::Error for ServiceError {}
+
+#[cfg(test)]
+mod mcp_callback_tests {
+    use std::{
+        collections::BTreeSet,
+        fs,
+        sync::{Arc, Mutex},
+    };
+
+    use super::*;
+    use crate::{
+        api::auth::contract::ScopedAuthorizer,
+        domain::{
+            events::UtcDateTime,
+            ids::{AttemptId, RunId, WorkspaceId},
+            lifecycle::FencingToken,
+            mcp_callback::{McpCallbackKind, McpCallbackMode, McpCallbackState},
+        },
+        runtime::daemon::ControlPlaneAuthority,
+    };
+
+    struct OrderingStore {
+        callback: McpCallbackProjection,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        replay: bool,
+    }
+
+    impl ServiceStore for OrderingStore {
+        fn command_scope(
+            &mut self,
+            _principal_id: PrincipalId,
+            _command: &Command,
+        ) -> Result<ResourceScope, ServiceError> {
+            self.calls.lock().unwrap().push("scope");
+            Ok(ResourceScope::new(
+                self.callback.principal_id,
+                self.callback.project_id,
+            ))
+        }
+
+        fn query_scope(&mut self, _query: &Query) -> Result<ResourceScope, ServiceError> {
+            unreachable!()
+        }
+
+        fn execute(&mut self, request: WriteRequest<'_>) -> Result<CommandReceipt, ServiceError> {
+            assert!(request.mcp_callback_request_digest.is_some());
+            self.calls.lock().unwrap().push("commit");
+            Ok(CommandReceipt {
+                operation: request.command.operation(),
+                commit_positions: vec![
+                    CommitPosition::new(if self.replay { 7 } else { 1 }).unwrap(),
+                ],
+                replayed: self.replay,
+            })
+        }
+
+        fn replay_mcp_callback_resolution(
+            &mut self,
+            _principal_id: PrincipalId,
+            _idempotency_key: &IdempotencyKey,
+            _command: &Command,
+        ) -> Result<Option<CommandReceipt>, ServiceError> {
+            self.calls.lock().unwrap().push("replay");
+            Ok(self.replay.then(|| CommandReceipt {
+                operation: "mcp_callback.resolve",
+                commit_positions: vec![CommitPosition::new(7).unwrap()],
+                replayed: true,
+            }))
+        }
+
+        fn reserve_mcp_callback_resolution(
+            &mut self,
+            _principal_id: PrincipalId,
+            _project_id: ProjectId,
+            _idempotency_key: &IdempotencyKey,
+            _command: &Command,
+        ) -> Result<Option<CommandReceipt>, ServiceError> {
+            self.calls.lock().unwrap().push("reserve");
+            Ok(None)
+        }
+
+        fn query(&mut self, _query: &Query) -> Result<QueryProjection, ServiceError> {
+            self.calls.lock().unwrap().push("query");
+            Ok(QueryProjection::McpCallback(Box::new(
+                self.callback.clone(),
+            )))
+        }
+
+        fn deletion_job(
+            &mut self,
+            _actor: DeletionActor,
+            _id: DeletionJobId,
+        ) -> Result<DeletionJob, DeletionError> {
+            unreachable!()
+        }
+
+        fn deletion_job_for_request(
+            &mut self,
+            _actor: DeletionActor,
+            _object_id: RetentionObjectId,
+            _idempotency_key: &str,
+        ) -> Result<DeletionJob, DeletionError> {
+            unreachable!()
+        }
+
+        fn archive_status(
+            &mut self,
+            _actor: DeletionActor,
+            _object_id: RetentionObjectId,
+        ) -> Result<ArchiveStatus, DeletionError> {
+            unreachable!()
+        }
+
+        fn store_time(&mut self) -> Result<StoreTimestamp, ServiceError> {
+            unreachable!()
+        }
+    }
+
+    struct OrderingRuntime {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        revision_live: bool,
+    }
+
+    impl Scheduler for OrderingRuntime {}
+    impl CapabilityService for OrderingRuntime {}
+    impl LeaseService for OrderingRuntime {}
+
+    impl ArtifactService for OrderingRuntime {
+        fn commit_verified<T>(
+            &self,
+            _principal_id: PrincipalId,
+            _project_id: ProjectId,
+            _command: &Command,
+            commit: impl FnOnce() -> Result<T, ServiceError>,
+        ) -> Result<T, ServiceError> {
+            self.calls.lock().unwrap().push("stage");
+            commit()
+        }
+
+        fn store_mcp_callback_content(
+            &self,
+            _principal_id: PrincipalId,
+            _project_id: ProjectId,
+            _run_id: RunId,
+            _callback_id: McpCallbackId,
+            _idempotency_key: &IdempotencyKey,
+            _bytes: &[u8],
+            _expires_at_unix_micros: i64,
+        ) -> Result<McpCallbackArtifactRef, ServiceError> {
+            self.calls.lock().unwrap().push("artifact");
+            McpCallbackArtifactRef::parse(&format!("artifact-ref:{}", "0".repeat(64)))
+                .map_err(|error| ServiceError::Store(error.to_string()))
+        }
+
+        fn mcp_callback_revision_live(&self, _revision: &str) -> bool {
+            self.calls.lock().unwrap().push("drift");
+            self.revision_live
+        }
+
+        fn mcp_callback_content_public(
+            &self,
+            _callback: &McpCallbackProjection,
+            _content: &serde_json::Value,
+        ) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn exact_replay_returns_before_content_recreation_or_stale_authority_work() {
+        let callback = callback_fixture();
+        let command = Command::ResolveMcpCallback {
+            schema_version: crate::domain::events::SchemaVersion::CURRENT,
+            callback_id: callback.id,
+            kind: callback.kind,
+            mode: callback.mode,
+            expected_version: callback.version,
+            challenge_generation: callback.challenge_generation,
+            schema_digest: callback.schema_digest.clone(),
+            action: McpCallbackAction::Accept,
+            content: Some(serde_json::json!({"name":"Ada"})),
+            artifact_refs: Vec::new(),
+        };
+        let key = IdempotencyKey::parse("resolve-order").unwrap();
+        let context = RequestContext::authenticated(
+            Ok(AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
+                callback.principal_id,
+                callback.project_id,
+                [Grant::ModelCall],
+            ))),
+            Some(key),
+            TraceId::parse("callback-order").unwrap(),
+        )
+        .unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut service = Service::with_runtime(
+            OrderingStore {
+                callback: callback.clone(),
+                calls: Arc::clone(&calls),
+                replay: false,
+            },
+            ScopedAuthorizer,
+            OrderingRuntime {
+                calls: Arc::clone(&calls),
+                revision_live: true,
+            },
+            &ControlPlaneAuthority::for_test(),
+        );
+        service.execute(&context, command.clone()).unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                "scope", "replay", "query", "drift", "artifact", "drift", "reserve", "stage",
+                "commit"
+            ]
+        );
+
+        calls.lock().unwrap().clear();
+        let mut service = Service::with_runtime(
+            OrderingStore {
+                callback,
+                calls: Arc::clone(&calls),
+                replay: true,
+            },
+            ScopedAuthorizer,
+            OrderingRuntime {
+                calls: Arc::clone(&calls),
+                revision_live: false,
+            },
+            &ControlPlaneAuthority::for_test(),
+        );
+        assert!(service.execute(&context, command).unwrap().replayed);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["scope", "replay"]);
+    }
+
+    fn callback_fixture() -> McpCallbackProjection {
+        McpCallbackProjection {
+            id: McpCallbackId::from_stable_bytes(b"callback"),
+            server_id: "server".to_owned(),
+            kind: McpCallbackKind::Elicitation,
+            mode: McpCallbackMode::Form,
+            principal_id: PrincipalId::from_stable_bytes(b"principal"),
+            project_id: ProjectId::from_stable_bytes(b"project"),
+            run_id: RunId::from_stable_bytes(b"run"),
+            attempt_id: AttemptId::from_stable_bytes(b"attempt"),
+            fence: FencingToken::new(1),
+            claim_generation: 1,
+            workspace_id: WorkspaceId::from_stable_bytes(b"workspace"),
+            workspace_revision: "revision".to_owned(),
+            request_id: "1".to_owned(),
+            request: serde_json::json!({"message":"Name"}),
+            schema: serde_json::json!({
+                "type":"object",
+                "properties":{"name":{"type":"string"}},
+                "required":["name"]
+            }),
+            request_digest: format!("sha256:{}", "0".repeat(64)),
+            schema_digest: format!("sha256:{}", "1".repeat(64)),
+            challenge_generation: 1,
+            operation_sequence: 1,
+            expires_at: UtcDateTime::parse("2099-01-01T00:00:00Z").unwrap(),
+            artifact_expires_at: UtcDateTime::parse("2100-01-01T00:00:00Z").unwrap(),
+            max_response_bytes: 1024,
+            max_content_bytes: 900,
+            secret_policy_id: "authorized-secrets-v1".to_owned(),
+            state: McpCallbackState::AwaitingResolution,
+            version: 2,
+            resolver_actor: None,
+            action: None,
+            artifact_refs: Vec::new(),
+            terminal_error: None,
+        }
+    }
+
+    #[test]
+    fn callback_content_is_schema_bounded_secret_free_and_owned() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        });
+        let valid = serde_json::json!({"name": "Ada"});
+        let bytes = validate_mcp_callback_content(&valid, &schema, 64, true).unwrap();
+        assert!(
+            validate_mcp_callback_content(
+                &serde_json::json!({"name": "Ada", "extra": true}),
+                &schema,
+                64,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mcp_callback_content(&serde_json::json!({"name": 1}), &schema, 64, true)
+                .is_err()
+        );
+        assert!(
+            validate_mcp_callback_content(
+                &serde_json::json!({"name": "Ada", "password": "no"}),
+                &schema,
+                64,
+                true
+            )
+            .is_err()
+        );
+        assert!(validate_mcp_callback_content(&valid, &schema, 4, true).is_err());
+        for secret in ["Ada", "QWRh"] {
+            let content = serde_json::json!({"name": secret});
+            assert!(validate_mcp_callback_content(&content, &schema, 64, false).is_err());
+        }
+        let fragmented_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "first": {"type": "string"},
+                "second": {"type": "string"}
+            },
+            "required": ["first", "second"]
+        });
+        assert!(
+            validate_mcp_callback_content(
+                &serde_json::json!({"first": "QW", "second": "Rh"}),
+                &fragmented_schema,
+                64,
+                false,
+            )
+            .is_err()
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "kit-mcp-callback-artifact-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let artifacts = ArtifactStore::open(&root).unwrap();
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let run = RunId::generate().unwrap();
+        let callback = McpCallbackId::generate().unwrap();
+        let key = IdempotencyKey::parse("callback-artifact").unwrap();
+        let expires_at = 4_102_444_800_000_000_i64;
+        let reference = artifacts
+            .store_mcp_callback_content(principal, project, run, callback, &key, &bytes, expires_at)
+            .unwrap();
+        assert_eq!(
+            artifacts
+                .store_mcp_callback_content(
+                    principal, project, run, callback, &key, &bytes, expires_at,
+                )
+                .unwrap()
+                .as_str(),
+            reference.as_str()
+        );
+        assert!(
+            artifacts
+                .store_mcp_callback_content(
+                    PrincipalId::generate().unwrap(),
+                    project,
+                    run,
+                    callback,
+                    &key,
+                    &bytes,
+                    expires_at,
+                )
+                .is_err()
+        );
+        assert!(ArtifactReference::parse(reference.as_str()).is_ok());
+        PENDING_CALLBACK_ARTIFACT.with(|pending| pending.borrow_mut().take());
+        let other = artifacts
+            .store_mcp_callback_content(
+                PrincipalId::generate().unwrap(),
+                project,
+                run,
+                callback,
+                &key,
+                &bytes,
+                expires_at,
+            )
+            .unwrap();
+        assert_ne!(reference, other);
+        PENDING_CALLBACK_ARTIFACT.with(|pending| pending.borrow_mut().take());
+
+        let principal = PrincipalId::generate().unwrap();
+        let reference = artifacts
+            .store_mcp_callback_content(principal, project, run, callback, &key, &bytes, expires_at)
+            .unwrap();
+        let command = Command::ResolveMcpCallback {
+            schema_version: crate::domain::events::SchemaVersion::CURRENT,
+            callback_id: callback,
+            kind: McpCallbackKind::Elicitation,
+            mode: McpCallbackMode::Form,
+            expected_version: 2,
+            challenge_generation: 1,
+            schema_digest: format!("sha256:{}", "0".repeat(64)),
+            action: McpCallbackAction::Accept,
+            content: None,
+            artifact_refs: vec![reference.clone()],
+        };
+        assert!(
+            artifacts
+                .commit_verified(principal, project, &command, || {
+                    Err::<(), _>(ServiceError::Conflict("commit fault".to_owned()))
+                })
+                .is_err()
+        );
+        assert!(
+            artifacts
+                .open_reference(ArtifactReference::parse(reference.as_str()).unwrap())
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+
+        let repaired = artifacts
+            .store_mcp_callback_content(principal, project, run, callback, &key, &bytes, expires_at)
+            .unwrap();
+        artifacts
+            .commit_verified(principal, project, &command, || Ok(()))
+            .unwrap();
+        let staged = artifacts
+            .staged_publication(ArtifactReference::parse(reference.as_str()).unwrap())
+            .unwrap();
+        artifacts.promote_publication(&staged).unwrap();
+        assert_eq!(repaired, reference);
+        let artifact = artifacts
+            .open_reference(ArtifactReference::parse(reference.as_str()).unwrap())
+            .unwrap();
+        assert_eq!(
+            artifact.manifest().retention,
+            ArtifactRetention::UntilUnixMicros(expires_at)
+        );
+        let digest = artifact.digest();
+        artifacts
+            .collect_garbage(&crate::store::artifacts::Reachability {
+                now_unix_micros: expires_at.saturating_add(1),
+                retained: BTreeSet::from([digest]),
+                ..crate::store::artifacts::Reachability::default()
+            })
+            .unwrap();
+        assert!(artifacts.open_bytes(digest).is_ok());
+        artifacts
+            .collect_garbage(&crate::store::artifacts::Reachability {
+                now_unix_micros: expires_at.saturating_add(1),
+                ..crate::store::artifacts::Reachability::default()
+            })
+            .unwrap();
+        assert!(artifacts.open_bytes(digest).is_err());
+        artifacts
+            .store_mcp_callback_content(principal, project, run, callback, &key, &bytes, expires_at)
+            .unwrap();
+        artifacts
+            .commit_verified(principal, project, &command, || Ok(()))
+            .unwrap();
+        let staged = artifacts
+            .staged_publication(ArtifactReference::parse(reference.as_str()).unwrap())
+            .unwrap();
+        artifacts.promote_publication(&staged).unwrap();
+        assert!(
+            artifacts
+                .open_reference(ArtifactReference::parse(reference.as_str()).unwrap())
+                .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

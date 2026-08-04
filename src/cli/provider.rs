@@ -163,6 +163,7 @@ impl ProviderAdd {
                 credential(self.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY"))?,
                 self.model.clone(),
                 self.base_url.clone(),
+                self.max_completion_tokens,
             )
             .map_err(invalid)?,
             ProviderKind::Anthropic => {
@@ -204,6 +205,7 @@ impl ProviderAdd {
             ProviderKind::Ollama => ProviderProfile::ollama(
                 self.model.clone().expect("validated"),
                 self.base_url.clone(),
+                self.max_tokens,
             ),
         })
     }
@@ -225,23 +227,38 @@ impl ProviderAdd {
             ProviderKind::Anthropic,
         )?;
         for (present, option) in [
-            (self.max_tokens.is_some(), "--max-tokens"),
             (self.version.is_some(), "--version"),
             (self.beta.is_some(), "--beta"),
         ] {
             reject(present, option, ProviderKind::Anthropic)?;
         }
+        if self.max_tokens.is_some()
+            && !matches!(
+                self.provider,
+                ProviderKind::Anthropic | ProviderKind::Ollama
+            )
+        {
+            return Err(invalid(
+                "--max-tokens is only valid for anthropic or ollama",
+            ));
+        }
         for (present, option) in [
             (self.app_name.is_some(), "--app-name"),
             (self.site_url.is_some(), "--site-url"),
-            (
-                self.max_completion_tokens.is_some(),
-                "--max-completion-tokens",
-            ),
             (self.temperature.is_some(), "--temperature"),
             (self.reasoning_effort.is_some(), "--reasoning-effort"),
         ] {
             reject(present, option, ProviderKind::OpenRouter)?;
+        }
+        if self.max_completion_tokens.is_some()
+            && !matches!(
+                self.provider,
+                ProviderKind::OpenAi | ProviderKind::OpenRouter
+            )
+        {
+            return Err(invalid(
+                "--max-completion-tokens is only valid for openai or openrouter",
+            ));
         }
         match self.provider {
             ProviderKind::OpenAi | ProviderKind::OpenRouter => {

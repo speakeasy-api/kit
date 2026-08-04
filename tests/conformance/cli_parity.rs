@@ -31,6 +31,7 @@ const PROJECT: &str = "project_00000000000000000000000001";
 const THREAD: &str = "thread_00000000000000000000000001";
 const RUN: &str = "run_00000000000000000000000001";
 const APPROVAL: &str = "approval_00000000000000000000000001";
+const MCP_CALLBACK: &str = "mcp_callback_00000000000000000000000001";
 const ARTIFACT: &str = "artifact_00000000000000000000000001";
 const INPUT: &str = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -217,6 +218,28 @@ fn representative_rfc_commands_parse_to_registered_operations() {
             "--jsonl",
         ],
         vec!["kit", "auth", "list", "--project", PROJECT],
+        vec!["kit", "mcp-callback", "list", "--project", PROJECT],
+        vec!["kit", "mcp-callback", "show", MCP_CALLBACK],
+        vec![
+            "kit",
+            "mcp-callback",
+            "resolve",
+            MCP_CALLBACK,
+            "--version",
+            "1",
+            "--challenge-generation",
+            "1",
+            "--kind",
+            "elicitation",
+            "--mode",
+            "form",
+            "--schema-digest",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "--action",
+            "accept",
+            "--content",
+            "{\"name\":\"Ada\"}",
+        ],
         vec![
             "kit",
             "approval",
@@ -508,6 +531,47 @@ fn json_output_uses_openapi_component_envelopes() {
             query(QueryProjection::AuthRequests(Vec::new())),
         ),
         (
+            "McpCallbackList",
+            query(QueryProjection::McpCallbacks(Vec::new())),
+        ),
+        (
+            "McpCallback",
+            query(QueryProjection::McpCallback(Box::new(
+                serde_json::from_value(json!({
+                    "id": MCP_CALLBACK,
+                    "server_id": "server",
+                    "kind": "elicitation",
+                    "mode": "form",
+                    "principal_id": "principal_00000000000000000000000001",
+                    "project_id": PROJECT,
+                    "run_id": RUN,
+                    "attempt_id": "attempt_00000000000000000000000001",
+                    "fence": 1,
+                    "claim_generation": 1,
+                    "workspace_id": "workspace_00000000000000000000000001",
+                    "workspace_revision": "revision",
+                    "request_id": "1",
+                    "request": {"message": "Name"},
+                    "schema": {"type": "object"},
+                    "request_digest": format!("sha256:{}", "0".repeat(64)),
+                    "schema_digest": format!("sha256:{}", "1".repeat(64)),
+                    "challenge_generation": 1,
+                    "operation_sequence": 1,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "artifact_expires_at": "2100-01-01T00:00:00Z",
+                    "max_response_bytes": 1024,
+                    "max_content_bytes": 900,
+                    "state": "awaiting_resolution",
+                    "version": 1,
+                    "resolver_actor": null,
+                    "action": null,
+                    "artifact_refs": [],
+                    "terminal_error": null
+                }))
+                .unwrap(),
+            ))),
+        ),
+        (
             "CapabilityList",
             query(QueryProjection::Capabilities(Vec::new())),
         ),
@@ -578,6 +642,30 @@ fn json_output_uses_openapi_component_envelopes() {
                     descriptor.command
                 )
             });
+        if schema == "McpCallback" {
+            let mut invalid_expiry = value.clone();
+            invalid_expiry
+                .as_object_mut()
+                .unwrap()
+                .insert("artifact_expires_at".to_owned(), json!(1));
+            assert!(
+                schema_validator(&document, schema)
+                    .validate(&invalid_expiry)
+                    .is_err(),
+                "generated client contract accepted a non-Timestamp artifact_expires_at"
+            );
+            let mut missing_expiry = value;
+            missing_expiry
+                .as_object_mut()
+                .unwrap()
+                .remove("artifact_expires_at");
+            assert!(
+                schema_validator(&document, schema)
+                    .validate(&missing_expiry)
+                    .is_err(),
+                "generated client contract accepted a callback without artifact_expires_at"
+            );
+        }
     }
 }
 

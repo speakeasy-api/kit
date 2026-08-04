@@ -15,6 +15,7 @@ use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
     SessionConfig, TurnRequest,
 };
+use agentkit_provider_ollama::{OllamaAdapter, OllamaConfig};
 use kit::agent::providers::{
     adapter::{ModelStreamPolicy, StreamCommitFactory, StreamPolicyAdapter},
     persistence::SqliteStreamCommitFactory,
@@ -30,6 +31,10 @@ use kit::{
         secret::SecretLease,
     },
     test_support,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
 };
 
 enum Step {
@@ -236,6 +241,7 @@ fn request() -> TurnRequest {
         available_tools: Vec::new(),
         cache: Some(agentkit_loop::PromptCacheRequest::automatic().with_key("cache-key")),
         structured_output: None,
+        generation: Default::default(),
         metadata: MetadataMap::new(),
     }
 }
@@ -264,6 +270,100 @@ async fn drain<T: ModelTurn>(turn: &mut T) -> Result<Vec<ModelTurnEvent>, LoopEr
         events.push(event);
     }
     Ok(events)
+}
+
+async fn receive_chat_completion_request(listener: TcpListener) -> serde_json::Value {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let (body_start, content_length) = loop {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "request ended before the HTTP body");
+        request.extend_from_slice(&chunk[..read]);
+        let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        let body_start = headers_end + 4;
+        if request.len() >= body_start + length {
+            break (body_start, length);
+        }
+    };
+    let body = serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+    let response = br#"{"id":"response","model":"llama-test","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(response).await.unwrap();
+    body
+}
+
+#[tokio::test]
+async fn ollama_openai_compatible_request_serializes_max_tokens_and_enforces_cap() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(receive_chat_completion_request(listener));
+    let adapter = OllamaAdapter::new(
+        OllamaConfig::new("llama-test")
+            .with_base_url(endpoint)
+            .with_max_tokens(64)
+            .with_streaming(false),
+    )
+    .unwrap();
+    assert_eq!(adapter.max_output_tokens(), Some(64));
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut capped = request();
+    capped.cache = None;
+    capped.generation.max_output_tokens = Some(32);
+    let _turn = session.begin_turn(capped, None).await.unwrap();
+
+    let body = server.await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "model": "llama-test",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "prompt"}],
+            "stream": false,
+            "user": "session"
+        })
+    );
+    assert!(body.get("num_predict").is_none());
+
+    let mut above_cap = request();
+    above_cap.generation.max_output_tokens = Some(65);
+    let error = match session.begin_turn(above_cap, None).await {
+        Ok(_) => panic!("request above the configured cap was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("max output tokens exceed the configured provider cap"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

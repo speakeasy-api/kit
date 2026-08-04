@@ -473,7 +473,7 @@ fn merge_unknown_delta(raw: &mut Value, delta_type: &str, delta: &Value) {
 
 fn parse_usage(value: Option<&Value>) -> Option<Usage> {
     let value = value?;
-    let input = value
+    let uncached_input = value
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -499,7 +499,7 @@ fn parse_usage(value: Option<&Value>) -> Option<Usage> {
 
     Some(Usage {
         tokens: Some(TokenUsage {
-            input_tokens: input,
+            input_tokens: uncached_input,
             output_tokens: output,
             reasoning_tokens: None,
             cached_input_tokens: cached,
@@ -582,7 +582,7 @@ mod tests {
     fn translates_text_turn_end_to_end() {
         let stream = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":2}}}\n\n",
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\n",
@@ -631,6 +631,8 @@ mod tests {
         let tokens = result.usage.as_ref().unwrap().tokens.as_ref().unwrap();
         assert_eq!(tokens.input_tokens, 10);
         assert_eq!(tokens.output_tokens, 5);
+        assert_eq!(tokens.cached_input_tokens, Some(3));
+        assert_eq!(tokens.cache_write_input_tokens, Some(2));
     }
 
     #[test]

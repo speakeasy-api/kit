@@ -62,7 +62,188 @@ subsequent_overlays:
       - McpResourceTemplate
       - McpConnection::capabilities
       - McpConnection::list_resource_templates_page
-current_snapshot_sha256: 3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077
+  - patch_id: m006-mcp-responder-foundation
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: 3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077
+    patched_snapshot_sha256: e80f12e8ca9f913a68667d7cc8dbed4673fc624a5d6c6ce15870718109b4e277
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: 7bf9cc7c627fcaff97d1fcd67031bcb0a9251180b12bf196c2fbfbf0871ff933
+        patched_sha256: 1847a64e17154942bbcb92901a77108300b1f070b549697aade7635b7439895a
+        reason: sanitized responder callback identity and connection generation
+      - path: vendor/agentkit/crates/agentkit-mcp/tests/in_memory.rs
+        previous_sha256: ca7790c34934c6ab8eb09e684367668a96f0b5e60ef33c46c1e09a4a1e335f2f
+        patched_sha256: 29cb7e4e9c3d6fbe731c92b02a188de4c48ffd7d84b14bde693d5f40f1e84cb2
+        reason: verify sanitized cancellation and generation context
+      - path: vendor/agentkit/crates/agentkit-mcp/tests/protocol_revision_pin.rs
+        previous_sha256: 6753afa18b530fa73e6feef41390a15bf6c95b6b8d3a38d2ca5ac767a107faf3
+        patched_sha256: 1f1bfdfe040bd0a1204ef8dcbd86e9704dd5279f8f6d6d72973ee88da89fa496
+        reason: preserve exact responder capability initialization across the pinned revision
+    public_contract:
+      - McpResponderRequestContext
+      - McpResponderCancellation
+      - McpHandlerConfig::session_generation
+  - patch_id: m006-mcp-callback-delivery-safety
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: e80f12e8ca9f913a68667d7cc8dbed4673fc624a5d6c6ce15870718109b4e277
+    patched_snapshot_sha256: 70b075e4e1c4b17dab2f32a37e7ebce9d9423290a3045b9dffda31a12695aa2b
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: 1847a64e17154942bbcb92901a77108300b1f070b549697aade7635b7439895a
+        patched_sha256: c0118dd6356367662a3cdb9752600be4d6fa6166984a4d1e5afe640766511bca
+        reason: bind delivery acknowledgement to callback ID, operation sequence, request digest, and response digest while rejecting reused outstanding JSON-RPC IDs
+    public_contract:
+      - McpCallbackDeliveryToken
+      - McpResponderRequestContext::on_delivery
+  - patch_id: m006-mcp-reconnect-commit-safety
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: 70b075e4e1c4b17dab2f32a37e7ebce9d9423290a3045b9dffda31a12695aa2b
+    patched_snapshot_sha256: e7b6399179851856365e0c6693311793b307b0de6c5daae6b6aa25fd7f21fec8
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: c0118dd6356367662a3cdb9752600be4d6fa6166984a4d1e5afe640766511bca
+        patched_sha256: eafb42817d6da50d921d11834dd7c92614952d2ec8f603253b2bcb908d8dff30
+        reason: keep a replacement session private through pinned binding validation, then commit generation, responder authority, and tracker replacement together
+      - path: vendor/agentkit/crates/agentkit-mcp/tests/protocol_revision_pin.rs
+        previous_sha256: 1f1bfdfe040bd0a1204ef8dcbd86e9704dd5279f8f6d6d72973ee88da89fa496
+        patched_sha256: fd888d47dbb524c5ad82f124db4d1631e2b04320ddacac7f831bcb1a0591f609
+        reason: prove an aborted replacement preserves the old generation and usable session
+    public_contract:
+      - McpHandlerConfig::session_generation
+      - McpConnection::begin_reinitialize_authorized
+      - McpConnection::reinitialize_authorized
+  - patch_id: m006-mcp-sampling-generation-controls
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: e7b6399179851856365e0c6693311793b307b0de6c5daae6b6aa25fd7f21fec8
+    patched_snapshot_sha256: d6975e62a3637fe0350c23033697fdf029627d094bd0f8d1f281db0ffc7d4595
+    files:
+      - path: vendor/agentkit/crates/agentkit-loop/src/lib.rs
+        previous_sha256: ddb75c55cc30bc81a4b5517246ae0f9e98ad77b12752e28a5930fc31da054f75
+        patched_sha256: cc051f7975345e823130c0d772c95d7040b5219ab31e84448c0292de9103186c
+      - path: vendor/agentkit/crates/agentkit-adapter-completions/src/lib.rs
+        previous_sha256: dc59d1d411d1dc3af34da68e7bf5a706c61c034601629bf333d647d7dcb340b9
+        patched_sha256: d33de45192fdf5fd1c34b936ff19b24881d22abddad3d6ded84322b8ef1df948
+      - path: vendor/agentkit/crates/agentkit-adapter-completions/src/request.rs
+        previous_sha256: ba016e4c6ae80bdd7ceaa07319b6c0d3f615f285e854323df58ba22e0e9b9adb
+        patched_sha256: ef0fbbe928ae81116bb5239b629b423fbefdb12b93c409986ee0173f632f529d
+      - path: vendor/agentkit/crates/agentkit-provider-anthropic/src/lib.rs
+        previous_sha256: 882f4ef3cf64d18fa3a806d343fd0cf4dc0a56c09b40a3beb87245118d8c8451
+        patched_sha256: 755f0a9d7c26241bf4e01322f724745c7abb6010d18fa0b567dbb90eed9ff8dc
+      - path: vendor/agentkit/crates/agentkit-provider-anthropic/src/request.rs
+        previous_sha256: 55594e9ee2bf174c1c15b94e05afa4428017cc6ea67b8b56cf01bf929fe1193e
+        patched_sha256: 6ab300c3ddd896b0a39216eea0b87cf3a4c53acdab0c90c49883a91c29bd37ca
+      - path: vendor/agentkit/crates/agentkit-provider-cerebras/src/request.rs
+        previous_sha256: 1f2c1ddc9fbee85f6f91613f5976b8bff2b4f345df88d94eedc75640ba2acd1b
+        patched_sha256: b191497f7e0389d398037703c024e4e8e87d77768dbbd74da41ba166653bca42
+      - path: vendor/agentkit/crates/agentkit-provider-ollama/src/lib.rs
+        previous_sha256: 8bad9518550d0c8b442467a09d39260ffa4b2b47d3dfc8a57f6c86a00651b577
+        patched_sha256: 8908901a4de0480391c12978d8e570c21228cf0d807c9b45ea862b538b5dcdb4
+      - path: vendor/agentkit/crates/agentkit-provider-openai/src/lib.rs
+        previous_sha256: 066df9a7b87647a511d6632708c1a4398ea7b6cb77f976fc6782a447f497e5f7
+        patched_sha256: 89083563b61becc363f2043a0dc32349af202377a55d8403d35f0cf697f260b6
+      - path: vendor/agentkit/crates/agentkit-provider-openrouter/src/lib.rs
+        previous_sha256: 11ff90a62e042af3341cb75cb2dc142cddb98a8ed410f9b6db7f1cf346169df4
+        patched_sha256: df4fcf1d239c8a364a3f99ac94e2fe357352ac195e2b1ee4a227ab02a6af4ac7
+      - path: vendor/agentkit/examples/cerebras-batch/src/main.rs
+        previous_sha256: 4fa456f81ff1d752a25bcbfff6980bdef62f3f28ddab72cfdf874288b825bf56
+        patched_sha256: a635e125f3c7e585a21c2c157acabe3aef8790a0fd75b9b8e59901739b965f0a
+    public_contract:
+      - GenerationControls
+      - TurnRequest::generation
+      - CompletionsProvider::apply_generation_controls
+  - patch_id: m006-mcp-durable-callback-accounting
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: d6975e62a3637fe0350c23033697fdf029627d094bd0f8d1f281db0ffc7d4595
+    patched_snapshot_sha256: 96d5b49d2c6978baf5ef3fefae5b16215d655e0196930cb879fbd45b7f24d703
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: eafb42817d6da50d921d11834dd7c92614952d2ec8f603253b2bcb908d8dff30
+        patched_sha256: 2fa27642924ef7e9a6df385c4b8fe11d6b7294fd28320e75e674b18c244407f0
+      - path: vendor/agentkit/crates/agentkit-adapter-completions/src/response.rs
+        previous_sha256: 9996f15e7eb88a87a45a4d903708ccefe97b0adadfddd54aebc409e4cbd979ce
+        patched_sha256: 11af02601406ec46a7b35ad7d97172f250502c8a4101a85bf332b59120f2912f
+      - path: vendor/agentkit/crates/agentkit-provider-anthropic/src/response.rs
+        previous_sha256: af25e1080c1a8e958052ad25edb692f59c5ad80fea6ae921fbbbb2c749cab039
+        patched_sha256: 99cab436b7160ef42ab722271a486e2e36bfd8cbf5309ff152a20f3b670a7896
+      - path: vendor/agentkit/crates/agentkit-provider-anthropic/src/stream.rs
+        previous_sha256: a050e16de33f522a1e963bf1f5bb5ed4a28f501ef01465588de88f21dce30b64
+        patched_sha256: 9ff0acbec250fbb827ff840d4e028ad4a217817db8a91437f91cf8aea591f497
+    public_contract:
+      - McpResponderRequestContext::callback_delivery_token_for
+  - patch_id: m006-mcp-durable-callback-completion
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: 96d5b49d2c6978baf5ef3fefae5b16215d655e0196930cb879fbd45b7f24d703
+    patched_snapshot_sha256: a03c04ffb4cf6c69afc716a1e680bb10056e4a020f87873f9466f23f27f21240
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: 2fa27642924ef7e9a6df385c4b8fe11d6b7294fd28320e75e674b18c244407f0
+        patched_sha256: 17830f720243c80ed5c24ef380c74a3b4d390db3f159c5f394af960aa9ae8c9b
+        reason: complete exact sent-response tracking before sealing transport delivery permits
+      - path: vendor/agentkit/crates/agentkit-provider-anthropic/src/response.rs
+        previous_sha256: 99cab436b7160ef42ab722271a486e2e36bfd8cbf5309ff152a20f3b670a7896
+        patched_sha256: ffac691138e87866332188aeb1510a426415c7a7f48ef47d89beda07754a05fa
+        reason: complete normalized non-streaming usage accounting
+      - path: vendor/agentkit/crates/agentkit-provider-anthropic/src/stream.rs
+        previous_sha256: 9ff0acbec250fbb827ff840d4e028ad4a217817db8a91437f91cf8aea591f497
+        patched_sha256: a95adf1290379e2f33e33a6d6cbed24ef3b084745863a07c7db6ec3b1ae1e3e5
+        reason: complete normalized streaming usage accounting
+  - patch_id: m006-mcp-responder-delivery-permit
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: a03c04ffb4cf6c69afc716a1e680bb10056e4a020f87873f9466f23f27f21240
+    patched_snapshot_sha256: 09c53abf98e8fe94c2327779d834d4372f09baed527677a4c2349e410e5918c5
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: 17830f720243c80ed5c24ef380c74a3b4d390db3f159c5f394af960aa9ae8c9b
+        patched_sha256: c7b13b80d67550f5863bf4f33ea6cf8ef87eff76c57730a538d0d64ede0faa38
+    public_contract:
+      - has_responder_delivery_permit
+  - patch_id: m006-provider-usage-normalization
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: 09c53abf98e8fe94c2327779d834d4372f09baed527677a4c2349e410e5918c5
+    patched_snapshot_sha256: 027da08fc1c48f4007f362cea0661411f3049aedbc76ec758c67e9e57b57be63
+    files:
+      - path: vendor/agentkit/crates/agentkit-adapter-completions/src/response.rs
+        previous_sha256: 11af02601406ec46a7b35ad7d97172f250502c8a4101a85bf332b59120f2912f
+        patched_sha256: 1f4ad5ef3de7e299785b8c0cca894f6d00eb4f6b0587aecc243a8f2fe58d5483
+        reason: subtract separately reported cache and reasoning details from provider totals at the OpenAI-compatible adapter boundary
+      - path: vendor/agentkit/crates/agentkit-provider-openrouter/src/lib.rs
+        previous_sha256: df4fcf1d239c8a364a3f99ac94e2fe357352ac195e2b1ee4a227ab02a6af4ac7
+        patched_sha256: dbf430a9b8380cbe0e2b2ee03f82ceaa049a65d0920686ba8aaa082e1290666d
+        reason: preserve and fixture real provider-reported USD cost alongside normalized token categories
+  - patch_id: m006-ollama-openai-compatible-output-cap
+    work_package: M006-W07c
+    classification: local_only
+    previous_snapshot_sha256: 027da08fc1c48f4007f362cea0661411f3049aedbc76ec758c67e9e57b57be63
+    patched_snapshot_sha256: 0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0
+    files:
+      - path: vendor/agentkit/book/src/ch01-model-adapter.md
+        previous_sha256: 0394c23d6b548d378c7e6e21b470185cd9cd1b2c69ff1037e210608199848fed
+        patched_sha256: 2b17a2ab94037151ecbe15a785a4303cbdcc24bd0d4f614347bb92b376383e45
+        reason: document the OpenAI-compatible Ollama output-token field
+      - path: vendor/agentkit/book/src/ch20-provider-adapters.md
+        previous_sha256: 35603a8ec327305435adcfb83b41ba9ccce7c58282ac72e63e65145ae747a40c
+        patched_sha256: d28caddff3b3c028266ab232ce587cce49e0f6742dde8af9c7db1da5a7449ead
+        reason: align the provider table and example with the wire contract
+      - path: vendor/agentkit/crates/agentkit-provider-ollama/README.md
+        previous_sha256: c1de624fa8ac4ddc6f7de636c59770740d7a3b185bf4d3df9d5e48a8f19e0bde
+        patched_sha256: 32e4fd886debc89d23d099201f9a9eb149e184a51274f14a9d916523f9c82222
+        reason: use the OpenAI-compatible output-cap builder
+      - path: vendor/agentkit/crates/agentkit-provider-ollama/src/lib.rs
+        previous_sha256: 8908901a4de0480391c12978d8e570c21228cf0d807c9b45ea862b538b5dcdb4
+        patched_sha256: ae061c1b1f462a6af6ed4a0c3ea8a20e6b3c88b574c13c3cae60703a711a9af4
+        reason: serialize and enforce max_tokens on the OpenAI-compatible endpoint
+    public_contract:
+      - OllamaConfig::with_max_tokens
+      - OllamaAdapter::max_output_tokens
+current_snapshot_sha256: 0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0
 public_contract:
   - PINNED_PROTOCOL_VERSION
   - enforce_pinned_protocol_version

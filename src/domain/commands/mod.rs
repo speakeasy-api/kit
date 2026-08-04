@@ -5,8 +5,9 @@ use super::events::{
     ApprovalDecision, ArtifactRecordId, ArtifactRef, AttemptTransition, RunTransition,
     SchemaVersion,
 };
-use super::ids::{ApprovalId, AttemptId, ProjectId, RunId, ThreadId};
+use super::ids::{ApprovalId, AttemptId, McpCallbackId, ProjectId, RunId, ThreadId};
 use super::lifecycle::AttemptOwnership;
+use super::mcp_callback::{McpCallbackAction, McpCallbackArtifactRef};
 use super::retention::RetentionPolicy;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -121,6 +122,20 @@ pub enum Command {
         granted: bool,
         expected_version: u64,
     },
+    ResolveMcpCallback {
+        schema_version: SchemaVersion,
+        callback_id: McpCallbackId,
+        kind: crate::domain::mcp_callback::McpCallbackKind,
+        mode: crate::domain::mcp_callback::McpCallbackMode,
+        expected_version: u64,
+        challenge_generation: u64,
+        schema_digest: String,
+        action: McpCallbackAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifact_refs: Vec<McpCallbackArtifactRef>,
+    },
     RegisterArtifactMetadata {
         schema_version: SchemaVersion,
         artifact_id: ArtifactRecordId,
@@ -149,6 +164,7 @@ impl Command {
             | Self::ResolveApproval { schema_version, .. }
             | Self::RequestAuth { schema_version, .. }
             | Self::ResolveAuth { schema_version, .. }
+            | Self::ResolveMcpCallback { schema_version, .. }
             | Self::RegisterArtifactMetadata { schema_version, .. } => *schema_version,
         }
     }

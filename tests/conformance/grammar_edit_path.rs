@@ -208,6 +208,7 @@ fn request() -> TurnRequest {
         available_tools: Vec::new(),
         cache: None,
         structured_output: None,
+        generation: Default::default(),
         metadata: MetadataMap::new(),
     }
 }

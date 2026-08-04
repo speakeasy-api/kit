@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agentkit_core::{Delta, FinishReason, Item, ItemKind, TurnCancellation, Usage};
+use agentkit_core::{
+    CancellationController, Delta, FinishReason, Item, ItemKind, TurnCancellation, Usage,
+};
 use agentkit_loop::{
     AgentEvent, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelAdapter, ModelSession,
     ModelTurn, ModelTurnEvent, ModelTurnResult, ObservedEvent, SessionConfig, TranscriptEvent,
@@ -21,6 +23,7 @@ use agentkit_provider_anthropic::{AnthropicAdapter, AnthropicSession, AnthropicT
 use agentkit_provider_ollama::{OllamaAdapter, OllamaSession, OllamaTurn};
 use agentkit_provider_openai::{OpenAIAdapter, OpenAISession, OpenAITurn};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterSession, OpenRouterTurn};
+use async_trait::async_trait;
 use tokio::{
     sync::{Semaphore, broadcast, mpsc, watch},
     task::JoinHandle,
@@ -139,6 +142,8 @@ pub struct RunExecutorConfig {
     mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
     mcp_stdio_profiles:
         Option<Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>>,
+    mcp_responder_outcomes: crate::protocols::mcp::responders::ResponderOutcomes,
+    callback_secrets: crate::protocols::mcp::responders::CallbackSecretRegistry,
     project_root: PathBuf,
     workspace_scratch: PathBuf,
     edit_workspace: Option<PathBuf>,
@@ -188,6 +193,8 @@ impl RunExecutorConfig {
             telemetry: None,
             mcp_servers: Vec::new(),
             mcp_stdio_profiles: None,
+            mcp_responder_outcomes: Default::default(),
+            callback_secrets: Default::default(),
             project_root,
             workspace_scratch,
             edit_workspace: None,
@@ -225,6 +232,22 @@ impl RunExecutorConfig {
         profiles: Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>,
     ) -> Self {
         self.mcp_stdio_profiles = Some(profiles);
+        self
+    }
+
+    pub fn with_mcp_responder_outcomes(
+        mut self,
+        outcomes: crate::protocols::mcp::responders::ResponderOutcomes,
+    ) -> Self {
+        self.mcp_responder_outcomes = outcomes;
+        self
+    }
+
+    pub(crate) fn with_callback_secret_registry(
+        mut self,
+        registry: crate::protocols::mcp::responders::CallbackSecretRegistry,
+    ) -> Self {
+        self.callback_secrets = registry;
         self
     }
 
@@ -567,6 +590,9 @@ impl AttemptMcpRuntime {
         runtime: Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
         config: &RunExecutorConfig,
         cancellation: Arc<AtomicBool>,
+        revision_live: Arc<AtomicBool>,
+        project_root: PathBuf,
+        workspace_revision: String,
     ) -> Result<Self, ExecutorError> {
         let (shutdown, _) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -605,6 +631,46 @@ impl AttemptMcpRuntime {
                 let _ = result;
             }));
         }
+        let monitor_runtime = Arc::clone(&runtime);
+        let monitor_cancellation = Arc::clone(&cancellation);
+        let mut stopped = shutdown.subscribe();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = stopped.changed() => {
+                        if result.is_err() || *stopped.borrow() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+                let root = project_root.clone();
+                let revision = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::task::spawn_blocking(move || {
+                        crate::workspace::revision::ManagedWorkspace::open(root)
+                            .and_then(|workspace| workspace.current_revision())
+                            .map(|revision| revision.id().to_string())
+                    }),
+                )
+                .await;
+                let current = match revision {
+                    Ok(Ok(Ok(revision))) => revision,
+                    _ => {
+                        revision_live.store(false, Ordering::Release);
+                        let _ = monitor_runtime.retire_for_revision_change();
+                        monitor_cancellation.store(true, Ordering::Release);
+                        return;
+                    }
+                };
+                if current != workspace_revision {
+                    revision_live.store(false, Ordering::Release);
+                    let _ = monitor_runtime.retire_for_revision_change();
+                    monitor_cancellation.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }));
         Ok(Self {
             runtime,
             shutdown,
@@ -653,7 +719,12 @@ struct ClaimHeartbeat {
 }
 
 impl ClaimHeartbeat {
-    fn start(config: &RunExecutorConfig, claim: crate::api::service::AttemptDriverClaim) -> Self {
+    fn start_with_authority(
+        config: &RunExecutorConfig,
+        claim: crate::api::service::AttemptDriverClaim,
+        current_fence: Arc<AtomicU64>,
+        current_claim_generation: Arc<AtomicU64>,
+    ) -> Self {
         let store = Arc::clone(&config.store);
         let lease_duration = config.lease_duration;
         let interval = config.claim_renewal_interval;
@@ -699,9 +770,15 @@ impl ClaimHeartbeat {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .renew_worker_claim(claim, lease_duration);
-                if let Err(error) = renewed {
-                    let _ = failure_tx.send(Some(error.to_string()));
-                    return;
+                match renewed {
+                    Ok(renewed) => {
+                        current_fence.store(renewed.fence.get(), Ordering::Release);
+                        current_claim_generation.store(renewed.lease_version, Ordering::Release);
+                    }
+                    Err(error) => {
+                        let _ = failure_tx.send(Some(error.to_string()));
+                        return;
+                    }
                 }
             }
         });
@@ -782,7 +859,14 @@ async fn execute_attempt(
     mut job: WorkerRun,
     progress: broadcast::Sender<ProgressEvent>,
 ) -> Result<AttemptExit, ExecutorError> {
-    let mut heartbeat = ClaimHeartbeat::start(config, job.claim);
+    let current_fence = Arc::new(AtomicU64::new(job.claim.fence.get()));
+    let current_claim_generation = Arc::new(AtomicU64::new(job.claim.lease_version));
+    let mut heartbeat = ClaimHeartbeat::start_with_authority(
+        config,
+        job.claim,
+        Arc::clone(&current_fence),
+        Arc::clone(&current_claim_generation),
+    );
     let started = Instant::now();
     let snapshot = RunConfigSnapshot::from_canonical_bytes(&job.effective_config)
         .map_err(|error| ExecutorError::Worker(error.to_string()))?;
@@ -801,21 +885,36 @@ async fn execute_attempt(
         );
     }
     config.model_adapter.select(snapshot.effective().provider)?;
-    let authority_revision = if config.mcp_servers.is_empty() {
+    let authority_snapshot = if config.mcp_servers.is_empty() {
         None
     } else {
-        let root = std::fs::canonicalize(&config.project_root).map_err(|error| {
-            ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
-        })?;
+        let root = config.project_root.clone();
         Some(
-            crate::workspace::revision::ManagedWorkspace::open(root)
-                .and_then(|workspace| workspace.current_revision())
-                .map_err(|error| ExecutorError::Worker(error.to_string()))?
-                .id()
-                .to_string(),
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    let root = std::fs::canonicalize(root).map_err(|error| {
+                        ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
+                    })?;
+                    let revision = crate::workspace::revision::ManagedWorkspace::open(&root)
+                        .and_then(|workspace| workspace.current_revision())
+                        .map_err(|error| ExecutorError::Worker(error.to_string()))?
+                        .id()
+                        .to_string();
+                    Ok::<_, ExecutorError>((root, revision))
+                }),
+            )
+            .await
+            .map_err(|_| ExecutorError::Worker("trusted project root scan timed out".to_owned()))?
+            .map_err(|error| {
+                ExecutorError::Worker(format!("trusted project root scan: {error}"))
+            })??,
         )
     };
-    let prepared_prompt = prepare_prompt(config, &job, &snapshot, authority_revision.as_deref())?;
+    let authority_revision = authority_snapshot
+        .as_ref()
+        .map(|(_, revision)| revision.as_str());
+    let prepared_prompt = prepare_prompt(config, &job, &snapshot, authority_revision)?;
     config.scheduler.register_run_with_snapshot(
         job.run.id,
         job.principal_id,
@@ -907,7 +1006,82 @@ async fn execute_attempt(
     }
 
     let live_cancellation = Arc::new(AtomicBool::new(false));
+    let revision_live = Arc::new(AtomicBool::new(true));
     let budget = durable_tool_budget(config, &snapshot)?;
+    let workspace = workspace_id(job.attempt.id)?;
+    let runtime_secrets = runtime_secret_leases(config, &job, &snapshot, workspace)?;
+    let sampling_policies = config
+        .mcp_servers
+        .iter()
+        .filter_map(|server| {
+            server
+                .responders
+                .sampling
+                .clone()
+                .map(|policy| (server.id.clone(), policy))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut responder_outcomes = config.mcp_responder_outcomes.clone();
+    for (server_id, scope) in &runtime_secrets.scopes {
+        responder_outcomes = responder_outcomes
+            .with_secret_scope(
+                &config.callback_secrets,
+                job.principal_id,
+                job.project_id,
+                job.run.id,
+                job.attempt.id,
+                server_id,
+                &scope.authorized_handles,
+                &scope.secrets,
+            )
+            .map_err(ExecutorError::Worker)?;
+    }
+    if !sampling_policies.is_empty() {
+        let provider = snapshot.effective().provider;
+        let model = config.model_adapter.model_name(provider).to_owned();
+        if sampling_policies.values().any(|policy| {
+            !config
+                .model_adapter
+                .sampling_dispatch_proven(provider, policy)
+        }) {
+            return Err(ExecutorError::Worker(
+                "MCP sampling requires proven USD provider pricing and an output-token cap"
+                    .to_owned(),
+            ));
+        }
+        if sampling_policies
+            .values()
+            .any(|policy| policy.model_id != model)
+        {
+            return Err(ExecutorError::Worker(
+                "MCP sampling model assertion differs from the run's selected model".to_owned(),
+            ));
+        }
+        responder_outcomes = responder_outcomes.with_sampling(Arc::new(DurableSamplingOutcome {
+            database: config.database.clone(),
+            store: Arc::clone(&config.store),
+            scheduler: config.scheduler.clone(),
+            selector: config.model_adapter.clone(),
+            provider,
+            security: model_security(&job, &snapshot, workspace)?,
+            occurred_at: job.occurred_at.clone(),
+            model,
+            provider_cap: config.model_adapter.max_output_tokens(provider),
+            run_cap: u32::try_from(snapshot.effective().max_tokens).unwrap_or(u32::MAX),
+            secrets: runtime_secrets
+                .scopes
+                .iter()
+                .map(|(server, scope)| (server.clone(), scope.secrets.clone()))
+                .collect(),
+            policies: sampling_policies,
+            workspace_revision: authority_revision
+                .ok_or_else(|| {
+                    ExecutorError::Worker("MCP workspace revision is unavailable".to_owned())
+                })?
+                .to_owned(),
+            artifact_retention_days: snapshot.effective().artifact_retention_days,
+        }));
+    }
     let mut mcp_runtime = None;
     let mut mcp_attempt_runtime = None;
     if !config.mcp_servers.is_empty() {
@@ -916,12 +1090,8 @@ async fn execute_attempt(
             job.project_id,
             snapshot.effective_authority().iter().copied(),
         ));
-        let workspace = workspace_id(job.attempt.id)?;
         let mut store = append_store(config)?;
         let mut resolved_auth = BTreeMap::new();
-        let mcp_stdio_secrets = config
-            .model_adapter
-            .secret_leases(snapshot.effective().provider);
         for server in &config.mcp_servers {
             if let Some(resolved) = crate::agent::driver::restart::resolved_mcp_bootstrap_auth(
                 &store, job.run.id, &server.id,
@@ -931,22 +1101,55 @@ async fn execute_attempt(
                 resolved_auth.insert(server.id.clone(), resolved);
             }
         }
+        let callback_secrets = runtime_secrets
+            .scopes
+            .iter()
+            .map(|(server, scope)| (server.clone(), scope.secrets.clone()))
+            .collect::<BTreeMap<_, _>>();
         let bootstrap_context = crate::protocols::mcp::config::McpBootstrapContext {
             authenticated: &authenticated,
             config: &snapshot,
             workspace_id: workspace,
-            workspace_revision: authority_revision.as_deref().ok_or_else(|| {
+            workspace_revision: authority_revision.ok_or_else(|| {
                 ExecutorError::Worker("MCP workspace revision is unavailable".to_owned())
             })?,
+            project_root: authority_snapshot
+                .as_ref()
+                .map(|(root, _)| root.as_path())
+                .ok_or_else(|| {
+                    ExecutorError::Worker("MCP source root is unavailable".to_owned())
+                })?,
             attempt: job.attempt.owner,
             claim: job.claim,
-            current_fence: Arc::new(AtomicU64::new(job.attempt.owner.fencing_token.get())),
+            current_fence: Arc::clone(&current_fence),
+            current_claim_generation: Arc::clone(&current_claim_generation),
+            revision_live: Arc::clone(&revision_live),
             cancellation: Arc::clone(&live_cancellation),
             budget: Arc::clone(&budget),
+            scheduler: config.scheduler.clone(),
+            responder_outcomes: &responder_outcomes,
+            callback_database: &config.database,
+            artifacts: Arc::clone(&config.artifacts),
+            claim_verifier: {
+                let worker_store = Arc::clone(&config.store);
+                Arc::new(move |claim| {
+                    worker_store
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .worker_append_store()
+                        .and_then(|mut store| {
+                            store
+                                .verify_driver_claim(claim)
+                                .map_err(|error| ServiceError::Store(error.to_string()))
+                        })
+                        .is_ok()
+                })
+            },
             occurred_at: &job.occurred_at,
             resolved_auth: &resolved_auth,
             stdio_profiles: config.mcp_stdio_profiles.as_deref(),
-            stdio_secrets: &mcp_stdio_secrets,
+            resolved_secrets: &runtime_secrets.resolved,
+            callback_secrets: &callback_secrets,
         };
         let (bootstrap, claim_error) = {
             let bootstrap = crate::protocols::mcp::config::bootstrap(
@@ -993,6 +1196,15 @@ async fn execute_attempt(
                     Arc::clone(&runtime),
                     config,
                     Arc::clone(&live_cancellation),
+                    Arc::clone(&revision_live),
+                    authority_snapshot
+                        .as_ref()
+                        .expect("MCP authority snapshot exists")
+                        .0
+                        .clone(),
+                    authority_revision
+                        .expect("MCP authority revision exists")
+                        .to_owned(),
                 )?;
                 mcp_runtime = Some(runtime);
                 mcp_attempt_runtime = Some(owned);
@@ -1545,6 +1757,668 @@ fn seed_boundary(
     )
 }
 
+#[derive(Clone)]
+struct DurableSamplingOutcome {
+    database: PathBuf,
+    store: SharedWorkerStore,
+    scheduler: DurableScheduler,
+    selector: SelectedModelAdapter,
+    provider: ConfigProvider,
+    security: ModelSecurity,
+    occurred_at: crate::domain::events::UtcDateTime,
+    model: String,
+    provider_cap: u32,
+    run_cap: u32,
+    secrets: BTreeMap<String, Vec<Arc<SecretLease>>>,
+    policies: BTreeMap<String, crate::protocols::mcp::config::McpSamplingResponderConfig>,
+    workspace_revision: String,
+    artifact_retention_days: u32,
+}
+
+#[cfg(debug_assertions)]
+#[allow(clippy::too_many_arguments)]
+pub fn durable_sampling_outcomes_for_test(
+    database: &std::path::Path,
+    store: SharedWorkerStore,
+    scheduler: DurableScheduler,
+    provider: Arc<FakeProvider>,
+    security: ModelSecurity,
+    server_id: &str,
+    policy: crate::protocols::mcp::config::McpSamplingResponderConfig,
+    secrets: Vec<Arc<SecretLease>>,
+) -> crate::protocols::mcp::responders::ResponderOutcomes {
+    let selected = security.config.effective().provider;
+    let registry = crate::protocols::mcp::responders::CallbackSecretRegistry::default();
+    crate::protocols::mcp::responders::ResponderOutcomes::default()
+        .with_secret_scope(
+            &registry,
+            security.attempt.principal_id,
+            security.config.project_id(),
+            security.config.run_id(),
+            security.attempt.attempt_id,
+            server_id,
+            ["provider:test", "http:test", "stdio:test", "callback:test"],
+            &secrets,
+        )
+        .expect("test callback secret scope is unique")
+        .with_sampling(Arc::new(DurableSamplingOutcome {
+            database: database.to_owned(),
+            store,
+            scheduler,
+            selector: SelectedModelAdapter::for_test(selected, provider),
+            provider: selected,
+            security,
+            occurred_at: crate::domain::events::UtcDateTime::parse("2026-08-04T12:00:00Z")
+                .expect("static test timestamp is valid"),
+            model: "fake-deterministic-v1".to_owned(),
+            provider_cap: 64,
+            run_cap: 64,
+            secrets: BTreeMap::from([(server_id.to_owned(), secrets)]),
+            policies: BTreeMap::from([(server_id.to_owned(), policy)]),
+            workspace_revision: "adversarial-revision".to_owned(),
+            artifact_retention_days: 1,
+        }))
+}
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[async_trait]
+impl crate::protocols::mcp::responders::SamplingOutcomeHandler for DurableSamplingOutcome {
+    fn max_output_tokens(&self) -> u32 {
+        self.provider_cap.min(self.run_cap)
+    }
+
+    async fn respond(
+        &self,
+        mut request: crate::protocols::mcp::responders::ValidatedSamplingRequest,
+        context: crate::protocols::mcp::responders::CallbackAuthorityContext,
+    ) -> Result<
+        crate::protocols::mcp::responders::SamplingHandlerOutput,
+        crate::protocols::mcp::responders::ResponderError,
+    > {
+        let policy = self
+            .policies
+            .get(context.server_id())
+            .ok_or(crate::protocols::mcp::responders::ResponderError::Authority)?;
+        if policy.model_id != self.model {
+            return Err(crate::protocols::mcp::responders::ResponderError::Authority);
+        }
+        let secrets = self
+            .secrets
+            .get(context.server_id())
+            .ok_or(crate::protocols::mcp::responders::ResponderError::Authority)?;
+        let request_digest = context.request_digest();
+        if matches!(
+            policy.approval,
+            crate::protocols::mcp::config::McpSamplingApprovalMode::RequestOnly
+                | crate::protocols::mcp::config::McpSamplingApprovalMode::RequestAndResponse
+        ) {
+            self.approve(
+                &context,
+                crate::domain::mcp_callback::McpCallbackMode::SamplingRequest,
+                request_digest,
+                serde_json::json!({
+                    "stage": "request",
+                    "digest": request_digest.to_string(),
+                    "request": request.params(),
+                }),
+                policy.timeout_millis,
+            )
+            .await?;
+        }
+
+        context.revalidate().await?;
+        let totals = self
+            .scheduler
+            .totals(self.security.config.run_id())
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let remaining = RunBudget::from_effective_config(self.security.config.effective())
+            .remaining(totals.committed, totals.reserved);
+        let (input_tokens, maximum, cost_budget) =
+            crate::protocols::mcp::responders::sampling_affordable_output_tokens(
+                request.params(),
+                policy,
+                self.provider_cap.min(self.run_cap),
+                remaining,
+            )?;
+        if remaining.turns() == 0 {
+            return Err(crate::protocols::mcp::responders::ResponderError::Unavailable);
+        }
+        request.set_max_output_tokens(maximum);
+        let durable_identity = sampling_turn_identity(&self.security, &context, request_digest);
+        let turn_request = detached_sampling_turn(&request, &durable_identity)?;
+
+        context.consume_dispatch_permit()?;
+        let adapter = self
+            .selector
+            .select(self.provider)
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let mut security = self.security.clone();
+        security.argument_constraints = ArgumentConstraints::new([format!(
+            "mcp_sampling:{}:{}:{}:{}",
+            context.server_id(),
+            context.generation(),
+            context.operation_sequence(),
+            request_digest
+        )
+        .into_bytes()]);
+        let validation_policy = policy.clone();
+        let validation_model = self.model.clone();
+        let validation_secrets = secrets.clone();
+        let validation_request_id = context.protocol_request_id();
+        let validation_max_tokens = request.params().max_tokens;
+        let durable = DurableModelAdapter::new(
+            adapter,
+            self.store
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .worker_append_store()
+                .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?,
+            self.scheduler.clone(),
+            security,
+            ModelPolicy {
+                reservation: Spend::new(
+                    cost_budget,
+                    input_tokens.saturating_add(u64::from(maximum)),
+                    1,
+                    0,
+                    0,
+                ),
+                provider_idempotency: if self.selector.provider_idempotency_enforced(self.provider)
+                {
+                    ProviderIdempotency::Enforced
+                } else {
+                    ProviderIdempotency::Unproven
+                },
+                detached: true,
+                ..ModelPolicy::default()
+            },
+            self.occurred_at.clone(),
+            TraceId::parse("mcp-sampling").expect("sampling trace id is valid"),
+        )
+        .with_outcome_validator(Arc::new(move |result| {
+            let redactor = CanaryRedactor::new([]).with_secrets(&validation_secrets);
+            crate::protocols::mcp::responders::validate_detached_sampling_model_result(
+                result,
+                &validation_model,
+                &validation_policy,
+                &validation_request_id,
+                validation_max_tokens,
+                |value| redactor.redact_text(value) == value,
+            )
+            .map_err(|error| LoopError::Provider(error.to_string()))
+        }));
+        let cancellation = CancellationController::new();
+        let turn_cancellation = TurnCancellation::new(cancellation.handle());
+        let cancellation_context = context.clone();
+        let _cancellation_monitor = AbortOnDrop(tokio::spawn(async move {
+            loop {
+                if cancellation_context.is_cancelled()
+                    || cancellation_context.revalidate().await.is_err()
+                    || tokio::time::Instant::now() >= cancellation_context.deadline()
+                {
+                    cancellation.interrupt();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }));
+        let mut session = durable
+            .start_session(SessionConfig::new(durable_identity))
+            .await
+            .map_err(map_sampling_model_error)?;
+        let mut turn = session
+            .begin_turn(turn_request, Some(turn_cancellation.clone()))
+            .await
+            .map_err(map_sampling_model_error)?;
+        let result = loop {
+            if context.is_cancelled() {
+                return Err(crate::protocols::mcp::responders::ResponderError::Unavailable);
+            }
+            match turn
+                .next_event(Some(turn_cancellation.clone()))
+                .await
+                .map_err(map_sampling_model_error)?
+            {
+                Some(ModelTurnEvent::Finished(result)) => break result,
+                Some(ModelTurnEvent::ToolCall(_)) => {
+                    return Err(crate::protocols::mcp::responders::ResponderError::Invalid);
+                }
+                Some(ModelTurnEvent::Delta(_) | ModelTurnEvent::Usage(_)) => {}
+                None => return Err(crate::protocols::mcp::responders::ResponderError::Unavailable),
+            }
+        };
+        context.revalidate().await?;
+        let mut output = detached_sampling_result(&result, &self.model, secrets)?;
+        if policy.approval
+            == crate::protocols::mcp::config::McpSamplingApprovalMode::RequestAndResponse
+        {
+            let response_bytes = serde_json::to_vec(&output.result)
+                .map_err(|_| crate::protocols::mcp::responders::ResponderError::Invalid)?;
+            let response_digest = Digest::of(DigestAlgorithm::Sha256, &response_bytes);
+            self.approve(
+                &context,
+                crate::domain::mcp_callback::McpCallbackMode::SamplingResponse,
+                response_digest,
+                serde_json::json!({
+                    "stage": "response",
+                    "digest": response_digest.to_string(),
+                    "response": output.result,
+                }),
+                policy.timeout_millis,
+            )
+            .await?;
+        }
+        context.revalidate().await?;
+        let response_bytes = serde_json::to_vec(&output.result)
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Invalid)?;
+        let mut delivery_identity = Vec::new();
+        crate::capabilities::kernel::identity::put_bytes(
+            &mut delivery_identity,
+            b"kit-mcp-sampling-delivery-v1",
+        );
+        crate::capabilities::kernel::identity::put_bytes(
+            &mut delivery_identity,
+            &request_digest.as_bytes(),
+        );
+        crate::capabilities::kernel::identity::put_bytes(&mut delivery_identity, &response_bytes);
+        let delivery_digest = Digest::of(DigestAlgorithm::Sha256, &delivery_identity);
+        let now = crate::domain::events::UtcDateTime::now()
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let expires_at = crate::domain::events::UtcDateTime::from_unix_micros(
+            now.unix_micros().saturating_add(
+                i64::try_from(Duration::from_millis(policy.timeout_millis).as_micros())
+                    .unwrap_or(i64::MAX),
+            ),
+        )
+        .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let artifact_expires_at = crate::domain::events::UtcDateTime::from_unix_micros(
+            expires_at.unix_micros().saturating_add(
+                i64::from(self.artifact_retention_days).saturating_mul(24 * 60 * 60 * 1_000_000),
+            ),
+        )
+        .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let callback = crate::domain::mcp_callback::McpCallbackProjection {
+            id: crate::protocols::mcp::responders::callback_id(
+                self.security.config.run_id(),
+                self.security.attempt.attempt_id,
+                self.security.attempt.fencing_token.get(),
+                self.security.claim.lease_version,
+                context.server_id(),
+                context.generation(),
+                context.operation_sequence(),
+                context.request_id(),
+                delivery_digest,
+            ),
+            server_id: context.server_id().to_owned(),
+            kind: crate::domain::mcp_callback::McpCallbackKind::Sampling,
+            mode: crate::domain::mcp_callback::McpCallbackMode::SamplingResponse,
+            principal_id: self.security.attempt.principal_id,
+            project_id: self.security.config.project_id(),
+            run_id: self.security.config.run_id(),
+            attempt_id: self.security.attempt.attempt_id,
+            fence: self.security.attempt.fencing_token,
+            claim_generation: self.security.claim.lease_version,
+            workspace_id: self.security.workspace_id,
+            workspace_revision: self.workspace_revision.clone(),
+            request_id: context.request_id().to_owned(),
+            request: serde_json::json!({
+                "stage": "delivery",
+                "response_digest": Digest::of(DigestAlgorithm::Sha256, &response_bytes).to_string(),
+            }),
+            schema: serde_json::json!({}),
+            request_digest: delivery_digest.to_string(),
+            schema_digest: delivery_digest.to_string(),
+            challenge_generation: context.generation(),
+            operation_sequence: context.operation_sequence(),
+            expires_at,
+            artifact_expires_at,
+            max_response_bytes: policy.max_output_bytes,
+            max_content_bytes: 1,
+            secret_policy_id: context.secret_policy_id()?.to_owned(),
+            state: crate::domain::mcp_callback::McpCallbackState::Requested,
+            version: 1,
+            resolver_actor: None,
+            action: None,
+            artifact_refs: Vec::new(),
+            terminal_error: None,
+        };
+        let store = crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let prepared = store
+            .prepare_automatic_delivery(callback)
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        context.bind_operation_sequence(prepared.operation_sequence);
+        if prepared.state == crate::domain::mcp_callback::McpCallbackState::ResponsePrepared {
+            output = output.with_delivery(store, prepared.id, delivery_digest.as_bytes());
+        } else if !matches!(
+            prepared.state,
+            crate::domain::mcp_callback::McpCallbackState::Delivered
+                | crate::domain::mcp_callback::McpCallbackState::DeliveryUnknown
+        ) {
+            return Err(crate::protocols::mcp::responders::ResponderError::Unavailable);
+        }
+        Ok(output)
+    }
+}
+
+impl DurableSamplingOutcome {
+    async fn approve(
+        &self,
+        context: &crate::protocols::mcp::responders::CallbackAuthorityContext,
+        mode: crate::domain::mcp_callback::McpCallbackMode,
+        digest: Digest,
+        request: serde_json::Value,
+        timeout_millis: u64,
+    ) -> Result<(), crate::protocols::mcp::responders::ResponderError> {
+        use crate::domain::mcp_callback::{
+            McpCallbackKind, McpCallbackProjection, McpCallbackState,
+        };
+        let now = crate::domain::events::UtcDateTime::now()
+            .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let expires_at = crate::domain::events::UtcDateTime::from_unix_micros(
+            now.unix_micros().saturating_add(
+                i64::try_from(Duration::from_millis(timeout_millis).as_micros())
+                    .unwrap_or(i64::MAX),
+            ),
+        )
+        .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let artifact_expires_at = crate::domain::events::UtcDateTime::from_unix_micros(
+            expires_at.unix_micros().saturating_add(
+                i64::from(self.artifact_retention_days).saturating_mul(24 * 60 * 60 * 1_000_000),
+            ),
+        )
+        .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?;
+        let callback = McpCallbackProjection {
+            id: crate::protocols::mcp::responders::callback_id(
+                self.security.config.run_id(),
+                self.security.attempt.attempt_id,
+                self.security.attempt.fencing_token.get(),
+                self.security.claim.lease_version,
+                context.server_id(),
+                context.generation(),
+                context.operation_sequence(),
+                context.request_id(),
+                digest,
+            ),
+            server_id: context.server_id().to_owned(),
+            kind: McpCallbackKind::Sampling,
+            mode,
+            principal_id: self.security.attempt.principal_id,
+            project_id: self.security.config.project_id(),
+            run_id: self.security.config.run_id(),
+            attempt_id: self.security.attempt.attempt_id,
+            fence: self.security.attempt.fencing_token,
+            claim_generation: self.security.claim.lease_version,
+            workspace_id: self.security.workspace_id,
+            workspace_revision: self.workspace_revision.clone(),
+            request_id: context.request_id().to_owned(),
+            request,
+            schema: serde_json::json!({}),
+            request_digest: digest.to_string(),
+            schema_digest: digest.to_string(),
+            challenge_generation: context.generation(),
+            operation_sequence: context.operation_sequence(),
+            expires_at,
+            artifact_expires_at,
+            max_response_bytes: 1024,
+            max_content_bytes: 1,
+            secret_policy_id: context.secret_policy_id()?.to_owned(),
+            state: McpCallbackState::Requested,
+            version: 1,
+            resolver_actor: None,
+            action: None,
+            artifact_refs: Vec::new(),
+            terminal_error: None,
+        };
+        context
+            .with_approval_quota(digest)?
+            .await_sampling_approval(
+                crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+                    .map_err(|_| crate::protocols::mcp::responders::ResponderError::Unavailable)?,
+                callback,
+            )
+            .await
+    }
+}
+
+fn detached_sampling_turn(
+    request: &crate::protocols::mcp::responders::ValidatedSamplingRequest,
+    request_id: &str,
+) -> Result<TurnRequest, crate::protocols::mcp::responders::ResponderError> {
+    crate::protocols::mcp::responders::detached_sampling_turn(request, request_id)
+}
+
+struct RuntimeSecretLeases {
+    resolved: Arc<BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>>,
+    scopes: BTreeMap<String, RuntimeSecretScope>,
+}
+
+struct RuntimeSecretScope {
+    secrets: Vec<Arc<SecretLease>>,
+    authorized_handles: BTreeSet<String>,
+}
+
+fn runtime_secret_leases(
+    config: &RunExecutorConfig,
+    job: &WorkerRun,
+    snapshot: &RunConfigSnapshot,
+    workspace_id: WorkspaceId,
+) -> Result<RuntimeSecretLeases, ExecutorError> {
+    if snapshot.principal_id() != job.principal_id
+        || snapshot.project_id() != job.project_id
+        || snapshot.run_id() != job.run.id
+    {
+        return Err(ExecutorError::Worker(
+            "runtime secret scope does not own this run".to_owned(),
+        ));
+    }
+    runtime_secret_leases_for_scope(
+        config,
+        job.principal_id,
+        job.project_id,
+        snapshot.effective().provider,
+        workspace_id,
+    )
+}
+
+fn runtime_secret_leases_for_scope(
+    config: &RunExecutorConfig,
+    principal_id: crate::domain::ids::PrincipalId,
+    project_id: crate::domain::ids::ProjectId,
+    provider: ConfigProvider,
+    workspace_id: WorkspaceId,
+) -> Result<RuntimeSecretLeases, ExecutorError> {
+    let provider_secrets = config.model_adapter.secret_leases(provider);
+    let provider_handle = format!("provider:{}", config.model_adapter.provider_name(provider));
+    let mut scopes = BTreeMap::new();
+    let mut resolved = BTreeMap::new();
+    for server in &config.mcp_servers {
+        if server.owner.principal_id != principal_id
+            || server.owner.project_id != project_id
+            || server
+                .owner
+                .workspace_id
+                .is_some_and(|owner| owner != workspace_id)
+        {
+            continue;
+        }
+        server.validate().map_err(ExecutorError::Worker)?;
+        if let Some(scope) = &server.credential_scope
+            && matches!(
+                scope,
+                crate::protocols::mcp::config::McpCredentialScopeConfig::Workspace {
+                    workspace_id: owner
+                } if *owner != workspace_id
+            )
+        {
+            continue;
+        }
+        let mut handles = BTreeSet::new();
+        handles.extend(server.credential_handle.iter().cloned());
+        if let crate::protocols::mcp::config::McpTransportConfig::Stdio { environment, .. } =
+            &server.transport
+        {
+            handles.extend(environment.values().map(|value| value.handle.clone()));
+        }
+        let mut secrets = provider_secrets.clone();
+        for handle in &handles {
+            let variable = handle.identifier().strip_prefix("env:").ok_or_else(|| {
+                ExecutorError::Worker("unsupported runtime secret handle".to_owned())
+            })?;
+            let value = std::env::var(variable).map_err(|_| {
+                ExecutorError::Worker(format!("runtime secret {variable:?} is unavailable"))
+            })?;
+            if value.is_empty() {
+                return Err(ExecutorError::Worker(format!(
+                    "runtime secret {variable:?} is empty"
+                )));
+            }
+            let lease = Arc::new(SecretLease::new(value.into_bytes()));
+            secrets.push(Arc::clone(&lease));
+            resolved.insert(handle.clone(), lease);
+        }
+        let mut authorized_handles =
+            BTreeSet::from([provider_handle.clone(), format!("callback:{}", server.id)]);
+        authorized_handles.extend(handles.iter().map(|handle| handle.identifier().to_owned()));
+        scopes.insert(
+            server.id.clone(),
+            RuntimeSecretScope {
+                secrets,
+                authorized_handles,
+            },
+        );
+    }
+    Ok(RuntimeSecretLeases {
+        resolved: Arc::new(resolved),
+        scopes,
+    })
+}
+
+fn sampling_turn_identity(
+    security: &ModelSecurity,
+    context: &crate::protocols::mcp::responders::CallbackAuthorityContext,
+    request_digest: Digest,
+) -> String {
+    let mut identity = Vec::new();
+    crate::capabilities::kernel::identity::put_bytes(&mut identity, b"kit-mcp-sampling-v1");
+    for field in [
+        security.config.run_id().to_string(),
+        security.attempt.attempt_id.to_string(),
+        context.server_id().to_owned(),
+    ] {
+        crate::capabilities::kernel::identity::put_bytes(&mut identity, field.as_bytes());
+    }
+    crate::capabilities::kernel::identity::put_bytes(
+        &mut identity,
+        &security.attempt.fencing_token.get().to_be_bytes(),
+    );
+    crate::capabilities::kernel::identity::put_bytes(
+        &mut identity,
+        &security.claim.lease_version.to_be_bytes(),
+    );
+    crate::capabilities::kernel::identity::put_bytes(
+        &mut identity,
+        &context.generation().to_be_bytes(),
+    );
+    crate::capabilities::kernel::identity::put_bytes(
+        &mut identity,
+        &context.operation_sequence().to_be_bytes(),
+    );
+    crate::capabilities::kernel::identity::put_bytes(&mut identity, &request_digest.as_bytes());
+    format!(
+        "mcp-sampling-{}",
+        Digest::of(DigestAlgorithm::Sha256, &identity)
+            .to_string()
+            .trim_start_matches("sha256:")
+    )
+}
+
+fn detached_sampling_result(
+    result: &ModelTurnResult,
+    model: &str,
+    secrets: &[Arc<SecretLease>],
+) -> Result<
+    crate::protocols::mcp::responders::SamplingHandlerOutput,
+    crate::protocols::mcp::responders::ResponderError,
+> {
+    let redactor = CanaryRedactor::new([]).with_secrets(secrets);
+    crate::protocols::mcp::responders::detached_sampling_result(result, model, |value| {
+        redactor.redact_text(value) == value
+    })
+}
+
+fn map_sampling_model_error(error: LoopError) -> crate::protocols::mcp::responders::ResponderError {
+    match error {
+        LoopError::Cancelled => crate::protocols::mcp::responders::ResponderError::Unavailable,
+        LoopError::Unsupported(_) => crate::protocols::mcp::responders::ResponderError::Invalid,
+        _ => crate::protocols::mcp::responders::ResponderError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod detached_sampling_tests {
+    use super::*;
+
+    fn result(part: Part) -> ModelTurnResult {
+        ModelTurnResult {
+            finish_reason: FinishReason::Completed,
+            output_items: vec![Item::new(ItemKind::Assistant, vec![part])],
+            usage: Some(Usage::new(TokenUsage::new(1, 1))),
+            metadata: agentkit_core::MetadataMap::new(),
+            model: Some("selected-model".into()),
+            response_id: None,
+        }
+    }
+
+    #[test]
+    fn detached_response_rejects_reasoning() {
+        assert!(
+            detached_sampling_result(
+                &result(Part::Reasoning(ReasoningPart::summary("private"))),
+                "selected-model",
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn detached_response_rejects_tool_use() {
+        assert!(
+            detached_sampling_result(
+                &result(Part::ToolCall(agentkit_core::ToolCallPart::new(
+                    "call",
+                    "tool",
+                    serde_json::json!({}),
+                ))),
+                "selected-model",
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn detached_response_rejects_secret_material() {
+        let secret = Arc::new(SecretLease::new(b"sampling-secret".to_vec()));
+        assert!(
+            detached_sampling_result(
+                &result(Part::Text(agentkit_core::TextPart::new("sampling-secret"))),
+                "selected-model",
+                &[secret],
+            )
+            .is_err()
+        );
+    }
+}
+
 type ExecutorModel =
     GrammarEditModelAdapter<DurableModelAdapter<StreamPolicyAdapter<SelectedAdapter>>>;
 
@@ -1616,45 +2490,7 @@ fn model_adapter(
         stream,
     );
     let workspace = workspace_id(job.attempt.id)?;
-    let capability = CapabilityIdentity::new(
-        CapabilitySource::new("native").expect("static capability source is valid"),
-        CapabilityNamespace::new("kit.model").expect("static capability namespace is valid"),
-        CapabilityName::new("call").expect("static capability name is valid"),
-        CapabilityVersion::new("1.0.0").expect("static capability version is valid"),
-        Digest::of(DigestAlgorithm::Blake3, b"kit durable model adapter"),
-    );
-    let schema = Digest::of(DigestAlgorithm::Sha256, b"kit model call schema v1");
-    let constraints = ArgumentConstraints::default();
-    let grants = CapabilityGrantSnapshot::new(
-        &snapshot,
-        [CapabilityGrant::new(
-            job.principal_id,
-            job.project_id,
-            workspace,
-            capability.clone(),
-            schema,
-            EffectClass::ModelCall,
-            constraints.clone(),
-        )],
-        DigestAlgorithm::Sha256,
-    );
-    let authenticated = AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
-        job.principal_id,
-        job.project_id,
-        snapshot.effective_authority().iter().copied(),
-    ));
-    let security = ModelSecurity {
-        authenticated,
-        config: snapshot.clone(),
-        grants,
-        delegation: None,
-        capability,
-        schema_digest: schema,
-        argument_constraints: constraints,
-        workspace_id: workspace,
-        attempt: job.attempt.owner,
-        claim: job.claim,
-    };
+    let security = model_security(job, &snapshot, workspace)?;
     let policy = ModelPolicy {
         reservation: config.model_reservation,
         provider_idempotency: if idempotent {
@@ -1679,6 +2515,52 @@ fn model_adapter(
         GrammarEditLimits::default(),
         grammar_context,
     ))
+}
+
+fn model_security(
+    job: &WorkerRun,
+    snapshot: &RunConfigSnapshot,
+    workspace: WorkspaceId,
+) -> Result<ModelSecurity, ExecutorError> {
+    let capability = CapabilityIdentity::new(
+        CapabilitySource::new("native").expect("static capability source is valid"),
+        CapabilityNamespace::new("kit.model").expect("static capability namespace is valid"),
+        CapabilityName::new("call").expect("static capability name is valid"),
+        CapabilityVersion::new("1.0.0").expect("static capability version is valid"),
+        Digest::of(DigestAlgorithm::Blake3, b"kit durable model adapter"),
+    );
+    let schema = Digest::of(DigestAlgorithm::Sha256, b"kit model call schema v1");
+    let constraints = ArgumentConstraints::default();
+    let grants = CapabilityGrantSnapshot::new(
+        snapshot,
+        [CapabilityGrant::new(
+            job.principal_id,
+            job.project_id,
+            workspace,
+            capability.clone(),
+            schema,
+            EffectClass::ModelCall,
+            constraints.clone(),
+        )],
+        DigestAlgorithm::Sha256,
+    );
+    let authenticated = AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
+        job.principal_id,
+        job.project_id,
+        snapshot.effective_authority().iter().copied(),
+    ));
+    Ok(ModelSecurity {
+        authenticated,
+        config: snapshot.clone(),
+        grants,
+        delegation: None,
+        capability,
+        schema_digest: schema,
+        argument_constraints: constraints,
+        workspace_id: workspace,
+        attempt: job.attempt.owner,
+        claim: job.claim,
+    })
 }
 
 struct PublicStreamCommitFactory {
@@ -2369,6 +3251,12 @@ fn complete_attempt(
     item.usage = None;
     let item_bytes =
         serde_json::to_vec(&item).map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    let snapshot = RunConfigSnapshot::from_canonical_bytes(&job.effective_config)
+        .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    let stored_at =
+        now_unix_micros().map_err(|error| ExecutorError::Artifact(error.to_string()))?;
+    let retention_micros = i64::from(snapshot.effective().artifact_retention_days)
+        .saturating_mul(24 * 60 * 60 * 1_000_000);
     let output_artifact = config
         .artifacts
         .put(
@@ -2378,8 +3266,8 @@ fn complete_attempt(
                 ArtifactClass::File,
                 job.principal_id.to_string(),
                 job.project_id.to_string(),
-                ArtifactRetention::Forever,
-                now_unix_micros().map_err(|error| ExecutorError::Artifact(error.to_string()))?,
+                ArtifactRetention::UntilUnixMicros(stored_at.saturating_add(retention_micros)),
+                stored_at,
             )
             .map_err(|error| ExecutorError::Artifact(error.to_string()))?,
         )
@@ -2389,8 +3277,6 @@ fn complete_attempt(
             .map_err(|error| ExecutorError::Artifact(error.to_string()))?;
     let preview = output_preview(&item);
     let usage = run_accounting(config, &job, prepared)?;
-    let snapshot = RunConfigSnapshot::from_canonical_bytes(&job.effective_config)
-        .map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let provider = snapshot.effective().provider;
     let envelope = RunEnvelope::capture(
         RunCapture {
@@ -2607,7 +3493,10 @@ fn run_accounting(
                     None,
                 )
                 .map_err(|error| ExecutorError::Worker(error.to_string()))?;
-                let actual = accounting_spend(&provisional);
+                let actual = value
+                    .get("settlement")
+                    .and_then(spend_from_value)
+                    .unwrap_or_else(|| accounting_spend(&provisional));
                 let reservation = if charged {
                     Some(config.scheduler.reconcile(reservation_id, actual)?)
                 } else {
@@ -2824,6 +3713,29 @@ impl SelectedModelAdapter {
 
     fn model_name(&self, provider: ConfigProvider) -> &str {
         &self.configured(provider).model
+    }
+
+    fn max_output_tokens(&self, provider: ConfigProvider) -> u32 {
+        match &self.configured(provider).adapter {
+            SelectedAdapter::OpenAi(adapter) => adapter.max_output_tokens().unwrap_or(u32::MAX),
+            SelectedAdapter::Anthropic(adapter) => adapter.max_output_tokens(),
+            SelectedAdapter::OpenRouter(adapter) => adapter.max_output_tokens().unwrap_or(u32::MAX),
+            SelectedAdapter::Ollama(adapter) => adapter.max_output_tokens().unwrap_or(u32::MAX),
+            #[cfg(debug_assertions)]
+            SelectedAdapter::Deterministic(_) => u32::MAX,
+        }
+    }
+
+    fn sampling_dispatch_proven(
+        &self,
+        provider: ConfigProvider,
+        policy: &crate::protocols::mcp::config::McpSamplingResponderConfig,
+    ) -> bool {
+        let output_cap = self.max_output_tokens(provider) != u32::MAX;
+        let pricing = policy.pricing.as_ref().is_some_and(|pricing| {
+            pricing.valid_for(self.provider_name(provider), self.model_name(provider))
+        });
+        output_cap && pricing
     }
 
     fn provider_idempotency_enforced(&self, _provider: ConfigProvider) -> bool {
@@ -3263,6 +4175,7 @@ impl FakeProviderBarrier {
 pub struct FakeResponse {
     pub text: String,
     pub hidden_reasoning: String,
+    pub include_reasoning: bool,
     pub usage: Usage,
     pub metadata: MetadataMap,
     pub delay: Duration,
@@ -3274,6 +4187,7 @@ impl FakeResponse {
         Self {
             text: text.into(),
             hidden_reasoning: "SECRET_CHAIN_OF_THOUGHT".to_owned(),
+            include_reasoning: true,
             usage: Usage::new(
                 TokenUsage::new(4, 2)
                     .with_reasoning_tokens(3)
@@ -3523,30 +4437,32 @@ impl FakeTurn {
     ) -> Self {
         let reasoning = PartId::new("reasoning");
         let text = PartId::new("text");
+        let text_part = Part::Text(
+            TextPart::new(response.text.clone()).with_metadata(response.metadata.clone()),
+        );
+        let mut parts = vec![text_part.clone()];
+        if response.include_reasoning {
+            parts.insert(
+                0,
+                Part::Reasoning(ReasoningPart {
+                    summary: Some(response.hidden_reasoning.clone()),
+                    data: Some(DataRef::inline_text(response.hidden_reasoning.clone())),
+                    redacted: false,
+                    metadata: MetadataMap::new(),
+                }),
+            );
+        }
         let result = ModelTurnResult {
             finish_reason: FinishReason::Completed,
-            output_items: vec![Item::new(
-                ItemKind::Assistant,
-                vec![
-                    Part::Reasoning(ReasoningPart {
-                        summary: Some(response.hidden_reasoning.clone()),
-                        data: Some(DataRef::inline_text(response.hidden_reasoning.clone())),
-                        redacted: false,
-                        metadata: MetadataMap::new(),
-                    }),
-                    Part::Text(
-                        TextPart::new(response.text.clone())
-                            .with_metadata(response.metadata.clone()),
-                    ),
-                ],
-            )],
+            output_items: vec![Item::new(ItemKind::Assistant, parts)],
             usage: Some(response.usage.clone()),
             metadata: response.metadata.clone(),
             model: Some("fake-deterministic-v1".to_owned()),
             response_id: Some("fake-response-1".to_owned()),
         };
-        Self {
-            events: VecDeque::from([
+        let mut events = VecDeque::new();
+        if response.include_reasoning {
+            events.extend([
                 ModelTurnEvent::Delta(Delta::BeginPart {
                     part_id: reasoning.clone(),
                     kind: PartKind::Reasoning,
@@ -3563,20 +4479,23 @@ impl FakeTurn {
                         metadata: MetadataMap::new(),
                     }),
                 }),
-                ModelTurnEvent::Delta(Delta::BeginPart {
-                    part_id: text.clone(),
-                    kind: PartKind::Text,
-                }),
-                ModelTurnEvent::Delta(Delta::AppendText {
-                    part_id: text,
-                    chunk: response.text.clone(),
-                }),
-                ModelTurnEvent::Delta(Delta::CommitPart {
-                    part: Part::Text(TextPart::new(response.text).with_metadata(response.metadata)),
-                }),
-                ModelTurnEvent::Usage(response.usage),
-                ModelTurnEvent::Finished(result),
-            ]),
+            ]);
+        }
+        events.extend([
+            ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: text.clone(),
+                kind: PartKind::Text,
+            }),
+            ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: text,
+                chunk: response.text,
+            }),
+            ModelTurnEvent::Delta(Delta::CommitPart { part: text_part }),
+            ModelTurnEvent::Usage(response.usage),
+            ModelTurnEvent::Finished(result),
+        ]);
+        Self {
+            events,
             delay: response.delay,
             delayed: false,
             #[cfg(debug_assertions)]
@@ -3927,15 +4846,111 @@ mod selector_tests {
 
     use super::{ExecutorError, SelectedAdapter, SelectedModelAdapter};
     #[cfg(debug_assertions)]
-    use super::{FakeProvider, FakeResponse, RunExecutorConfig};
+    use super::{FakeProvider, FakeResponse, RunExecutorConfig, runtime_secret_leases_for_scope};
     use crate::{
         agent::extensions::{
             ExtensionConfigStack, ExtensionPoint, ExtensionRegistry, TrustedExtensionToken,
             built_in_descriptors,
         },
+        agent::{
+            accounting::CostRate,
+            providers::config::{ConfiguredProvider, ProviderProfile},
+        },
         api::service::RunFailureCode,
         domain::{config::Provider, secret::SecretLease},
+        protocols::mcp::config::{McpSamplingPricingPolicy, McpSamplingResponderConfig},
     };
+
+    #[test]
+    fn capped_persistent_profiles_prove_sampling_dispatch() {
+        let ConfiguredProvider::OpenAi {
+            config: openai,
+            credential,
+        } = ProviderProfile::openai("key".into(), Some("openai-model".into()), None, Some(64))
+            .unwrap()
+            .configure()
+            .unwrap()
+        else {
+            panic!("expected openai profile")
+        };
+        let ConfiguredProvider::Ollama(ollama) =
+            ProviderProfile::ollama("ollama-model".into(), None, Some(64))
+                .configure()
+                .unwrap()
+        else {
+            panic!("expected ollama profile")
+        };
+        let trusted = TrustedExtensionToken::daemon_bootstrap();
+        let contracts = ExtensionRegistry::from_descriptors(built_in_descriptors()).unwrap();
+        let extensions = ExtensionConfigStack::built_ins()
+            .materialize(&contracts)
+            .unwrap();
+        let descriptor = contracts
+            .get(extensions.selection(ExtensionPoint::ModelAdapter))
+            .unwrap()
+            .clone();
+        let selector = SelectedModelAdapter::new(
+            &trusted,
+            descriptor,
+            [
+                (
+                    Provider::OpenAi,
+                    SelectedAdapter::OpenAi(
+                        agentkit_provider_openai::OpenAIAdapter::new(openai).unwrap(),
+                    ),
+                    "openai-model".to_owned(),
+                    vec![credential],
+                ),
+                (
+                    Provider::Ollama,
+                    SelectedAdapter::Ollama(
+                        agentkit_provider_ollama::OllamaAdapter::new(ollama).unwrap(),
+                    ),
+                    "ollama-model".to_owned(),
+                    Vec::new(),
+                ),
+            ],
+            extensions,
+        )
+        .unwrap();
+
+        for (provider, name, model, local_free) in [
+            (Provider::OpenAi, "openai", "openai-model", false),
+            (Provider::Ollama, "ollama", "ollama-model", true),
+        ] {
+            let amount = u64::from(!local_free);
+            let policy = McpSamplingResponderConfig {
+                model_id: model.to_owned(),
+                approval: Default::default(),
+                timeout_millis: 1,
+                max_cost_microusd: 1,
+                max_tokens: 32,
+                max_messages: 1,
+                max_content_items: 1,
+                max_content_bytes: 1,
+                max_output_bytes: 1,
+                max_output_content_items: 1,
+                max_system_prompt_bytes: 1,
+                max_stop_sequences: 0,
+                max_stop_sequence_bytes: 1,
+                max_temperature: 1.0,
+                pricing: Some(McpSamplingPricingPolicy {
+                    version: "test-v1".to_owned(),
+                    provider: name.to_owned(),
+                    model: model.to_owned(),
+                    tokenizer_bytes_per_token: 1,
+                    input: CostRate::new(amount, 1),
+                    cache_read: CostRate::new(amount, 1),
+                    cache_write: CostRate::new(amount, 1),
+                    output: CostRate::new(amount, 1),
+                    reasoning: CostRate::new(amount, 1),
+                    local_free,
+                }),
+            };
+            assert_eq!(selector.max_output_tokens(provider), 64);
+            assert!(selector.sampling_dispatch_proven(provider, &policy));
+        }
+    }
 
     #[cfg(debug_assertions)]
     #[test]
@@ -3969,6 +4984,197 @@ mod selector_tests {
 
         assert!(config.native_semantic_evidence.shares_state_with(&evidence));
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn configured_provider_and_each_mcp_server_get_an_exact_scanner() {
+        use crate::{
+            domain::ids::{AttemptId, PrincipalId, ProjectId, RunId, WorkspaceId},
+            executor::profile::{
+                Architecture, ExecutorProfile, Platform, ProfileSpec, ResourceLimits, TrustTier,
+            },
+            protocols::mcp::{
+                config::McpServerConfig,
+                responders::{CallbackSecretRegistry, ResponderOutcomes},
+            },
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "kit-runtime-secret-sources-{}",
+            RunId::generate().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let run = RunId::generate().unwrap();
+        let attempt = AttemptId::generate().unwrap();
+        let workspace = WorkspaceId::generate().unwrap();
+        let provider_secret = Arc::new(SecretLease::new(b"provider-source-secret".to_vec()));
+        let http_variable = format!("KIT_MCP_HTTP_SECRET_{}", std::process::id());
+        let stdio_variable = format!("KIT_MCP_STDIO_SECRET_{}", std::process::id());
+        // SAFETY: unique process-scoped names are installed and removed within this test.
+        unsafe {
+            std::env::set_var(&http_variable, "http-source-secret");
+            std::env::set_var(&stdio_variable, "stdio-source-secret");
+        }
+
+        let owner = serde_json::json!({
+            "principal_id": principal,
+            "project_id": project,
+            "workspace_id": workspace,
+        });
+        let descriptor = serde_json::json!({
+            "kind":"tool", "remote":"test",
+            "descriptor_digest":format!("sha256:{}", "0".repeat(64)),
+            "effect":"network_egress", "retry_safety":"idempotent",
+            "required_grants":["network_egress"], "auth_scopes":[],
+            "availability":"available"
+        });
+        let http: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "id":"http-source",
+            "transport":{"kind":"http","endpoint":"https://example.com/mcp"},
+            "owner":owner,
+            "source":"mcp.http", "trust_domain":"example.com", "namespace":"http",
+            "version":"1", "credential_handle":format!("env:{http_variable}"),
+            "credential_scope":{"kind":"project"},
+            "egress":{"scheme":"https","host":"example.com","port":443},
+            "descriptors":[descriptor.clone()]
+        }))
+        .unwrap();
+        let mut unrelated = http.clone();
+        unrelated.id = "other-tenant".to_owned();
+        unrelated.owner.project_id = ProjectId::generate().unwrap();
+        unrelated.credential_handle = Some(
+            crate::domain::secret::SecretHandle::parse("env:UNRELATED_TENANT_SECRET").unwrap(),
+        );
+        let platform = if cfg!(target_os = "windows") {
+            Platform::Windows
+        } else if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else {
+            Platform::Linux
+        };
+        let architecture = if cfg!(target_arch = "aarch64") {
+            Architecture::Aarch64
+        } else {
+            Architecture::X86_64
+        };
+        let profile = ProfileSpec::isolated(
+            TrustTier::TrustedLocal,
+            platform,
+            architecture,
+            ResourceLimits::new(
+                10_000,
+                256 * 1024 * 1024,
+                16,
+                16 * 1024 * 1024,
+                64 * 1024 * 1024,
+                64 * 1024 * 1024,
+                16 * 1024 * 1024,
+                30_000,
+            ),
+        );
+        let profile_digest = ExecutorProfile::new(profile.clone())
+            .unwrap()
+            .digest()
+            .to_string();
+        let stdio: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "id":"stdio-source",
+            "transport":{
+                "kind":"stdio", "owned_process_profile":"test-profile",
+                "argv":[std::env::current_exe().unwrap()], "profile":profile,
+                "profile_digest":profile_digest,
+                "environment":{"MCP_TOKEN":{
+                    "handle":format!("env:{stdio_variable}"),
+                    "credential_scope":{"kind":"project"}
+                }}
+            },
+            "owner":owner,
+            "source":"mcp.stdio", "trust_domain":"local", "namespace":"stdio",
+            "version":"1", "descriptors":[descriptor]
+        }))
+        .unwrap();
+        let artifacts =
+            Arc::new(crate::store::artifacts::ArtifactStore::open(root.join("artifacts")).unwrap());
+        let store = Arc::new(std::sync::Mutex::new(
+            crate::test_support::open_service_store(&database).unwrap(),
+        ));
+        let scheduler = crate::runtime::scheduler::DurableScheduler::open(&database).unwrap();
+        let config = RunExecutorConfig::new(
+            &database,
+            artifacts,
+            store,
+            scheduler,
+            SelectedModelAdapter::for_test(
+                Provider::OpenAi,
+                Arc::new(
+                    FakeProvider::new(FakeResponse::completed("test"))
+                        .with_secret_leases([provider_secret]),
+                ),
+            ),
+        )
+        .with_mcp_servers([http, stdio, unrelated]);
+        let leases = runtime_secret_leases_for_scope(
+            &config,
+            principal,
+            project,
+            Provider::OpenAi,
+            workspace,
+        )
+        .unwrap();
+        let registry = CallbackSecretRegistry::default();
+        let mut outcomes = ResponderOutcomes::default();
+        for (server, scope) in &leases.scopes {
+            outcomes = outcomes
+                .with_secret_scope(
+                    &registry,
+                    principal,
+                    project,
+                    run,
+                    attempt,
+                    server,
+                    &scope.authorized_handles,
+                    &scope.secrets,
+                )
+                .unwrap();
+        }
+        let http = outcomes.secret_scanner_for_test("http-source").unwrap();
+        assert_ne!(
+            http.redact_text("provider-source-secret"),
+            "provider-source-secret"
+        );
+        assert_ne!(http.redact_text("http-source-secret"), "http-source-secret");
+        assert_eq!(
+            http.redact_text("stdio-source-secret"),
+            "stdio-source-secret"
+        );
+        let stdio = outcomes.secret_scanner_for_test("stdio-source").unwrap();
+        assert_ne!(
+            stdio.redact_text("provider-source-secret"),
+            "provider-source-secret"
+        );
+        assert_ne!(
+            stdio.redact_text("stdio-source-secret"),
+            "stdio-source-secret"
+        );
+        assert_eq!(
+            stdio.redact_text("http-source-secret"),
+            "http-source-secret"
+        );
+        assert_eq!(leases.scopes["http-source"].authorized_handles.len(), 3);
+        assert_eq!(leases.scopes["stdio-source"].authorized_handles.len(), 3);
+        assert!(outcomes.secret_policy_id_for_test("http-source").is_some());
+        assert!(outcomes.secret_policy_id_for_test("stdio-source").is_some());
+        assert!(outcomes.secret_scanner_for_test("other-tenant").is_none());
+
+        // SAFETY: removes only the unique variables installed above.
+        unsafe {
+            std::env::remove_var(http_variable);
+            std::env::remove_var(stdio_variable);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

@@ -432,7 +432,9 @@ fn all_provider_add_options_and_credential_failures_are_validated() {
                 "--api-key-env",
                 "KIT_TEST_CREDENTIAL",
                 "--base-url",
-                "http://openai.test/chat",
+                "https://openai.test/chat",
+                "--max-completion-tokens",
+                "111",
             ],
         ),
         (
@@ -473,7 +475,14 @@ fn all_provider_add_options_and_credential_failures_are_validated() {
         ),
         (
             "ollama",
-            vec!["--provider", "ollama", "--model", "llama-test"],
+            vec![
+                "--provider",
+                "ollama",
+                "--model",
+                "llama-test",
+                "--max-tokens",
+                "222",
+            ],
         ),
     ] {
         let mut command = kit(&config);
@@ -491,6 +500,11 @@ fn all_provider_add_options_and_credential_failures_are_validated() {
         "openrouter/auto"
     );
     assert_eq!(persisted["providers"]["anthropic"]["max_tokens"], 321);
+    assert_eq!(
+        persisted["providers"]["openai"]["max_completion_tokens"],
+        111
+    );
+    assert_eq!(persisted["providers"]["ollama"]["max_tokens"], 222);
 
     let missing = kit(&config)
         .args([
@@ -526,7 +540,7 @@ fn all_provider_add_options_and_credential_failures_are_validated() {
         .unwrap();
     assert_eq!(inapplicable.status.code(), Some(2));
     let error = String::from_utf8(inapplicable.stderr).unwrap();
-    assert!(error.contains("only valid for anthropic"));
+    assert!(error.contains("only valid for anthropic or ollama"));
     assert!(!error.contains(CANARY));
     fs::remove_dir_all(root).unwrap();
 }
@@ -582,7 +596,7 @@ fn list_rejects_duplicate_oversize_symlink_and_world_readable_configs() {
 }
 
 #[test]
-fn kit_provider_environment_override_ignores_an_invalid_persistent_registry() {
+fn kit_provider_environment_override_still_validates_persistent_mcp_config() {
     let root = temporary("precedence");
     fs::create_dir_all(&root).unwrap();
     let config = root.join("config.json");
@@ -606,11 +620,7 @@ fn kit_provider_environment_override_ignores_an_invalid_persistent_registry() {
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("model adapter unavailable"), "{error}");
-    assert!(
-        !error.contains("persistent provider configuration"),
-        "{error}"
-    );
+    assert!(error.contains("persistent MCP configuration"), "{error}");
     fs::remove_dir_all(root).unwrap();
 }
 

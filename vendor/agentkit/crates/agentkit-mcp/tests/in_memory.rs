@@ -157,7 +157,7 @@ async fn connect_in_memory_with_server_peer(
     builder: agentkit_mcp::McpHandlerConfig,
 ) -> (McpConnection, Peer<RoleServer>) {
     let handler_config = builder.clone();
-    let (handler, channels) = builder.build();
+    let (handler, channels) = builder.build_for(McpServerId::new("in-memory"));
     let (server_io, client_io) = tokio::io::duplex(8 * 1024);
     let (peer_tx, peer_rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -523,7 +523,11 @@ impl McpSamplingResponder for EchoSampling {
     async fn create_message(
         &self,
         params: McpCreateMessageRequestParams,
+        context: agentkit_mcp::McpResponderRequestContext,
     ) -> Result<McpCreateMessageResult, McpError> {
+        assert_eq!(context.server_id().to_string(), "in-memory");
+        assert!(!context.cancellation().is_cancelled());
+        assert_eq!(context.generation(), 1);
         let last_text = params
             .messages
             .iter()
@@ -546,7 +550,10 @@ struct StaticRoots(Vec<McpRoot>);
 
 #[async_trait]
 impl McpRootsProvider for StaticRoots {
-    async fn list_roots(&self) -> Result<Vec<McpRoot>, McpError> {
+    async fn list_roots(
+        &self,
+        _context: agentkit_mcp::McpResponderRequestContext,
+    ) -> Result<Vec<McpRoot>, McpError> {
         Ok(self.0.clone())
     }
 }
@@ -558,6 +565,7 @@ impl McpElicitationResponder for AcceptingElicitation {
     async fn create_elicitation(
         &self,
         _params: McpCreateElicitationRequestParams,
+        _context: agentkit_mcp::McpResponderRequestContext,
     ) -> Result<McpCreateElicitationResult, McpError> {
         Ok(McpCreateElicitationResult::new(
             McpElicitationAction::Accept,
@@ -629,10 +637,13 @@ async fn roots_provider_supplies_list_roots_response() {
 }
 
 #[tokio::test]
-async fn roots_provider_default_returns_empty() {
+async fn roots_provider_absent_returns_method_not_found() {
     let (_connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
-    let result = peer.list_roots().await.expect("list_roots succeeds");
-    assert!(result.roots.is_empty());
+    let error = peer
+        .list_roots()
+        .await
+        .expect_err("missing roots provider rejects");
+    assert!(error.to_string().contains("-32601"));
 }
 
 #[tokio::test]
@@ -773,13 +784,30 @@ async fn list_changed_notifications_emit_events() {
 
 #[tokio::test]
 async fn handler_advertises_responder_capabilities_during_initialize() {
-    let (connection, _peer) = connect_in_memory_with_server_peer(
-        McpHandlerConfig::new()
-            .with_sampling_responder(Arc::new(EchoSampling))
-            .with_elicitation_responder(Arc::new(AcceptingElicitation))
-            .with_roots_provider(Arc::new(StaticRoots(Vec::new()))),
-    )
-    .await;
+    let config = McpHandlerConfig::new()
+        .with_sampling_responder(Arc::new(EchoSampling))
+        .with_elicitation_responder(Arc::new(AcceptingElicitation))
+        .with_roots_provider(Arc::new(StaticRoots(Vec::new())));
+    let initialize: rmcp::model::InitializeRequestParams =
+        serde_json::from_value(config.initialize_arguments()).expect("initialize params decode");
+    assert!(initialize.capabilities.sampling.is_some());
+    assert!(
+        initialize
+            .capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|value| { value.form.is_some() && value.url.is_none() })
+    );
+    assert_eq!(
+        initialize
+            .capabilities
+            .roots
+            .as_ref()
+            .and_then(|value| value.list_changed),
+        Some(false)
+    );
+    assert!(initialize.capabilities.tasks.is_none());
+    let (connection, _peer) = connect_in_memory_with_server_peer(config).await;
 
     // Server peer info is only available on the server side; capabilities on the
     // connection reflect what the *server* advertised. We assert the wiring

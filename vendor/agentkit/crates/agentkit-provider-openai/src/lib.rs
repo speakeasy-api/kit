@@ -259,6 +259,41 @@ impl CompletionsProvider for OpenAIProvider {
         &self.request_config
     }
 
+    fn apply_generation_controls(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        controls: &agentkit_loop::GenerationControls,
+    ) -> Result<(), LoopError> {
+        if let Some(maximum) = controls.max_output_tokens {
+            if maximum == 0
+                || self
+                    .request_config
+                    .max_completion_tokens
+                    .is_some_and(|cap| maximum > cap)
+            {
+                return Err(LoopError::Unsupported(
+                    "OpenAI max output tokens exceed the configured provider cap".into(),
+                ));
+            }
+            body.insert("max_completion_tokens".into(), Value::from(maximum));
+        }
+        if let Some(temperature) = controls.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(LoopError::Unsupported(
+                    "OpenAI temperature is outside the supported range".into(),
+                ));
+            }
+            body.insert("temperature".into(), serde_json::json!(temperature));
+        }
+        if let Some(stops) = &controls.stop_sequences {
+            body.insert(
+                "stop".into(),
+                Value::Array(stops.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        Ok(())
+    }
+
     fn preprocess_request(
         &self,
         builder: agentkit_http::HttpRequestBuilder,
@@ -370,6 +405,11 @@ impl OpenAIAdapter {
         let provider = OpenAIProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Configured provider output-token ceiling, if one was materialized.
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.0.provider_config().max_completion_tokens
+    }
 }
 
 #[async_trait]
@@ -423,6 +463,7 @@ mod tests {
             available_tools: Vec::new(),
             cache,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         }
     }
@@ -451,6 +492,27 @@ mod tests {
             body.get("prompt_cache_retention"),
             Some(&Value::String("24h".into()))
         );
+    }
+
+    #[test]
+    fn per_turn_generation_controls_override_the_exact_request_fields() {
+        let provider = OpenAIProvider::from(
+            OpenAIConfig::new("sk-test", "gpt-test").with_max_completion_tokens(64),
+        );
+        let mut body = serde_json::Map::new();
+        provider
+            .apply_generation_controls(
+                &mut body,
+                &agentkit_loop::GenerationControls {
+                    max_output_tokens: Some(32),
+                    temperature: Some(0.25),
+                    stop_sequences: Some(vec!["STOP".into()]),
+                },
+            )
+            .unwrap();
+        assert_eq!(body["max_completion_tokens"], 32);
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["stop"], serde_json::json!(["STOP"]));
     }
 
     #[test]

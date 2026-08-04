@@ -23,6 +23,9 @@ pub(crate) fn build_request_body<P: CompletionsProvider>(
             body.insert(key, value);
         }
     }
+    provider
+        .apply_generation_controls(&mut body, &request.generation)
+        .map_err(|error| CompletionsError::Protocol(error.to_string()))?;
 
     let mut messages = build_messages(&request.transcript)?;
     if provider.requires_alternating_roles() {
@@ -543,6 +546,7 @@ mod tests {
             available_tools,
             cache: None,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         }
     }

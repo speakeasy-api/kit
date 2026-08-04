@@ -70,6 +70,17 @@ pub enum AppendOutcome {
     Replayed(IdempotentResponse),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingArtifactPublication {
+    pub reference: String,
+    pub digest: String,
+    pub purpose: String,
+    pub subject_id: String,
+    pub principal_id: String,
+    pub project_id: String,
+    pub run_id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CrashPoint {
     AfterTransactionBegin,
@@ -175,6 +186,7 @@ impl From<rusqlite::Error> for StoreError {
 
 pub struct SqliteStore {
     connection: Connection,
+    pending_artifact_publication: Option<PendingArtifactPublication>,
     _authority: crate::runtime::daemon::ControlPlaneAuthority,
 }
 
@@ -197,6 +209,7 @@ impl SqliteStore {
         migrate(&mut connection)?;
         Ok(Self {
             connection,
+            pending_artifact_publication: None,
             _authority: authority.clone(),
         })
     }
@@ -390,6 +403,7 @@ impl SqliteStore {
         mut crash: impl FnMut(CrashPoint) -> bool,
     ) -> Result<AppendOutcome, StoreError> {
         validate_command(&command)?;
+        let publication = self.pending_artifact_publication.take();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -407,6 +421,7 @@ impl SqliteStore {
                         response,
                         commit_positions: checked_positions(positions(&transaction, scope, key)?)?,
                     };
+                    journal_artifact_publication(&transaction, &command, publication.as_ref())?;
                     transaction.commit()?;
                     return Ok(AppendOutcome::Replayed(result));
                 }
@@ -457,30 +472,7 @@ impl SqliteStore {
                 .checked_add(1)
                 .ok_or(StoreError::PositionExhausted)?;
             ensure_event_absent(&transaction, event.id)?;
-            transaction.execute(
-                "INSERT INTO events (
-                     event_id, stream, sequence, commit_position, event_type, schema_version,
-                     occurred_at, causation_id, correlation_id, attempt_id, trace_id,
-                     payload, artifacts
-                 ) VALUES (
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
-                 )",
-                params![
-                    event.id.to_string(),
-                    stream,
-                    *sequence,
-                    watermark,
-                    event.event_type.as_str(),
-                    u16::from(event.schema_version),
-                    event.occurred_at.as_str(),
-                    event.causation_id.to_string(),
-                    event.correlation_id.to_string(),
-                    event.attempt_id.map(|id| id.to_string()),
-                    event.trace_id.as_str(),
-                    event.payload,
-                    event.artifacts,
-                ],
-            )?;
+            insert_event_row(&transaction, event, *sequence, watermark)?;
             insert_position(
                 &transaction,
                 scope,
@@ -514,6 +506,7 @@ impl SqliteStore {
             ));
         }
         inject(&mut crash, CrashPoint::AfterIdempotencyTerminal)?;
+        journal_artifact_publication(&transaction, &command, publication.as_ref())?;
         inject(&mut crash, CrashPoint::BeforeCommit)?;
         transaction.commit()?;
         inject(&mut crash, CrashPoint::AfterCommit)?;
@@ -522,6 +515,27 @@ impl SqliteStore {
             response: command.response,
             commit_positions: committed_positions,
         }))
+    }
+
+    pub(crate) fn arm_artifact_publication(
+        &mut self,
+        publication: PendingArtifactPublication,
+    ) -> Result<(), StoreError> {
+        if self.pending_artifact_publication.is_some() {
+            return Err(StoreError::InvalidRequest(
+                "artifact publication is already armed",
+            ));
+        }
+        self.pending_artifact_publication = Some(publication);
+        Ok(())
+    }
+
+    pub(crate) fn clear_artifact_publication(&mut self, reference: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM artifact_publication_journal WHERE artifact_reference=?1",
+            [reference],
+        )?;
+        Ok(())
     }
 
     pub fn events(&self) -> Result<Vec<StoredEvent>, StoreError> {
@@ -561,6 +575,143 @@ impl SqliteStore {
         )?;
         u64::try_from(position).map_err(|_| StoreError::CorruptData("negative commit watermark"))
     }
+}
+
+pub(crate) fn append_canonical_event(
+    transaction: &Transaction<'_>,
+    event: &NewEvent,
+    expected_version: u64,
+) -> Result<CommitPosition, StoreError> {
+    let stream = event.stream.to_string();
+    transaction.execute(
+        "INSERT INTO stream_heads (stream, version) VALUES (?1, 0)
+         ON CONFLICT(stream) DO NOTHING",
+        [&stream],
+    )?;
+    let actual: i64 = transaction.query_row(
+        "SELECT version FROM stream_heads WHERE stream=?1",
+        [&stream],
+        |row| row.get(0),
+    )?;
+    if actual < 0 {
+        return Err(StoreError::CorruptData("negative stream version"));
+    }
+    if actual as u64 != expected_version {
+        return Err(StoreError::ExpectedVersion {
+            stream,
+            expected: expected_version,
+            actual: actual.max(0) as u64,
+        });
+    }
+    ensure_event_absent(transaction, event.id)?;
+    let sequence = actual.checked_add(1).ok_or(StoreError::PositionExhausted)?;
+    let watermark: i64 = transaction.query_row(
+        "SELECT position FROM commit_watermark WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if watermark < 0 {
+        return Err(StoreError::CorruptData("negative commit watermark"));
+    }
+    let position = watermark
+        .checked_add(1)
+        .ok_or(StoreError::PositionExhausted)?;
+    insert_event_row(transaction, event, sequence, position)?;
+    transaction.execute(
+        "UPDATE stream_heads SET version=?2 WHERE stream=?1",
+        params![event.stream.to_string(), sequence],
+    )?;
+    transaction.execute(
+        "UPDATE commit_watermark SET position=?1 WHERE singleton=1",
+        [position],
+    )?;
+    CommitPosition::new(
+        u64::try_from(position).map_err(|_| StoreError::CorruptData("negative commit position"))?,
+    )
+    .map_err(|_| StoreError::CorruptData("invalid callback commit position"))
+}
+
+fn insert_event_row(
+    transaction: &Transaction<'_>,
+    event: &NewEvent,
+    sequence: i64,
+    position: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO events (
+             event_id, stream, sequence, commit_position, event_type, schema_version,
+             occurred_at, causation_id, correlation_id, attempt_id, trace_id,
+             payload, artifacts
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            event.id.to_string(),
+            event.stream.to_string(),
+            sequence,
+            position,
+            event.event_type.as_str(),
+            u16::from(event.schema_version),
+            event.occurred_at.as_str(),
+            event.causation_id.to_string(),
+            event.correlation_id.to_string(),
+            event.attempt_id.map(|id| id.to_string()),
+            event.trace_id.as_str(),
+            event.payload,
+            event.artifacts,
+        ],
+    )?;
+    Ok(())
+}
+
+fn journal_artifact_publication(
+    transaction: &Transaction<'_>,
+    command: &AppendCommand,
+    publication: Option<&PendingArtifactPublication>,
+) -> Result<(), StoreError> {
+    let Some(publication) = publication else {
+        return Ok(());
+    };
+    let expected = crate::domain::events::ArtifactRef::parse(&publication.digest)
+        .map_err(|_| StoreError::InvalidRequest("invalid artifact publication digest"))?;
+    let mut referenced = false;
+    for event in &command.events {
+        let artifacts: Vec<crate::domain::events::ArtifactRef> =
+            serde_json::from_slice(&event.artifacts).map_err(|_| {
+                StoreError::InvalidRequest(
+                    "event artifacts must be a JSON array of content digests",
+                )
+            })?;
+        if artifacts.len() > crate::capabilities::kernel::invoke::MAX_INVOCATION_ARTIFACT_DIGESTS {
+            return Err(StoreError::InvalidRequest(
+                "event artifact digest limit exceeded",
+            ));
+        }
+        referenced |= artifacts.contains(&expected);
+    }
+    if !referenced {
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO artifact_publication_journal
+         (artifact_reference,artifact_digest,purpose,subject_id,principal_id,project_id,run_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(artifact_reference) DO UPDATE SET
+           artifact_digest=excluded.artifact_digest,
+           purpose=excluded.purpose,
+           subject_id=excluded.subject_id,
+           principal_id=excluded.principal_id,
+           project_id=excluded.project_id,
+           run_id=excluded.run_id",
+        params![
+            publication.reference,
+            publication.digest,
+            publication.purpose,
+            publication.subject_id,
+            publication.principal_id,
+            publication.project_id,
+            publication.run_id,
+        ],
+    )?;
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
@@ -658,8 +809,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
              fence INTEGER NOT NULL CHECK (fence > 0),
              lease_version INTEGER NOT NULL CHECK (lease_version > 0),
              expires_at_unix_micros INTEGER NOT NULL CHECK (expires_at_unix_micros >= 0),
-             quiescent INTEGER NOT NULL DEFAULT 0 CHECK (quiescent IN (0, 1))
-         );",
+              quiescent INTEGER NOT NULL DEFAULT 0 CHECK (quiescent IN (0, 1))
+          );
+          CREATE TABLE IF NOT EXISTS artifact_publication_journal (
+              artifact_reference TEXT PRIMARY KEY, artifact_digest TEXT NOT NULL,
+              purpose TEXT NOT NULL, subject_id TEXT NOT NULL, principal_id TEXT NOT NULL,
+              project_id TEXT NOT NULL, run_id TEXT NOT NULL
+          );",
     )?;
     transaction.commit()?;
     Ok(())

@@ -4,7 +4,8 @@ use kit::domain::commands::ExpectedVersion;
 use kit::domain::events::{EntityId, EventType, SchemaVersion, TraceId, UtcDateTime};
 use kit::domain::ids::{CommandId, EventId, PrincipalId, RunId};
 use kit::store::sqlite::append::{
-    AppendCommand, AppendOutcome, CrashPoint, ExpectedStreamVersion, NewEvent, StoreError,
+    AppendCommand, AppendOutcome, CrashPoint, ExpectedStreamVersion, NewEvent,
+    PendingArtifactPublication, StoreError,
 };
 use kit::store::sqlite::idempotency::{
     CanonicalRequestDigest, ClaimOutcome, IdempotencyKey, IdempotencyScope, IdempotencyStatus,
@@ -86,7 +87,13 @@ fn command(key: &str, principal: PrincipalId, first: RunId, second: RunId) -> Ap
                 version: ExpectedVersion::new(0),
             },
         ],
-        events: vec![event(first, b"first"), event(second, b"second")],
+        events: vec![
+            NewEvent {
+                artifacts: br#"["blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]"#.to_vec(),
+                ..event(first, b"first")
+            },
+            event(second, b"second"),
+        ],
         response: b"terminal-response".to_vec(),
     }
 }
@@ -105,6 +112,16 @@ fn every_transaction_boundary_recovers_as_all_or_nothing_without_invented_succes
         let idempotency_key = append.idempotency_key.clone();
 
         let mut store = test_support::open_sqlite_store(database.path()).unwrap();
+        let publication = PendingArtifactPublication {
+            reference: format!("artifact-ref:{}", "b".repeat(64)),
+            digest: format!("blake3:{}", "a".repeat(64)),
+            purpose: "mcp_invocation_result".to_owned(),
+            subject_id: "invocation_crash_test".to_owned(),
+            principal_id: principal.to_string(),
+            project_id: "project_crash_test".to_owned(),
+            run_id: first.to_string(),
+        };
+        test_support::arm_artifact_publication(&mut store, publication.clone()).unwrap();
         let ClaimOutcome::Claimed(claim) = test_support::claim(
             &mut store,
             scope.clone(),
@@ -128,6 +145,15 @@ fn every_transaction_boundary_recovers_as_all_or_nothing_without_invented_succes
 
         let mut recovered = test_support::open_sqlite_store(database.path()).unwrap();
         let committed = point == CrashPoint::AfterCommit;
+        let journaled: usize = rusqlite::Connection::open(database.path())
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM artifact_publication_journal",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journaled, usize::from(committed));
         assert_eq!(
             recovered.events().unwrap().len(),
             if committed { 2 } else { 0 }
@@ -158,6 +184,7 @@ fn every_transaction_boundary_recovers_as_all_or_nothing_without_invented_succes
         ));
 
         append.claim = None;
+        test_support::arm_artifact_publication(&mut recovered, publication).unwrap();
         let retry = test_support::append(&mut recovered, append).unwrap();
         if committed {
             assert!(matches!(retry, AppendOutcome::Replayed(_)));

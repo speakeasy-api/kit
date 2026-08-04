@@ -13,7 +13,10 @@ use crate::{
     store::{
         backup::{BackupConfig, BackupError, BackupGeneration, BackupManager},
         sqlite::{
-            append::{AppendCommand, AppendOutcome, CrashPoint, SqliteStore, StoreError},
+            append::{
+                AppendCommand, AppendOutcome, CrashPoint, PendingArtifactPublication, SqliteStore,
+                StoreError,
+            },
             idempotency::{CanonicalRequestDigest, ClaimOutcome, IdempotencyKey, IdempotencyScope},
             projection::{
                 ProjectionCrashPoint, ProjectionError, ProjectionSnapshot, ProjectionStore,
@@ -158,6 +161,13 @@ pub fn append_with_hook(
     crash: impl FnMut(CrashPoint) -> bool,
 ) -> Result<AppendOutcome, StoreError> {
     store.append_with_hook(command, crash)
+}
+
+pub fn arm_artifact_publication(
+    store: &mut SqliteStore,
+    publication: PendingArtifactPublication,
+) -> Result<(), StoreError> {
+    store.arm_artifact_publication(publication)
 }
 
 pub fn claim(

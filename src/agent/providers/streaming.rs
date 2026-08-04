@@ -103,6 +103,11 @@ impl CanaryRedactor {
         for (url_safe, padded) in [(false, true), (false, false), (true, true), (true, false)] {
             self.patterns.push(base64(source, url_safe, padded));
         }
+        if let Ok(text) = std::str::from_utf8(source)
+            && let Ok(json) = serde_json::to_vec(text)
+        {
+            self.patterns.push(json);
+        }
     }
 
     fn finish(mut self) -> Self {
@@ -111,6 +116,16 @@ impl CanaryRedactor {
             .sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
         self.patterns.dedup();
         self
+    }
+}
+
+impl Drop for CanaryRedactor {
+    fn drop(&mut self) {
+        for pattern in &mut self.patterns {
+            pattern.fill(0);
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        std::hint::black_box(&mut self.patterns);
     }
 }
 

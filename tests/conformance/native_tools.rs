@@ -47,6 +47,7 @@ fn request() -> TurnRequest {
         available_tools: catalog().iter().map(|tool| tool.spec().clone()).collect(),
         cache: None,
         structured_output: None,
+        generation: Default::default(),
         metadata: MetadataMap::new(),
     }
 }

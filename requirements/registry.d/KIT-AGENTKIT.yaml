@@ -262,9 +262,14 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/agent/adapters/model.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - src/protocols/mcp/config.rs
+  telemetry_links:
+  - tests/fault/model_intent_outcome.rs
+  - tests/adversarial/mcp_callback_authority.rs
   evidence_type: conformance
   evidence_id: EV-M002-W03-C-001
   evidence_job: fault
@@ -308,9 +313,14 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/agent/adapters/model.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - src/protocols/mcp/config.rs
+  telemetry_links:
+  - tests/fault/model_intent_outcome.rs
+  - tests/adversarial/mcp_callback_authority.rs
   evidence_type: conformance
   evidence_id: EV-M002-W03-C-002
   evidence_job: fault

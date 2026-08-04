@@ -1,14 +1,14 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
 use agentkit_mcp::{
-    AuthOperation, ClientJsonRpcMessage, McpConnection, McpError, McpHttpClient, McpServerConfig,
-    McpServerId, McpSse, McpSseError, McpSseStream, McpStreamableHttpError,
+    AuthOperation, ClientJsonRpcMessage, McpConnection, McpError, McpHandlerConfig, McpHttpClient,
+    McpServerConfig, McpServerId, McpSse, McpSseError, McpSseStream, McpStreamableHttpError,
     McpStreamableHttpPostResponse, McpTransportBinding, StreamableHttpTransportConfig,
 };
 use bytes::Bytes;
@@ -34,6 +34,7 @@ use crate::{
             Authorization as EgressAuthorization, CredentialHandle, EgressPolicy,
             MAX_RESOLVED_ADDRESSES,
         },
+        ids::{PrincipalId, ProjectId},
         secret::{SecretHandle, SecretLease},
     },
     store::sqlite::append::SqliteStore,
@@ -120,30 +121,42 @@ pub trait HttpCredentialBroker: Send + Sync + 'static {
     ) -> Result<SecretLease, HttpCredentialError>;
 }
 
-pub(crate) struct EnvironmentHttpCredentialBroker;
+pub(crate) struct EnvironmentHttpCredentialBroker {
+    principal_id: PrincipalId,
+    project_id: ProjectId,
+    secrets: Arc<BTreeMap<SecretHandle, Arc<SecretLease>>>,
+}
+
+impl EnvironmentHttpCredentialBroker {
+    pub(crate) fn new(
+        principal_id: PrincipalId,
+        project_id: ProjectId,
+        secrets: Arc<BTreeMap<SecretHandle, Arc<SecretLease>>>,
+    ) -> Self {
+        Self {
+            principal_id,
+            project_id,
+            secrets,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl HttpCredentialBroker for EnvironmentHttpCredentialBroker {
     async fn authorize_and_resolve(
         &self,
         handle: &SecretHandle,
-        _context: &HttpSecretContext<'_>,
+        context: &HttpSecretContext<'_>,
     ) -> Result<SecretLease, HttpCredentialError> {
-        let variable = handle
-            .identifier()
-            .strip_prefix("env:")
-            .filter(|value| {
-                !value.is_empty()
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            })
-            .ok_or(HttpCredentialError::Denied)?;
-        let value = std::env::var(variable).map_err(|_| HttpCredentialError::Unavailable)?;
-        if value.is_empty() {
-            return Err(HttpCredentialError::Invalid);
+        if context.principal_id() != self.principal_id.to_string()
+            || context.project_id() != self.project_id.to_string()
+        {
+            return Err(HttpCredentialError::Denied);
         }
-        Ok(SecretLease::new(value.into_bytes()))
+        self.secrets
+            .get(handle)
+            .map(|lease| SecretLease::new(lease.expose().to_vec()))
+            .ok_or(HttpCredentialError::Denied)
     }
 }
 
@@ -152,7 +165,8 @@ pub enum StreamableHttpOutcome {
     AuthRequired(Box<TransportAuthChallenge>),
 }
 
-pub async fn connect_streamable_http(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_streamable_http_with_handler(
     server_id: McpServerId,
     endpoint: &str,
     request: &BrokerInvocation<'_>,
@@ -160,6 +174,7 @@ pub async fn connect_streamable_http(
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
+    handler: McpHandlerConfig,
 ) -> Result<StreamableHttpOutcome, TransportError> {
     super::validate_initialize_arguments(request)?;
     let operation = TransportOperation::parse(INITIALIZE_OPERATION)?;
@@ -195,11 +210,12 @@ pub async fn connect_streamable_http(
         store,
         limits,
         false,
+        handler,
     )
     .await
 }
 
-pub async fn resume_streamable_http(
+pub async fn connect_streamable_http(
     server_id: McpServerId,
     endpoint: &str,
     request: &BrokerInvocation<'_>,
@@ -207,6 +223,30 @@ pub async fn resume_streamable_http(
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
+) -> Result<StreamableHttpOutcome, TransportError> {
+    connect_streamable_http_with_handler(
+        server_id,
+        endpoint,
+        request,
+        policy,
+        credentials,
+        store,
+        limits,
+        McpHandlerConfig::new().with_events_capacity(limits.channel_capacity()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resume_streamable_http_with_handler(
+    server_id: McpServerId,
+    endpoint: &str,
+    request: &BrokerInvocation<'_>,
+    policy: &EgressPolicy,
+    credentials: Arc<dyn HttpCredentialBroker>,
+    store: &mut SqliteStore,
+    limits: TransportLimits,
+    handler: McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError> {
     super::validate_initialize_arguments(request)?;
     let operation = TransportOperation::parse(INITIALIZE_OPERATION)?;
@@ -232,12 +272,35 @@ pub async fn resume_streamable_http(
         store,
         limits,
         true,
+        handler,
     )
     .await?
     {
         StreamableHttpOutcome::Ready(connection) => Ok(*connection),
         StreamableHttpOutcome::AuthRequired(_) => Err(BrokerError::RepeatedAuthChallenge.into()),
     }
+}
+
+pub async fn resume_streamable_http(
+    server_id: McpServerId,
+    endpoint: &str,
+    request: &BrokerInvocation<'_>,
+    policy: &EgressPolicy,
+    credentials: Arc<dyn HttpCredentialBroker>,
+    store: &mut SqliteStore,
+    limits: TransportLimits,
+) -> Result<ReadyConnection, TransportError> {
+    resume_streamable_http_with_handler(
+        server_id,
+        endpoint,
+        request,
+        policy,
+        credentials,
+        store,
+        limits,
+        McpHandlerConfig::new().with_events_capacity(limits.channel_capacity()),
+    )
+    .await
 }
 
 pub fn resolve_streamable_http_auth(
@@ -271,6 +334,7 @@ async fn connect_once(
     store: &mut SqliteStore,
     limits: TransportLimits,
     replay: bool,
+    handler: McpHandlerConfig,
 ) -> Result<StreamableHttpOutcome, TransportError> {
     let configured_server = ConfiguredServerIdentity::new(server_id.to_string())?;
     let operations = OperationGate::new();
@@ -305,7 +369,7 @@ async fn connect_once(
                 return Err(error.into());
             }
         };
-    let result = McpConnection::connect_authorized_http(&config).await;
+    let result = McpConnection::connect_authorized_http(&config, handler).await;
     if request.cancelled() {
         let cleanup =
             tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
@@ -1839,12 +1903,16 @@ mod tests {
             TransportLimits::default(),
         );
         assert!(
-            McpConnection::connect_authorized_http(&McpServerConfig::new(
-                "duplicate-http",
-                McpTransportBinding::StreamableHttp(
-                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http.clone()),
+            McpConnection::connect_authorized_http(
+                &McpServerConfig::new(
+                    "duplicate-http",
+                    McpTransportBinding::StreamableHttp(
+                        StreamableHttpTransportConfig::new(&endpoint)
+                            .with_http_client(http.clone()),
+                    ),
                 ),
-            ))
+                McpHandlerConfig::new()
+            )
             .await
             .is_err()
         );
@@ -1899,12 +1967,15 @@ mod tests {
             Arc::clone(&broker),
             TransportLimits::default(),
         );
-        let connection = McpConnection::connect_authorized_http(&McpServerConfig::new(
-            "header-test",
-            McpTransportBinding::StreamableHttp(
-                StreamableHttpTransportConfig::new(&endpoint).with_http_client(http),
+        let connection = McpConnection::connect_authorized_http(
+            &McpServerConfig::new(
+                "header-test",
+                McpTransportBinding::StreamableHttp(
+                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http),
+                ),
             ),
-        ))
+            McpHandlerConfig::new(),
+        )
         .await
         .unwrap();
         assert_eq!(
@@ -1954,12 +2025,15 @@ mod tests {
             Arc::clone(&broker),
             TransportLimits::default(),
         );
-        let error = match McpConnection::connect_authorized_http(&McpServerConfig::new(
-            "old-http",
-            McpTransportBinding::StreamableHttp(
-                StreamableHttpTransportConfig::new(&endpoint).with_http_client(http.clone()),
+        let error = match McpConnection::connect_authorized_http(
+            &McpServerConfig::new(
+                "old-http",
+                McpTransportBinding::StreamableHttp(
+                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http.clone()),
+                ),
             ),
-        ))
+            McpHandlerConfig::new(),
+        )
         .await
         {
             Ok(_) => panic!("older revision must be refused"),
@@ -2025,12 +2099,15 @@ mod tests {
                 resolutions: AtomicUsize::new(0),
             });
             let http = client(&endpoint, &credential, broker, TransportLimits::default());
-            let error = match McpConnection::connect_authorized_http(&McpServerConfig::new(
-                "auth-http",
-                McpTransportBinding::StreamableHttp(
-                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http),
+            let error = match McpConnection::connect_authorized_http(
+                &McpServerConfig::new(
+                    "auth-http",
+                    McpTransportBinding::StreamableHttp(
+                        StreamableHttpTransportConfig::new(&endpoint).with_http_client(http),
+                    ),
                 ),
-            ))
+                McpHandlerConfig::new(),
+            )
             .await
             {
                 Ok(_) => panic!("HTTP auth status must interrupt"),
@@ -2413,12 +2490,15 @@ mod tests {
             resolutions: AtomicUsize::new(0),
         });
         let http = client(&endpoint, &credential, broker, TransportLimits::default());
-        let error = match McpConnection::connect_authorized_http(&McpServerConfig::new(
-            "missing-http",
-            McpTransportBinding::StreamableHttp(
-                StreamableHttpTransportConfig::new(&endpoint).with_http_client(http),
+        let error = match McpConnection::connect_authorized_http(
+            &McpServerConfig::new(
+                "missing-http",
+                McpTransportBinding::StreamableHttp(
+                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http),
+                ),
             ),
-        ))
+            McpHandlerConfig::new(),
+        )
         .await
         {
             Ok(_) => panic!("missing revision must be refused"),
@@ -2468,12 +2548,16 @@ mod tests {
             TransportLimits::default(),
         );
         assert!(
-            McpConnection::connect_authorized_http(&McpServerConfig::new(
-                "header-overflow",
-                McpTransportBinding::StreamableHttp(
-                    StreamableHttpTransportConfig::new(&endpoint).with_http_client(http.clone()),
+            McpConnection::connect_authorized_http(
+                &McpServerConfig::new(
+                    "header-overflow",
+                    McpTransportBinding::StreamableHttp(
+                        StreamableHttpTransportConfig::new(&endpoint)
+                            .with_http_client(http.clone()),
+                    ),
                 ),
-            ))
+                McpHandlerConfig::new()
+            )
             .await
             .is_err()
         );

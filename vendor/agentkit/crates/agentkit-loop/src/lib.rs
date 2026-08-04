@@ -551,6 +551,30 @@ impl PromptCacheRequest {
     }
 }
 
+/// Provider-neutral generation controls for one model request.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationControls {
+    /// Maximum number of output tokens the provider may generate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Sampling temperature for this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Exact sequences that stop generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+}
+
+impl GenerationControls {
+    /// Returns true when no per-request control is set.
+    pub fn is_empty(&self) -> bool {
+        self.max_output_tokens.is_none()
+            && self.temperature.is_none()
+            && self.stop_sequences.is_none()
+    }
+}
+
 /// Payload sent to the model at the start of each turn.
 ///
 /// The [`LoopDriver`] constructs this automatically from its internal state
@@ -570,6 +594,9 @@ pub struct TurnRequest {
     pub cache: Option<PromptCacheRequest>,
     /// Provider-neutral structured-output request for this turn.
     pub structured_output: Option<StructuredOutputRequest>,
+    /// Provider-neutral per-request generation controls.
+    #[serde(default, skip_serializing_if = "GenerationControls::is_empty")]
+    pub generation: GenerationControls,
     /// Per-turn metadata (e.g. provider hints).
     pub metadata: MetadataMap,
 }
@@ -2649,6 +2676,7 @@ where
                 .take()
                 .or_else(|| self.default_cache.clone()),
             structured_output: self.default_structured_output.clone(),
+            generation: GenerationControls::default(),
             metadata: MetadataMap::new(),
         };
 

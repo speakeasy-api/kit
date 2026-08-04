@@ -706,31 +706,21 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1234
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_api_800 exits 0 with 1 passed and 0 failed
-  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  expected_result: cargo test --locked --test conformance http_contract::openapi_callback_resolution_enforces_kind_mode_and_content_contract -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-API-800 or its source contract changes.
 - requirement_id: KIT-API-801
   evidence_type: conformance
   evidence_id: EV-1.04-C-1235
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_api_801 exits 0 with 1 passed and 0 failed
-  artifact_digest: fbbf1f0582d4c9403e60184c389963a5acd6407abaa12013d36a017a57c50159
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  expected_result: cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-API-801 or its source contract changes.
 - requirement_id: KIT-API-802
   evidence_type: conformance
@@ -1001,16 +991,11 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1254
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_api_820 exits 0 with 1 passed and 0 failed
-  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  expected_result: cargo test --locked --test conformance cli_parity::cli_service_and_openapi_have_zero_uncovered_operations -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-API-820 or its source contract changes.
 - requirement_id: KIT-API-821
   evidence_type: conformance
@@ -6731,7 +6716,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1192
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_806 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
   artifact_digest: null
   environment_digest: null
   versions: null

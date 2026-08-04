@@ -475,7 +475,7 @@ The generic `CompletionsAdapter<P>` implements `ModelAdapter` and handles:
 └────────────────────────────────────────────────────────────┘
 ```
 
-The `Config` associated type is generic because request parameters differ across providers — and sometimes across models within the same provider. Ollama uses `num_predict` where OpenAI uses `max_completion_tokens`. Mistral uses `max_tokens`. Some providers support `top_k`, others don't. Making this a provider-defined `Serialize` struct means each provider declares exactly the parameters it supports, with their correct field names, and gets compile-time validation and IDE completion. The adapter serialises the struct and merges it into the request body:
+The `Config` associated type is generic because request parameters differ across providers — and sometimes across models within the same provider. Ollama's OpenAI-compatible endpoint uses `max_tokens`, while OpenAI uses `max_completion_tokens`. Some providers support `top_k`, others don't. Making this a provider-defined `Serialize` struct means each provider declares exactly the parameters it supports, with their correct field names, and gets compile-time validation and IDE completion. The adapter serialises the struct and merges it into the request body:
 
 ```rust
 // In the adapter's request builder:
@@ -487,7 +487,7 @@ if let Value::Object(fields) = config_value {
 }
 ```
 
-This means Ollama can use `num_predict` where OpenAI uses `max_completion_tokens`, Mistral can use `max_tokens`, and each provider gets IDE completion and compile-time validation for its supported parameters.
+This means Ollama can use `max_tokens` where OpenAI uses `max_completion_tokens`, and each provider gets IDE completion and compile-time validation for its supported parameters.
 
 ## Building an Ollama provider
 
@@ -502,7 +502,7 @@ pub struct OllamaConfig {
     pub model: String,
     pub base_url: String,
     pub temperature: Option<f32>,
-    pub num_predict: Option<u32>,
+    pub max_tokens: Option<u32>,
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
 }
@@ -513,7 +513,7 @@ impl OllamaConfig {
             model: model.into(),
             base_url: "http://localhost:11434/v1/chat/completions".into(),
             temperature: None,
-            num_predict: None,
+            max_tokens: None,
             top_k: None,
             top_p: None,
         }
@@ -524,8 +524,8 @@ impl OllamaConfig {
         self
     }
 
-    pub fn with_num_predict(mut self, v: u32) -> Self {
-        self.num_predict = Some(v);
+    pub fn with_max_tokens(mut self, v: u32) -> Self {
+        self.max_tokens = Some(v);
         self
     }
     // ...
@@ -543,7 +543,7 @@ pub struct OllamaRequestConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_predict: Option<u32>,
+    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -745,7 +745,7 @@ agentkit ships the following provider crates, all built on `agentkit-adapter-com
 | [`agentkit-provider-groq`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-groq)             | [Groq](https://groq.com)              | Bearer                  | `api.groq.com/openai/v1/chat/completions` |
 | [`agentkit-provider-mistral`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-mistral)       | [Mistral](https://mistral.ai)         | Bearer                  | `api.mistral.ai/v1/chat/completions`      |
 
-Each follows the same pattern: a config struct with `new()` fluent builders (and an optional `from_env()` helper), a `Serialize` request config, and a `CompletionsProvider` impl. Provider-specific parameters are strongly typed — Ollama has `num_predict` and `top_k`, Mistral uses `max_tokens` instead of `max_completion_tokens`, OpenAI has `frequency_penalty` and `presence_penalty`.
+Each follows the same pattern: a config struct with `new()` fluent builders (and an optional `from_env()` helper), a `Serialize` request config, and a `CompletionsProvider` impl. Provider-specific parameters are strongly typed — Ollama has `max_tokens` and `top_k`, while OpenAI has `max_completion_tokens`, `frequency_penalty`, and `presence_penalty`.
 
 For providers not listed here, you can either:
 

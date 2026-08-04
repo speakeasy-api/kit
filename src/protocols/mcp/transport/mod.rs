@@ -13,9 +13,8 @@ use std::{
 };
 
 use agentkit_mcp::{
-    CallToolResult, GetPromptResult, McpConnection, McpError, McpHttpClient, McpProtocolVersion,
-    McpServerEvent, PINNED_PROTOCOL_VERSION, ReadResourceResult,
-    kit_authorized_initialize_arguments,
+    CallToolResult, GetPromptResult, McpAuthorizedReinitializeCandidate, McpConnection, McpError,
+    McpHttpClient, McpProtocolVersion, McpServerEvent, PINNED_PROTOCOL_VERSION, ReadResourceResult,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -47,12 +46,14 @@ pub use http::{
     HttpCredentialBroker, HttpCredentialError, HttpSecretContext, StreamableHttpOutcome,
     connect_streamable_http, resolve_streamable_http_auth, resume_streamable_http,
 };
+use http::{connect_streamable_http_with_handler, resume_streamable_http_with_handler};
 use invocation::{
     McpInvocationResult, McpOperation, NormalizedMcpResult, normalize_invocation_result,
 };
 pub use invocation::{McpResultError, McpResultPolicy};
 #[cfg(not(windows))]
 pub(crate) use stdio::ProductionStdioProfiles;
+use stdio::connect_stdio_with_handler;
 pub use stdio::{
     OwnedStdioEnvironment, OwnedStdioLaunchError, OwnedStdioLimits, OwnedStdioProcess,
     OwnedStdioProcessLaunch, OwnedStdioProcessService, OwnedStdioProfileError,
@@ -61,10 +62,7 @@ pub use stdio::{
 
 pub const PROTOCOL_REVISION: McpProtocolVersion = PINNED_PROTOCOL_VERSION;
 
-pub(crate) fn authorized_initialize_arguments() -> Value {
-    kit_authorized_initialize_arguments()
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_configured_streamable_http(
     server_id: &str,
     endpoint: &str,
@@ -73,8 +71,9 @@ pub(crate) async fn connect_configured_streamable_http(
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
+    handler: agentkit_mcp::McpHandlerConfig,
 ) -> Result<StreamableHttpOutcome, TransportError> {
-    connect_streamable_http(
+    connect_streamable_http_with_handler(
         agentkit_mcp::McpServerId::new(server_id),
         endpoint,
         request,
@@ -82,6 +81,7 @@ pub(crate) async fn connect_configured_streamable_http(
         credentials,
         store,
         limits,
+        handler,
     )
     .await
 }
@@ -93,14 +93,16 @@ pub(crate) async fn connect_configured_stdio(
     prepare: impl FnOnce() -> Result<SandboxedStdioLauncher, OwnedStdioProfileError>,
     store: &mut SqliteStore,
     limits: TransportLimits,
+    handler: agentkit_mcp::McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError> {
-    connect_stdio(
+    connect_stdio_with_handler(
         agentkit_mcp::McpServerId::new(server_id),
         profile,
         request,
         prepare,
         store,
         limits,
+        handler,
     )
     .await
 }
@@ -131,6 +133,7 @@ pub(crate) fn resolve_configured_streamable_http_auth(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resume_configured_streamable_http(
     server_id: &str,
     endpoint: &str,
@@ -139,8 +142,9 @@ pub(crate) async fn resume_configured_streamable_http(
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
+    handler: agentkit_mcp::McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError> {
-    resume_streamable_http(
+    resume_streamable_http_with_handler(
         agentkit_mcp::McpServerId::new(server_id),
         endpoint,
         request,
@@ -148,14 +152,37 @@ pub(crate) async fn resume_configured_streamable_http(
         credentials,
         store,
         limits,
+        handler,
     )
     .await
 }
 
 fn validate_initialize_arguments(request: &BrokerInvocation<'_>) -> Result<(), TransportError> {
-    let arguments = serde_json::from_slice::<Value>(request.arguments())
-        .map_err(|_| BrokerError::InvalidArguments)?;
-    if arguments == kit_authorized_initialize_arguments() {
+    let arguments =
+        serde_json::from_slice::<rmcp::model::InitializeRequestParams>(request.arguments())
+            .map_err(|_| BrokerError::InvalidArguments)?;
+    let capabilities = &arguments.capabilities;
+    if arguments.protocol_version == PINNED_PROTOCOL_VERSION
+        && arguments.client_info.name == "agentkit-mcp"
+        && !arguments.client_info.version.is_empty()
+        && arguments.client_info.version.len() <= 64
+        && arguments.meta.is_none()
+        && capabilities.experimental.is_none()
+        && capabilities.extensions.is_none()
+        && capabilities.tasks.is_none()
+        && capabilities
+            .roots
+            .as_ref()
+            .is_none_or(|roots| roots.list_changed != Some(true))
+        && capabilities
+            .sampling
+            .as_ref()
+            .is_none_or(|sampling| sampling.tools.is_none() && sampling.context.is_none())
+        && capabilities
+            .elicitation
+            .as_ref()
+            .is_none_or(|elicitation| elicitation.form.is_some() && elicitation.url.is_none())
+    {
         Ok(())
     } else {
         Err(BrokerError::InvalidArguments.into())
@@ -324,6 +351,7 @@ pub struct ReadyConnection {
     retired: AtomicBool,
     serial: OperationQueue,
     lifecycle_authority: Option<Arc<LifecycleAuthority>>,
+    responders: Option<crate::protocols::mcp::responders::ResponderInstallation>,
 }
 
 struct LifecycleAuthority(OwnedBrokerInvocation);
@@ -432,6 +460,15 @@ impl McpCapabilityRuntime {
                 .write()
                 .map_err(|_| TransportError::AuthorizationMismatch)?
                 .insert(identity, (server.grant_extension, server.request_extension));
+        }
+        for registered in runtime
+            .connections
+            .connections
+            .read()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .values()
+        {
+            registered.connection.arm_responders();
         }
         Ok(runtime)
     }
@@ -557,6 +594,7 @@ impl McpCapabilityRuntime {
             .map(|registered| registered.connection);
         *catalog = candidate;
         if let Some(replaced) = &replaced {
+            replaced.disarm_responders();
             replaced.retired.store(true, Ordering::Release);
         }
         Ok((generation, replaced))
@@ -572,7 +610,8 @@ impl McpCapabilityRuntime {
             .write()
             .map_err(|_| TransportError::AuthorizationMismatch)?;
         let removed = self.connections.remove(server, generation)?;
-        if removed.is_some() {
+        if let Some(connection) = &removed {
+            connection.disarm_responders();
             self.catalog
                 .write()
                 .map_err(|_| TransportError::AuthorizationMismatch)?
@@ -852,7 +891,11 @@ impl McpCapabilityRuntime {
         self.authority
             .write()
             .map_err(|_| TransportError::AuthorizationMismatch)?
-            .insert(identity, (server.grant_extension, server.request_extension));
+            .insert(
+                identity.clone(),
+                (server.grant_extension, server.request_extension),
+            );
+        self.connections.get(&identity)?.arm_responders();
         if let Some(replaced) = replaced {
             let result = replaced.close_owned(store).await;
             if let Err(error) = result {
@@ -864,6 +907,28 @@ impl McpCapabilityRuntime {
             }
         }
         Ok(generation)
+    }
+
+    pub(crate) fn retire_for_revision_change(&self) -> Result<(), TransportError> {
+        let _lifecycle = self
+            .lifecycle
+            .write()
+            .map_err(|_| TransportError::AuthorizationMismatch)?;
+        let connections = self.connections.drain();
+        let mut catalog = self
+            .catalog
+            .write()
+            .map_err(|_| TransportError::AuthorizationMismatch)?;
+        for connection in &connections {
+            connection.disarm_responders();
+            connection.retired.store(true, Ordering::Release);
+            catalog.remove(&connection.configured_server)?;
+        }
+        self.retained_retired
+            .lock()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .extend(connections);
+        Ok(())
     }
 
     pub async fn shutdown(&self, store: &mut SqliteStore) -> Result<(), TransportError> {
@@ -892,6 +957,7 @@ impl McpCapabilityRuntime {
                 .drain(..),
         );
         for connection in connections {
+            connection.disarm_responders();
             connection.retired.store(true, Ordering::Release);
             let result = connection.close_owned(store).await;
             if failure.is_none() {
@@ -954,6 +1020,7 @@ impl ReadyConnectionRegistry {
             )
             .map(|registered| registered.connection);
         if let Some(replaced) = &replaced {
+            replaced.disarm_responders();
             replaced.retired.store(true, Ordering::Release);
         }
         Ok((generation, replaced))
@@ -1052,12 +1119,33 @@ impl ReadyConnection {
             retired: AtomicBool::new(false),
             serial: OperationQueue::new(),
             lifecycle_authority: None,
+            responders: None,
         })
     }
 
     fn with_lifecycle_authority(mut self, request: &BrokerInvocation<'_>) -> Self {
         self.lifecycle_authority = Some(Arc::new(LifecycleAuthority::capture(request)));
         self
+    }
+
+    pub(crate) fn with_responders(
+        mut self,
+        responders: crate::protocols::mcp::responders::ResponderInstallation,
+    ) -> Self {
+        self.responders = Some(responders);
+        self
+    }
+
+    fn arm_responders(&self) {
+        if let Some(responders) = &self.responders {
+            responders.arm();
+        }
+    }
+
+    fn disarm_responders(&self) {
+        if let Some(responders) = &self.responders {
+            responders.disarm();
+        }
     }
 
     #[cfg(test)]
@@ -1274,22 +1362,13 @@ impl ReadyConnection {
             }
             let authorization = self.operations.current_authorization()?;
             self.operations.clear_generation(generation)?;
-            let initialize_arguments = serde_json::to_vec(&kit_authorized_initialize_arguments())
+            let initialize_arguments = serde_json::to_vec(&self.connection.initialize_arguments())
                 .expect("static MCP initialize arguments serialize");
             let initialize_request = request.transport_initialize(&initialize_arguments);
             if let Err(error) = self
                 .reinitialize_expired_session_inner(&initialize_request, store)
                 .await
             {
-                transport_auth::finish_dispatch(
-                    request,
-                    dispatch,
-                    transport_auth::TransportDispatchOutcome::OutcomeUnknown,
-                    store,
-                )?;
-                return Err(error);
-            }
-            if let Err(error) = self.validate_reinitialized_binding(request, store).await {
                 transport_auth::finish_dispatch(
                     request,
                     dispatch,
@@ -2025,6 +2104,7 @@ impl ReadyConnection {
                 (
                     normalized.dispatch_outcome(),
                     normalized.presentation().clone(),
+                    normalized.publication().clone(),
                 ),
                 artifacts,
                 store,
@@ -2119,14 +2199,14 @@ impl ReadyConnection {
             return Err(TransportError::AuthorizationMismatch);
         }
         validate_initialize_arguments(request)?;
-        let arguments = kit_authorized_initialize_arguments();
+        let arguments = self.connection.initialize_arguments();
         let (dispatch, generation) = self.authorize(request, "initialize", arguments, store)?;
         let result = tokio::time::timeout(
             self.request_timeout,
-            self.connection.reinitialize_authorized(),
+            self.connection.begin_reinitialize_authorized(),
         )
         .await;
-        self.finish_timed_operation(
+        let (candidate, _) = self.finish_timed_operation(
             result,
             dispatch,
             generation,
@@ -2134,11 +2214,19 @@ impl ReadyConnection {
             store,
             "initialize response",
         )?;
+        if let Err(error) = self
+            .validate_reinitialized_binding(request, store, &candidate)
+            .await
+        {
+            candidate.abort().await?;
+            return Err(error);
+        }
+        let negotiated = feature_kinds(candidate.capabilities());
+        candidate.commit(|| self.arm_responders()).await;
         *self
             .negotiated
             .write()
-            .map_err(|_| TransportError::AuthorizationMismatch)? =
-            feature_kinds(self.connection.capabilities());
+            .map_err(|_| TransportError::AuthorizationMismatch)? = negotiated;
         Ok(())
     }
 
@@ -2146,6 +2234,7 @@ impl ReadyConnection {
         &self,
         request: &BrokerInvocation<'_>,
         store: &mut SqliteStore,
+        candidate: &McpAuthorizedReinitializeCandidate<'_>,
     ) -> Result<(), TransportError> {
         let binding = request.binding().ok_or(BrokerError::BindingMismatch)?;
         let target = binding
@@ -2180,7 +2269,7 @@ impl ReadyConnection {
                 crate::capabilities::catalog::CapabilityKind::Tool => {
                     let result = tokio::time::timeout(
                         self.request_timeout,
-                        self.connection.list_tools_page(cursor.clone()),
+                        candidate.list_tools_page(cursor.clone()),
                     )
                     .await;
                     self.finish_timed_operation(
@@ -2196,7 +2285,7 @@ impl ReadyConnection {
                 crate::capabilities::catalog::CapabilityKind::Resource => {
                     let result = tokio::time::timeout(
                         self.request_timeout,
-                        self.connection.list_resources_page(cursor.clone()),
+                        candidate.list_resources_page(cursor.clone()),
                     )
                     .await;
                     self.finish_timed_operation(
@@ -2212,7 +2301,7 @@ impl ReadyConnection {
                 crate::capabilities::catalog::CapabilityKind::ResourceTemplate => {
                     let result = tokio::time::timeout(
                         self.request_timeout,
-                        self.connection.list_resource_templates_page(cursor.clone()),
+                        candidate.list_resource_templates_page(cursor.clone()),
                     )
                     .await;
                     self.finish_timed_operation(
@@ -2228,7 +2317,7 @@ impl ReadyConnection {
                 crate::capabilities::catalog::CapabilityKind::Prompt => {
                     let result = tokio::time::timeout(
                         self.request_timeout,
-                        self.connection.list_prompts_page(cursor.clone()),
+                        candidate.list_prompts_page(cursor.clone()),
                     )
                     .await;
                     self.finish_timed_operation(
@@ -2328,6 +2417,7 @@ impl ReadyConnection {
         request: &BrokerInvocation<'_>,
         store: &mut SqliteStore,
     ) -> Result<(), TransportError> {
+        self.disarm_responders();
         let _permit = self.serial.acquire(request, self.close_timeout).await?;
         let (dispatch, generation) = self.authorize_inner(
             request,
@@ -3034,7 +3124,17 @@ impl OperationGate {
         let message =
             serde_json::to_value(message).map_err(|_| TransportError::AuthorizationMismatch)?;
         let method = message.get("method").and_then(Value::as_str);
-        let method = method.ok_or(TransportError::AuthorizationMismatch)?;
+        let Some(method) = method else {
+            if agentkit_mcp::has_responder_delivery_permit(&message) {
+                return self
+                    .connection
+                    .lock()
+                    .map_err(|_| TransportError::AuthorizationMismatch)?
+                    .clone()
+                    .ok_or(TransportError::AuthorizationMismatch);
+            }
+            return Err(TransportError::AuthorizationMismatch);
+        };
         if method == "notifications/initialized"
             && self.initialized_followup.swap(false, Ordering::AcqRel)
         {
@@ -3435,7 +3535,7 @@ mod tests {
         sync::atomic::{AtomicU64, AtomicUsize},
     };
 
-    use agentkit_mcp::{McpHandlerConfig, McpServerId};
+    use agentkit_mcp::{McpHandlerConfig, McpServerId, kit_authorized_initialize_arguments};
     use rmcp::{
         RoleClient,
         service::{RxJsonRpcMessage, TxJsonRpcMessage},
@@ -4203,6 +4303,10 @@ mod tests {
             arguments.clone(),
         ))
         .unwrap();
+        assert!(
+            gate.authorize_message(&serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}))
+                .is_err()
+        );
         assert!(
             gate.authorize_message(
                 &serde_json::json!({"id":1,"method":"tools/call","params":arguments})

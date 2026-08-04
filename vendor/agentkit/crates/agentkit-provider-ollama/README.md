@@ -64,7 +64,7 @@ use agentkit_provider_ollama::{OllamaAdapter, OllamaConfig};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let config = OllamaConfig::from_env()?
     .with_temperature(0.0)
-    .with_num_predict(4096);
+    .with_max_tokens(4096);
 
 let adapter = OllamaAdapter::new(config)?;
 # Ok(())

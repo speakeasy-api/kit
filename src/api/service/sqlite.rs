@@ -27,7 +27,9 @@ use crate::domain::deletion::{
 use crate::domain::events::{
     AttemptState, EntityId, EventType, RunState, SchemaVersion, UtcDateTime,
 };
-use crate::domain::ids::{AttemptId, CommandId, EventId, PrincipalId, ProjectId, RunId, ThreadId};
+use crate::domain::ids::{
+    AttemptId, CommandId, EventId, McpCallbackId, PrincipalId, ProjectId, RunId, ThreadId,
+};
 use crate::domain::lifecycle::{AttemptOwnership, AttemptTransition, FencingToken, RunTransition};
 use crate::domain::projections::{DeletionIntent, DomainReducer, PersistedCommand};
 use crate::domain::retention::{
@@ -112,6 +114,8 @@ impl SqliteServiceStore {
         projections
             .ensure_event_index()
             .map_err(|error| ServiceError::Store(error.to_string()))?;
+        crate::store::sqlite::mcp_callback::McpCallbackStore::open(path)
+            .map_err(mcp_callback_error)?;
         Ok(Self {
             append,
             projections,
@@ -235,7 +239,7 @@ impl SqliteServiceStore {
             .projections
             .with_store_time(|transaction, _| {
                 let mut statement = transaction.prepare(
-                    "SELECT event.event_id, event.commit_position, index_row.project_id,
+                    "SELECT event.event_id, event.commit_position, event.stream, index_row.project_id,
                             index_row.event_class, index_row.stored_at_unix_micros,
                             event.artifacts
                      FROM event_projection_index AS index_row
@@ -249,8 +253,9 @@ impl SqliteServiceStore {
                             row.get::<_, i64>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, Vec<u8>>(5)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -259,7 +264,7 @@ impl SqliteServiceStore {
                 let mut report = EventCompactionReport::default();
                 let mut blocked_projects = BTreeSet::new();
                 let mut gaps = BTreeMap::<(ProjectId, String), u64>::new();
-                for (event_id, position, project, class, stored_at, artifacts) in rows {
+                for (event_id, position, stream, project, class, stored_at, artifacts) in rows {
                     report.examined += 1;
                     let project_id = ProjectId::parse(&project).map_err(|error| {
                         crate::store::sqlite::projection::ProjectionError::Reducer(
@@ -320,12 +325,13 @@ impl SqliteServiceStore {
                         params![event_key, now_unix_micros],
                         |row| row.get(0),
                     )?;
+                    let terminal_callback = class == "terminal" && McpCallbackId::parse(&stream).is_ok();
                     if blocked_projects.contains(&project_id)
                         || !expired
                         || !cursor_safe
                         || held
                         || backed_up
-                        || artifacts != b"[]"
+                        || (artifacts != b"[]" && !terminal_callback)
                     {
                         blocked_projects.insert(project_id);
                         report.blocked += 1;
@@ -351,6 +357,18 @@ impl SqliteServiceStore {
                          ON CONFLICT(target_sha256) DO NOTHING",
                         params![sha256(event_key.as_bytes()).as_slice(), now_unix_micros],
                     )?;
+                    if terminal_callback {
+                        crate::store::sqlite::mcp_callback::scrub_callback(
+                            transaction,
+                            &stream,
+                            now_unix_micros,
+                        )
+                        .map_err(|error| {
+                            crate::store::sqlite::projection::ProjectionError::Reducer(
+                                error.to_string(),
+                            )
+                        })?;
+                    }
                     gaps.insert((project_id, class), position as u64);
                     report.erased += 1;
                 }
@@ -1363,6 +1381,10 @@ impl SqliteServiceStore {
             trace_id: &trace,
             command: &command,
             driver_claim: Some(driver_claim),
+            mcp_callback_request_digest: None,
+            mcp_callback_authority: None,
+            mcp_callback_recheck: None,
+            mcp_callback_workspace_revision: None,
         })?;
         Ok(())
     }
@@ -1668,15 +1690,98 @@ impl ServiceStore for SqliteServiceStore {
             }
             return Ok(ResourceScope::project_creation(principal_id, *project_id));
         }
+        if let Command::ResolveMcpCallback { callback_id, .. } = command {
+            let callback =
+                crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+                    .map_err(mcp_callback_error)?
+                    .get(*callback_id)
+                    .map_err(mcp_callback_error)?;
+            return Ok(ResourceScope::new(
+                callback.principal_id,
+                callback.project_id,
+            ));
+        }
         let state = self.state()?;
         state.scope(command.resource())
     }
 
     fn query_scope(&mut self, query: &Query) -> Result<ResourceScope, ServiceError> {
+        if let Query::GetMcpCallback { callback_id } = query {
+            let callback =
+                crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+                    .map_err(mcp_callback_error)?
+                    .get(*callback_id)
+                    .map_err(mcp_callback_error)?;
+            return Ok(ResourceScope::new(
+                callback.principal_id,
+                callback.project_id,
+            ));
+        }
+        if let Query::PendingMcpCallbacks { project_id } = query {
+            let state = self.state()?;
+            return state.scope(Resource::Project(*project_id));
+        }
         self.state()?.scope(query.resource())
     }
 
     fn execute(&mut self, request: WriteRequest<'_>) -> Result<CommandReceipt, ServiceError> {
+        if let Command::ResolveMcpCallback {
+            callback_id,
+            expected_version,
+            challenge_generation,
+            schema_digest,
+            action,
+            content,
+            artifact_refs,
+            ..
+        } = request.command
+        {
+            if content.is_some() {
+                return Err(ServiceError::Invalid(
+                    "callback content was not converted to an artifact".to_owned(),
+                ));
+            }
+            let request_digest = request.mcp_callback_request_digest.ok_or_else(|| {
+                ServiceError::Store("callback request digest is missing".to_owned())
+            })?;
+            let (_, replayed, commit_positions) =
+                crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+                    .map_err(mcp_callback_error)?
+                    .resolve_with_recheck(
+                        request.principal_id,
+                        self.command_scope(request.principal_id, request.command)?
+                            .project_id(),
+                        request.idempotency_key,
+                        *callback_id,
+                        *expected_version,
+                        *challenge_generation,
+                        schema_digest,
+                        *action,
+                        artifact_refs.clone(),
+                        request_digest,
+                        request.mcp_callback_authority.ok_or_else(|| {
+                            ServiceError::Conflict(
+                                "callback commit authority is missing".to_owned(),
+                            )
+                        })?,
+                        request.mcp_callback_recheck.ok_or_else(|| {
+                            ServiceError::Conflict(
+                                "callback commit authority recheck is missing".to_owned(),
+                            )
+                        })?,
+                        request.mcp_callback_workspace_revision.ok_or_else(|| {
+                            ServiceError::Conflict(
+                                "callback workspace revision lease is missing".to_owned(),
+                            )
+                        })?,
+                    )
+                    .map_err(mcp_callback_error)?;
+            return Ok(CommandReceipt {
+                operation: request.command.operation(),
+                commit_positions,
+                replayed,
+            });
+        }
         let state = self.state()?;
         if let Command::CreateThread { thread_id, .. } = request.command
             && self.is_tombstoned(RetentionObjectId::Transcript(*thread_id))?
@@ -1863,6 +1968,84 @@ impl ServiceStore for SqliteServiceStore {
         })
     }
 
+    fn replay_mcp_callback_resolution(
+        &mut self,
+        principal_id: PrincipalId,
+        idempotency_key: &IdempotencyKey,
+        command: &Command,
+    ) -> Result<Option<CommandReceipt>, ServiceError> {
+        let Command::ResolveMcpCallback {
+            callback_id,
+            expected_version,
+            challenge_generation,
+            schema_digest,
+            ..
+        } = command
+        else {
+            return Ok(None);
+        };
+        let request_digest = mcp_callback_request_digest(command)?;
+        crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+            .map_err(mcp_callback_error)?
+            .replay_resolution(
+                principal_id,
+                self.command_scope(principal_id, command)?.project_id(),
+                *callback_id,
+                idempotency_key,
+                request_digest,
+                *expected_version,
+                *challenge_generation,
+                schema_digest,
+            )
+            .map(|replay| {
+                replay.map(|(_, commit_positions)| CommandReceipt {
+                    operation: command.operation(),
+                    commit_positions,
+                    replayed: true,
+                })
+            })
+            .map_err(mcp_callback_error)
+    }
+
+    fn reserve_mcp_callback_resolution(
+        &mut self,
+        principal_id: PrincipalId,
+        project_id: ProjectId,
+        idempotency_key: &IdempotencyKey,
+        command: &Command,
+    ) -> Result<Option<CommandReceipt>, ServiceError> {
+        let Command::ResolveMcpCallback {
+            callback_id,
+            expected_version,
+            challenge_generation,
+            schema_digest,
+            ..
+        } = command
+        else {
+            return Ok(None);
+        };
+        crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+            .map_err(mcp_callback_error)?
+            .reserve_resolution(
+                principal_id,
+                project_id,
+                *callback_id,
+                idempotency_key,
+                mcp_callback_request_digest(command)?,
+                *expected_version,
+                *challenge_generation,
+                schema_digest,
+            )
+            .map(|replay| {
+                replay.map(|(_, commit_positions)| CommandReceipt {
+                    operation: command.operation(),
+                    commit_positions,
+                    replayed: true,
+                })
+            })
+            .map_err(mcp_callback_error)
+    }
+
     fn query(&mut self, query: &Query) -> Result<QueryProjection, ServiceError> {
         let state = self.state()?;
         match query {
@@ -1983,6 +2166,20 @@ impl ServiceStore for SqliteServiceStore {
                     .cloned()
                     .collect(),
             )),
+            Query::PendingMcpCallbacks { project_id } => {
+                crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+                    .map_err(mcp_callback_error)?
+                    .pending(*project_id)
+                    .map(QueryProjection::McpCallbacks)
+                    .map_err(mcp_callback_error)
+            }
+            Query::GetMcpCallback { callback_id } => {
+                crate::store::sqlite::mcp_callback::McpCallbackStore::open(&self.database)
+                    .map_err(mcp_callback_error)?
+                    .get(*callback_id)
+                    .map(|callback| QueryProjection::McpCallback(Box::new(callback)))
+                    .map_err(mcp_callback_error)
+            }
             Query::GetArtifactMetadata { artifact_id } => state
                 .artifacts
                 .get(artifact_id)
@@ -2899,6 +3096,14 @@ fn erase_retained_object(
     };
     let erased_events = match evaluation.object.id {
         RetentionObjectId::Transcript(thread_id) => {
+            crate::store::sqlite::mcp_callback::scrub_callback_transcript(
+                transaction,
+                &thread_id.to_string(),
+                now,
+            )
+            .map_err(|error| {
+                crate::store::sqlite::projection::ProjectionError::Reducer(error.to_string())
+            })?;
             transaction.execute(
                 "DELETE FROM deletion_artifact_references
                  WHERE reference_id IN (
@@ -3008,6 +3213,7 @@ impl Command {
             Self::RequestAuth { run_id, .. } | Self::ResolveAuth { run_id, .. } => {
                 Resource::AuthRequest(*run_id)
             }
+            Self::ResolveMcpCallback { callback_id, .. } => Resource::McpCallback(*callback_id),
         }
     }
 
@@ -3030,6 +3236,7 @@ impl Command {
             Self::RequestApproval { approval_id, .. }
             | Self::ResolveApproval { approval_id, .. } => EntityId::Approval(*approval_id),
             Self::RegisterArtifactMetadata { artifact_id, .. } => EntityId::Artifact(*artifact_id),
+            Self::ResolveMcpCallback { callback_id, .. } => EntityId::McpCallback(*callback_id),
         }
     }
 
@@ -3051,6 +3258,7 @@ impl Command {
             | Self::ResolveAuth { run_id, .. } => EntityId::Run(*run_id),
             Self::TransitionAttempt { attempt_id, .. } => EntityId::Attempt(*attempt_id),
             Self::ResolveApproval { approval_id, .. } => EntityId::Approval(*approval_id),
+            Self::ResolveMcpCallback { callback_id, .. } => EntityId::McpCallback(*callback_id),
         }
     }
 
@@ -3088,6 +3296,7 @@ impl Query {
             | Self::ListRuns { project_id }
             | Self::PendingApprovals { project_id }
             | Self::PendingAuthRequests { project_id }
+            | Self::PendingMcpCallbacks { project_id }
             | Self::ListCapabilities { project_id }
             | Self::EventCursorStatus { project_id, .. }
             | Self::Status { project_id } => Resource::Project(*project_id),
@@ -3104,8 +3313,33 @@ impl Query {
             | Self::RunTimeline { run_id, .. } => Resource::Run(*run_id),
             Self::GetAttempt { attempt_id } => Resource::Attempt(*attempt_id),
             Self::GetArtifactMetadata { artifact_id } => Resource::Artifact(*artifact_id),
+            Self::GetMcpCallback { callback_id } => Resource::McpCallback(*callback_id),
         }
     }
+}
+
+fn mcp_callback_error(error: crate::domain::mcp_callback::McpCallbackError) -> ServiceError {
+    use crate::domain::mcp_callback::McpCallbackError;
+    match error {
+        McpCallbackError::NotFound => ServiceError::NotFound,
+        McpCallbackError::Invalid(message) => ServiceError::Invalid(message.to_owned()),
+        McpCallbackError::Store(message) => ServiceError::Store(message),
+        McpCallbackError::VersionConflict { .. }
+        | McpCallbackError::IllegalTransition { .. }
+        | McpCallbackError::Terminal(_)
+        | McpCallbackError::IdempotencyConflict
+        | McpCallbackError::Authority
+        | McpCallbackError::Expired => ServiceError::Conflict(error.to_string()),
+    }
+}
+
+fn mcp_callback_request_digest(command: &Command) -> Result<[u8; 32], ServiceError> {
+    let bytes =
+        serde_json::to_vec(command).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let digest = Digest::of(DigestAlgorithm::Sha256, &bytes);
+    let mut request_digest = [0_u8; 32];
+    request_digest.copy_from_slice(&digest.as_bytes());
+    Ok(request_digest)
 }
 
 fn store_timestamp(time: &StoreTime) -> Result<UtcDateTime, ServiceError> {

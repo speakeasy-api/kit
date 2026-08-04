@@ -37,6 +37,7 @@ use agentkit_adapter_completions::{
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
+use serde_json::Value;
 use thiserror::Error;
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1/chat/completions";
@@ -54,7 +55,7 @@ const DEFAULT_ENDPOINT: &str = "http://localhost:11434/v1/chat/completions";
 ///
 /// let config = OllamaConfig::new("llama3.1:8b")
 ///     .with_temperature(0.0)
-///     .with_num_predict(4096);
+///     .with_max_tokens(4096);
 /// ```
 #[derive(Clone, Debug)]
 pub struct OllamaConfig {
@@ -64,8 +65,8 @@ pub struct OllamaConfig {
     pub base_url: String,
     /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
-    /// Maximum number of tokens to generate (Ollama's equivalent of `max_completion_tokens`).
-    pub num_predict: Option<u32>,
+    /// Maximum number of tokens to generate through the OpenAI-compatible endpoint.
+    pub max_tokens: Option<u32>,
     /// Limits the next token selection to the top K most probable tokens.
     pub top_k: Option<u32>,
     /// Nucleus sampling parameter.
@@ -89,7 +90,7 @@ impl OllamaConfig {
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
             temperature: None,
-            num_predict: None,
+            max_tokens: None,
             top_k: None,
             top_p: None,
             parallel_tool_calls: None,
@@ -111,8 +112,8 @@ impl OllamaConfig {
     }
 
     /// Sets the maximum number of tokens to generate.
-    pub fn with_num_predict(mut self, v: u32) -> Self {
-        self.num_predict = Some(v);
+    pub fn with_max_tokens(mut self, v: u32) -> Self {
+        self.max_tokens = Some(v);
         self
     }
 
@@ -177,7 +178,7 @@ pub struct OllamaRequestConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_predict: Option<u32>,
+    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -204,7 +205,7 @@ impl From<OllamaConfig> for OllamaProvider {
             request_config: OllamaRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
-                num_predict: config.num_predict,
+                max_tokens: config.max_tokens,
                 top_k: config.top_k,
                 top_p: config.top_p,
                 parallel_tool_calls: config.parallel_tool_calls,
@@ -224,6 +225,41 @@ impl CompletionsProvider for OllamaProvider {
     }
     fn config(&self) -> &OllamaRequestConfig {
         &self.request_config
+    }
+
+    fn apply_generation_controls(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        controls: &agentkit_loop::GenerationControls,
+    ) -> Result<(), LoopError> {
+        if let Some(maximum) = controls.max_output_tokens {
+            if maximum == 0
+                || self
+                    .request_config
+                    .max_tokens
+                    .is_some_and(|cap| maximum > cap)
+            {
+                return Err(LoopError::Unsupported(
+                    "Ollama max output tokens exceed the configured provider cap".into(),
+                ));
+            }
+            body.insert("max_tokens".into(), Value::from(maximum));
+        }
+        if let Some(temperature) = controls.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(LoopError::Unsupported(
+                    "Ollama temperature is outside the supported range".into(),
+                ));
+            }
+            body.insert("temperature".into(), serde_json::json!(temperature));
+        }
+        if let Some(stops) = &controls.stop_sequences {
+            body.insert(
+                "stop".into(),
+                Value::Array(stops.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        Ok(())
     }
 
     fn preprocess_request(
@@ -279,6 +315,11 @@ impl OllamaAdapter {
         let provider = OllamaProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Configured provider output-token ceiling, if one was materialized.
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.0.provider_config().max_tokens
+    }
 }
 
 #[async_trait]
@@ -304,4 +345,29 @@ pub enum OllamaError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_turn_generation_controls_override_the_exact_request_fields() {
+        let provider = OllamaProvider::from(OllamaConfig::new("model").with_max_tokens(64));
+        let mut body = serde_json::Map::new();
+        provider
+            .apply_generation_controls(
+                &mut body,
+                &agentkit_loop::GenerationControls {
+                    max_output_tokens: Some(32),
+                    temperature: Some(0.25),
+                    stop_sequences: Some(vec!["STOP".into()]),
+                },
+            )
+            .unwrap();
+        assert_eq!(body["max_tokens"], 32);
+        assert!(body.get("num_predict").is_none());
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["stop"], serde_json::json!(["STOP"]));
+    }
 }

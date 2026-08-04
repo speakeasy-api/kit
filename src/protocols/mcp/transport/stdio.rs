@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     future::Future,
     io,
     path::{Path, PathBuf},
@@ -125,31 +125,42 @@ pub trait OwnedStdioProfileProvider: Send + Sync + 'static {
         &self,
         profile: &str,
         owner: AttemptOwnership,
-        authorized_credentials: &BTreeSet<crate::domain::secret::SecretHandle>,
+        authorized_credentials: &Arc<
+            BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>,
+        >,
     ) -> Result<SandboxedStdioLauncher, OwnedStdioProfileError>;
 }
 
 pub struct OwnedStdioEnvironment {
-    values: BTreeMap<String, crate::domain::secret::SecretHandle>,
+    values: BTreeMap<
+        String,
+        (
+            crate::domain::secret::SecretHandle,
+            Arc<crate::domain::secret::SecretLease>,
+        ),
+    >,
 }
 
 impl OwnedStdioEnvironment {
     fn new(
         values: impl IntoIterator<Item = (String, crate::domain::secret::SecretHandle)>,
-        authorized: &BTreeSet<crate::domain::secret::SecretHandle>,
+        authorized: &Arc<BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>>,
     ) -> Result<Self, OwnedStdioProfileError> {
-        let values = values.into_iter().collect::<BTreeMap<_, _>>();
-        if values.values().all(|handle| authorized.contains(handle)) {
-            Ok(Self { values })
-        } else {
-            Err(OwnedStdioProfileError::Invalid)
+        let mut resolved = BTreeMap::new();
+        for (variable, handle) in values {
+            let lease = authorized
+                .get(&handle)
+                .cloned()
+                .ok_or(OwnedStdioProfileError::Invalid)?;
+            resolved.insert(variable, (handle, lease));
         }
+        Ok(Self { values: resolved })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &crate::domain::secret::SecretHandle)> {
         self.values
             .iter()
-            .map(|(variable, handle)| (variable.as_str(), handle))
+            .map(|(variable, (handle, _))| (variable.as_str(), handle))
     }
 }
 
@@ -249,7 +260,9 @@ impl OwnedStdioProfileProvider for ProductionStdioProfiles {
         &self,
         profile_name: &str,
         owner: AttemptOwnership,
-        authorized_credentials: &BTreeSet<crate::domain::secret::SecretHandle>,
+        authorized_credentials: &Arc<
+            BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>,
+        >,
     ) -> Result<SandboxedStdioLauncher, OwnedStdioProfileError> {
         let configured = self
             .profiles
@@ -334,20 +347,8 @@ impl OwnedStdioProcessService for ProductionOwnedStdioService {
         let max_frame_bytes = limits.max_frame_bytes();
         let child = tokio::task::spawn_blocking(move || {
             let mut leases = Vec::with_capacity(environment.values.len());
-            for (variable, handle) in environment.values {
-                let source = handle.identifier().strip_prefix("env:").ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::PermissionDenied, "unscoped MCP stdio handle")
-                })?;
-                let value = std::env::var(source).map_err(|_| {
-                    io::Error::new(io::ErrorKind::NotFound, "MCP stdio credential unavailable")
-                })?;
-                if value.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "MCP stdio credential is empty",
-                    ));
-                }
-                leases.push((variable, SecretLease::new(value.into_bytes())));
+            for (variable, (_, lease)) in environment.values {
+                leases.push((variable, SecretLease::new(lease.expose().to_vec())));
             }
             let scanner = CaptureRedactor::new(
                 &leases
@@ -538,13 +539,14 @@ impl SandboxedStdioLauncher {
     }
 }
 
-pub async fn connect_stdio<F>(
+pub(crate) async fn connect_stdio_with_handler<F>(
     server_id: McpServerId,
     profile: &str,
     request: &BrokerInvocation<'_>,
     prepare: F,
     store: &mut SqliteStore,
     limits: TransportLimits,
+    handler: McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError>
 where
     F: FnOnce() -> Result<SandboxedStdioLauncher, OwnedStdioProfileError>,
@@ -572,6 +574,7 @@ where
                 &mut launcher,
                 limits,
                 Arc::clone(&operations),
+                handler,
             )
             .await
         }
@@ -600,12 +603,36 @@ where
     }
 }
 
+pub async fn connect_stdio<F>(
+    server_id: McpServerId,
+    profile: &str,
+    request: &BrokerInvocation<'_>,
+    prepare: F,
+    store: &mut SqliteStore,
+    limits: TransportLimits,
+) -> Result<ReadyConnection, TransportError>
+where
+    F: FnOnce() -> Result<SandboxedStdioLauncher, OwnedStdioProfileError>,
+{
+    connect_stdio_with_handler(
+        server_id,
+        profile,
+        request,
+        prepare,
+        store,
+        limits,
+        McpHandlerConfig::new().with_events_capacity(limits.channel_capacity()),
+    )
+    .await
+}
+
 async fn connect_stdio_authorized(
     server_id: McpServerId,
     request: &BrokerInvocation<'_>,
     launcher: &mut SandboxedStdioLauncher,
     limits: TransportLimits,
     operations: Arc<OperationGate>,
+    handler: McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError> {
     let launch = launcher.launch(limits).await?;
     let cleanup = Arc::clone(&launch.process);
@@ -615,6 +642,7 @@ async fn connect_stdio_authorized(
         launch.scanners,
         limits,
         operations,
+        handler,
     )
     .await;
     if request.cancelled() {
@@ -634,6 +662,7 @@ async fn connect_owned_transport(
     scanners: Vec<SensitiveDataScanner>,
     limits: TransportLimits,
     operations: Arc<OperationGate>,
+    handler: McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError> {
     let cleanup_process = Arc::clone(&process);
     let ready_reaper = Arc::clone(&process);
@@ -646,12 +675,8 @@ async fn connect_owned_transport(
             Arc::clone(&operations),
             server_id.clone(),
         );
-        let result = McpConnection::connect_kit_authorized_transport(
-            server_id,
-            transport,
-            McpHandlerConfig::new().with_events_capacity(limits.channel_capacity()),
-        )
-        .await;
+        let result =
+            McpConnection::connect_kit_authorized_transport(server_id, transport, handler).await;
         let connection = match result {
             Ok(connection) => connection,
             Err(error) => return Err(operations.take_failure().unwrap_or_else(|| error.into())),
@@ -751,12 +776,13 @@ impl Transport<RoleClient> for BoundedStdioTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let authorized = self.operations.authorize_message(&item);
+        let operations = Arc::clone(&self.operations);
         let max = self.max_frame_bytes;
         let timeout = self.io_timeout;
         let process = Arc::clone(&self.process);
         async move {
-            authorized
+            operations
+                .authorize_message(&item)
                 .map(|_| ())
                 .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
             let frame = serde_json::to_vec(&item).map_err(invalid_data)?;
@@ -868,7 +894,10 @@ mod tests {
         assert!(matches!(
             OwnedStdioEnvironment::new(
                 [("TOKEN".to_owned(), forbidden)],
-                &BTreeSet::from([allowed]),
+                &Arc::new(BTreeMap::from([(
+                    allowed,
+                    Arc::new(SecretLease::new(b"allowed".to_vec())),
+                )])),
             ),
             Err(OwnedStdioProfileError::Invalid)
         ));
@@ -883,7 +912,13 @@ mod tests {
                 ("FIRST_TOKEN".to_owned(), first.clone()),
                 ("SECOND_TOKEN".to_owned(), second.clone()),
             ],
-            &BTreeSet::from([first, second]),
+            &Arc::new(BTreeMap::from([
+                (first, Arc::new(SecretLease::new(b"first-secret".to_vec()))),
+                (
+                    second,
+                    Arc::new(SecretLease::new(b"second-secret".to_vec())),
+                ),
+            ])),
         )
         .unwrap();
         assert_eq!(environment.values.len(), 2);
@@ -1051,6 +1086,7 @@ mod tests {
             vec![CaptureRedactor::new(&[]).scanner()],
             TransportLimits::default(),
             operations,
+            McpHandlerConfig::new(),
         )
         .await
         {

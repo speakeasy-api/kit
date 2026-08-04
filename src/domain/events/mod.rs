@@ -8,8 +8,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::config::{ConfigField, LayerKind};
 use super::ids::{
     AgentLinkId, ApprovalId, ArtifactId, AttemptId, CheckpointId, CommandId, DaemonServiceId,
-    EventId, ExperimentId, ExternalTaskId, ModelCallId, PrincipalId, ProcessId, ProjectId, RunId,
-    TaskId, TerminalId, ThreadId, ToolCallId, TurnId, WorkspaceId,
+    EventId, ExperimentId, ExternalTaskId, McpCallbackId, ModelCallId, PrincipalId, ProcessId,
+    ProjectId, RunId, TaskId, TerminalId, ThreadId, ToolCallId, TurnId, WorkspaceId,
 };
 use std::collections::BTreeMap;
 
@@ -205,6 +205,23 @@ impl UtcDateTime {
             second % 60
         ))
     }
+
+    pub(crate) fn from_unix_micros(value: i64) -> Result<Self, TimestampError> {
+        if value < 0 {
+            return Err(TimestampError);
+        }
+        let seconds = value / 1_000_000;
+        let micros = value % 1_000_000;
+        let days = seconds / 86_400;
+        let second = seconds % 86_400;
+        let (year, month, day) = civil_from_days(days);
+        Self::parse(&format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{micros:06}Z",
+            second / 3_600,
+            second % 3_600 / 60,
+            second % 60
+        ))
+    }
 }
 
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
@@ -391,6 +408,7 @@ entity_id!(
     Checkpoint(CheckpointId),
     Artifact(ArtifactId),
     Experiment(ExperimentId),
+    McpCallback(McpCallbackId),
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -30,6 +30,7 @@ use crate::{
     domain::crypto::{hmac_sha256_domain, sha256},
     domain::events::CommitPosition,
     domain::ids::{ProjectId, RunId},
+    domain::mcp_callback::McpCallbackProjection,
 };
 
 use super::{
@@ -752,6 +753,38 @@ fn command_wire(command: &Command) -> Result<(String, Value), ClientError> {
             vec![("run_id", run_id.to_string())],
             json!({ "granted": granted, "expected_version": expected_version }),
         ),
+        Command::ResolveMcpCallback {
+            callback_id,
+            kind,
+            mode,
+            expected_version,
+            challenge_generation,
+            schema_digest,
+            action,
+            content,
+            ..
+        } => {
+            let mut body = json!({
+                "kind": kind,
+                "mode": mode,
+                "expected_version": expected_version,
+                "challenge_generation": challenge_generation,
+                "schema_digest": schema_digest,
+                "action": action,
+            });
+            if matches!(
+                (kind, mode, action),
+                (
+                    crate::domain::mcp_callback::McpCallbackKind::Elicitation,
+                    crate::domain::mcp_callback::McpCallbackMode::Form,
+                    crate::domain::mcp_callback::McpCallbackAction::Accept,
+                )
+            ) && let Some(content) = content
+            {
+                body["content"] = content.clone();
+            }
+            (vec![("mcp_callback_id", callback_id.to_string())], body)
+        }
         Command::RegisterArtifactMetadata {
             artifact_id,
             project_id,
@@ -786,6 +819,7 @@ fn query_path(query: &Query) -> Result<String, ClientError> {
         | Query::ListRuns { project_id }
         | Query::PendingApprovals { project_id }
         | Query::PendingAuthRequests { project_id }
+        | Query::PendingMcpCallbacks { project_id }
         | Query::ListCapabilities { project_id }
         | Query::Status { project_id } => (vec![("project_id", project_id.to_string())], vec![]),
         Query::GetThread { thread_id } => (vec![("thread_id", thread_id.to_string())], vec![]),
@@ -820,6 +854,9 @@ fn query_path(query: &Query) -> Result<String, ClientError> {
         ),
         Query::GetArtifactMetadata { artifact_id } => {
             (vec![("artifact_id", artifact_id.to_string())], vec![])
+        }
+        Query::GetMcpCallback { callback_id } => {
+            (vec![("mcp_callback_id", callback_id.to_string())], vec![])
         }
         Query::EventCursorStatus { project_id, cursor } => (
             vec![("project_id", project_id.to_string())],
@@ -895,6 +932,12 @@ fn query_response(query: Query, response: Response) -> Result<QueryProjection, C
         Query::PendingAuthRequests { .. } => QueryProjection::AuthRequests(
             json_response::<Items<AuthRequestProjection>>(response)?.items,
         ),
+        Query::PendingMcpCallbacks { .. } => QueryProjection::McpCallbacks(
+            json_response::<Items<McpCallbackProjection>>(response)?.items,
+        ),
+        Query::GetMcpCallback { .. } => {
+            QueryProjection::McpCallback(Box::new(json_response(response)?))
+        }
         Query::GetArtifactMetadata { .. } => QueryProjection::ArtifactMetadata(json_response::<
             ArtifactMetadataProjection,
         >(response)?),
@@ -1192,4 +1235,46 @@ struct StreamRecovery {
     code: String,
     snapshot: Value,
     new_cursor: OpaqueStreamCursor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{
+        events::SchemaVersion,
+        ids::McpCallbackId,
+        mcp_callback::{McpCallbackAction, McpCallbackKind, McpCallbackMode},
+    };
+
+    fn resolution(action: McpCallbackAction, content: Option<Value>) -> Command {
+        Command::ResolveMcpCallback {
+            schema_version: SchemaVersion::CURRENT,
+            callback_id: McpCallbackId::from_stable_bytes(b"cli-callback"),
+            kind: McpCallbackKind::Elicitation,
+            mode: McpCallbackMode::Form,
+            expected_version: 2,
+            challenge_generation: 3,
+            schema_digest: format!("sha256:{}", "0".repeat(64)),
+            action,
+            content,
+            artifact_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn callback_resolution_wire_uses_discriminators_and_only_accepted_content() {
+        let (_, accepted) = command_wire(&resolution(
+            McpCallbackAction::Accept,
+            Some(json!({"name":"Ada"})),
+        ))
+        .unwrap();
+        assert_eq!(accepted["kind"], "elicitation");
+        assert_eq!(accepted["mode"], "form");
+        assert_eq!(accepted["content"], json!({"name":"Ada"}));
+
+        for action in [McpCallbackAction::Decline, McpCallbackAction::Cancel] {
+            let (_, body) = command_wire(&resolution(action, None)).unwrap();
+            assert!(body.get("content").is_none());
+        }
+    }
 }

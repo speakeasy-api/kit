@@ -49,6 +49,7 @@ tags:
   - name: Events
   - name: Approvals
   - name: Auth
+  - name: MCPCallbacks
   - name: Artifacts
   - name: Retention
   - name: Terminals
@@ -688,6 +689,61 @@ paths:
           $ref: '#/components/responses/Problem'
         '504':
           $ref: '#/components/responses/Problem'
+  /v1/projects/{project_id}/mcp-callbacks:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: listPendingMcpCallbacks
+      tags: [MCPCallbacks]
+      responses:
+        '200':
+          description: Pending durable MCP form-elicitation callbacks.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/McpCallbackList'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '500': {$ref: '#/components/responses/Problem'}
+  /v1/mcp-callbacks/{mcp_callback_id}:
+    parameters:
+      - $ref: '#/components/parameters/McpCallbackId'
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      operationId: getMcpCallback
+      tags: [MCPCallbacks]
+      responses:
+        '200':
+          description: Durable MCP callback projection.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/McpCallback'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '500': {$ref: '#/components/responses/Problem'}
+  /v1/mcp-callbacks/{mcp_callback_id}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/McpCallbackId'
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      operationId: resolveMcpCallback
+      tags: [MCPCallbacks]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResolveMcpCallback'}
+      responses:
+        '200': {$ref: '#/components/responses/ResourceUpdated'}
+        '400': {$ref: '#/components/responses/Problem'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '500': {$ref: '#/components/responses/Problem'}
   /v1/projects/{project_id}/artifacts:
     parameters:
       - $ref: '#/components/parameters/ProjectId'
@@ -1066,6 +1122,12 @@ components:
       required: true
       schema:
         $ref: '#/components/schemas/ApprovalId'
+    McpCallbackId:
+      name: mcp_callback_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/McpCallbackId'
     ArtifactId:
       name: artifact_id
       in: path
@@ -2190,7 +2252,7 @@ components:
     OpaqueId:
       type: string
       minLength: 28
-      maxLength: 37
+      maxLength: 39
       description: Opaque, case-sensitive identifier. Clients must not parse its prefix or payload.
     ProjectId:
       allOf:
@@ -2208,6 +2270,10 @@ components:
       allOf:
         - $ref: '#/components/schemas/OpaqueId'
         - pattern: '^approval_[0-7][0-9a-hjkmnp-tv-z]{25}$'
+    McpCallbackId:
+      allOf:
+        - $ref: '#/components/schemas/OpaqueId'
+        - pattern: '^mcp_callback_[0-7][0-9a-hjkmnp-tv-z]{25}$'
     ArtifactId:
       allOf:
         - $ref: '#/components/schemas/OpaqueId'
@@ -2407,6 +2473,39 @@ components:
           type: integer
           minimum: 1
       additionalProperties: true
+    ResolveMcpCallback:
+      oneOf:
+        - type: object
+          required: [kind, mode, expected_version, challenge_generation, schema_digest, action, content]
+          properties:
+            kind: {const: elicitation}
+            mode: {const: form}
+            expected_version: {type: integer, minimum: 1}
+            challenge_generation: {type: integer, minimum: 1}
+            schema_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+            action: {const: accept}
+            content: {type: object}
+          additionalProperties: false
+        - type: object
+          required: [kind, mode, expected_version, challenge_generation, schema_digest, action]
+          properties:
+            kind: {const: elicitation}
+            mode: {const: form}
+            expected_version: {type: integer, minimum: 1}
+            challenge_generation: {type: integer, minimum: 1}
+            schema_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+            action: {enum: [decline, cancel]}
+          additionalProperties: false
+        - type: object
+          required: [kind, mode, expected_version, challenge_generation, schema_digest, action]
+          properties:
+            kind: {const: sampling}
+            mode: {enum: [sampling_request, sampling_response]}
+            expected_version: {type: integer, minimum: 1}
+            challenge_generation: {type: integer, minimum: 1}
+            schema_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+            action: {enum: [accept, decline, cancel]}
+          additionalProperties: false
     RegisterArtifactMetadata:
       type: object
       required: [id, reference, media_type, size]
@@ -2705,6 +2804,56 @@ components:
         version:
           type: integer
           minimum: 1
+      additionalProperties: true
+    McpCallback:
+      type: object
+      required: [id, server_id, kind, mode, principal_id, project_id, run_id, attempt_id, fence, claim_generation, workspace_id, workspace_revision, request_id, request, schema, request_digest, schema_digest, challenge_generation, operation_sequence, expires_at, artifact_expires_at, max_response_bytes, max_content_bytes, secret_policy_id, state, version, resolver_actor, action, artifact_refs, terminal_error]
+      properties:
+        id: {$ref: '#/components/schemas/McpCallbackId'}
+        server_id: {type: string, minLength: 1, maxLength: 256}
+        kind: {enum: [elicitation, roots, sampling]}
+        mode: {enum: [form, roots_response, sampling_request, sampling_response]}
+        principal_id: {$ref: '#/components/schemas/PrincipalId'}
+        project_id: {$ref: '#/components/schemas/ProjectId'}
+        run_id: {$ref: '#/components/schemas/RunId'}
+        attempt_id: {$ref: '#/components/schemas/OpaqueId'}
+        fence: {type: integer, minimum: 1}
+        claim_generation: {type: integer, minimum: 1}
+        workspace_id: {$ref: '#/components/schemas/OpaqueId'}
+        workspace_revision: {type: string, minLength: 1, maxLength: 256}
+        request_id: {type: string, minLength: 1, maxLength: 512}
+        request: {type: object}
+        schema: {type: object}
+        request_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        schema_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+        challenge_generation: {type: integer, minimum: 1}
+        operation_sequence: {type: integer, minimum: 1}
+        expires_at: {$ref: '#/components/schemas/Timestamp'}
+        artifact_expires_at: {$ref: '#/components/schemas/Timestamp'}
+        max_response_bytes: {type: integer, minimum: 1}
+        max_content_bytes: {type: integer, minimum: 1}
+        secret_policy_id: {type: string, minLength: 1, maxLength: 128}
+        state: {enum: [requested, awaiting_resolution, resolved, response_prepared, delivered, delivery_unknown, expired, interrupted]}
+        version: {type: integer, minimum: 1}
+        resolver_actor:
+          oneOf:
+            - {$ref: '#/components/schemas/PrincipalId'}
+            - {type: 'null'}
+        action: {type: [string, 'null'], enum: [accept, decline, cancel, null]}
+        artifact_refs:
+          type: array
+          maxItems: 4
+          items: {type: string, pattern: '^artifact-ref:[0-9a-f]{64}$'}
+        terminal_error: {type: [string, 'null']}
+      additionalProperties: true
+    McpCallbackList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/McpCallback'
       additionalProperties: true
     AuthRequestList:
       type: object

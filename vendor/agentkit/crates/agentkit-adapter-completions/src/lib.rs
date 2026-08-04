@@ -31,7 +31,8 @@ use std::sync::Arc;
 use agentkit_core::{MetadataMap, TurnCancellation, Usage};
 use agentkit_http::{BodyStream, Http, HttpError, HttpRequestBuilder, StatusCode};
 use agentkit_loop::{
-    LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
+    GenerationControls, LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent,
+    SessionConfig, TurnRequest,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -101,6 +102,23 @@ pub trait CompletionsProvider: Send + Sync + Clone {
         _request: &TurnRequest,
     ) -> Result<(), LoopError> {
         Ok(())
+    }
+
+    /// Maps provider-neutral generation controls into this provider's exact
+    /// request fields. Providers must reject controls they cannot honor.
+    fn apply_generation_controls(
+        &self,
+        _body: &mut serde_json::Map<String, Value>,
+        controls: &GenerationControls,
+    ) -> Result<(), LoopError> {
+        if controls.is_empty() {
+            Ok(())
+        } else {
+            Err(LoopError::Unsupported(format!(
+                "{} does not support per-request generation controls",
+                self.provider_name()
+            )))
+        }
     }
 
     /// Whether to request an SSE streaming response. Defaults to `true`.
@@ -191,6 +209,11 @@ impl<P: CompletionsProvider> CompletionsAdapter<P> {
             provider_label: provider.provider_name().to_lowercase(),
             provider: Arc::new(provider),
         })
+    }
+
+    /// Returns the immutable provider request configuration selected for this adapter.
+    pub fn provider_config(&self) -> &P::Config {
+        self.provider.config()
     }
 
     /// Creates a new adapter with a pre-configured [`Http`] client. Use this to

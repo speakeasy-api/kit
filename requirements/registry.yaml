@@ -1920,9 +1920,14 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/agent/adapters/model.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - src/protocols/mcp/config.rs
+  telemetry_links:
+  - tests/fault/model_intent_outcome.rs
+  - tests/adversarial/mcp_callback_authority.rs
   evidence_type: conformance
   evidence_id: EV-M002-W03-C-001
   evidence_job: fault
@@ -1966,9 +1971,14 @@
   - hostile
   release_gates:
   - G02
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/agent/adapters/model.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - src/protocols/mcp/config.rs
+  telemetry_links:
+  - tests/fault/model_intent_outcome.rs
+  - tests/adversarial/mcp_callback_authority.rs
   evidence_type: conformance
   evidence_id: EV-M002-W03-C-002
   evidence_job: fault
@@ -3202,7 +3212,7 @@
   applicability: mandatory
   interpretation: Kit exposes an authenticated versioned HTTP JSON API described by OpenAPI.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_api_800 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance http_contract::openapi_callback_resolution_enforces_kind_mode_and_content_contract -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M001
   contributing_milestones: []
   dependencies: []
@@ -3217,22 +3227,23 @@
   - hostile
   release_gates:
   - G01
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/api/http/core/mod.rs
+  - src/api/http/router.rs
+  - src/api/service/mod.rs
+  - src/api/service/sqlite.rs
+  public_contract_links:
+  - docs/api/openapi.yaml
+  telemetry_links:
+  - tests/conformance/http_contract.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1234
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_api_800 exits 0 with 1 passed and 0 failed
-  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  expected_result: cargo test --locked --test conformance http_contract::openapi_callback_resolution_enforces_kind_mode_and_content_contract -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-API-800 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -3253,7 +3264,7 @@
   applicability: mandatory
   interpretation: Every API resource, event, terminal, and artifact is authorized to a principal and project.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_api_801 exits 0 with 1 passed and 0 failed
+  - cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
   primary_milestone: M001
   contributing_milestones: []
   dependencies: []
@@ -3268,22 +3279,24 @@
   - hostile
   release_gates:
   - G01
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/api/http/router.rs
+  - src/api/service/mod.rs
+  - src/api/service/sqlite.rs
+  - src/store/sqlite/mcp_callback.rs
+  public_contract_links:
+  - docs/api/openapi.yaml
+  telemetry_links:
+  - tests/conformance/http_contract.rs
+  - tests/adversarial/mcp_callback_authority.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1235
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_api_801 exits 0 with 1 passed and 0 failed
-  artifact_digest: fbbf1f0582d4c9403e60184c389963a5acd6407abaa12013d36a017a57c50159
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  expected_result: cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-API-801 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -4229,7 +4242,7 @@
   applicability: mandatory
   interpretation: The CLI uses the same authorization, validation, event, and lifecycle handlers as external clients.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_api_820 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance cli_parity::cli_service_and_openapi_have_zero_uncovered_operations -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M001
   contributing_milestones: []
   dependencies: []
@@ -4244,22 +4257,25 @@
   - hostile
   release_gates:
   - G01
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/cli/core/command_tree.rs
+  - src/cli/core/parser.rs
+  - src/cli/core/http.rs
+  - src/api/service/mod.rs
+  public_contract_links:
+  - docs/api/openapi.yaml
+  - src/api/http/core/mod.rs
+  telemetry_links:
+  - tests/conformance/cli_parity.rs
+  - tests/conformance/http_contract.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1254
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_api_820 exits 0 with 1 passed and 0 failed
-  artifact_digest: 4f48b3ed7f1cb20edd34bebabe34ddfa3d9be5dd194f996c9da66807898bb549
-  environment_digest: 6199847ad2fd21561461f5bb01d709b4d26c89b57f6fcc2968fefd70b3abafa2
-  versions:
-    cargo: 1.94.0
-    cargo_lock_sha256: 7943c800482a3961919933ead6b78b69e40859e4f283ff0290489398a543d6c2
-    os: Darwin 25.5.0 arm64
-    python: 3.13.11
-    rustc: 1.94.0
-  latest_result: pass
+  expected_result: cargo test --locked --test conformance cli_parity::cli_service_and_openapi_have_zero_uncovered_operations -- --exact exits 0 with 1 passed and 0 failed
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
   revalidation_rule: Re-run when the implementation of KIT-API-820 or its source contract changes.
   decision_record: null
   deviation_record: null
@@ -6377,12 +6393,12 @@
   source_quote: '- The capability broker owns authorization and invocation.'
   source_fingerprint: b891cb948796ef3e24ef0f02190e33c46f3a58d4efc73006a8b9f1d727d9c811
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
-  interpretation: Every direct, nested, native, and protocol capability call passes through one broker decision.
+  interpretation: Native and MCP tool, resource, prompt, sampling, form-elicitation, and roots operations pass through broker-derived authority; ACP callbacks and the remaining protocol surface keep this promise active.
   acceptance_criteria:
   - cargo test --test conformance architectural_promises broker_authority exits 0 with 0 failed tests
   primary_milestone: M006
@@ -6410,11 +6426,15 @@
   - src/capabilities/broker/mod.rs
   - src/capabilities/native/orchestrate.rs
   - src/agent/adapters/tool.rs
+  - src/protocols/mcp/responders/mod.rs
+  - src/store/sqlite/mcp_callback.rs
   public_contract_links: []
   telemetry_links:
   - tests/conformance/grant_ext.rs
   - tests/conformance/broker_paths.rs
   - tests/fault/broker_auth_interrupt.rs
+  - tests/adversarial/mcp_callback_authority.rs
+  - tests/conformance/mcp_transport.rs
   evidence_type: conformance
   evidence_id: EV-7.14-C-201
   evidence_job: integration
@@ -27691,7 +27711,7 @@
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: W07a and W07b implement discovery, list-change refresh, and auth resume; sampling, elicitation, and roots responders remain W07c, so this promise is active rather than implemented.
+  interpretation: W07a and W07b implement discovery, list-change refresh, and auth resume; W07c implements configured sampling, form elicitation, and roots responders. URL elicitation remains W08, so this promise stays active.
   acceptance_criteria:
   - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
@@ -27713,10 +27733,21 @@
   - src/protocols/mcp/transport/mod.rs
   - src/protocols/mcp/transport/http.rs
   - src/protocols/mcp/transport/stdio.rs
-  public_contract_links: []
+  - src/protocols/mcp/responders/mod.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - src/protocols/mcp/config.rs
+  - docs/api/openapi.yaml
+  - src/cli/core/command_tree.rs
   telemetry_links:
   - tests/conformance/mcp_features.rs
   - tests/fault/mcp_listchange_storm.rs
+  - tests/conformance/mcp_transport.rs
+  - tests/adversarial/mcp_callback_authority.rs
+  - tests/fault/model_intent_outcome.rs
+  - tests/integration/provider_stream.rs
+  - tests/conformance/http_contract.rs
+  - tests/conformance/cli_parity.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1187
   evidence_job: integration
@@ -27897,7 +27928,7 @@
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: W07b makes the Kit broker the sole authority for MCP tools, resources, prompts, discovery, refresh, auth, and dispatch; sampling, elicitation, roots, and ACP callback coverage remain W07c, so this promise is active rather than implemented.
+  interpretation: W07b covers MCP discovery and invocation authority; W07c adds broker-derived authority for MCP sampling, form elicitation, and roots. ACP callback authority and URL elicitation remain outside this unit, so this promise stays active.
   acceptance_criteria:
   - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
@@ -27918,10 +27949,19 @@
   - src/capabilities/broker/mod.rs
   - src/protocols/mcp/transport/mod.rs
   - src/protocols/mcp/transport/invocation.rs
-  public_contract_links: []
+  - src/protocols/mcp/responders/mod.rs
+  - src/store/sqlite/mcp_callback.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - src/protocols/mcp/config.rs
+  - docs/api/openapi.yaml
+  - src/cli/core/command_tree.rs
   telemetry_links:
   - tests/conformance/mcp_invocation.rs
   - tests/adversarial/mcp_result_authority.rs
+  - tests/adversarial/mcp_callback_authority.rs
+  - tests/conformance/mcp_transport.rs
+  - tests/fault/model_intent_outcome.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1191
   evidence_job: integration
@@ -27943,14 +27983,14 @@
   source_quote: Kit’s capability broker is the sole policy and dispatch authority for native tools, MCP tools/resources/prompts, ACP callbacks, and MCP sampling/elicitation/roots. Agentkit permission types adapt broker decisions into loop interrupts; they are not a second authority. Protocol permission or elicitation responses resolve a durable Kit request only after actor authentication and grant validation, with their own causation, budget, and cancellation records.
   source_fingerprint: 99f98d1f9f36de799f957befce239ab061b5cd2d83d69744b261222fa0aece7d
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: Protocol permission and elicitation responses resolve durable Kit requests only after actor authentication and grant validation.
+  interpretation: MCP sampling permission and form-elicitation responses resolve versioned durable callback requests only through authenticated API or CLI service commands with current principal, project, grant, challenge, schema, attempt, fence, claim, revision, budget, and cancellation authority.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_mcp_806 exits 0 with 1 passed and 0 failed
+  - cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -27965,13 +28005,30 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
-  public_contract_links: []
-  telemetry_links: []
+  implementation_links:
+  - src/domain/mcp_callback.rs
+  - src/store/sqlite/mcp_callback.rs
+  - src/api/service/mod.rs
+  - src/api/service/sqlite.rs
+  - src/protocols/mcp/responders/mod.rs
+  - src/agent/executor/mod.rs
+  public_contract_links:
+  - docs/api/openapi.yaml
+  - src/api/http/core/mod.rs
+  - src/api/http/router.rs
+  - src/cli/core/command_tree.rs
+  - src/cli/core/http.rs
+  telemetry_links:
+  - tests/conformance/http_contract.rs
+  - tests/conformance/cli_parity.rs
+  - tests/conformance/mcp_transport.rs
+  - tests/adversarial/mcp_callback_authority.rs
+  - tests/fault/model_intent_outcome.rs
+  - tests/fault/sched_crash.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1192
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_mcp_806 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
   artifact_digest: null
   environment_digest: null
   versions: null

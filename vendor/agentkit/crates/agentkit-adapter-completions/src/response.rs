@@ -208,25 +208,37 @@ pub(crate) fn parse_tool_arguments(arguments: &str) -> Result<Value, Completions
 }
 
 pub(crate) fn map_usage(usage: Option<ResponseUsage>) -> Option<Usage> {
-    usage.map(|usage| Usage {
-        tokens: Some(TokenUsage {
-            input_tokens: usage.prompt_tokens.unwrap_or_default(),
-            output_tokens: usage.completion_tokens.unwrap_or_default(),
-            reasoning_tokens: usage
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|details| details.reasoning_tokens),
-            cached_input_tokens: usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens),
-            cache_write_input_tokens: usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cache_write_tokens),
-        }),
-        cost: None,
-        metadata: MetadataMap::new(),
+    usage.map(|usage| {
+        let cached = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens);
+        let cache_write = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens);
+        let reasoning = usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens);
+        Usage {
+            tokens: Some(TokenUsage {
+                input_tokens: usage
+                    .prompt_tokens
+                    .unwrap_or_default()
+                    .saturating_sub(cached.unwrap_or_default())
+                    .saturating_sub(cache_write.unwrap_or_default()),
+                output_tokens: usage
+                    .completion_tokens
+                    .unwrap_or_default()
+                    .saturating_sub(reasoning.unwrap_or_default()),
+                reasoning_tokens: reasoning,
+                cached_input_tokens: cached,
+                cache_write_input_tokens: cache_write,
+            }),
+            cost: None,
+            metadata: MetadataMap::new(),
+        }
     })
 }
 
@@ -343,6 +355,40 @@ pub(crate) struct ResponseUsage {
 pub(crate) struct ResponsePromptTokenDetails {
     pub cached_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn openai_compatible_provider_totals_are_normalized_once() {
+        for provider in ["openai", "openrouter", "ollama"] {
+            let fixture = format!(
+                r#"{{"provider":"{provider}","prompt_tokens":100,"completion_tokens":40,"prompt_tokens_details":{{"cached_tokens":30,"cache_write_tokens":20}},"completion_tokens_details":{{"reasoning_tokens":15}}}}"#
+            );
+            let raw: Value = serde_json::from_str(&fixture).unwrap();
+            let usage: ResponseUsage = serde_json::from_value(raw).unwrap();
+            let tokens = map_usage(Some(usage)).unwrap().tokens.unwrap();
+            assert_eq!(tokens.input_tokens, 50, "{provider}");
+            assert_eq!(tokens.cached_input_tokens, Some(30), "{provider}");
+            assert_eq!(tokens.cache_write_input_tokens, Some(20), "{provider}");
+            assert_eq!(tokens.output_tokens, 25, "{provider}");
+            assert_eq!(tokens.reasoning_tokens, Some(15), "{provider}");
+            assert_eq!(
+                tokens.input_tokens
+                    + tokens.cached_input_tokens.unwrap()
+                    + tokens.cache_write_input_tokens.unwrap(),
+                100,
+                "{provider}"
+            );
+            assert_eq!(
+                tokens.output_tokens + tokens.reasoning_tokens.unwrap(),
+                40,
+                "{provider}"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]

@@ -3,7 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::events::{CommitPosition, EventEnvelope, EventPayload, SchemaVersion};
+use super::events::{CommitPosition, EntityId, EventEnvelope, EventPayload, SchemaVersion};
 use super::ids::{ApprovalId, ArtifactId, AttemptId, PrincipalId, ProjectId, RunId, ThreadId};
 use super::retention::{RetentionObjectId, RetentionPolicy};
 use crate::api::auth::contract::ResourceScope;
@@ -189,6 +189,26 @@ impl DomainReducer {
         }
         self.committed = position;
         let operation = event.event.event_type.as_str();
+        if operation == "mcp_callback.transitioned" {
+            let stored: crate::domain::mcp_callback::McpCallbackEventEnvelope =
+                serde_json::from_slice(&event.event.payload)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+            if event.event.correlation_id != EntityId::Run(stored.run_id)
+                || event.event.attempt_id.is_none()
+            {
+                return Err(ServiceError::Store(
+                    "MCP callback event indexing does not match its run".to_owned(),
+                ));
+            }
+            return Ok(Some((
+                IndexedEventScope {
+                    project_id: stored.project_id,
+                    thread_id: None,
+                    run_id: Some(stored.run_id),
+                },
+                stored.stored_at_unix_micros,
+            )));
+        }
         if operation == "run.prompt" {
             let stored: RunSemanticEnvelope<RunPromptProjection> =
                 serde_json::from_slice(&event.event.payload)
@@ -640,6 +660,11 @@ impl DomainReducer {
                 run.auth_granted = Some(*granted);
                 run.version += 1;
             }
+            Command::ResolveMcpCallback { .. } => {
+                return Err(ServiceError::Store(
+                    "MCP callbacks use their dedicated projection".to_owned(),
+                ));
+            }
             Command::RegisterArtifactMetadata {
                 artifact_id,
                 project_id,
@@ -942,6 +967,7 @@ impl DomainReducer {
                 .get(&id)
                 .and_then(|approval| self.project_for_run(approval.run_id)),
             Resource::Artifact(id) => self.artifacts.get(&id).map(|artifact| artifact.project_id),
+            Resource::McpCallback(_) => None,
         }
         .ok_or(ServiceError::NotFound)?;
         let principal = self
@@ -1099,6 +1125,7 @@ impl DomainReducer {
                 .get(approval_id)
                 .and_then(|approval| self.project_for_run(approval.run_id))
                 .ok_or(ServiceError::NotFound),
+            Command::ResolveMcpCallback { .. } => Err(ServiceError::NotFound),
         }
     }
 

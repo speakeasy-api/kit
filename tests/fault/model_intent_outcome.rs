@@ -10,8 +10,8 @@ use std::{
 };
 
 use agentkit_core::{
-    Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind, ReasoningPart,
-    TextPart, TokenUsage, TurnCancellation, Usage,
+    CostUsage, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind,
+    ReasoningPart, TextPart, TokenUsage, TurnCancellation, Usage,
 };
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
@@ -51,7 +51,10 @@ use kit::{
         ids::{AttemptId, CommandId, EventId, PrincipalId, ProjectId, RunId, WorkspaceId},
         lifecycle::{AttemptOwnership, AttemptState, FencingToken},
     },
-    runtime::scheduler::{DurableScheduler, limits::Spend},
+    runtime::scheduler::{
+        AdmissionKind, DurableScheduler, ReservationRequest, SchedulerError, limits::Spend,
+        reserve::ReservationId,
+    },
     store::sqlite::idempotency::IdempotencyKey,
     test_support,
 };
@@ -93,6 +96,11 @@ struct FakeSession {
 struct FakeTurn {
     events: VecDeque<ModelTurnEvent>,
 }
+
+#[derive(Clone)]
+struct HangingAdapter;
+
+struct HangingSession;
 
 impl ModelAdapter for FakeAdapter {
     type Session = FakeSession;
@@ -145,6 +153,16 @@ impl ModelSession for FakeSession {
     fn model_name(&self) -> Option<&str> {
         Some("fake-model")
     }
+
+    fn prepare_turn(&mut self, request: &mut TurnRequest) -> Result<(), LoopError> {
+        if request.generation.temperature.is_some() {
+            Err(LoopError::Unsupported(
+                "temperature is unsupported".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl ModelTurn for FakeTurn {
@@ -159,6 +177,45 @@ impl ModelTurn for FakeTurn {
         Self: 'async_trait,
     {
         Box::pin(async move { Ok(self.events.pop_front()) })
+    }
+}
+
+impl ModelAdapter for HangingAdapter {
+    type Session = HangingSession;
+
+    fn start_session<'life0, 'async_trait>(
+        &'life0 self,
+        _config: SessionConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Session, LoopError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Ok(HangingSession) })
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("hanging")
+    }
+}
+
+impl ModelSession for HangingSession {
+    type Turn = FakeTurn;
+
+    fn begin_turn<'life0, 'async_trait>(
+        &'life0 mut self,
+        _request: TurnRequest,
+        _cancellation: Option<TurnCancellation>,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Turn, LoopError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::pending())
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        Some("fake-model")
     }
 }
 
@@ -312,6 +369,7 @@ impl Fixture {
                 provider_idempotency: ProviderIdempotency::Unproven,
                 max_buffered_bytes: 1024 * 1024,
                 max_delta_bytes: 4,
+                detached: false,
             },
             fake: FakeAdapter::with_events(events),
         }
@@ -401,6 +459,7 @@ fn request() -> TurnRequest {
         available_tools: Vec::new(),
         cache: None,
         structured_output: None,
+        generation: Default::default(),
         metadata: MetadataMap::new(),
     }
 }
@@ -558,6 +617,7 @@ async fn crash_windows_reconcile_without_duplicate_dispatch_or_invented_success(
         ModelCrashPoint::BetweenIntentAndDispatch,
         ModelCrashPoint::AfterDispatch,
         ModelCrashPoint::BeforeOutcome,
+        ModelCrashPoint::AfterOutcome,
     ] {
         let fixture = Fixture::new([ModelTurnEvent::Finished(result())]);
         fixture.seed_boundary();
@@ -606,12 +666,28 @@ async fn crash_windows_reconcile_without_duplicate_dispatch_or_invented_success(
                         if outcomes.len() == 1
                 ));
             }
+            ModelCrashPoint::AfterOutcome => {
+                assert_eq!(events_after_crash.len(), 3);
+                assert_eq!(fixture.fake.dispatches(), 1);
+                let outcome: serde_json::Value =
+                    serde_json::from_slice(&events_after_crash[2].event.payload).unwrap();
+                assert_eq!(outcome["status"], "succeeded");
+                assert_eq!(outcome["settlement"]["cost_microusd"], 10);
+                assert!(matches!(
+                    RestartProjection::reconstruct(&fixture.projection(), &all_events_after_crash)
+                        .unwrap(),
+                    RecoveryState::Ready(_)
+                ));
+            }
         }
 
         fixture.scheduler.reconcile_startup().unwrap();
         let mut restarted = begin(fixture.adapter(None)).await.unwrap();
         let recovered = drain(&mut restarted).await;
-        if point == ModelCrashPoint::BetweenIntentAndDispatch {
+        if matches!(
+            point,
+            ModelCrashPoint::BetweenIntentAndDispatch | ModelCrashPoint::AfterOutcome
+        ) {
             assert!(recovered.is_ok());
             assert_eq!(fixture.fake.dispatches(), 1);
             let events = fixture
@@ -652,6 +728,223 @@ async fn stale_owner_is_rejected_before_budget_intent_or_provider() {
         .unwrap();
     assert!(begin(fixture.adapter(None)).await.is_err());
     assert_eq!(fixture.fake.dispatches(), 0);
+    assert!(fixture.events().is_empty());
+    assert_eq!(
+        fixture
+            .scheduler
+            .totals(fixture.security.config.run_id())
+            .unwrap(),
+        kit::runtime::scheduler::reserve::BudgetTotals {
+            committed: Spend::ZERO,
+            reserved: Spend::ZERO,
+        }
+    );
+}
+
+#[tokio::test]
+async fn detached_model_call_requires_the_exact_model_grant_decision() {
+    let mut fixture = Fixture::new([ModelTurnEvent::Finished(result())]);
+    fixture.policy.detached = true;
+    fixture.security.authenticated = LocalPeerAuthenticator::new(BTreeMap::from([(
+        UID,
+        GrantSnapshot::new(
+            fixture.security.attempt.principal_id,
+            fixture.security.config.project_id(),
+            [],
+        ),
+    )]))
+    .authenticate(&LocalPeerObservation::from_transport(UID, 43, UID))
+    .unwrap();
+
+    assert!(begin(fixture.adapter(None)).await.is_err());
+    assert_eq!(fixture.fake.dispatches(), 0);
+    assert!(fixture.events().is_empty());
+}
+
+#[tokio::test]
+async fn rejected_detached_output_never_enters_durable_model_records() {
+    let secret = "provider-secret-that-must-not-persist";
+    let mut rejected = result();
+    rejected.output_items = vec![Item::text(ItemKind::Assistant, secret)];
+    let mut fixture = Fixture::new([ModelTurnEvent::Finished(rejected)]);
+    fixture.policy.detached = true;
+    let adapter = fixture.adapter(None).with_outcome_validator(Arc::new(|_| {
+        Err(LoopError::Provider("rejected by Kit validator".to_owned()))
+    }));
+    let mut session = begin(adapter).await.unwrap();
+    assert!(drain(&mut session).await.is_err());
+
+    let connection = rusqlite::Connection::open(fixture.database.path()).unwrap();
+    let mut statement = connection
+        .prepare("SELECT response FROM idempotency")
+        .unwrap();
+    let records = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!records.is_empty());
+    assert!(records.iter().all(|record| {
+        !record
+            .windows(secret.len())
+            .any(|bytes| bytes == secret.as_bytes())
+    }));
+    let outcomes = fixture
+        .events()
+        .into_iter()
+        .filter(|event| event.event.event_type.as_str() == "model_call.outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 1);
+    let outcome: serde_json::Value = serde_json::from_slice(&outcomes[0].event.payload).unwrap();
+    assert_eq!(outcome["status"], "outcome_unknown");
+    assert_eq!(outcome["settlement"]["cost_microusd"], 10);
+}
+
+#[tokio::test]
+async fn detached_actual_overage_replays_the_same_failure_without_output_or_redispatch() {
+    let mut overage = result();
+    overage.usage =
+        Some(Usage::new(TokenUsage::new(120, 30)).with_cost(CostUsage::new(0.000_011, "USD")));
+    let mut fixture = Fixture::new([ModelTurnEvent::Finished(overage)]);
+    fixture.policy.detached = true;
+
+    let mut first = begin(fixture.adapter(None)).await.unwrap();
+    let first_error = drain(&mut first).await.unwrap_err().to_string();
+    assert!(
+        first_error.contains("actual usage exceeded"),
+        "{first_error}"
+    );
+    assert_eq!(fixture.fake.dispatches(), 1);
+
+    let outcome = fixture
+        .events()
+        .into_iter()
+        .find(|event| event.event.event_type.as_str() == "model_call.outcome")
+        .unwrap();
+    let outcome: serde_json::Value = serde_json::from_slice(&outcome.event.payload).unwrap();
+    let reservation = kit::runtime::scheduler::reserve::ReservationId::new(
+        u128::from_str_radix(outcome["reservation_id"].as_str().unwrap(), 16).unwrap(),
+    );
+    let snapshot = fixture.scheduler.snapshot(reservation).unwrap();
+    assert_eq!(
+        snapshot.status(),
+        kit::runtime::scheduler::reserve::ReservationStatus::ActualOverage
+    );
+    assert_eq!(snapshot.spend(), Spend::new(11, 150, 1, 0, 0));
+
+    let mut replay = begin(fixture.adapter(None)).await.unwrap();
+    let replay_error = drain(&mut replay).await.unwrap_err().to_string();
+    assert!(
+        replay_error.contains("actual usage exceeded"),
+        "{replay_error}"
+    );
+    assert_eq!(fixture.fake.dispatches(), 1);
+    assert_eq!(
+        fixture
+            .scheduler
+            .totals(fixture.security.config.run_id())
+            .unwrap()
+            .committed,
+        Spend::new(11, 150, 1, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn after_outcome_recovery_permanently_blocks_spend_after_actual_overage() {
+    let mut overage = result();
+    overage.usage =
+        Some(Usage::new(TokenUsage::new(120, 30)).with_cost(CostUsage::new(0.000_011, "USD")));
+    let mut fixture = Fixture::new([ModelTurnEvent::Finished(overage)]);
+    fixture.policy.detached = true;
+
+    let mut crashed = begin(fixture.adapter(Some(ModelCrashPoint::AfterOutcome)))
+        .await
+        .unwrap();
+    assert!(drain(&mut crashed).await.is_err());
+    assert_eq!(fixture.fake.dispatches(), 1);
+
+    fixture.scheduler.reconcile_startup().unwrap();
+    let future_spend = |id| ReservationRequest {
+        id: ReservationId::new(id),
+        run_id: fixture.security.config.run_id(),
+        principal_id: fixture.security.attempt.principal_id,
+        attempt: Some(fixture.security.attempt),
+        idempotency_key: format!("future-spend-{id}"),
+        kind: AdmissionKind::Model,
+        spend: Spend::new(1, 1, 1, 0, 0),
+    };
+    assert!(matches!(
+        fixture.scheduler.reserve(&future_spend(u128::MAX)),
+        Err(SchedulerError::BudgetBlocked)
+    ));
+
+    let reopened = DurableScheduler::open(fixture.database.path()).unwrap();
+    assert!(matches!(
+        reopened.reserve(&future_spend(u128::MAX - 1)),
+        Err(SchedulerError::BudgetBlocked)
+    ));
+}
+
+#[tokio::test]
+async fn live_cancellation_aborts_a_provider_that_ignores_cancellation() {
+    let mut fixture = Fixture::new([]);
+    fixture.policy.detached = true;
+    let adapter = DurableModelAdapter::new(
+        HangingAdapter,
+        test_support::open_sqlite_store(fixture.database.path()).unwrap(),
+        fixture.scheduler.clone(),
+        fixture.security.clone(),
+        fixture.policy,
+        UtcDateTime::parse("2026-07-22T12:00:00Z").unwrap(),
+        TraceId::parse("model-cancellation").unwrap(),
+    );
+    let mut session = adapter
+        .start_session(SessionConfig::new("attempt-session"))
+        .await
+        .unwrap();
+    let controller = agentkit_core::CancellationController::new();
+    let cancellation = TurnCancellation::new(controller.handle());
+    let interrupt = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        controller.interrupt();
+    });
+    assert!(
+        session
+            .begin_turn(request(), Some(cancellation))
+            .await
+            .is_err()
+    );
+    interrupt.await.unwrap();
+    assert_eq!(
+        fixture
+            .scheduler
+            .totals(fixture.security.config.run_id())
+            .unwrap()
+            .committed,
+        fixture.policy.reservation
+    );
+    let outcomes = fixture
+        .events()
+        .into_iter()
+        .filter(|event| event.event.event_type.as_str() == "model_call.outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 1);
+    let outcome: serde_json::Value = serde_json::from_slice(&outcomes[0].event.payload).unwrap();
+    assert_eq!(outcome["status"], "outcome_unknown");
+}
+
+#[tokio::test]
+async fn unsupported_generation_controls_fail_before_intent_or_reservation() {
+    let mut fixture = Fixture::new([]);
+    fixture.policy.detached = true;
+    let mut session = fixture
+        .adapter(None)
+        .start_session(SessionConfig::new("attempt-session"))
+        .await
+        .unwrap();
+    let mut unsupported = request();
+    unsupported.generation.temperature = Some(0.5);
+    assert!(session.begin_turn(unsupported, None).await.is_err());
     assert!(fixture.events().is_empty());
     assert_eq!(
         fixture

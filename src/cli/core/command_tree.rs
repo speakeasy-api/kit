@@ -29,6 +29,7 @@ pub fn command() -> Command {
             events(),
             approval(),
             auth(),
+            mcp_callback(),
             required_id(
                 leaf("status", "Show project service status"),
                 "project",
@@ -386,6 +387,75 @@ fn auth() -> Command {
     ])
 }
 
+fn mcp_callback() -> Command {
+    group("mcp-callback", "List, inspect, and resolve MCP callbacks").subcommands([
+        required_id(
+            leaf("list", "List pending MCP callbacks"),
+            "project",
+            "project-id",
+            "PROJECT_ID",
+            "Project identifier",
+        ),
+        required_id(
+            leaf("show", "Show an MCP callback"),
+            "mcp-callback",
+            "mcp-callback-id",
+            "MCP_CALLBACK_ID",
+            "MCP callback identifier",
+        ),
+        required_id(
+            mutation_leaf(
+                leaf("resolve", "Resolve an MCP callback")
+                    .arg(positive_u64(
+                        "version",
+                        "version",
+                        "Expected callback version",
+                    ))
+                    .arg(positive_u64(
+                        "challenge-generation",
+                        "challenge-generation",
+                        "Expected challenge generation",
+                    ))
+                    .arg(
+                        required_value("kind", "kind", "KIND", "Callback kind")
+                            .value_parser(PossibleValuesParser::new(["elicitation", "sampling"])),
+                    )
+                    .arg(
+                        required_value("mode", "mode", "MODE", "Callback mode").value_parser(
+                            PossibleValuesParser::new([
+                                "form",
+                                "sampling-request",
+                                "sampling-response",
+                            ]),
+                        ),
+                    )
+                    .arg(required_value(
+                        "schema-digest",
+                        "schema-digest",
+                        "SHA256_DIGEST",
+                        "Expected callback schema digest",
+                    ))
+                    .arg(
+                        required_value("action", "action", "ACTION", "Callback resolution")
+                            .value_parser(PossibleValuesParser::new([
+                                "accept", "decline", "cancel",
+                            ])),
+                    )
+                    .arg(value(
+                        "content",
+                        "content",
+                        "JSON",
+                        "Accepted callback content as JSON",
+                    )),
+            ),
+            "mcp-callback",
+            "mcp-callback-id",
+            "MCP_CALLBACK_ID",
+            "MCP callback identifier",
+        ),
+    ])
+}
+
 fn capability() -> Command {
     group("capability", "Inspect project capabilities").subcommand(required_id(
         leaf("list", "List project capabilities"),
@@ -724,7 +794,7 @@ fn provider() -> Command {
                     "max-tokens",
                     "max-tokens",
                     "POSITIVE_INTEGER",
-                    "Anthropic maximum output tokens",
+                    "Anthropic or Ollama maximum output tokens",
                 )
                 .value_parser(clap::value_parser!(u32).range(1..)),
             )
@@ -752,7 +822,7 @@ fn provider() -> Command {
                     "max-completion-tokens",
                     "max-completion-tokens",
                     "POSITIVE_INTEGER",
-                    "OpenRouter maximum completion tokens",
+                    "OpenAI or OpenRouter maximum completion tokens",
                 )
                 .value_parser(clap::value_parser!(u32).range(1..)),
             )

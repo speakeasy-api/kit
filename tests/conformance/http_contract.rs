@@ -46,6 +46,7 @@ const PROJECT: &str = "project_00000000000000000000000001";
 const THREAD: &str = "thread_00000000000000000000000001";
 const RUN: &str = "run_00000000000000000000000001";
 const APPROVAL: &str = "approval_00000000000000000000000001";
+const MCP_CALLBACK: &str = "mcp_callback_00000000000000000000000001";
 const ARTIFACT: &str = "artifact_00000000000000000000000001";
 const REFERENCE: &str = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -213,6 +214,57 @@ fn openapi_run_config_and_failure_match_service_serde() {
     assert_eq!(
         document["components"]["schemas"]["Run"]["properties"]["failure"]["oneOf"][0]["$ref"],
         "#/components/schemas/RunFailure"
+    );
+}
+
+#[test]
+fn openapi_callback_resolution_enforces_kind_mode_and_content_contract() {
+    let document = openapi();
+    let validator = component_validator(&document, "ResolveMcpCallback");
+    let base = json!({
+        "expected_version": 2,
+        "challenge_generation": 1,
+        "schema_digest": format!("sha256:{}", "0".repeat(64)),
+    });
+    let resolution = |kind: &str, mode: &str, action: &str, content: Option<Value>| {
+        let mut value = base.clone();
+        value["kind"] = kind.into();
+        value["mode"] = mode.into();
+        value["action"] = action.into();
+        if let Some(content) = content {
+            value["content"] = content;
+        }
+        value
+    };
+    assert!(
+        validator
+            .validate(&resolution(
+                "elicitation",
+                "form",
+                "accept",
+                Some(json!({"name":"Ada"})),
+            ))
+            .is_ok()
+    );
+    assert!(
+        validator
+            .validate(&resolution("elicitation", "form", "accept", None))
+            .is_err()
+    );
+    assert!(
+        validator
+            .validate(&resolution("sampling", "sampling_request", "accept", None,))
+            .is_ok()
+    );
+    assert!(
+        validator
+            .validate(&resolution(
+                "sampling",
+                "sampling_request",
+                "accept",
+                Some(json!({"forbidden":true})),
+            ))
+            .is_err()
     );
 }
 
@@ -556,6 +608,7 @@ async fn auth_precedes_dispatch_and_existence_is_not_leaked() {
             .replace("{thread_id}", THREAD)
             .replace("{run_id}", RUN)
             .replace("{approval_id}", APPROVAL)
+            .replace("{mcp_callback_id}", MCP_CALLBACK)
             .replace("{artifact_id}", ARTIFACT);
         let method = Method::from_bytes(route.method.as_bytes()).unwrap();
         problem(
@@ -649,6 +702,30 @@ async fn parity_adapters_dispatch_the_registered_service_operation() {
             StatusCode::NOT_FOUND,
         ),
         (
+            Method::GET,
+            format!("/v1/projects/{PROJECT}/mcp-callbacks"),
+            String::new(),
+            "mcp_callback.pending",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            format!("/v1/mcp-callbacks/{MCP_CALLBACK}"),
+            String::new(),
+            "mcp_callback.get",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::POST,
+            format!("/v1/mcp-callbacks/{MCP_CALLBACK}/resolve"),
+            format!(
+                r#"{{"kind":"elicitation","mode":"form","expected_version":2,"challenge_generation":1,"schema_digest":"sha256:{}","action":"decline"}}"#,
+                "0".repeat(64)
+            ),
+            "mcp_callback.resolve",
+            StatusCode::OK,
+        ),
+        (
             Method::POST,
             format!("/v1/runs/{RUN}/auth/resolve"),
             r#"{"granted":true,"expected_version":1}"#.to_owned(),
@@ -701,6 +778,29 @@ async fn parity_adapters_dispatch_the_registered_service_operation() {
 }
 
 #[tokio::test]
+async fn mcp_callback_resolution_rejects_unknown_fields_before_dispatch() {
+    let schema = openapi();
+    let validator = problem_validator(&schema);
+    let service = Arc::new(FixtureService::default());
+    let body = format!(
+        r#"{{"kind":"elicitation","mode":"form","expected_version":2,"challenge_generation":1,"schema_digest":"sha256:{}","action":"decline","url":"https://example.invalid"}}"#,
+        "0".repeat(64)
+    );
+    problem(
+        app(service.clone(), true, Duration::from_secs(1)),
+        request(
+            Method::POST,
+            &format!("/v1/mcp-callbacks/{MCP_CALLBACK}/resolve"),
+            Body::from(body),
+        ),
+        StatusCode::BAD_REQUEST,
+        &validator,
+    )
+    .await;
+    assert_eq!(service.calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn every_mutation_rejects_a_missing_idempotency_key_before_dispatch() {
     let schema = openapi();
     let validator = problem_validator(&schema);
@@ -712,6 +812,7 @@ async fn every_mutation_rejects_a_missing_idempotency_key_before_dispatch() {
             .replace("{thread_id}", THREAD)
             .replace("{run_id}", RUN)
             .replace("{approval_id}", APPROVAL)
+            .replace("{mcp_callback_id}", MCP_CALLBACK)
             .replace("{artifact_id}", ARTIFACT);
         let request = Request::builder()
             .method(route.method)

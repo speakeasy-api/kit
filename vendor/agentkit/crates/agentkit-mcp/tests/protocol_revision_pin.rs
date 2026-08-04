@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use agentkit_core::MetadataMap;
 use agentkit_mcp::{
-    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpError, McpProtocolVersion,
-    McpServerConfig, McpServerId, McpTransportBinding, PINNED_PROTOCOL_VERSION,
-    StdioTransportConfig, StreamableHttpTransportConfig, enforce_pinned_protocol_version,
+    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpError, McpHandlerConfig,
+    McpProtocolVersion, McpResponderRequestContext, McpRoot, McpRootsProvider, McpServerConfig,
+    McpServerId, McpTransportBinding, PINNED_PROTOCOL_VERSION, StdioTransportConfig,
+    StreamableHttpTransportConfig, enforce_pinned_protocol_version,
 };
 use axum::Router;
 use axum::extract::State;
@@ -33,6 +34,18 @@ use tokio::sync::Mutex;
 const PIN: &str = "2025-11-25";
 const KNOWN_OLDER_REVISIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DISCOVERY_METHODS: [&str; 3] = ["tools/list", "resources/list", "prompts/list"];
+
+struct EmptyRoots;
+
+#[async_trait::async_trait]
+impl McpRootsProvider for EmptyRoots {
+    async fn list_roots(
+        &self,
+        _context: McpResponderRequestContext,
+    ) -> Result<Vec<McpRoot>, McpError> {
+        Ok(Vec::new())
+    }
+}
 
 fn refused_revision(error: McpError) -> McpProtocolVersion {
     match error {
@@ -342,6 +355,7 @@ async fn http_reconnect_refuses_revision_downgrade() {
     let connection = McpConnection::connect(&http_config(addr))
         .await
         .expect("initial connect negotiates the pin");
+    let generation = connection.handler_config().session_generation();
     let request = AuthRequest {
         id: "pin-reauth".into(),
         provider: "test".into(),
@@ -360,15 +374,27 @@ async fn http_reconnect_refuses_revision_downgrade() {
         json!("2025-06-18")
     );
     assert_eq!(state.initialize_count.load(Ordering::SeqCst), 2);
+    assert_eq!(connection.handler_config().session_generation(), generation);
+    assert_eq!(
+        connection.negotiated_protocol_version(),
+        Some(PINNED_PROTOCOL_VERSION)
+    );
+    connection
+        .list_tools()
+        .await
+        .expect("failed replacement leaves the old session usable");
 }
 
 #[tokio::test]
 async fn http_reconnect_replaces_server_capabilities() {
     let state = MockState::new(&[PIN, PIN]);
     let addr = spawn_mock(state).await;
-    let connection = McpConnection::connect(&http_config(addr))
-        .await
-        .expect("initial connect succeeds");
+    let connection = McpConnection::connect_with_handler(
+        &http_config(addr),
+        McpHandlerConfig::new().with_roots_provider(Arc::new(EmptyRoots)),
+    )
+    .await
+    .expect("initial connect succeeds");
     let initial = connection.capabilities();
     assert_eq!(initial.tools.unwrap().list_changed, Some(false));
     assert!(initial.resources.is_none());
@@ -390,6 +416,38 @@ async fn http_reconnect_replaces_server_capabilities() {
     let replaced = connection.capabilities();
     assert!(replaced.tools.is_none());
     assert_eq!(replaced.resources.unwrap().list_changed, Some(true));
+    assert!(connection.handler_config().roots.is_some());
+}
+
+#[tokio::test]
+async fn authorized_reconnect_candidate_does_not_replace_live_session_before_commit() {
+    let state = MockState::new(&[PIN, PIN]);
+    let addr = spawn_mock(state.clone()).await;
+    let connection = McpConnection::connect_with_handler(
+        &http_config(addr),
+        McpHandlerConfig::new().with_roots_provider(Arc::new(EmptyRoots)),
+    )
+    .await
+    .expect("initial connect succeeds");
+    let generation = connection.handler_config().session_generation();
+
+    let candidate = connection
+        .begin_reinitialize_authorized()
+        .await
+        .expect("candidate initialize succeeds");
+    assert!(candidate.capabilities().resources.is_some());
+    assert!(connection.capabilities().tools.is_some());
+    assert!(connection.capabilities().resources.is_none());
+    assert_eq!(connection.handler_config().session_generation(), generation);
+
+    candidate.abort().await.expect("candidate closes");
+    assert_eq!(connection.handler_config().session_generation(), generation);
+    connection
+        .list_tools()
+        .await
+        .expect("aborted candidate leaves old session usable");
+    connection.close().await.expect("old session closes");
+    assert_eq!(state.deletes.load(Ordering::SeqCst), 2);
 }
 
 const STDIO_FAKE_SERVER: &str = r#"

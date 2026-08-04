@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use kit::api::service::{AuthorityPath, OperationKind, handlers};
 
-const COMMAND_COUNT: usize = 16;
-const QUERY_COUNT: usize = 19;
+const COMMAND_COUNT: usize = 17;
+const QUERY_COUNT: usize = 21;
 
 #[test]
 fn handler_parity() {

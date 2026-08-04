@@ -13,7 +13,7 @@ pub const AGENTKIT_DIRTY_OVERLAY_SHA256: &str =
 pub const AGENTKIT_EXCLUDED_PATHS_SHA256: &str =
     "6013053000cc27b0e77ed61964266ff38e246bee41fee9ef829c0d8763ecd3ae";
 pub const AGENTKIT_SNAPSHOT_SHA256: &str =
-    "3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077";
+    "0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0";
 pub const RUNLET_SNAPSHOT_SHA256: &str =
     "fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef";
 
@@ -422,13 +422,7 @@ pub fn from_agentkit_part(part: &upstream::Part) -> CanonicalPart {
 pub fn from_agentkit_usage(usage: &upstream::Usage) -> CanonicalUsage {
     let tokens = usage.tokens.as_ref();
     let cost = usage.cost.as_ref();
-    let uncached_input_tokens = tokens.and_then(|tokens| {
-        tokens
-            .cached_input_tokens
-            .zip(tokens.cache_write_input_tokens)
-            .and_then(|(read, write)| read.checked_add(write))
-            .and_then(|cached| tokens.input_tokens.checked_sub(cached))
-    });
+    let uncached_input_tokens = tokens.map(|tokens| tokens.input_tokens);
     CanonicalUsage {
         input_tokens: tokens.map(|tokens| tokens.input_tokens),
         output_tokens: tokens.map(|tokens| tokens.output_tokens),
@@ -791,5 +785,26 @@ fn approval_interrupt(request: &ApprovalRequest) -> CanonicalInterrupt {
         message: Some(request.summary.clone()),
         transcript_len: None,
         metadata: Some(request.metadata.clone()),
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn bridge_preserves_normalized_categories_without_subtracting_again() {
+        let usage = upstream::Usage::new(
+            upstream::TokenUsage::new(50, 25)
+                .with_cached_input_tokens(30)
+                .with_cache_write_input_tokens(20)
+                .with_reasoning_tokens(15),
+        );
+        let canonical = from_agentkit_usage(&usage);
+        assert_eq!(canonical.uncached_input_tokens, Some(50));
+        assert_eq!(canonical.cached_input_tokens, Some(30));
+        assert_eq!(canonical.cache_write_input_tokens, Some(20));
+        assert_eq!(canonical.output_tokens, Some(25));
+        assert_eq!(canonical.reasoning_tokens, Some(15));
     }
 }

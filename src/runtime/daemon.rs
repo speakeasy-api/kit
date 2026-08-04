@@ -192,6 +192,8 @@ struct DaemonRuntime {
     artifacts: Arc<ArtifactStore>,
     backup_snapshot: Arc<Mutex<()>>,
     executor: Arc<RunExecutor>,
+    project_root: PathBuf,
+    callback_secrets: crate::protocols::mcp::responders::CallbackSecretRegistry,
 }
 
 impl Scheduler for DaemonRuntime {
@@ -264,6 +266,70 @@ impl ArtifactService for DaemonRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.artifacts
             .commit_verified(principal_id, project_id, command, commit)
+    }
+
+    fn store_mcp_callback_content(
+        &self,
+        principal_id: PrincipalId,
+        project_id: ProjectId,
+        run_id: crate::domain::ids::RunId,
+        callback_id: crate::domain::ids::McpCallbackId,
+        idempotency_key: &IdempotencyKey,
+        bytes: &[u8],
+        expires_at_unix_micros: i64,
+    ) -> Result<crate::domain::mcp_callback::McpCallbackArtifactRef, ServiceError> {
+        let _snapshot = self
+            .backup_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.artifacts.store_mcp_callback_content(
+            principal_id,
+            project_id,
+            run_id,
+            callback_id,
+            idempotency_key,
+            bytes,
+            expires_at_unix_micros,
+        )
+    }
+
+    fn mcp_callback_revision_live(&self, revision: &str) -> bool {
+        crate::workspace::revision::ManagedWorkspace::open(&self.project_root)
+            .and_then(|workspace| workspace.current_revision())
+            .is_ok_and(|current| current.id().to_string() == revision)
+    }
+
+    fn mcp_callback_content_public(
+        &self,
+        callback: &crate::domain::mcp_callback::McpCallbackProjection,
+        content: &serde_json::Value,
+    ) -> bool {
+        self.callback_secrets
+            .callback_content_public(callback, content)
+    }
+
+    fn with_mcp_callback_revision<T>(
+        &self,
+        revision: &str,
+        commit: impl FnOnce(&str) -> Result<T, ServiceError>,
+    ) -> Result<T, ServiceError> {
+        let expected =
+            crate::workspace::revision::RevisionId::parse(revision).ok_or_else(|| {
+                ServiceError::Conflict("callback workspace revision is invalid".to_owned())
+            })?;
+        let workspace = crate::workspace::revision::ManagedWorkspace::open(&self.project_root)
+            .map_err(|_| {
+                ServiceError::Conflict("callback workspace revision is unavailable".to_owned())
+            })?;
+        let _guard = workspace
+            .stable_read_guard_before(
+                expected,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .map_err(|_| {
+                ServiceError::Conflict("callback workspace revision is stale".to_owned())
+            })?;
+        commit(revision)
     }
 }
 
@@ -864,6 +930,16 @@ impl Daemon {
         let database = state_root.join(DATABASE_FILE);
         let store = SqliteServiceStore::open(&database, &authority)
             .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        let artifact_store = Arc::new(
+            ArtifactStore::open(state_root.join("artifacts"))
+                .map_err(|error| DaemonError::Setup(error.to_string()))?,
+        );
+        crate::store::sqlite::mcp_callback::McpCallbackStore::open(&database)
+            .and_then(|store| {
+                store.reconcile_artifact_publications()?;
+                store.interrupt_inflight()
+            })
+            .map_err(|error| DaemonError::Setup(error.to_string()))?;
         let scheduler = DurableScheduler::open(&database)
             .map_err(|error| DaemonError::Setup(error.to_string()))?;
         scheduler
@@ -880,10 +956,6 @@ impl Daemon {
                 }
                 Err(error) => return Err(DaemonError::Setup(error.to_string())),
             };
-        let artifact_store = Arc::new(
-            ArtifactStore::open(state_root.join("artifacts"))
-                .map_err(|error| DaemonError::Setup(error.to_string()))?,
-        );
         let model_adapter_config = config.model_adapter.ok_or_else(|| {
             DaemonError::Setup(
                 "model adapter unavailable; configure a profile with `kit provider add`, or set KIT_PROVIDER and its provider settings".to_owned(),
@@ -1012,6 +1084,7 @@ impl Daemon {
         } else {
             None
         };
+        let callback_secrets = crate::protocols::mcp::responders::CallbackSecretRegistry::default();
         let mut executor_config = RunExecutorConfig::new(
             &database,
             Arc::clone(&artifact_store),
@@ -1019,6 +1092,7 @@ impl Daemon {
             scheduler.clone(),
             model_adapter,
         )
+        .with_callback_secret_registry(callback_secrets.clone())
         .with_project_root(&config.project_root)
         .with_process_registry(exec_manager.clone())
         .with_verification_registry(config.verification_registry.clone())
@@ -1151,6 +1225,8 @@ impl Daemon {
                         artifacts: artifact_store.clone(),
                         backup_snapshot: Arc::clone(&backup_snapshot),
                         executor: Arc::clone(&executor),
+                        project_root: config.project_root.clone(),
+                        callback_secrets,
                     },
                     telemetry.clone(),
                 ),

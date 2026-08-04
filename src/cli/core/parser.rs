@@ -13,7 +13,8 @@ use crate::{
     },
     domain::{
         events::{ApprovalDecision, SchemaVersion},
-        ids::{ArtifactId, ProjectId, ThreadId},
+        ids::{ArtifactId, McpCallbackId, ProjectId, ThreadId},
+        mcp_callback::{McpCallbackAction, McpCallbackKind, McpCallbackMode},
     },
     store::sqlite::idempotency::IdempotencyKey,
 };
@@ -249,6 +250,30 @@ pub const CLI_OPERATIONS: &[OperationDescriptor] = &[
         "auth resolve",
         Some("auth.resolve"),
         Some("resolveAuth"),
+        Some("ResourceReceipt"),
+        true,
+        false,
+    ),
+    operation(
+        "mcp-callback list",
+        Some("mcp_callback.pending"),
+        Some("listPendingMcpCallbacks"),
+        Some("McpCallbackList"),
+        false,
+        false,
+    ),
+    operation(
+        "mcp-callback show",
+        Some("mcp_callback.get"),
+        Some("getMcpCallback"),
+        Some("McpCallback"),
+        false,
+        false,
+    ),
+    operation(
+        "mcp-callback resolve",
+        Some("mcp_callback.resolve"),
+        Some("resolveMcpCallback"),
         Some("ResourceReceipt"),
         true,
         false,
@@ -722,6 +747,57 @@ fn invocation(
                         expected_version: number(matches, "version"),
                     },
                     run_id,
+                    idempotency_key,
+                )
+            }
+            _ => unreachable!(),
+        },
+        "mcp-callback" => match subcommand(matches) {
+            ("list", matches) => Ok(query(Query::PendingMcpCallbacks {
+                project_id: required_id(matches, "project", "project-id", "--project")?,
+            })),
+            ("show", matches) => Ok(query(Query::GetMcpCallback {
+                callback_id: required_id(
+                    matches,
+                    "mcp-callback",
+                    "mcp-callback-id",
+                    "--mcp-callback",
+                )?,
+            })),
+            ("resolve", matches) => {
+                let callback_id: McpCallbackId =
+                    required_id(matches, "mcp-callback", "mcp-callback-id", "--mcp-callback")?;
+                let action = match string(matches, "action") {
+                    "accept" => McpCallbackAction::Accept,
+                    "decline" => McpCallbackAction::Decline,
+                    "cancel" => McpCallbackAction::Cancel,
+                    _ => unreachable!("Clap validates callback actions"),
+                };
+                let kind = match string(matches, "kind") {
+                    "elicitation" => McpCallbackKind::Elicitation,
+                    "sampling" => McpCallbackKind::Sampling,
+                    _ => unreachable!("Clap validates callback kinds"),
+                };
+                let mode = match string(matches, "mode") {
+                    "form" => McpCallbackMode::Form,
+                    "sampling-request" => McpCallbackMode::SamplingRequest,
+                    "sampling-response" => McpCallbackMode::SamplingResponse,
+                    _ => unreachable!("Clap validates callback modes"),
+                };
+                mutation(
+                    Command::ResolveMcpCallback {
+                        schema_version: SchemaVersion::CURRENT,
+                        callback_id,
+                        kind,
+                        mode,
+                        expected_version: number(matches, "version"),
+                        challenge_generation: number(matches, "challenge-generation"),
+                        schema_digest: string(matches, "schema-digest").to_owned(),
+                        action,
+                        content: optional(matches, "content", "--content")?,
+                        artifact_refs: Vec::new(),
+                    },
+                    callback_id,
                     idempotency_key,
                 )
             }

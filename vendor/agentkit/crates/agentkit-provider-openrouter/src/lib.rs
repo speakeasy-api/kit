@@ -380,6 +380,41 @@ impl CompletionsProvider for OpenRouterProvider {
         &self.request_config
     }
 
+    fn apply_generation_controls(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        controls: &agentkit_loop::GenerationControls,
+    ) -> Result<(), LoopError> {
+        if let Some(maximum) = controls.max_output_tokens {
+            if maximum == 0
+                || self
+                    .request_config
+                    .max_completion_tokens
+                    .is_some_and(|cap| maximum > cap)
+            {
+                return Err(LoopError::Unsupported(
+                    "OpenRouter max output tokens exceed the configured provider cap".into(),
+                ));
+            }
+            body.insert("max_completion_tokens".into(), Value::from(maximum));
+        }
+        if let Some(temperature) = controls.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(LoopError::Unsupported(
+                    "OpenRouter temperature is outside the supported range".into(),
+                ));
+            }
+            body.insert("temperature".into(), serde_json::json!(temperature));
+        }
+        if let Some(stops) = &controls.stop_sequences {
+            body.insert(
+                "stop".into(),
+                Value::Array(stops.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        Ok(())
+    }
+
     fn preprocess_request(
         &self,
         builder: agentkit_http::HttpRequestBuilder,
@@ -904,6 +939,11 @@ impl OpenRouterAdapter {
         let provider = OpenRouterProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Configured provider output-token ceiling, if one was materialized.
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.0.provider_config().max_completion_tokens
+    }
 }
 
 #[async_trait]
@@ -981,6 +1021,7 @@ mod tests {
             available_tools: Vec::new(),
             cache,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         }
     }
@@ -1067,6 +1108,42 @@ mod tests {
                 }),
             ]))
         );
+    }
+
+    #[test]
+    fn per_turn_generation_controls_override_the_exact_request_fields() {
+        let provider = OpenRouterProvider::from(
+            OpenRouterConfig::new("sk-test", "provider/model").with_max_completion_tokens(64),
+        );
+        let mut body = serde_json::Map::new();
+        provider
+            .apply_generation_controls(
+                &mut body,
+                &agentkit_loop::GenerationControls {
+                    max_output_tokens: Some(32),
+                    temperature: Some(0.25),
+                    stop_sequences: Some(vec!["STOP".into()]),
+                },
+            )
+            .unwrap();
+        assert_eq!(body["max_completion_tokens"], 32);
+        assert_eq!(body["temperature"], 0.25);
+        assert_eq!(body["stop"], serde_json::json!(["STOP"]));
+    }
+
+    #[test]
+    fn real_usage_cost_fixture_preserves_provider_reported_usd() {
+        let provider = OpenRouterProvider::from(OpenRouterConfig::new("sk-test", "model"));
+        let raw: Value = serde_json::from_str(
+            r#"{"id":"gen-1","model":"openai/gpt-5","usage":{"prompt_tokens":100,"completion_tokens":40,"cost":0.000123}}"#,
+        )
+        .unwrap();
+        let mut usage = Some(Usage::default());
+        let mut metadata = MetadataMap::new();
+        provider.postprocess_response(&mut usage, &mut metadata, &raw);
+        let cost = usage.unwrap().cost.unwrap();
+        assert_eq!(cost.amount, 0.000123);
+        assert_eq!(cost.currency, "USD");
     }
 
     #[test]

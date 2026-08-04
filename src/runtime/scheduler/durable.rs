@@ -30,6 +30,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum AdmissionKind {
     Run,
     Model,
+    Callback,
     Tool,
     Process,
 }
@@ -39,6 +40,7 @@ impl AdmissionKind {
         match self {
             Self::Run => "run",
             Self::Model => "model",
+            Self::Callback => "callback",
             Self::Tool => "tool",
             Self::Process => "process",
         }
@@ -191,6 +193,9 @@ pub enum SchedulerError {
     StaleFence,
     InvalidTransition,
     Exhausted(Exhaustion),
+    BudgetBreach(Exhaustion),
+    ActualOverage,
+    BudgetBlocked,
 }
 
 impl fmt::Display for SchedulerError {
@@ -230,6 +235,21 @@ impl fmt::Display for SchedulerError {
                 exhaustion.reserved,
                 exhaustion.requested
             ),
+            Self::BudgetBreach(exhaustion) => write!(
+                formatter,
+                "{} budget breached: maximum {}, committed {}, reserved {}, actual {}",
+                exhaustion.resource,
+                exhaustion.maximum,
+                exhaustion.committed,
+                exhaustion.reserved,
+                exhaustion.requested
+            ),
+            Self::BudgetBlocked => {
+                formatter.write_str("run budget is blocked by unreconciled overage")
+            }
+            Self::ActualOverage => {
+                formatter.write_str("provider actual usage exceeded its reservation")
+            }
         }
     }
 }
@@ -813,6 +833,9 @@ impl DurableScheduler {
             }
             return Err(SchedulerError::Conflict);
         }
+        if run.budget_breached {
+            return Err(SchedulerError::BudgetBlocked);
+        }
         let duplicate: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM scheduler_reservations WHERE run_id = ?1 AND idempotency_key = ?2)",
             params![request.run_id.to_string(), request.idempotency_key],
@@ -916,10 +939,17 @@ impl DurableScheduler {
         let transaction = immediate(&mut connection)?;
         let record =
             reservation_by_id(&transaction, id)?.ok_or(SchedulerError::UnknownReservation)?;
-        if record.snapshot.status() == ReservationStatus::Reconciled {
+        if matches!(
+            record.snapshot.status(),
+            ReservationStatus::Reconciled | ReservationStatus::ActualOverage
+        ) {
             if record.snapshot.spend() == actual {
                 transaction.commit()?;
-                return Ok(record.snapshot);
+                return if record.snapshot.status() == ReservationStatus::ActualOverage {
+                    Err(SchedulerError::ActualOverage)
+                } else {
+                    Ok(record.snapshot)
+                };
             }
             return Err(SchedulerError::Conflict);
         }
@@ -933,14 +963,34 @@ impl DurableScheduler {
             .committed
             .checked_sub(record.snapshot.spend())
             .ok_or(SchedulerError::Conflict)?;
-        run.budget
-            .check(committed, totals.reserved, actual)
-            .map_err(SchedulerError::Exhausted)?;
+        let breach = run.budget.check(committed, totals.reserved, actual).err();
+        let reservation_overage = Spend::new(
+            actual
+                .cost_microusd()
+                .saturating_sub(record.snapshot.spend().cost_microusd()),
+            actual
+                .tokens()
+                .saturating_sub(record.snapshot.spend().tokens()),
+            actual
+                .turns()
+                .saturating_sub(record.snapshot.spend().turns()),
+            actual
+                .tools()
+                .saturating_sub(record.snapshot.spend().tools()),
+            actual
+                .processes()
+                .saturating_sub(record.snapshot.spend().processes()),
+        );
         let now = store_time(&transaction)?;
+        let terminal_status = if reservation_overage == Spend::ZERO {
+            ReservationStatus::Reconciled
+        } else {
+            ReservationStatus::ActualOverage
+        };
         transaction.execute(
             "UPDATE scheduler_reservations
              SET cost = ?2, tokens = ?3, turns = ?4, tools = ?5, processes = ?6,
-                 state = 'reconciled', updated_at = ?7
+                  state = ?7, updated_at = ?8
              WHERE reservation_id = ?1",
             params![
                 reservation_key(id),
@@ -949,10 +999,35 @@ impl DurableScheduler {
                 actual_values[2],
                 actual_values[3],
                 actual_values[4],
+                status_name(terminal_status),
                 now,
             ],
         )?;
+        if reservation_overage != Spend::ZERO {
+            transaction.execute(
+                "UPDATE scheduler_runs
+                 SET budget_breached = 1,
+                     cost_overage = max(cost_overage, ?2),
+                     token_overage = max(token_overage, ?3),
+                     turn_overage = max(turn_overage, ?4), updated_at = ?5
+                 WHERE run_id = ?1",
+                params![
+                    record.run_id.to_string(),
+                    to_i64(reservation_overage.cost_microusd())?,
+                    to_i64(reservation_overage.tokens())?,
+                    to_i64(reservation_overage.turns())?,
+                    now,
+                ],
+            )?;
+        }
+        refresh_budget_breach(&transaction, record.run_id, now)?;
         transaction.commit()?;
+        if reservation_overage != Spend::ZERO {
+            return Err(SchedulerError::ActualOverage);
+        }
+        if let Some(exhaustion) = breach {
+            return Err(SchedulerError::BudgetBreach(exhaustion));
+        }
         Ok(ReservationSnapshot::new(
             id,
             actual,
@@ -1127,11 +1202,58 @@ impl DurableScheduler {
              WHERE state = 'reserved' AND dispatch_state IN ('undispatched', 'canceled')",
             [now],
         )?;
-        let dispatched_unknown = transaction.execute(
-            "UPDATE scheduler_reservations SET state = 'reconciled', dispatch_state = 'unknown', updated_at = ?1
-             WHERE state = 'reserved' AND dispatch_state IN ('dispatched', 'unknown')",
+        transaction.execute(
+            "UPDATE scheduler_reservations AS reservation
+             SET cost = CAST((SELECT json_extract(CAST(event.payload AS TEXT), '$.settlement.cost_microusd')
+                              FROM events AS event
+                              WHERE event.event_type = 'model_call.outcome'
+                                AND json_extract(CAST(event.payload AS TEXT), '$.reservation_id') = reservation.reservation_id
+                                AND json_extract(CAST(event.payload AS TEXT), '$.charged') = 1
+                                AND json_type(CAST(event.payload AS TEXT), '$.settlement') = 'object'
+                              ORDER BY event.commit_position DESC LIMIT 1) AS INTEGER),
+                 tokens = CAST((SELECT json_extract(CAST(event.payload AS TEXT), '$.settlement.tokens')
+                                FROM events AS event
+                                WHERE event.event_type = 'model_call.outcome'
+                                  AND json_extract(CAST(event.payload AS TEXT), '$.reservation_id') = reservation.reservation_id
+                                  AND json_extract(CAST(event.payload AS TEXT), '$.charged') = 1
+                                  AND json_type(CAST(event.payload AS TEXT), '$.settlement') = 'object'
+                                ORDER BY event.commit_position DESC LIMIT 1) AS INTEGER),
+                 turns = 1, tools = 0, processes = 0,
+                 state = CASE
+                   WHEN json_extract(CAST((SELECT event.payload FROM events AS event
+                     WHERE event.event_type = 'model_call.outcome'
+                       AND json_extract(CAST(event.payload AS TEXT), '$.reservation_id') = reservation.reservation_id
+                     ORDER BY event.commit_position DESC LIMIT 1) AS TEXT), '$.policy_violation')
+                     LIKE '%provider_%_overage%'
+                   THEN 'actual_overage' ELSE 'reconciled' END,
+                 updated_at = ?1
+             WHERE state IN ('reserved', 'debited') AND dispatch_state = 'dispatched'
+               AND EXISTS (
+                 SELECT 1 FROM events AS event
+                 WHERE event.event_type = 'model_call.outcome'
+                   AND json_extract(CAST(event.payload AS TEXT), '$.reservation_id') = reservation.reservation_id
+                   AND json_extract(CAST(event.payload AS TEXT), '$.charged') = 1
+                   AND json_type(CAST(event.payload AS TEXT), '$.settlement') = 'object'
+               )",
             [now],
         )?;
+        let dispatched_unknown = transaction.execute(
+            "UPDATE scheduler_reservations SET state = 'reconciled', dispatch_state = 'unknown', updated_at = ?1
+             WHERE state IN ('reserved', 'debited') AND dispatch_state IN ('dispatched', 'unknown')
+               AND NOT (kind = 'callback' AND state = 'debited')",
+            [now],
+        )?;
+        let run_ids = transaction
+            .prepare("SELECT run_id FROM scheduler_runs")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for run_id in run_ids {
+            refresh_budget_breach(
+                &transaction,
+                run_id.parse().map_err(|_| SchedulerError::Conflict)?,
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(ReconciliationReport {
             released,
@@ -1158,8 +1280,10 @@ impl DurableScheduler {
         let record =
             reservation_by_id(&transaction, id)?.ok_or(SchedulerError::UnknownReservation)?;
         if record.snapshot.status() == target
-            || matches!(record.snapshot.status(), ReservationStatus::Reconciled)
-                && target == ReservationStatus::Debited
+            || matches!(
+                record.snapshot.status(),
+                ReservationStatus::Reconciled | ReservationStatus::ActualOverage
+            ) && target == ReservationStatus::Debited
         {
             transaction.commit()?;
             return Ok(record.snapshot);
@@ -1306,6 +1430,7 @@ struct ReservationRun {
     attempt_id: Option<String>,
     fence: u64,
     phase: String,
+    budget_breached: bool,
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), SchedulerError> {
@@ -1330,7 +1455,11 @@ fn migrate(connection: &mut Connection) -> Result<(), SchedulerError> {
              process_limit INTEGER NOT NULL CHECK (process_limit >= 0),
              config_digest TEXT NOT NULL DEFAULT 'legacy',
              queue_position INTEGER NOT NULL UNIQUE CHECK (queue_position > 0),
-              phase TEXT NOT NULL CHECK (phase IN ('queued', 'admitted', 'terminal', 'canceled')),
+               phase TEXT NOT NULL CHECK (phase IN ('queued', 'admitted', 'terminal', 'canceled')),
+               budget_breached INTEGER NOT NULL DEFAULT 0 CHECK (budget_breached IN (0, 1)),
+               cost_overage INTEGER NOT NULL DEFAULT 0 CHECK (cost_overage >= 0),
+               token_overage INTEGER NOT NULL DEFAULT 0 CHECK (token_overage >= 0),
+               turn_overage INTEGER NOT NULL DEFAULT 0 CHECK (turn_overage >= 0),
               attempt_id TEXT,
               attempt_fence INTEGER NOT NULL DEFAULT 0 CHECK (attempt_fence >= 0),
               executor_quiescent INTEGER NOT NULL DEFAULT 0 CHECK (executor_quiescent IN (0, 1)),
@@ -1346,13 +1475,13 @@ fn migrate(connection: &mut Connection) -> Result<(), SchedulerError> {
              attempt_id TEXT,
              attempt_fence INTEGER,
              idempotency_key TEXT NOT NULL,
-             kind TEXT NOT NULL CHECK (kind IN ('run', 'model', 'tool', 'process')),
+             kind TEXT NOT NULL CHECK (kind IN ('run', 'model', 'callback', 'tool', 'process')),
              cost INTEGER NOT NULL CHECK (cost >= 0),
              tokens INTEGER NOT NULL CHECK (tokens >= 0),
              turns INTEGER NOT NULL CHECK (turns >= 0),
              tools INTEGER NOT NULL CHECK (tools >= 0),
              processes INTEGER NOT NULL CHECK (processes >= 0),
-             state TEXT NOT NULL CHECK (state IN ('reserved', 'debited', 'released', 'reconciled')),
+             state TEXT NOT NULL CHECK (state IN ('reserved', 'debited', 'released', 'reconciled', 'actual_overage')),
              dispatch_state TEXT NOT NULL CHECK (dispatch_state IN ('undispatched', 'dispatched', 'canceled', 'unknown')),
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
@@ -1382,6 +1511,63 @@ fn migrate(connection: &mut Connection) -> Result<(), SchedulerError> {
         transaction.execute(
             "ALTER TABLE scheduler_runs ADD COLUMN terminal_event_watermark INTEGER CHECK (terminal_event_watermark >= 0)",
             [],
+        )?;
+    }
+    if !column_exists(&transaction, "scheduler_runs", "budget_breached")? {
+        transaction.execute(
+            "ALTER TABLE scheduler_runs ADD COLUMN budget_breached INTEGER NOT NULL DEFAULT 0 CHECK (budget_breached IN (0, 1))",
+            [],
+        )?;
+    }
+    for (column, definition) in [
+        (
+            "cost_overage",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (cost_overage >= 0)",
+        ),
+        (
+            "token_overage",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (token_overage >= 0)",
+        ),
+        (
+            "turn_overage",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (turn_overage >= 0)",
+        ),
+    ] {
+        if !column_exists(&transaction, "scheduler_runs", column)? {
+            transaction.execute(
+                &format!("ALTER TABLE scheduler_runs ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    let reservation_schema: String = transaction.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='scheduler_reservations'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !reservation_schema.contains("'callback'")
+        || !reservation_schema.contains("'actual_overage'")
+    {
+        transaction.execute_batch(
+            "DROP TRIGGER IF EXISTS run_to_trial_effect_delete_guard;
+             ALTER TABLE scheduler_reservations RENAME TO scheduler_reservations_legacy;
+             CREATE TABLE scheduler_reservations (
+                 reservation_id TEXT PRIMARY KEY,
+                 run_id TEXT NOT NULL REFERENCES scheduler_runs(run_id) ON DELETE CASCADE,
+                 principal_id TEXT NOT NULL, attempt_id TEXT, attempt_fence INTEGER,
+                 idempotency_key TEXT NOT NULL,
+                 kind TEXT NOT NULL CHECK (kind IN ('run', 'model', 'callback', 'tool', 'process')),
+                 cost INTEGER NOT NULL CHECK (cost >= 0), tokens INTEGER NOT NULL CHECK (tokens >= 0),
+                 turns INTEGER NOT NULL CHECK (turns >= 0), tools INTEGER NOT NULL CHECK (tools >= 0),
+                 processes INTEGER NOT NULL CHECK (processes >= 0),
+                 state TEXT NOT NULL CHECK (state IN ('reserved', 'debited', 'released', 'reconciled', 'actual_overage')),
+                 dispatch_state TEXT NOT NULL CHECK (dispatch_state IN ('undispatched', 'dispatched', 'canceled', 'unknown')),
+                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                 UNIQUE (run_id, idempotency_key)
+             );
+             INSERT INTO scheduler_reservations SELECT * FROM scheduler_reservations_legacy;
+             DROP TABLE scheduler_reservations_legacy;
+             CREATE INDEX scheduler_reservations_run ON scheduler_reservations(run_id, state);",
         )?;
     }
     transaction.execute_batch(
@@ -1786,7 +1972,7 @@ fn reservation_run(
     transaction
         .query_row(
             "SELECT principal_id, cost_limit, token_limit, turn_limit, tool_limit, process_limit,
-                    attempt_id, attempt_fence, phase FROM scheduler_runs WHERE run_id = ?1",
+                    attempt_id, attempt_fence, phase, budget_breached FROM scheduler_runs WHERE run_id = ?1",
             [run_id.to_string()],
             |row| {
                 Ok(ReservationRun {
@@ -1801,6 +1987,7 @@ fn reservation_run(
                     attempt_id: row.get(6)?,
                     fence: row.get(7)?,
                     phase: row.get(8)?,
+                    budget_breached: row.get(9)?,
                 })
             },
         )
@@ -1890,9 +2077,49 @@ fn totals_tx(connection: &Connection, run_id: RunId) -> Result<BudgetTotals, Sch
         })?)
     };
     Ok(BudgetTotals {
-        committed: sum("'debited', 'reconciled'")?,
+        committed: sum("'debited', 'reconciled', 'actual_overage'")?,
         reserved: sum("'reserved'")?,
     })
+}
+
+fn refresh_budget_breach(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    now: i64,
+) -> Result<(), SchedulerError> {
+    let run = reservation_run(transaction, run_id)?.ok_or(SchedulerError::UnknownRun)?;
+    let totals = totals_tx(transaction, run_id)?.committed;
+    let limits = run.budget.limits();
+    let overage = Spend::new(
+        totals
+            .cost_microusd()
+            .saturating_sub(limits.cost_microusd()),
+        totals.tokens().saturating_sub(limits.tokens()),
+        totals.turns().saturating_sub(limits.turns()),
+        totals.tools().saturating_sub(limits.tools()),
+        totals.processes().saturating_sub(limits.processes()),
+    );
+    let actual_overage: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scheduler_reservations WHERE run_id = ?1 AND state = 'actual_overage')",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "UPDATE scheduler_runs
+         SET budget_breached = budget_breached OR ?2,
+             cost_overage = max(cost_overage, ?3),
+             token_overage = max(token_overage, ?4),
+             turn_overage = max(turn_overage, ?5), updated_at = ?6 WHERE run_id = ?1",
+        params![
+            run_id.to_string(),
+            actual_overage || overage != Spend::ZERO,
+            to_i64(overage.cost_microusd())?,
+            to_i64(overage.tokens())?,
+            to_i64(overage.turns())?,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 fn remove_orphan_runs(transaction: &Transaction<'_>) -> Result<usize, SchedulerError> {
@@ -1915,6 +2142,13 @@ fn validate_category(kind: AdmissionKind, spend: Spend) -> Result<(), SchedulerE
     let valid = match kind {
         AdmissionKind::Run => true,
         AdmissionKind::Model => spend.turns() > 0 && spend.tools() == 0 && spend.processes() == 0,
+        AdmissionKind::Callback => {
+            spend.turns() > 0
+                && spend.cost_microusd() == 0
+                && spend.tokens() == 0
+                && spend.tools() == 0
+                && spend.processes() == 0
+        }
         AdmissionKind::Tool => spend.tools() > 0 && spend.processes() == 0,
         AdmissionKind::Process => spend.processes() > 0,
     };
@@ -1949,6 +2183,7 @@ fn status_name(status: ReservationStatus) -> &'static str {
         ReservationStatus::Debited => "debited",
         ReservationStatus::Released => "released",
         ReservationStatus::Reconciled => "reconciled",
+        ReservationStatus::ActualOverage => "actual_overage",
     }
 }
 
@@ -1958,6 +2193,7 @@ fn parse_status(value: &str) -> Result<ReservationStatus, rusqlite::Error> {
         "debited" => Ok(ReservationStatus::Debited),
         "released" => Ok(ReservationStatus::Released),
         "reconciled" => Ok(ReservationStatus::Reconciled),
+        "actual_overage" => Ok(ReservationStatus::ActualOverage),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -1966,6 +2202,7 @@ fn parse_kind(value: &str) -> Result<AdmissionKind, rusqlite::Error> {
     match value {
         "run" => Ok(AdmissionKind::Run),
         "model" => Ok(AdmissionKind::Model),
+        "callback" => Ok(AdmissionKind::Callback),
         "tool" => Ok(AdmissionKind::Tool),
         "process" => Ok(AdmissionKind::Process),
         _ => Err(rusqlite::Error::InvalidQuery),

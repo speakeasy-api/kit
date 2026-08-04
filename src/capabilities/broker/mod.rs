@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::BTreeSet, fmt, io::Read, sync::atomic::Ordering};
+use std::{collections::BTreeSet, fmt, io::Read, sync::atomic::Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,14 +27,18 @@ use crate::{
     domain::{
         commands::ExpectedVersion,
         events::{EntityId, EventType, SchemaVersion},
-        ids::{ApprovalId, EventId, ToolCallId},
+        ids::{ApprovalId, EventId, ProjectId, RunId, ToolCallId},
         secret::SecretHandle,
     },
     runtime::scheduler::{limits::Spend, reserve::BudgetLedger},
-    store::artifacts::{ArtifactClass, ArtifactMetadata, ArtifactRetention, ArtifactStore},
+    store::artifacts::{
+        ArtifactClass, ArtifactEnvelopeBinding, ArtifactMetadata, ArtifactPublication,
+        ArtifactRetention, ArtifactStore,
+    },
     store::sqlite::{
         append::{
-            AppendCommand, AppendOutcome, ExpectedStreamVersion, NewEvent, SqliteStore, StoreError,
+            AppendCommand, AppendOutcome, ExpectedStreamVersion, NewEvent,
+            PendingArtifactPublication, SqliteStore, StoreError,
         },
         idempotency::{
             CanonicalRequestDigest, IdempotencyKey, IdempotencyScope, IdempotencyStatus,
@@ -110,6 +114,7 @@ impl OwnedBrokerInvocation {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_lifecycle(
         server: &str,
+        initialize_arguments: serde_json::Value,
         authenticated: &crate::api::auth::contract::AuthenticatedPrincipal,
         config: &crate::domain::config::RunConfigSnapshot,
         workspace_id: crate::domain::ids::WorkspaceId,
@@ -215,10 +220,8 @@ impl OwnedBrokerInvocation {
             schema,
             argument_constraints: constraints,
             effect,
-            arguments: serde_json::to_vec(
-                &crate::protocols::mcp::transport::authorized_initialize_arguments(),
-            )
-            .map_err(|_| BrokerError::InvalidAuthState)?,
+            arguments: serde_json::to_vec(&initialize_arguments)
+                .map_err(|_| BrokerError::InvalidAuthState)?,
             workspace_id,
             project_id: config.project_id(),
             invocation_id,
@@ -687,6 +690,8 @@ pub struct BrokerResult {
 pub(crate) struct ExternalResultAuthority {
     provenance: CallProvenance,
     metadata: ArtifactMetadata,
+    project_id: ProjectId,
+    run_id: RunId,
 }
 
 impl ExternalResultAuthority {
@@ -696,6 +701,17 @@ impl ExternalResultAuthority {
 
     pub(crate) const fn metadata(&self) -> &ArtifactMetadata {
         &self.metadata
+    }
+
+    pub(crate) fn artifact_binding(&self) -> ArtifactEnvelopeBinding {
+        ArtifactEnvelopeBinding {
+            principal: self.provenance.principal_id().to_string(),
+            project: self.project_id.to_string(),
+            run: self.run_id.to_string(),
+            purpose: "mcp_invocation_result".to_owned(),
+            invocation_id: Some(self.provenance.invocation_id().to_string()),
+            callback_id: None,
+        }
     }
 }
 
@@ -913,6 +929,8 @@ pub(crate) fn replay(
                     .to_string()
                     .as_str(),
                 &request.envelope.project_id.to_string(),
+                &request.envelope.config.run_id().to_string(),
+                request.envelope.invocation_id,
             )?;
             let mut result = broker_result(invocation)?;
             result.presentation = presentation;
@@ -1010,6 +1028,8 @@ fn prepare_inner(
             Ok::<_, BrokerError>(ExternalResultAuthority {
                 provenance,
                 metadata,
+                project_id: request.envelope.project_id,
+                run_id: request.envelope.config.run_id(),
             })
         })
         .transpose()
@@ -1059,43 +1079,45 @@ pub(crate) fn complete(
 pub(crate) fn complete_external(
     request: &BrokerInvocation<'_>,
     authorized: BrokerAuthorizedInvocation,
-    external: (DispatchOutcome, Presentation),
+    external: (DispatchOutcome, Presentation, ArtifactPublication),
     artifacts: &ArtifactStore,
     store: &mut SqliteStore,
     budget: &BudgetLedger,
     crash_at: Option<InvocationCrashPoint>,
 ) -> Result<BrokerResult, BrokerError> {
-    let (dispatched, presentation) = external;
-    let artifact = match verify_external_dispatch(&authorized, &dispatched, artifacts) {
-        Ok(artifact) => artifact,
-        Err(_) => {
-            return complete(
-                request,
-                authorized,
-                DispatchOutcome::Failed {
-                    code: "mcp.invalid_external_result".to_owned(),
-                },
-                store,
-                budget,
-                crash_at,
-            );
-        }
-    };
-    let expected_presentation = match presentation_from_dispatch(&dispatched, artifacts) {
-        Ok(Some(presentation)) => presentation,
-        Ok(None) | Err(_) => {
-            return complete(
-                request,
-                authorized,
-                DispatchOutcome::Failed {
-                    code: "mcp.presentation_reconstruction_failed".to_owned(),
-                },
-                store,
-                budget,
-                crash_at,
-            );
-        }
-    };
+    let (dispatched, presentation, publication) = external;
+    if verify_external_dispatch(&authorized, &dispatched, artifacts, &publication).is_err() {
+        return complete(
+            request,
+            authorized,
+            DispatchOutcome::Failed {
+                code: "mcp.invalid_external_result".to_owned(),
+            },
+            store,
+            budget,
+            crash_at,
+        );
+    }
+    let authority = authorized
+        .result_authority
+        .as_ref()
+        .ok_or(BrokerError::BindingMismatch)?;
+    let expected_presentation =
+        match presentation_from_dispatch(&dispatched, artifacts, authority, Some(&publication)) {
+            Ok(Some(presentation)) => presentation,
+            Ok(None) | Err(_) => {
+                return complete(
+                    request,
+                    authorized,
+                    DispatchOutcome::Failed {
+                        code: "mcp.presentation_reconstruction_failed".to_owned(),
+                    },
+                    store,
+                    budget,
+                    crash_at,
+                );
+            }
+        };
     if presentation != expected_presentation {
         return complete(
             request,
@@ -1108,50 +1130,60 @@ pub(crate) fn complete_external(
             crash_at,
         );
     }
-    let authorized = RefCell::new(Some(authorized));
-    match artifacts.commit_reference(&artifact, |_| {
-        complete(
-            request,
-            authorized
-                .borrow_mut()
-                .take()
-                .expect("artifact reference commits once"),
-            dispatched,
-            store,
-            budget,
-            crash_at,
-        )
+    let _publication_guard =
+        crate::store::sqlite::mcp_callback::lock_artifact_publication(publication.reference());
+    if let Err(error) = store.arm_artifact_publication(PendingArtifactPublication {
+        reference: publication.reference().to_string(),
+        digest: publication.digest().to_string(),
+        purpose: "mcp_invocation_result".to_owned(),
+        subject_id: authority.provenance.invocation_id().to_string(),
+        principal_id: authority.provenance.principal_id().to_string(),
+        project_id: authority.project_id.to_string(),
+        run_id: authority.run_id.to_string(),
     }) {
-        Ok(mut result) => {
-            result.presentation = Some(presentation);
-            Ok(result)
-        }
-        Err(crate::store::artifacts::ReferenceError::Artifact(_)) => {
-            if let Some(authorized) = authorized.into_inner() {
-                return complete(
-                    request,
-                    authorized,
-                    DispatchOutcome::Failed {
-                        code: "mcp.artifact_reference_failed".to_owned(),
-                    },
-                    store,
-                    budget,
-                    crash_at,
-                );
-            }
-            Err(BrokerError::InvalidResultProvenance(
-                ResultError::InvalidArtifact,
-            ))
-        }
-        Err(crate::store::artifacts::ReferenceError::Commit(error)) => Err(error),
+        return Err(BrokerError::Invoke(InvokeError::Store(error)));
     }
+    let mut result = match complete(request, authorized, dispatched, store, budget, crash_at) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = store.clear_artifact_publication(&publication.reference().to_string());
+            return Err(error);
+        }
+    };
+    let references_publication =
+        result
+            .invocation
+            .canonical
+            .output
+            .as_ref()
+            .is_some_and(|output| {
+                output
+                    .artifact_digests
+                    .iter()
+                    .any(|digest| digest.as_str() == publication.digest().to_string())
+            });
+    if references_publication {
+        artifacts
+            .promote_publication(&publication)
+            .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?;
+    } else {
+        artifacts
+            .remove_publication_stage(publication.reference())
+            .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?;
+    }
+    store
+        .clear_artifact_publication(&publication.reference().to_string())
+        .map_err(|error| BrokerError::Invoke(InvokeError::Store(error)))?;
+    result.presentation = references_publication.then_some(presentation);
+    Ok(result)
 }
 
 fn verify_external_dispatch(
     authorized: &BrokerAuthorizedInvocation,
     dispatched: &DispatchOutcome,
     artifacts: &ArtifactStore,
-) -> Result<crate::store::artifacts::VerifiedArtifact, BrokerError> {
+    publication: &ArtifactPublication,
+) -> Result<(), BrokerError> {
     let authority = authorized
         .result_authority
         .as_ref()
@@ -1191,12 +1223,14 @@ fn verify_external_dispatch(
             ResultError::InvalidProvenance,
         ));
     }
-    let artifact = artifacts
-        .open_reference(canonical.artifacts()[0])
-        .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?;
+    if canonical.artifacts()[0] != publication.reference() {
+        return Err(BrokerError::InvalidResultProvenance(
+            ResultError::InvalidArtifact,
+        ));
+    }
     if output.artifact_digests.as_slice()
         != [
-            crate::domain::events::ArtifactRef::parse(&artifact.digest().to_string())
+            crate::domain::events::ArtifactRef::parse(&publication.digest().to_string())
                 .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?,
         ]
     {
@@ -1204,7 +1238,7 @@ fn verify_external_dispatch(
             ResultError::InvalidArtifact,
         ));
     }
-    let manifest = artifact.manifest();
+    let manifest = publication.manifest();
     let expected = &authority.metadata;
     if manifest.media_type != expected.media_type
         || manifest.class != expected.class
@@ -1217,7 +1251,10 @@ fn verify_external_dispatch(
             ResultError::InvalidArtifact,
         ));
     }
-    Ok(artifact)
+    artifacts
+        .read_staged_publication(publication, &authority.artifact_binding(), 8 * 1024 * 1024)
+        .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?;
+    Ok(())
 }
 
 fn persisted_presentation(
@@ -1225,37 +1262,46 @@ fn persisted_presentation(
     artifacts: &ArtifactStore,
     principal_id: &str,
     project_id: &str,
+    run_id: &str,
+    invocation_id: ToolCallId,
 ) -> Result<Option<Presentation>, BrokerError> {
     let Some(output) = invocation.canonical.output.as_ref() else {
         return Ok(None);
     };
-    presentation_from_output_for_owner(output, artifacts, Some((principal_id, project_id)))
+    let binding = ArtifactEnvelopeBinding {
+        principal: principal_id.to_owned(),
+        project: project_id.to_owned(),
+        run: run_id.to_owned(),
+        purpose: "mcp_invocation_result".to_owned(),
+        invocation_id: Some(invocation_id.to_string()),
+        callback_id: None,
+    };
+    presentation_from_output_for_owner(output, artifacts, Some(binding), None)
 }
 
 fn presentation_from_dispatch(
     dispatched: &DispatchOutcome,
     artifacts: &ArtifactStore,
+    authority: &ExternalResultAuthority,
+    publication: Option<&ArtifactPublication>,
 ) -> Result<Option<Presentation>, BrokerError> {
     match dispatched {
         DispatchOutcome::DurablyCommitted(output)
-        | DispatchOutcome::DurablyFailed { output, .. } => {
-            presentation_from_output(output, artifacts)
-        }
+        | DispatchOutcome::DurablyFailed { output, .. } => presentation_from_output_for_owner(
+            output,
+            artifacts,
+            Some(authority.artifact_binding()),
+            publication,
+        ),
         _ => Ok(None),
     }
-}
-
-fn presentation_from_output(
-    output: &kernel_invoke::CanonicalOutput,
-    artifacts: &ArtifactStore,
-) -> Result<Option<Presentation>, BrokerError> {
-    presentation_from_output_for_owner(output, artifacts, None)
 }
 
 fn presentation_from_output_for_owner(
     output: &kernel_invoke::CanonicalOutput,
     artifacts: &ArtifactStore,
-    owner: Option<(&str, &str)>,
+    binding: Option<ArtifactEnvelopeBinding>,
+    publication: Option<&ArtifactPublication>,
 ) -> Result<Option<Presentation>, BrokerError> {
     if output.media_type != "application/vnd.kit.canonical-result+json" {
         return Ok(None);
@@ -1265,23 +1311,43 @@ fn presentation_from_output_for_owner(
     let Some(reference) = canonical.artifacts().first().copied() else {
         return Ok(None);
     };
-    let payload = artifacts
-        .with_reference_reader(reference, |manifest, reader| {
-            if owner.is_some_and(|(principal, project)| {
-                manifest.principal != principal || manifest.project != project
-            }) {
-                return Err(crate::store::artifacts::ArtifactError::AccessDenied);
-            }
-            let mut bytes = Vec::new();
-            reader.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > 8 * 1024 * 1024 {
-                return Err(crate::store::artifacts::ArtifactError::InvalidManifest(
-                    "MCP result payload exceeds presentation replay bound",
-                ));
-            }
-            Ok(bytes)
-        })
-        .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?;
+    let payload = if let Some(publication) = publication {
+        let binding = binding
+            .as_ref()
+            .ok_or(BrokerError::InvalidResultProvenance(
+                ResultError::InvalidArtifact,
+            ))?;
+        artifacts
+            .read_staged_publication(publication, binding, 8 * 1024 * 1024)
+            .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?
+    } else {
+        artifacts
+            .with_reference_reader(reference, |manifest, reader| {
+                if binding.as_ref().is_some_and(|binding| {
+                    manifest.principal != binding.principal || manifest.project != binding.project
+                }) {
+                    return Err(crate::store::artifacts::ArtifactError::AccessDenied);
+                }
+                let mut envelope = Vec::new();
+                reader
+                    .take(8 * 1024 * 1024 + 8192)
+                    .read_to_end(&mut envelope)?;
+                let bytes = binding
+                    .as_ref()
+                    .ok_or(crate::store::artifacts::ArtifactError::InvalidManifest(
+                        "MCP result envelope binding is unavailable",
+                    ))?
+                    .open(&envelope)?
+                    .to_vec();
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err(crate::store::artifacts::ArtifactError::InvalidManifest(
+                        "MCP result payload exceeds presentation replay bound",
+                    ));
+                }
+                Ok(bytes)
+            })
+            .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidArtifact))?
+    };
     let value: serde_json::Value = serde_json::from_slice(&payload)
         .map_err(|_| BrokerError::InvalidResultProvenance(ResultError::InvalidJson))?;
     let presentation = value

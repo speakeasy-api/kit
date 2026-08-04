@@ -23,7 +23,10 @@ use std::collections::HashMap;
 #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use agentkit_capabilities::{
@@ -131,20 +134,275 @@ pub const PINNED_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion::V_20
 /// Exact `initialize` params emitted by Kit's authorized connect paths.
 #[cfg(feature = "kit-authorized")]
 pub fn kit_authorized_initialize_arguments() -> Value {
-    serde_json::to_value(
-        rmcp_model::InitializeRequestParams::new(
-            rmcp_model::ClientCapabilities::default(),
-            rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
-                .with_title("agentkit MCP client"),
-        )
-        .with_protocol_version(PINNED_PROTOCOL_VERSION),
-    )
-    .expect("static Kit initialize arguments serialize")
+    McpHandlerConfig::new().initialize_arguments()
 }
 
 struct PinnedTransport<T> {
     inner: T,
     refused: Arc<std::sync::Mutex<Option<Option<McpProtocolVersion>>>>,
+    sent: SentResponseTracker,
+    server_id: McpServerId,
+    generation: u64,
+}
+
+type SentCallback = Box<dyn FnOnce(McpCallbackDeliveryToken, bool) + Send + 'static>;
+type BeforeSend = Box<dyn FnOnce() -> bool + Send + 'static>;
+
+struct ResponderDeliveryPermit {
+    server_id: String,
+    generation: u64,
+    message: Value,
+    _token: McpCallbackDeliveryToken,
+}
+
+tokio::task_local! {
+    static RESPONDER_DELIVERY_PERMIT: ResponderDeliveryPermit;
+}
+
+/// Returns whether this exact methodless message is being delivered by a tracked responder.
+#[doc(hidden)]
+pub fn has_responder_delivery_permit<T: Serialize>(message: &T) -> bool {
+    let Ok(message) = serde_json::to_value(message) else {
+        return false;
+    };
+    if message.get("method").is_some()
+        || message.get("id").is_none()
+        || message.get("result").is_none()
+    {
+        return false;
+    }
+    RESPONDER_DELIVERY_PERMIT
+        .try_with(|permit| {
+            !permit.server_id.is_empty() && permit.generation != 0 && message == permit.message
+        })
+        .unwrap_or(false)
+}
+
+struct SentCallbackGuard(Option<(McpCallbackDeliveryToken, SentCallback)>, bool);
+
+impl SentCallbackGuard {
+    fn complete(mut self, delivered: bool) {
+        if let Some((token, callback)) = self.0.take() {
+            callback(token, delivered && self.1);
+        }
+    }
+}
+
+impl Drop for SentCallbackGuard {
+    fn drop(&mut self) {
+        if let Some((token, callback)) = self.0.take() {
+            callback(token, false);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SentResponseTracker(Arc<std::sync::Mutex<HashMap<SentResponseKey, TrackedResponse>>>);
+
+impl Drop for SentResponseTracker {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.0) != 1 {
+            return;
+        }
+        let deliveries = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain()
+            .filter_map(|(_, response)| response.delivery)
+            .collect::<Vec<_>>();
+        for delivery in deliveries {
+            (delivery.callback)(delivery.token, false);
+        }
+    }
+}
+
+type SentResponseKey = (String, u64, String);
+
+struct TrackedResponse {
+    operation_sequence: u64,
+    delivery: Option<TrackedDelivery>,
+}
+
+struct TrackedDelivery {
+    token: McpCallbackDeliveryToken,
+    result: Value,
+    before_send: BeforeSend,
+    callback: SentCallback,
+}
+
+struct ResponseReservation {
+    sent: SentResponseTracker,
+    key: Option<SentResponseKey>,
+}
+
+impl ResponseReservation {
+    fn finish(mut self, successful: bool) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        self.sent.finish_reservation(&key, successful);
+    }
+}
+
+impl Drop for ResponseReservation {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.sent.finish_reservation(&key, false);
+        }
+    }
+}
+
+impl fmt::Debug for SentResponseTracker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SentResponseTracker")
+    }
+}
+
+impl SentResponseTracker {
+    fn reserve_unmanaged(
+        &self,
+        server_id: &McpServerId,
+        generation: u64,
+        request_id: &rmcp_model::RequestId,
+        operation_sequence: u64,
+    ) {
+        let Ok(request_id) = serde_json::to_string(request_id) else {
+            return;
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry((server_id.to_string(), generation, request_id))
+            .or_insert(TrackedResponse {
+                operation_sequence,
+                delivery: None,
+            });
+    }
+
+    fn reserve(
+        &self,
+        server_id: &McpServerId,
+        generation: u64,
+        request_id: &rmcp_model::RequestId,
+        operation_sequence: u64,
+    ) -> Result<ResponseReservation, String> {
+        let key = (
+            server_id.to_string(),
+            generation,
+            serde_json::to_string(request_id).map_err(|error| error.to_string())?,
+        );
+        let mut tracked = self
+            .0
+            .lock()
+            .map_err(|_| "MCP sent-response tracker is poisoned".to_owned())?;
+        if tracked.contains_key(&key) {
+            return Err("MCP JSON-RPC request ID is already active".to_owned());
+        }
+        tracked.insert(
+            key.clone(),
+            TrackedResponse {
+                operation_sequence,
+                delivery: None,
+            },
+        );
+        Ok(ResponseReservation {
+            sent: self.clone(),
+            key: Some(key),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register<T: Serialize>(
+        &self,
+        server_id: &McpServerId,
+        generation: u64,
+        request_id: &rmcp_model::RequestId,
+        operation_sequence: u64,
+        token: McpCallbackDeliveryToken,
+        result: &T,
+        before_send: BeforeSend,
+        callback: SentCallback,
+    ) -> Result<(), String> {
+        let key = serde_json::to_string(request_id).map_err(|error| error.to_string())?;
+        let result = serde_json::to_value(result).map_err(|error| error.to_string())?;
+        let mut tracked = self
+            .0
+            .lock()
+            .map_err(|_| "MCP sent-response tracker is poisoned".to_owned())?;
+        let key = (server_id.to_string(), generation, key);
+        let Some(response) = tracked.get_mut(&key) else {
+            callback(token, false);
+            return Err("MCP JSON-RPC response ID was not reserved".to_owned());
+        };
+        if response.operation_sequence != operation_sequence || response.delivery.is_some() {
+            callback(token, false);
+            return Err("MCP JSON-RPC response ID is already awaiting delivery".to_owned());
+        }
+        response.delivery = Some(TrackedDelivery {
+            token,
+            result,
+            before_send,
+            callback,
+        });
+        Ok(())
+    }
+
+    fn take(
+        &self,
+        server_id: &McpServerId,
+        generation: u64,
+        message: &serde_json::Value,
+    ) -> Option<(McpCallbackDeliveryToken, BeforeSend, SentCallback, bool)> {
+        let object = message.as_object()?;
+        let key = (
+            server_id.to_string(),
+            generation,
+            serde_json::to_string(object.get("id")?).ok()?,
+        );
+        let result = object.get("result")?.clone();
+        let mut tracked = self.0.lock().ok()?;
+        let tracked = tracked.remove(&key)?.delivery?;
+        let exact = tracked.result == result;
+        Some((tracked.token, tracked.before_send, tracked.callback, exact))
+    }
+
+    fn finish_reservation(&self, key: &SentResponseKey, successful: bool) {
+        let delivery = {
+            let mut tracked = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            if successful
+                && tracked
+                    .get(key)
+                    .is_some_and(|response| response.delivery.is_some())
+            {
+                return;
+            }
+            tracked.remove(key).and_then(|response| response.delivery)
+        };
+        if let Some(delivery) = delivery {
+            (delivery.callback)(delivery.token, false);
+        }
+    }
+
+    fn drain_session(&self, server_id: &McpServerId, generation: u64) {
+        let server_id = server_id.to_string();
+        let callbacks = {
+            let mut tracked = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            let keys = tracked
+                .keys()
+                .filter(|(server, found_generation, _)| {
+                    server == &server_id && *found_generation == generation
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| tracked.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        for tracked in callbacks.into_iter().filter_map(|tracked| tracked.delivery) {
+            (tracked.callback)(tracked.token, false);
+        }
+    }
 }
 
 impl<T> Transport<RoleClient> for PinnedTransport<T>
@@ -157,7 +415,43 @@ where
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-        self.inner.send(item)
+        let sent = self.sent.clone();
+        let message = serde_json::to_value(&item).ok();
+        let callback = message
+            .as_ref()
+            .and_then(|message| sent.take(&self.server_id, self.generation, message));
+        let future = self.inner.send(item);
+        let server_id = self.server_id.to_string();
+        let generation = self.generation;
+        async move {
+            let (callback, permit, authorized) = callback.map_or(
+                (None, None, true),
+                |(token, before_send, callback, exact)| {
+                    let authorized = exact && before_send();
+                    let permit = authorized.then(|| ResponderDeliveryPermit {
+                        server_id,
+                        generation,
+                        message: message
+                            .as_ref()
+                            .expect("tracked response has serialized message")
+                            .clone(),
+                        _token: token.clone(),
+                    });
+                    (Some((token, callback)), permit, authorized)
+                },
+            );
+            if !authorized {
+                SentCallbackGuard(callback, false).complete(false);
+                return Ok(());
+            }
+            let callback = SentCallbackGuard(callback, true);
+            let result = match permit {
+                Some(permit) => RESPONDER_DELIVERY_PERMIT.scope(permit, future).await,
+                None => future.await,
+            };
+            callback.complete(result.is_ok());
+            result
+        }
     }
 
     async fn receive(&mut self) -> Option<rmcp::service::RxJsonRpcMessage<RoleClient>> {
@@ -174,6 +468,7 @@ where
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
+        self.sent.drain_session(&self.server_id, self.generation);
         self.inner.close().await
     }
 }
@@ -1293,6 +1588,7 @@ pub trait McpSamplingResponder: Send + Sync + 'static {
     async fn create_message(
         &self,
         params: McpCreateMessageRequestParams,
+        context: McpResponderRequestContext,
     ) -> Result<McpCreateMessageResult, McpError>;
 }
 
@@ -1306,6 +1602,7 @@ pub trait McpElicitationResponder: Send + Sync + 'static {
     async fn create_elicitation(
         &self,
         params: McpCreateElicitationRequestParams,
+        context: McpResponderRequestContext,
     ) -> Result<McpCreateElicitationResult, McpError>;
 }
 
@@ -1316,7 +1613,213 @@ pub trait McpElicitationResponder: Send + Sync + 'static {
 #[async_trait]
 pub trait McpRootsProvider: Send + Sync + 'static {
     /// Returns the roots the server should consider in scope.
-    async fn list_roots(&self) -> Result<Vec<McpRoot>, McpError>;
+    async fn list_roots(
+        &self,
+        context: McpResponderRequestContext,
+    ) -> Result<Vec<McpRoot>, McpError>;
+}
+
+/// Sanitized identity and cancellation state for a server-initiated request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpCallbackDeliveryToken {
+    callback_id: String,
+    operation_sequence: u64,
+    request_digest: [u8; 32],
+    response_digest: [u8; 32],
+}
+
+impl McpCallbackDeliveryToken {
+    #[allow(clippy::result_large_err)]
+    fn new(
+        callback_id: impl Into<String>,
+        operation_sequence: u64,
+        request_digest: [u8; 32],
+        response_digest: [u8; 32],
+    ) -> Result<Self, McpError> {
+        let callback_id = callback_id.into();
+        if callback_id.is_empty() || operation_sequence == 0 {
+            return Err(McpError::Protocol(
+                "invalid MCP callback delivery token".to_owned(),
+            ));
+        }
+        Ok(Self {
+            callback_id,
+            operation_sequence,
+            request_digest,
+            response_digest,
+        })
+    }
+
+    /// Returns the callback identity bound to this delivery.
+    pub fn callback_id(&self) -> &str {
+        &self.callback_id
+    }
+
+    /// Returns the connection-owned callback operation sequence.
+    pub const fn operation_sequence(&self) -> u64 {
+        self.operation_sequence
+    }
+
+    /// Returns the canonical callback request digest.
+    pub const fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+
+    /// Returns the exact response digest.
+    pub const fn response_digest(&self) -> [u8; 32] {
+        self.response_digest
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct McpResponderRequestContext {
+    server_id: McpServerId,
+    request_id: rmcp_model::RequestId,
+    generation: u64,
+    operation_sequence: u64,
+    cancellation: McpResponderCancellation,
+    sent: SentResponseTracker,
+}
+
+impl McpResponderRequestContext {
+    /// Creates a context without retaining the peer, extensions, or request metadata.
+    #[allow(clippy::result_large_err)]
+    pub fn new(
+        server_id: McpServerId,
+        request_id: rmcp_model::RequestId,
+        generation: u64,
+        cancellation: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let sent = SentResponseTracker::default();
+        sent.reserve_unmanaged(&server_id, generation, &request_id, 1);
+        Self {
+            server_id,
+            request_id,
+            generation,
+            operation_sequence: 1,
+            cancellation: McpResponderCancellation(Arc::new(cancellation)),
+            sent,
+        }
+    }
+
+    fn new_tracked(
+        server_id: McpServerId,
+        request_id: rmcp_model::RequestId,
+        generation: u64,
+        operation_sequence: u64,
+        cancellation: impl Fn() -> bool + Send + Sync + 'static,
+        sent: SentResponseTracker,
+    ) -> Self {
+        Self {
+            server_id,
+            request_id,
+            generation,
+            operation_sequence,
+            cancellation: McpResponderCancellation(Arc::new(cancellation)),
+            sent,
+        }
+    }
+
+    /// Returns the configured server identity, never server-supplied metadata.
+    pub fn server_id(&self) -> &McpServerId {
+        &self.server_id
+    }
+
+    /// Returns the JSON-RPC request identifier.
+    pub fn request_id(&self) -> &rmcp_model::RequestId {
+        &self.request_id
+    }
+
+    /// Returns the local connection generation that received the request.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the connection-owned monotonic responder operation sequence.
+    pub const fn operation_sequence(&self) -> u64 {
+        self.operation_sequence
+    }
+
+    /// Mints the opaque capability used to acknowledge one exact callback response.
+    #[allow(clippy::result_large_err)]
+    pub fn callback_delivery_token(
+        &self,
+        callback_id: impl Into<String>,
+        request_digest: [u8; 32],
+        response_digest: [u8; 32],
+    ) -> Result<McpCallbackDeliveryToken, McpError> {
+        McpCallbackDeliveryToken::new(
+            callback_id,
+            self.operation_sequence,
+            request_digest,
+            response_digest,
+        )
+    }
+
+    /// Reuses the durable operation sequence assigned when this callback was first journaled.
+    #[allow(clippy::result_large_err)]
+    pub fn callback_delivery_token_for(
+        &self,
+        callback_id: impl Into<String>,
+        operation_sequence: u64,
+        request_digest: [u8; 32],
+        response_digest: [u8; 32],
+    ) -> Result<McpCallbackDeliveryToken, McpError> {
+        McpCallbackDeliveryToken::new(
+            callback_id,
+            operation_sequence,
+            request_digest,
+            response_digest,
+        )
+    }
+
+    /// Reports whether the transport accepted this exact response.
+    #[allow(clippy::result_large_err)]
+    pub fn on_delivery<T: Serialize>(
+        &self,
+        token: McpCallbackDeliveryToken,
+        result: &T,
+        before_send: impl FnOnce() -> bool + Send + 'static,
+        callback: impl FnOnce(McpCallbackDeliveryToken, bool) + Send + 'static,
+    ) -> Result<(), McpError> {
+        self.sent
+            .register(
+                &self.server_id,
+                self.generation,
+                &self.request_id,
+                self.operation_sequence,
+                token,
+                result,
+                Box::new(before_send),
+                Box::new(callback),
+            )
+            .map_err(McpError::Protocol)
+    }
+
+    /// Returns a cancellation-only view of the request.
+    pub const fn cancellation(&self) -> &McpResponderCancellation {
+        &self.cancellation
+    }
+}
+
+/// Cancellation-only request state. It cannot reach the peer or request metadata.
+#[derive(Clone)]
+pub struct McpResponderCancellation(Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl fmt::Debug for McpResponderCancellation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpResponderCancellation")
+            .field("is_cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl McpResponderCancellation {
+    /// Returns whether the server cancelled this request.
+    pub fn is_cancelled(&self) -> bool {
+        (self.0)()
+    }
 }
 
 /// Default broadcast capacity for [`McpServerEvent`] subscribers.
@@ -1351,26 +1854,66 @@ pub struct McpClientChannels {
 /// the connection must preserve adapter-time hooks from the config.
 #[derive(Clone)]
 pub struct McpClientHandler {
+    server_id: McpServerId,
     info: rmcp_model::ClientInfo,
     notifications: mpsc::Sender<McpServerNotification>,
     events: broadcast::Sender<McpServerEvent>,
     sampling: Option<Arc<dyn McpSamplingResponder>>,
     elicitation: Option<Arc<dyn McpElicitationResponder>>,
     roots: Option<Arc<dyn McpRootsProvider>>,
+    generation: u64,
+    operation_sequence: Arc<AtomicU64>,
+    sent: SentResponseTracker,
 }
 
 impl ClientHandler for McpClientHandler {
     fn create_message(
         &self,
         params: rmcp_model::CreateMessageRequestParams,
-        _context: rmcp::service::RequestContext<RoleClient>,
+        context: rmcp::service::RequestContext<RoleClient>,
     ) -> impl Future<Output = Result<rmcp_model::CreateMessageResult, rmcp_model::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
         let responder = self.sampling.clone();
         async move {
             match responder {
-                Some(responder) => responder.create_message(params).await.map_err(Into::into),
+                Some(responder) => {
+                    let operation_sequence = self
+                        .operation_sequence
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            current.checked_add(1)
+                        })
+                        .map_err(|_| {
+                            rmcp_model::ErrorData::internal_error(
+                                "MCP responder operation sequence exhausted",
+                                None,
+                            )
+                        })?;
+                    let reservation = self
+                        .sent
+                        .reserve(
+                            &self.server_id,
+                            self.generation,
+                            &context.id,
+                            operation_sequence,
+                        )
+                        .map_err(|error| rmcp_model::ErrorData::invalid_request(error, None))?;
+                    let result = responder
+                        .create_message(
+                            params,
+                            McpResponderRequestContext::new_tracked(
+                                self.server_id.clone(),
+                                context.id,
+                                self.generation,
+                                operation_sequence,
+                                move || context.ct.is_cancelled(),
+                                self.sent.clone(),
+                            ),
+                        )
+                        .await;
+                    reservation.finish(result.is_ok());
+                    result.map_err(Into::into)
+                }
                 None => Err(rmcp_model::ErrorData::method_not_found::<
                     rmcp_model::CreateMessageRequestMethod,
                 >()),
@@ -1380,19 +1923,50 @@ impl ClientHandler for McpClientHandler {
 
     fn list_roots(
         &self,
-        _context: rmcp::service::RequestContext<RoleClient>,
+        context: rmcp::service::RequestContext<RoleClient>,
     ) -> impl Future<Output = Result<rmcp_model::ListRootsResult, rmcp_model::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
         let provider = self.roots.clone();
         async move {
             match provider {
-                Some(provider) => provider
-                    .list_roots()
-                    .await
-                    .map(McpListRootsResult::new)
-                    .map_err(Into::into),
-                None => Ok(McpListRootsResult::default()),
+                Some(provider) => {
+                    let operation_sequence = self
+                        .operation_sequence
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            current.checked_add(1)
+                        })
+                        .map_err(|_| {
+                            rmcp_model::ErrorData::internal_error(
+                                "MCP responder operation sequence exhausted",
+                                None,
+                            )
+                        })?;
+                    let reservation = self
+                        .sent
+                        .reserve(
+                            &self.server_id,
+                            self.generation,
+                            &context.id,
+                            operation_sequence,
+                        )
+                        .map_err(|error| rmcp_model::ErrorData::invalid_request(error, None))?;
+                    let result = provider
+                        .list_roots(McpResponderRequestContext::new_tracked(
+                            self.server_id.clone(),
+                            context.id,
+                            self.generation,
+                            operation_sequence,
+                            move || context.ct.is_cancelled(),
+                            self.sent.clone(),
+                        ))
+                        .await;
+                    reservation.finish(result.is_ok());
+                    result.map(McpListRootsResult::new).map_err(Into::into)
+                }
+                None => Err(rmcp_model::ErrorData::method_not_found::<
+                    rmcp_model::ListRootsRequestMethod,
+                >()),
             }
         }
     }
@@ -1400,20 +1974,53 @@ impl ClientHandler for McpClientHandler {
     fn create_elicitation(
         &self,
         params: rmcp_model::CreateElicitationRequestParams,
-        _context: rmcp::service::RequestContext<RoleClient>,
+        context: rmcp::service::RequestContext<RoleClient>,
     ) -> impl Future<Output = Result<rmcp_model::CreateElicitationResult, rmcp_model::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
         let responder = self.elicitation.clone();
         async move {
             match responder {
-                Some(responder) => responder
-                    .create_elicitation(params)
-                    .await
-                    .map_err(Into::into),
-                None => Ok(McpCreateElicitationResult::new(
-                    McpElicitationAction::Decline,
-                )),
+                Some(responder) => {
+                    let operation_sequence = self
+                        .operation_sequence
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            current.checked_add(1)
+                        })
+                        .map_err(|_| {
+                            rmcp_model::ErrorData::internal_error(
+                                "MCP responder operation sequence exhausted",
+                                None,
+                            )
+                        })?;
+                    let reservation = self
+                        .sent
+                        .reserve(
+                            &self.server_id,
+                            self.generation,
+                            &context.id,
+                            operation_sequence,
+                        )
+                        .map_err(|error| rmcp_model::ErrorData::invalid_request(error, None))?;
+                    let result = responder
+                        .create_elicitation(
+                            params,
+                            McpResponderRequestContext::new_tracked(
+                                self.server_id.clone(),
+                                context.id,
+                                self.generation,
+                                operation_sequence,
+                                move || context.ct.is_cancelled(),
+                                self.sent.clone(),
+                            ),
+                        )
+                        .await;
+                    reservation.finish(result.is_ok());
+                    result.map_err(Into::into)
+                }
+                None => Err(rmcp_model::ErrorData::method_not_found::<
+                    rmcp_model::ElicitationCreateRequestMethod,
+                >()),
             }
         }
     }
@@ -1494,7 +2101,15 @@ impl ClientHandler for McpClientHandler {
 
 impl From<McpError> for rmcp_model::ErrorData {
     fn from(error: McpError) -> Self {
-        rmcp_model::ErrorData::internal_error(error.to_string(), None)
+        match error {
+            McpError::ResponderInvalid(message) => {
+                rmcp_model::ErrorData::invalid_params(message, None)
+            }
+            McpError::ResponderUnavailable(message) => {
+                rmcp_model::ErrorData::internal_error(message, None)
+            }
+            error => rmcp_model::ErrorData::internal_error(error.to_string(), None),
+        }
     }
 }
 
@@ -1508,7 +2123,7 @@ type RmcpClientService = RunningService<RoleClient, McpClientHandler>;
 /// [`McpConnection::connect_with_handler`] to drive a single connection, or
 /// install one on the manager via
 /// [`McpServerManager::with_handler_config`] / per-trait builders.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct McpHandlerConfig {
     /// Responder for server-initiated `sampling/createMessage` requests.
     pub sampling: Option<Arc<dyn McpSamplingResponder>>,
@@ -1531,6 +2146,27 @@ pub struct McpHandlerConfig {
     /// Broadcast capacity for the [`McpServerEvent`] channel. Defaults to
     /// `DEFAULT_EVENTS_CAPACITY` when `None`.
     pub events_capacity: Option<usize>,
+    generation: Arc<AtomicU64>,
+    generation_gate: Arc<tokio::sync::Mutex<()>>,
+    operation_sequence: Arc<AtomicU64>,
+    sent: SentResponseTracker,
+}
+
+impl Default for McpHandlerConfig {
+    fn default() -> Self {
+        Self {
+            sampling: None,
+            elicitation: None,
+            roots: None,
+            auth: None,
+            error_responder: None,
+            events_capacity: None,
+            generation: Arc::new(AtomicU64::new(1)),
+            generation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            operation_sequence: Arc::new(AtomicU64::new(1)),
+            sent: SentResponseTracker::default(),
+        }
+    }
 }
 
 impl McpHandlerConfig {
@@ -1578,11 +2214,21 @@ impl McpHandlerConfig {
         self
     }
 
+    /// Returns the current local session generation.
+    pub fn session_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Builds a handler together with a fresh [`McpClientChannels`] pair —
     /// the notification receiver and a new broadcast sender for
     /// [`McpServerEvent`].
     pub fn build(&self) -> (McpClientHandler, McpClientChannels) {
-        self.build_inner(None)
+        self.build_for(McpServerId::new("unconfigured"))
+    }
+
+    /// Builds a handler bound to the configured server identity.
+    pub fn build_for(&self, server_id: McpServerId) -> (McpClientHandler, McpClientChannels) {
+        self.build_inner(server_id, self.session_generation(), None)
     }
 
     /// Builds a handler that publishes [`McpServerEvent`] into the provided
@@ -1593,11 +2239,35 @@ impl McpHandlerConfig {
         &self,
         events: broadcast::Sender<McpServerEvent>,
     ) -> (McpClientHandler, McpClientChannels) {
-        self.build_inner(Some(events))
+        self.build_inner(
+            McpServerId::new("unconfigured"),
+            self.session_generation(),
+            Some(events),
+        )
+    }
+
+    /// Rebuilds a handler for a configured server while preserving its event channel.
+    pub fn build_for_with(
+        &self,
+        server_id: McpServerId,
+        events: broadcast::Sender<McpServerEvent>,
+    ) -> (McpClientHandler, McpClientChannels) {
+        self.build_inner(server_id, self.session_generation(), Some(events))
+    }
+
+    fn build_for_with_generation(
+        &self,
+        server_id: McpServerId,
+        generation: u64,
+        events: broadcast::Sender<McpServerEvent>,
+    ) -> (McpClientHandler, McpClientChannels) {
+        self.build_inner(server_id, generation, Some(events))
     }
 
     fn build_inner(
         &self,
+        server_id: McpServerId,
+        generation: u64,
         events: Option<broadcast::Sender<McpServerEvent>>,
     ) -> (McpClientHandler, McpClientChannels) {
         let capacity = self.events_capacity.unwrap_or(DEFAULT_EVENTS_CAPACITY);
@@ -1618,10 +2288,13 @@ impl McpHandlerConfig {
             });
         }
         if self.roots.is_some() {
-            capabilities.roots = Some(McpRootsCapabilities::default());
+            capabilities.roots = Some(McpRootsCapabilities {
+                list_changed: Some(false),
+            });
         }
 
         let handler = McpClientHandler {
+            server_id,
             info: rmcp_model::ClientInfo::new(
                 capabilities,
                 rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
@@ -1633,6 +2306,9 @@ impl McpHandlerConfig {
             sampling: self.sampling.clone(),
             elicitation: self.elicitation.clone(),
             roots: self.roots.clone(),
+            generation,
+            operation_sequence: Arc::clone(&self.operation_sequence),
+            sent: self.sent.clone(),
         };
 
         (
@@ -1642,6 +2318,19 @@ impl McpHandlerConfig {
                 events: events_tx,
             },
         )
+    }
+
+    /// Returns the exact initialize params emitted by a handler using this config.
+    pub fn initialize_arguments(&self) -> Value {
+        let (handler, _) = self.build();
+        serde_json::to_value(
+            rmcp_model::InitializeRequestParams::new(
+                handler.info.capabilities,
+                handler.info.client_info,
+            )
+            .with_protocol_version(PINNED_PROTOCOL_VERSION),
+        )
+        .expect("static MCP initialize arguments serialize")
     }
 }
 
@@ -1658,6 +2347,145 @@ pub struct McpConnection {
     handler_config: McpHandlerConfig,
     capabilities: RwLock<McpServerCapabilities>,
     protocol_version: RwLock<Option<McpProtocolVersion>>,
+    session_generation: AtomicU64,
+}
+
+/// A replacement session that has completed initialize but is not authoritative yet.
+pub struct McpAuthorizedReinitializeCandidate<'a> {
+    connection: &'a McpConnection,
+    service: Option<RmcpClientService>,
+    peer: Peer<RoleClient>,
+    notifications: Option<mpsc::Receiver<McpServerNotification>>,
+    capabilities: McpServerCapabilities,
+    protocol_version: McpProtocolVersion,
+    previous_generation: u64,
+    generation: u64,
+    _generation_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl McpAuthorizedReinitializeCandidate<'_> {
+    /// Returns the capabilities negotiated by the candidate session.
+    pub fn capabilities(&self) -> McpServerCapabilities {
+        self.capabilities.clone()
+    }
+
+    /// Lists one tool page through the candidate session.
+    pub async fn list_tools_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpTool>, Option<String>), McpError> {
+        let result = self
+            .peer
+            .list_tools(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.tools, result.next_cursor))
+    }
+
+    /// Lists one resource page through the candidate session.
+    pub async fn list_resources_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpResource>, Option<String>), McpError> {
+        let result = self
+            .peer
+            .list_resources(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.resources, result.next_cursor))
+    }
+
+    /// Lists one resource-template page through the candidate session.
+    pub async fn list_resource_templates_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpResourceTemplate>, Option<String>), McpError> {
+        let result = self
+            .peer
+            .list_resource_templates(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.resource_templates, result.next_cursor))
+    }
+
+    /// Lists one prompt page through the candidate session.
+    pub async fn list_prompts_page(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<(Vec<McpPrompt>, Option<String>), McpError> {
+        let result = self
+            .peer
+            .list_prompts(Some(
+                rmcp_model::PaginatedRequestParams::default().with_cursor(cursor),
+            ))
+            .await
+            .map_err(rmcp_service_error)?;
+        Ok((result.prompts, result.next_cursor))
+    }
+
+    /// Makes this candidate authoritative and arms its owner before old tracking drains.
+    pub async fn commit(mut self, arm: impl FnOnce()) {
+        let service = self.service.take().expect("candidate service is present");
+        let notifications = self
+            .notifications
+            .take()
+            .expect("candidate notifications are present");
+        let previous = {
+            let mut inner = self.connection.inner.lock().await;
+            std::mem::replace(&mut *inner, service)
+        };
+        *self.connection.notifications.lock().await = notifications;
+        *self
+            .connection
+            .peer
+            .write()
+            .expect("MCP peer lock poisoned") = self.peer.clone();
+        *self
+            .connection
+            .capabilities
+            .write()
+            .expect("MCP capabilities lock poisoned") = self.capabilities.clone();
+        *self
+            .connection
+            .protocol_version
+            .write()
+            .expect("MCP protocol version lock poisoned") = Some(self.protocol_version.clone());
+        self.connection
+            .handler_config
+            .generation
+            .store(self.generation, Ordering::Release);
+        self.connection
+            .session_generation
+            .store(self.generation, Ordering::Release);
+        arm();
+        self.connection
+            .handler_config
+            .sent
+            .drain_session(&self.connection.server_id, self.previous_generation);
+        let mut previous = previous;
+        let _ = previous.close().await;
+    }
+
+    /// Closes this candidate without changing the authoritative session or generation.
+    pub async fn abort(mut self) -> Result<(), McpError> {
+        self.connection
+            .handler_config
+            .sent
+            .drain_session(&self.connection.server_id, self.generation);
+        self.service
+            .take()
+            .expect("candidate service is present")
+            .close()
+            .await
+            .map(|_| ())
+            .map_err(|error| McpError::Transport(format!("rmcp candidate close failed: {error}")))
+    }
 }
 
 /// The result of replaying an MCP operation after auth resolution.
@@ -1695,10 +2523,13 @@ impl McpConnection {
     /// Kit production entry point. It accepts only Streamable HTTP configs
     /// carrying an injected, policy-owned HTTP client.
     #[cfg(feature = "kit-authorized")]
-    pub async fn connect_authorized_http(config: &McpServerConfig) -> Result<Self, McpError> {
+    pub async fn connect_authorized_http(
+        config: &McpServerConfig,
+        handler_config: McpHandlerConfig,
+    ) -> Result<Self, McpError> {
         match &config.transport {
             McpTransportBinding::StreamableHttp(binding) if binding.http_client.is_some() => {
-                Self::connect_with_auth(config, None, McpHandlerConfig::default()).await
+                Self::connect_with_auth(config, None, handler_config).await
             }
             _ => Err(McpError::Protocol(
                 "Kit requires an authorized adopted HTTP client".into(),
@@ -1720,16 +2551,20 @@ impl McpConnection {
         T: rmcp::transport::Transport<RoleClient> + 'static,
     {
         let server_id = server_id.into();
-        let (handler, channels) = handler_config.build();
+        let (handler, channels) = handler_config.build_for(server_id.clone());
         let McpClientChannels {
             notifications,
             events,
         } = channels;
         let refused = Arc::new(std::sync::Mutex::new(None));
+        let generation = handler.generation;
         let service = handler
             .serve(PinnedTransport {
                 inner: transport,
                 refused: refused.clone(),
+                sent: handler_config.sent.clone(),
+                server_id: server_id.clone(),
+                generation,
             })
             .await
             .map_err(|error| {
@@ -1758,6 +2593,7 @@ impl McpConnection {
             handler_config,
             capabilities: RwLock::new(capabilities),
             protocol_version: RwLock::new(Some(protocol_version)),
+            session_generation: AtomicU64::new(generation),
         })
     }
 
@@ -1766,7 +2602,17 @@ impl McpConnection {
         auth: Option<&MetadataMap>,
         handler_config: McpHandlerConfig,
     ) -> Result<Self, McpError> {
-        let (handler, channels) = handler_config.build();
+        let generation = handler_config.session_generation();
+        Self::connect_with_auth_generation(config, auth, handler_config, generation).await
+    }
+
+    async fn connect_with_auth_generation(
+        config: &McpServerConfig,
+        auth: Option<&MetadataMap>,
+        handler_config: McpHandlerConfig,
+        generation: u64,
+    ) -> Result<Self, McpError> {
+        let (handler, channels) = handler_config.build_inner(config.id.clone(), generation, None);
         let McpClientChannels {
             notifications: notification_rx,
             events: events_tx,
@@ -1792,6 +2638,7 @@ impl McpConnection {
             handler_config,
             capabilities: RwLock::new(capabilities),
             protocol_version: RwLock::new(Some(protocol_version)),
+            session_generation: AtomicU64::new(generation),
         })
     }
 
@@ -1870,6 +2717,7 @@ impl McpConnection {
             .peer_info()
             .map(|info| info.protocol_version.clone());
         let peer = service.peer().clone();
+        let generation = handler_config.session_generation();
         Self {
             server_id: server_id.into(),
             config: None,
@@ -1881,6 +2729,7 @@ impl McpConnection {
             handler_config,
             capabilities: RwLock::new(capabilities),
             protocol_version: RwLock::new(protocol_version),
+            session_generation: AtomicU64::new(generation),
         }
     }
 
@@ -1888,32 +2737,53 @@ impl McpConnection {
         let Some(config) = self.config.clone() else {
             return Ok(());
         };
-        let (handler, channels) = self.handler_config.build_with(self.events.clone());
+        let candidate = self.reconnect_candidate(&config, auth).await?;
+        candidate.commit(|| {}).await;
+        Ok(())
+    }
+
+    async fn reconnect_candidate(
+        &self,
+        config: &McpServerConfig,
+        auth: Option<&MetadataMap>,
+    ) -> Result<McpAuthorizedReinitializeCandidate<'_>, McpError> {
+        let generation_guard = Arc::clone(&self.handler_config.generation_gate)
+            .lock_owned()
+            .await;
+        let previous_generation = self.session_generation.load(Ordering::Acquire);
+        let generation = self
+            .handler_config
+            .session_generation()
+            .checked_add(1)
+            .ok_or_else(|| McpError::Protocol("MCP session generation exhausted".to_owned()))?;
+        let (handler, channels) = self.handler_config.build_for_with_generation(
+            self.server_id.clone(),
+            generation,
+            self.events.clone(),
+        );
         let McpClientChannels {
             notifications: notification_rx,
             ..
         } = channels;
         let (service, capabilities, protocol_version) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
-                connect_rmcp_stdio(&config, binding, handler).await?
+                connect_rmcp_stdio(config, binding, handler).await?
             }
             McpTransportBinding::StreamableHttp(binding) => {
-                connect_rmcp_streamable_http(&config, binding, auth, handler).await?
+                connect_rmcp_streamable_http(config, binding, auth, handler).await?
             }
         };
-        let new_peer = service.peer().clone();
-        *self.notifications.lock().await = notification_rx;
-        *self.inner.lock().await = service;
-        *self.peer.write().expect("MCP peer lock poisoned") = new_peer;
-        *self
-            .capabilities
-            .write()
-            .expect("MCP capabilities lock poisoned") = capabilities;
-        *self
-            .protocol_version
-            .write()
-            .expect("MCP protocol version lock poisoned") = Some(protocol_version);
-        Ok(())
+        Ok(McpAuthorizedReinitializeCandidate {
+            connection: self,
+            peer: service.peer().clone(),
+            service: Some(service),
+            notifications: Some(notification_rx),
+            capabilities,
+            protocol_version,
+            previous_generation,
+            generation,
+            _generation_guard: generation_guard,
+        })
     }
 
     fn peer(&self) -> Peer<RoleClient> {
@@ -1956,6 +2826,11 @@ impl McpConnection {
     /// [`McpAuthResponder`] when an auth challenge surfaces.
     pub fn handler_config(&self) -> &McpHandlerConfig {
         &self.handler_config
+    }
+
+    /// Returns the exact initialize params used by this connection and reconnects.
+    pub fn initialize_arguments(&self) -> Value {
+        self.handler_config.initialize_arguments()
     }
 
     /// Subscribes to the per-connection [`McpServerEvent`] broadcast.
@@ -2046,6 +2921,10 @@ impl McpConnection {
     /// For Streamable HTTP this drives the rmcp transport to issue a `DELETE`
     /// against the negotiated session, releasing server-side state.
     pub async fn close(&self) -> Result<(), McpError> {
+        self.handler_config.sent.drain_session(
+            &self.server_id,
+            self.session_generation.load(Ordering::Acquire),
+        );
         let mut inner = self.inner.lock().await;
         inner
             .close()
@@ -2082,6 +2961,16 @@ impl McpConnection {
     #[cfg(feature = "kit-authorized")]
     pub async fn reinitialize_authorized(&self) -> Result<(), McpError> {
         self.reconnect_inner(None).await
+    }
+
+    /// Starts an authorized reinitialize without replacing the live session.
+    pub async fn begin_reinitialize_authorized(
+        &self,
+    ) -> Result<McpAuthorizedReinitializeCandidate<'_>, McpError> {
+        let config = self.config.as_ref().ok_or_else(|| {
+            McpError::Protocol("authorized MCP connection cannot be reinitialized".to_owned())
+        })?;
+        self.reconnect_candidate(config, None).await
     }
 
     /// Discovers tools, resources, and prompts that the server advertised.
@@ -2367,10 +3256,15 @@ async fn connect_rmcp_stdio(
     .map_err(McpError::Io)?;
 
     let refused = Arc::new(std::sync::Mutex::new(None));
+    let sent = handler.sent.clone();
+    let generation = handler.generation;
     let service = handler
         .serve(PinnedTransport {
             inner: transport,
             refused: refused.clone(),
+            sent,
+            server_id: config.id.clone(),
+            generation,
         })
         .await
         .map_err(|error| {
@@ -2437,10 +3331,15 @@ async fn connect_rmcp_streamable_http(
         },
         rmcp_config,
     );
+    let sent = handler.sent.clone();
+    let generation = handler.generation;
     let result = handler
         .serve(PinnedTransport {
             inner: transport,
             refused: refused.clone(),
+            sent,
+            server_id: config.id.clone(),
+            generation,
         })
         .await;
     let service = match result {
@@ -2970,19 +3869,27 @@ impl McpServerManager {
         config: &McpServerConfig,
         auth: Option<&MetadataMap>,
         handler_config: McpHandlerConfig,
+        generation: u64,
         options: &McpServerOptions,
     ) -> Result<(Arc<McpConnection>, McpDiscoverySnapshot), McpError> {
         #[cfg(all(feature = "kit-authorized", not(feature = "unmediated-dev")))]
         {
-            let _ = (config, auth, handler_config, options);
+            let _ = (config, auth, handler_config, generation, options);
             return Err(McpError::Protocol(
                 "Kit disables AgentKit manager-owned transport construction".into(),
             ));
         }
         #[cfg(any(not(feature = "kit-authorized"), feature = "unmediated-dev"))]
         let connect = async {
-            let connection =
-                Arc::new(McpConnection::connect_with_auth(config, auth, handler_config).await?);
+            let connection = Arc::new(
+                McpConnection::connect_with_auth_generation(
+                    config,
+                    auth,
+                    handler_config,
+                    generation,
+                )
+                .await?,
+            );
             let snapshot = connection.discover().await?;
             Ok((connection, snapshot))
         };
@@ -3011,10 +3918,22 @@ impl McpServerManager {
             .cloned()
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
         let options = self.options.get(server_id).cloned().unwrap_or_default();
+        let generation_gate = Arc::clone(&self.handler_config.generation_gate);
+        let _generation_guard = generation_gate.lock().await;
+        let replacing = self.connections.contains_key(server_id);
+        let generation = if replacing {
+            self.handler_config
+                .session_generation()
+                .checked_add(1)
+                .ok_or_else(|| McpError::Protocol("MCP session generation exhausted".to_owned()))?
+        } else {
+            self.handler_config.session_generation()
+        };
         let (connection, snapshot) = Self::connect_and_discover(
             &config,
             self.auth.get(server_id),
             self.handler_config.clone(),
+            generation,
             &options,
         )
         .await?;
@@ -3024,6 +3943,11 @@ impl McpServerManager {
             snapshot,
             namespace: self.namespace.clone(),
         };
+        if replacing {
+            self.handler_config
+                .generation
+                .store(generation, Ordering::Release);
+        }
         self.install_connection(server_id.clone(), handle.clone())
             .await;
         self.register_server_tools(server_id, &handle.snapshot);
@@ -3045,6 +3969,17 @@ impl McpServerManager {
 
     /// Connects all registered servers concurrently.
     pub async fn connect_all(&mut self) -> Result<Vec<McpServerHandle>, McpError> {
+        let replacing = self.connections.keys().cloned().collect::<Vec<_>>();
+        let generation_gate = Arc::clone(&self.handler_config.generation_gate);
+        let _generation_guard = generation_gate.lock().await;
+        let generation = if replacing.is_empty() {
+            self.handler_config.session_generation()
+        } else {
+            self.handler_config
+                .session_generation()
+                .checked_add(1)
+                .ok_or_else(|| McpError::Protocol("MCP session generation exhausted".to_owned()))?
+        };
         let plans: Vec<(
             McpServerId,
             McpServerConfig,
@@ -3069,9 +4004,14 @@ impl McpServerManager {
             let handler_config = handler_config.clone();
             let namespace = namespace.clone();
             async move {
-                let (connection, snapshot) =
-                    Self::connect_and_discover(&config, auth.as_ref(), handler_config, &options)
-                        .await?;
+                let (connection, snapshot) = Self::connect_and_discover(
+                    &config,
+                    auth.as_ref(),
+                    handler_config,
+                    generation,
+                    &options,
+                )
+                .await?;
                 Ok::<(McpServerId, McpServerHandle), McpError>((
                     server_id,
                     McpServerHandle {
@@ -3085,6 +4025,11 @@ impl McpServerManager {
         });
 
         let results = try_join_all(futures).await?;
+        if !replacing.is_empty() {
+            self.handler_config
+                .generation
+                .store(generation, Ordering::Release);
+        }
         let mut handles = Vec::with_capacity(results.len());
         let mut connected: Vec<(McpServerId, McpDiscoverySnapshot)> =
             Vec::with_capacity(results.len());
@@ -3172,6 +4117,7 @@ impl McpServerManager {
         }
 
         let handler_config = self.handler_config.clone();
+        let generation = self.handler_config.session_generation();
         let namespace = self.namespace.clone();
 
         let futures = plans.into_iter().map(|(server_id, config, options, auth)| {
@@ -3183,6 +4129,7 @@ impl McpServerManager {
                         &config,
                         auth.as_ref(),
                         handler_config,
+                        generation,
                         &options,
                     )
                     .await?;
@@ -4372,6 +5319,12 @@ pub enum McpError {
     /// An MCP protocol violation.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// A server-initiated request failed bounded host validation.
+    #[error("invalid MCP responder request: {0}")]
+    ResponderInvalid(String),
+    /// A configured responder is disabled, not armed, saturated, or timed out.
+    #[error("MCP responder unavailable: {0}")]
+    ResponderUnavailable(String),
     /// The server requires authentication before the operation can proceed.
     #[error("MCP auth required: {0:?}")]
     AuthRequired(Box<AuthRequest>),
@@ -4425,6 +5378,178 @@ impl From<String> for McpServerId {
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn exact_response_delivery_reports_transport_failure() {
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sent = SentResponseTracker::default();
+        let reservation = sent
+            .reserve(
+                &McpServerId::new("server"),
+                1,
+                &rmcp_model::RequestId::Number(7),
+                9,
+            )
+            .unwrap();
+        let context = McpResponderRequestContext::new_tracked(
+            McpServerId::new("server"),
+            rmcp_model::RequestId::Number(7),
+            1,
+            9,
+            || false,
+            sent,
+        );
+        let observed = Arc::clone(&delivered);
+        let token = McpCallbackDeliveryToken::new("callback", 9, [1; 32], [2; 32]).unwrap();
+        context
+            .on_delivery(
+                token.clone(),
+                &serde_json::json!({"action":"decline"}),
+                || true,
+                move |returned, accepted| {
+                    assert_eq!(returned, token);
+                    observed.store(accepted, Ordering::Release);
+                },
+            )
+            .unwrap();
+        reservation.finish(true);
+        let (token, before_send, callback, _exact) = context
+            .sent
+            .take(
+                &context.server_id,
+                context.generation,
+                &serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":7,
+                    "result":{"action":"decline"}
+                }),
+            )
+            .unwrap();
+        assert!(before_send());
+        callback(token, false);
+        assert!(!delivered.load(Ordering::Acquire));
+        assert_eq!(context.operation_sequence(), 9);
+    }
+
+    #[test]
+    fn reused_json_rpc_id_cannot_cross_settle_delivery_tokens() {
+        let sent = SentResponseTracker::default();
+        let first = McpResponderRequestContext::new_tracked(
+            McpServerId::new("server"),
+            rmcp_model::RequestId::Number(7),
+            1,
+            9,
+            || false,
+            sent.clone(),
+        );
+        let second = McpResponderRequestContext::new_tracked(
+            McpServerId::new("server"),
+            rmcp_model::RequestId::Number(7),
+            1,
+            10,
+            || false,
+            sent,
+        );
+        let first_delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_reservation = first
+            .sent
+            .reserve(&first.server_id, first.generation, &first.request_id, 9)
+            .unwrap();
+        assert!(
+            second
+                .sent
+                .reserve(&second.server_id, second.generation, &second.request_id, 10)
+                .is_err()
+        );
+        let observed = Arc::clone(&first_delivered);
+        first
+            .on_delivery(
+                McpCallbackDeliveryToken::new("first", 9, [1; 32], [2; 32]).unwrap(),
+                &serde_json::json!({"action":"decline"}),
+                || true,
+                move |_, delivered| observed.store(delivered, Ordering::Release),
+            )
+            .unwrap();
+        first_reservation.finish(true);
+        let (token, before_send, callback, exact) = first
+            .sent
+            .take(
+                &first.server_id,
+                first.generation,
+                &serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":7,
+                    "result":{"action":"decline"}
+                }),
+            )
+            .unwrap();
+        callback(token, exact && before_send());
+        assert!(first_delivered.load(Ordering::Acquire));
+        assert!(!second_delivered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn generation_drain_settles_old_pending_without_touching_reused_id() {
+        let sent = SentResponseTracker::default();
+        let server = McpServerId::new("server");
+        let old = McpResponderRequestContext::new_tracked(
+            server.clone(),
+            rmcp_model::RequestId::Number(7),
+            1,
+            9,
+            || false,
+            sent.clone(),
+        );
+        let old_delivered = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let old_reservation = sent
+            .reserve(&server, 1, &rmcp_model::RequestId::Number(7), 9)
+            .unwrap();
+        let observed = Arc::clone(&old_delivered);
+        old.on_delivery(
+            McpCallbackDeliveryToken::new("old", 9, [1; 32], [2; 32]).unwrap(),
+            &serde_json::json!({"action":"decline"}),
+            || true,
+            move |_, delivered| observed.store(delivered, Ordering::Release),
+        )
+        .unwrap();
+        old_reservation.finish(true);
+        sent.drain_session(&server, 1);
+        assert!(!old_delivered.load(Ordering::Acquire));
+
+        let new = McpResponderRequestContext::new_tracked(
+            server.clone(),
+            rmcp_model::RequestId::Number(7),
+            2,
+            10,
+            || false,
+            sent,
+        );
+        let new_delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let new_reservation = new
+            .sent
+            .reserve(&server, 2, &rmcp_model::RequestId::Number(7), 10)
+            .unwrap();
+        let observed = Arc::clone(&new_delivered);
+        new.on_delivery(
+            McpCallbackDeliveryToken::new("new", 10, [3; 32], [4; 32]).unwrap(),
+            &serde_json::json!({"action":"accept"}),
+            || true,
+            move |_, delivered| observed.store(delivered, Ordering::Release),
+        )
+        .unwrap();
+        new_reservation.finish(true);
+        let (token, before_send, callback, exact) = new
+            .sent
+            .take(
+                &server,
+                2,
+                &serde_json::json!({"id":7,"result":{"action":"accept"}}),
+            )
+            .unwrap();
+        callback(token, exact && before_send());
+        assert!(new_delivered.load(Ordering::Acquire));
+    }
 
     #[test]
     fn sse_reconnect_budget_is_total_and_bounded() {

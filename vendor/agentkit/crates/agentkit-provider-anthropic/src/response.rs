@@ -182,7 +182,7 @@ fn block_to_part(block: &Value) -> Result<Option<Part>, ResponseError> {
 
 fn parse_usage(value: Option<&Value>) -> Option<Usage> {
     let value = value?;
-    let input = value
+    let uncached_input = value
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -194,7 +194,6 @@ fn parse_usage(value: Option<&Value>) -> Option<Usage> {
     let cache_write = value
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64);
-
     let mut metadata = MetadataMap::new();
     if let Some(creation) = value.get("cache_creation") {
         metadata.insert("anthropic.cache_creation".into(), creation.clone());
@@ -208,7 +207,7 @@ fn parse_usage(value: Option<&Value>) -> Option<Usage> {
 
     Some(Usage {
         tokens: Some(TokenUsage {
-            input_tokens: input,
+            input_tokens: uncached_input,
             output_tokens: output,
             reasoning_tokens: None,
             cached_input_tokens: cached,

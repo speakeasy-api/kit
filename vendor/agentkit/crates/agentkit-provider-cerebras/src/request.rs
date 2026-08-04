@@ -571,6 +571,7 @@ mod tests {
             available_tools: tools,
             cache: None,
             structured_output: None,
+            generation: Default::default(),
             metadata: MetadataMap::new(),
         }
     }
