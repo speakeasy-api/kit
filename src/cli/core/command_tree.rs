@@ -424,6 +424,7 @@ fn mcp_callback() -> Command {
                         required_value("mode", "mode", "MODE", "Callback mode").value_parser(
                             PossibleValuesParser::new([
                                 "form",
+                                "url",
                                 "sampling-request",
                                 "sampling-response",
                             ]),

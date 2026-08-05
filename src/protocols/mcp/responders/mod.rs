@@ -32,13 +32,13 @@ use crate::{
         ids::{McpCallbackId, PrincipalId, ProjectId, WorkspaceId},
         mcp_callback::{
             McpCallbackError, McpCallbackKind, McpCallbackMode, McpCallbackProjection,
-            McpCallbackState,
+            McpCallbackState, McpUrlCallbackBinding, McpUrlDestination,
         },
     },
     executor::profile::{ExecutorProfile, MountRole},
     protocols::mcp::config::{
         McpFormElicitationResponderConfig, McpRootsResponderConfig, McpSamplingResponderConfig,
-        McpServerConfig, McpTransportConfig,
+        McpServerConfig, McpTransportConfig, McpUrlElicitationResponderConfig,
     },
     runtime::scheduler::{
         AdmissionKind, DurableScheduler, ReservationRequest,
@@ -54,7 +54,44 @@ use crate::{
 const INVALID_REQUEST: &str = "MCP responder request rejected";
 const NOT_READY: &str = "MCP responder is not ready";
 
-type SecretScanner = crate::agent::providers::streaming::CanaryRedactor;
+#[derive(Default)]
+pub(crate) struct CallbackSecretScanner(
+    std::sync::RwLock<crate::agent::providers::streaming::CanaryRedactor>,
+);
+
+impl CallbackSecretScanner {
+    pub(crate) fn new(canaries: impl IntoIterator<Item = String>) -> Self {
+        Self(std::sync::RwLock::new(
+            crate::agent::providers::streaming::CanaryRedactor::new(canaries),
+        ))
+    }
+
+    fn with_secrets(self, secrets: &[Arc<crate::domain::secret::SecretLease>]) -> Self {
+        let scanner = self
+            .0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .with_secrets(secrets);
+        Self(std::sync::RwLock::new(scanner))
+    }
+
+    pub(crate) fn add_secret(&self, secret: &crate::domain::secret::SecretLease) {
+        let mut scanner = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *scanner = scanner.clone().with_secret(secret);
+    }
+
+    pub(crate) fn redact_text(&self, value: &str) -> String {
+        self.0.read().map_or_else(
+            |_| "[REDACTED]".to_owned(),
+            |scanner| scanner.redact_text(value),
+        )
+    }
+}
+
+type SecretScanner = CallbackSecretScanner;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CallbackSecretScope {
@@ -177,7 +214,7 @@ impl Drop for CallbackSecretRegistration {
     }
 }
 
-fn callback_value_public_to(scanner: &SecretScanner, value: &serde_json::Value) -> bool {
+pub(crate) fn callback_value_public_to(scanner: &SecretScanner, value: &serde_json::Value) -> bool {
     let Ok(canonical) = serde_json::to_string(value) else {
         return false;
     };
@@ -795,8 +832,14 @@ impl ValidatedSamplingRequest {
 
 pub struct ValidatedElicitationRequest {
     message: String,
-    schema: rmcp::model::ElicitationSchema,
+    kind: ValidatedElicitationKind,
     max_response_bytes: usize,
+    timeout: Duration,
+}
+
+enum ValidatedElicitationKind {
+    Form(rmcp::model::ElicitationSchema),
+    Url { url: String, elicitation_id: String },
 }
 
 impl ValidatedElicitationRequest {
@@ -812,11 +855,35 @@ impl ValidatedElicitationRequest {
     }
 
     pub const fn schema(&self) -> &rmcp::model::ElicitationSchema {
-        &self.schema
+        match &self.kind {
+            ValidatedElicitationKind::Form(schema) => schema,
+            ValidatedElicitationKind::Url { .. } => panic!("URL elicitation has no form schema"),
+        }
     }
 
     pub const fn max_response_bytes(&self) -> usize {
         self.max_response_bytes
+    }
+
+    fn mode(&self) -> McpCallbackMode {
+        match &self.kind {
+            ValidatedElicitationKind::Form(_) => McpCallbackMode::Form,
+            ValidatedElicitationKind::Url { .. } => McpCallbackMode::Url,
+        }
+    }
+
+    fn url(&self) -> Option<(&str, &str)> {
+        match &self.kind {
+            ValidatedElicitationKind::Url {
+                url,
+                elicitation_id,
+            } => Some((url, elicitation_id)),
+            ValidatedElicitationKind::Form(_) => None,
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -1043,6 +1110,7 @@ pub trait ElicitationOutcomeHandler: Send + Sync + 'static {
 pub struct ResponderOutcomes {
     sampling: Option<Arc<dyn SamplingOutcomeHandler>>,
     elicitation: Option<Arc<dyn ElicitationOutcomeHandler>>,
+    durable_elicitation: Option<Arc<DurableElicitationOutcome>>,
     roots_delivery: Option<DurableRootsDelivery>,
     secret_scopes: BTreeMap<String, ResponderSecretScope>,
 }
@@ -1186,10 +1254,8 @@ impl ResponderOutcomes {
             ),
             secret_policy_id: secret_policy_id.clone(),
         });
-        if self.elicitation.is_none()
-            && let Some(policy) = &server.responders.elicitation
-        {
-            self.elicitation = Some(Arc::new(DurableElicitationOutcome {
+        if server.responders.elicitation.is_some() || server.responders.url_elicitation.is_some() {
+            let durable = Arc::new(DurableElicitationOutcome {
                 store,
                 artifacts,
                 project_root: project_root.to_owned(),
@@ -1200,13 +1266,17 @@ impl ResponderOutcomes {
                 workspace_id,
                 workspace_revision: workspace_revision.to_owned(),
                 server_id: server.id.clone(),
-                timeout: Duration::from_millis(policy.timeout_millis),
                 artifact_retention: Duration::from_secs(
                     u64::from(artifact_retention_days) * 24 * 60 * 60,
                 ),
                 cancellation,
                 secret_policy_id,
-            }));
+                url_policy: server.responders.url_elicitation.clone(),
+            });
+            self.durable_elicitation = Some(Arc::clone(&durable));
+            if self.elicitation.is_none() {
+                self.elicitation = Some(durable);
+            }
         }
         Ok(self)
     }
@@ -1281,6 +1351,7 @@ impl DurableRootsDelivery {
             max_response_bytes: response_bytes,
             max_content_bytes: 1,
             secret_policy_id: self.secret_policy_id.clone(),
+            url_binding: None,
             state: McpCallbackState::Requested,
             version: 1,
             resolver_actor: None,
@@ -1316,10 +1387,10 @@ struct DurableElicitationOutcome {
     workspace_id: WorkspaceId,
     workspace_revision: String,
     server_id: String,
-    timeout: Duration,
     artifact_retention: Duration,
     cancellation: Arc<AtomicBool>,
     secret_policy_id: String,
+    url_policy: Option<McpUrlElicitationResponderConfig>,
 }
 
 #[async_trait]
@@ -1329,23 +1400,40 @@ impl ElicitationOutcomeHandler for DurableElicitationOutcome {
         request: ValidatedElicitationRequest,
         context: CallbackAuthorityContext,
     ) -> Result<ElicitationHandlerOutput, ResponderError> {
-        let request_value = serde_json::json!({
-            "message": request.message(),
-            "requested_schema": request.schema(),
-        });
-        let schema = serde_json::to_value(request.schema()).map_err(|_| ResponderError::Invalid)?;
+        let (request_value, schema) = match &request.kind {
+            ValidatedElicitationKind::Form(schema) => (
+                serde_json::json!({
+                    "message": request.message(),
+                    "requested_schema": schema,
+                }),
+                serde_json::to_value(schema).map_err(|_| ResponderError::Invalid)?,
+            ),
+            ValidatedElicitationKind::Url {
+                url,
+                elicitation_id,
+            } => (
+                serde_json::json!({
+                    "message": request.message(),
+                    "url": url,
+                    "elicitation_id": elicitation_id,
+                }),
+                serde_json::json!({}),
+            ),
+        };
         let schema_bytes = bounded_json(&schema, 1024 * 1024)?;
         let request_bytes = bounded_json(
             &request_value,
-            request
-                .message()
-                .len()
-                .checked_add(schema_bytes.len())
-                .and_then(|value| value.checked_add(128))
-                .ok_or(ResponderError::Invalid)?,
+            callback_elicitation_request_limit(
+                &request,
+                schema_bytes.len(),
+                self.url_policy.as_ref(),
+            )?,
         )?;
-        let max_content_bytes =
-            elicitation_content_limit(request.max_response_bytes(), context.request_id())?;
+        let max_content_bytes = if request.mode() == McpCallbackMode::Form {
+            elicitation_content_limit(request.max_response_bytes(), context.request_id())?
+        } else {
+            1
+        };
         let request_digest = Digest::of(DigestAlgorithm::Sha256, &request_bytes);
         let callback_id = callback_id(
             self.claim.run_id,
@@ -1362,13 +1450,14 @@ impl ElicitationOutcomeHandler for DurableElicitationOutcome {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ResponderError::Unavailable)?;
         let now_micros = i64::try_from(now.as_micros()).map_err(|_| ResponderError::Unavailable)?;
+        let timeout = request.timeout();
         let timeout_micros =
-            i64::try_from(self.timeout.as_micros()).map_err(|_| ResponderError::Unavailable)?;
+            i64::try_from(timeout.as_micros()).map_err(|_| ResponderError::Unavailable)?;
         let callback = McpCallbackProjection {
             id: callback_id,
             server_id: self.server_id.clone(),
             kind: McpCallbackKind::Elicitation,
-            mode: McpCallbackMode::Form,
+            mode: request.mode(),
             principal_id: self.principal_id,
             project_id: self.project_id,
             run_id: self.claim.run_id,
@@ -1396,6 +1485,7 @@ impl ElicitationOutcomeHandler for DurableElicitationOutcome {
             max_response_bytes: request.max_response_bytes(),
             max_content_bytes,
             secret_policy_id: self.secret_policy_id.clone(),
+            url_binding: None,
             state: McpCallbackState::Requested,
             version: 1,
             resolver_actor: None,
@@ -1412,29 +1502,37 @@ impl ElicitationOutcomeHandler for DurableElicitationOutcome {
         let mut cleanup =
             CallbackCleanup::new(self.store.clone(), callback_id, request_digest.as_bytes());
         context.request_persisted()?;
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.cancellation.load(Ordering::Acquire) {
-                self.settle(
-                    callback_id,
-                    McpCallbackState::Interrupted,
-                    "outcome_unknown",
-                )
-                .await?;
-                cleanup.disarm();
-                return Err(ResponderError::Unavailable);
-            }
-            if context.is_cancelled() {
-                self.settle(
-                    callback_id,
-                    McpCallbackState::Interrupted,
-                    "request_cancelled",
-                )
-                .await?;
-                cleanup.disarm();
-                return Err(ResponderError::Unavailable);
-            }
-            let reload_after_expiration_conflict = if tokio::time::Instant::now() >= deadline {
+            let cancellation_error = if self.cancellation.load(Ordering::Acquire) {
+                Some("outcome_unknown")
+            } else if context.is_cancelled() {
+                Some("request_cancelled")
+            } else {
+                None
+            };
+            let reload_after_settlement_conflict = if let Some(error) = cancellation_error {
+                let store = self.store.clone();
+                let error = error.to_owned();
+                let settled = tokio::task::spawn_blocking(move || {
+                    store.settle_awaiting(
+                        callback_id,
+                        awaiting_version,
+                        McpCallbackState::Interrupted,
+                        Some(error),
+                    )
+                })
+                .await
+                .map_err(|_| ResponderError::Unavailable)?;
+                match settled {
+                    Ok(_) | Err(McpCallbackError::Terminal(_)) => {
+                        cleanup.disarm();
+                        return Err(ResponderError::Unavailable);
+                    }
+                    Err(McpCallbackError::VersionConflict { .. }) => true,
+                    Err(_) => return Err(ResponderError::Unavailable),
+                }
+            } else if tokio::time::Instant::now() >= deadline {
                 let store = self.store.clone();
                 let expired = tokio::task::spawn_blocking(move || {
                     store.settle_awaiting(
@@ -1461,7 +1559,7 @@ impl ElicitationOutcomeHandler for DurableElicitationOutcome {
             } else {
                 false
             };
-            if !reload_after_expiration_conflict && !self.authority_live(&callback).await {
+            if !reload_after_settlement_conflict && !self.authority_live(&callback).await {
                 self.settle(
                     callback_id,
                     McpCallbackState::Interrupted,
@@ -1486,47 +1584,51 @@ impl ElicitationOutcomeHandler for DurableElicitationOutcome {
                 McpCallbackState::Resolved => {
                     let response = match current.action.ok_or(ResponderError::Invalid)? {
                         crate::domain::mcp_callback::McpCallbackAction::Accept => {
-                            let reference = current
-                                .artifact_refs
-                                .first()
-                                .ok_or(ResponderError::Invalid)?;
-                            let reference = ArtifactReference::parse(reference.as_str())
-                                .map_err(|_| ResponderError::Invalid)?;
-                            let artifact = self
-                                .artifacts
-                                .open_reference(reference)
-                                .map_err(|_| ResponderError::Invalid)?;
-                            if artifact.manifest().principal != self.principal_id.to_string()
-                                || artifact.manifest().project != self.project_id.to_string()
-                                || artifact.manifest().media_type
-                                    != "application/vnd.kit.artifact-envelope"
-                                || artifact.manifest().size
-                                    > current.max_content_bytes as u64 + 16 * 1024
-                            {
-                                return Err(ResponderError::Authority);
+                            if current.mode == McpCallbackMode::Url {
+                                McpCreateElicitationResult::new(McpElicitationAction::Accept)
+                            } else {
+                                let reference = current
+                                    .artifact_refs
+                                    .first()
+                                    .ok_or(ResponderError::Invalid)?;
+                                let reference = ArtifactReference::parse(reference.as_str())
+                                    .map_err(|_| ResponderError::Invalid)?;
+                                let artifact = self
+                                    .artifacts
+                                    .open_reference(reference)
+                                    .map_err(|_| ResponderError::Invalid)?;
+                                if artifact.manifest().principal != self.principal_id.to_string()
+                                    || artifact.manifest().project != self.project_id.to_string()
+                                    || artifact.manifest().media_type
+                                        != "application/vnd.kit.artifact-envelope"
+                                    || artifact.manifest().size
+                                        > current.max_content_bytes as u64 + 16 * 1024
+                                {
+                                    return Err(ResponderError::Authority);
+                                }
+                                let binding = ArtifactEnvelopeBinding {
+                                    principal: current.principal_id.to_string(),
+                                    project: current.project_id.to_string(),
+                                    run: current.run_id.to_string(),
+                                    purpose: "mcp_callback_content".to_owned(),
+                                    invocation_id: None,
+                                    callback_id: Some(current.id.to_string()),
+                                };
+                                let bytes = self
+                                    .artifacts
+                                    .with_reference_reader(reference, |_, reader| {
+                                        let mut envelope = Vec::new();
+                                        reader
+                                            .take(current.max_content_bytes as u64 + 16 * 1024)
+                                            .read_to_end(&mut envelope)?;
+                                        Ok(binding.open(&envelope)?.to_vec())
+                                    })
+                                    .map_err(|_| ResponderError::Invalid)?;
+                                let content = serde_json::from_slice(&bytes)
+                                    .map_err(|_| ResponderError::Invalid)?;
+                                McpCreateElicitationResult::new(McpElicitationAction::Accept)
+                                    .with_content(content)
                             }
-                            let binding = ArtifactEnvelopeBinding {
-                                principal: current.principal_id.to_string(),
-                                project: current.project_id.to_string(),
-                                run: current.run_id.to_string(),
-                                purpose: "mcp_callback_content".to_owned(),
-                                invocation_id: None,
-                                callback_id: Some(current.id.to_string()),
-                            };
-                            let bytes = self
-                                .artifacts
-                                .with_reference_reader(reference, |_, reader| {
-                                    let mut envelope = Vec::new();
-                                    reader
-                                        .take(current.max_content_bytes as u64 + 16 * 1024)
-                                        .read_to_end(&mut envelope)?;
-                                    Ok(binding.open(&envelope)?.to_vec())
-                                })
-                                .map_err(|_| ResponderError::Invalid)?;
-                            let content = serde_json::from_slice(&bytes)
-                                .map_err(|_| ResponderError::Invalid)?;
-                            McpCreateElicitationResult::new(McpElicitationAction::Accept)
-                                .with_content(content)
                         }
                         crate::domain::mcp_callback::McpCallbackAction::Decline => {
                             McpCreateElicitationResult::new(McpElicitationAction::Decline)
@@ -1589,6 +1691,197 @@ pub fn callback_id(
 }
 
 impl DurableElicitationOutcome {
+    #[allow(clippy::too_many_arguments)]
+    async fn await_invocation_url(
+        &self,
+        request: &crate::capabilities::broker::BrokerInvocation<'_>,
+        generation: u64,
+        error_response_digest: Digest,
+        message: &str,
+        url: &str,
+        elicitation_id: &str,
+        raw_data: Option<&serde_json::Value>,
+    ) -> Result<InvocationUrlResolution, ResponderError> {
+        let policy = self
+            .url_policy
+            .as_ref()
+            .ok_or(ResponderError::Unavailable)?;
+        validate_invocation_url_error(policy, message, url, elicitation_id, raw_data)?;
+        let request_value = serde_json::json!({
+            "error_code": -32042,
+            "error_response_digest": error_response_digest.to_string(),
+            "message": message,
+            "url": url,
+            "elicitation_id": elicitation_id,
+        });
+        let request_bytes = bounded_json(
+            &request_value,
+            policy
+                .max_message_bytes
+                .checked_add(policy.max_url_bytes)
+                .and_then(|value| value.checked_add(policy.max_elicitation_id_bytes))
+                .and_then(|value| value.checked_add(256))
+                .ok_or(ResponderError::Invalid)?,
+        )?;
+        let request_digest = Digest::of(DigestAlgorithm::Sha256, &request_bytes);
+        let url_digest = Digest::of(DigestAlgorithm::Sha256, url.as_bytes());
+        let now = UtcDateTime::now().map_err(|_| ResponderError::Unavailable)?;
+        let timeout = Duration::from_millis(policy.timeout_millis);
+        let expires_at = UtcDateTime::from_unix_micros(now.unix_micros().saturating_add(
+            i64::try_from(timeout.as_micros()).map_err(|_| ResponderError::Unavailable)?,
+        ))
+        .map_err(|_| ResponderError::Unavailable)?;
+        let artifact_expires_at = UtcDateTime::from_unix_micros(
+            expires_at.unix_micros().saturating_add(
+                i64::try_from(self.artifact_retention.as_micros())
+                    .map_err(|_| ResponderError::Unavailable)?,
+            ),
+        )
+        .map_err(|_| ResponderError::Unavailable)?;
+        let callback_id = callback_id(
+            self.claim.run_id,
+            self.attempt.attempt_id,
+            self.attempt.fencing_token.get(),
+            self.claim.lease_version,
+            &self.server_id,
+            generation,
+            generation,
+            &request.invocation_id_string(),
+            request_digest,
+        );
+        let retry_safety = match request.retry_safety() {
+            crate::capabilities::kernel::invoke::RetrySafety::Idempotent => "idempotent",
+            crate::capabilities::kernel::invoke::RetrySafety::NonIdempotent => "non_idempotent",
+        };
+        let callback = self
+            .store
+            .request(McpCallbackProjection {
+                id: callback_id,
+                server_id: self.server_id.clone(),
+                kind: McpCallbackKind::Elicitation,
+                mode: McpCallbackMode::Url,
+                principal_id: self.principal_id,
+                project_id: self.project_id,
+                run_id: self.claim.run_id,
+                attempt_id: self.attempt.attempt_id,
+                fence: self.attempt.fencing_token,
+                claim_generation: self.claim.lease_version,
+                workspace_id: self.workspace_id,
+                workspace_revision: self.workspace_revision.clone(),
+                request_id: request.invocation_id_string(),
+                request: request_value,
+                schema: serde_json::json!({}),
+                request_digest: request_digest.to_string(),
+                schema_digest: request_digest.to_string(),
+                challenge_generation: generation,
+                operation_sequence: generation,
+                expires_at,
+                artifact_expires_at,
+                max_response_bytes: policy.max_response_bytes,
+                max_content_bytes: 1,
+                secret_policy_id: self.secret_policy_id.clone(),
+                url_binding: Some(McpUrlCallbackBinding {
+                    invocation_id: request.invocation_id_string(),
+                    idempotency_digest: request.idempotency_digest().to_string(),
+                    server_id: self.server_id.clone(),
+                    generation,
+                    operation: "tools/call".to_owned(),
+                    invocation_request_digest: request.invocation_request_digest().to_string(),
+                    error_response_digest: error_response_digest.to_string(),
+                    url_digest: url_digest.to_string(),
+                    original_effect: request.effect(),
+                    grant_digest: request.grant_digest().to_string(),
+                    accept_destination: McpUrlDestination::from_url(url)
+                        .map_err(|_| ResponderError::Invalid)?,
+                    retry_safety: retry_safety.to_owned(),
+                    undispatched_proof:
+                        crate::domain::mcp_callback::McpUndispatchedProof::from_terminal_url_elicitation(
+                            error_response_digest.to_string(),
+                        ),
+                }),
+                state: McpCallbackState::Requested,
+                version: 1,
+                resolver_actor: None,
+                action: None,
+                artifact_refs: Vec::new(),
+                terminal_error: None,
+            })
+            .map_err(|_| ResponderError::Unavailable)?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let current = self
+                .store
+                .get(callback_id)
+                .map_err(|_| ResponderError::Unavailable)?;
+            if current.state == McpCallbackState::Resolved {
+                let action = current.action.ok_or(ResponderError::Invalid)?;
+                self.store
+                    .prepare_response(callback_id)
+                    .map_err(|_| ResponderError::Unavailable)?;
+                if action != crate::domain::mcp_callback::McpCallbackAction::Accept {
+                    self.store
+                        .deliver(callback_id)
+                        .map_err(|_| ResponderError::Unavailable)?;
+                }
+                return Ok(InvocationUrlResolution {
+                    action,
+                    binding: current.url_binding.ok_or(ResponderError::Invalid)?,
+                    delivery: (action == crate::domain::mcp_callback::McpCallbackAction::Accept)
+                        .then_some((self.store.clone(), callback_id)),
+                });
+            }
+            if !matches!(
+                current.state,
+                McpCallbackState::AwaitingResolution | McpCallbackState::Requested
+            ) {
+                return Err(ResponderError::Unavailable);
+            }
+            if self.cancellation.load(Ordering::Acquire) || request.cancelled() {
+                match self.store.settle_awaiting(
+                    callback_id,
+                    current.version,
+                    McpCallbackState::Interrupted,
+                    Some("outcome_unknown".to_owned()),
+                ) {
+                    Ok(_) | Err(McpCallbackError::Terminal(_)) => {
+                        return Err(ResponderError::Unavailable);
+                    }
+                    Err(McpCallbackError::VersionConflict { .. }) => continue,
+                    Err(_) => return Err(ResponderError::Unavailable),
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                match self.store.settle_awaiting(
+                    callback_id,
+                    current.version,
+                    McpCallbackState::Expired,
+                    Some("callback_expired".to_owned()),
+                ) {
+                    Ok(_) | Err(McpCallbackError::Terminal(_)) => {
+                        return Err(ResponderError::Unavailable);
+                    }
+                    Err(McpCallbackError::VersionConflict { .. }) => continue,
+                    Err(_) => return Err(ResponderError::Unavailable),
+                }
+            }
+            if !self.authority_live(&callback).await {
+                match self.store.settle_awaiting(
+                    callback_id,
+                    current.version,
+                    McpCallbackState::Interrupted,
+                    Some("outcome_unknown".to_owned()),
+                ) {
+                    Ok(_) | Err(McpCallbackError::Terminal(_)) => {
+                        return Err(ResponderError::Authority);
+                    }
+                    Err(McpCallbackError::VersionConflict { .. }) => continue,
+                    Err(_) => return Err(ResponderError::Unavailable),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn authority_live(&self, callback: &McpCallbackProjection) -> bool {
         let store = self.store.clone();
         let callback = callback.clone();
@@ -1615,6 +1908,102 @@ impl DurableElicitationOutcome {
             .map(drop)
             .map_err(|_| ResponderError::Unavailable)
     }
+}
+
+pub(crate) struct InvocationUrlResolution {
+    pub action: crate::domain::mcp_callback::McpCallbackAction,
+    binding: McpUrlCallbackBinding,
+    delivery: Option<(McpCallbackStore, McpCallbackId)>,
+}
+
+impl InvocationUrlResolution {
+    pub(crate) fn authorizes_retry(
+        &self,
+        request: &crate::capabilities::broker::BrokerInvocation<'_>,
+        server_id: &str,
+        generation: u64,
+        error_response_digest: Digest,
+        url: &str,
+    ) -> bool {
+        self.binding.invocation_id == request.invocation_id_string()
+            && self.binding.idempotency_digest == request.idempotency_digest().to_string()
+            && self.binding.server_id == server_id
+            && self.binding.generation == generation
+            && self.binding.operation == "tools/call"
+            && self.binding.invocation_request_digest
+                == request.invocation_request_digest().to_string()
+            && self.binding.error_response_digest == error_response_digest.to_string()
+            && self.binding.url_digest
+                == Digest::of(DigestAlgorithm::Sha256, url.as_bytes()).to_string()
+            && self.binding.original_effect == request.effect()
+            && self.binding.grant_digest == request.grant_digest().to_string()
+            && McpUrlDestination::from_url(url)
+                .is_ok_and(|destination| self.binding.accept_destination == destination)
+            && self.binding.retry_safety == "idempotent"
+            && self
+                .binding
+                .undispatched_proof
+                .proves(&error_response_digest.to_string())
+    }
+
+    pub fn finish(mut self, delivered: bool) {
+        if let Some((store, id)) = self.delivery.take() {
+            if delivered {
+                let _ = store.deliver(id);
+            } else {
+                let _ = store.settle(
+                    id,
+                    McpCallbackState::DeliveryUnknown,
+                    Some("outcome_unknown".to_owned()),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for InvocationUrlResolution {
+    fn drop(&mut self) {
+        if let Some((store, id)) = self.delivery.take() {
+            let _ = store.settle(
+                id,
+                McpCallbackState::DeliveryUnknown,
+                Some("outcome_unknown".to_owned()),
+            );
+        }
+    }
+}
+
+fn validate_invocation_url_error(
+    policy: &McpUrlElicitationResponderConfig,
+    message: &str,
+    url: &str,
+    elicitation_id: &str,
+    raw_data: Option<&serde_json::Value>,
+) -> Result<(), ResponderError> {
+    let params = McpCreateElicitationRequestParams::UrlElicitationParams {
+        meta: None,
+        message: message.to_owned(),
+        url: url.to_owned(),
+        elicitation_id: elicitation_id.to_owned(),
+    };
+    validate_elicitation_configured(params, None, Some(policy))?;
+    let raw = raw_data
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ResponderError::Invalid)?;
+    if raw.len() < 2
+        || raw.len() > 3
+        || raw.get("url").and_then(serde_json::Value::as_str) != Some(url)
+        || raw.get("elicitationId").and_then(serde_json::Value::as_str) != Some(elicitation_id)
+        || raw
+            .get("message")
+            .is_some_and(|value| value.as_str() != Some(message))
+        || raw
+            .keys()
+            .any(|key| !matches!(key.as_str(), "url" | "elicitationId" | "message"))
+    {
+        return Err(ResponderError::Invalid);
+    }
+    Ok(())
 }
 
 struct CallbackCleanup {
@@ -1731,6 +2120,8 @@ impl ResponderControl {
 pub struct ResponderInstallation {
     handler: McpHandlerConfig,
     control: Arc<ResponderControl>,
+    durable_elicitation: Option<Arc<DurableElicitationOutcome>>,
+    secret_scanner: Arc<SecretScanner>,
 }
 
 impl ResponderInstallation {
@@ -1749,6 +2140,47 @@ impl ResponderInstallation {
 
     pub(crate) fn disarm(&self) {
         self.control.disarm();
+    }
+
+    pub(crate) fn secret_scanner(&self) -> Arc<SecretScanner> {
+        Arc::clone(&self.secret_scanner)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn await_invocation_url(
+        &self,
+        request: &crate::capabilities::broker::BrokerInvocation<'_>,
+        generation: u64,
+        error_response_digest: Digest,
+        message: &str,
+        url: &str,
+        elicitation_id: &str,
+        raw_data: Option<&serde_json::Value>,
+    ) -> Result<InvocationUrlResolution, ResponderError> {
+        if !callback_value_public_to(
+            &self.secret_scanner,
+            &serde_json::json!({
+                "message": message,
+                "url": url,
+                "elicitation_id": elicitation_id,
+                "raw_data": raw_data,
+            }),
+        ) {
+            return Err(ResponderError::Invalid);
+        }
+        self.durable_elicitation
+            .as_ref()
+            .ok_or(ResponderError::Unavailable)?
+            .await_invocation_url(
+                request,
+                generation,
+                error_response_digest,
+                message,
+                url,
+                elicitation_id,
+                raw_data,
+            )
+            .await
     }
 }
 
@@ -1820,15 +2252,22 @@ pub(crate) fn install(
             outcome: Arc::clone(outcome),
         }));
     }
-    if let (Some(policy), Some(outcome)) = (&server.responders.elicitation, &outcomes.elicitation) {
-        handler = handler.with_elicitation_responder(Arc::new(ElicitationResponder {
-            policy: policy.clone(),
-            authority: authority.clone(),
-            control: Arc::clone(&control),
-            active: Arc::new(Semaphore::new(1)),
-            waiting: Arc::new(Semaphore::new(1)),
-            outcome: Arc::clone(outcome),
-        }));
+    if (server.responders.elicitation.is_some() || server.responders.url_elicitation.is_some())
+        && let Some(outcome) = &outcomes.elicitation
+    {
+        handler = handler.with_elicitation_responder_modes(
+            Arc::new(ElicitationResponder {
+                form_policy: server.responders.elicitation.clone(),
+                url_policy: server.responders.url_elicitation.clone(),
+                authority: authority.clone(),
+                control: Arc::clone(&control),
+                active: Arc::new(Semaphore::new(1)),
+                waiting: Arc::new(Semaphore::new(1)),
+                outcome: Arc::clone(outcome),
+            }),
+            server.responders.elicitation.is_some(),
+            server.responders.url_elicitation.is_some(),
+        );
     }
     if let Some(policy) = &server.responders.roots
         && let Some(root) = roots_for(policy, root_proof)?
@@ -1847,7 +2286,12 @@ pub(crate) fn install(
             delivery,
         }));
     }
-    Ok(ResponderInstallation { handler, control })
+    Ok(ResponderInstallation {
+        handler,
+        control,
+        durable_elicitation: outcomes.durable_elicitation.clone(),
+        secret_scanner: Arc::clone(&secret_scope.scanner),
+    })
 }
 
 struct SamplingResponder {
@@ -1942,7 +2386,8 @@ impl McpSamplingResponder for SamplingResponder {
 }
 
 struct ElicitationResponder {
-    policy: McpFormElicitationResponderConfig,
+    form_policy: Option<McpFormElicitationResponderConfig>,
+    url_policy: Option<McpUrlElicitationResponderConfig>,
     authority: ResponderAuthority,
     control: Arc<ResponderControl>,
     active: Arc<Semaphore>,
@@ -1957,63 +2402,79 @@ impl McpElicitationResponder for ElicitationResponder {
         params: McpCreateElicitationRequestParams,
         request_context: McpResponderRequestContext,
     ) -> Result<McpCreateElicitationResult, McpError> {
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(self.policy.timeout_millis);
-        tokio::time::timeout(
-            Duration::from_millis(self.policy.timeout_millis)
-                .saturating_add(Duration::from_secs(6)),
-            async {
-                let _permit = acquire_callback(&self.active, &self.waiting).await?;
-                self.authority
-                    .verify_live(&request_context, &self.control)
-                    .await?;
-                let quota = CallbackReservation::reserve(
-                    &self.authority,
-                    &request_context,
-                    Digest::of(DigestAlgorithm::Sha256, b"elicitation/create/validation"),
-                    Spend::new(0, 0, 1, 0, 0),
-                    "validation",
-                )?;
-                quota.commit()?;
-                let request_value =
-                    serde_json::to_value(&params).map_err(|_| ResponderError::Invalid)?;
-                if !self.authority.callback_value_and_semantic_public(
-                    &request_value,
-                    &elicitation_semantic(&params),
-                ) {
-                    return Err(ResponderError::Invalid);
-                }
-                let bytes = responder_envelope(
-                    "elicitation/create",
-                    request_context.request_id(),
-                    &params,
-                    elicitation_request_limit(&self.policy)?,
-                )?;
-                let (request, request_fields, _) = validate_elicitation(params, &self.policy)?;
-                let callback = CallbackAuthorityContext::from_request(
-                    &request_context,
-                    Digest::of(DigestAlgorithm::Sha256, &bytes),
-                    deadline,
-                    self.authority.clone(),
-                    Arc::clone(&self.control),
-                )?
-                .with_reservation(quota);
-                let mut output = self.outcome.respond(request, callback.clone()).await?;
-                self.authority
-                    .verify_live(&request_context, &self.control)
-                    .await?;
-                validate_elicitation_output(
-                    &output.result,
-                    &self.policy,
-                    &request_fields,
-                    request_context.request_id(),
-                )?;
-                if let Some(delivery) = output.delivery.take() {
-                    delivery.arm(&callback, &output.result)?;
-                }
-                Ok(output.result)
-            },
-        )
+        let timeout = match &params {
+            McpCreateElicitationRequestParams::FormElicitationParams { .. } => self
+                .form_policy
+                .as_ref()
+                .map(|policy| Duration::from_millis(policy.timeout_millis)),
+            McpCreateElicitationRequestParams::UrlElicitationParams { .. } => self
+                .url_policy
+                .as_ref()
+                .map(|policy| Duration::from_millis(policy.timeout_millis)),
+        }
+        .ok_or_else(|| map_error(ResponderError::Invalid))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::time::timeout(timeout.saturating_add(Duration::from_secs(6)), async {
+            let _permit = acquire_callback(&self.active, &self.waiting).await?;
+            self.authority
+                .verify_live(&request_context, &self.control)
+                .await?;
+            let quota = CallbackReservation::reserve(
+                &self.authority,
+                &request_context,
+                Digest::of(DigestAlgorithm::Sha256, b"elicitation/create/validation"),
+                Spend::new(0, 0, 1, 0, 0),
+                "validation",
+            )?;
+            quota.commit()?;
+            let request_value =
+                serde_json::to_value(&params).map_err(|_| ResponderError::Invalid)?;
+            if !self
+                .authority
+                .callback_value_and_semantic_public(&request_value, &elicitation_semantic(&params))
+            {
+                return Err(ResponderError::Invalid);
+            }
+            let bytes = responder_envelope(
+                "elicitation/create",
+                request_context.request_id(),
+                &params,
+                elicitation_request_limit_configured(
+                    self.form_policy.as_ref(),
+                    self.url_policy.as_ref(),
+                )?,
+            )?;
+            let (request, request_fields, _) = validate_elicitation_configured(
+                params,
+                self.form_policy.as_ref(),
+                self.url_policy.as_ref(),
+            )?;
+            let mode = request.mode();
+            let callback = CallbackAuthorityContext::from_request(
+                &request_context,
+                Digest::of(DigestAlgorithm::Sha256, &bytes),
+                deadline,
+                self.authority.clone(),
+                Arc::clone(&self.control),
+            )?
+            .with_reservation(quota);
+            let mut output = self.outcome.respond(request, callback.clone()).await?;
+            self.authority
+                .verify_live(&request_context, &self.control)
+                .await?;
+            validate_elicitation_output(
+                &output.result,
+                self.form_policy.as_ref(),
+                self.url_policy.as_ref(),
+                &request_fields,
+                mode,
+                request_context.request_id(),
+            )?;
+            if let Some(delivery) = output.delivery.take() {
+                delivery.arm(&callback, &output.result)?;
+            }
+            Ok(output.result)
+        })
         .await
         .map_err(|_| unavailable())?
         .map_err(map_error)
@@ -2499,8 +2960,9 @@ fn validate_elicitation(
     let schema_bytes = bounded_json(&requested_schema, policy.max_schema_bytes)?;
     let request = ValidatedElicitationRequest {
         message,
-        schema: requested_schema,
+        kind: ValidatedElicitationKind::Form(requested_schema),
         max_response_bytes: policy.max_response_bytes,
+        timeout: Duration::from_millis(policy.timeout_millis),
     };
     let bytes = bounded_json(
         &(request.message.as_str(), request.schema()),
@@ -2517,26 +2979,121 @@ fn validate_elicitation(
     ))
 }
 
+fn validate_elicitation_configured(
+    params: McpCreateElicitationRequestParams,
+    form: Option<&McpFormElicitationResponderConfig>,
+    url: Option<&McpUrlElicitationResponderConfig>,
+) -> Result<(ValidatedElicitationRequest, Vec<u8>, Digest), ResponderError> {
+    match params {
+        params @ McpCreateElicitationRequestParams::FormElicitationParams { .. } => {
+            validate_elicitation(params, form.ok_or(ResponderError::Invalid)?)
+        }
+        McpCreateElicitationRequestParams::UrlElicitationParams {
+            meta,
+            message,
+            url: requested_url,
+            elicitation_id,
+        } => {
+            let policy = url.ok_or(ResponderError::Invalid)?;
+            if meta.is_some()
+                || message.is_empty()
+                || message.len() > policy.max_message_bytes
+                || message.chars().any(char::is_control)
+                || requested_url.is_empty()
+                || requested_url.len() > policy.max_url_bytes
+                || elicitation_id.is_empty()
+                || elicitation_id.len() > policy.max_elicitation_id_bytes
+                || elicitation_id.bytes().any(|byte| !byte.is_ascii_graphic())
+            {
+                return Err(ResponderError::Invalid);
+            }
+            let credential = crate::domain::egress::CredentialHandle::new("url:inert")
+                .map_err(|_| ResponderError::Invalid)?;
+            let grants = policy
+                .allowed_origins
+                .iter()
+                .map(|origin| {
+                    crate::domain::egress::DestinationGrant::new(
+                        &origin.scheme,
+                        &origin.host,
+                        origin.port,
+                        credential.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ResponderError::Invalid)?;
+            crate::domain::egress::EgressPolicy::new(grants)
+                .grant_for_url(&requested_url)
+                .map_err(|_| ResponderError::Invalid)?;
+            let request = ValidatedElicitationRequest {
+                message,
+                kind: ValidatedElicitationKind::Url {
+                    url: requested_url,
+                    elicitation_id,
+                },
+                max_response_bytes: policy.max_response_bytes,
+                timeout: Duration::from_millis(policy.timeout_millis),
+            };
+            let bytes = bounded_json(
+                &(request.message(), request.url()),
+                policy
+                    .max_message_bytes
+                    .checked_add(policy.max_url_bytes)
+                    .and_then(|value| value.checked_add(policy.max_elicitation_id_bytes))
+                    .and_then(|value| value.checked_add(256))
+                    .ok_or(ResponderError::Invalid)?,
+            )?;
+            let digest = Digest::of(DigestAlgorithm::Sha256, &bytes);
+            Ok((request, bytes, digest))
+        }
+    }
+}
+
 fn validate_elicitation_output(
     response: &McpCreateElicitationResult,
-    policy: &McpFormElicitationResponderConfig,
+    form_policy: Option<&McpFormElicitationResponderConfig>,
+    url_policy: Option<&McpUrlElicitationResponderConfig>,
     request_bytes: &[u8],
+    mode: McpCallbackMode,
     request_id: &rmcp::model::RequestId,
 ) -> Result<(), ResponderError> {
     if response.meta.is_some()
-        || match response.action {
-            McpElicitationAction::Accept => response.content.is_none(),
-            McpElicitationAction::Decline | McpElicitationAction::Cancel => {
-                response.content.is_some()
-            }
+        || match mode {
+            McpCallbackMode::Form => match response.action {
+                McpElicitationAction::Accept => response.content.is_none(),
+                McpElicitationAction::Decline | McpElicitationAction::Cancel => {
+                    response.content.is_some()
+                }
+            },
+            McpCallbackMode::Url => response.content.is_some(),
+            _ => true,
         }
     {
         return Err(ResponderError::Invalid);
     }
+    let maximum = match mode {
+        McpCallbackMode::Form => {
+            form_policy
+                .ok_or(ResponderError::Invalid)?
+                .max_response_bytes
+        }
+        McpCallbackMode::Url => {
+            if response.content.is_some() {
+                return Err(ResponderError::Invalid);
+            }
+            url_policy
+                .ok_or(ResponderError::Invalid)?
+                .max_response_bytes
+        }
+        _ => return Err(ResponderError::Invalid),
+    };
     bounded_json(
         &serde_json::json!({"jsonrpc":"2.0","id":request_id,"result":response}),
-        policy.max_response_bytes,
+        maximum,
     )?;
+    if mode == McpCallbackMode::Url {
+        return Ok(());
+    }
     let Some(content) = &response.content else {
         return Ok(());
     };
@@ -2599,6 +3156,47 @@ fn elicitation_request_limit(
         .max_message_bytes
         .checked_add(policy.max_schema_bytes)
         .and_then(|value| value.checked_add(1024))
+        .ok_or(ResponderError::Invalid)
+}
+
+fn elicitation_request_limit_configured(
+    form: Option<&McpFormElicitationResponderConfig>,
+    url: Option<&McpUrlElicitationResponderConfig>,
+) -> Result<usize, ResponderError> {
+    let form = form
+        .map(elicitation_request_limit)
+        .transpose()?
+        .unwrap_or(0);
+    let url = url
+        .map(|policy| {
+            policy
+                .max_message_bytes
+                .checked_add(policy.max_url_bytes)
+                .and_then(|value| value.checked_add(policy.max_elicitation_id_bytes))
+                .and_then(|value| value.checked_add(1024))
+                .ok_or(ResponderError::Invalid)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(form.max(url).max(1))
+}
+
+fn callback_elicitation_request_limit(
+    request: &ValidatedElicitationRequest,
+    schema_bytes: usize,
+    url_policy: Option<&McpUrlElicitationResponderConfig>,
+) -> Result<usize, ResponderError> {
+    let fields = request.message().len().checked_add(schema_bytes);
+    let fields = if matches!(request.kind, ValidatedElicitationKind::Url { .. }) {
+        let policy = url_policy.ok_or(ResponderError::Invalid)?;
+        fields
+            .and_then(|value| value.checked_add(policy.max_url_bytes))
+            .and_then(|value| value.checked_add(policy.max_elicitation_id_bytes))
+    } else {
+        fields
+    };
+    fields
+        .and_then(|value| value.checked_add(128))
         .ok_or(ResponderError::Invalid)
 }
 
@@ -3267,6 +3865,188 @@ mod tests {
         }
     }
 
+    fn url_elicitation_policy() -> McpUrlElicitationResponderConfig {
+        McpUrlElicitationResponderConfig {
+            timeout_millis: 100,
+            max_message_bytes: 128,
+            max_url_bytes: 1024,
+            max_elicitation_id_bytes: 64,
+            max_response_bytes: 1024,
+            allowed_origins: vec![crate::protocols::mcp::config::McpUrlOriginConfig {
+                scheme: "https".to_owned(),
+                host: "auth.example.com".to_owned(),
+                port: 443,
+            }],
+        }
+    }
+
+    #[test]
+    fn url_elicitation_is_strict_inert_and_advertised_only_when_configured() {
+        let policy = url_elicitation_policy();
+        let valid = McpCreateElicitationRequestParams::UrlElicitationParams {
+            meta: None,
+            message: "Complete setup".to_owned(),
+            url: "https://auth.example.com/complete?challenge=opaque".to_owned(),
+            elicitation_id: "challenge".to_owned(),
+        };
+        let request = validate_elicitation_configured(valid, None, Some(&policy))
+            .unwrap()
+            .0;
+        assert_eq!(request.mode(), McpCallbackMode::Url);
+        assert_eq!(
+            request.url(),
+            Some((
+                "https://auth.example.com/complete?challenge=opaque",
+                "challenge"
+            ))
+        );
+        for malicious in [
+            "http://auth.example.com/",
+            "https://auth.example.com/#fragment",
+            "https://user@auth.example.com/",
+            "https://127.0.0.1/",
+            "https://other.example.com/",
+        ] {
+            assert!(
+                validate_elicitation_configured(
+                    McpCreateElicitationRequestParams::UrlElicitationParams {
+                        meta: None,
+                        message: "Complete setup".to_owned(),
+                        url: malicious.to_owned(),
+                        elicitation_id: "challenge".to_owned(),
+                    },
+                    None,
+                    Some(&policy),
+                )
+                .is_err()
+            );
+        }
+
+        let responder = ElicitationResponder {
+            form_policy: None,
+            url_policy: Some(policy),
+            authority: test_authority(RunBudget::new(100, 100, 100, 100, 100)),
+            control: Arc::new(ResponderControl::default()),
+            active: Arc::new(Semaphore::new(1)),
+            waiting: Arc::new(Semaphore::new(1)),
+            outcome: Arc::new(CountingElicitation(Arc::new(AtomicU64::new(0)))),
+        };
+        let initialize = McpHandlerConfig::new()
+            .with_elicitation_responder_modes(Arc::new(responder), false, true)
+            .initialize_arguments();
+        assert!(initialize["capabilities"]["elicitation"]["url"].is_object());
+        assert!(initialize["capabilities"]["elicitation"]["form"].is_null());
+    }
+
+    #[test]
+    fn url_elicitation_allows_ordinary_oauth_wording() {
+        let policy = url_elicitation_policy();
+        for message in [
+            "Authenticate with OAuth to continue",
+            "Authorize access in your browser",
+            "Complete authentication",
+        ] {
+            assert!(
+                validate_elicitation_configured(
+                    McpCreateElicitationRequestParams::UrlElicitationParams {
+                        meta: None,
+                        message: message.to_owned(),
+                        url: "https://auth.example.com/complete".to_owned(),
+                        elicitation_id: "challenge".to_owned(),
+                    },
+                    None,
+                    Some(&policy),
+                )
+                .is_ok(),
+                "rejected {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_elicitation_maximum_fields_fit_and_one_extra_byte_is_rejected() {
+        let policy = url_elicitation_policy();
+        let prefix = "https://auth.example.com/";
+        let message = "m".repeat(policy.max_message_bytes);
+        let url = format!(
+            "{prefix}{}",
+            "u".repeat(policy.max_url_bytes - prefix.len())
+        );
+        let elicitation_id = "i".repeat(policy.max_elicitation_id_bytes);
+        let params = McpCreateElicitationRequestParams::UrlElicitationParams {
+            meta: None,
+            message: message.clone(),
+            url: url.clone(),
+            elicitation_id: elicitation_id.clone(),
+        };
+        assert!(
+            responder_envelope(
+                "elicitation/create",
+                &NumberOrString::Number(1),
+                &params,
+                elicitation_request_limit_configured(None, Some(&policy)).unwrap(),
+            )
+            .is_ok()
+        );
+        let request = validate_elicitation_configured(params, None, Some(&policy))
+            .unwrap()
+            .0;
+        let schema = serde_json::json!({});
+        let schema_bytes = bounded_json(&schema, 1024 * 1024).unwrap();
+        let request_value = serde_json::json!({
+            "message": message,
+            "url": url,
+            "elicitation_id": elicitation_id,
+        });
+        assert!(
+            bounded_json(
+                &request_value,
+                callback_elicitation_request_limit(&request, schema_bytes.len(), Some(&policy),)
+                    .unwrap(),
+            )
+            .is_ok()
+        );
+
+        for (url, elicitation_id) in [
+            (
+                format!(
+                    "{prefix}{}",
+                    "u".repeat(policy.max_url_bytes + 1 - prefix.len())
+                ),
+                "i".repeat(policy.max_elicitation_id_bytes),
+            ),
+            (
+                format!(
+                    "{prefix}{}",
+                    "u".repeat(policy.max_url_bytes - prefix.len())
+                ),
+                "i".repeat(policy.max_elicitation_id_bytes + 1),
+            ),
+        ] {
+            assert!(
+                validate_elicitation_configured(
+                    McpCreateElicitationRequestParams::UrlElicitationParams {
+                        meta: None,
+                        message: "m".repeat(policy.max_message_bytes),
+                        url,
+                        elicitation_id,
+                    },
+                    None,
+                    Some(&policy),
+                )
+                .is_err()
+            );
+        }
+
+        let mut overflow = policy.clone();
+        overflow.max_url_bytes = usize::MAX;
+        assert!(elicitation_request_limit_configured(None, Some(&overflow)).is_err());
+        assert!(
+            callback_elicitation_request_limit(&request, schema_bytes.len(), Some(&overflow))
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn elicitation_schema_and_output_attacks_reach_dispatch_wrapper() {
         let policy = elicitation_policy();
@@ -3274,7 +4054,8 @@ mod tests {
             let control = Arc::new(ResponderControl::default());
             control.arm(1);
             let responder = ElicitationResponder {
-                policy: policy.clone(),
+                form_policy: Some(policy.clone()),
+                url_policy: None,
                 authority: test_authority(RunBudget::new(100, 100, 100, 100, 100)),
                 control,
                 active: Arc::new(Semaphore::new(1)),
@@ -3318,15 +4099,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elicitation_secret_is_rejected_before_outcome_handler() {
-        let scanner = Arc::new(crate::agent::providers::streaming::CanaryRedactor::new([
-            "leased-value".to_owned(),
-        ]));
+    async fn current_bearer_in_form_is_rejected_before_outcome_handler() {
+        let scanner = Arc::new(CallbackSecretScanner::new([]));
+        scanner.add_secret(&crate::domain::secret::SecretLease::new(
+            b"leased-value".to_vec(),
+        ));
         let calls = Arc::new(AtomicU64::new(0));
         let control = Arc::new(ResponderControl::default());
         control.arm(1);
         let responder = ElicitationResponder {
-            policy: elicitation_policy(),
+            form_policy: Some(elicitation_policy()),
+            url_policy: None,
             authority: test_authority(RunBudget::new(100, 100, 100, 100, 100)).with_secret_scanner(
                 Some(scanner),
                 Some(Arc::from("elicitation-inbound-test")),
@@ -3575,6 +4358,32 @@ mod tests {
         ));
         drop(own_registration);
         assert!(!registry.content_public(&own, &serde_json::json!({"value":"public"})));
+    }
+
+    #[test]
+    fn callback_scanner_absorbs_jit_http_lease_with_scoped_credentials() {
+        let scanner = CallbackSecretScanner::new([]).with_secrets(&[
+            Arc::new(crate::domain::secret::SecretLease::new(
+                b"provider-secret".to_vec(),
+            )),
+            Arc::new(crate::domain::secret::SecretLease::new(
+                b"stdio-secret".to_vec(),
+            )),
+        ]);
+        scanner.add_secret(&crate::domain::secret::SecretLease::new(
+            b"current-http-bearer".to_vec(),
+        ));
+
+        for secret in ["provider-secret", "stdio-secret", "current-http-bearer"] {
+            assert!(!callback_value_public_to(
+                &scanner,
+                &serde_json::json!({"form_value":secret}),
+            ));
+        }
+        assert!(callback_value_public_to(
+            &scanner,
+            &serde_json::json!({"form_value":"public"}),
+        ));
     }
 
     #[test]

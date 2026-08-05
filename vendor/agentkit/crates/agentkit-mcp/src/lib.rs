@@ -2129,6 +2129,8 @@ pub struct McpHandlerConfig {
     pub sampling: Option<Arc<dyn McpSamplingResponder>>,
     /// Responder for server-initiated `elicitation/create` requests.
     pub elicitation: Option<Arc<dyn McpElicitationResponder>>,
+    elicitation_form: bool,
+    elicitation_url: bool,
     /// Provider for `roots/list`.
     pub roots: Option<Arc<dyn McpRootsProvider>>,
     /// Resolver for auth challenges raised during MCP operations. When
@@ -2157,6 +2159,8 @@ impl Default for McpHandlerConfig {
         Self {
             sampling: None,
             elicitation: None,
+            elicitation_form: false,
+            elicitation_url: false,
             roots: None,
             auth: None,
             error_responder: None,
@@ -2187,6 +2191,21 @@ impl McpHandlerConfig {
         responder: Arc<dyn McpElicitationResponder>,
     ) -> Self {
         self.elicitation = Some(responder);
+        self.elicitation_form = true;
+        self
+    }
+
+    /// Sets one responder and the exact elicitation modes advertised by the client.
+    #[cfg(feature = "kit-authorized")]
+    pub fn with_elicitation_responder_modes(
+        mut self,
+        responder: Arc<dyn McpElicitationResponder>,
+        form: bool,
+        url: bool,
+    ) -> Self {
+        self.elicitation = Some(responder);
+        self.elicitation_form = form;
+        self.elicitation_url = url;
         self
     }
 
@@ -2283,8 +2302,12 @@ impl McpHandlerConfig {
         }
         if self.elicitation.is_some() {
             capabilities.elicitation = Some(McpElicitationCapability {
-                form: Some(McpFormElicitationCapability::default()),
-                url: None,
+                form: self
+                    .elicitation_form
+                    .then(McpFormElicitationCapability::default),
+                url: self
+                    .elicitation_url
+                    .then(McpUrlElicitationCapability::default),
             });
         }
         if self.roots.is_some() {

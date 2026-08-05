@@ -798,6 +798,12 @@ impl McpCallbackStore {
         callback.apply(&event)?;
         insert_event(&transaction, &command, &event, &callback, callback.version)?;
         save(&transaction, &callback)?;
+        transaction
+            .execute(
+                "DELETE FROM mcp_callback_resolution_reservations WHERE callback_id=?1",
+                [callback_id.to_string()],
+            )
+            .map_err(store)?;
         transaction.commit().map_err(store)?;
         Ok(callback)
     }
@@ -880,6 +886,12 @@ impl McpCallbackStore {
         callback.apply(&event)?;
         insert_event(&transaction, &command, &event, &callback, callback.version)?;
         save(&transaction, &callback)?;
+        transaction
+            .execute(
+                "DELETE FROM mcp_callback_resolution_reservations WHERE callback_id=?1",
+                [callback_id.to_string()],
+            )
+            .map_err(store)?;
         transaction.commit().map_err(store)?;
         Ok(callback)
     }
@@ -1133,10 +1145,20 @@ impl McpCallbackStore {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let mut interrupted = 0;
         for id in &ids {
-            self.interrupt(*id, "outcome_unknown".to_owned())?;
+            match self.interrupt(*id, "outcome_unknown".to_owned()) {
+                Ok(_) => interrupted += 1,
+                Err(McpCallbackError::Terminal(_)) | Err(McpCallbackError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
-        Ok(ids.len())
+        Ok(interrupted)
+    }
+
+    pub fn reconcile_startup(&self) -> Result<usize, McpCallbackError> {
+        self.reconcile_artifact_publications()?;
+        self.interrupt_inflight()
     }
 
     pub fn authority_live(&self, callback: &McpCallbackProjection) -> Result<(), McpCallbackError> {
@@ -1163,6 +1185,7 @@ fn resolution_publication(
                 callback.mode,
                 crate::domain::mcp_callback::McpCallbackMode::SamplingRequest
                     | crate::domain::mcp_callback::McpCallbackMode::SamplingResponse
+                    | crate::domain::mcp_callback::McpCallbackMode::Url
             )
         })
     {
@@ -1640,11 +1663,21 @@ fn same_request(left: &McpCallbackProjection, right: &McpCallbackProjection) -> 
         && left.server_id == right.server_id
         && left.kind == right.kind
         && left.mode == right.mode
+        && left.principal_id == right.principal_id
+        && left.project_id == right.project_id
+        && left.run_id == right.run_id
+        && left.workspace_id == right.workspace_id
+        && left.workspace_revision == right.workspace_revision
+        && left.request_id == right.request_id
+        && left.request == right.request
         && left.request_digest == right.request_digest
         && left.schema_digest == right.schema_digest
         && left.attempt_id == right.attempt_id
         && left.fence == right.fence
         && left.claim_generation == right.claim_generation
+        && left.challenge_generation == right.challenge_generation
+        && left.operation_sequence == right.operation_sequence
+        && left.url_binding == right.url_binding
 }
 
 fn same_authority(left: &McpCallbackProjection, right: &McpCallbackProjection) -> bool {
@@ -1656,8 +1689,16 @@ fn same_authority(left: &McpCallbackProjection, right: &McpCallbackProjection) -
         && left.claim_generation == right.claim_generation
         && left.workspace_id == right.workspace_id
         && left.workspace_revision == right.workspace_revision
+        && left.server_id == right.server_id
+        && left.kind == right.kind
+        && left.mode == right.mode
+        && left.request_id == right.request_id
+        && left.request == right.request
+        && left.request_digest == right.request_digest
         && left.challenge_generation == right.challenge_generation
+        && left.operation_sequence == right.operation_sequence
         && left.schema_digest == right.schema_digest
+        && left.url_binding == right.url_binding
 }
 
 fn guard_claim(
@@ -2100,7 +2141,10 @@ mod tests {
             events::UtcDateTime,
             ids::{AttemptId, RunId, WorkspaceId},
             lifecycle::FencingToken,
-            mcp_callback::{McpCallbackKind, McpCallbackMode},
+            mcp_callback::{
+                McpCallbackKind, McpCallbackMode, McpUndispatchedProof, McpUrlCallbackBinding,
+                McpUrlDestination,
+            },
         },
         runtime::daemon::ControlPlaneAuthority,
         store::artifacts::{
@@ -2165,7 +2209,7 @@ mod tests {
         let authority = ControlPlaneAuthority::for_test();
         let mut append = SqliteStore::open(&database, &authority).unwrap();
         drop(ProjectionStore::open(&database).unwrap());
-        let callback = fixture(1);
+        let callback = url_fixture(1);
         append
             .install_driver_claim_for_test(AttemptDriverClaim {
                 run_id: callback.run_id,
@@ -2636,7 +2680,7 @@ mod tests {
             Err(McpCallbackError::IdempotencyConflict)
         ));
 
-        let raced = fixture(2);
+        let raced = url_fixture(2);
         append
             .install_driver_claim_for_test(AttemptDriverClaim {
                 run_id: raced.run_id,
@@ -2694,7 +2738,7 @@ mod tests {
             McpCallbackState::Resolved
         );
 
-        let restart = fixture(3);
+        let restart = url_fixture(3);
         append
             .install_driver_claim_for_test(AttemptDriverClaim {
                 run_id: restart.run_id,
@@ -2707,7 +2751,7 @@ mod tests {
             .unwrap();
         store.request(restart.clone()).unwrap();
 
-        let delivery = fixture(4);
+        let delivery = url_fixture(4);
         append
             .install_driver_claim_for_test(AttemptDriverClaim {
                 run_id: delivery.run_id,
@@ -2748,21 +2792,84 @@ mod tests {
             )
             .unwrap();
         store.prepare_response(delivery.id).unwrap();
+
+        let accepted = url_fixture(5);
+        append
+            .install_driver_claim_for_test(AttemptDriverClaim {
+                run_id: accepted.run_id,
+                attempt_id: accepted.attempt_id,
+                principal_id: accepted.principal_id,
+                fence: accepted.fence,
+                lease_version: accepted.claim_generation,
+                expires_at_unix_micros: i64::MAX,
+            })
+            .unwrap();
+        store.request(accepted.clone()).unwrap();
+        let accepted_key = IdempotencyKey::parse("accepted-url-proof").unwrap();
+        store
+            .reserve_resolution(
+                accepted.principal_id,
+                accepted.project_id,
+                accepted.id,
+                &accepted_key,
+                [5; 32],
+                2,
+                7,
+                &accepted.schema_digest,
+            )
+            .unwrap();
+        let accepted_resolution = store
+            .resolve(
+                accepted.principal_id,
+                accepted.project_id,
+                &accepted_key,
+                accepted.id,
+                2,
+                7,
+                &accepted.schema_digest,
+                McpCallbackAction::Accept,
+                Vec::new(),
+                [5; 32],
+                &accepted,
+            )
+            .unwrap()
+            .0;
+        assert_eq!(accepted_resolution.state, McpCallbackState::Resolved);
+        assert_eq!(
+            store.prepare_response(accepted.id).unwrap().state,
+            McpCallbackState::ResponsePrepared
+        );
         drop(store);
         let restarted = McpCallbackStore::open(&database).unwrap();
-        assert_eq!(restarted.interrupt_inflight().unwrap(), 5);
+        assert_eq!(restarted.reconcile_startup().unwrap(), 6);
         let interrupted = restarted.get(restart.id).unwrap();
         assert_eq!(interrupted.state, McpCallbackState::Interrupted);
+        assert_eq!(interrupted.mode, McpCallbackMode::Url);
         assert_eq!(
             interrupted.terminal_error.as_deref(),
             Some("outcome_unknown")
         );
         let delivery_unknown = restarted.get(delivery.id).unwrap();
         assert_eq!(delivery_unknown.state, McpCallbackState::DeliveryUnknown);
+        assert_eq!(delivery_unknown.mode, McpCallbackMode::Url);
         assert_eq!(delivery_unknown.action, Some(McpCallbackAction::Decline));
         assert_eq!(
             delivery_unknown.terminal_error.as_deref(),
             Some("delivery_unknown")
+        );
+        let accepted_unknown = restarted.get(accepted.id).unwrap();
+        assert_eq!(accepted_unknown.state, McpCallbackState::DeliveryUnknown);
+        assert_eq!(accepted_unknown.action, Some(McpCallbackAction::Accept));
+        assert_eq!(
+            connection(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM mcp_callback_resolution_reservations",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -3393,6 +3500,7 @@ mod tests {
             max_response_bytes: 1024,
             max_content_bytes: 900,
             secret_policy_id: "authorized-secrets-v1".to_owned(),
+            url_binding: None,
             state: McpCallbackState::Requested,
             version: 1,
             resolver_actor: None,
@@ -3400,5 +3508,49 @@ mod tests {
             artifact_refs: Vec::new(),
             terminal_error: None,
         }
+    }
+
+    fn url_fixture(sequence: u8) -> McpCallbackProjection {
+        let mut callback = fixture(sequence);
+        let response_digest = format!("sha256:{}", format!("{:x}", sequence).repeat(64));
+        let url = format!("https://auth.example/complete/{sequence}");
+        callback.mode = McpCallbackMode::Url;
+        callback.request_id = format!("invocation-{sequence}");
+        callback.request = serde_json::json!({
+            "error_code":-32042,
+            "error_response_digest":response_digest,
+            "message":"authenticate",
+            "url":url,
+            "elicitation_id":format!("challenge-{sequence}")
+        });
+        callback.schema = serde_json::json!({});
+        callback.request_digest = crate::capabilities::kernel::identity::Digest::of(
+            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+            &serde_json::to_vec(&callback.request).unwrap(),
+        )
+        .to_string();
+        callback.operation_sequence = callback.challenge_generation;
+        callback.url_binding = Some(McpUrlCallbackBinding {
+            invocation_id: callback.request_id.clone(),
+            idempotency_digest: format!("sha256:{}", "a".repeat(64)),
+            server_id: callback.server_id.clone(),
+            generation: callback.challenge_generation,
+            operation: "tools/call".to_owned(),
+            invocation_request_digest: format!("sha256:{}", "b".repeat(64)),
+            error_response_digest: response_digest.clone(),
+            url_digest: crate::capabilities::kernel::identity::Digest::of(
+                crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                url.as_bytes(),
+            )
+            .to_string(),
+            original_effect: crate::capabilities::kernel::grant::EffectClass::WorkspaceRead,
+            grant_digest: format!("sha256:{}", "c".repeat(64)),
+            accept_destination: McpUrlDestination::from_url(&url).unwrap(),
+            retry_safety: "idempotent".to_owned(),
+            undispatched_proof: McpUndispatchedProof::from_terminal_url_elicitation(
+                response_digest,
+            ),
+        });
+        callback
     }
 }

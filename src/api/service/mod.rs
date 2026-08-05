@@ -1376,15 +1376,51 @@ where
         let result = (|| {
             let descriptor = command.descriptor();
             let scope = self.store.command_scope(context.principal_id(), &command)?;
+            let mut preloaded_mcp_callback = None;
+            let required_grant = if let Command::ResolveMcpCallback { callback_id, .. } = &command {
+                let callback = match self.store.query(&Query::GetMcpCallback {
+                    callback_id: *callback_id,
+                })? {
+                    QueryProjection::McpCallback(callback) => callback,
+                    _ => {
+                        return Err(ServiceError::Store(
+                            "invalid callback projection".to_owned(),
+                        ));
+                    }
+                };
+                let required = callback
+                    .url_binding
+                    .as_ref()
+                    .map_or(descriptor.required_grant, |binding| {
+                        binding.original_effect.required_grant()
+                    });
+                preloaded_mcp_callback = Some(callback);
+                required
+            } else {
+                descriptor.required_grant
+            };
             self.authorizer
-                .authorize(context.principal(), scope, descriptor.required_grant)
+                .authorize(context.principal(), scope, required_grant)
                 .map_err(ServiceError::Authentication)?;
+            let url_accept = matches!(
+                &command,
+                Command::ResolveMcpCallback {
+                    mode: crate::domain::mcp_callback::McpCallbackMode::Url,
+                    action: McpCallbackAction::Accept,
+                    ..
+                }
+            );
+            if url_accept {
+                self.authorizer
+                    .authorize(context.principal(), scope, Grant::NetworkEgress)
+                    .map_err(ServiceError::Authentication)?;
+            }
             let mut mcp_callback_request_digest = None;
             let mut mcp_callback_authority = None;
             let original_callback_command =
                 matches!(command, Command::ResolveMcpCallback { .. }).then(|| command.clone());
             if let Command::ResolveMcpCallback {
-                callback_id,
+                callback_id: _,
                 kind,
                 mode,
                 challenge_generation,
@@ -1426,16 +1462,9 @@ where
                         "callback artifact references are service-owned".to_owned(),
                     ));
                 }
-                let callback = match self.store.query(&Query::GetMcpCallback {
-                    callback_id: *callback_id,
-                })? {
-                    QueryProjection::McpCallback(callback) => callback,
-                    _ => {
-                        return Err(ServiceError::Store(
-                            "invalid callback projection".to_owned(),
-                        ));
-                    }
-                };
+                let callback = preloaded_mcp_callback
+                    .take()
+                    .expect("callback authority was preloaded");
                 if callback.principal_id != context.principal_id()
                     || callback.project_id != context.grant().project_id()
                     || callback.kind != *kind
@@ -1450,7 +1479,8 @@ where
                 let content_bytes = match (callback.mode, action) {
                     (
                         crate::domain::mcp_callback::McpCallbackMode::SamplingRequest
-                        | crate::domain::mcp_callback::McpCallbackMode::SamplingResponse,
+                        | crate::domain::mcp_callback::McpCallbackMode::SamplingResponse
+                        | crate::domain::mcp_callback::McpCallbackMode::Url,
                         _,
                     ) => {
                         if content.is_some() {
@@ -1543,6 +1573,8 @@ where
             let callback_recheck = |callback: &McpCallbackProjection| {
                 callback.principal_id == context.principal_id()
                     && callback.project_id == context.grant().project_id()
+                    && context.grant().grants().contains(&required_grant)
+                    && (!url_accept || context.grant().grants().contains(&Grant::NetworkEgress))
                     && runtime.mcp_callback_revision_live(&callback.workspace_revision)
             };
             runtime.admit_command(principal_id, idempotency_key, &command)?;
@@ -1970,7 +2002,10 @@ mod mcp_callback_tests {
             events::UtcDateTime,
             ids::{AttemptId, RunId, WorkspaceId},
             lifecycle::FencingToken,
-            mcp_callback::{McpCallbackKind, McpCallbackMode, McpCallbackState},
+            mcp_callback::{
+                McpCallbackKind, McpCallbackMode, McpCallbackState, McpUndispatchedProof,
+                McpUrlCallbackBinding, McpUrlDestination,
+            },
         },
         runtime::daemon::ControlPlaneAuthority,
     };
@@ -2167,7 +2202,7 @@ mod mcp_callback_tests {
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             [
-                "scope", "replay", "query", "drift", "artifact", "drift", "reserve", "stage",
+                "scope", "query", "replay", "drift", "artifact", "drift", "reserve", "stage",
                 "commit"
             ]
         );
@@ -2187,7 +2222,132 @@ mod mcp_callback_tests {
             &ControlPlaneAuthority::for_test(),
         );
         assert!(service.execute(&context, command).unwrap().replayed);
-        assert_eq!(calls.lock().unwrap().as_slice(), ["scope", "replay"]);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["scope", "query", "replay"]
+        );
+    }
+
+    #[test]
+    fn url_resolution_keeps_original_authority_and_adds_egress_only_for_accept() {
+        let callback = url_callback_fixture();
+        let command = |callback: &McpCallbackProjection, action| Command::ResolveMcpCallback {
+            schema_version: crate::domain::events::SchemaVersion::CURRENT,
+            callback_id: callback.id,
+            kind: callback.kind,
+            mode: callback.mode,
+            expected_version: callback.version,
+            challenge_generation: callback.challenge_generation,
+            schema_digest: callback.schema_digest.clone(),
+            action,
+            content: None,
+            artifact_refs: Vec::new(),
+        };
+        let execute = |callback: &McpCallbackProjection, grants, action| {
+            let context = RequestContext::authenticated(
+                Ok(AuthenticatedPrincipal::from_grants(GrantSnapshot::new(
+                    callback.principal_id,
+                    callback.project_id,
+                    grants,
+                ))),
+                Some(IdempotencyKey::parse(&format!("url-authority-{action:?}")).unwrap()),
+                TraceId::parse("url-authority").unwrap(),
+            )
+            .unwrap();
+            Service::with_runtime(
+                OrderingStore {
+                    callback: callback.clone(),
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    replay: false,
+                },
+                ScopedAuthorizer,
+                OrderingRuntime {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    revision_live: true,
+                },
+                &ControlPlaneAuthority::for_test(),
+            )
+            .execute(&context, command(callback, action))
+        };
+
+        assert!(matches!(
+            execute(&callback, [Grant::NetworkEgress], McpCallbackAction::Accept),
+            Err(ServiceError::Authentication(_))
+        ));
+        assert!(matches!(
+            execute(&callback, [Grant::ModelCall], McpCallbackAction::Accept),
+            Err(ServiceError::Authentication(_))
+        ));
+        assert!(execute(&callback, [Grant::ModelCall], McpCallbackAction::Decline).is_ok());
+
+        let mut invocation_callback = callback;
+        invocation_callback
+            .url_binding
+            .as_mut()
+            .unwrap()
+            .original_effect = crate::capabilities::kernel::grant::EffectClass::WorkspaceRead;
+        assert!(
+            execute(
+                &invocation_callback,
+                [Grant::WorkspaceRead],
+                McpCallbackAction::Decline,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            execute(
+                &invocation_callback,
+                [Grant::ModelCall],
+                McpCallbackAction::Decline,
+            ),
+            Err(ServiceError::Authentication(_))
+        ));
+    }
+
+    fn url_callback_fixture() -> McpCallbackProjection {
+        let mut callback = callback_fixture();
+        let url = "https://auth.example.com/complete";
+        let response_digest = format!("sha256:{}", "2".repeat(64));
+        callback.mode = McpCallbackMode::Url;
+        callback.request_id = "invocation".to_owned();
+        callback.request = serde_json::json!({
+            "error_code": -32042,
+            "error_response_digest": response_digest,
+            "message": "authenticate",
+            "url": url,
+            "elicitation_id": "challenge"
+        });
+        callback.schema = serde_json::json!({});
+        callback.max_content_bytes = 1;
+        callback.request_digest = crate::capabilities::kernel::identity::Digest::of(
+            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+            &serde_json::to_vec(&callback.request).unwrap(),
+        )
+        .to_string();
+        callback.schema_digest = callback.request_digest.clone();
+        callback.url_binding = Some(McpUrlCallbackBinding {
+            invocation_id: callback.request_id.clone(),
+            idempotency_digest: format!("sha256:{}", "3".repeat(64)),
+            server_id: callback.server_id.clone(),
+            generation: callback.challenge_generation,
+            operation: "tools/call".to_owned(),
+            invocation_request_digest: format!("sha256:{}", "4".repeat(64)),
+            error_response_digest: response_digest.clone(),
+            url_digest: crate::capabilities::kernel::identity::Digest::of(
+                crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                url.as_bytes(),
+            )
+            .to_string(),
+            original_effect: crate::capabilities::kernel::grant::EffectClass::ModelCall,
+            grant_digest: format!("sha256:{}", "5".repeat(64)),
+            accept_destination: McpUrlDestination::from_url(url).unwrap(),
+            retry_safety: "idempotent".to_owned(),
+            undispatched_proof: McpUndispatchedProof::from_terminal_url_elicitation(
+                response_digest,
+            ),
+        });
+        callback.validate().unwrap();
+        callback
     }
 
     fn callback_fixture() -> McpCallbackProjection {
@@ -2220,6 +2380,7 @@ mod mcp_callback_tests {
             max_response_bytes: 1024,
             max_content_bytes: 900,
             secret_policy_id: "authorized-secrets-v1".to_owned(),
+            url_binding: None,
             state: McpCallbackState::AwaitingResolution,
             version: 2,
             resolver_actor: None,

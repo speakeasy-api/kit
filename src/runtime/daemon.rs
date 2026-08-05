@@ -935,10 +935,7 @@ impl Daemon {
                 .map_err(|error| DaemonError::Setup(error.to_string()))?,
         );
         crate::store::sqlite::mcp_callback::McpCallbackStore::open(&database)
-            .and_then(|store| {
-                store.reconcile_artifact_publications()?;
-                store.interrupt_inflight()
-            })
+            .and_then(|store| store.reconcile_startup())
             .map_err(|error| DaemonError::Setup(error.to_string()))?;
         let scheduler = DurableScheduler::open(&database)
             .map_err(|error| DaemonError::Setup(error.to_string()))?;

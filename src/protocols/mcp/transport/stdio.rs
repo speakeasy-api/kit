@@ -834,9 +834,6 @@ impl Transport<RoleClient> for BoundedStdioTransport {
                 return None;
             }
         };
-        if self.operations.scan_payload(&payload).is_err() {
-            return None;
-        }
         let value = payload.value();
         if value
             .get("result")
@@ -853,7 +850,7 @@ impl Transport<RoleClient> for BoundedStdioTransport {
                 ));
             return None;
         }
-        if value.get("result").is_some()
+        if (value.get("result").is_some() || super::is_terminal_url_elicitation(&payload))
             && let Err(error) = self.operations.capture_payload(payload.clone())
         {
             self.operations

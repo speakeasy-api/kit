@@ -1256,6 +1256,11 @@ async fn resolve_mcp_callback(
         ) => body.content.is_some(),
         (
             crate::domain::mcp_callback::McpCallbackKind::Elicitation,
+            crate::domain::mcp_callback::McpCallbackMode::Url,
+            _,
+        ) => body.content.is_none(),
+        (
+            crate::domain::mcp_callback::McpCallbackKind::Elicitation,
             crate::domain::mcp_callback::McpCallbackMode::Form,
             McpCallbackAction::Decline | McpCallbackAction::Cancel,
         )

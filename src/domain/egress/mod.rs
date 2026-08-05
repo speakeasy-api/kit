@@ -3,12 +3,43 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
 pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_RESOLVED_ADDRESSES: usize = 64;
+pub const MAX_EGRESS_URL_BYTES: usize = 16 * 1024;
 const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[async_trait::async_trait]
+pub trait EgressResolver: Send + Sync + 'static {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, Denial>;
+}
+
+#[derive(Default)]
+pub struct SystemEgressResolver;
+
+#[async_trait::async_trait]
+impl EgressResolver for SystemEgressResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, Denial> {
+        let resolved = tokio::time::timeout(
+            DNS_RESOLUTION_TIMEOUT,
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| Denial::ResolverUnavailable)?
+        .map_err(|_| Denial::ResolverUnavailable)?;
+        let addresses = resolved
+            .take(MAX_RESOLVED_ADDRESSES + 1)
+            .map(|address| address.ip())
+            .collect::<Vec<_>>();
+        if addresses.len() > MAX_RESOLVED_ADDRESSES {
+            return Err(Denial::ResolutionLimit);
+        }
+        Ok(addresses)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Scheme {
@@ -211,16 +242,75 @@ impl Authorization {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EgressPolicy {
     grants: BTreeSet<DestinationGrant>,
+    resolver: Arc<dyn EgressResolver>,
+}
+
+impl fmt::Debug for EgressPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EgressPolicy")
+            .field("grants", &self.grants)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EgressPolicy {
     pub fn new(grants: impl IntoIterator<Item = DestinationGrant>) -> Self {
         Self {
             grants: grants.into_iter().collect(),
+            resolver: Arc::new(SystemEgressResolver),
         }
+    }
+
+    pub fn with_resolver(mut self, resolver: Arc<dyn EgressResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    pub(crate) fn configured_destinations(&self) -> impl Iterator<Item = &Destination> {
+        self.grants.iter().map(DestinationGrant::destination)
+    }
+
+    /// Selects an exact configured destination and its opaque credential
+    /// before any resolver or credential storage is consulted.
+    pub fn grant_for_url(&self, url: &str) -> Result<&DestinationGrant, Denial> {
+        let destination = parse_url(url)?;
+        let mut matches = self
+            .grants
+            .iter()
+            .filter(|grant| grant.destination == destination);
+        let grant = matches.next().ok_or(Denial::DestinationNotGranted)?;
+        if matches.next().is_some() {
+            return Err(Denial::AmbiguousGrant);
+        }
+        Ok(grant)
+    }
+
+    pub fn canonical_url(url: &str) -> Result<url::Url, Denial> {
+        let destination = parse_url(url)?;
+        let mut parsed = url::Url::parse(url).map_err(|_| Denial::InvalidUrl)?;
+        let parsed_host = parsed.host_str().ok_or(Denial::InvalidHost)?;
+        if !parsed_host.is_ascii() {
+            return Err(Denial::InvalidHost);
+        }
+        if matches!(&destination.host, Host::Domain(host) if !parsed_host.trim_end_matches('.').eq_ignore_ascii_case(host))
+        {
+            return Err(Denial::InvalidHost);
+        }
+        let canonical_host = match &destination.host {
+            Host::Ip(IpAddr::V6(address)) => format!("[{address}]"),
+            host => host.canonical(),
+        };
+        parsed
+            .set_host(Some(&canonical_host))
+            .map_err(|_| Denial::InvalidHost)?;
+        if parse_url(parsed.as_str())? != destination {
+            return Err(Denial::InvalidUrl);
+        }
+        Ok(parsed)
     }
 
     /// Resolves through the policy-owned system resolver and pins the complete
@@ -232,8 +322,13 @@ impl EgressPolicy {
     ) -> Result<Authorization, Denial> {
         let destination = parse_url(url)?;
         self.authorize_destination(&destination, credential)?;
-        let resolution = resolve_destination(&destination).await?;
+        let resolution = self.resolve_destination(&destination).await?;
         self.authorize(url, credential, &resolution, 0)
+    }
+
+    pub async fn resolve_initial_granted(&self, url: &str) -> Result<Authorization, Denial> {
+        let credential = self.grant_for_url(url)?.credential.clone();
+        self.resolve_initial(url, &credential).await
     }
 
     pub async fn resolve_redirect(
@@ -247,8 +342,17 @@ impl EgressPolicy {
         }
         let destination = parse_url(url)?;
         self.authorize_destination(&destination, credential)?;
-        let resolution = resolve_destination(&destination).await?;
+        let resolution = self.resolve_destination(&destination).await?;
         self.authorize(url, credential, &resolution, previous.redirects + 1)
+    }
+
+    pub async fn resolve_redirect_granted(
+        &self,
+        previous: &Authorization,
+        url: &str,
+    ) -> Result<Authorization, Denial> {
+        let credential = self.grant_for_url(url)?.credential.clone();
+        self.resolve_redirect(previous, url, &credential).await
     }
 
     pub fn validate_peer(
@@ -343,25 +447,18 @@ impl EgressPolicy {
         }
         Ok(())
     }
-}
 
-async fn resolve_destination(destination: &Destination) -> Result<ResolverObservation, Denial> {
-    let host = destination.host.canonical();
-    let resolved = tokio::time::timeout(
-        DNS_RESOLUTION_TIMEOUT,
-        tokio::net::lookup_host((host.as_str(), destination.port)),
-    )
-    .await
-    .map_err(|_| Denial::ResolverUnavailable)?
-    .map_err(|_| Denial::ResolverUnavailable)?;
-    let addresses = resolved
-        .take(MAX_RESOLVED_ADDRESSES + 1)
-        .map(|address| address.ip())
-        .collect::<Vec<_>>();
-    if addresses.len() > MAX_RESOLVED_ADDRESSES {
-        return Err(Denial::ResolutionLimit);
+    async fn resolve_destination(
+        &self,
+        destination: &Destination,
+    ) -> Result<ResolverObservation, Denial> {
+        let host = destination.host.canonical();
+        let addresses = self.resolver.resolve(&host, destination.port).await?;
+        if addresses.len() > MAX_RESOLVED_ADDRESSES {
+            return Err(Denial::ResolutionLimit);
+        }
+        Ok(ResolverObservation::new(addresses))
     }
-    Ok(ResolverObservation::new(addresses))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,6 +475,7 @@ pub enum Denial {
     DangerousPort,
     InvalidCredentialHandle,
     DestinationNotGranted,
+    AmbiguousGrant,
     EmptyResolution,
     ResolverUnavailable,
     ResolutionLimit,
@@ -396,6 +494,7 @@ impl std::error::Error for Denial {}
 
 fn parse_url(value: &str) -> Result<Destination, Denial> {
     if value.is_empty()
+        || value.len() > MAX_EGRESS_URL_BYTES
         || value
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b' ' || byte == b'\\')
@@ -630,6 +729,8 @@ fn public_ipv6(address: Ipv6Addr) -> bool {
         (0x2001_0000_0000_0000_0000_0000_0000_0000, 23),
         (0x2001_0db8_0000_0000_0000_0000_0000_0000, 32),
         (0x2002_0000_0000_0000_0000_0000_0000_0000, 16),
+        (0x3fff_0000_0000_0000_0000_0000_0000_0000, 20),
+        (0x5f00_0000_0000_0000_0000_0000_0000_0000, 16),
         (0xfc00_0000_0000_0000_0000_0000_0000_0000, 7),
         (0xfe80_0000_0000_0000_0000_0000_0000_0000, 10),
         (0xfec0_0000_0000_0000_0000_0000_0000_0000, 10),
@@ -657,6 +758,74 @@ mod tests {
                 .resolve_initial("https://must-not-resolve.invalid/mcp", &credential)
                 .await,
             Err(Denial::DestinationNotGranted)
+        );
+    }
+
+    #[test]
+    fn canonical_url_strips_one_root_dot_and_rejects_ambiguous_hosts() {
+        assert_eq!(
+            EgressPolicy::canonical_url("https://EXAMPLE.com./mcp?x=1")
+                .unwrap()
+                .as_str(),
+            "https://example.com/mcp?x=1"
+        );
+        for denied in [
+            "https://example.com../mcp",
+            "https://exämple.com/mcp",
+            "https://xn--exmple-cua.com../mcp",
+        ] {
+            assert!(
+                EgressPolicy::canonical_url(denied).is_err(),
+                "accepted {denied}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_iana_non_global_ipv6_ranges_are_shared_denials() {
+        for address in [
+            "::",
+            "::1",
+            "64:ff9b::1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff00::1",
+        ] {
+            assert!(!public_ip(address.parse().unwrap()), "accepted {address}");
+        }
+        assert!(public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_ipv6_literal_is_canonicalized_without_losing_url_brackets() {
+        let credential = CredentialHandle::new("test:credential").unwrap();
+        let grant =
+            DestinationGrant::new("https", "2606:4700:4700::1111", 443, credential).unwrap();
+        let policy = EgressPolicy::new([grant]);
+        let url = EgressPolicy::canonical_url(
+            "https://[2606:4700:4700:0:0:0:0:1111]/authorize?client=kit",
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://[2606:4700:4700::1111]/authorize?client=kit"
+        );
+        assert_eq!(
+            policy
+                .grant_for_url(url.as_str())
+                .unwrap()
+                .destination()
+                .host(),
+            "2606:4700:4700::1111"
         );
     }
 }

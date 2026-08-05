@@ -187,7 +187,11 @@ impl OwnedBrokerInvocation {
             )
             .with_extension(
                 crate::capabilities::kernel::grant_ext::GrantExtension::new(
-                    extension.egress().cloned(),
+                    extension
+                        .egress()
+                        .cloned()
+                        .into_iter()
+                        .chain(extension.egresses().iter().cloned()),
                     extension
                         .credential()
                         .cloned()
@@ -477,6 +481,36 @@ impl<'a> BrokerInvocation<'a> {
         self.envelope.retry_safety
     }
 
+    pub(crate) fn invocation_id_string(&self) -> String {
+        self.envelope.invocation_id.to_string()
+    }
+
+    pub(crate) const fn workspace_id(&self) -> crate::domain::ids::WorkspaceId {
+        self.envelope.workspace_id
+    }
+
+    pub(crate) fn idempotency_digest(&self) -> Digest {
+        Digest::of(
+            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+            self.envelope.idempotency_key.as_str().as_bytes(),
+        )
+    }
+
+    pub(crate) fn grant_digest(&self) -> Digest {
+        self.envelope.grants.digest()
+    }
+
+    pub(crate) const fn effect(&self) -> crate::capabilities::kernel::grant::EffectClass {
+        self.envelope.effect
+    }
+
+    pub(crate) fn invocation_request_digest(&self) -> Digest {
+        Digest::of(
+            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+            self.envelope.arguments,
+        )
+    }
+
     fn result_provenance(
         &self,
         remaining_budget: Spend,
@@ -544,6 +578,26 @@ impl<'a> BrokerInvocation<'a> {
         } else {
             preflight(self)
         }
+    }
+
+    pub(crate) fn preflight_transport_retry(
+        &self,
+        store: &mut SqliteStore,
+    ) -> Result<(), BrokerError> {
+        self.envelope
+            .preflight_authority(store, self.lifecycle_shutdown())
+            .map_err(BrokerError::Invoke)?;
+        self.preflight_transport()?;
+        if self.envelope.cancellation.load(Ordering::Acquire) && !self.lifecycle_shutdown() {
+            return Err(BrokerError::TransportAuthCancelled);
+        }
+        let decision = grant::decide(self.envelope.grant_request());
+        if !decision.is_allowed() {
+            return Err(BrokerError::Invoke(InvokeError::AuthorizationDenied(
+                decision.reason(),
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) const fn lifecycle_shutdown(&self) -> bool {

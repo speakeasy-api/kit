@@ -19,15 +19,18 @@ use agentkit_mcp::{
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::protocols::mcp::egress::McpResponseScanner;
 use crate::{
     capabilities::broker::{
         self, BrokerError, BrokerInvocation, BrokerOutcome, BrokerPrepareOutcome,
         OwnedBrokerInvocation,
         transport_auth::{self, TransportAuthState},
     },
-    capabilities::kernel::invoke::InvocationCrashPoint,
+    capabilities::kernel::{
+        identity::{Digest, DigestAlgorithm},
+        invoke::InvocationCrashPoint,
+    },
     capabilities::{kernel::invoke::InvocationEnvelope, registration::BoundRegistrationCall},
-    domain::secret::SecretLease,
     protocols::mcp::features::{
         ConfiguredServerIdentity, DiscoveredFeatures, DiscoveryError, FeatureError,
         FeatureListKind, FeaturePage, McpCatalog, NegotiatedFeatureKinds, PayloadError,
@@ -38,13 +41,15 @@ use crate::{
     runtime::scheduler::reserve::BudgetLedger,
     store::artifacts::ArtifactStore,
     store::sqlite::append::SqliteStore,
-    telemetry::redact::{CaptureRedactor, SensitiveDataScanner},
 };
 
+pub use crate::protocols::mcp::egress::{
+    HttpCredentialBroker, HttpCredentialError, HttpSecretContext,
+};
 pub(crate) use http::EnvironmentHttpCredentialBroker;
 pub use http::{
-    HttpCredentialBroker, HttpCredentialError, HttpSecretContext, StreamableHttpOutcome,
-    connect_streamable_http, resolve_streamable_http_auth, resume_streamable_http,
+    StreamableHttpOutcome, connect_streamable_http, resolve_streamable_http_auth,
+    resume_streamable_http,
 };
 use http::{connect_streamable_http_with_handler, resume_streamable_http_with_handler};
 use invocation::{
@@ -181,7 +186,7 @@ fn validate_initialize_arguments(request: &BrokerInvocation<'_>) -> Result<(), T
         && capabilities
             .elicitation
             .as_ref()
-            .is_none_or(|elicitation| elicitation.form.is_some() && elicitation.url.is_none())
+            .is_none_or(|elicitation| elicitation.form.is_some() || elicitation.url.is_some())
     {
         Ok(())
     } else {
@@ -595,7 +600,7 @@ impl McpCapabilityRuntime {
         *catalog = candidate;
         if let Some(replaced) = &replaced {
             replaced.disarm_responders();
-            replaced.retired.store(true, Ordering::Release);
+            replaced.retire();
         }
         Ok((generation, replaced))
     }
@@ -921,7 +926,7 @@ impl McpCapabilityRuntime {
             .map_err(|_| TransportError::AuthorizationMismatch)?;
         for connection in &connections {
             connection.disarm_responders();
-            connection.retired.store(true, Ordering::Release);
+            connection.retire();
             catalog.remove(&connection.configured_server)?;
         }
         self.retained_retired
@@ -958,7 +963,7 @@ impl McpCapabilityRuntime {
         );
         for connection in connections {
             connection.disarm_responders();
-            connection.retired.store(true, Ordering::Release);
+            connection.retire();
             let result = connection.close_owned(store).await;
             if failure.is_none() {
                 failure = result.err();
@@ -1021,7 +1026,7 @@ impl ReadyConnectionRegistry {
             .map(|registered| registered.connection);
         if let Some(replaced) = &replaced {
             replaced.disarm_responders();
-            replaced.retired.store(true, Ordering::Release);
+            replaced.retire();
         }
         Ok((generation, replaced))
     }
@@ -1045,7 +1050,7 @@ impl ReadyConnectionRegistry {
             .remove(server.as_str())
             .map(|registered| registered.connection);
         if let Some(removed) = &removed {
-            removed.retired.store(true, Ordering::Release);
+            removed.retire();
         }
         Ok(removed)
     }
@@ -1103,7 +1108,9 @@ impl ReadyConnection {
         if connection.negotiated_protocol_version().as_ref() != Some(&PROTOCOL_REVISION) {
             return Err(TransportError::ProtocolVersionRefused);
         }
-        let negotiated = Arc::new(RwLock::new(feature_kinds(connection.capabilities())));
+        let negotiated = feature_kinds(connection.capabilities());
+        operations.set_notification_support(&negotiated)?;
+        let negotiated = Arc::new(RwLock::new(negotiated));
         operations.ready.store(true, Ordering::Release);
         Ok(Self {
             connection,
@@ -1132,6 +1139,8 @@ impl ReadyConnection {
         mut self,
         responders: crate::protocols::mcp::responders::ResponderInstallation,
     ) -> Self {
+        self.operations
+            .set_responder_scanner(responders.secret_scanner());
         self.responders = Some(responders);
         self
     }
@@ -1146,6 +1155,11 @@ impl ReadyConnection {
         if let Some(responders) = &self.responders {
             responders.disarm();
         }
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.operations.clear_response_scanners();
     }
 
     #[cfg(test)]
@@ -1869,7 +1883,26 @@ impl ReadyConnection {
         )?)
     }
 
-    async fn call_tool(
+    fn finish_interrupted_tool_call(
+        &self,
+        request: &BrokerInvocation<'_>,
+        dispatch: transport_auth::TransportDispatch,
+        generation: Option<u64>,
+        store: &mut SqliteStore,
+        outcome: transport_auth::TransportDispatchOutcome,
+        error: TransportError,
+    ) -> BoundOperationError {
+        let persisted = transport_auth::finish_dispatch(request, dispatch, outcome, store)
+            .map_err(TransportError::from);
+        let cleared = generation
+            .map(|generation| self.operations.clear_generation(generation))
+            .transpose();
+        BoundOperationError::after_dispatch(
+            persisted.err().or_else(|| cleared.err()).unwrap_or(error),
+        )
+    }
+
+    async fn call_tool_with_url_elicitation(
         &self,
         request: &BrokerInvocation<'_>,
         name: &str,
@@ -1881,26 +1914,198 @@ impl ReadyConnection {
         if !arguments.is_null() {
             wire.insert("arguments".to_owned(), arguments.clone());
         }
+        let operation_arguments = Value::Object(wire);
         let (dispatch, generation) = self
-            .authorize(request, "tools/call", Value::Object(wire), store)
+            .authorize(request, "tools/call", operation_arguments.clone(), store)
             .map_err(BoundOperationError::before_dispatch)?;
-        let result = tokio::time::timeout(
+        let first = tokio::time::timeout(
             self.request_timeout,
             self.connection.call_tool(name, arguments.clone()),
         )
         .await;
-        self.finish_with_session_retry(
-            result,
-            dispatch,
+        let Ok(Err(McpError::Invocation(agentkit_mcp::McpInvocationError::UrlElicitation {
+            message,
+            data: Some(data),
+            raw_data,
+        }))) = first
+        else {
+            return self
+                .finish_with_session_retry(
+                    first,
+                    dispatch,
+                    generation,
+                    request,
+                    store,
+                    "tools/call response",
+                    || self.connection.call_tool(name, arguments),
+                )
+                .await
+                .map(|(value, _)| value)
+                .map_err(BoundOperationError::after_dispatch);
+        };
+        let Some(responders) = self.responders.as_ref() else {
+            return Err(self.finish_interrupted_tool_call(
+                request,
+                dispatch,
+                Some(generation),
+                store,
+                transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                TransportError::UrlElicitationUnavailable,
+            ));
+        };
+        let error_response_digest = match self.operations.exact_terminal_url_elicitation_digest(
             generation,
+            &message,
+            raw_data.as_ref(),
+        ) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Err(self.finish_interrupted_tool_call(
+                    request,
+                    dispatch,
+                    Some(generation),
+                    store,
+                    transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                    error,
+                ));
+            }
+        };
+        let resolution = match responders
+            .await_invocation_url(
+                request,
+                generation,
+                error_response_digest,
+                &message,
+                &data.url,
+                &data.elicitation_id,
+                raw_data.as_ref(),
+            )
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(_) => {
+                return Err(self.finish_interrupted_tool_call(
+                    request,
+                    dispatch,
+                    Some(generation),
+                    store,
+                    transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                    TransportError::UrlElicitationUnavailable,
+                ));
+            }
+        };
+        if resolution.action != crate::domain::mcp_callback::McpCallbackAction::Accept {
+            return Err(self.finish_interrupted_tool_call(
+                request,
+                dispatch,
+                Some(generation),
+                store,
+                transport_auth::TransportDispatchOutcome::Completed,
+                TransportError::UrlElicitationDeclined,
+            ));
+        }
+        if request.retry_safety() == crate::capabilities::kernel::invoke::RetrySafety::NonIdempotent
+            || !resolution.authorizes_retry(
+                request,
+                self.configured_server.as_str(),
+                generation,
+                error_response_digest,
+                &data.url,
+            )
+        {
+            resolution.finish(false);
+            return Err(self.finish_interrupted_tool_call(
+                request,
+                dispatch,
+                Some(generation),
+                store,
+                transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                TransportError::UrlElicitationUnavailable,
+            ));
+        }
+        if let Err(error) = request.preflight_transport_retry(store) {
+            resolution.finish(false);
+            return Err(self.finish_interrupted_tool_call(
+                request,
+                dispatch,
+                Some(generation),
+                store,
+                transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                error.into(),
+            ));
+        }
+        let operation = transport_auth::TransportOperation::parse("tools/call")
+            .map_err(|error| BoundOperationError::after_dispatch(error.into()))?;
+        let argument_bytes = serde_json::to_vec(&operation_arguments).map_err(|_| {
+            BoundOperationError::after_dispatch(TransportError::AuthorizationMismatch)
+        })?;
+        let binding = self
+            .operations
+            .binding()
+            .map_err(BoundOperationError::after_dispatch)?
+            .with_request(request);
+        let authorization = match authorize_ready_operation(
             request,
+            &operation,
+            &binding,
+            &argument_bytes,
             store,
-            "tools/call response",
-            || self.connection.call_tool(name, arguments),
-        )
-        .await
-        .map(|(value, _)| value)
-        .map_err(BoundOperationError::after_dispatch)
+        ) {
+            Ok((authorization, _)) => authorization,
+            Err(error) => {
+                resolution.finish(false);
+                return Err(self.finish_interrupted_tool_call(
+                    request,
+                    dispatch,
+                    Some(generation),
+                    store,
+                    transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = self.operations.clear_generation(generation) {
+            resolution.finish(false);
+            return Err(self.finish_interrupted_tool_call(
+                request,
+                dispatch,
+                Some(generation),
+                store,
+                transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                error,
+            ));
+        }
+        let generation = match self.operations.install(authorization) {
+            Ok(generation) => generation,
+            Err(error) => {
+                resolution.finish(false);
+                return Err(self.finish_interrupted_tool_call(
+                    request,
+                    dispatch,
+                    None,
+                    store,
+                    transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                    error,
+                ));
+            }
+        };
+        let retry = self
+            .finish_timed_operation(
+                tokio::time::timeout(
+                    self.request_timeout,
+                    self.connection.call_tool(name, arguments),
+                )
+                .await,
+                dispatch,
+                generation,
+                request,
+                store,
+                "tools/call response",
+            )
+            .map(|(value, _)| value)
+            .map_err(BoundOperationError::after_dispatch);
+        resolution.finish(retry.is_ok());
+        retry
     }
 
     pub async fn invoke_bound(
@@ -2037,7 +2242,7 @@ impl ReadyConnection {
         } else {
             let result = match &operation {
                 McpOperation::Tool { name, arguments } => self
-                    .call_tool(&request, name, arguments.clone(), store)
+                    .call_tool_with_url_elicitation(&request, name, arguments.clone(), store)
                     .await
                     .map(McpInvocationResult::Tool),
                 McpOperation::Resource { uri } => self
@@ -2223,6 +2428,7 @@ impl ReadyConnection {
         }
         let negotiated = feature_kinds(candidate.capabilities());
         candidate.commit(|| self.arm_responders()).await;
+        self.operations.set_notification_support(&negotiated)?;
         *self
             .negotiated
             .write()
@@ -2417,6 +2623,7 @@ impl ReadyConnection {
         request: &BrokerInvocation<'_>,
         store: &mut SqliteStore,
     ) -> Result<(), TransportError> {
+        self.operations.clear_response_scanners();
         self.disarm_responders();
         let _permit = self.serial.acquire(request, self.close_timeout).await?;
         let (dispatch, generation) = self.authorize_inner(
@@ -2450,11 +2657,15 @@ impl ReadyConnection {
                 result = cleanup;
             }
         }
-        self.finish_operation(result, dispatch, generation, request, store)
-            .map(|(value, _)| value)
+        let result = self
+            .finish_operation(result, dispatch, generation, request, store)
+            .map(|(value, _)| value);
+        self.operations.clear_response_scanners();
+        result
     }
 
     pub(crate) async fn close_owned(&self, store: &mut SqliteStore) -> Result<(), TransportError> {
+        self.operations.clear_response_scanners();
         let result = match self.lifecycle_request() {
             Ok(owner) => self.close(&owner.shutdown_invocation(), store).await,
             Err(error) => Err(error),
@@ -2842,7 +3053,7 @@ fn fail_refresh_closed(
         .write()
         .map_err(|_| TransportError::AuthorizationMismatch)?;
     if registry.generation(&connection.configured_server)? == Some(connection_generation) {
-        connection.retired.store(true, Ordering::Release);
+        connection.retire();
         catalog
             .write()
             .map_err(|_| TransportError::AuthorizationMismatch)?
@@ -3005,10 +3216,45 @@ struct OperationGate {
     next: Mutex<Option<Arc<transport_auth::TransportAuthorization>>>,
     failure: Mutex<Option<TransportFailure>>,
     response: Mutex<OperationResponse>,
-    response_scanner: Mutex<Option<SensitiveDataScanner>>,
-    active_secrets: Mutex<Vec<SecretLease>>,
+    callback_scanners: Mutex<BTreeMap<String, Arc<McpResponseScanner>>>,
+    notification_support: RwLock<Option<NotificationSupport>>,
+    responder_scanner: Mutex<Option<Arc<crate::protocols::mcp::responders::CallbackSecretScanner>>>,
     binding: Mutex<Option<transport_auth::TransportBinding>>,
     connection: Mutex<Option<Arc<transport_auth::TransportAuthorization>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NotificationSupport {
+    tools_changed: bool,
+    resources_changed: bool,
+    prompts_changed: bool,
+}
+
+impl NotificationSupport {
+    fn from_capabilities(capabilities: &rmcp::model::ServerCapabilities) -> Self {
+        Self {
+            tools_changed: capabilities
+                .tools
+                .as_ref()
+                .is_some_and(|capability| capability.list_changed == Some(true)),
+            resources_changed: capabilities
+                .resources
+                .as_ref()
+                .is_some_and(|capability| capability.list_changed == Some(true)),
+            prompts_changed: capabilities
+                .prompts
+                .as_ref()
+                .is_some_and(|capability| capability.list_changed == Some(true)),
+        }
+    }
+
+    fn from_negotiated(negotiated: &NegotiatedFeatureKinds) -> Self {
+        Self {
+            tools_changed: negotiated.supports_list_changed(FeatureListKind::Tools),
+            resources_changed: negotiated.supports_list_changed(FeatureListKind::Resources),
+            prompts_changed: negotiated.supports_list_changed(FeatureListKind::Prompts),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3024,6 +3270,8 @@ enum TransportFailure {
     ResponseTooLarge,
     SseEventTooLarge,
     Credential(HttpCredentialError),
+    Egress(crate::protocols::mcp::egress::McpEgressError),
+    HttpTimeout,
     MissingProtocolVersion(agentkit_mcp::McpServerId),
     StdioParse(String),
     StdioTimeout,
@@ -3062,8 +3310,9 @@ impl OperationGate {
             next: Mutex::new(None),
             failure: Mutex::new(None),
             response: Mutex::new(OperationResponse::default()),
-            response_scanner: Mutex::new(None),
-            active_secrets: Mutex::new(Vec::new()),
+            callback_scanners: Mutex::new(BTreeMap::new()),
+            notification_support: RwLock::new(None),
+            responder_scanner: Mutex::new(None),
             binding: Mutex::new(None),
             connection: Mutex::new(None),
         })
@@ -3204,6 +3453,48 @@ impl OperationGate {
             .ok_or(TransportError::AuthorizationMismatch)
     }
 
+    fn exact_terminal_url_elicitation_digest(
+        &self,
+        generation: u64,
+        message: &str,
+        raw_data: Option<&Value>,
+    ) -> Result<Digest, TransportError> {
+        let response = self
+            .response
+            .lock()
+            .map_err(|_| TransportError::AuthorizationMismatch)?;
+        let payload = response
+            .payload
+            .as_ref()
+            .filter(|_| response.active == Some(generation))
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        let value = payload.value();
+        let object = value
+            .as_object()
+            .filter(|object| {
+                object.len() == 3
+                    && object.contains_key("jsonrpc")
+                    && object.contains_key("id")
+                    && object.contains_key("error")
+            })
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        let error = object
+            .get("error")
+            .and_then(Value::as_object)
+            .filter(|error| {
+                error.len() == 3
+                    && error.get("code").and_then(Value::as_i64) == Some(-32042)
+                    && error.get("message").and_then(Value::as_str) == Some(message)
+                    && error.get("data") == raw_data
+            })
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        let _ = error;
+        Ok(Digest::of(
+            DigestAlgorithm::Sha256,
+            payload.canonical_bytes(),
+        ))
+    }
+
     fn bind_connection(
         &self,
         authorization: Arc<transport_auth::TransportAuthorization>,
@@ -3247,14 +3538,6 @@ impl OperationGate {
         self.message_sent.store(false, Ordering::Release);
         response.response_id = None;
         response.active = None;
-        self.active_secrets
-            .lock()
-            .map_err(|_| TransportError::AuthorizationMismatch)?
-            .clear();
-        *self
-            .response_scanner
-            .lock()
-            .map_err(|_| TransportError::AuthorizationMismatch)? = None;
         Ok(response.payload.take())
     }
 
@@ -3274,30 +3557,150 @@ impl OperationGate {
         }
     }
 
-    fn install_secret(&self, secret: SecretLease) -> Result<(), TransportError> {
-        let mut secrets = self
-            .active_secrets
-            .lock()
-            .map_err(|_| TransportError::AuthorizationMismatch)?;
-        secrets.push(secret);
+    fn set_responder_scanner(
+        &self,
+        scanner: Arc<crate::protocols::mcp::responders::CallbackSecretScanner>,
+    ) {
         *self
-            .response_scanner
+            .responder_scanner
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scanner);
+    }
+
+    fn set_notification_support(
+        &self,
+        negotiated: &NegotiatedFeatureKinds,
+    ) -> Result<(), TransportError> {
+        *self
+            .notification_support
+            .write()
             .map_err(|_| TransportError::AuthorizationMismatch)? =
-            Some(CaptureRedactor::new(&secrets).scanner());
+            Some(NotificationSupport::from_negotiated(negotiated));
         Ok(())
     }
 
-    fn scan_ingress(&self, bytes: &[u8]) -> Result<(), TransportError> {
-        let mut scanner = self
-            .response_scanner
+    fn bind_callback_scanner(
+        &self,
+        payload: &RawPayload,
+        scanner: Arc<McpResponseScanner>,
+    ) -> Result<(), TransportError> {
+        let value = payload.value();
+        if value.get("method").and_then(Value::as_str).is_none() {
+            self.bind_initial_notification_support(value)?;
+            return Ok(());
+        }
+        let Some(id) = value
+            .get("id")
+            .filter(|id| id.is_string() || id.is_number())
+        else {
+            return self.validate_notification(value);
+        };
+        let key = serde_json::to_string(id).map_err(|_| TransportError::AuthorizationMismatch)?;
+        let mut scanners = self
+            .callback_scanners
             .lock()
             .map_err(|_| TransportError::AuthorizationMismatch)?;
-        let Some(scanner) = scanner.as_mut() else {
+        if scanners.contains_key(&key) {
+            return Err(TransportError::AuthorizationMismatch);
+        }
+        scanners.insert(key, scanner);
+        Ok(())
+    }
+
+    fn bind_initial_notification_support(&self, value: &Value) -> Result<(), TransportError> {
+        if self.ready.load(Ordering::Acquire)
+            || self
+                .next
+                .lock()
+                .map_err(|_| TransportError::AuthorizationMismatch)?
+                .as_ref()
+                .is_none_or(|authorization| authorization.operation().as_str() != "initialize")
+        {
+            return Ok(());
+        }
+        let response = self
+            .response
+            .lock()
+            .map_err(|_| TransportError::AuthorizationMismatch)?;
+        if value.get("id") != response.response_id.as_ref() {
+            return Ok(());
+        }
+        let Some(result) = value.get("result").cloned() else {
             return Ok(());
         };
-        scanner.push(bytes);
-        if scanner.found() {
+        let Ok(result) = serde_json::from_value::<rmcp::model::InitializeResult>(result) else {
+            return Ok(());
+        };
+        if result.protocol_version != PROTOCOL_REVISION {
+            return Ok(());
+        }
+        *self
+            .notification_support
+            .write()
+            .map_err(|_| TransportError::AuthorizationMismatch)? =
+            Some(NotificationSupport::from_capabilities(&result.capabilities));
+        Ok(())
+    }
+
+    fn validate_notification(&self, value: &Value) -> Result<(), TransportError> {
+        let notification =
+            match serde_json::from_value::<rmcp::model::ServerJsonRpcMessage>(value.clone())
+                .map_err(|_| TransportError::AuthorizationMismatch)?
+            {
+                rmcp::model::ServerJsonRpcMessage::Notification(notification) => {
+                    notification.notification
+                }
+                _ => return Err(TransportError::AuthorizationMismatch),
+            };
+        let support = self
+            .notification_support
+            .read()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        let accepted = match notification {
+            rmcp::model::ServerNotification::ToolListChangedNotification(_) => {
+                support.tools_changed && value.get("params").is_none()
+            }
+            rmcp::model::ServerNotification::ResourceListChangedNotification(_) => {
+                support.resources_changed && value.get("params").is_none()
+            }
+            rmcp::model::ServerNotification::PromptListChangedNotification(_) => {
+                support.prompts_changed && value.get("params").is_none()
+            }
+            rmcp::model::ServerNotification::ProgressNotification(_)
+            | rmcp::model::ServerNotification::CancelledNotification(_) => true,
+            _ => false,
+        };
+        accepted
+            .then_some(())
+            .ok_or(TransportError::AuthorizationMismatch)
+    }
+
+    fn scan_callback_response(&self, value: &Value, bytes: &[u8]) -> Result<(), TransportError> {
+        let id = value
+            .get("id")
+            .filter(|id| id.is_string() || id.is_number())
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        let key = serde_json::to_string(id).map_err(|_| TransportError::AuthorizationMismatch)?;
+        let scanner = self
+            .callback_scanners
+            .lock()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .remove(&key)
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        let response_public = self
+            .responder_scanner
+            .lock()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .as_ref()
+            .is_some_and(|scanner| {
+                crate::protocols::mcp::responders::callback_value_public_to(scanner, value)
+            });
+        if scanner
+            .scan_callback(bytes)
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            || !response_public
+        {
             self.fail(TransportFailure::SensitivePayload);
             Err(TransportError::SensitivePayload)
         } else {
@@ -3305,10 +3708,15 @@ impl OperationGate {
         }
     }
 
-    fn scan_payload(&self, payload: &RawPayload) -> Result<(), TransportError> {
-        // Raw ingress catches encoded reflections; canonical JSON catches escapes
-        // such as `\u002d` after decoding and before any artifact is written.
-        self.scan_ingress(payload.canonical_bytes())
+    fn clear_response_scanners(&self) {
+        self.callback_scanners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *self
+            .responder_scanner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn capture_payload(&self, payload: RawPayload) -> Result<bool, TransportError> {
@@ -3336,6 +3744,8 @@ impl OperationGate {
                 TransportFailure::ResponseTooLarge => TransportError::ResponseTooLarge,
                 TransportFailure::SseEventTooLarge => TransportError::SseEventTooLarge,
                 TransportFailure::Credential(error) => TransportError::Credential(error),
+                TransportFailure::Egress(error) => TransportError::Egress(error),
+                TransportFailure::HttpTimeout => TransportError::Timeout("HTTP request"),
                 TransportFailure::MissingProtocolVersion(server) => {
                     TransportError::Agentkit(Box::new(McpError::UnsupportedProtocolVersion {
                         server,
@@ -3353,6 +3763,10 @@ impl OperationGate {
                 TransportFailure::SessionExpired => TransportError::SessionExpired,
             })
     }
+}
+
+fn is_terminal_url_elicitation(payload: &RawPayload) -> bool {
+    payload.value()["error"]["code"].as_i64() == Some(-32042)
 }
 
 #[derive(Debug)]
@@ -3382,12 +3796,21 @@ pub enum TransportError {
         cleanup: io::Error,
     },
     Credential(HttpCredentialError),
+    Egress(crate::protocols::mcp::egress::McpEgressError),
     Payload(PayloadError),
     Feature(FeatureError),
     Discovery(DiscoveryError),
     Result(McpResultError),
     SensitivePayload,
     SessionExpired,
+    UrlElicitation {
+        message: String,
+        url: String,
+        elicitation_id: String,
+        raw_data: Option<Value>,
+    },
+    UrlElicitationUnavailable,
+    UrlElicitationDeclined,
     AuthRequired(Box<transport_auth::TransportAuthChallenge>),
 }
 
@@ -3430,6 +3853,7 @@ impl fmt::Display for TransportError {
                 write!(formatter, "{primary}; cleanup: {cleanup}")
             }
             Self::Credential(error) => error.fmt(formatter),
+            Self::Egress(error) => error.fmt(formatter),
             Self::Payload(error) => error.fmt(formatter),
             Self::Feature(error) => error.fmt(formatter),
             Self::Discovery(error) => error.fmt(formatter),
@@ -3438,6 +3862,13 @@ impl fmt::Display for TransportError {
                 formatter.write_str("MCP response contains protected credential material")
             }
             Self::SessionExpired => formatter.write_str("MCP session expired"),
+            Self::UrlElicitation { .. } => {
+                formatter.write_str("MCP URL elicitation requires authenticated resolution")
+            }
+            Self::UrlElicitationUnavailable => {
+                formatter.write_str("MCP URL elicitation outcome is unknown")
+            }
+            Self::UrlElicitationDeclined => formatter.write_str("MCP URL elicitation declined"),
             Self::AuthRequired(_) => formatter.write_str("MCP operation requires authorization"),
         }
     }
@@ -3463,7 +3894,11 @@ impl TransportError {
             Self::AuthRequired(_) => "mcp.transport_auth_interrupted",
             Self::SensitivePayload => "mcp.sensitive_payload",
             Self::SessionExpired => "mcp.session_expired",
+            Self::UrlElicitation { .. } => "mcp.url_elicitation_required",
+            Self::UrlElicitationUnavailable => "mcp.url_elicitation_outcome_unknown",
+            Self::UrlElicitationDeclined => "mcp.url_elicitation_declined",
             Self::Credential(_) => "mcp.credential_failed",
+            Self::Egress(_) => "mcp.egress_denied",
             Self::Payload(_) | Self::Result(_) => "mcp.invalid_response",
             Self::Cleanup { primary, .. } => primary.completion_code(),
             Self::Broker(_)
@@ -3583,6 +4018,7 @@ mod tests {
                 WorkspaceId,
             },
             lifecycle::{AttemptOwnership, FencingToken},
+            secret::SecretLease,
         },
         runtime::scheduler::{budget::RunBudget, limits::Spend, reserve::BudgetLedger},
         store::{artifacts::ArtifactStore, sqlite::idempotency::IdempotencyKey},
@@ -3675,7 +4111,6 @@ mod tests {
                         PayloadLimits::default(),
                     )
                     .map_err(std::io::Error::other)?;
-                    gate.scan_payload(&payload).map_err(std::io::Error::other)?;
                     gate.capture_payload(payload)
                         .map_err(std::io::Error::other)?;
                 }
@@ -3707,6 +4142,168 @@ mod tests {
         }
     }
 
+    struct UrlAcceptanceResolver {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::domain::egress::EgressResolver for UrlAcceptanceResolver {
+        async fn resolve(
+            &self,
+            host: &str,
+            _port: u16,
+        ) -> Result<Vec<std::net::IpAddr>, crate::domain::egress::Denial> {
+            self.calls.lock().unwrap().push(host.to_owned());
+            match host {
+                "mcp-a.example" => Ok(vec!["8.8.8.8".parse().unwrap()]),
+                "mcp-b.example" => Ok(vec!["1.1.1.1".parse().unwrap()]),
+                _ => Err(crate::domain::egress::Denial::ResolverUnavailable),
+            }
+        }
+    }
+
+    struct UrlAcceptanceCredentials;
+
+    #[async_trait::async_trait]
+    impl crate::protocols::mcp::egress::HttpCredentialBroker for UrlAcceptanceCredentials {
+        async fn authorize_and_resolve(
+            &self,
+            _handle: &crate::domain::secret::SecretHandle,
+            _context: &crate::protocols::mcp::egress::HttpSecretContext<'_>,
+        ) -> Result<SecretLease, crate::protocols::mcp::egress::HttpCredentialError> {
+            Ok(SecretLease::new(b"credential-canary".to_vec()))
+        }
+    }
+
+    #[derive(Default)]
+    struct UrlAcceptanceDialer {
+        initialize_redirected: AtomicBool,
+        tool_calls: Mutex<BTreeMap<String, usize>>,
+        observations: Mutex<Vec<(String, String, Vec<std::net::IpAddr>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::protocols::mcp::egress::EgressDialer for UrlAcceptanceDialer {
+        async fn send(
+            &self,
+            request: reqwest::Request,
+            authorization: &crate::domain::egress::Authorization,
+            _limits: crate::protocols::mcp::egress::McpEgressLimits,
+        ) -> Result<crate::protocols::mcp::egress::EgressDialResponse, std::io::Error> {
+            let url = request.url().to_string();
+            self.observations.lock().unwrap().push((
+                url.clone(),
+                authorization.destination().host(),
+                authorization.resolved_addresses().collect(),
+            ));
+            let body = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+            let method = body
+                .as_ref()
+                .and_then(|body| body.get("method"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let mut response = ::http::Response::builder();
+            let peer: std::net::IpAddr = if url.starts_with("https://mcp-b.example") {
+                "1.1.1.1"
+            } else {
+                "8.8.8.8"
+            }
+            .parse()
+            .unwrap();
+            if method.as_deref() == Some("initialize")
+                && !self.initialize_redirected.swap(true, Ordering::AcqRel)
+            {
+                response = response
+                    .status(::http::StatusCode::TEMPORARY_REDIRECT)
+                    .header(::http::header::LOCATION, "https://mcp-b.example/mcp");
+                return Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                    response: response.body(bytes::Bytes::new()).unwrap().into(),
+                    peer: Some(peer),
+                });
+            }
+            let Some(body) = body else {
+                return Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                    response: response
+                        .status(::http::StatusCode::ACCEPTED)
+                        .body(bytes::Bytes::new())
+                        .unwrap()
+                        .into(),
+                    peer: Some(peer),
+                });
+            };
+            let Some(id) = body.get("id").cloned() else {
+                return Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                    response: response
+                        .status(::http::StatusCode::ACCEPTED)
+                        .body(bytes::Bytes::new())
+                        .unwrap()
+                        .into(),
+                    peer: Some(peer),
+                });
+            };
+            let payload = match method.as_deref() {
+                Some("initialize") => serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "result":{
+                        "protocolVersion":"2025-11-25",
+                        "capabilities":{"tools":{}},
+                        "serverInfo":{"name":"url-acceptance","version":"1"}
+                    }
+                }),
+                Some("tools/call") => {
+                    let scenario = body["params"]["arguments"]["scenario"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let call = {
+                        let mut calls = self.tool_calls.lock().unwrap();
+                        let call = calls.entry(scenario.clone()).or_default();
+                        *call += 1;
+                        *call
+                    };
+                    if scenario == "accepted" && call == 2 {
+                        serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "result":{"content":[{"type":"text","text":"authorized"}],"isError":false}
+                        })
+                    } else {
+                        let message = match scenario.as_str() {
+                            "secret" => "credential-canary",
+                            "encoded_secret" => "Y3JlZGVudGlhbC1jYW5hcnk=",
+                            _ => "Authenticate with OAuth, then authorize access",
+                        };
+                        serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "error":{
+                                "code":-32042,
+                                "message":message,
+                                "data":{
+                                    "url":"https://auth.example.com/authorize",
+                                    "elicitationId":format!("{scenario}-{call}")
+                                }
+                            }
+                        })
+                    }
+                }
+                _ => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
+            };
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                response: response
+                    .status(::http::StatusCode::OK)
+                    .header(::http::header::CONTENT_TYPE, "application/json")
+                    .body(bytes::Bytes::from(bytes))
+                    .unwrap()
+                    .into(),
+                peer: Some(peer),
+            })
+        }
+    }
+
     struct RuntimeInputs {
         authenticated: AuthenticatedPrincipal,
         config: RunConfigSnapshot,
@@ -3723,10 +4320,13 @@ mod tests {
 
     impl RuntimeInputs {
         fn new() -> Self {
+            Self::with_authority(BTreeSet::from([Grant::WorkspaceRead]))
+        }
+
+        fn with_authority(authority: BTreeSet<Grant>) -> Self {
             let principal = PrincipalId::generate().unwrap();
             let project = ProjectId::generate().unwrap();
             let workspace = WorkspaceId::generate().unwrap();
-            let authority = BTreeSet::from([Grant::WorkspaceRead]);
             let config = LayerStack {
                 built_in: ConfigLayer {
                     schema_version: CONFIG_SCHEMA_VERSION,
@@ -4265,6 +4865,420 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn production_url_elicitation_broker_connector_callback_and_retry_acceptance() {
+        use crate::{
+            capabilities::kernel::{
+                grant_ext::{EgressConstraint, GrantExtension, RequestExtension},
+                invoke::{CanonicalOutput, DispatchOutcome},
+            },
+            domain::{
+                egress::{CredentialHandle, DestinationGrant, EgressPolicy},
+                mcp_callback::{McpCallbackAction, McpCallbackState},
+                secret::SecretHandle,
+            },
+            protocols::mcp::{
+                config::{
+                    McpOwnerConfig, McpResponderConfig, McpServerConfig, McpTransportConfig,
+                    McpUrlElicitationResponderConfig, McpUrlOriginConfig,
+                },
+                responders::{
+                    CallbackSecretRegistry, ResponderAuthority, ResponderOutcomes, SourceRootProof,
+                },
+            },
+            store::sqlite::mcp_callback::McpCallbackStore,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "kit-mcp-url-production-{}",
+            EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("events.sqlite3");
+        let artifacts = Arc::new(ArtifactStore::open(root.join("artifacts")).unwrap());
+        let project_root = root.join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        let project_root = std::fs::canonicalize(project_root).unwrap();
+        let workspace = crate::workspace::revision::ManagedWorkspace::open(&project_root).unwrap();
+        let workspace_revision = workspace.current_revision().unwrap().id().to_string();
+        let mut store = test_support::open_sqlite_store(&database).unwrap();
+        let mut inputs = RuntimeInputs::with_authority(BTreeSet::from([
+            Grant::WorkspaceRead,
+            Grant::NetworkEgress,
+        ]));
+        inputs.claim.expires_at_unix_micros = i64::MAX;
+        store.install_driver_claim_for_test(inputs.claim).unwrap();
+        let credential = SecretHandle::parse("env:URL_ACCEPTANCE").unwrap();
+        let initial =
+            EgressConstraint::new("https", "mcp-a.example", 443, credential.clone()).unwrap();
+        let redirect =
+            EgressConstraint::new("https", "mcp-b.example", 443, credential.clone()).unwrap();
+        let extension = RequestExtension::new(Some(initial.clone()), Some(credential.clone()))
+            .with_egresses([redirect.clone()])
+            .unwrap()
+            .with_workspace_revision(&workspace_revision);
+        let server_config = McpServerConfig {
+            id: "url-production".to_owned(),
+            transport: McpTransportConfig::Http {
+                endpoint: "https://mcp-a.example/mcp".to_owned(),
+            },
+            owner: McpOwnerConfig {
+                principal_id: inputs.authenticated.principal_id(),
+                project_id: inputs.project,
+                workspace_id: Some(inputs.workspace),
+            },
+            source: "url-production".to_owned(),
+            trust_domain: "url-production".to_owned(),
+            namespace: "mcp.url.production".to_owned(),
+            version: "1".to_owned(),
+            credential_handle: Some(credential.clone()),
+            credential_scope: None,
+            egress: None,
+            descriptors: Vec::new(),
+            responders: McpResponderConfig {
+                url_elicitation: Some(McpUrlElicitationResponderConfig {
+                    timeout_millis: 2_000,
+                    max_message_bytes: 256,
+                    max_url_bytes: 1024,
+                    max_elicitation_id_bytes: 128,
+                    max_response_bytes: 1024,
+                    allowed_origins: vec![McpUrlOriginConfig {
+                        scheme: "https".to_owned(),
+                        host: "auth.example.com".to_owned(),
+                        port: 443,
+                    }],
+                }),
+                ..McpResponderConfig::default()
+            },
+        };
+        let scanner_secret = Arc::new(SecretLease::new(b"credential-canary".to_vec()));
+        let outcomes = ResponderOutcomes::default()
+            .with_secret_scope(
+                &CallbackSecretRegistry::default(),
+                inputs.authenticated.principal_id(),
+                inputs.project,
+                inputs.config.run_id(),
+                inputs.attempt.attempt_id,
+                server_config.id.as_str(),
+                [credential.identifier()],
+                &[scanner_secret],
+            )
+            .unwrap()
+            .with_default_elicitation(
+                &server_config,
+                &database,
+                Arc::clone(&artifacts),
+                &project_root,
+                inputs.authenticated.principal_id(),
+                inputs.project,
+                inputs.attempt,
+                inputs.claim,
+                inputs.workspace,
+                &workspace_revision,
+                1,
+                Arc::clone(&inputs.cancellation),
+            )
+            .unwrap();
+        let responders = crate::protocols::mcp::responders::install(
+            &server_config,
+            ResponderAuthority::new(
+                inputs.attempt,
+                inputs.claim,
+                Arc::clone(&inputs.fence),
+                Arc::new(AtomicU64::new(inputs.claim.lease_version)),
+                Arc::new(|| true),
+                server_config.id.as_str(),
+                Arc::new(BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100))),
+                Arc::clone(&inputs.cancellation),
+                Arc::new(|_| true),
+            ),
+            &outcomes,
+            SourceRootProof::issue(&server_config, &root).unwrap(),
+            TransportLimits::default().channel_capacity(),
+        )
+        .unwrap();
+        let initialize_arguments = responders.handler_config().initialize_arguments();
+        let lifecycle = OwnedBrokerInvocation::run_lifecycle(
+            &server_config.id,
+            initialize_arguments,
+            &inputs.authenticated,
+            &inputs.config,
+            inputs.workspace,
+            extension.clone(),
+            inputs.attempt,
+            inputs.claim,
+            Arc::clone(&inputs.fence),
+            Arc::clone(&inputs.cancellation),
+            inputs.occurred_at.clone(),
+        )
+        .unwrap();
+        let resolver = Arc::new(UrlAcceptanceResolver {
+            calls: Mutex::new(Vec::new()),
+        });
+        let dialer = Arc::new(UrlAcceptanceDialer::default());
+        let policy = EgressPolicy::new([
+            DestinationGrant::new(
+                "https",
+                "mcp-a.example",
+                443,
+                CredentialHandle::new(credential.identifier()).unwrap(),
+            )
+            .unwrap(),
+            DestinationGrant::new(
+                "https",
+                "mcp-b.example",
+                443,
+                CredentialHandle::new(credential.identifier()).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .with_resolver(resolver.clone());
+        let lifecycle_request = lifecycle.invocation();
+        let connection = match http::connect_streamable_http_with_handler_and_dialer(
+            agentkit_mcp::McpServerId::new(&server_config.id),
+            "https://mcp-a.example/mcp",
+            &lifecycle_request,
+            &policy,
+            Arc::new(UrlAcceptanceCredentials),
+            &mut store,
+            TransportLimits::default(),
+            responders.handler_config(),
+            Some(dialer.clone()),
+        )
+        .await
+        .unwrap()
+        {
+            StreamableHttpOutcome::Ready(connection) => (*connection).with_responders(responders),
+            StreamableHttpOutcome::AuthRequired(_) => {
+                panic!("initialize unexpectedly required auth")
+            }
+        };
+        connection.arm_responders();
+
+        let schema = NormalizedSchema::ingest(
+            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            JSON_SCHEMA_2020_12,
+            b"URL acceptance operation",
+            DigestAlgorithm::Sha256,
+        )
+        .unwrap();
+        let capability = CapabilityIdentity::new(
+            CapabilitySource::new("mcp-url-production").unwrap(),
+            CapabilityNamespace::new("mcp.url.production").unwrap(),
+            CapabilityName::new("authenticate").unwrap(),
+            CapabilityVersion::new("1").unwrap(),
+            Digest::of(DigestAlgorithm::Sha256, b"mcp url production"),
+        );
+        let grants = CapabilityGrantSnapshot::new(
+            &inputs.config,
+            [CapabilityGrant::new(
+                inputs.authenticated.principal_id(),
+                inputs.project,
+                inputs.workspace,
+                capability.clone(),
+                schema.source().normalized_digest(),
+                EffectClass::WorkspaceRead,
+                inputs.constraints.clone(),
+            )
+            .with_extension(
+                GrantExtension::new([initial, redirect], [credential.clone()], 0).unwrap(),
+            )],
+            DigestAlgorithm::Sha256,
+        );
+        let callback_store = McpCallbackStore::open(&database).unwrap();
+        let budget = BudgetLedger::new(RunBudget::new(100, 100, 100, 100, 100));
+
+        for (index, scenario, retry_safety, action, expected_ok, expected_calls) in [
+            (
+                1_u8,
+                "accepted",
+                RetrySafety::Idempotent,
+                Some(McpCallbackAction::Accept),
+                true,
+                2,
+            ),
+            (
+                2,
+                "declined",
+                RetrySafety::Idempotent,
+                Some(McpCallbackAction::Decline),
+                false,
+                1,
+            ),
+            (
+                3,
+                "cancelled",
+                RetrySafety::Idempotent,
+                Some(McpCallbackAction::Cancel),
+                false,
+                1,
+            ),
+            (
+                4,
+                "non_idempotent",
+                RetrySafety::NonIdempotent,
+                Some(McpCallbackAction::Accept),
+                false,
+                1,
+            ),
+            (5, "secret", RetrySafety::Idempotent, None, false, 1),
+            (6, "encoded_secret", RetrySafety::Idempotent, None, false, 1),
+        ] {
+            let key = IdempotencyKey::parse(&format!("url-production-{scenario}")).unwrap();
+            let invocation = ToolCallId::generate().unwrap();
+            let mut envelope = inputs.envelope(
+                &grants,
+                &capability,
+                schema.source().normalized_digest(),
+                b"{}",
+                invocation,
+                &key,
+            );
+            envelope.extension = extension.clone();
+            envelope.retry_safety = retry_safety;
+            let request = BrokerInvocation::generic(envelope, &schema);
+            let invoke = async {
+                let prepared = match broker::prepare(&request, &mut store, &budget, None).unwrap() {
+                    BrokerPrepareOutcome::Authorized(prepared) => *prepared,
+                    _ => panic!("broker did not authorize {scenario}"),
+                };
+                let result = connection
+                    .call_tool_with_url_elicitation(
+                        &request,
+                        "authenticate",
+                        serde_json::json!({"scenario":scenario}),
+                        &mut store,
+                    )
+                    .await;
+                broker::complete(
+                    &request,
+                    prepared,
+                    if result.is_ok() {
+                        DispatchOutcome::Succeeded(CanonicalOutput {
+                            media_type: "application/json".to_owned(),
+                            body: b"{}".to_vec(),
+                            artifact_digests: Vec::new(),
+                        })
+                    } else {
+                        DispatchOutcome::OutcomeUnknown {
+                            code: "url_acceptance_expected".to_owned(),
+                        }
+                    },
+                    &mut store,
+                    &budget,
+                    None,
+                )
+                .unwrap();
+                result
+            };
+            let result = if let Some(action) = action {
+                tokio::pin!(invoke);
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                let callback = loop {
+                    let pending = callback_store.pending(inputs.project).unwrap();
+                    if let Some(callback) = pending.into_iter().find(|callback| {
+                        callback.request["elicitation_id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with(scenario))
+                    }) {
+                        break callback;
+                    }
+                    tokio::select! {
+                        result = &mut invoke => {
+                            panic!("invocation ended before durable callback for {scenario}: {:?}", result.err().map(|error| error.error));
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "durable callback not created for {scenario}"
+                    );
+                };
+                callback_store.authority_live(&callback).unwrap();
+                assert_eq!(
+                    workspace.current_revision().unwrap().id().to_string(),
+                    callback.workspace_revision
+                );
+                let resolution_key = IdempotencyKey::parse(&format!("resolve-{scenario}")).unwrap();
+                callback_store
+                    .reserve_resolution(
+                        inputs.authenticated.principal_id(),
+                        inputs.project,
+                        callback.id,
+                        &resolution_key,
+                        [index; 32],
+                        callback.version,
+                        callback.challenge_generation,
+                        &callback.schema_digest,
+                    )
+                    .unwrap();
+                callback_store
+                    .resolve_with_recheck(
+                        inputs.authenticated.principal_id(),
+                        inputs.project,
+                        &resolution_key,
+                        callback.id,
+                        callback.version,
+                        callback.challenge_generation,
+                        &callback.schema_digest,
+                        action,
+                        Vec::new(),
+                        [index; 32],
+                        &callback,
+                        &|_| true,
+                        &workspace_revision,
+                    )
+                    .unwrap();
+                let callback_id = callback.id;
+                let result = invoke.await;
+                let callback = callback_store.get(callback_id).unwrap();
+                assert_eq!(callback.action, Some(action));
+                assert!(matches!(
+                    callback.state,
+                    McpCallbackState::Delivered | McpCallbackState::DeliveryUnknown
+                ));
+                result
+            } else {
+                invoke.await
+            };
+            assert_eq!(result.is_ok(), expected_ok, "scenario {scenario}");
+            assert_eq!(
+                dialer.tool_calls.lock().unwrap().get(scenario).copied(),
+                Some(expected_calls),
+                "scenario {scenario} retried incorrectly"
+            );
+        }
+
+        {
+            let observations = dialer.observations.lock().unwrap();
+            assert_eq!(observations[0].0, "https://mcp-a.example/mcp");
+            assert_eq!(observations[1].0, "https://mcp-b.example/mcp");
+            for (url, host, addresses) in observations.iter() {
+                let expected = if url.starts_with("https://mcp-b.example") {
+                    ("mcp-b.example", "1.1.1.1")
+                } else {
+                    ("mcp-a.example", "8.8.8.8")
+                };
+                assert_eq!(host, expected.0);
+                assert_eq!(
+                    addresses,
+                    &[expected.1.parse::<std::net::IpAddr>().unwrap()]
+                );
+            }
+        }
+        {
+            let resolutions = resolver.calls.lock().unwrap();
+            assert!(resolutions.iter().any(|host| host == "mcp-a.example"));
+            assert!(resolutions.iter().any(|host| host == "mcp-b.example"));
+        }
+        connection
+            .close(&lifecycle_request, &mut store)
+            .await
+            .unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn post_ready_gate_requires_one_exact_operation_and_arguments_per_message() {
         let gate = OperationGate::new();
@@ -4320,36 +5334,277 @@ mod tests {
     }
 
     #[test]
-    fn active_http_credential_scanner_rejects_raw_percent_and_base64_reflection() {
-        for reflected in [
-            b"credential-canary".as_slice(),
-            b"%63%72%65%64%65%6E%74%69%61%6C%2D%63%61%6E%61%72%79".as_slice(),
-            b"Y3JlZGVudGlhbC1jYW5hcnk=".as_slice(),
+    fn url_retry_rotates_the_one_message_authorization_generation() {
+        let gate = OperationGate::new();
+        gate.set_binding(transport_auth::TransportBinding::for_test(
+            "test-server",
+            "http",
+            "http://127.0.0.1/mcp",
+            None,
+        ))
+        .unwrap();
+        gate.ready.store(true, Ordering::Release);
+        let authorization = transport_auth::TransportAuthorization::for_test_arguments(
+            transport_auth::TransportOperation::parse("tools/call").unwrap(),
+            serde_json::json!({"name":"read","arguments":{"path":"README.md"}}),
+        );
+        let first = gate.install(authorization).unwrap();
+        let request = serde_json::json!({
+            "id": 1,
+            "method":"tools/call",
+            "params":{"name":"read","arguments":{"path":"README.md"}}
+        });
+        assert!(gate.authorize_message(&request).is_ok());
+        assert!(gate.authorize_message(&request).is_err());
+
+        gate.clear_generation(first).unwrap();
+        let second = gate
+            .install(transport_auth::TransportAuthorization::for_test_arguments(
+                transport_auth::TransportOperation::parse("tools/call").unwrap(),
+                serde_json::json!({"name":"read","arguments":{"path":"README.md"}}),
+            ))
+            .unwrap();
+        assert!(gate.authorize_message(&request).is_ok());
+        gate.clear_generation(second).unwrap();
+    }
+
+    #[test]
+    fn only_exact_captured_terminal_32042_response_mints_undispatched_digest() {
+        let data = serde_json::json!({
+            "url":"https://auth.example/complete",
+            "elicitationId":"challenge"
+        });
+        for (code, extra, accepted) in [
+            (-32042, false, true),
+            (-32041, false, false),
+            (-32042, true, false),
         ] {
             let gate = OperationGate::new();
-            gate.install_secret(SecretLease::new(b"credential-canary".to_vec()))
+            gate.set_binding(transport_auth::TransportBinding::for_test(
+                "test-server",
+                "http",
+                "http://127.0.0.1/mcp",
+                None,
+            ))
+            .unwrap();
+            gate.ready.store(true, Ordering::Release);
+            let generation = gate
+                .install(transport_auth::TransportAuthorization::for_test_arguments(
+                    transport_auth::TransportOperation::parse("tools/call").unwrap(),
+                    serde_json::json!({"name":"read"}),
+                ))
                 .unwrap();
-            assert!(matches!(
-                gate.scan_ingress(reflected),
-                Err(TransportError::SensitivePayload)
-            ));
+            gate.authorize_message(&serde_json::json!({
+                "jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read"}
+            }))
+            .unwrap();
+            let mut error = serde_json::json!({
+                "code":code,
+                "message":"authenticate",
+                "data":data
+            });
+            if extra {
+                error["effect"] = Value::String("unknown".to_owned());
+            }
+            let payload = RawPayload::from_value(
+                serde_json::json!({"jsonrpc":"2.0","id":7,"error":error}),
+                PayloadLimits::default(),
+            )
+            .unwrap();
+            assert!(gate.capture_payload(payload).unwrap());
+            assert_eq!(
+                gate.exact_terminal_url_elicitation_digest(
+                    generation,
+                    "authenticate",
+                    Some(&data),
+                )
+                .is_ok(),
+                accepted
+            );
         }
     }
 
     #[test]
-    fn decoded_json_credential_reflection_is_rejected_before_payload_capture() {
+    fn callback_response_uses_its_owning_stream_and_configured_scanners() {
         let gate = OperationGate::new();
-        gate.install_secret(SecretLease::new(b"credential-canary".to_vec()))
+        gate.set_responder_scanner(Arc::new(
+            crate::protocols::mcp::responders::CallbackSecretScanner::new([
+                "configured-secret".into()
+            ]),
+        ));
+        let first = Arc::new(McpResponseScanner::new(&[SecretLease::new(
+            b"first-stream-secret".to_vec(),
+        )]));
+        let second = Arc::new(McpResponseScanner::new(&[SecretLease::new(
+            b"second-stream-secret".to_vec(),
+        )]));
+        for (id, scanner) in [(1, first), (2, second)] {
+            let payload = RawPayload::from_value(
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"roots/list",
+                    "params":{}
+                }),
+                PayloadLimits::default(),
+            )
             .unwrap();
-        let payload = RawPayload::parse(
-            br#"{"jsonrpc":"2.0","id":1,"result":{"text":"credential\u002dcanary"}}"#,
+            gate.bind_callback_scanner(&payload, scanner).unwrap();
+        }
+
+        let first_response = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":{"roots":[{"name":"first-stream-secret"}]}
+        });
+        assert!(matches!(
+            gate.scan_callback_response(
+                &first_response,
+                &serde_json::to_vec(&first_response).unwrap()
+            ),
+            Err(TransportError::SensitivePayload)
+        ));
+
+        let second_response = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "result":{"roots":[{"name":"configured-secret"}]}
+        });
+        assert!(matches!(
+            gate.scan_callback_response(
+                &second_response,
+                &serde_json::to_vec(&second_response).unwrap()
+            ),
+            Err(TransportError::SensitivePayload)
+        ));
+    }
+
+    #[test]
+    fn callback_binding_accepts_only_typed_negotiated_idless_notifications() {
+        let gate = OperationGate::new();
+        gate.set_binding(transport_auth::TransportBinding::for_test(
+            "test-server",
+            "http",
+            "http://127.0.0.1/mcp",
+            None,
+        ))
+        .unwrap();
+        gate.install(
+            transport_auth::TransportAuthorization::for_test_bound_arguments_binding(
+                transport_auth::TransportOperation::parse("initialize").unwrap(),
+                kit_authorized_initialize_arguments(),
+                None,
+                None,
+                transport_auth::TransportBinding::for_test(
+                    "test-server",
+                    "http",
+                    "http://127.0.0.1/mcp",
+                    None,
+                ),
+            ),
+        )
+        .unwrap();
+        gate.authorize_message(&serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":kit_authorized_initialize_arguments()
+        }))
+        .unwrap();
+        let scanner = Arc::new(McpResponseScanner::new(&[]));
+        let initialize = RawPayload::from_value(
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "result":{
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{"tools":{"listChanged":true},"resources":{}},
+                    "serverInfo":{"name":"notification-test","version":"1"}
+                }
+            }),
             PayloadLimits::default(),
         )
         .unwrap();
-        assert!(matches!(
-            gate.scan_payload(&payload),
-            Err(TransportError::SensitivePayload)
-        ));
+        gate.bind_callback_scanner(&initialize, Arc::clone(&scanner))
+            .unwrap();
+
+        for notification in [
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/tools/list_changed"
+            }),
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/progress",
+                "params":{"progressToken":"refresh","progress":1}
+            }),
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/cancelled",
+                "params":{"requestId":7,"reason":"stopped"}
+            }),
+        ] {
+            assert!(!agentkit_mcp::has_responder_delivery_permit(&notification));
+            gate.bind_callback_scanner(
+                &RawPayload::from_value(notification, PayloadLimits::default()).unwrap(),
+                Arc::clone(&scanner),
+            )
+            .unwrap();
+        }
+        assert_eq!(Arc::strong_count(&scanner), 1);
+
+        for notification in [
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/resources/list_changed"
+            }),
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/tools/list_changed",
+                "params":{}
+            }),
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/progress",
+                "params":{"progress":1}
+            }),
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/unknown"
+            }),
+        ] {
+            assert!(
+                gate.bind_callback_scanner(
+                    &RawPayload::from_value(notification, PayloadLimits::default()).unwrap(),
+                    Arc::clone(&scanner),
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(Arc::strong_count(&scanner), 1);
+    }
+
+    #[test]
+    fn connection_close_state_drops_unanswered_callback_scanners() {
+        let gate = OperationGate::new();
+        let scanner = Arc::new(McpResponseScanner::new(&[SecretLease::new(
+            b"stream-secret".to_vec(),
+        )]));
+        let payload = RawPayload::from_value(
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"roots/list",
+                "params":{}
+            }),
+            PayloadLimits::default(),
+        )
+        .unwrap();
+        gate.bind_callback_scanner(&payload, Arc::clone(&scanner))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&scanner), 2);
+        gate.clear_response_scanners();
+        assert_eq!(Arc::strong_count(&scanner), 1);
     }
 
     #[test]

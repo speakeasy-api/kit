@@ -21,7 +21,7 @@ vendor_pins:
   agentkit:
     version: 0.10.2
     commit: c3926f1c4f3c945d400c8b6ef039da1f84826fcd
-    snapshot_sha256: 0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0
+    snapshot_sha256: 5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4
     source: vendor/agentkit/SNAPSHOT-METADATA.yaml
 
 built_ins:

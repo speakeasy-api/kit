@@ -58,9 +58,83 @@ pub enum McpCallbackKind {
 #[serde(rename_all = "snake_case")]
 pub enum McpCallbackMode {
     Form,
+    Url,
     RootsResponse,
     SamplingRequest,
     SamplingResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUrlCallbackBinding {
+    pub invocation_id: String,
+    pub idempotency_digest: String,
+    pub server_id: String,
+    pub generation: u64,
+    pub operation: String,
+    pub invocation_request_digest: String,
+    pub error_response_digest: String,
+    pub url_digest: String,
+    pub original_effect: crate::capabilities::kernel::grant::EffectClass,
+    pub grant_digest: String,
+    pub accept_destination: McpUrlDestination,
+    pub retry_safety: String,
+    pub undispatched_proof: McpUndispatchedProof,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUrlDestination {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl McpUrlDestination {
+    pub(crate) fn from_url(value: &str) -> Result<Self, McpCallbackError> {
+        let url = crate::domain::egress::EgressPolicy::canonical_url(value)
+            .map_err(|_| McpCallbackError::Invalid("invalid callback URL destination"))?;
+        Ok(Self {
+            scheme: url.scheme().to_owned(),
+            host: url
+                .host_str()
+                .ok_or(McpCallbackError::Invalid(
+                    "invalid callback URL destination",
+                ))?
+                .to_owned(),
+            port: url
+                .port_or_known_default()
+                .ok_or(McpCallbackError::Invalid(
+                    "invalid callback URL destination",
+                ))?,
+        })
+    }
+
+    fn matches_url(&self, value: &str) -> bool {
+        Self::from_url(value).is_ok_and(|destination| destination == *self)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUndispatchedProof {
+    terminal_error_code: i64,
+    terminal_response_digest: String,
+}
+
+impl McpUndispatchedProof {
+    pub(crate) fn from_terminal_url_elicitation(response_digest: String) -> Self {
+        Self {
+            terminal_error_code: -32042,
+            terminal_response_digest: response_digest,
+        }
+    }
+
+    pub fn proves(&self, response_digest: &str) -> bool {
+        self.terminal_error_code == -32042
+            && self.terminal_response_digest == response_digest
+            && valid_sha256(response_digest)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,6 +194,8 @@ pub struct McpCallbackProjection {
     pub max_content_bytes: usize,
     #[serde(default = "default_secret_policy_id")]
     pub secret_policy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_binding: Option<McpUrlCallbackBinding>,
     pub state: McpCallbackState,
     pub version: u64,
     pub resolver_actor: Option<PrincipalId>,
@@ -153,6 +229,16 @@ impl McpCallbackProjection {
                 .any(|byte| !byte.is_ascii_graphic())
             || !valid_sha256(&self.request_digest)
             || !valid_sha256(&self.schema_digest)
+            || !valid_url_binding(
+                self.mode,
+                self.url_binding.as_ref(),
+                &self.request,
+                &self.server_id,
+                self.challenge_generation,
+                self.operation_sequence,
+                &self.request_id,
+                &self.request_digest,
+            )
         {
             return Err(McpCallbackError::Invalid("invalid callback binding"));
         }
@@ -389,6 +475,83 @@ fn valid_sha256(value: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn valid_url_binding(
+    mode: McpCallbackMode,
+    binding: Option<&McpUrlCallbackBinding>,
+    request: &serde_json::Value,
+    server_id: &str,
+    challenge_generation: u64,
+    operation_sequence: u64,
+    request_id: &str,
+    request_digest: &str,
+) -> bool {
+    let terminal_url_error = request
+        .get("error_code")
+        .and_then(serde_json::Value::as_i64)
+        == Some(-32042);
+    match (mode, binding, terminal_url_error) {
+        (McpCallbackMode::Url, Some(binding), true) => {
+            !binding.invocation_id.is_empty()
+                && binding.invocation_id.len() <= 256
+                && binding
+                    .invocation_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic())
+                && valid_sha256(&binding.idempotency_digest)
+                && binding.invocation_id == request_id
+                && !binding.server_id.is_empty()
+                && binding.server_id.len() <= 256
+                && binding
+                    .server_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic())
+                && binding.generation > 0
+                && binding.server_id == server_id
+                && binding.generation == challenge_generation
+                && binding.generation == operation_sequence
+                && binding.operation == "tools/call"
+                && valid_sha256(&binding.invocation_request_digest)
+                && valid_sha256(&binding.error_response_digest)
+                && valid_sha256(&binding.url_digest)
+                && valid_sha256(&binding.grant_digest)
+                && binding
+                    .undispatched_proof
+                    .proves(&binding.error_response_digest)
+                && request
+                    .get("error_response_digest")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(binding.error_response_digest.as_str())
+                && serde_json::to_vec(request).is_ok_and(|bytes| {
+                    crate::capabilities::kernel::identity::Digest::of(
+                        crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                        &bytes,
+                    )
+                    .to_string()
+                        == request_digest
+                })
+                && matches!(
+                    binding.retry_safety.as_str(),
+                    "idempotent" | "non_idempotent"
+                )
+                && request
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| {
+                        crate::capabilities::kernel::identity::Digest::of(
+                            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                            url.as_bytes(),
+                        )
+                        .to_string()
+                            == binding.url_digest
+                            && binding.accept_destination.matches_url(url)
+                    })
+        }
+        (McpCallbackMode::Url, None, false) | (_, None, false) => true,
+        _ => false,
+    }
+}
+
 fn default_secret_policy_id() -> String {
     "authorized-secrets-v1".to_owned()
 }
@@ -575,6 +738,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn url_callback_binds_exact_url_and_accepts_no_content_artifact() {
+        let mut callback = fixture();
+        let url = "https://auth.example/complete";
+        callback.mode = McpCallbackMode::Url;
+        callback.request_id = "invocation".to_owned();
+        callback.request = serde_json::json!({
+            "error_code": -32042,
+            "error_response_digest": format!("sha256:{}", "5".repeat(64)),
+            "url": url,
+            "elicitation_id": "challenge"
+        });
+        callback.request_digest = crate::capabilities::kernel::identity::Digest::of(
+            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+            &serde_json::to_vec(&callback.request).unwrap(),
+        )
+        .to_string();
+        callback.schema = serde_json::json!({});
+        callback.url_binding = Some(McpUrlCallbackBinding {
+            invocation_id: "invocation".to_owned(),
+            idempotency_digest: format!("sha256:{}", "2".repeat(64)),
+            server_id: callback.server_id.clone(),
+            generation: callback.challenge_generation,
+            operation: "tools/call".to_owned(),
+            invocation_request_digest: format!("sha256:{}", "4".repeat(64)),
+            error_response_digest: format!("sha256:{}", "5".repeat(64)),
+            url_digest: crate::capabilities::kernel::identity::Digest::of(
+                crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                url.as_bytes(),
+            )
+            .to_string(),
+            original_effect: crate::capabilities::kernel::grant::EffectClass::ModelCall,
+            grant_digest: format!("sha256:{}", "3".repeat(64)),
+            accept_destination: McpUrlDestination::from_url(url).unwrap(),
+            retry_safety: "idempotent".to_owned(),
+            undispatched_proof: McpUndispatchedProof::from_terminal_url_elicitation(format!(
+                "sha256:{}",
+                "5".repeat(64)
+            )),
+        });
+        callback.validate().unwrap();
+        callback.state = McpCallbackState::AwaitingResolution;
+        callback
+            .apply(&McpCallbackEvent {
+                callback_id: callback.id,
+                expected_version: callback.version,
+                state: McpCallbackState::Resolved,
+                resolver_actor: Some(callback.principal_id),
+                action: Some(McpCallbackAction::Accept),
+                artifact_refs: Vec::new(),
+                terminal_error: None,
+            })
+            .unwrap();
+        let mut changed = callback.clone();
+        changed.request["url"] = serde_json::Value::String("https://evil.example/".to_owned());
+        assert!(changed.validate().is_err());
+    }
+
     fn fixture() -> McpCallbackProjection {
         McpCallbackProjection {
             id: McpCallbackId::parse("mcp_callback_00000000000000000000000001").unwrap(),
@@ -601,6 +822,7 @@ mod tests {
             max_response_bytes: 1024,
             max_content_bytes: 900,
             secret_policy_id: "authorized-secrets-v1".to_owned(),
+            url_binding: None,
             state: McpCallbackState::Requested,
             version: 1,
             resolver_actor: None,

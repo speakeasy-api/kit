@@ -698,7 +698,7 @@ paths:
       tags: [MCPCallbacks]
       responses:
         '200':
-          description: Pending durable MCP form-elicitation callbacks.
+          description: Pending durable MCP form and URL elicitation callbacks.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/McpCallbackList'}
@@ -2506,6 +2506,16 @@ components:
             schema_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
             action: {enum: [accept, decline, cancel]}
           additionalProperties: false
+        - type: object
+          required: [kind, mode, expected_version, challenge_generation, schema_digest, action]
+          properties:
+            kind: {const: elicitation}
+            mode: {const: url}
+            expected_version: {type: integer, minimum: 1}
+            challenge_generation: {type: integer, minimum: 1}
+            schema_digest: {type: string, pattern: '^sha256:[0-9a-f]{64}$'}
+            action: {enum: [accept, decline, cancel]}
+          additionalProperties: false
     RegisterArtifactMetadata:
       type: object
       required: [id, reference, media_type, size]
@@ -2812,7 +2822,7 @@ components:
         id: {$ref: '#/components/schemas/McpCallbackId'}
         server_id: {type: string, minLength: 1, maxLength: 256}
         kind: {enum: [elicitation, roots, sampling]}
-        mode: {enum: [form, roots_response, sampling_request, sampling_response]}
+        mode: {enum: [form, url, roots_response, sampling_request, sampling_response]}
         principal_id: {$ref: '#/components/schemas/PrincipalId'}
         project_id: {$ref: '#/components/schemas/ProjectId'}
         run_id: {$ref: '#/components/schemas/RunId'}

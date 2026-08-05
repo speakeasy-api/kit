@@ -18,6 +18,7 @@ mod exec_secret_leak;
 mod local_sandbox;
 mod mcp_callback_authority;
 mod mcp_result_authority;
+mod mcp_url;
 mod native_tool_bypass;
 mod path_escape;
 #[path = "../fixtures/protocol_sim/mod.rs"]

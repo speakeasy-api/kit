@@ -267,6 +267,25 @@ impl SensitiveDataScanner {
         self.found
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.state = self
+            .patterns
+            .stream_matcher
+            .as_ref()
+            .and_then(|matcher| matcher.start_state(Anchored::No).ok());
+        self.decoded_states = self
+            .patterns
+            .raw_stream_matcher
+            .as_ref()
+            .and_then(|matcher| matcher.start_state(Anchored::No).ok())
+            .map(|state| vec![state; 4])
+            .unwrap_or_default();
+        self.decoders = std::array::from_fn(|_| PercentDecoder::default());
+        self.found = self.patterns.truncated
+            || (self.patterns.stream_matcher.is_some() && self.state.is_none())
+            || (self.patterns.raw_stream_matcher.is_some() && self.decoded_states.is_empty());
+    }
+
     fn scan_decoded_byte(&mut self, layer: usize, byte: u8) {
         if layer == self.decoders.len() || self.decoded_states.is_empty() {
             return;

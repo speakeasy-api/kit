@@ -2082,6 +2082,7 @@ impl crate::protocols::mcp::responders::SamplingOutcomeHandler for DurableSampli
             max_response_bytes: policy.max_output_bytes,
             max_content_bytes: 1,
             secret_policy_id: context.secret_policy_id()?.to_owned(),
+            url_binding: None,
             state: crate::domain::mcp_callback::McpCallbackState::Requested,
             version: 1,
             resolver_actor: None,
@@ -2170,6 +2171,7 @@ impl DurableSamplingOutcome {
             max_response_bytes: 1024,
             max_content_bytes: 1,
             secret_policy_id: context.secret_policy_id()?.to_owned(),
+            url_binding: None,
             state: McpCallbackState::Requested,
             version: 1,
             resolver_actor: None,
@@ -2262,13 +2264,29 @@ fn runtime_secret_leases_for_scope(
         }
         let mut handles = BTreeSet::new();
         handles.extend(server.credential_handle.iter().cloned());
+        if let Some(egress) = &server.egress {
+            handles.extend(
+                egress
+                    .redirect_grants
+                    .iter()
+                    .map(|grant| grant.credential_handle.clone()),
+            );
+        }
         if let crate::protocols::mcp::config::McpTransportConfig::Stdio { environment, .. } =
             &server.transport
         {
             handles.extend(environment.values().map(|value| value.handle.clone()));
         }
         let mut secrets = provider_secrets.clone();
-        for handle in &handles {
+        let eager_handles = if matches!(
+            server.transport,
+            crate::protocols::mcp::config::McpTransportConfig::Http { .. }
+        ) {
+            BTreeSet::new()
+        } else {
+            handles.clone()
+        };
+        for handle in &eager_handles {
             let variable = handle.identifier().strip_prefix("env:").ok_or_else(|| {
                 ExecutorError::Worker("unsupported runtime secret handle".to_owned())
             })?;
@@ -4988,7 +5006,7 @@ mod selector_tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn configured_provider_and_each_mcp_server_get_an_exact_scanner() {
+    fn http_credentials_are_lazy_and_callback_scanners_remain_server_scoped() {
         use crate::{
             domain::ids::{AttemptId, PrincipalId, ProjectId, RunId, WorkspaceId},
             executor::profile::{
@@ -5014,9 +5032,8 @@ mod selector_tests {
         let provider_secret = Arc::new(SecretLease::new(b"provider-source-secret".to_vec()));
         let http_variable = format!("KIT_MCP_HTTP_SECRET_{}", std::process::id());
         let stdio_variable = format!("KIT_MCP_STDIO_SECRET_{}", std::process::id());
-        // SAFETY: unique process-scoped names are installed and removed within this test.
+        // SAFETY: the unique stdio variable is installed and removed within this test.
         unsafe {
-            std::env::set_var(&http_variable, "http-source-secret");
             std::env::set_var(&stdio_variable, "stdio-source-secret");
         }
 
@@ -5145,7 +5162,7 @@ mod selector_tests {
             http.redact_text("provider-source-secret"),
             "provider-source-secret"
         );
-        assert_ne!(http.redact_text("http-source-secret"), "http-source-secret");
+        assert_eq!(http.redact_text("http-source-secret"), "http-source-secret");
         assert_eq!(
             http.redact_text("stdio-source-secret"),
             "stdio-source-secret"
@@ -5165,13 +5182,15 @@ mod selector_tests {
         );
         assert_eq!(leases.scopes["http-source"].authorized_handles.len(), 3);
         assert_eq!(leases.scopes["stdio-source"].authorized_handles.len(), 3);
+        assert!(!leases.resolved.contains_key(
+            &crate::domain::secret::SecretHandle::parse(&format!("env:{http_variable}")).unwrap()
+        ));
         assert!(outcomes.secret_policy_id_for_test("http-source").is_some());
         assert!(outcomes.secret_policy_id_for_test("stdio-source").is_some());
         assert!(outcomes.secret_scanner_for_test("other-tenant").is_none());
 
-        // SAFETY: removes only the unique variables installed above.
+        // SAFETY: removes only the unique variable installed above.
         unsafe {
-            std::env::remove_var(http_variable);
             std::env::remove_var(stdio_variable);
         }
         std::fs::remove_dir_all(root).unwrap();

@@ -243,7 +243,19 @@ subsequent_overlays:
     public_contract:
       - OllamaConfig::with_max_tokens
       - OllamaAdapter::max_output_tokens
-current_snapshot_sha256: 0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0
+  - patch_id: m006-mcp-url-elicitation-capability
+    work_package: M006-W08
+    classification: local_only
+    previous_snapshot_sha256: 0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0
+    patched_snapshot_sha256: 5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4
+    files:
+      - path: vendor/agentkit/crates/agentkit-mcp/src/lib.rs
+        previous_sha256: c7b13b80d67550f5863bf4f33ea6cf8ef87eff76c57730a538d0d64ede0faa38
+        patched_sha256: 7392736c443fef2749e4c2eb4db04045fb38d21079e410a5431a613be3f25e8a
+        reason: advertise the exact configured form and URL elicitation capability modes
+    public_contract:
+      - McpHandlerConfig::with_elicitation_responder_modes
+current_snapshot_sha256: 5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4
 public_contract:
   - PINNED_PROTOCOL_VERSION
   - enforce_pinned_protocol_version
@@ -254,6 +266,7 @@ public_contract:
   - StreamableHttpTransportConfig::with_max_sse_reconnects
   - StreamableHttpTransportConfig::with_channel_buffer_capacity
   - McpHttpClient::close_open_sessions
+  - McpHandlerConfig::with_elicitation_responder_modes
 upstream:
   status: pending_submission
   blocking: false

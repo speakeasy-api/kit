@@ -245,6 +245,15 @@ maintenance:
       - "crates/agentkit-provider-ollama/README.md"
       - "crates/agentkit-provider-ollama/src/lib.rs"
     contract: "Ollama OpenAI-compatible chat completions use max_tokens for configured and per-turn output caps"
+  mcp_url_elicitation_capability:
+    patch_id: "m006-mcp-url-elicitation-capability"
+    work_package: "M006-W08"
+    classification: "local_only"
+    previous_snapshot_sha256: "0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0"
+    patched_snapshot_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
+    files:
+      - "crates/agentkit-mcp/src/lib.rs"
+    contract: "the host advertises only the configured form and URL elicitation capability modes"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -260,7 +269,7 @@ final_snapshot:
   manifest: "vendor/agentkit/SNAPSHOT-MANIFEST.sha256"
   generated_target_roots_excluded:
     - "target"
-  aggregate_sha256: "0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0"
+  aggregate_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   symlink_hashing: "SHA-256 of link target bytes"
   license_preserved: "LICENSE"
@@ -843,7 +852,7 @@ files:
     sha256: "d334d6bae3ceea005f2effe6b8d8b8579ee74a14d1b6bc7557d194b4e40f983b"
   - path: "crates/agentkit-mcp/src/lib.rs"
     mode: "100644"
-    sha256: "c7b13b80d67550f5863bf4f33ea6cf8ef87eff76c57730a538d0d64ede0faa38"
+    sha256: "7392736c443fef2749e4c2eb4db04045fb38d21079e410a5431a613be3f25e8a"
   - path: "crates/agentkit-mcp/tests/dynamic_http_client.rs"
     mode: "100644"
     sha256: "c8d9af93264df4dec6af89bfa2e24a1be22f05a7e017c0d1b6c4f2d5575f78ea"

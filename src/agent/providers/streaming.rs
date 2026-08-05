@@ -69,6 +69,11 @@ impl CanaryRedactor {
         self.finish()
     }
 
+    pub(crate) fn with_secret(mut self, secret: &SecretLease) -> Self {
+        self.add_pattern(secret.expose());
+        self.finish()
+    }
+
     pub fn redact_text(&self, value: &str) -> String {
         let redacted = self
             .patterns

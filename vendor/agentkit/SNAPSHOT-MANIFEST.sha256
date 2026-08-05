@@ -184,7 +184,7 @@ f6cf06007fb4123b59cd0437e365c2515ebe7abba296ecb02cbf3753fa15ed60  100644  crates
 cc051f7975345e823130c0d772c95d7040b5219ab31e84448c0292de9103186c  100644  crates/agentkit-loop/src/lib.rs
 f261f25abd55cdaeba3c77962ff3f962b1cc98caa0d54c1c407ef344a012ec4f  100644  crates/agentkit-mcp/Cargo.toml
 d334d6bae3ceea005f2effe6b8d8b8579ee74a14d1b6bc7557d194b4e40f983b  100644  crates/agentkit-mcp/README.md
-c7b13b80d67550f5863bf4f33ea6cf8ef87eff76c57730a538d0d64ede0faa38  100644  crates/agentkit-mcp/src/lib.rs
+7392736c443fef2749e4c2eb4db04045fb38d21079e410a5431a613be3f25e8a  100644  crates/agentkit-mcp/src/lib.rs
 c8d9af93264df4dec6af89bfa2e24a1be22f05a7e017c0d1b6c4f2d5575f78ea  100644  crates/agentkit-mcp/tests/dynamic_http_client.rs
 29cb7e4e9c3d6fbe731c92b02a188de4c48ffd7d84b14bde693d5f40f1e84cb2  100644  crates/agentkit-mcp/tests/in_memory.rs
 fd888d47dbb524c5ad82f124db4d1631e2b04320ddacac7f831bcb1a0591f609  100644  crates/agentkit-mcp/tests/protocol_revision_pin.rs

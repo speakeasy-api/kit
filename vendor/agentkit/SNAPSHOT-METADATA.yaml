@@ -228,6 +228,15 @@ maintenance:
       - "crates/agentkit-provider-ollama/README.md"
       - "crates/agentkit-provider-ollama/src/lib.rs"
     contract: "Ollama OpenAI-compatible chat completions use max_tokens for configured and per-turn output caps"
+  mcp_url_elicitation_capability:
+    patch_id: "m006-mcp-url-elicitation-capability"
+    work_package: "M006-W08"
+    classification: "local_only"
+    previous_snapshot_sha256: "0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0"
+    patched_snapshot_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
+    files:
+      - "crates/agentkit-mcp/src/lib.rs"
+    contract: "the host advertises only the configured form and URL elicitation capability modes"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -242,8 +251,8 @@ dependency_graph:
 final_snapshot:
   payload_file_count: 357
   manifest: "SNAPSHOT-MANIFEST.sha256"
-  manifest_sha256: "0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0"
-  aggregate_sha256: "0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0"
+  manifest_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
+  aggregate_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   attestation_files_excluded_from_payload_digest:
     - "SNAPSHOT-MANIFEST.sha256"

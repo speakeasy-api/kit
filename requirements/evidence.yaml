@@ -6666,7 +6666,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1187
   evidence_job: integration
-  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_url_elicitation_broker_connector_callback_and_retry_acceptance --lib -- --exact && cargo test --locked --test adversarial mcp_url -- --test-threads=1 exits 0 with all matching tests passed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -10586,7 +10586,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1197
   evidence_job: adversarial
-  expected_result: cargo test --locked --test adversarial local_sandbox && cargo test --locked --test adversarial container_fs && cargo test --locked --test adversarial container_net exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  expected_result: cargo test --locked --test adversarial mcp_url -- --test-threads=1 exits 0 with all matching tests passed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null

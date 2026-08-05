@@ -19909,14 +19909,14 @@
   source_quote: Kit connects stdio and Streamable HTTP MCP servers through `agentkit-mcp`, preserving tools, resources, and prompts as distinct capability types. It supports explicit discovery, list-change refresh, auth interruption/resume, and configured client-side sampling, elicitation, and roots responders.
   source_fingerprint: 2fce9901bb757c1c8d04ada8501cf260c70c83e0c05963ddfb9a810745484a9b
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: active
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: W07a and W07b implement discovery, list-change refresh, and auth resume; W07c implements configured sampling, form elicitation, and roots responders. URL elicitation remains W08, so this promise stays active.
+  interpretation: W07a-W07c implement discovery, list-change refresh, auth resume, sampling, form elicitation, and roots; W08 adds configured URL elicitation and typed -32042 durable retry handling.
   acceptance_criteria:
-  - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
+  - cargo test --locked protocols::mcp::transport::tests::production_url_elicitation_broker_connector_callback_and_retry_acceptance --lib -- --exact && cargo test --locked --test adversarial mcp_url -- --test-threads=1 exits 0 with all matching tests passed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -19937,16 +19937,19 @@
   - src/protocols/mcp/transport/http.rs
   - src/protocols/mcp/transport/stdio.rs
   - src/protocols/mcp/responders/mod.rs
+  - src/protocols/mcp/egress.rs
   - src/agent/executor/mod.rs
   public_contract_links:
   - src/protocols/mcp/config.rs
   - docs/api/openapi.yaml
   - src/cli/core/command_tree.rs
   telemetry_links:
+  - src/protocols/mcp/transport/mod.rs
   - tests/conformance/mcp_features.rs
   - tests/fault/mcp_listchange_storm.rs
   - tests/conformance/mcp_transport.rs
   - tests/adversarial/mcp_callback_authority.rs
+  - tests/adversarial/mcp_url.rs
   - tests/fault/model_intent_outcome.rs
   - tests/integration/provider_stream.rs
   - tests/conformance/http_contract.rs
@@ -19954,7 +19957,7 @@
   evidence_type: conformance
   evidence_id: EV-1.04-C-1187
   evidence_job: integration
-  expected_result: cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked protocols::mcp::transport::tests::production_url_elicitation_broker_connector_callback_and_retry_acceptance --lib -- --exact && cargo test --locked --test adversarial mcp_url -- --test-threads=1 exits 0 with all matching tests passed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -20131,7 +20134,7 @@
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: W07b covers MCP discovery and invocation authority; W07c adds broker-derived authority for MCP sampling, form elicitation, and roots. ACP callback authority and URL elicitation remain outside this unit, so this promise stays active.
+  interpretation: W07b covers MCP discovery and invocation authority; W07c adds broker-derived authority for sampling, form elicitation, and roots; W08 adds URL elicitation. ACP callback authority remains outside this unit, so this promise stays active.
   acceptance_criteria:
   - cargo test --locked protocols::mcp::transport::tests::production_runtime_load_registration_broker_refresh_replay_and_reconnect --lib -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
@@ -20153,6 +20156,7 @@
   - src/protocols/mcp/transport/mod.rs
   - src/protocols/mcp/transport/invocation.rs
   - src/protocols/mcp/responders/mod.rs
+  - src/protocols/mcp/egress.rs
   - src/store/sqlite/mcp_callback.rs
   - src/agent/executor/mod.rs
   public_contract_links:
@@ -20163,6 +20167,7 @@
   - tests/conformance/mcp_invocation.rs
   - tests/adversarial/mcp_result_authority.rs
   - tests/adversarial/mcp_callback_authority.rs
+  - tests/adversarial/mcp_url.rs
   - tests/conformance/mcp_transport.rs
   - tests/fault/model_intent_outcome.rs
   evidence_type: conformance
@@ -20191,7 +20196,7 @@
   tombstone_reason: null
   area: KIT-MCP
   applicability: mandatory
-  interpretation: MCP sampling permission and form-elicitation responses resolve versioned durable callback requests only through authenticated API or CLI service commands with current principal, project, grant, challenge, schema, attempt, fence, claim, revision, budget, and cancellation authority.
+  interpretation: MCP sampling permission and form/URL elicitation responses resolve versioned durable callback requests only through authenticated API or CLI service commands with current principal, project, grant, challenge, schema or URL digest, attempt, fence, claim, revision, idempotency, deadline, and cancellation authority.
   acceptance_criteria:
   - cargo test --locked api::service::mcp_callback_tests --lib exits 0 with all matching tests passed
   primary_milestone: M006
@@ -20226,6 +20231,7 @@
   - tests/conformance/cli_parity.rs
   - tests/conformance/mcp_transport.rs
   - tests/adversarial/mcp_callback_authority.rs
+  - tests/adversarial/mcp_url.rs
   - tests/fault/model_intent_outcome.rs
   - tests/fault/sched_crash.rs
   evidence_type: conformance
@@ -20463,14 +20469,14 @@
   source_quote: Every discovered URL is defended against SSRF, redirects, DNS rebinding, private ranges, local services, dangerous schemes, and unauthorized hosts.
   source_fingerprint: 2e003e5f0eda1ee1f84c61a369dc7b0b9a7b12cb35b7a17543206de277b8de10
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: active
+  status: implemented
   supersedes: null
   tombstone_reason: null
   area: KIT-SEC
   applicability: mandatory
-  interpretation: Discovered URLs are checked for redirects, DNS rebinding, private ranges, local services, dangerous schemes, and unauthorized hosts.
+  interpretation: The MCP egress connector authorizes every initial and redirect destination before bounded DNS, pins only public addresses, verifies the actual peer, rejects rebinding and ambiguous redirects, strips origin credentials, and leaves all server URL surfaces inert.
   acceptance_criteria:
-  - cargo test --locked --test adversarial local_sandbox && cargo test --locked --test adversarial container_fs && cargo test --locked --test adversarial container_net exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  - cargo test --locked --test adversarial mcp_url -- --test-threads=1 exits 0 with at least 100 malicious URL cases denied, zero automatic follows, and zero credential inheritance; this local-only result is not trusted release evidence
   primary_milestone: M003
   contributing_milestones: []
   dependencies: []
@@ -20485,13 +20491,19 @@
   - hostile
   release_gates:
   - G03
-  implementation_links: []
+  implementation_links:
+  - src/domain/egress/mod.rs
+  - src/protocols/mcp/egress.rs
+  - src/protocols/mcp/transport/http.rs
+  - src/protocols/mcp/responders/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/adversarial/mcp_url.rs
+  - tests/adversarial/url_policy.rs
   evidence_type: conformance
   evidence_id: EV-1.04-C-1197
   evidence_job: adversarial
-  expected_result: cargo test --locked --test adversarial local_sandbox && cargo test --locked --test adversarial container_fs && cargo test --locked --test adversarial container_net exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  expected_result: cargo test --locked --test adversarial mcp_url -- --test-threads=1 exits 0 with all matching tests passed; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null

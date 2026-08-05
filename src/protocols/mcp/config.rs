@@ -51,6 +51,8 @@ pub struct McpResponderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elicitation: Option<McpFormElicitationResponderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_elicitation: Option<McpUrlElicitationResponderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roots: Option<McpRootsResponderConfig>,
 }
 
@@ -117,6 +119,25 @@ pub struct McpFormElicitationResponderConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct McpUrlElicitationResponderConfig {
+    pub timeout_millis: u64,
+    pub max_message_bytes: usize,
+    pub max_url_bytes: usize,
+    pub max_elicitation_id_bytes: usize,
+    pub max_response_bytes: usize,
+    pub allowed_origins: Vec<McpUrlOriginConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUrlOriginConfig {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpRootsResponderConfig {
     pub timeout_millis: u64,
     pub max_roots: usize,
@@ -177,6 +198,18 @@ pub struct McpEgressConfig {
     pub scheme: String,
     pub host: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirect_grants: Vec<McpRedirectGrantConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRedirectGrantConfig {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub credential_handle: SecretHandle,
+    pub credential_scope: McpCredentialScopeConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -242,7 +275,7 @@ impl McpServerConfig {
                 if self.credential_handle.is_none() {
                     return Err("MCP HTTP transport requires a credential handle".to_owned());
                 }
-                let url = url::Url::parse(endpoint)
+                let url = crate::domain::egress::EgressPolicy::canonical_url(endpoint)
                     .map_err(|_| "MCP HTTP endpoint is invalid".to_owned())?;
                 if url.scheme() != "https" {
                     return Err("MCP credential-bearing HTTP endpoints must use HTTPS".to_owned());
@@ -250,11 +283,62 @@ impl McpServerConfig {
                 let port = url.port_or_known_default().ok_or_else(|| {
                     "MCP HTTP endpoint has no supported effective port".to_owned()
                 })?;
-                if url.scheme() != egress.scheme
-                    || url.host_str() != Some(egress.host.as_str())
-                    || port != egress.port
-                {
+                let initial = crate::domain::egress::DestinationGrant::new(
+                    &egress.scheme,
+                    &egress.host,
+                    egress.port,
+                    crate::domain::egress::CredentialHandle::new(
+                        self.credential_handle
+                            .as_ref()
+                            .expect("checked above")
+                            .identifier(),
+                    )
+                    .map_err(|_| "MCP HTTP egress grant is invalid".to_owned())?,
+                )
+                .map_err(|_| "MCP HTTP egress grant is invalid".to_owned())?;
+                let initial_destination = (
+                    initial.destination().scheme(),
+                    initial.destination().host(),
+                    initial.destination().port(),
+                );
+                let exact = crate::domain::egress::EgressPolicy::new([initial]);
+                exact
+                    .grant_for_url(url.as_str())
+                    .map_err(|_| "MCP HTTP endpoint is not a strict exact URL".to_owned())?;
+                if port != egress.port {
                     return Err("MCP HTTP endpoint and egress grant differ".to_owned());
+                }
+                if egress.redirect_grants.len() > crate::domain::egress::MAX_REDIRECTS {
+                    return Err("MCP HTTP redirect grant limit exceeded".to_owned());
+                }
+                let mut destinations = BTreeSet::from([initial_destination]);
+                for redirect in &egress.redirect_grants {
+                    validate_credential_handle(&redirect.credential_handle)?;
+                    if redirect.scheme != "https"
+                        || !credential_scope_authorizes_owner(
+                            &redirect.credential_scope,
+                            &self.owner,
+                        )
+                    {
+                        return Err("MCP HTTP redirect grant is invalid or duplicate".to_owned());
+                    }
+                    let redirect_grant = crate::domain::egress::DestinationGrant::new(
+                        &redirect.scheme,
+                        &redirect.host,
+                        redirect.port,
+                        crate::domain::egress::CredentialHandle::new(
+                            redirect.credential_handle.identifier(),
+                        )
+                        .map_err(|_| "MCP redirect credential is invalid".to_owned())?,
+                    )
+                    .map_err(|_| "MCP HTTP redirect grant is invalid or duplicate".to_owned())?;
+                    if !destinations.insert((
+                        redirect_grant.destination().scheme(),
+                        redirect_grant.destination().host(),
+                        redirect_grant.destination().port(),
+                    )) {
+                        return Err("MCP HTTP redirect grant is invalid or duplicate".to_owned());
+                    }
                 }
             }
             (McpTransportConfig::Http { .. }, None) => {
@@ -344,7 +428,10 @@ impl McpServerConfig {
 
 impl McpResponderConfig {
     fn is_disabled(&self) -> bool {
-        self.sampling.is_none() && self.elicitation.is_none() && self.roots.is_none()
+        self.sampling.is_none()
+            && self.elicitation.is_none()
+            && self.url_elicitation.is_none()
+            && self.roots.is_none()
     }
 
     fn validate(&self, transport: &McpTransportConfig) -> Result<(), String> {
@@ -430,6 +517,42 @@ impl McpResponderConfig {
         {
             return Err("MCP form elicitation responder limits are invalid".to_owned());
         }
+        if let Some(policy) = &self.url_elicitation {
+            if !(1..=300_000).contains(&policy.timeout_millis)
+                || !bounded(policy.max_message_bytes, 64 * 1024)
+                || !bounded(
+                    policy.max_url_bytes,
+                    crate::domain::egress::MAX_EGRESS_URL_BYTES,
+                )
+                || !bounded(policy.max_elicitation_id_bytes, 4096)
+                || !(1024..=64 * 1024).contains(&policy.max_response_bytes)
+                || policy.allowed_origins.is_empty()
+                || policy.allowed_origins.len() > crate::domain::egress::MAX_REDIRECTS + 1
+            {
+                return Err("MCP URL elicitation responder limits are invalid".to_owned());
+            }
+            let mut origins = BTreeSet::new();
+            for origin in &policy.allowed_origins {
+                let credential = crate::domain::egress::CredentialHandle::new("url:inert")
+                    .expect("static credential handle");
+                let grant = crate::domain::egress::DestinationGrant::new(
+                    &origin.scheme,
+                    &origin.host,
+                    origin.port,
+                    credential,
+                )
+                .map_err(|_| "MCP URL elicitation origin is invalid".to_owned())?;
+                if grant.destination().scheme() != crate::domain::egress::Scheme::Https
+                    || !origins.insert((
+                        grant.destination().scheme(),
+                        grant.destination().host(),
+                        grant.destination().port(),
+                    ))
+                {
+                    return Err("MCP URL elicitation origin is invalid or duplicate".to_owned());
+                }
+            }
+        }
         if let Some(policy) = &self.roots {
             if !(1..=300_000).contains(&policy.timeout_millis)
                 || policy.max_roots != 1
@@ -489,6 +612,32 @@ impl McpSamplingPricingPolicy {
 
 fn bounded(value: usize, maximum: usize) -> bool {
     (1..=maximum).contains(&value)
+}
+
+fn validate_credential_handle(handle: &SecretHandle) -> Result<(), String> {
+    let identifier = handle.identifier();
+    if identifier.strip_prefix("env:").is_some_and(|value| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }) {
+        Ok(())
+    } else {
+        Err("MCP credential handle uses an unsupported opaque scheme".to_owned())
+    }
+}
+
+fn credential_scope_authorizes_owner(
+    scope: &McpCredentialScopeConfig,
+    owner: &McpOwnerConfig,
+) -> bool {
+    match scope {
+        McpCredentialScopeConfig::Project => true,
+        McpCredentialScopeConfig::Workspace { workspace_id } => owner
+            .workspace_id
+            .is_none_or(|owner| owner == *workspace_id),
+    }
 }
 
 fn safe_absolute_path(path: &std::path::Path) -> bool {
@@ -792,6 +941,9 @@ pub(crate) async fn bootstrap(
                     let egress = configured.egress.as_ref().ok_or_else(|| {
                         format!("MCP server {:?} has no egress grant", configured.id)
                     })?;
+                    let endpoint = EgressPolicy::canonical_url(endpoint)
+                        .map_err(|_| format!("MCP server {:?} endpoint is invalid", configured.id))?
+                        .to_string();
                     let egress_constraint = EgressConstraint::new(
                         &egress.scheme,
                         &egress.host,
@@ -799,10 +951,88 @@ pub(crate) async fn bootstrap(
                         credential.clone(),
                     )
                     .map_err(|_| format!("MCP server {:?} has invalid egress", configured.id))?;
+                    let mut egress_constraints = vec![egress_constraint.clone()];
+                    let mut destination_grants =
+                        Vec::with_capacity(egress.redirect_grants.len().saturating_add(1));
+                    let handle = CredentialHandle::new(credential.identifier().to_owned())
+                        .map_err(|error| error.to_string())?;
+                    destination_grants.push(
+                        DestinationGrant::new(&egress.scheme, &egress.host, egress.port, handle)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    let mut credentials = BTreeSet::from([credential.clone()]);
+                    let mut credential_scopes = BTreeMap::from([(
+                        credential.clone(),
+                        configured
+                            .credential_scope
+                            .clone()
+                            .ok_or_else(|| "MCP HTTP credential scope is missing".to_owned())?,
+                    )]);
+                    for redirect in &egress.redirect_grants {
+                        if let McpCredentialScopeConfig::Workspace { workspace_id } =
+                            redirect.credential_scope
+                            && workspace_id != context.workspace_id
+                        {
+                            return Err(format!(
+                                "MCP server {:?} redirect credential does not authorize this workspace",
+                                configured.id
+                            )
+                            .into());
+                        }
+                        credentials.insert(redirect.credential_handle.clone());
+                        if credential_scopes
+                            .insert(
+                                redirect.credential_handle.clone(),
+                                redirect.credential_scope.clone(),
+                            )
+                            .is_some_and(|scope| scope != redirect.credential_scope)
+                        {
+                            return Err(format!(
+                                "MCP server {:?} credential has ambiguous scopes",
+                                configured.id
+                            )
+                            .into());
+                        }
+                        egress_constraints.push(
+                            EgressConstraint::new(
+                                &redirect.scheme,
+                                &redirect.host,
+                                redirect.port,
+                                redirect.credential_handle.clone(),
+                            )
+                            .map_err(|_| {
+                                format!(
+                                    "MCP server {:?} has invalid redirect egress",
+                                    configured.id
+                                )
+                            })?,
+                        );
+                        destination_grants.push(
+                            DestinationGrant::new(
+                                &redirect.scheme,
+                                &redirect.host,
+                                redirect.port,
+                                CredentialHandle::new(
+                                    redirect.credential_handle.identifier().to_owned(),
+                                )
+                                .map_err(|error| error.to_string())?,
+                            )
+                            .map_err(|error| error.to_string())?,
+                        );
+                    }
                     let extension = RequestExtension::new(
                         Some(egress_constraint.clone()),
                         Some(credential.clone()),
                     )
+                    .with_egresses(egress_constraints.iter().skip(1).cloned())
+                    .map_err(|_| "MCP redirect egress extension is invalid".to_owned())?
+                    .with_credentials(
+                        credentials
+                            .iter()
+                            .filter(|value| *value != &credential)
+                            .cloned(),
+                    )
+                    .map_err(|_| "MCP redirect credential extension is invalid".to_owned())?
                     .with_workspace_revision(context.workspace_revision);
                     let lifecycle =
                         crate::capabilities::broker::OwnedBrokerInvocation::run_lifecycle(
@@ -824,23 +1054,14 @@ pub(crate) async fn bootstrap(
                                 configured.id
                             )
                         })?;
-                    let handle = CredentialHandle::new(credential.identifier().to_owned())
-                        .map_err(|error| error.to_string())?;
-                    let grant = DestinationGrant::new(
-                        &egress.scheme,
-                        &egress.host,
-                        egress.port,
-                        handle.clone(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let policy = EgressPolicy::new([grant]);
+                    let policy = EgressPolicy::new(destination_grants);
                     let request = lifecycle.invocation();
                     let connection = if let Some(resolved) =
                         context.resolved_auth.get(&configured.id)
                     {
                         resolve_configured_streamable_http_auth(
                             &configured.id,
-                            endpoint,
+                            &endpoint,
                             &request,
                             context.authenticated,
                             if resolved.granted {
@@ -866,15 +1087,16 @@ pub(crate) async fn bootstrap(
                                 context.cancellation.as_ref(),
                                 resume_configured_streamable_http(
                                     &configured.id,
-                                    endpoint,
+                                    &endpoint,
                                     &request,
                                     &policy,
                                     Arc::new(
                                         crate::protocols::mcp::transport::EnvironmentHttpCredentialBroker::new(
-                                            context.authenticated.principal_id(),
-                                            context.config.project_id(),
-                                            Arc::clone(context.resolved_secrets),
-                                        ),
+                                             context.authenticated.principal_id(),
+                                             context.config.project_id(),
+                                             context.workspace_id,
+                                             credential_scopes.clone(),
+                                        ).with_callback_scanner(responders.secret_scanner()),
                                     ),
                                     store,
                                     TransportLimits::default(),
@@ -896,15 +1118,16 @@ pub(crate) async fn bootstrap(
                             context.cancellation.as_ref(),
                             connect_configured_streamable_http(
                                 &configured.id,
-                                endpoint,
+                                &endpoint,
                                 &request,
                                 &policy,
                                 Arc::new(
                                     crate::protocols::mcp::transport::EnvironmentHttpCredentialBroker::new(
-                                        context.authenticated.principal_id(),
-                                        context.config.project_id(),
-                                        Arc::clone(context.resolved_secrets),
-                                    ),
+                                         context.authenticated.principal_id(),
+                                         context.config.project_id(),
+                                         context.workspace_id,
+                                         credential_scopes,
+                                    ).with_callback_scanner(responders.secret_scanner()),
                                 ),
                                 store,
                                 TransportLimits::default(),
@@ -924,8 +1147,9 @@ pub(crate) async fn bootstrap(
                         }
                     };
                     opened.push(Arc::clone(&connection));
-                    let grant_extension = GrantExtension::new([egress_constraint], [credential], 0)
-                        .map_err(|_| "MCP grant extension is invalid".to_owned())?;
+                    let grant_extension =
+                        GrantExtension::new(egress_constraints, credentials, 0)
+                            .map_err(|_| "MCP grant extension is invalid".to_owned())?;
                     (extension, grant_extension, connection)
                 }
                 McpTransportConfig::Stdio {
@@ -1254,6 +1478,7 @@ mod tests {
                 pricing: None,
             }),
             elicitation: None,
+            url_elicitation: None,
             roots: None,
         };
         assert!(
@@ -1350,6 +1575,7 @@ mod tests {
                 }))
                 .unwrap(),
             }),
+            url_elicitation: None,
             roots: None,
         };
         assert!(
@@ -1359,5 +1585,50 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn url_elicitation_origins_are_exact_https_and_bounded() {
+        let valid = McpResponderConfig {
+            url_elicitation: Some(McpUrlElicitationResponderConfig {
+                timeout_millis: 1_000,
+                max_message_bytes: 256,
+                max_url_bytes: 1024,
+                max_elicitation_id_bytes: 128,
+                max_response_bytes: 1024,
+                allowed_origins: vec![McpUrlOriginConfig {
+                    scheme: "https".to_owned(),
+                    host: "auth.example.com".to_owned(),
+                    port: 443,
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(
+            valid
+                .validate(&McpTransportConfig::Http {
+                    endpoint: "https://example.invalid/mcp".to_owned(),
+                })
+                .is_ok()
+        );
+        for (scheme, host, port) in [
+            ("http", "auth.example.com", 80),
+            ("https", "localhost", 443),
+            ("https", "127.0.0.1", 443),
+            ("https", "auth.example.com", 22),
+        ] {
+            let mut invalid = valid.clone();
+            let origin = &mut invalid.url_elicitation.as_mut().unwrap().allowed_origins[0];
+            origin.scheme = scheme.to_owned();
+            origin.host = host.to_owned();
+            origin.port = port;
+            assert!(
+                invalid
+                    .validate(&McpTransportConfig::Http {
+                        endpoint: "https://example.invalid/mcp".to_owned(),
+                    })
+                    .is_err()
+            );
+        }
     }
 }

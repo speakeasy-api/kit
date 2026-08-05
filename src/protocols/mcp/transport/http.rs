@@ -2,7 +2,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
@@ -13,9 +12,11 @@ use agentkit_mcp::{
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream::BoxStream};
+#[cfg(test)]
+use http::header::AUTHORIZATION;
 use http::{
     HeaderName, HeaderValue, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+    header::{ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE},
 };
 use rmcp::model::ServerJsonRpcMessage;
 use serde_json::Value;
@@ -30,12 +31,14 @@ use crate::{
         },
     },
     domain::{
-        egress::{
-            Authorization as EgressAuthorization, CredentialHandle, EgressPolicy,
-            MAX_RESOLVED_ADDRESSES,
-        },
-        ids::{PrincipalId, ProjectId},
+        egress::{Authorization as EgressAuthorization, CredentialHandle, EgressPolicy},
+        ids::{PrincipalId, ProjectId, WorkspaceId},
         secret::{SecretHandle, SecretLease},
+    },
+    protocols::mcp::egress::{
+        EgressDialer, HttpCredentialBroker, HttpCredentialError, HttpSecretContext,
+        McpEgressConnector, McpEgressLimits, McpEgressRequest, McpEgressResponse,
+        McpResponseScanner,
     },
     store::sqlite::append::SqliteStore,
 };
@@ -50,94 +53,39 @@ const SESSION_HEADER: &str = "mcp-session-id";
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SSE_CONTENT_TYPE: &str = "text/event-stream";
-const MAX_BEARER_BYTES: usize = 8 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpCredentialError {
-    Denied,
-    Unavailable,
-    Invalid,
-}
-
-impl fmt::Display for HttpCredentialError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Denied => "MCP credential resolution denied",
-            Self::Unavailable => "MCP credential resolver unavailable",
-            Self::Invalid => "MCP credential is not a valid bounded bearer value",
-        })
-    }
-}
-
-impl std::error::Error for HttpCredentialError {}
-
-pub struct HttpSecretContext<'a> {
-    principal_id: &'a str,
-    project_id: &'a str,
-    invocation_id: &'a str,
-    decision_digest: &'a str,
-    request_digest: &'a str,
-    scope: Option<&'a str>,
-    operation: &'a str,
-    endpoint: &'a str,
-}
-
-impl HttpSecretContext<'_> {
-    pub fn principal_id(&self) -> &str {
-        self.principal_id
-    }
-    pub fn project_id(&self) -> &str {
-        self.project_id
-    }
-    pub fn invocation_id(&self) -> &str {
-        self.invocation_id
-    }
-    pub fn decision_digest(&self) -> &str {
-        self.decision_digest
-    }
-    pub fn request_digest(&self) -> &str {
-        self.request_digest
-    }
-    pub fn scope(&self) -> Option<&str> {
-        self.scope
-    }
-    pub fn operation(&self) -> &str {
-        self.operation
-    }
-    pub fn endpoint(&self) -> &str {
-        self.endpoint
-    }
-}
-
-/// Secret storage is not policy authority: the opaque context is minted only
-/// after the capability broker and egress policy have both authorized the
-/// exact invocation. Implementations return a short-lived zeroizing lease.
-#[async_trait::async_trait]
-pub trait HttpCredentialBroker: Send + Sync + 'static {
-    async fn authorize_and_resolve(
-        &self,
-        handle: &SecretHandle,
-        context: &HttpSecretContext<'_>,
-    ) -> Result<SecretLease, HttpCredentialError>;
-}
-
 pub(crate) struct EnvironmentHttpCredentialBroker {
     principal_id: PrincipalId,
     project_id: ProjectId,
-    secrets: Arc<BTreeMap<SecretHandle, Arc<SecretLease>>>,
+    workspace_id: WorkspaceId,
+    credentials: BTreeMap<SecretHandle, crate::protocols::mcp::config::McpCredentialScopeConfig>,
+    callback_scanner: Option<Arc<crate::protocols::mcp::responders::CallbackSecretScanner>>,
 }
 
 impl EnvironmentHttpCredentialBroker {
     pub(crate) fn new(
         principal_id: PrincipalId,
         project_id: ProjectId,
-        secrets: Arc<BTreeMap<SecretHandle, Arc<SecretLease>>>,
+        workspace_id: WorkspaceId,
+        credentials: BTreeMap<
+            SecretHandle,
+            crate::protocols::mcp::config::McpCredentialScopeConfig,
+        >,
     ) -> Self {
         Self {
             principal_id,
             project_id,
-            secrets,
+            workspace_id,
+            credentials,
+            callback_scanner: None,
         }
+    }
+
+    pub(crate) fn with_callback_scanner(
+        mut self,
+        scanner: Arc<crate::protocols::mcp::responders::CallbackSecretScanner>,
+    ) -> Self {
+        self.callback_scanner = Some(scanner);
+        self
     }
 }
 
@@ -150,13 +98,34 @@ impl HttpCredentialBroker for EnvironmentHttpCredentialBroker {
     ) -> Result<SecretLease, HttpCredentialError> {
         if context.principal_id() != self.principal_id.to_string()
             || context.project_id() != self.project_id.to_string()
+            || context.workspace_id() != self.workspace_id.to_string()
         {
             return Err(HttpCredentialError::Denied);
         }
-        self.secrets
+        let scope = self
+            .credentials
             .get(handle)
-            .map(|lease| SecretLease::new(lease.expose().to_vec()))
-            .ok_or(HttpCredentialError::Denied)
+            .ok_or(HttpCredentialError::Denied)?;
+        if matches!(
+            scope,
+            crate::protocols::mcp::config::McpCredentialScopeConfig::Workspace { workspace_id }
+                if *workspace_id != self.workspace_id
+        ) {
+            return Err(HttpCredentialError::Denied);
+        }
+        let variable = handle
+            .identifier()
+            .strip_prefix("env:")
+            .ok_or(HttpCredentialError::Denied)?;
+        let value = std::env::var(variable).map_err(|_| HttpCredentialError::Unavailable)?;
+        if value.is_empty() {
+            return Err(HttpCredentialError::Invalid);
+        }
+        let lease = SecretLease::new(value.into_bytes());
+        if let Some(scanner) = &self.callback_scanner {
+            scanner.add_secret(&lease);
+        }
+        Ok(lease)
     }
 }
 
@@ -176,20 +145,51 @@ pub(crate) async fn connect_streamable_http_with_handler(
     limits: TransportLimits,
     handler: McpHandlerConfig,
 ) -> Result<StreamableHttpOutcome, TransportError> {
+    connect_streamable_http_with_handler_and_dialer(
+        server_id,
+        endpoint,
+        request,
+        policy,
+        credentials,
+        store,
+        limits,
+        handler,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn connect_streamable_http_with_handler_and_dialer(
+    server_id: McpServerId,
+    endpoint: &str,
+    request: &BrokerInvocation<'_>,
+    policy: &EgressPolicy,
+    credentials: Arc<dyn HttpCredentialBroker>,
+    store: &mut SqliteStore,
+    limits: TransportLimits,
+    handler: McpHandlerConfig,
+    dialer: Option<Arc<dyn EgressDialer>>,
+) -> Result<StreamableHttpOutcome, TransportError> {
+    let deadline = tokio::time::Instant::now() + limits.request_timeout();
     super::validate_initialize_arguments(request)?;
+    let endpoint = EgressPolicy::canonical_url(endpoint)
+        .map_err(|_| TransportError::InvalidEndpoint)?
+        .to_string();
     let operation = TransportOperation::parse(INITIALIZE_OPERATION)?;
-    let binding = TransportBinding::new(request, server_id.to_string(), "http", endpoint, None);
+    let binding = TransportBinding::new(request, server_id.to_string(), "http", &endpoint, None);
     let authorization = transport_auth::authorize(request, &operation, &binding, store)?;
     let credential = authorization
         .credential()
         .ok_or(TransportError::PolicyAuthorizationMismatch)?;
     let handle = CredentialHandle::new(credential.identifier().to_owned())
         .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
-    let policy = policy
-        .resolve_initial(endpoint, &handle)
-        .await
-        .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
-    validate_policy(endpoint, &policy, &authorization, limits)?;
+    let policy_authorization =
+        tokio::time::timeout_at(deadline, policy.resolve_initial(&endpoint, &handle))
+            .await
+            .map_err(|_| TransportError::Timeout("HTTP initialize"))?
+            .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
+    validate_policy(&endpoint, &policy_authorization, &authorization, limits)?;
     match transport_auth::state(request, &binding, store) {
         Ok(TransportAuthState::Absent) | Err(BrokerError::AuthNotRequired) => {}
         Ok(TransportAuthState::Pending(challenge)) => {
@@ -202,15 +202,18 @@ pub(crate) async fn connect_streamable_http_with_handler(
     }
     connect_once(
         server_id,
-        endpoint,
+        &endpoint,
         request,
         authorization,
-        &policy,
+        policy.clone(),
+        &policy_authorization,
         credentials,
         store,
         limits,
         false,
         handler,
+        dialer,
+        deadline,
     )
     .await
 }
@@ -248,31 +251,39 @@ pub(crate) async fn resume_streamable_http_with_handler(
     limits: TransportLimits,
     handler: McpHandlerConfig,
 ) -> Result<ReadyConnection, TransportError> {
+    let deadline = tokio::time::Instant::now() + limits.request_timeout();
     super::validate_initialize_arguments(request)?;
+    let endpoint = EgressPolicy::canonical_url(endpoint)
+        .map_err(|_| TransportError::InvalidEndpoint)?
+        .to_string();
     let operation = TransportOperation::parse(INITIALIZE_OPERATION)?;
-    let binding = TransportBinding::new(request, server_id.to_string(), "http", endpoint, None);
+    let binding = TransportBinding::new(request, server_id.to_string(), "http", &endpoint, None);
     let authorization = transport_auth::authorize_replay(request, &operation, &binding, store)?;
     let credential = authorization
         .credential()
         .ok_or(TransportError::PolicyAuthorizationMismatch)?;
     let handle = CredentialHandle::new(credential.identifier().to_owned())
         .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
-    let policy = policy
-        .resolve_initial(endpoint, &handle)
-        .await
-        .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
-    validate_policy(endpoint, &policy, &authorization, limits)?;
+    let policy_authorization =
+        tokio::time::timeout_at(deadline, policy.resolve_initial(&endpoint, &handle))
+            .await
+            .map_err(|_| TransportError::Timeout("HTTP initialize"))?
+            .map_err(|_| TransportError::PolicyAuthorizationMismatch)?;
+    validate_policy(&endpoint, &policy_authorization, &authorization, limits)?;
     match connect_once(
         server_id,
-        endpoint,
+        &endpoint,
         request,
         authorization,
-        &policy,
+        policy.clone(),
+        &policy_authorization,
         credentials,
         store,
         limits,
         true,
         handler,
+        None,
+        deadline,
     )
     .await?
     {
@@ -311,12 +322,15 @@ pub fn resolve_streamable_http_auth(
     resolution: AuthResolution,
     store: &mut SqliteStore,
 ) -> Result<(), TransportError> {
+    let endpoint = EgressPolicy::canonical_url(endpoint)
+        .map_err(|_| TransportError::InvalidEndpoint)?
+        .to_string();
     transport_auth::resume(
         request,
         actor,
         &server_id.to_string(),
         "http",
-        endpoint,
+        &endpoint,
         resolution,
         store,
     )?;
@@ -329,12 +343,15 @@ async fn connect_once(
     endpoint: &str,
     request: &BrokerInvocation<'_>,
     authorization: TransportAuthorization,
+    egress_policy: EgressPolicy,
     policy: &EgressAuthorization,
     credentials: Arc<dyn HttpCredentialBroker>,
     store: &mut SqliteStore,
     limits: TransportLimits,
     replay: bool,
     handler: McpHandlerConfig,
+    dialer: Option<Arc<dyn EgressDialer>>,
+    deadline: tokio::time::Instant,
 ) -> Result<StreamableHttpOutcome, TransportError> {
     let configured_server = ConfiguredServerIdentity::new(server_id.to_string())?;
     let operations = OperationGate::new();
@@ -345,10 +362,14 @@ async fn connect_once(
         &server_id,
         endpoint,
         authorization,
+        egress_policy,
         policy,
+        request.workspace_id(),
         Arc::clone(&operations),
         credentials,
         limits,
+        dialer,
+        deadline,
     )?);
     let binding = StreamableHttpTransportConfig::new(endpoint)
         .with_http_client(client.clone())
@@ -369,7 +390,42 @@ async fn connect_once(
                 return Err(error.into());
             }
         };
-    let result = McpConnection::connect_authorized_http(&config, handler).await;
+    let result = match tokio::time::timeout_at(
+        deadline,
+        McpConnection::connect_authorized_http(&config, handler),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let cleanup =
+                tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
+            let persisted = transport_auth::finish_dispatch(
+                request,
+                dispatch,
+                transport_auth::TransportDispatchOutcome::OutcomeUnknown,
+                store,
+            );
+            let cleared = operations.clear_generation(generation);
+            persisted?;
+            cleared?;
+            let primary = TransportError::Timeout("HTTP initialize");
+            return match cleanup {
+                Ok(Ok(())) => Err(primary),
+                Ok(Err(error)) => Err(TransportError::Cleanup {
+                    primary: Box::new(primary),
+                    cleanup: std::io::Error::other(error),
+                }),
+                Err(_) => Err(TransportError::Cleanup {
+                    primary: Box::new(primary),
+                    cleanup: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "MCP HTTP session cleanup timed out",
+                    ),
+                }),
+            };
+        }
+    };
     if request.cancelled() {
         let cleanup =
             tokio::time::timeout(limits.close_timeout(), client.close_open_sessions()).await;
@@ -642,58 +698,60 @@ const fn insecure_test_endpoint(_: &url::Url) -> bool {
 }
 
 struct AuthorizedHttpClient {
-    client: reqwest::Client,
     authorization: TransportAuthorization,
     endpoint: String,
-    policy: EgressAuthorization,
-    credentials: Arc<dyn HttpCredentialBroker>,
+    connector: McpEgressConnector,
     limits: TransportLimits,
     sessions: Mutex<Option<String>>,
     cleanup_sessions: Mutex<BTreeSet<String>>,
     operations: Arc<OperationGate>,
     server_id: McpServerId,
+    workspace_id: String,
+    initial_deadline: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl AuthorizedHttpClient {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         server_id: &McpServerId,
         endpoint: &str,
         authorization: TransportAuthorization,
+        egress_policy: EgressPolicy,
         policy: &EgressAuthorization,
+        workspace_id: WorkspaceId,
         operations: Arc<OperationGate>,
         credentials: Arc<dyn HttpCredentialBroker>,
         limits: TransportLimits,
+        dialer: Option<Arc<dyn EgressDialer>>,
+        initial_deadline: tokio::time::Instant,
     ) -> Result<Self, TransportError> {
-        let host = policy.destination().host();
-        let port = policy.destination().port();
-        let addresses = policy
-            .resolved_addresses()
-            .map(|address| SocketAddr::new(address, port))
-            .collect::<Vec<_>>();
-        if addresses.is_empty() || addresses.len() > MAX_RESOLVED_ADDRESSES {
+        if policy.resolved_addresses().next().is_none() {
             return Err(TransportError::PolicyAuthorizationMismatch);
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .resolve_to_addrs(&host, &addresses)
-            .connect_timeout(limits.connect_timeout())
-            .timeout(limits.request_timeout())
-            .pool_max_idle_per_host(0)
-            .build()
-            .map_err(|error| TransportError::Io(std::io::Error::other(error)))?;
+        let egress_limits = McpEgressLimits {
+            max_location_bytes: limits.max_header_bytes(),
+            max_headers: limits.max_headers(),
+            max_header_bytes: limits.max_header_bytes(),
+            request_timeout: limits.request_timeout(),
+            connect_timeout: limits.connect_timeout(),
+        };
+        let connector = if let Some(dialer) = dialer {
+            McpEgressConnector::with_dialer(egress_policy, credentials, dialer, egress_limits)
+        } else {
+            McpEgressConnector::new(egress_policy, credentials, egress_limits)
+        }
+        .with_initial_authorization(policy.clone());
         Ok(Self {
-            client,
             authorization,
             endpoint: endpoint.to_owned(),
-            policy: policy.clone(),
-            credentials,
+            connector,
             limits,
             sessions: Mutex::new(None),
             cleanup_sessions: Mutex::new(BTreeSet::new()),
             operations,
             server_id: server_id.clone(),
+            workspace_id: workspace_id.to_string(),
+            initial_deadline: Mutex::new(Some(initial_deadline)),
         })
     }
 
@@ -705,41 +763,24 @@ impl AuthorizedHttpClient {
         }
     }
 
-    fn check_peer(
-        &self,
-        response: &reqwest::Response,
-    ) -> Result<(), McpStreamableHttpError<reqwest::Error>> {
-        let peer = response
-            .remote_addr()
-            .ok_or_else(|| unexpected("MCP HTTP peer address is unavailable"))?;
-        if self.policy.authorizes_peer(peer.ip()) {
-            Ok(())
-        } else {
-            Err(unexpected("MCP HTTP peer address is not authorized"))
-        }
-    }
-
     fn check_response_headers(
         &self,
         response: &reqwest::Response,
     ) -> Result<(), McpStreamableHttpError<reqwest::Error>> {
-        let mut count = 0usize;
-        let mut bytes = 0usize;
-        for (name, value) in response.headers() {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| unexpected("MCP HTTP response headers exceed bound"))?;
-            bytes = bytes
-                .checked_add(name.as_str().len())
-                .and_then(|total| total.checked_add(value.as_bytes().len()))
-                .ok_or_else(|| unexpected("MCP HTTP response headers exceed bound"))?;
-            if count > self.limits.max_headers() || bytes > self.limits.max_header_bytes() {
-                self.operations.fail(TransportFailure::InvalidHeader);
-                return Err(unexpected("MCP HTTP response headers exceed bound"));
-            }
-            self.operations
-                .scan_ingress(value.as_bytes())
-                .map_err(|_| unexpected("MCP HTTP response contains credential material"))?;
+        if crate::protocols::mcp::egress::check_headers(
+            response.headers(),
+            McpEgressLimits {
+                max_location_bytes: self.limits.max_header_bytes(),
+                max_headers: self.limits.max_headers(),
+                max_header_bytes: self.limits.max_header_bytes(),
+                request_timeout: self.limits.request_timeout(),
+                connect_timeout: self.limits.connect_timeout(),
+            },
+        )
+        .is_err()
+        {
+            self.operations.fail(TransportFailure::InvalidHeader);
+            return Err(unexpected("MCP HTTP response headers exceed bound"));
         }
         Ok(())
     }
@@ -768,81 +809,12 @@ impl AuthorizedHttpClient {
             .map_err(|_| unexpected("MCP session binding is unavailable"))
     }
 
-    async fn credential(
+    fn headers(
         &self,
-        request: reqwest::RequestBuilder,
-        authorization: &TransportAuthorization,
-    ) -> Result<reqwest::RequestBuilder, McpStreamableHttpError<reqwest::Error>> {
-        let resolved = tokio::time::timeout(
-            self.limits.request_timeout(),
-            self.credentials.authorize_and_resolve(
-                authorization
-                    .credential()
-                    .ok_or_else(|| unexpected("MCP credential authorization is missing"))?,
-                &HttpSecretContext {
-                    principal_id: authorization.principal_id(),
-                    project_id: authorization.project_id(),
-                    invocation_id: authorization.invocation_id(),
-                    decision_digest: authorization.decision_digest(),
-                    request_digest: authorization.request_digest(),
-                    scope: authorization.scope(),
-                    operation: authorization.operation().as_str(),
-                    endpoint: &self.endpoint,
-                },
-            ),
-        )
-        .await;
-        let lease = match resolved {
-            Ok(Ok(lease)) => lease,
-            Ok(Err(error)) => {
-                self.operations.fail(TransportFailure::Credential(error));
-                return Err(unexpected("credential resolution failed"));
-            }
-            Err(_) => {
-                self.operations.fail(TransportFailure::Credential(
-                    HttpCredentialError::Unavailable,
-                ));
-                return Err(unexpected("credential resolution timed out"));
-            }
-        };
-        let secret = lease.expose();
-        if secret.is_empty()
-            || secret.len() > MAX_BEARER_BYTES
-            || secret.iter().any(|byte| !byte.is_ascii_graphic())
-        {
-            self.operations
-                .fail(TransportFailure::Credential(HttpCredentialError::Invalid));
-            return Err(unexpected("credential is not a valid bounded bearer value"));
-        }
-        let mut bearer = Vec::with_capacity("Bearer ".len() + secret.len());
-        bearer.extend_from_slice(b"Bearer ");
-        bearer.extend_from_slice(secret);
-        let mut value = HeaderValue::from_bytes(&bearer).map_err(|_| {
-            self.operations
-                .fail(TransportFailure::Credential(HttpCredentialError::Invalid));
-            unexpected("credential is not a valid HTTP header")
-        })?;
-        bearer.fill(0);
-        value.set_sensitive(true);
-        self.operations
-            .install_secret(lease)
-            .map_err(|_| unexpected("credential scanner initialization failed"))?;
-        // reqwest must own one HeaderValue copy until send; it is sensitive,
-        // never formatted or persisted, and the source buffer is already zeroed.
-        Ok(request.header(AUTHORIZATION, value))
-    }
-
-    async fn headers(
-        &self,
-        mut request: reqwest::RequestBuilder,
+        mut headers: http::HeaderMap,
         mut custom: HashMap<HeaderName, HeaderValue>,
         require_protocol: bool,
-        authorization: &TransportAuthorization,
-    ) -> Result<reqwest::RequestBuilder, McpStreamableHttpError<reqwest::Error>> {
-        if custom.len() > self.limits.max_headers() {
-            self.operations.fail(TransportFailure::InvalidHeader);
-            return Err(unexpected("too many MCP HTTP headers"));
-        }
+    ) -> Result<http::HeaderMap, McpStreamableHttpError<reqwest::Error>> {
         let protocol = custom.remove(&HeaderName::from_static(PROTOCOL_HEADER));
         if require_protocol {
             let protocol = protocol.ok_or_else(|| {
@@ -853,7 +825,7 @@ impl AuthorizedHttpClient {
                 self.operations.fail(TransportFailure::InvalidHeader);
                 return Err(unexpected("invalid MCP protocol header"));
             }
-            request = request.header(PROTOCOL_HEADER, protocol);
+            headers.insert(HeaderName::from_static(PROTOCOL_HEADER), protocol);
         } else if protocol.is_some() {
             self.operations.fail(TransportFailure::InvalidHeader);
             return Err(unexpected("initialize request carried a protocol header"));
@@ -877,9 +849,67 @@ impl AuthorizedHttpClient {
                 self.operations.fail(TransportFailure::InvalidHeader);
                 return Err(unexpected("reserved or oversized MCP HTTP header"));
             }
-            request = request.header(name, value);
+            headers.insert(name, value);
         }
-        self.credential(request, authorization).await
+        Ok(headers)
+    }
+
+    async fn send(
+        &self,
+        method: http::Method,
+        url: &str,
+        headers: http::HeaderMap,
+        body: Bytes,
+        authorization: &TransportAuthorization,
+    ) -> Result<McpEgressResponse, McpStreamableHttpError<reqwest::Error>> {
+        let deadline = self
+            .initial_deadline
+            .lock()
+            .map_err(|_| unexpected("MCP HTTP deadline state is unavailable"))?
+            .take()
+            .unwrap_or_else(|| tokio::time::Instant::now() + self.limits.request_timeout());
+        let response = self
+            .connector
+            .execute_before(
+                McpEgressRequest {
+                    method,
+                    url: url.to_owned(),
+                    headers,
+                    body,
+                },
+                authorization.principal_id(),
+                authorization.project_id(),
+                &self.workspace_id,
+                authorization.invocation_id(),
+                authorization.decision_digest(),
+                authorization.request_digest(),
+                authorization.scope(),
+                authorization.operation().as_str(),
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                self.operations.fail(match error {
+                    crate::protocols::mcp::egress::McpEgressError::InvalidHeader => {
+                        TransportFailure::InvalidHeader
+                    }
+                    crate::protocols::mcp::egress::McpEgressError::Credential(error) => {
+                        TransportFailure::Credential(error)
+                    }
+                    crate::protocols::mcp::egress::McpEgressError::Timeout => {
+                        TransportFailure::HttpTimeout
+                    }
+                    error => TransportFailure::Egress(error),
+                });
+                unexpected("MCP egress connector denied request")
+            })?;
+        if response.redirects() > 0 && response.response().headers().contains_key(SESSION_HEADER) {
+            self.operations.fail(TransportFailure::InvalidHeader);
+            return Err(unexpected(
+                "redirected MCP response carried session authority",
+            ));
+        }
+        Ok(response)
     }
 
     fn check_authorization(
@@ -950,21 +980,37 @@ impl McpHttpClient for AuthorizedHttpClient {
             self.operations.fail(TransportFailure::ResponseTooLarge);
             return Err(unexpected("outbound MCP JSON exceeds bound"));
         }
-        let mut request = self
-            .client
-            .post(uri.as_ref())
-            .header(ACCEPT, format!("{JSON_CONTENT_TYPE}, {SSE_CONTENT_TYPE}"))
-            .header(CONTENT_TYPE, JSON_CONTENT_TYPE);
-        request = self
-            .headers(request, custom_headers, !is_initialize, &authorization)
-            .await?;
-        if let Some(session_id) = &session_id {
-            request = request.header(SESSION_HEADER, self.session(session_id)?);
+        if agentkit_mcp::has_responder_delivery_permit(&message) {
+            let value = serde_json::to_value(&message)?;
+            self.operations
+                .scan_callback_response(&value, &body)
+                .map_err(|_| unexpected("MCP callback response contains credential material"))?;
         }
-        let response = request.body(body).send().await?;
-        self.check_peer(&response)?;
-        self.check_response_headers(&response)?;
-        response_auth_error(&response, self.limits)?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
+        headers = self.headers(headers, custom_headers, !is_initialize)?;
+        if let Some(session_id) = &session_id {
+            headers.insert(
+                HeaderName::from_static(SESSION_HEADER),
+                self.session(session_id)?,
+            );
+        }
+        let response = self
+            .send(
+                http::Method::POST,
+                uri.as_ref(),
+                headers,
+                Bytes::from(body),
+                &authorization,
+            )
+            .await?;
+        self.check_response_headers(response.response())?;
+        response_auth_error(response.response(), self.limits)?;
+        let deadline = response.deadline();
         let status = response.status();
         let is_request = matches!(&message, ClientJsonRpcMessage::Request(_));
         if status == StatusCode::NOT_FOUND && session_id.is_some() {
@@ -999,9 +1045,15 @@ impl McpHttpClient for AuthorizedHttpClient {
         if !is_request {
             if status != StatusCode::ACCEPTED
                 || content_type.is_some()
-                || !bounded_body(response, self.limits.max_json_bytes(), &self.operations)
-                    .await?
-                    .is_empty()
+                || !bounded_body(
+                    response,
+                    self.limits.max_json_bytes(),
+                    &self.operations,
+                    deadline,
+                )
+                .await?
+                .bytes
+                .is_empty()
             {
                 return Err(unexpected(
                     "MCP notification/response requires an empty 202 acknowledgement",
@@ -1010,22 +1062,36 @@ impl McpHttpClient for AuthorizedHttpClient {
             return Ok(McpStreamableHttpPostResponse::Accepted);
         }
         if !status.is_success() {
-            let _ = bounded_body(response, self.limits.max_json_bytes(), &self.operations).await?;
+            let _ = bounded_body(
+                response,
+                self.limits.max_json_bytes(),
+                &self.operations,
+                deadline,
+            )
+            .await?;
             return Err(unexpected("MCP HTTP request failed"));
         }
         match content_type.as_deref().and_then(parse_media_type) {
             Some(JSON_CONTENT_TYPE) => {
-                let body =
-                    bounded_body(response, self.limits.max_json_bytes(), &self.operations).await?;
-                let payload =
-                    RawPayload::parse(&body, self.limits.payload_limits()).map_err(|error| {
+                let body = bounded_body(
+                    response,
+                    self.limits.max_json_bytes(),
+                    &self.operations,
+                    deadline,
+                )
+                .await?;
+                let payload = RawPayload::parse(&body.bytes, self.limits.payload_limits())
+                    .map_err(|error| {
                         self.operations.fail(TransportFailure::Payload(error));
                         unexpected("invalid bounded MCP JSON response")
                     })?;
-                self.operations.scan_payload(&payload).map_err(|_| {
-                    unexpected("MCP response reflected protected credential material")
-                })?;
-                if payload.value().get("result").is_some() {
+                scan_canonical(&body.scanner, &payload, &self.operations)?;
+                self.operations
+                    .bind_callback_scanner(&payload, Arc::clone(&body.scanner))
+                    .map_err(|_| unexpected("conflicting MCP callback request"))?;
+                if payload.value().get("result").is_some()
+                    || super::is_terminal_url_elicitation(&payload)
+                {
                     self.operations
                         .capture_payload(payload.clone())
                         .map_err(|_| unexpected("conflicting MCP response payload"))?;
@@ -1053,9 +1119,12 @@ impl McpHttpClient for AuthorizedHttpClient {
                     self.server_id.clone(),
                 );
                 if is_initialize {
-                    let first = stream
-                        .next()
+                    let first = tokio::time::timeout_at(deadline, stream.next())
                         .await
+                        .map_err(|_| {
+                            self.operations.fail(TransportFailure::HttpTimeout);
+                            unexpected("MCP HTTP initialize timed out")
+                        })?
                         .ok_or_else(|| unexpected("initialize SSE stream ended without a result"))?
                         .map_err(|_| unexpected("initialize SSE stream failed"))?;
                     stream = futures_util::stream::once(async move { Ok(first) })
@@ -1081,17 +1150,24 @@ impl McpHttpClient for AuthorizedHttpClient {
             .current_authorization()
             .map_err(|_| unexpected("MCP session deletion was not broker-authorized"))?;
         self.check_authorization(&authorization, Some(session_id.as_ref()))?;
-        let request = self
-            .client
-            .delete(uri.as_ref())
-            .header(SESSION_HEADER, self.session(&session_id)?);
-        let request = self
-            .headers(request, custom_headers, true, &authorization)
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(SESSION_HEADER),
+            self.session(&session_id)?,
+        );
+        headers = self.headers(headers, custom_headers, true)?;
+        let response = self
+            .send(
+                http::Method::DELETE,
+                uri.as_ref(),
+                headers,
+                Bytes::new(),
+                &authorization,
+            )
             .await?;
-        let response = request.send().await?;
-        self.check_peer(&response)?;
-        self.check_response_headers(&response)?;
-        response_auth_error(&response, self.limits)?;
+        self.check_response_headers(response.response())?;
+        response_auth_error(response.response(), self.limits)?;
+        let deadline = response.deadline();
         if response.status() == StatusCode::NOT_FOUND {
             self.expire_session(&session_id)?;
             self.bind_session(None)?;
@@ -1116,7 +1192,13 @@ impl McpHttpClient for AuthorizedHttpClient {
         if !response.status().is_success() {
             return Err(unexpected("MCP session deletion failed"));
         }
-        let _ = bounded_body(response, self.limits.max_json_bytes(), &self.operations).await?;
+        let _ = bounded_body(
+            response,
+            self.limits.max_json_bytes(),
+            &self.operations,
+            deadline,
+        )
+        .await?;
         let mut session = self
             .sessions
             .lock()
@@ -1146,21 +1228,30 @@ impl McpHttpClient for AuthorizedHttpClient {
             .current_authorization()
             .map_err(|_| unexpected("MCP SSE reconnect was not broker-authorized"))?;
         self.check_authorization(&authorization, Some(session_id.as_ref()))?;
-        let mut request = self
-            .client
-            .get(uri.as_ref())
-            .header(ACCEPT, SSE_CONTENT_TYPE)
-            .header(SESSION_HEADER, self.session(&session_id)?);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static(SSE_CONTENT_TYPE));
+        headers.insert(
+            HeaderName::from_static(SESSION_HEADER),
+            self.session(&session_id)?,
+        );
         if let Some(event_id) = last_event_id.filter(|id| !id.is_empty()) {
-            request = request.header(LAST_EVENT_ID_HEADER, self.event_id(&event_id)?);
+            headers.insert(
+                HeaderName::from_static(LAST_EVENT_ID_HEADER),
+                self.event_id(&event_id)?,
+            );
         }
-        request = self
-            .headers(request, custom_headers, true, &authorization)
+        headers = self.headers(headers, custom_headers, true)?;
+        let response = self
+            .send(
+                http::Method::GET,
+                uri.as_ref(),
+                headers,
+                Bytes::new(),
+                &authorization,
+            )
             .await?;
-        let response = request.send().await?;
-        self.check_peer(&response)?;
-        self.check_response_headers(&response)?;
-        response_auth_error(&response, self.limits)?;
+        self.check_response_headers(response.response())?;
+        response_auth_error(response.response(), self.limits)?;
         if response.status() == StatusCode::NOT_FOUND {
             self.expire_session(&session_id)?;
             self.bind_session(None)?;
@@ -1206,23 +1297,29 @@ impl McpHttpClient for AuthorizedHttpClient {
                 HeaderName::from_static(PROTOCOL_HEADER),
                 HeaderValue::from_static(PROTOCOL_REVISION_HEADER),
             );
-            let request = self
-                .client
-                .delete(&self.endpoint)
-                .header(SESSION_HEADER, self.session(&session)?);
             let authorization = self
                 .operations
                 .current_authorization()
                 .map_err(|_| unexpected("MCP session cleanup was not broker-authorized"))?;
             self.check_authorization(&authorization, Some(&session))?;
+            let mut request_headers = http::HeaderMap::new();
+            request_headers.insert(
+                HeaderName::from_static(SESSION_HEADER),
+                self.session(&session)?,
+            );
+            request_headers = self.headers(request_headers, headers, true)?;
             let response = self
-                .headers(request, headers, true, &authorization)
-                .await?
-                .send()
+                .send(
+                    http::Method::DELETE,
+                    &self.endpoint,
+                    request_headers,
+                    Bytes::new(),
+                    &authorization,
+                )
                 .await?;
-            self.check_peer(&response)?;
-            self.check_response_headers(&response)?;
-            response_auth_error(&response, self.limits)?;
+            self.check_response_headers(response.response())?;
+            response_auth_error(response.response(), self.limits)?;
+            let deadline = response.deadline();
             if response.status() == StatusCode::NOT_FOUND {
                 self.expire_session(&session)?;
                 self.bind_session(None)?;
@@ -1233,7 +1330,13 @@ impl McpHttpClient for AuthorizedHttpClient {
             {
                 return Err(unexpected("MCP failed-initialize session cleanup failed"));
             }
-            let _ = bounded_body(response, self.limits.max_json_bytes(), &self.operations).await?;
+            let _ = bounded_body(
+                response,
+                self.limits.max_json_bytes(),
+                &self.operations,
+                deadline,
+            )
+            .await?;
             *self
                 .sessions
                 .lock()
@@ -1370,10 +1473,11 @@ fn response_session(
 }
 
 async fn bounded_body(
-    response: reqwest::Response,
+    response: McpEgressResponse,
     max: usize,
     operations: &OperationGate,
-) -> Result<Vec<u8>, McpStreamableHttpError<reqwest::Error>> {
+    deadline: tokio::time::Instant,
+) -> Result<ScannedBody, McpStreamableHttpError<reqwest::Error>> {
     if response
         .content_length()
         .is_some_and(|length| length > max as u64)
@@ -1381,20 +1485,65 @@ async fn bounded_body(
         operations.fail(TransportFailure::ResponseTooLarge);
         return Err(unexpected("MCP HTTP body exceeds bound"));
     }
+    let (response, _, scanner) = response.into_parts();
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| {
+            operations.fail(TransportFailure::HttpTimeout);
+            unexpected("MCP HTTP body timed out")
+        })?
+    {
         let chunk = chunk?;
         if body.len().saturating_add(chunk.len()) > max {
             operations.fail(TransportFailure::ResponseTooLarge);
             return Err(unexpected("MCP HTTP body exceeds bound"));
         }
-        operations
-            .scan_ingress(&chunk)
-            .map_err(|_| unexpected("MCP HTTP response contains credential material"))?;
+        scan_ingress(&scanner, &chunk, operations)?;
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(ScannedBody {
+        bytes: body,
+        scanner,
+    })
+}
+
+struct ScannedBody {
+    bytes: Vec<u8>,
+    scanner: Arc<McpResponseScanner>,
+}
+
+fn scan_ingress(
+    scanner: &McpResponseScanner,
+    bytes: &[u8],
+    operations: &OperationGate,
+) -> Result<(), McpStreamableHttpError<reqwest::Error>> {
+    if scanner
+        .scan_ingress(bytes)
+        .map_err(|_| unexpected("credential scanner is unavailable"))?
+    {
+        operations.fail(TransportFailure::SensitivePayload);
+        Err(unexpected("MCP HTTP response contains credential material"))
+    } else {
+        Ok(())
+    }
+}
+
+fn scan_canonical(
+    scanner: &McpResponseScanner,
+    payload: &RawPayload,
+    operations: &OperationGate,
+) -> Result<(), McpStreamableHttpError<reqwest::Error>> {
+    if scanner
+        .scan_canonical(payload.canonical_bytes())
+        .map_err(|_| unexpected("credential scanner is unavailable"))?
+    {
+        operations.fail(TransportFailure::SensitivePayload);
+        Err(unexpected("MCP HTTP response contains credential material"))
+    } else {
+        Ok(())
+    }
 }
 
 fn unexpected(message: &'static str) -> McpStreamableHttpError<reqwest::Error> {
@@ -1402,14 +1551,15 @@ fn unexpected(message: &'static str) -> McpStreamableHttpError<reqwest::Error> {
 }
 
 fn bounded_sse(
-    response: reqwest::Response,
+    response: McpEgressResponse,
     limits: TransportLimits,
     operations: Arc<OperationGate>,
     _server_id: McpServerId,
 ) -> McpSseStream {
+    let (response, _, scanner) = response.into_parts();
     let input: BoxStream<'static, Result<Bytes, reqwest::Error>> = response.bytes_stream().boxed();
     futures_util::stream::unfold(
-        SseState::new(input, limits, Arc::clone(&operations)),
+        SseState::new(input, limits, Arc::clone(&operations), scanner),
         |mut state| async move { state.next().await.map(|event| (event, state)) },
     )
     .boxed()
@@ -1427,6 +1577,7 @@ struct SseState {
     bom_index: Option<usize>,
     terminal: bool,
     operations: Arc<OperationGate>,
+    scanner: Arc<McpResponseScanner>,
 }
 
 impl SseState {
@@ -1434,6 +1585,7 @@ impl SseState {
         input: BoxStream<'static, Result<Bytes, reqwest::Error>>,
         limits: TransportLimits,
         operations: Arc<OperationGate>,
+        scanner: Arc<McpResponseScanner>,
     ) -> Self {
         Self {
             input,
@@ -1447,6 +1599,7 @@ impl SseState {
             bom_index: Some(0),
             terminal: false,
             operations,
+            scanner,
         }
     }
 
@@ -1458,7 +1611,7 @@ impl SseState {
             if self.offset == self.chunk.len() {
                 match self.input.next().await {
                     Some(Ok(chunk)) => {
-                        if let Err(error) = self.operations.scan_ingress(&chunk) {
+                        if let Err(error) = scan_ingress(&self.scanner, &chunk, &self.operations) {
                             self.terminal = true;
                             return Some(Err(McpSseError::Body(Box::new(error))));
                         }
@@ -1525,11 +1678,20 @@ impl SseState {
                                     return Some(Err(McpSseError::Body(Box::new(error))));
                                 }
                             };
-                            if self.operations.scan_payload(&payload).is_err() {
+                            if scan_canonical(&self.scanner, &payload, &self.operations).is_err() {
                                 self.terminal = true;
                                 return Some(Err(McpSseError::Body(Box::new(SsePayloadConflict))));
                             }
-                            if payload.value().get("result").is_some()
+                            if self
+                                .operations
+                                .bind_callback_scanner(&payload, Arc::clone(&self.scanner))
+                                .is_err()
+                            {
+                                self.terminal = true;
+                                return Some(Err(McpSseError::Body(Box::new(SsePayloadConflict))));
+                            }
+                            if (payload.value().get("result").is_some()
+                                || super::is_terminal_url_elicitation(&payload))
                                 && self.operations.capture_payload(payload).is_err()
                             {
                                 self.terminal = true;
@@ -1691,6 +1853,51 @@ mod tests {
         resolutions: AtomicUsize,
     }
 
+    struct ActiveCredentialBroker;
+
+    #[async_trait::async_trait]
+    impl HttpCredentialBroker for ActiveCredentialBroker {
+        async fn authorize_and_resolve(
+            &self,
+            _handle: &SecretHandle,
+            _context: &HttpSecretContext<'_>,
+        ) -> Result<SecretLease, HttpCredentialError> {
+            Ok(SecretLease::new(b"active-hop-credential".to_vec()))
+        }
+    }
+
+    struct StaticBodyDialer(Bytes);
+
+    #[async_trait::async_trait]
+    impl EgressDialer for StaticBodyDialer {
+        async fn send(
+            &self,
+            request: reqwest::Request,
+            _authorization: &EgressAuthorization,
+            _limits: McpEgressLimits,
+        ) -> Result<crate::protocols::mcp::egress::EgressDialResponse, std::io::Error> {
+            assert_eq!(
+                request.headers()[AUTHORIZATION],
+                "Bearer active-hop-credential"
+            );
+            Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                response: ::http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .body(reqwest::Body::from(self.0.clone()))
+                    .unwrap()
+                    .into(),
+                peer: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            })
+        }
+    }
+
+    fn response_scanner(secret: &[u8]) -> Arc<McpResponseScanner> {
+        Arc::new(McpResponseScanner::new(&[SecretLease::new(
+            secret.to_vec(),
+        )]))
+    }
+
     #[async_trait::async_trait]
     impl HttpCredentialBroker for CredentialBroker {
         async fn authorize_and_resolve(
@@ -1701,6 +1908,211 @@ mod tests {
             assert!(!context.operation().is_empty());
             self.resolutions.fetch_add(1, Ordering::SeqCst);
             Ok(SecretLease::new(b"test-token".to_vec()))
+        }
+    }
+
+    struct RotatingCredentialBroker {
+        resolutions: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpCredentialBroker for RotatingCredentialBroker {
+        async fn authorize_and_resolve(
+            &self,
+            _handle: &SecretHandle,
+            _context: &HttpSecretContext<'_>,
+        ) -> Result<SecretLease, HttpCredentialError> {
+            let secret = match self.resolutions.fetch_add(1, Ordering::SeqCst) {
+                0 => b"sse-credential".as_slice(),
+                1 => b"post-credential".as_slice(),
+                _ => return Err(HttpCredentialError::Unavailable),
+            };
+            Ok(SecretLease::new(secret.to_vec()))
+        }
+    }
+
+    struct ConcurrentResponseDialer {
+        calls: AtomicUsize,
+        sse: std::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>>,
+        >,
+        post_body: Bytes,
+    }
+
+    #[derive(Default)]
+    struct NotificationSseDialer {
+        sse: std::sync::Mutex<
+            Option<tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>>,
+        >,
+        list_calls: AtomicUsize,
+    }
+
+    impl NotificationSseDialer {
+        async fn notify(&self, notification: Value) {
+            let bytes = Bytes::from(format!("data: {notification}\n\n"));
+            loop {
+                if let Some(sender) = self.sse.lock().unwrap().clone()
+                    && sender.send(Ok(bytes.clone())).is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EgressDialer for NotificationSseDialer {
+        async fn send(
+            &self,
+            request: reqwest::Request,
+            _authorization: &EgressAuthorization,
+            _limits: McpEgressLimits,
+        ) -> Result<crate::protocols::mcp::egress::EgressDialResponse, std::io::Error> {
+            assert_eq!(
+                request.headers()[AUTHORIZATION],
+                "Bearer active-hop-credential"
+            );
+            let http_method = request.method().clone();
+            let body = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+            let method = body
+                .as_ref()
+                .and_then(|body| body.get("method"))
+                .and_then(Value::as_str);
+            let response = if http_method == Method::GET {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                *self.sse.lock().unwrap() = Some(tx);
+                let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                });
+                ::http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, SSE_CONTENT_TYPE)
+                    .body(reqwest::Body::wrap_stream(stream))
+                    .unwrap()
+                    .into()
+            } else {
+                match method {
+                    Some("initialize") => {
+                        let id = body.as_ref().unwrap()["id"].clone();
+                        let initialize = serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "result":{
+                                "protocolVersion":"2025-11-25",
+                                "capabilities":{"tools":{"listChanged":true}},
+                                "serverInfo":{"name":"notification-sse","version":"1"}
+                            }
+                        });
+                        ::http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+                            .header(SESSION_HEADER, "notification-session")
+                            .body(reqwest::Body::from(initialize.to_string()))
+                            .unwrap()
+                            .into()
+                    }
+                    Some("notifications/initialized") => ::http::Response::builder()
+                        .status(StatusCode::ACCEPTED)
+                        .body(reqwest::Body::default())
+                        .unwrap()
+                        .into(),
+                    Some("tools/list") => {
+                        self.list_calls.fetch_add(1, Ordering::SeqCst);
+                        let id = body.as_ref().unwrap()["id"].clone();
+                        let response = serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "id":id,
+                            "result":{"tools":[{
+                                "name":"refreshed_tool",
+                                "inputSchema":{"type":"object"}
+                            }]}
+                        });
+                        ::http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+                            .body(reqwest::Body::from(response.to_string()))
+                            .unwrap()
+                            .into()
+                    }
+                    _ => ::http::Response::builder()
+                        .status(StatusCode::ACCEPTED)
+                        .body(reqwest::Body::default())
+                        .unwrap()
+                        .into(),
+                }
+            };
+            Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                response,
+                peer: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            })
+        }
+    }
+
+    impl ConcurrentResponseDialer {
+        fn new(post_body: impl Into<Bytes>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                sse: std::sync::Mutex::new(None),
+                post_body: post_body.into(),
+            }
+        }
+
+        fn send_sse(&self, bytes: &'static [u8]) {
+            self.sse
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .send(Ok(Bytes::from_static(bytes)))
+                .unwrap();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EgressDialer for ConcurrentResponseDialer {
+        async fn send(
+            &self,
+            request: reqwest::Request,
+            _authorization: &EgressAuthorization,
+            _limits: McpEgressLimits,
+        ) -> Result<crate::protocols::mcp::egress::EgressDialResponse, std::io::Error> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let authorization = request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            let response = if call == 0 {
+                assert_eq!(authorization, Some("Bearer sse-credential"));
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                *self.sse.lock().unwrap() = Some(tx);
+                let body = reqwest::Body::wrap_stream(futures_util::stream::unfold(
+                    rx,
+                    |mut rx| async move { rx.recv().await.map(|chunk| (chunk, rx)) },
+                ));
+                ::http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, SSE_CONTENT_TYPE)
+                    .body(body)
+                    .unwrap()
+                    .into()
+            } else {
+                assert_eq!(call, 1);
+                assert_eq!(authorization, Some("Bearer post-credential"));
+                ::http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .body(reqwest::Body::from(self.post_body.clone()))
+                    .unwrap()
+                    .into()
+            };
+            Ok(crate::protocols::mcp::egress::EgressDialResponse {
+                response,
+                peer: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            })
         }
     }
 
@@ -1836,6 +2248,16 @@ mod tests {
         broker: Arc<CredentialBroker>,
         limits: TransportLimits,
     ) -> Arc<AuthorizedHttpClient> {
+        client_with_dialer(endpoint, credential, broker, limits, None)
+    }
+
+    fn client_with_dialer(
+        endpoint: &str,
+        credential: &SecretHandle,
+        broker: Arc<dyn HttpCredentialBroker>,
+        limits: TransportLimits,
+        dialer: Option<Arc<dyn EgressDialer>>,
+    ) -> Arc<AuthorizedHttpClient> {
         let parsed = url::Url::parse(endpoint).unwrap();
         let address = parsed.host_str().unwrap().parse::<IpAddr>().unwrap();
         let policy = EgressAuthorization::for_test(
@@ -1856,13 +2278,363 @@ mod tests {
                 &McpServerId::new("http-test"),
                 endpoint,
                 authorization,
+                EgressPolicy::new([]),
                 &policy,
+                WorkspaceId::parse("workspace_00000000000000000000000001").unwrap(),
                 operations,
                 broker,
                 limits,
+                dialer,
+                tokio::time::Instant::now() + limits.request_timeout(),
             )
             .unwrap(),
         )
+    }
+
+    fn concurrent_client(
+        endpoint: &str,
+        credential: &SecretHandle,
+        broker: Arc<RotatingCredentialBroker>,
+        dialer: Arc<ConcurrentResponseDialer>,
+    ) -> AuthorizedHttpClient {
+        let parsed = url::Url::parse(endpoint).unwrap();
+        let address = parsed.host_str().unwrap().parse::<IpAddr>().unwrap();
+        let policy = EgressAuthorization::for_test(
+            crate::domain::egress::Scheme::Http,
+            parsed.host_str().unwrap(),
+            parsed.port_or_known_default().unwrap(),
+            EgressCredentialHandle::new(credential.identifier()).unwrap(),
+            [address],
+        );
+        let operations = OperationGate::new();
+        let authorization = authorization(endpoint, credential);
+        operations
+            .set_binding(authorization.binding().clone())
+            .unwrap();
+        operations
+            .bind_connection(Arc::new(authorization.clone()))
+            .unwrap();
+        let limits = TransportLimits::default();
+        AuthorizedHttpClient::new(
+            &McpServerId::new("http-test"),
+            endpoint,
+            authorization,
+            EgressPolicy::new([]),
+            &policy,
+            WorkspaceId::parse("workspace_00000000000000000000000001").unwrap(),
+            operations,
+            broker,
+            limits,
+            Some(dialer),
+            tokio::time::Instant::now() + limits.request_timeout(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn long_lived_sse_keeps_its_scanner_while_concurrent_post_rotates_credentials() {
+        let endpoint = "http://127.0.0.1:43210/mcp";
+        let credential = SecretHandle::parse("test:rotating-http").unwrap();
+        let broker = Arc::new(RotatingCredentialBroker {
+            resolutions: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ConcurrentResponseDialer::new(br#"{}"#.as_slice()));
+        let http = concurrent_client(endpoint, &credential, broker, Arc::clone(&dialer));
+        let authorization = http.authorization.clone();
+
+        let sse = http
+            .send(
+                http::Method::GET,
+                endpoint,
+                http::HeaderMap::new(),
+                Bytes::new(),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let mut stream = bounded_sse(
+            sse,
+            TransportLimits::default(),
+            Arc::clone(&http.operations),
+            McpServerId::new("http-test"),
+        );
+        let post = http
+            .send(
+                http::Method::POST,
+                endpoint,
+                http::HeaderMap::new(),
+                Bytes::new(),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let deadline = post.deadline();
+        bounded_body(post, 1024, &http.operations, deadline)
+            .await
+            .unwrap();
+
+        dialer.send_sse(b"data: post-credential\n\n");
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().data.as_deref(),
+            Some("post-credential")
+        );
+        dialer.send_sse(b"data: Bearer sse-credential\n\n");
+        assert!(matches!(stream.next().await, Some(Err(_))));
+        assert!(matches!(
+            http.operations.take_failure(),
+            Some(TransportError::SensitivePayload)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rotating_post_reflection_is_rejected_without_ending_live_sse() {
+        let endpoint = "http://127.0.0.1:43210/mcp";
+        let credential = SecretHandle::parse("test:rotating-http").unwrap();
+        let broker = Arc::new(RotatingCredentialBroker {
+            resolutions: AtomicUsize::new(0),
+        });
+        let dialer = Arc::new(ConcurrentResponseDialer::new(
+            br#"{"token":"post-credential"}"#.as_slice(),
+        ));
+        let http = concurrent_client(endpoint, &credential, broker, Arc::clone(&dialer));
+        let authorization = http.authorization.clone();
+
+        let sse = http
+            .send(
+                http::Method::GET,
+                endpoint,
+                http::HeaderMap::new(),
+                Bytes::new(),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let mut stream = bounded_sse(
+            sse,
+            TransportLimits::default(),
+            Arc::clone(&http.operations),
+            McpServerId::new("http-test"),
+        );
+        let post = http
+            .send(
+                http::Method::POST,
+                endpoint,
+                http::HeaderMap::new(),
+                Bytes::new(),
+                &authorization,
+            )
+            .await
+            .unwrap();
+        let deadline = post.deadline();
+        assert!(
+            bounded_body(post, 1024, &http.operations, deadline)
+                .await
+                .is_err()
+        );
+
+        dialer.send_sse(b"data: still-live\n\n");
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().data.as_deref(),
+            Some("still-live")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_http_credential_scanner_rejects_raw_percent_and_base64_reflection() {
+        let endpoint = "http://127.0.0.1:43210/mcp";
+        let credential = SecretHandle::parse("test:active-http").unwrap();
+        let initialize: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":agentkit_mcp::kit_authorized_initialize_arguments()
+        }))
+        .unwrap();
+        let response = |name: &str| {
+            Bytes::from(
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "result":{
+                        "protocolVersion":"2025-11-25",
+                        "capabilities":{},
+                        "serverInfo":{"name":name,"version":"1"}
+                    }
+                })
+                .to_string(),
+            )
+        };
+
+        for (encoding, reflected) in [
+            ("raw", "active-hop-credential"),
+            ("mixed percent", "active%2dhop-cred%65ntial"),
+            ("base64", "YWN0aXZlLWhvcC1jcmVkZW50aWFs"),
+            ("nested base64", "WVdOMGFYWmxMV2h2Y0MxamNtVmtaVzUwYVdGcw=="),
+        ] {
+            let http = client_with_dialer(
+                endpoint,
+                &credential,
+                Arc::new(ActiveCredentialBroker),
+                TransportLimits::default(),
+                Some(Arc::new(StaticBodyDialer(response(reflected)))),
+            );
+            assert!(
+                http.post_message(
+                    Arc::from(endpoint),
+                    initialize.clone(),
+                    None,
+                    None,
+                    HashMap::new(),
+                )
+                .await
+                .is_err(),
+                "{encoding} reflection reached typed parsing",
+            );
+            assert!(matches!(
+                http.operations.take_failure(),
+                Some(TransportError::SensitivePayload)
+            ));
+            assert!(
+                http.operations.response.lock().unwrap().payload.is_none(),
+                "{encoding} reflection reached model/artifact capture",
+            );
+        }
+
+        let http = client_with_dialer(
+            endpoint,
+            &credential,
+            Arc::new(ActiveCredentialBroker),
+            TransportLimits::default(),
+            Some(Arc::new(StaticBodyDialer(response("public-control")))),
+        );
+        assert!(matches!(
+            http.post_message(Arc::from(endpoint), initialize, None, None, HashMap::new(),)
+                .await,
+            Ok(McpStreamableHttpPostResponse::Json(..))
+        ));
+        assert!(http.operations.response.lock().unwrap().payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn production_http_sse_list_changed_reaches_refresh_and_rejects_credential_notification()
+    {
+        let endpoint = "http://127.0.0.1:43210/mcp";
+        let credential = SecretHandle::parse("test:notification-sse").unwrap();
+        let dialer = Arc::new(NotificationSseDialer::default());
+        let http = client_with_dialer(
+            endpoint,
+            &credential,
+            Arc::new(ActiveCredentialBroker),
+            TransportLimits::default(),
+            Some(dialer.clone()),
+        );
+        let connection = McpConnection::connect_authorized_http(
+            &McpServerConfig::new(
+                "notification-sse",
+                McpTransportBinding::StreamableHttp(
+                    StreamableHttpTransportConfig::new(endpoint).with_http_client(http.clone()),
+                ),
+            ),
+            McpHandlerConfig::new(),
+        )
+        .await
+        .unwrap();
+        let authorization = http.operations.current_authorization().unwrap();
+        http.operations.bind_connection(authorization).unwrap();
+        http.operations.clear();
+        http.operations.ready.store(true, Ordering::Release);
+
+        let mut events = connection.subscribe_events();
+        dialer
+            .notify(serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/tools/list_changed"
+            }))
+            .await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            agentkit_mcp::McpServerEvent::ToolListChanged
+        ));
+
+        http.operations
+            .install(operation_authorization(
+                &http,
+                "tools/list",
+                serde_json::json!({}),
+                Some(credential),
+            ))
+            .unwrap();
+        let (tools, cursor) = connection.list_tools_page(None).await.unwrap();
+        assert_eq!(cursor, None);
+        assert_eq!(tools[0].name, "refreshed_tool");
+        assert_eq!(dialer.list_calls.load(Ordering::SeqCst), 1);
+
+        dialer
+            .notify(serde_json::json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/progress",
+                "params":{
+                    "progressToken":"refresh",
+                    "progress":1,
+                    "message":"active-hop-credential"
+                }
+            }))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    http.operations.take_failure(),
+                    Some(TransportError::SensitivePayload)
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn environment_broker_checks_exact_workspace_before_lazy_secret_lookup() {
+        let principal = PrincipalId::parse("principal_00000000000000000000000001").unwrap();
+        let project = ProjectId::parse("project_00000000000000000000000001").unwrap();
+        let workspace = WorkspaceId::parse("workspace_00000000000000000000000001").unwrap();
+        let other = WorkspaceId::parse("workspace_00000000000000000000000002").unwrap();
+        let handle = SecretHandle::parse("env:KIT_MCP_MUST_NOT_BE_LOADED").unwrap();
+        let broker = EnvironmentHttpCredentialBroker::new(
+            principal,
+            project,
+            workspace,
+            BTreeMap::from([(
+                handle.clone(),
+                crate::protocols::mcp::config::McpCredentialScopeConfig::Workspace {
+                    workspace_id: workspace,
+                },
+            )]),
+        );
+        let result = broker
+            .authorize_and_resolve(
+                &handle,
+                &HttpSecretContext {
+                    principal_id: &principal.to_string(),
+                    project_id: &project.to_string(),
+                    workspace_id: &other.to_string(),
+                    invocation_id: "invocation",
+                    decision_digest: "decision",
+                    request_digest: "request",
+                    scope: None,
+                    operation: "tools/call",
+                    endpoint: "https://example.com/mcp",
+                    destination_digest: "destination",
+                    hop: 0,
+                },
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), HttpCredentialError::Denied);
     }
 
     fn operation_authorization(
@@ -1924,9 +2696,6 @@ mod tests {
         ));
 
         let operations = OperationGate::new();
-        operations
-            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
-            .unwrap();
         let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
             futures_util::stream::once(async {
                 Ok(Bytes::from_static(
@@ -1934,7 +2703,12 @@ mod tests {
                 ))
             })
             .boxed();
-        let mut state = SseState::new(input, TransportLimits::default(), Arc::clone(&operations));
+        let mut state = SseState::new(
+            input,
+            TransportLimits::default(),
+            Arc::clone(&operations),
+            response_scanner(b"not-reflected"),
+        );
         assert!(state.next().await.unwrap().is_err());
         assert!(matches!(
             operations.take_failure(),
@@ -2721,6 +3495,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_sse_callbacks_reject_bearer_reflection() {
+        for method in ["sampling/createMessage", "elicitation/create", "roots/list"] {
+            let operations = OperationGate::new();
+            let event = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{method}\",\"params\":{{\"message\":\"Bearer credential-canary\"}}}}\n\n"
+            );
+            let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
+                futures_util::stream::once(async move { Ok(Bytes::from(event)) }).boxed();
+            let mut state = SseState::new(
+                input,
+                TransportLimits::default(),
+                Arc::clone(&operations),
+                response_scanner(b"credential-canary"),
+            );
+            assert!(matches!(
+                state.next().await,
+                Some(Err(McpSseError::Body(_)))
+            ));
+            assert!(matches!(
+                operations.take_failure(),
+                Some(TransportError::SensitivePayload)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn sse_parser_follows_bom_eof_replacement_retry_and_empty_id_rules() {
         let input: BoxStream<'static, Result<Bytes, reqwest::Error>> = futures_util::stream::iter([
             Ok(Bytes::from_static(b"\xef")),
@@ -2730,10 +3530,12 @@ mod tests {
         ])
         .boxed();
         let operations = OperationGate::new();
-        operations
-            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
-            .unwrap();
-        let mut state = SseState::new(input, TransportLimits::default(), operations);
+        let mut state = SseState::new(
+            input,
+            TransportLimits::default(),
+            operations,
+            response_scanner(b"not-reflected"),
+        );
         let event = state.next().await.unwrap().unwrap();
         assert_eq!(event.event.as_deref(), Some("message"));
         assert_eq!(event.id.as_deref(), Some(""));
@@ -2743,20 +3545,24 @@ mod tests {
         let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
             futures_util::stream::iter([Ok(Bytes::from_static(b"data: incomplete"))]).boxed();
         let operations = OperationGate::new();
-        operations
-            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
-            .unwrap();
-        let mut state = SseState::new(input, TransportLimits::default(), operations);
+        let mut state = SseState::new(
+            input,
+            TransportLimits::default(),
+            operations,
+            response_scanner(b"not-reflected"),
+        );
         assert!(state.next().await.is_none());
 
         let input: BoxStream<'static, Result<Bytes, reqwest::Error>> =
             futures_util::stream::iter([Ok(Bytes::from_static(b"id: control\nretry: 10\n\n"))])
                 .boxed();
         let operations = OperationGate::new();
-        operations
-            .install_secret(SecretLease::new(b"not-reflected".to_vec()))
-            .unwrap();
-        let mut state = SseState::new(input, TransportLimits::default(), operations);
+        let mut state = SseState::new(
+            input,
+            TransportLimits::default(),
+            operations,
+            response_scanner(b"not-reflected"),
+        );
         let control = state.next().await.unwrap().unwrap();
         assert_eq!(control.id.as_deref(), Some("control"));
         assert_eq!(control.retry, Some(10));

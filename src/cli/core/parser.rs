@@ -780,6 +780,7 @@ fn invocation(
                 };
                 let mode = match string(matches, "mode") {
                     "form" => McpCallbackMode::Form,
+                    "url" => McpCallbackMode::Url,
                     "sampling-request" => McpCallbackMode::SamplingRequest,
                     "sampling-response" => McpCallbackMode::SamplingResponse,
                     _ => unreachable!("Clap validates callback modes"),

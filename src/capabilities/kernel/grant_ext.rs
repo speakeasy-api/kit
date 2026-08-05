@@ -107,7 +107,12 @@ impl GrantExtension {
     pub(super) fn allows_except_depth(&self, request: &RequestExtension) -> bool {
         request.egress.as_ref().is_none_or(|egress| {
             self.egress.contains(egress) && self.credentials.contains(egress.credential())
-        }) && request.credentials.is_subset(&self.credentials)
+        }) && request.egresses.is_subset(&self.egress)
+            && request
+                .egresses
+                .iter()
+                .all(|egress| self.credentials.contains(egress.credential()))
+            && request.credentials.is_subset(&self.credentials)
             && request.credential.as_ref().is_none_or(|credential| {
                 self.credentials.contains(credential)
                     && request
@@ -146,6 +151,7 @@ fn collect_bounded<T: Ord>(
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RequestExtension {
     egress: Option<EgressConstraint>,
+    egresses: BTreeSet<EgressConstraint>,
     credential: Option<SecretHandle>,
     credentials: BTreeSet<SecretHandle>,
     workspace_revision: Option<String>,
@@ -155,6 +161,7 @@ impl RequestExtension {
     pub fn new(egress: Option<EgressConstraint>, credential: Option<SecretHandle>) -> Self {
         Self {
             egress,
+            egresses: BTreeSet::new(),
             credential,
             credentials: BTreeSet::new(),
             workspace_revision: None,
@@ -175,6 +182,23 @@ impl RequestExtension {
         Ok(self)
     }
 
+    pub fn with_egresses(
+        mut self,
+        egresses: impl IntoIterator<Item = EgressConstraint>,
+    ) -> Result<Self, GrantExtensionError> {
+        self.egresses = collect_bounded(egresses)?;
+        if self.egress.is_none() && !self.egresses.is_empty() {
+            return Err(GrantExtensionError::InvalidEgress);
+        }
+        if let Some(initial) = &self.egress {
+            self.egresses.remove(initial);
+        }
+        if self.egresses.len() + usize::from(self.egress.is_some()) > MAX_EXTENSION_ITEMS {
+            return Err(GrantExtensionError::LimitExceeded);
+        }
+        Ok(self)
+    }
+
     pub fn with_workspace_revision(mut self, revision: impl Into<String>) -> Self {
         self.workspace_revision = Some(revision.into());
         self
@@ -182,6 +206,10 @@ impl RequestExtension {
 
     pub const fn egress(&self) -> Option<&EgressConstraint> {
         self.egress.as_ref()
+    }
+
+    pub fn egresses(&self) -> &BTreeSet<EgressConstraint> {
+        &self.egresses
     }
 
     pub const fn credential(&self) -> Option<&SecretHandle> {
@@ -203,6 +231,10 @@ impl RequestExtension {
                 egress.write_canonical(output);
             }
             None => output.push(0),
+        }
+        output.extend_from_slice(&(self.egresses.len() as u64).to_be_bytes());
+        for egress in &self.egresses {
+            egress.write_canonical(output);
         }
         match &self.credential {
             Some(credential) => {
@@ -253,6 +285,21 @@ mod tests {
             !GrantExtension::new([], [first], 0)
                 .unwrap()
                 .allows_except_depth(&request)
+        );
+    }
+
+    #[test]
+    fn secondary_egresses_require_a_primary_destination() {
+        let secondary = EgressConstraint::new(
+            "https",
+            "redirect.example",
+            443,
+            SecretHandle::parse("env:REDIRECT_TOKEN").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            RequestExtension::new(None, None).with_egresses([secondary]),
+            Err(GrantExtensionError::InvalidEgress)
         );
     }
 }

@@ -560,11 +560,13 @@ pub fn decide(request: GrantRequest<'_>) -> GrantDecision {
         .contains(&request.effect.required_grant())
     {
         GrantReasonCode::EffectNotConfigured
-    } else if binding_inputs.extension.egress().is_some()
+    } else if (binding_inputs.extension.egress().is_some()
+        || !binding_inputs.extension.egresses().is_empty())
         && !authenticated.grants().contains(&Grant::NetworkEgress)
     {
         GrantReasonCode::EffectNotAuthenticated
-    } else if binding_inputs.extension.egress().is_some()
+    } else if (binding_inputs.extension.egress().is_some()
+        || !binding_inputs.extension.egresses().is_empty())
         && !request
             .config
             .effective_authority()

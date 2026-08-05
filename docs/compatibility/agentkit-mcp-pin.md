@@ -5,7 +5,7 @@
 - Patch ID: `m006-mcp-protocol-revision-pin`
 - W07a snapshot SHA-256: `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`
 - Previous snapshot SHA-256: `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`
-- Current snapshot SHA-256: `0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0` (local overlays)
+- Current snapshot SHA-256: `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4` (local overlays)
 - Upstream status: pending submission; upstream acceptance is non-blocking
 - Blocker closed locally: `BLK-05` (`docs/decisions/PRE-0005-protocol-revisions.md`)
 
@@ -129,10 +129,9 @@ the captured vendor snapshot. Kit's root manifest pins its direct
 `agentkit-mcp`, `rmcp`, `reqwest`, `http`, `bytes`, and `tokio-util` edges and
 records the resulting root lock digest in `build-manifest.yaml`.
 
-The policy-owned pinned connector and actual-peer validation are the minimum
-W08 scope pulled forward because Streamable HTTP could not safely carry a
-credential through the system/default resolver. Redirect support remains
-disabled rather than partially authorized.
+The policy-owned pinned connector performs bounded manual redirects through
+exact per-origin grants, fresh credentials, pinned addresses, and actual-peer
+validation. Automatic redirects, retries, and proxies remain disabled.
 
 ## Snapshot Accounting
 
@@ -142,10 +141,11 @@ W07b keeps 357 payload files and modifies the MCP library and revision test.
 The contiguous local-only W07c chain adds sanitized responder delivery,
 reconnect commit fencing, generation controls, durable callback accounting,
 provider usage normalization, and the Ollama output cap while retaining 357
-payload files, producing current aggregate
-`0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0`.
+payload files. W08 adds exact URL-elicitation capability advertisement and
+produces current aggregate
+`5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4`.
 All overlay steps and their exact before/after file hashes are recorded in
 `src/protocols/mcp/agentkit_patch/manifest.yaml`; the snapshot manifest,
-metadata, pin document, build manifest, and `requirements/reports/m006-w07c.md`
+metadata, pin document, build manifest, and `requirements/reports/m006-w08.md`
 carry the current aggregate.
 `vendor/agentkit/Cargo.lock` is unchanged; no new vendor dependency was added.
