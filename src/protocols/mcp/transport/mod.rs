@@ -357,6 +357,7 @@ pub struct ReadyConnection {
     serial: OperationQueue,
     lifecycle_authority: Option<Arc<LifecycleAuthority>>,
     responders: Option<crate::protocols::mcp::responders::ResponderInstallation>,
+    extension_lifecycle: Option<crate::capabilities::extensions::ExtensionLifecycleGuard>,
 }
 
 struct LifecycleAuthority(OwnedBrokerInvocation);
@@ -397,6 +398,14 @@ pub struct McpCapabilityRuntime {
             ),
         >,
     >,
+    extension_registry: Option<crate::capabilities::extensions::SharedCapabilityExtensionRegistry>,
+    extension_routes: BTreeMap<
+        String,
+        (
+            crate::capabilities::extensions::ExtensionScope,
+            crate::agent::extensions::ExtensionReference,
+        ),
+    >,
 }
 
 #[derive(Clone)]
@@ -406,6 +415,10 @@ pub struct McpRuntimeServer {
     connection: Arc<ReadyConnection>,
     grant_extension: crate::capabilities::kernel::grant_ext::GrantExtension,
     request_extension: crate::capabilities::kernel::grant_ext::RequestExtension,
+    extension: Option<(
+        crate::capabilities::extensions::ExtensionScope,
+        crate::agent::extensions::ExtensionReference,
+    )>,
 }
 
 impl McpRuntimeServer {
@@ -426,6 +439,7 @@ impl McpRuntimeServer {
             connection,
             grant_extension: Default::default(),
             request_extension: Default::default(),
+            extension: None,
         })
     }
 
@@ -436,6 +450,15 @@ impl McpRuntimeServer {
     ) -> Self {
         self.grant_extension = grant;
         self.request_extension = request;
+        self
+    }
+
+    pub(crate) fn with_extension(
+        mut self,
+        scope: crate::capabilities::extensions::ExtensionScope,
+        reference: crate::agent::extensions::ExtensionReference,
+    ) -> Self {
+        self.extension = Some((scope, reference));
         self
     }
 }
@@ -461,6 +484,8 @@ impl McpCapabilityRuntime {
             stopped: AtomicBool::new(false),
             retained_retired: Mutex::new(Vec::new()),
             authority: RwLock::new(BTreeMap::new()),
+            extension_registry: None,
+            extension_routes: BTreeMap::new(),
         }
     }
 
@@ -490,6 +515,74 @@ impl McpCapabilityRuntime {
         Ok(runtime)
     }
 
+    pub(crate) fn from_extension_servers(
+        catalog: McpCatalog,
+        servers: impl IntoIterator<Item = McpRuntimeServer>,
+        registry: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
+    ) -> Result<Self, TransportError> {
+        let mut runtime = Self::new(catalog);
+        runtime.extension_registry = Some(registry);
+        for server in servers {
+            let identity = server.catalog.server().as_str().to_owned();
+            let extension = server
+                .extension
+                .clone()
+                .ok_or(TransportError::AuthorizationMismatch)?;
+            runtime.install(server.catalog, server.discovered, server.connection)?;
+            runtime
+                .authority
+                .write()
+                .map_err(|_| TransportError::AuthorizationMismatch)?
+                .insert(
+                    identity.clone(),
+                    (server.grant_extension, server.request_extension),
+                );
+            runtime.extension_routes.insert(identity, extension);
+        }
+        for registered in runtime
+            .connections
+            .connections
+            .read()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .values()
+        {
+            registered.connection.arm_responders();
+            runtime.watch_extension_revocation(
+                registered.generation,
+                Arc::clone(&registered.connection),
+            );
+        }
+        Ok(runtime)
+    }
+
+    fn watch_extension_revocation(&self, generation: u64, connection: Arc<ReadyConnection>) {
+        let Some(lifecycle) = connection.extension_lifecycle.as_ref() else {
+            return;
+        };
+        let mut cancellation = lifecycle.cancellation();
+        let connections = Arc::clone(&self.connections);
+        let catalog = Arc::clone(&self.catalog);
+        let runtime_lifecycle = Arc::clone(&self.lifecycle);
+        tokio::spawn(async move {
+            if !*cancellation.borrow() && cancellation.changed().await.is_err() {
+                return;
+            }
+            connection.disarm_responders();
+            connection.retire();
+            connection.operations.revoke();
+            if let Ok(_lifecycle) = runtime_lifecycle.write()
+                && let Ok(Some(removed)) =
+                    connections.remove(&connection.configured_server, generation)
+            {
+                let _ = catalog
+                    .write()
+                    .map(|mut catalog| catalog.remove(&connection.configured_server));
+                debug_assert!(Arc::ptr_eq(&removed, &connection));
+            }
+            connection.terminate_revoked().await;
+        });
+    }
+
     pub fn authority_for(
         &self,
         server: &str,
@@ -506,6 +599,42 @@ impl McpCapabilityRuntime {
             .get(server)
             .cloned()
             .ok_or(TransportError::AuthorizationMismatch)
+    }
+
+    fn ensure_extension_current(&self, server: &str) -> Result<(), TransportError> {
+        let Some(registry) = &self.extension_registry else {
+            return Ok(());
+        };
+        let (scope, reference) = self
+            .extension_routes
+            .get(server)
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        registry
+            .read()
+            .map_err(|_| TransportError::AuthorizationMismatch)?
+            .ensure_untrusted_active(*scope, reference)
+            .map_err(|_| TransportError::BindingExpired)
+    }
+
+    fn ensure_extension_current_durable(
+        &self,
+        server: &str,
+        store: &mut SqliteStore,
+    ) -> Result<(), TransportError> {
+        let Some(registry) = &self.extension_registry else {
+            return Ok(());
+        };
+        let (scope, reference) = self
+            .extension_routes
+            .get(server)
+            .ok_or(TransportError::AuthorizationMismatch)?;
+        crate::capabilities::extensions::CapabilityExtensionRegistry::ensure_untrusted_active_durable(
+            registry,
+            *scope,
+            reference,
+            store,
+        )
+        .map_err(|_| TransportError::BindingExpired)
     }
 
     #[cfg(test)]
@@ -547,6 +676,12 @@ impl McpCapabilityRuntime {
                 let Some(target) = entry.external_target() else {
                     return true;
                 };
+                if self
+                    .ensure_extension_current(target.configured_server())
+                    .is_err()
+                {
+                    return false;
+                }
                 connections
                     .get(target.configured_server())
                     .is_some_and(|registered| {
@@ -673,6 +808,7 @@ impl McpCapabilityRuntime {
                 return Err(error);
             }
         };
+        self.ensure_extension_current_durable(server, store)?;
         // Exact durable outcomes survive catalog removal, but replay still runs
         // current run authority and artifact-owner checks and never dispatches.
         match broker::replay(&request, store, budget, artifacts) {
@@ -786,6 +922,7 @@ impl McpCapabilityRuntime {
                 return Err(error);
             }
         };
+        self.ensure_extension_current_durable(server, store)?;
         let connection = match self.connections.get(server) {
             Ok(connection) => connection,
             Err(error) => {
@@ -864,6 +1001,7 @@ impl McpCapabilityRuntime {
         F: FnMut(&'static str, Option<&str>) -> Result<BrokerInvocation<'a>, TransportError>,
     {
         let connection = self.connections.get(server.as_str())?;
+        self.ensure_extension_current_durable(server.as_str(), store)?;
         if self.connections.generation(server)? != Some(generation) {
             return Ok(());
         }
@@ -896,6 +1034,7 @@ impl McpCapabilityRuntime {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), TransportError> {
         let connection = self.connections.get(server.as_str())?;
+        self.ensure_extension_current_durable(server.as_str(), store)?;
         if self.connections.generation(server)? != Some(generation) {
             return Ok(());
         }
@@ -983,6 +1122,24 @@ impl McpCapabilityRuntime {
         store: &mut SqliteStore,
     ) -> Result<u64, TransportError> {
         let identity = server.catalog.server().as_str().to_owned();
+        if let Some((scope, reference)) = &server.extension {
+            crate::capabilities::extensions::CapabilityExtensionRegistry::ensure_untrusted_active_durable(
+                self.extension_registry
+                    .as_ref()
+                    .ok_or(TransportError::AuthorizationMismatch)?,
+                *scope,
+                reference,
+                store,
+            )
+            .map_err(|_| TransportError::BindingExpired)?;
+        }
+        server.connection.ensure_extension_current()?;
+        if self.extension_registry.is_some()
+            && server.extension.as_ref() != self.extension_routes.get(&identity)
+        {
+            return Err(TransportError::AuthorizationMismatch);
+        }
+        let connection = Arc::clone(&server.connection);
         let (generation, replaced) =
             self.install(server.catalog, server.discovered, server.connection)?;
         self.authority
@@ -993,6 +1150,9 @@ impl McpCapabilityRuntime {
                 (server.grant_extension, server.request_extension),
             );
         self.connections.get(&identity)?.arm_responders();
+        if self.extension_registry.is_some() {
+            self.watch_extension_revocation(generation, connection);
+        }
         if let Some(replaced) = replaced {
             let result = replaced.close_owned(store).await;
             if let Err(error) = result {
@@ -1219,6 +1379,7 @@ impl ReadyConnection {
             serial: OperationQueue::new(),
             lifecycle_authority: None,
             responders: None,
+            extension_lifecycle: None,
         })
     }
 
@@ -1237,7 +1398,19 @@ impl ReadyConnection {
         self
     }
 
+    pub(crate) fn with_extension_lifecycle(
+        mut self,
+        lifecycle: crate::capabilities::extensions::ExtensionLifecycleGuard,
+    ) -> Self {
+        self.extension_lifecycle = Some(lifecycle);
+        self
+    }
+
     fn arm_responders(&self) {
+        if self.ensure_extension_current().is_err() {
+            self.retire();
+            return;
+        }
         if let Some(responders) = &self.responders {
             responders.arm();
         }
@@ -1252,6 +1425,16 @@ impl ReadyConnection {
     fn retire(&self) {
         self.retired.store(true, Ordering::Release);
         self.operations.clear_response_scanners();
+    }
+
+    fn ensure_extension_current(&self) -> Result<(), TransportError> {
+        self.extension_lifecycle
+            .as_ref()
+            .map_or(Ok(()), |lifecycle| {
+                lifecycle
+                    .ensure_current()
+                    .map_err(|_| TransportError::BindingExpired)
+            })
     }
 
     #[cfg(test)]
@@ -1311,6 +1494,9 @@ impl ReadyConnection {
         store: &mut SqliteStore,
         allow_retired: bool,
     ) -> Result<(transport_auth::TransportDispatch, u64), TransportError> {
+        if !allow_retired {
+            self.ensure_extension_current()?;
+        }
         if !allow_retired && self.retired.load(Ordering::Acquire) {
             return Err(TransportError::ConnectionRetired);
         }
@@ -1342,7 +1528,9 @@ impl ReadyConnection {
     ) -> Result<(T, Option<RawPayload>), TransportError> {
         match result {
             Ok(value) => {
-                let cancelled = request.cancelled() && !request.lifecycle_shutdown();
+                let extension_error = self.ensure_extension_current().err();
+                let cancelled = extension_error.is_some()
+                    || (request.cancelled() && !request.lifecycle_shutdown());
                 let persisted = transport_auth::finish_dispatch(
                     request,
                     dispatch,
@@ -1357,7 +1545,7 @@ impl ReadyConnection {
                 persisted?;
                 let capture = capture?;
                 if cancelled {
-                    Err(TransportError::Cancelled)
+                    Err(extension_error.unwrap_or(TransportError::Cancelled))
                 } else {
                     Ok((value, capture))
                 }
@@ -2785,6 +2973,17 @@ impl ReadyConnection {
             }),
         }
     }
+
+    async fn terminate_revoked(&self) {
+        let deadline = tokio::time::Instant::now() + self.close_timeout;
+        let _ = tokio::time::timeout_at(deadline, self.connection.close()).await;
+        if let Some(cleanup) = &self.cleanup {
+            let _ = tokio::time::timeout_at(deadline, cleanup.close_open_sessions()).await;
+        }
+        if let Some(reaper) = &self.stdio_reaper {
+            let _ = tokio::time::timeout_at(deadline, reaper.close_and_reap()).await;
+        }
+    }
 }
 
 pub struct McpRefreshDriver {
@@ -3408,6 +3607,25 @@ impl OperationGate {
             binding: Mutex::new(None),
             connection: Mutex::new(None),
         })
+    }
+
+    fn revoke(&self) {
+        self.ready.store(false, Ordering::Release);
+        self.initialized_followup.store(false, Ordering::Release);
+        self.message_sent.store(false, Ordering::Release);
+        *self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.clear_response_scanners();
     }
 
     fn install(
@@ -4714,7 +4932,10 @@ mod tests {
         let database = root.join("events.sqlite3");
         let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
         let mut store = test_support::open_sqlite_store(&database).unwrap();
-        let inputs = RuntimeInputs::new();
+        let inputs = RuntimeInputs::with_authority(BTreeSet::from([
+            Grant::WorkspaceRead,
+            Grant::WorkspaceWrite,
+        ]));
         store.install_driver_claim_for_test(inputs.claim).unwrap();
 
         let server = ConfiguredServerIdentity::new("production-runtime").unwrap();
@@ -4790,6 +5011,47 @@ mod tests {
         Arc::get_mut(&mut connection)
             .unwrap()
             .set_lifecycle_authority(&discovery_request());
+        let extension_contract = crate::capabilities::extensions::ExtensionContract::untrusted(
+            crate::capabilities::extensions::ExtensionKind::McpServer,
+            crate::agent::extensions::ExtensionIdentity::parse("mcp.production-runtime").unwrap(),
+            crate::agent::extensions::ExtensionVersion::parse("1.0.0").unwrap(),
+            crate::agent::extensions::ContentDigest::sha256(b"runtime-schema"),
+            crate::agent::extensions::ContentDigest::sha256(b"runtime-implementation"),
+            crate::agent::extensions::CompatibilityRange::new(
+                crate::capabilities::extensions::CAPABILITY_EXTENSION_HOST_VERSION,
+                crate::agent::extensions::ContractVersion::new(2, 0, 0),
+            ),
+            crate::capabilities::extensions::ExtensionProtocol::Mcp,
+            server.as_str(),
+            crate::agent::extensions::ContentDigest::sha256(b"runtime-profile").to_string(),
+            crate::capabilities::extensions::ExtensionMetadata::default(),
+        )
+        .unwrap();
+        let extension_reference = extension_contract.reference();
+        let extension_scope = crate::capabilities::extensions::ExtensionScope::new(
+            inputs.authenticated.principal_id(),
+            inputs.project,
+        );
+        let extension_registry = Arc::new(RwLock::new(
+            crate::capabilities::extensions::CapabilityExtensionRegistry::default(),
+        ));
+        crate::capabilities::extensions::CapabilityExtensionRegistry::register_untrusted_durable(
+            &extension_registry,
+            &inputs.authenticated,
+            inputs.project,
+            extension_contract,
+            &mut store,
+        )
+        .unwrap();
+        let extension_lifecycle =
+            crate::capabilities::extensions::CapabilityExtensionRegistry::untrusted_lifecycle_guard(
+                &extension_registry,
+                extension_scope,
+                &extension_reference,
+            )
+            .unwrap();
+        Arc::get_mut(&mut connection).unwrap().extension_lifecycle =
+            Some(extension_lifecycle.clone());
 
         let feature = discovered.tools()[0].normalize().unwrap();
         let policy = McpCatalogPolicy::new(
@@ -4819,14 +5081,16 @@ mod tests {
             )]),
         )
         .unwrap();
-        let runtime = McpCapabilityRuntime::from_configured_servers(
+        let runtime = McpCapabilityRuntime::from_extension_servers(
             McpCatalog::new(CatalogSnapshot::new([], DigestAlgorithm::Sha256).unwrap()),
             [McpRuntimeServer::new(
                 catalog_config.clone(),
                 discovered.clone(),
                 Arc::clone(&connection),
             )
-            .unwrap()],
+            .unwrap()
+            .with_extension(extension_scope, extension_reference.clone())],
+            Arc::clone(&extension_registry),
         )
         .unwrap();
         let first_generation = runtime.refresh_registrations().unwrap()[0].1;
@@ -5012,6 +5276,7 @@ mod tests {
         Arc::get_mut(&mut replacement)
             .unwrap()
             .set_lifecycle_authority(&discovery_request());
+        Arc::get_mut(&mut replacement).unwrap().extension_lifecycle = Some(extension_lifecycle);
         replacement
             .operations
             .set_binding(transport_auth::TransportBinding::new(
@@ -5024,7 +5289,9 @@ mod tests {
             .unwrap();
         let second_generation = runtime
             .replace_and_close(
-                McpRuntimeServer::new(catalog_config, discovered, replacement).unwrap(),
+                McpRuntimeServer::new(catalog_config, discovered, replacement)
+                    .unwrap()
+                    .with_extension(extension_scope, extension_reference.clone()),
                 &mut store,
             )
             .await
@@ -5036,9 +5303,6 @@ mod tests {
             runtime.connections.generation(&server).unwrap(),
             Some(second_generation)
         );
-
-        runtime.shutdown(&mut store).await.unwrap();
-        assert!(runtime.catalog_snapshot().unwrap().entries().is_empty());
 
         let removed_binding_replay = runtime
             .invoke_registered(
@@ -5084,6 +5348,38 @@ mod tests {
                 .is_err()
         );
         assert_eq!(tool_calls.load(Ordering::Acquire), 1);
+
+        crate::capabilities::extensions::CapabilityExtensionRegistry::revoke_durable(
+            &extension_registry,
+            &inputs.authenticated,
+            inputs.project,
+            &extension_reference,
+            &mut store,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while closes.load(Ordering::Acquire) < 2
+                || !runtime.catalog_snapshot().unwrap().entries().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("revoked live connection was not closed");
+        assert!(
+            runtime
+                .invoke_registered(
+                    &call,
+                    invoke(),
+                    &mut store,
+                    &budget,
+                    &artifacts,
+                    &McpResultPolicy::default(),
+                )
+                .await
+                .is_err()
+        );
+        runtime.shutdown(&mut store).await.unwrap();
 
         let event_types = store
             .events()
@@ -5233,8 +5529,10 @@ mod tests {
         )
         .unwrap();
         let initialize_arguments = responders.handler_config().initialize_arguments();
+        let extension_contract = server_config.extension_contract().unwrap();
         let lifecycle = OwnedBrokerInvocation::run_lifecycle(
             &server_config.id,
+            &extension_contract,
             initialize_arguments,
             &inputs.authenticated,
             &inputs.config,

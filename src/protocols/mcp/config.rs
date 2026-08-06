@@ -6,9 +6,16 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent::extensions::{
+        CompatibilityRange, ContentDigest, ContractVersion, ExtensionIdentity, ExtensionVersion,
+    },
     api::{auth::contract::AuthenticatedPrincipal, service::AttemptDriverClaim},
     capabilities::{
         catalog::{Availability, CapabilityKind},
+        extensions::{
+            CAPABILITY_EXTENSION_HOST_VERSION, ExtensionContract, ExtensionKind, ExtensionMetadata,
+            ExtensionProtocol, ExtensionScope, canonical_schema_digest, implementation_merkle,
+        },
         kernel::{grant::EffectClass, identity::Digest, invoke::RetrySafety},
     },
     domain::{
@@ -227,6 +234,80 @@ pub struct McpDescriptorPolicyConfig {
 }
 
 impl McpServerConfig {
+    pub fn extension_contract(&self) -> Result<ExtensionContract, String> {
+        let executable = match self.transport {
+            McpTransportConfig::Stdio { .. } => Some(self.stdio_executable_identity()?),
+            McpTransportConfig::Http { .. } => None,
+        };
+        self.extension_contract_with(executable.as_ref())
+    }
+
+    fn extension_contract_with(
+        &self,
+        executable: Option<&StdioExecutableIdentity>,
+    ) -> Result<ExtensionContract, String> {
+        let (implementation_digest, sandbox_profile_digest) = match &self.transport {
+            McpTransportConfig::Stdio { profile_digest, .. } => {
+                let executable = executable
+                    .ok_or_else(|| "MCP stdio executable identity was not resolved".to_owned())?;
+                (executable.digest.clone(), profile_digest.clone())
+            }
+            McpTransportConfig::Http { .. } => {
+                let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+                let digest = ContentDigest::sha256(&bytes);
+                (digest.clone(), digest.to_string())
+            }
+        };
+        ExtensionContract::untrusted(
+            ExtensionKind::McpServer,
+            ExtensionIdentity::parse(format!("mcp.{}", self.id))
+                .map_err(|error| error.to_string())?,
+            ExtensionVersion::parse(self.version.clone()).map_err(|error| error.to_string())?,
+            mcp_lifecycle_schema_digest(),
+            implementation_digest,
+            CompatibilityRange::new(
+                CAPABILITY_EXTENSION_HOST_VERSION,
+                ContractVersion::new(2, 0, 0),
+            ),
+            ExtensionProtocol::Mcp,
+            self.id.clone(),
+            sandbox_profile_digest,
+            ExtensionMetadata {
+                display_name: Some(self.id.clone()),
+                description: None,
+                vendor: Some(self.trust_domain.clone()),
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn stdio_executable_identity(&self) -> Result<StdioExecutableIdentity, String> {
+        let McpTransportConfig::Stdio { argv, .. } = &self.transport else {
+            return Err("MCP transport is not stdio".to_owned());
+        };
+        let executable = argv
+            .first()
+            .ok_or_else(|| "MCP stdio executable is missing".to_owned())?;
+        let canonical = std::fs::canonicalize(executable)
+            .map_err(|error| format!("MCP stdio executable {executable:?}: {error}"))?;
+        if !canonical.is_file() {
+            return Err(format!(
+                "MCP stdio executable {:?} is not a file",
+                canonical
+            ));
+        }
+        let bytes = std::fs::read(&canonical)
+            .map_err(|error| format!("MCP stdio executable {:?}: {error}", canonical))?;
+        Ok(StdioExecutableIdentity {
+            digest: ContentDigest::sha256(&bytes),
+            bytes: bytes.into(),
+        })
+    }
+
+    pub(crate) const fn extension_scope(&self) -> ExtensionScope {
+        ExtensionScope::new(self.owner.principal_id, self.owner.project_id)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         ConfiguredServerIdentity::new(&self.id)
             .map_err(|error| format!("MCP server id: {error}"))?;
@@ -424,6 +505,44 @@ impl McpServerConfig {
         self.responders.validate(&self.transport)?;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+pub struct StdioExecutableIdentity {
+    pub(crate) digest: ContentDigest,
+    pub(crate) bytes: Arc<[u8]>,
+}
+
+pub fn mcp_lifecycle_schema_digest() -> crate::agent::extensions::ContentDigest {
+    canonical_schema_digest(include_bytes!(
+        "../../../docs/compatibility/schemas/mcp-lifecycle-v1.json"
+    ))
+}
+
+pub fn mcp_runtime_implementation_digest() -> crate::agent::extensions::ContentDigest {
+    implementation_merkle(&[
+        ("src/protocols/mcp/config.rs", include_bytes!("config.rs")),
+        (
+            "src/protocols/mcp/transport/mod.rs",
+            include_bytes!("transport/mod.rs"),
+        ),
+        (
+            "src/protocols/mcp/transport/http.rs",
+            include_bytes!("transport/http.rs"),
+        ),
+        (
+            "src/protocols/mcp/transport/stdio.rs",
+            include_bytes!("transport/stdio.rs"),
+        ),
+        (
+            "src/protocols/mcp/transport/invocation.rs",
+            include_bytes!("transport/invocation.rs"),
+        ),
+        (
+            "src/protocols/mcp/responders/mod.rs",
+            include_bytes!("responders/mod.rs"),
+        ),
+    ])
 }
 
 impl McpResponderConfig {
@@ -706,6 +825,7 @@ pub struct McpBootstrapContext<'a> {
     pub stdio_profiles: Option<&'a dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>,
     pub resolved_secrets: &'a Arc<BTreeMap<SecretHandle, Arc<crate::domain::secret::SecretLease>>>,
     pub callback_secrets: &'a BTreeMap<String, Vec<Arc<crate::domain::secret::SecretLease>>>,
+    pub extension_registry: &'a crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
 }
 
 pub enum McpBootstrapOutcome {
@@ -862,6 +982,14 @@ pub(crate) async fn bootstrap(
     for configured in servers {
         let server = async {
             configured.validate()?;
+            let stdio_executable = match configured.transport {
+                McpTransportConfig::Stdio { .. } => Some(configured.stdio_executable_identity()?),
+                McpTransportConfig::Http { .. } => None,
+            };
+            let extension_contract =
+                configured.extension_contract_with(stdio_executable.as_ref())?;
+            let extension_reference = extension_contract.reference();
+            let extension_scope = configured.extension_scope();
             if !configured.owner.authorizes(
                 context.authenticated.principal_id(),
                 context.config.project_id(),
@@ -883,6 +1011,22 @@ pub(crate) async fn bootstrap(
                 )
                 .into());
             }
+            crate::capabilities::extensions::CapabilityExtensionRegistry::register_untrusted_durable(
+                context.extension_registry,
+                context.authenticated,
+                context.config.project_id(),
+                extension_contract.clone(),
+                store,
+            )
+            .map_err(|error| error.to_string())?;
+            let extension_lifecycle =
+                crate::capabilities::extensions::CapabilityExtensionRegistry::untrusted_lifecycle_guard_durable(
+                    context.extension_registry,
+                    extension_scope,
+                    &extension_reference,
+                    store,
+                )
+                .map_err(|error| error.to_string())?;
             let responder_authority = crate::protocols::mcp::responders::ResponderAuthority::new(
                 context.attempt,
                 context.claim,
@@ -902,7 +1046,8 @@ pub(crate) async fn bootstrap(
                 Arc::clone(&context.cancellation),
                 Arc::clone(&context.claim_verifier),
             )
-            .with_scheduler(context.scheduler.clone());
+            .with_scheduler(context.scheduler.clone())
+            .with_extension_lifecycle(extension_lifecycle.clone());
             let root_proof = crate::protocols::mcp::responders::SourceRootProof::issue(
                 configured,
                 context.project_root,
@@ -1037,6 +1182,7 @@ pub(crate) async fn bootstrap(
                     let lifecycle =
                         crate::capabilities::broker::OwnedBrokerInvocation::run_lifecycle(
                             &configured.id,
+                            &extension_contract,
                             initialize_arguments.clone(),
                             context.authenticated,
                             context.config,
@@ -1056,6 +1202,29 @@ pub(crate) async fn bootstrap(
                         })?;
                     let policy = EgressPolicy::new(destination_grants);
                     let request = lifecycle.invocation();
+                    let sandbox_profile_digest = match extension_contract.route() {
+                        crate::capabilities::extensions::ExtensionRoute::OutOfProcess {
+                            sandbox_profile_digest,
+                            ..
+                        } => sandbox_profile_digest,
+                        crate::capabilities::extensions::ExtensionRoute::InProcess => {
+                            unreachable!()
+                        }
+                    };
+                    crate::capabilities::extensions::CapabilityExtensionRegistry::authorize_mcp_route_durable(
+                            context.extension_registry,
+                            extension_scope,
+                            &extension_reference,
+                            &request,
+                            "http",
+                            &endpoint,
+                            sandbox_profile_digest,
+                            None,
+                            store,
+                        )
+                        .map_err(|error| {
+                            format!("MCP server {:?} extension route: {error}", configured.id)
+                        })?;
                     let connection = if let Some(resolved) =
                         context.resolved_auth.get(&configured.id)
                     {
@@ -1111,7 +1280,8 @@ pub(crate) async fn bootstrap(
                                 ),
                                 error => error,
                             })?
-                            .with_responders(responders.clone()),
+                            .with_responders(responders.clone())
+                            .with_extension_lifecycle(extension_lifecycle.clone()),
                         )
                     } else {
                         match await_bootstrap(
@@ -1137,7 +1307,9 @@ pub(crate) async fn bootstrap(
                         .await?
                         {
                             StreamableHttpOutcome::Ready(connection) => Arc::new(
-                                (*connection).with_responders(responders.clone()),
+                                (*connection)
+                                    .with_responders(responders.clone())
+                                    .with_extension_lifecycle(extension_lifecycle.clone()),
                             ),
                             StreamableHttpOutcome::AuthRequired(challenge) => {
                                 return Err(BootstrapStepError::AuthRequired(Box::new(
@@ -1154,6 +1326,8 @@ pub(crate) async fn bootstrap(
                 }
                 McpTransportConfig::Stdio {
                     owned_process_profile,
+                    profile,
+                    profile_digest,
                     environment,
                     ..
                 } => {
@@ -1201,6 +1375,7 @@ pub(crate) async fn bootstrap(
                     let lifecycle =
                         crate::capabilities::broker::OwnedBrokerInvocation::run_lifecycle(
                             &configured.id,
+                            &extension_contract,
                             initialize_arguments.clone(),
                             context.authenticated,
                             context.config,
@@ -1219,6 +1394,23 @@ pub(crate) async fn bootstrap(
                             )
                         })?;
                     let request = lifecycle.invocation();
+                    let sandbox_profile =
+                        crate::executor::profile::ExecutorProfile::new(profile.as_ref().clone())
+                            .map_err(|error| error.to_string())?;
+                    crate::capabilities::extensions::CapabilityExtensionRegistry::authorize_mcp_route_durable(
+                            context.extension_registry,
+                            extension_scope,
+                            &extension_reference,
+                            &request,
+                            "stdio",
+                            owned_process_profile,
+                            profile_digest,
+                            Some(&sandbox_profile),
+                            store,
+                        )
+                        .map_err(|error| {
+                            format!("MCP server {:?} extension route: {error}", configured.id)
+                        })?;
                     let connection = Arc::new(
                         await_bootstrap(
                             context.cancellation.as_ref(),
@@ -1231,7 +1423,14 @@ pub(crate) async fn bootstrap(
                                         owned_process_profile,
                                         context.attempt,
                                         context.resolved_secrets,
+                                        stdio_executable
+                                            .as_ref()
+                                            .expect("stdio executable identity was resolved"),
                                     )?;
+                                    let executable = stdio_executable
+                                        .as_ref()
+                                        .expect("stdio executable identity was resolved");
+                                    launcher.bind_executable_digest(executable.digest.clone())?;
                                     launcher.add_scanner(
                                         crate::telemetry::redact::CaptureRedactor::new(
                                             &scanner_leases,
@@ -1246,7 +1445,8 @@ pub(crate) async fn bootstrap(
                             ),
                         )
                         .await?
-                        .with_responders(responders.clone()),
+                        .with_responders(responders.clone())
+                        .with_extension_lifecycle(extension_lifecycle.clone()),
                     );
                     opened.push(Arc::clone(&connection));
                     let grant_extension = GrantExtension::new([], credentials, 0)
@@ -1358,7 +1558,8 @@ pub(crate) async fn bootstrap(
             .map_err(|error| error.to_string())?;
             Ok(McpRuntimeServer::new(catalog, discovered, connection)
                 .map_err(|error| error.to_string())?
-                .with_authority(grant_extension, extension))
+                .with_authority(grant_extension, extension)
+                .with_extension(extension_scope, extension_reference))
         };
         match server.await {
             Ok(server) => runtime_servers.push(server),
@@ -1381,9 +1582,10 @@ pub(crate) async fn bootstrap(
     let snapshot =
         CatalogSnapshot::new([], DigestAlgorithm::Sha256).map_err(|error| error.to_string())?;
     let runtime =
-        match crate::protocols::mcp::transport::McpCapabilityRuntime::from_configured_servers(
+        match crate::protocols::mcp::transport::McpCapabilityRuntime::from_extension_servers(
             McpCatalog::new(snapshot),
             runtime_servers,
+            Arc::clone(context.extension_registry),
         ) {
             Ok(runtime) => runtime,
             Err(error) => {

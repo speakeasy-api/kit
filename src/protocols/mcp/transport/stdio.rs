@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs,
     future::Future,
-    io,
+    io::{self, Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -128,6 +129,7 @@ pub trait OwnedStdioProfileProvider: Send + Sync + 'static {
         authorized_credentials: &Arc<
             BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>,
         >,
+        executable: &crate::protocols::mcp::config::StdioExecutableIdentity,
     ) -> Result<SandboxedStdioLauncher, OwnedStdioProfileError>;
 }
 
@@ -184,6 +186,7 @@ pub(crate) struct ProductionStdioProfiles {
     project_root: PathBuf,
     registration: ProcessRegistryRegistration,
     service: Arc<ProductionOwnedStdioService>,
+    executable_staging: PathBuf,
 }
 
 #[cfg(not(windows))]
@@ -250,6 +253,10 @@ impl ProductionStdioProfiles {
                 },
             ),
             service: Arc::new(ProductionOwnedStdioService::default()),
+            executable_staging: build_root
+                .parent()
+                .unwrap_or(build_root)
+                .join(".kit-mcp-executable-staging"),
         })))
     }
 }
@@ -263,6 +270,7 @@ impl OwnedStdioProfileProvider for ProductionStdioProfiles {
         authorized_credentials: &Arc<
             BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>,
         >,
+        executable: &crate::protocols::mcp::config::StdioExecutableIdentity,
     ) -> Result<SandboxedStdioLauncher, OwnedStdioProfileError> {
         let configured = self
             .profiles
@@ -273,7 +281,9 @@ impl OwnedStdioProfileProvider for ProductionStdioProfiles {
         {
             return Err(OwnedStdioProfileError::Invalid);
         }
-        let mut command = LocalCommand::new(&configured.argv[0], &self.project_root);
+        let executable_file = prepare_executable(&self.executable_staging, executable)
+            .map_err(|_| OwnedStdioProfileError::Unavailable)?;
+        let mut command = descriptor_command(&executable_file, &self.project_root)?;
         for argument in &configured.argv[1..] {
             command = command.arg(argument);
         }
@@ -300,7 +310,113 @@ impl OwnedStdioProfileProvider for ProductionStdioProfiles {
             prepared,
             service,
             environment,
+            executable.digest.clone(),
+            executable_file.file,
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_command(
+    executable: &PreparedExecutableFile,
+    project_root: &Path,
+) -> Result<LocalCommand, OwnedStdioProfileError> {
+    use std::os::fd::AsRawFd as _;
+    Ok(LocalCommand::inherited_program(
+        executable.file.as_raw_fd(),
+        project_root,
+    ))
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn descriptor_command(
+    _executable: &PreparedExecutableFile,
+    _project_root: &Path,
+) -> Result<LocalCommand, OwnedStdioProfileError> {
+    Err(OwnedStdioProfileError::Unavailable)
+}
+
+#[cfg(not(windows))]
+struct PreparedExecutableFile {
+    file: fs::File,
+    #[cfg(test)]
+    staging_path: PathBuf,
+}
+
+#[cfg(not(windows))]
+impl PreparedExecutableFile {
+    #[cfg(test)]
+    fn descriptor_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+        PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
+    }
+}
+
+#[cfg(not(windows))]
+fn prepare_executable(
+    root: &Path,
+    executable: &crate::protocols::mcp::config::StdioExecutableIdentity,
+) -> io::Result<PreparedExecutableFile> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-only MCP execution is unavailable on this platform",
+    ));
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::{
+            fd::AsRawFd as _,
+            unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
+        };
+
+        if crate::agent::extensions::ContentDigest::sha256(&executable.bytes) != executable.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP executable object digest changed",
+            ));
+        }
+        fs::create_dir_all(root)?;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
+        let name = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let staging_path = root.join(name);
+        let mut writer = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o500)
+            .open(&staging_path)?;
+        writer.write_all(&executable.bytes)?;
+        writer.sync_all()?;
+        let mut file = fs::File::open(&staging_path)?;
+        fs::remove_file(&staging_path)?;
+        drop(writer);
+        let mut copied = Vec::with_capacity(executable.bytes.len());
+        file.read_to_end(&mut copied)?;
+        if crate::agent::extensions::ContentDigest::sha256(&copied) != executable.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP executable staging digest changed",
+            ));
+        }
+        file.rewind()?;
+        let descriptor = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if flags < 0
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(PreparedExecutableFile {
+            file,
+            #[cfg(test)]
+            staging_path,
+        })
     }
 }
 
@@ -443,6 +559,8 @@ pub struct SandboxedStdioLauncher {
     service: Arc<dyn OwnedStdioProcessService>,
     environment: Option<OwnedStdioEnvironment>,
     scanners: Vec<SensitiveDataScanner>,
+    executable_digest: Option<crate::agent::extensions::ContentDigest>,
+    executable_file: Option<fs::File>,
     #[cfg(debug_assertions)]
     process: Option<Arc<dyn OwnedStdioProcess>>,
 }
@@ -456,6 +574,8 @@ impl SandboxedStdioLauncher {
                 values: BTreeMap::new(),
             }),
             scanners: Vec::new(),
+            executable_digest: None,
+            executable_file: None,
             #[cfg(debug_assertions)]
             process: None,
         }
@@ -486,6 +606,8 @@ impl SandboxedStdioLauncher {
             service: Arc::new(UnusedService),
             environment: None,
             scanners: Vec::new(),
+            executable_digest: None,
+            executable_file: None,
             process: Some(process),
         }
     }
@@ -494,12 +616,16 @@ impl SandboxedStdioLauncher {
         token: PreparedCommandToken,
         service: Arc<dyn OwnedStdioProcessService>,
         environment: OwnedStdioEnvironment,
+        executable_digest: crate::agent::extensions::ContentDigest,
+        executable_file: fs::File,
     ) -> Self {
         Self {
             token: Some(token),
             service,
             environment: Some(environment),
             scanners: Vec::new(),
+            executable_digest: Some(executable_digest),
+            executable_file: Some(executable_file),
             #[cfg(debug_assertions)]
             process: None,
         }
@@ -507,6 +633,21 @@ impl SandboxedStdioLauncher {
 
     pub fn add_scanner(&mut self, scanner: SensitiveDataScanner) {
         self.scanners.push(scanner);
+    }
+
+    pub(crate) fn bind_executable_digest(
+        &mut self,
+        digest: crate::agent::extensions::ContentDigest,
+    ) -> Result<(), OwnedStdioProfileError> {
+        #[cfg(debug_assertions)]
+        if self.executable_digest.is_none() && self.process.is_some() {
+            self.executable_digest = Some(digest);
+            return Ok(());
+        }
+        if self.executable_digest.as_ref() != Some(&digest) {
+            return Err(OwnedStdioProfileError::Invalid);
+        }
+        Ok(())
     }
 
     async fn launch(
@@ -542,6 +683,7 @@ impl SandboxedStdioLauncher {
         };
         match outcome {
             Some(Ok(mut process)) => {
+                self.executable_file.take();
                 process.scanners.append(&mut self.scanners);
                 Ok(process)
             }
@@ -925,6 +1067,53 @@ mod tests {
     use super::*;
     use crate::capabilities::broker::transport_auth::{TransportAuthorization, TransportOperation};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn original_and_content_addressed_path_replacement_cannot_change_verified_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-mcp-executable-object-{}-{}",
+            std::process::id(),
+            crate::domain::ids::ProjectId::generate().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("server");
+        let output = root.join("output");
+        let verified = b"#!/bin/sh\nprintf verified > \"$1\"\n".to_vec();
+        fs::write(&source, &verified).unwrap();
+        let identity = crate::protocols::mcp::config::StdioExecutableIdentity {
+            digest: crate::agent::extensions::ContentDigest::sha256(&verified),
+            bytes: verified.into(),
+        };
+
+        let prepared = prepare_executable(&root.join("objects"), &identity).unwrap();
+        fs::write(
+            &source,
+            b"#!/bin/sh\nprintf original-replacement > \"$1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &prepared.staging_path,
+            b"#!/bin/sh\nprintf staging-replacement > \"$1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("objects")
+                .join(identity.digest.as_str().replace(':', "-")),
+            b"#!/bin/sh\nprintf content-addressed-replacement > \"$1\"\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .arg(prepared.descriptor_path())
+                .arg(&output)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(fs::read_to_string(output).unwrap(), "verified");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stdio_environment_rejects_a_handle_outside_lifecycle_authority() {

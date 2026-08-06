@@ -25,6 +25,10 @@ fn main() -> ExitCode {
     if let Some(exit) = kit::executor::syntax::worker_main(&arguments) {
         return exit;
     }
+    #[cfg(debug_assertions)]
+    if let Some(exit) = kit::test_support::mcp_stdio_worker_main(&arguments) {
+        return exit;
+    }
     let output = match parse(arguments) {
         Err(error) => {
             let format = error.output_format().unwrap_or(OutputFormat::Human);

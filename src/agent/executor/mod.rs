@@ -144,6 +144,8 @@ pub struct RunExecutorConfig {
     pub telemetry: Option<Arc<crate::runtime::telemetry::TelemetryRuntime<'static>>>,
     tool_learning_key: Option<[u8; 32]>,
     mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
+    capability_extensions: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
+    capability_extensions_owned: bool,
     mcp_stdio_profiles:
         Option<Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>>,
     mcp_responder_outcomes: crate::protocols::mcp::responders::ResponderOutcomes,
@@ -197,6 +199,8 @@ impl RunExecutorConfig {
             telemetry: None,
             tool_learning_key: None,
             mcp_servers: Vec::new(),
+            capability_extensions: Arc::new(std::sync::RwLock::new(Default::default())),
+            capability_extensions_owned: false,
             mcp_stdio_profiles: None,
             mcp_responder_outcomes: Default::default(),
             callback_secrets: Default::default(),
@@ -234,6 +238,15 @@ impl RunExecutorConfig {
         servers: impl IntoIterator<Item = crate::protocols::mcp::config::McpServerConfig>,
     ) -> Self {
         self.mcp_servers = servers.into_iter().collect();
+        self
+    }
+
+    pub fn with_capability_extensions(
+        mut self,
+        registry: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
+    ) -> Self {
+        self.capability_extensions = registry;
+        self.capability_extensions_owned = true;
         self
     }
 
@@ -353,7 +366,7 @@ pub struct RunExecutor {
 }
 
 impl RunExecutor {
-    pub fn start(config: RunExecutorConfig) -> Result<Self, ExecutorError> {
+    pub fn start(mut config: RunExecutorConfig) -> Result<Self, ExecutorError> {
         if config.concurrency == 0
             || config.queue_capacity == 0
             || config.database.as_os_str().is_empty()
@@ -391,6 +404,23 @@ impl RunExecutor {
                     })
         {
             return Err(ExecutorError::McpStdioServiceUnavailable { profile });
+        }
+        if !config.capability_extensions_owned {
+            let snapshots = config
+                .store
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .worker_append_store()
+                .map_err(|error| ExecutorError::Worker(error.to_string()))?
+                .extension_registry_snapshots()
+                .map_err(ExecutorError::Store)?;
+            let registry =
+                crate::capabilities::extensions::CapabilityExtensionRegistry::from_repository_snapshots(
+                    snapshots,
+                )
+                .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+            config.capability_extensions = Arc::new(std::sync::RwLock::new(registry));
+            config.capability_extensions_owned = true;
         }
         SqliteStreamCommitFactory::open(&config.database, StreamLimits::default())?;
         let (wake, wake_rx) = mpsc::channel(config.queue_capacity);
@@ -1171,6 +1201,7 @@ async fn execute_attempt(
             stdio_profiles: config.mcp_stdio_profiles.as_deref(),
             resolved_secrets: &runtime_secrets.resolved,
             callback_secrets: &callback_secrets,
+            extension_registry: &config.capability_extensions,
         };
         let (bootstrap, claim_error) = {
             let bootstrap = crate::protocols::mcp::config::bootstrap(
@@ -2766,6 +2797,14 @@ fn tool_adapter(
     let project_root = std::fs::canonicalize(&config.project_root).map_err(|error| {
         ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
     })?;
+    let native_scope =
+        crate::capabilities::extensions::ExtensionScope::new(job.principal_id, job.project_id);
+    let native_extension_guard = crate::capabilities::extensions::attest_native_extension_durable(
+        &config.capability_extensions,
+        native_scope,
+        &mut append_store(config)?,
+    )
+    .map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let (mcp_runtime, mcp_revision) = mcp.unzip();
     let descriptors = crate::capabilities::native::NativeCatalog::enabled(snapshot);
     let configured = descriptors
@@ -2920,7 +2959,7 @@ fn tool_adapter(
                         extension: extension.clone(),
                     })
                     .collect(),
-                provider: provider_capability_contract(config, snapshot)?,
+                provider: provider_capability_contract(config, snapshot, native_scope)?,
                 telemetry: config.telemetry.clone(),
                 pointer_key,
             })
@@ -3047,6 +3086,7 @@ fn tool_adapter(
         snapshot.clone(),
         acquisition,
         crate::capabilities::native::dispatch::NativeRuntime {
+            extension_guard: native_extension_guard,
             workspace_id: workspace,
             process_registration,
             cancellation: SqliteCancellationCoordinator::new(&config.database),
@@ -3125,6 +3165,7 @@ fn tool_adapter(
 fn provider_capability_contract(
     config: &RunExecutorConfig,
     snapshot: &RunConfigSnapshot,
+    scope: crate::capabilities::extensions::ExtensionScope,
 ) -> Result<crate::capabilities::registration::ProviderCapabilityContract, ExecutorError> {
     use crate::capabilities::{
         kernel::identity::DigestAlgorithm,
@@ -3159,8 +3200,13 @@ fn provider_capability_contract(
         DigestAlgorithm::Sha256,
     )
     .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    let adapter = crate::capabilities::schema::SchemaProjectionAdapter::new(
+        &config.capability_extensions,
+        scope,
+    )
+    .map_err(|error| ExecutorError::Worker(error.to_string()))?;
     Ok(ProviderCapabilityContract::portable(
-        ValidatedProjectionSupport::validate(&profile)
+        ValidatedProjectionSupport::validate_with_adapter(&profile, &adapter)
             .map_err(|error| ExecutorError::Worker(error.to_string()))?,
     ))
 }

@@ -48,6 +48,10 @@ use crate::{
         },
         stream::{CursorKey, SqliteStreamAdapter, StreamCancellation, StreamConfig},
     },
+    capabilities::extensions::{
+        CAPABILITY_EXTENSION_HOST_VERSION, CapabilityExtensionRegistry, ExtensionScope,
+        SharedCapabilityExtensionRegistry, built_in_contracts,
+    },
     domain::{
         config::{Grant, Provider as ConfigProvider, StaticRunConfigMaterializer},
         ids::{PrincipalId, ProjectId},
@@ -68,6 +72,7 @@ use crate::{
         ArtifactDigest, ArtifactError, ArtifactStore, Reachability, now_unix_micros,
     },
     store::backup::{BackupConfig, BackupGeneration, BackupManager},
+    store::sqlite::append::SqliteStore,
     store::sqlite::idempotency::IdempotencyKey,
     telemetry::otel::{
         AttributeValue, DropPolicy, DurableLocalExporter, LogRecord, LogSeverity, Resource,
@@ -963,6 +968,35 @@ impl Daemon {
         })?;
         let default_provider = model_adapter_config.default_provider;
         let trusted = TrustedExtensionToken::daemon_bootstrap();
+        let capability_scope = ExtensionScope::new(identity.principal_id, identity.project_id);
+        let mut capability_store = SqliteStore::open(&database, &authority)
+            .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        let capability_extensions = CapabilityExtensionRegistry::from_repository_snapshots(
+            capability_store
+                .extension_registry_snapshots()
+                .map_err(|error| DaemonError::Setup(error.to_string()))?,
+        )
+        .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        let capability_extensions: SharedCapabilityExtensionRegistry =
+            Arc::new(std::sync::RwLock::new(capability_extensions));
+        crate::capabilities::extensions::attest_native_extension_durable(
+            &capability_extensions,
+            capability_scope,
+            &mut capability_store,
+        )
+        .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        for contract in built_in_contracts() {
+            capability_extensions
+                .read()
+                .map_err(|_| DaemonError::Setup("extension registry is unavailable".to_owned()))?
+                .resolve_trusted(
+                    &trusted,
+                    capability_scope,
+                    &contract.reference(),
+                    CAPABILITY_EXTENSION_HOST_VERSION,
+                )
+                .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        }
         let mut extension_registry = ExtensionRegistry::default();
         for descriptor in built_in_descriptors() {
             extension_registry
@@ -1123,6 +1157,7 @@ impl Daemon {
         )
         .with_native_semantic_evidence(native_semantic_evidence.clone())
         .with_native_edit_validation_time(config.native_edit_validation_time)
+        .with_capability_extensions(Arc::clone(&capability_extensions))
         .with_mcp_servers(config.mcp_servers);
         if let Some(profiles) = mcp_stdio_profiles {
             executor_config = executor_config.with_mcp_stdio_profiles(profiles);
@@ -1229,6 +1264,7 @@ impl Daemon {
                     diagnostic_adapters: config.native_diagnostic_adapters.clone(),
                     feedback_limits: config.native_feedback_limits.clone(),
                     edit_validation_time: config.native_edit_validation_time,
+                    capability_extensions: Arc::clone(&capability_extensions),
                     #[cfg(debug_assertions)]
                     check_completions: config.native_check_completions.clone(),
                 },

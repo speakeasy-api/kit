@@ -22,7 +22,8 @@ use crate::capabilities::{
     },
     schema::{
         JSON_SCHEMA_2020_12, NormalizedSchema, ProjectionError, ProjectionProfile,
-        ProjectionTarget, SchemaProjectionSet, SchemaValidation, number_is_lossless,
+        ProjectionTarget, SchemaProjectionAdapter, SchemaProjectionSet, SchemaValidation,
+        number_is_lossless,
     },
 };
 
@@ -106,6 +107,20 @@ pub struct ValidatedProjectionSupport {
 
 impl ValidatedProjectionSupport {
     pub fn validate(profile: &ProjectionProfile) -> Result<Self, ProjectionError> {
+        Self::validate_with(profile, None)
+    }
+
+    pub(crate) fn validate_with_adapter(
+        profile: &ProjectionProfile,
+        adapter: &SchemaProjectionAdapter,
+    ) -> Result<Self, ProjectionError> {
+        Self::validate_with(profile, Some(adapter))
+    }
+
+    fn validate_with(
+        profile: &ProjectionProfile,
+        adapter: Option<&SchemaProjectionAdapter>,
+    ) -> Result<Self, ProjectionError> {
         let mut tools = Vec::with_capacity(HOST_TOOLS.len());
         for (operation, wire_name, description, schema) in HOST_TOOLS {
             let normalized = NormalizedSchema::ingest(
@@ -115,7 +130,10 @@ impl ValidatedProjectionSupport {
                 DigestAlgorithm::Sha256,
             )?;
             let mut projections = SchemaProjectionSet::new(normalized);
-            let projection = projections.project(profile)?;
+            let projection = match adapter {
+                Some(adapter) => adapter.project(&mut projections, profile)?,
+                None => projections.project(profile)?,
+            };
             tools.push(host_tool(
                 operation,
                 wire_name,

@@ -11730,14 +11730,14 @@
   source_quote: '- native capability providers,'
   source_fingerprint: b05e99443c6d7437a4a77e610d3ec06575723093e246b0882e914c6b50a4ac5e
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CONFIG
   applicability: mandatory
   interpretation: Extensions can provide native capability providers.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_config_808 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance ext_m006 -- --test-threads=1 exits 0 with at least 1 passed and 0 failed; local results remain untrusted production evidence
   primary_milestone: M006
   contributing_milestones:
   - M001
@@ -11753,13 +11753,16 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
-  public_contract_links: []
+  implementation_links:
+  - src/capabilities/extensions/mod.rs
+  - requirements/reports/m006-w11.md
+  public_contract_links:
+  - docs/compatibility/ext-m006.yaml
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-1.04-C-1309
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_config_808 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance ext_m006 -- --test-threads=1 exits 0 with at least 1 passed and 0 failed; local results remain untrusted production evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -11777,14 +11780,14 @@
   source_quote: '- MCP servers,'
   source_fingerprint: 10c7baac37a11b1b264ff5bbd63553cc9ec45845423547c2e58f527ca23b9048
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CONFIG
   applicability: mandatory
   interpretation: Extensions can provide MCP servers.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_config_809 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance ext_m006 -- --test-threads=1 and cargo test --locked --test adversarial untrusted_ext -- --test-threads=1 each exit 0 with at least 1 passed and 0 failed; local results remain untrusted production evidence
   primary_milestone: M006
   contributing_milestones:
   - M001
@@ -11800,13 +11803,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
-  public_contract_links: []
+  implementation_links:
+  - src/capabilities/extensions/mod.rs
+  - tests/adversarial/untrusted_ext.rs
+  - requirements/reports/m006-w11.md
+  public_contract_links:
+  - docs/compatibility/ext-m006.yaml
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-1.04-C-1310
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_config_809 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance ext_m006 -- --test-threads=1 and cargo test --locked --test adversarial untrusted_ext -- --test-threads=1 each exit 0 with at least 1 passed and 0 failed; local results remain untrusted production evidence
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -12158,17 +12165,18 @@
   source_quote: In-process plugins are trusted code. Untrusted extensions run out of process through MCP, ACP, A2A, or a narrow Kit plugin protocol under sandbox policy.
   source_fingerprint: 63a239d7364dce0a7f6757651bd7604e709376daa35821e0146f0ae810957778
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CONFIG
   applicability: mandatory
   interpretation: In-process plugins are treated as trusted code.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_config_817 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance ext_m006 -- --test-threads=1 exits 0 with at least 1 passed and 0 failed for the M006 capability extension subset; broader extension coverage and trusted evidence remain pending
   primary_milestone: M012
   contributing_milestones:
   - M001
+  - M006
   dependencies: []
   owner: Configuration owner
   criticality: high
@@ -12181,13 +12189,18 @@
   - hostile
   release_gates:
   - G12
-  implementation_links: []
-  public_contract_links: []
+  implementation_links:
+  - src/agent/extensions/registry.rs
+  - src/capabilities/extensions/mod.rs
+  - requirements/reports/m006-w11.md
+  public_contract_links:
+  - docs/compatibility/ext-m002.yaml
+  - docs/compatibility/ext-m006.yaml
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-1.04-C-1318
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_config_817 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance ext_m006 -- --test-threads=1 exits 0 with at least 1 passed and 0 failed for the M006 capability extension subset; broader extension coverage and trusted evidence remain pending
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -12205,17 +12218,18 @@
   source_quote: In-process plugins are trusted code. Untrusted extensions run out of process through MCP, ACP, A2A, or a narrow Kit plugin protocol under sandbox policy.
   source_fingerprint: 63a239d7364dce0a7f6757651bd7604e709376daa35821e0146f0ae810957778
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CONFIG
   applicability: mandatory
   interpretation: Untrusted extensions run out of process through MCP, ACP, A2A, or a narrow sandboxed plugin protocol.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_config_818 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test adversarial untrusted_ext -- --test-threads=1 exits 0 with exactly 100 rejected untrusted in-process contract loads and exactly 100 real child-process stdio MCP calls; the trusted Restricted/Hostile sandbox test remains ignored and this requirement remains pending until that external evidence runs
   primary_milestone: M012
   contributing_milestones:
   - M001
+  - M006
   dependencies: []
   owner: Configuration owner
   criticality: high
@@ -12228,13 +12242,19 @@
   - hostile
   release_gates:
   - G12
-  implementation_links: []
-  public_contract_links: []
+  implementation_links:
+  - src/agent/extensions/registry.rs
+  - src/capabilities/extensions/mod.rs
+  - tests/adversarial/untrusted_ext.rs
+  - requirements/reports/m006-w11.md
+  public_contract_links:
+  - docs/compatibility/ext-m002.yaml
+  - docs/compatibility/ext-m006.yaml
   telemetry_links: []
   evidence_type: conformance
   evidence_id: EV-1.04-C-1319
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_config_818 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test adversarial untrusted_ext -- --test-threads=1 exits 0 with exactly 100 rejected untrusted in-process contract loads and exactly 100 real child-process stdio MCP calls; the trusted Restricted/Hostile sandbox test remains ignored and this requirement remains pending until that external evidence runs
   artifact_digest: null
   environment_digest: null
   versions: null

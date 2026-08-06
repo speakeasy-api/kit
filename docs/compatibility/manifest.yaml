@@ -2,6 +2,7 @@ schema_version: 1
 build_manifest: docs/compatibility/build-manifest.yaml
 extension_contracts:
   m002: docs/compatibility/ext-m002.yaml
+  m006: docs/compatibility/ext-m006.yaml
 product_version: 0.1.0
 versions:
   executor_profile_schema:

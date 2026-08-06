@@ -183,6 +183,7 @@ impl StructuralPreviewRegistry {
 }
 
 pub(crate) struct NativeRuntime {
+    pub extension_guard: crate::capabilities::extensions::NativeExtensionGuard,
     pub workspace_id: crate::domain::ids::WorkspaceId,
     pub process_registration: Option<ProcessRegistryRegistration>,
     pub cancellation: SqliteCancellationCoordinator,
@@ -366,6 +367,7 @@ fn validate_native_semantic_replacement(
 }
 
 pub(crate) struct NativeDispatcher {
+    extension_guard: crate::capabilities::extensions::NativeExtensionGuard,
     root: PathBuf,
     workspace: Option<ManagedWorkspace>,
     index: Option<MetadataIndex>,
@@ -427,6 +429,7 @@ impl NativeDispatcher {
         std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
         let grants = authenticated.grant_snapshot().clone();
         Ok(Self {
+            extension_guard: runtime.extension_guard,
             root,
             workspace: None,
             index: None,
@@ -497,6 +500,9 @@ impl NativeDispatcher {
     }
 
     pub(crate) fn dispatch(&mut self, invocation: &AuthorizedInvocation) -> DispatchOutcome {
+        if self.extension_guard.ensure_current().is_err() {
+            return failed("native_extension_contract_inactive");
+        }
         if self.cancelled() {
             return failed("cancelled");
         }
@@ -2993,6 +2999,11 @@ mod tests {
             config,
             None,
             NativeRuntime {
+                extension_guard: crate::capabilities::extensions::attest_native_extension(
+                    &Arc::new(std::sync::RwLock::new(Default::default())),
+                    crate::capabilities::extensions::ExtensionScope::new(principal, project),
+                )
+                .unwrap(),
                 workspace_id: WorkspaceId::generate().unwrap(),
                 process_registration: None,
                 cancellation: SqliteCancellationCoordinator::new(directory.join("state.sqlite3")),

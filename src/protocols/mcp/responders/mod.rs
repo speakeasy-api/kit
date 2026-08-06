@@ -677,6 +677,7 @@ pub(crate) struct ResponderAuthority {
     scheduler: Option<DurableScheduler>,
     cancellation: Arc<AtomicBool>,
     claim_verifier: ClaimVerifier,
+    extension_lifecycle: Option<crate::capabilities::extensions::ExtensionLifecycleGuard>,
     secret_scanner: Option<Arc<SecretScanner>>,
     secret_policy_id: Option<Arc<str>>,
     _secret_registration: Option<Arc<CallbackSecretRegistration>>,
@@ -706,6 +707,7 @@ impl ResponderAuthority {
             scheduler: None,
             cancellation,
             claim_verifier,
+            extension_lifecycle: None,
             secret_scanner: None,
             secret_policy_id: None,
             _secret_registration: None,
@@ -714,6 +716,14 @@ impl ResponderAuthority {
 
     pub(crate) fn with_scheduler(mut self, scheduler: DurableScheduler) -> Self {
         self.scheduler = Some(scheduler);
+        self
+    }
+
+    pub(crate) fn with_extension_lifecycle(
+        mut self,
+        lifecycle: crate::capabilities::extensions::ExtensionLifecycleGuard,
+    ) -> Self {
+        self.extension_lifecycle = Some(lifecycle);
         self
     }
 
@@ -771,6 +781,10 @@ impl ResponderAuthority {
         if !control.authorizes(request.generation())
             || self.cancellation.load(Ordering::Acquire)
             || request.cancellation().is_cancelled()
+            || self
+                .extension_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.ensure_current().is_err())
         {
             return Err(ResponderError::Unavailable);
         }
@@ -794,6 +808,10 @@ impl ResponderAuthority {
         if !control.authorizes(generation)
             || self.cancellation.load(Ordering::Acquire)
             || request_cancellation.is_cancelled()
+            || self
+                .extension_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.ensure_current().is_err())
         {
             return Err(ResponderError::Unavailable);
         }
@@ -2122,6 +2140,7 @@ pub struct ResponderInstallation {
     control: Arc<ResponderControl>,
     durable_elicitation: Option<Arc<DurableElicitationOutcome>>,
     secret_scanner: Arc<SecretScanner>,
+    extension_lifecycle: Option<crate::capabilities::extensions::ExtensionLifecycleGuard>,
 }
 
 impl ResponderInstallation {
@@ -2157,6 +2176,13 @@ impl ResponderInstallation {
         elicitation_id: &str,
         raw_data: Option<&serde_json::Value>,
     ) -> Result<InvocationUrlResolution, ResponderError> {
+        if self
+            .extension_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.ensure_current().is_err())
+        {
+            return Err(ResponderError::Unavailable);
+        }
         if !callback_value_public_to(
             &self.secret_scanner,
             &serde_json::json!({
@@ -2168,7 +2194,8 @@ impl ResponderInstallation {
         ) {
             return Err(ResponderError::Invalid);
         }
-        self.durable_elicitation
+        let result = self
+            .durable_elicitation
             .as_ref()
             .ok_or(ResponderError::Unavailable)?
             .await_invocation_url(
@@ -2180,7 +2207,15 @@ impl ResponderInstallation {
                 elicitation_id,
                 raw_data,
             )
-            .await
+            .await?;
+        if self
+            .extension_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.ensure_current().is_err())
+        {
+            return Err(ResponderError::Unavailable);
+        }
+        Ok(result)
     }
 }
 
@@ -2241,6 +2276,7 @@ pub(crate) fn install(
         Some(Arc::clone(&secret_scope.policy_id)),
         Some(Arc::clone(&secret_scope.registration)),
     );
+    let extension_lifecycle = authority.extension_lifecycle.clone();
     let mut handler = McpHandlerConfig::new().with_events_capacity(events_capacity);
     if let (Some(policy), Some(outcome)) = (&server.responders.sampling, &outcomes.sampling) {
         handler = handler.with_sampling_responder(Arc::new(SamplingResponder {
@@ -2291,6 +2327,7 @@ pub(crate) fn install(
         control,
         durable_elicitation: outcomes.durable_elicitation.clone(),
         secret_scanner: Arc::clone(&secret_scope.scanner),
+        extension_lifecycle,
     })
 }
 

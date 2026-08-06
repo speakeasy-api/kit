@@ -1,0 +1,89 @@
+schema_version: 1
+milestone: M006-W11
+registry_format_version: 1
+host_contract_version: 1.0.0
+compatibility_range:
+  minimum: 1.0.0
+  maximum_exclusive: 2.0.0
+
+bounds:
+  global_entries: 4096
+  project_entries: 256
+  global_snapshot_bytes: 8388608
+  project_snapshot_bytes: 524288
+  metadata_text_bytes: 1024
+
+trust_boundary:
+  in_process: build_attested_token_required
+  restored_trusted: inactive_until_build_reattested
+  restored_untrusted: fresh_broker_authorization_required
+  untrusted_in_process: rejected_at_validation
+  dynamic_library_loading: prohibited
+  out_of_process: current_exact_broker_decision_plus_sandbox
+  authority: broker_kernel_only
+  stdio_identity: exact_verified_executable_sha256_with_descriptor_only_launch
+
+protocols:
+  mcp:
+    version: "2025-11-25"
+    pin: agentkit_mcp::PINNED_PROTOCOL_VERSION
+  acp:
+    version: v1
+    pin: protocol.acp.wire
+  a2a:
+    version: 1.0.0
+    pin: protocol.a2a.wire
+  kit_plugin:
+    version: 1
+    scope: narrow_sandboxed_extension_route
+
+extension_kinds:
+  - native_provider
+  - mcp_server
+  - schema_projection_adapter
+
+built_ins:
+  - kind: native_provider
+    identity: kit.native-provider
+    version: 1.0.0
+    trust: trusted
+    route:
+      type: in_process
+    compatibility:
+      minimum: 1.0.0
+      maximum_exclusive: 2.0.0
+    schema_digest: sha256:192a510e776a5bea66a115469e772fff8280bce59d03e142ccebb151efa92e98
+    implementation_digest: sha256:a0f4626029cfc394c6213f257f63bdb5b2b26e1459f1a5d133ad50a2e1e4ab18
+    schema_artifact: docs/compatibility/schemas/native-provider-v1.json
+    implementation_sources:
+      - src/capabilities/native/catalog.rs
+      - src/capabilities/native/dispatch.rs
+      - src/capabilities/native/orchestrate.rs
+      - src/capabilities/registration/mod.rs
+  - kind: schema_projection_adapter
+    identity: kit.schema-projection
+    version: 1.0.0
+    trust: trusted
+    route:
+      type: in_process
+    compatibility:
+      minimum: 1.0.0
+      maximum_exclusive: 2.0.0
+    schema_digest: sha256:1513dd74beb7d4f7955de7f5584498036a65d0a3ab6dcd47b7b8eeaf68a10719
+    implementation_digest: sha256:541127e0ab58fb4960bb15838cc16b4157aca1fc202d5ec7a00bc51323479333
+    schema_artifact: docs/compatibility/schemas/schema-projection-v1.json
+    implementation_sources:
+      - src/capabilities/schema/mod.rs
+
+mcp_runtime:
+  protocol_version: "2025-11-25"
+  schema_digest: sha256:0ea11e4be269f053014f854ea7a63f56149da5c45dfc0a6c97c8ac79cbf8d65e
+  implementation_digest: sha256:09c93d0f075dafa8e1d1ff6321265e4507ce7c1fd60a7eada976413f871b04de
+  schema_artifact: docs/compatibility/schemas/mcp-lifecycle-v1.json
+  implementation_sources:
+    - src/protocols/mcp/config.rs
+    - src/protocols/mcp/transport/mod.rs
+    - src/protocols/mcp/transport/http.rs
+    - src/protocols/mcp/transport/stdio.rs
+    - src/protocols/mcp/transport/invocation.rs
+    - src/protocols/mcp/responders/mod.rs

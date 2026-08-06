@@ -13,7 +13,7 @@ use crate::domain::commands::ExpectedVersion;
 use crate::domain::events::{
     CommitPosition, EntityId, EventType, SchemaVersion, StreamSequence, TraceId, UtcDateTime,
 };
-use crate::domain::ids::{AttemptId, CommandId, EventId, RunId};
+use crate::domain::ids::{AttemptId, CommandId, EventId, PrincipalId, ProjectId, RunId};
 
 #[cfg(any(test, debug_assertions))]
 use super::idempotency::ClaimOutcome;
@@ -115,6 +115,13 @@ pub struct CatalogStatsSnapshot {
     pub payload_bytes: u64,
     pub payload: Vec<u8>,
     pub entries: Vec<DurableCatalogStats>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtensionRegistryCommit {
+    Committed,
+    Stale,
+    LimitExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,6 +298,141 @@ impl SqliteStore {
         )?;
         configure_connection(&connection)?;
         migrate(&mut connection)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn extension_registry_state(&mut self) -> Result<(u64, Vec<(u64, Vec<u8>)>), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let revision = transaction.query_row(
+            "SELECT revision FROM capability_extension_registry_state WHERE singleton=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let snapshots = {
+            let mut statement = transaction.prepare(
+                "SELECT revision, snapshot FROM capability_extension_registry
+                 ORDER BY principal_id, project_id",
+            )?;
+            statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit()?;
+        let revision = u64::try_from(revision)
+            .map_err(|_| StoreError::CorruptData("negative global registry revision"))?;
+        let snapshots = snapshots
+            .into_iter()
+            .map(|(revision, snapshot)| {
+                Ok((
+                    u64::try_from(revision)
+                        .map_err(|_| StoreError::CorruptData("negative registry revision"))?,
+                    snapshot,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok((revision, snapshots))
+    }
+
+    pub fn extension_registry_snapshots(&mut self) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        self.extension_registry_state()
+            .map(|(_, snapshots)| snapshots)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_extension_registry_snapshot(
+        &mut self,
+        principal_id: PrincipalId,
+        project_id: ProjectId,
+        expected_revision: u64,
+        revision: u64,
+        snapshot: &[u8],
+        entry_count: usize,
+        max_entries: usize,
+        max_snapshot_bytes: usize,
+    ) -> Result<ExtensionRegistryCommit, StoreError> {
+        if revision
+            != expected_revision
+                .checked_add(1)
+                .ok_or(StoreError::PositionExhausted)?
+        {
+            return Err(StoreError::InvalidRequest(
+                "extension registry revision is not monotonic",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (stored_revision, total_entries, total_bytes) = transaction.query_row(
+            "SELECT revision, entry_count, snapshot_bytes
+             FROM capability_extension_registry_state WHERE singleton=1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        if stored_revision
+            != i64::try_from(expected_revision).map_err(|_| StoreError::PositionExhausted)?
+        {
+            return Ok(ExtensionRegistryCommit::Stale);
+        }
+        let (previous_entries, previous_bytes) = transaction
+            .query_row(
+                "SELECT entry_count, length(snapshot) FROM capability_extension_registry
+                 WHERE principal_id=?1 AND project_id=?2",
+                params![principal_id.to_string(), project_id.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0));
+        let next_entries = total_entries
+            .checked_sub(previous_entries)
+            .and_then(|value| value.checked_add(i64::try_from(entry_count).ok()?))
+            .ok_or(StoreError::PositionExhausted)?;
+        let next_bytes = total_bytes
+            .checked_sub(previous_bytes)
+            .and_then(|value| value.checked_add(i64::try_from(snapshot.len()).ok()?))
+            .ok_or(StoreError::PositionExhausted)?;
+        if next_entries > i64::try_from(max_entries).map_err(|_| StoreError::PositionExhausted)?
+            || next_bytes
+                > i64::try_from(max_snapshot_bytes).map_err(|_| StoreError::PositionExhausted)?
+        {
+            return Ok(ExtensionRegistryCommit::LimitExceeded);
+        }
+        transaction.execute(
+            "UPDATE capability_extension_registry_state
+             SET revision=?1, entry_count=?2, snapshot_bytes=?3
+             WHERE singleton=1 AND revision=?4",
+            params![
+                i64::try_from(revision).map_err(|_| StoreError::PositionExhausted)?,
+                next_entries,
+                next_bytes,
+                stored_revision,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO capability_extension_registry
+                 (principal_id, project_id, revision, snapshot, entry_count)
+             VALUES (?1, ?2, ?4, ?5, ?6)
+             ON CONFLICT(principal_id, project_id) DO UPDATE SET
+                 revision=excluded.revision, snapshot=excluded.snapshot,
+                 entry_count=excluded.entry_count",
+            params![
+                principal_id.to_string(),
+                project_id.to_string(),
+                i64::try_from(expected_revision).map_err(|_| StoreError::PositionExhausted)?,
+                i64::try_from(revision).map_err(|_| StoreError::PositionExhausted)?,
+                snapshot,
+                i64::try_from(entry_count).map_err(|_| StoreError::PositionExhausted)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ExtensionRegistryCommit::Committed)
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -2062,8 +2204,56 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
                required INTEGER NOT NULL CHECK (required IN (0,1)),
                created_at INTEGER NOT NULL CHECK (created_at >= 0),
-               CHECK ((first_position IS NULL) = (last_position IS NULL))
-           );",
+                CHECK ((first_position IS NULL) = (last_position IS NULL))
+            );
+            CREATE TABLE IF NOT EXISTS capability_extension_registry (
+                principal_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                snapshot BLOB NOT NULL,
+                entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+                PRIMARY KEY (principal_id, project_id)
+            );
+            CREATE TABLE IF NOT EXISTS capability_extension_registry_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+                snapshot_bytes INTEGER NOT NULL CHECK (snapshot_bytes >= 0)
+            );",
+    )?;
+    let has_extension_revision: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('capability_extension_registry')
+         WHERE name='revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_extension_revision {
+        transaction.execute_batch(
+            "ALTER TABLE capability_extension_registry
+             ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0);",
+        )?;
+    }
+    let has_extension_entry_count: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('capability_extension_registry')
+         WHERE name='entry_count')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_extension_entry_count {
+        transaction.execute_batch(
+            "ALTER TABLE capability_extension_registry
+             ADD COLUMN entry_count INTEGER NOT NULL DEFAULT 0 CHECK (entry_count >= 0);",
+        )?;
+    }
+    transaction.execute_batch(
+        "UPDATE capability_extension_registry
+         SET entry_count=json_array_length(snapshot, '$.entries')
+         WHERE entry_count=0;
+         INSERT OR IGNORE INTO capability_extension_registry_state
+             (singleton, revision, entry_count, snapshot_bytes)
+         SELECT 1, coalesce(max(revision), 0), coalesce(sum(entry_count), 0),
+                coalesce(sum(length(snapshot)), 0)
+         FROM capability_extension_registry;",
     )?;
     let has_learning_project: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tool_learning_outbox') WHERE name='project')",

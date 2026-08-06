@@ -290,6 +290,35 @@ pub struct SchemaProjectionSet {
     attempts: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SchemaProjectionAdapter {
+    lifecycle: crate::capabilities::extensions::ExtensionLifecycleGuard,
+}
+
+impl SchemaProjectionAdapter {
+    pub(crate) fn new(
+        registry: &crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
+        scope: crate::capabilities::extensions::ExtensionScope,
+    ) -> Result<Self, crate::capabilities::extensions::RegistryError> {
+        Ok(Self {
+            lifecycle: crate::capabilities::extensions::CapabilityExtensionRegistry::schema_projection_lifecycle_guard(
+                registry, scope,
+            )?,
+        })
+    }
+
+    pub(crate) fn project<'a>(
+        &self,
+        projections: &'a mut SchemaProjectionSet,
+        profile: &ProjectionProfile,
+    ) -> Result<&'a ProviderSchemaProjection, ProjectionError> {
+        self.lifecycle
+            .ensure_current()
+            .map_err(|_| ProjectionError::AdapterUnavailable)?;
+        projections.project(profile)
+    }
+}
+
 impl SchemaProjectionSet {
     pub fn new(schema: NormalizedSchema) -> Self {
         Self {
@@ -384,6 +413,7 @@ pub enum ProjectionError {
     UnsupportedConstraint { pointer: String, keyword: String },
     SchemaTooLarge,
     ProjectionConflict,
+    AdapterUnavailable,
     LimitExceeded,
 }
 
@@ -411,6 +441,7 @@ impl fmt::Display for ProjectionError {
                 }
                 Self::SchemaTooLarge => "schema exceeds the projection profile byte limit",
                 Self::ProjectionConflict => "projection target already exists",
+                Self::AdapterUnavailable => "schema projection adapter is unavailable",
                 Self::LimitExceeded => "schema depth or node limit exceeded",
                 Self::UnsupportedConstraint { .. } => unreachable!(),
             }),

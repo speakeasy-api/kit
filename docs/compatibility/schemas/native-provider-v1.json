@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"arguments":{"type":"object"},"capability":{"type":"string"}},"required":["capability","arguments"],"title":"Kit native provider dispatch v1","type":"object"}

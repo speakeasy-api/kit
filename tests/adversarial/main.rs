@@ -32,6 +32,7 @@ mod shadow_leak;
 mod tool_kernel_bypass;
 mod tool_learning_canary;
 mod trial_grader_access;
+mod untrusted_ext;
 mod url_policy;
 mod windows_job;
 

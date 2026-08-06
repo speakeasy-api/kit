@@ -287,6 +287,7 @@ pub struct NativeRepoOptions {
     pub diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
     pub feedback_limits: crate::verify::feedback::FeedbackLimits,
     pub edit_validation_time: Duration,
+    pub capability_extensions: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
     #[cfg(debug_assertions)]
     pub check_completions: Vec<crate::executor::check::ConformanceCheck>,
 }
@@ -560,6 +561,18 @@ impl NativeRepoService {
             options.project_id,
             authority_grants,
         ));
+        let mut extension_store =
+            SqliteStore::open(&options.database, authority).map_err(|error| error.to_string())?;
+        let native_extension_guard =
+            crate::capabilities::extensions::attest_native_extension_durable(
+                &options.capability_extensions,
+                crate::capabilities::extensions::ExtensionScope::new(
+                    options.principal_id,
+                    options.project_id,
+                ),
+                &mut extension_store,
+            )
+            .map_err(|error| error.to_string())?;
         let constraints = NativeCatalog::all()
             .iter()
             .map(|descriptor| {
@@ -671,6 +684,7 @@ impl NativeRepoService {
             config.clone(),
             Some(acquisition),
             crate::capabilities::native::dispatch::NativeRuntime {
+                extension_guard: native_extension_guard,
                 workspace_id,
                 process_registration: Some(options.process_registration),
                 cancellation: options.cancellation,
@@ -698,8 +712,6 @@ impl NativeRepoService {
         // Probe and cache the managed workspace before the HTTP server starts. A
         // first request must not inherit the cost of indexing a large checkout.
         dispatcher.revision()?;
-        let _store =
-            SqliteStore::open(&options.database, authority).map_err(|error| error.to_string())?;
         migrate(&options.database)?;
         let state = Arc::new(Mutex::new(NativeRepoState { dispatcher }));
         let worker = NativeRepoWorker {
@@ -3894,6 +3906,7 @@ mod tests {
                 feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
+                capability_extensions: Arc::new(std::sync::RwLock::new(Default::default())),
                 #[cfg(debug_assertions)]
                 check_completions: Vec::new(),
             },

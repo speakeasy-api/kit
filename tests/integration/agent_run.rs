@@ -165,6 +165,7 @@ mod agent_run_tests {
             _authorized_credentials: &Arc<
                 BTreeMap<kit::domain::secret::SecretHandle, Arc<SecretLease>>,
             >,
+            _executable: &kit::protocols::mcp::config::StdioExecutableIdentity,
         ) -> Result<
             kit::protocols::mcp::transport::SandboxedStdioLauncher,
             kit::protocols::mcp::transport::OwnedStdioProfileError,
@@ -1426,7 +1427,7 @@ mod agent_run_tests {
             kit::executor::profile::Architecture::X86_64
         };
         let profile = kit::executor::profile::ProfileSpec::isolated(
-            kit::executor::profile::TrustTier::TrustedLocal,
+            kit::executor::profile::TrustTier::Restricted,
             platform,
             architecture,
             kit::executor::profile::ResourceLimits::new(
@@ -1448,7 +1449,12 @@ mod agent_run_tests {
             id: "learning-fixture".to_owned(),
             transport: kit::protocols::mcp::config::McpTransportConfig::Stdio {
                 owned_process_profile: "memory".to_owned(),
-                argv: vec!["/memory".to_owned()],
+                argv: vec![
+                    std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ],
                 profile: Box::new(profile),
                 profile_digest,
                 environment: BTreeMap::new(),

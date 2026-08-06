@@ -521,7 +521,15 @@ impl LocalOsBackend {
             )));
         }
         validate_requirements(profile, &self.capabilities())?;
-        let program = canonical_program(&request.program)?;
+        let program = match request.inherited_program {
+            Some(_) if self.kind != BackendKind::LinuxBubblewrap => {
+                return Err(LocalExecutionError::InvalidRequest(
+                    "descriptor-only execution requires the Linux sandbox helper".to_owned(),
+                ));
+            }
+            Some(_) => request.program.clone(),
+            None => canonical_program(&request.program)?,
+        };
         let current_dir = canonical_directory(&request.current_dir)?;
         if !is_inside_workspace(&current_dir, paths) {
             return Err(LocalExecutionError::InvalidRequest(
@@ -529,7 +537,13 @@ impl LocalOsBackend {
             ));
         }
         validate_environment(&request.environment)?;
-        let mut pinned_paths = vec![PinnedPath::new(&program)?];
+        let mut pinned_paths = request
+            .inherited_program
+            .is_none()
+            .then(|| PinnedPath::new(&program))
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>();
         if let Some(wrapper) = &self.program {
             pinned_paths.push(PinnedPath::new(wrapper)?);
         }
@@ -559,6 +573,7 @@ impl LocalOsBackend {
                         &sandbox_cwd,
                         &environment,
                         &request.args,
+                        request.inherited_program,
                     ),
                     current_dir: PathBuf::from("/"),
                     environment,
@@ -689,6 +704,7 @@ impl LocalOsBackend {
                             OsString::from("-c"),
                             OsString::from(linux_isolation_probe_script(&marker_name)),
                         ],
+                        None,
                     ),
                     current_dir: PathBuf::from("/"),
                     environment: scrubbed_environment(paths, BTreeMap::new(), true),
@@ -969,6 +985,7 @@ impl CapabilityRunner for SystemCapabilityRunner {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalCommand {
     program: PathBuf,
+    inherited_program: Option<i32>,
     args: Vec<OsString>,
     current_dir: PathBuf,
     environment: BTreeMap<OsString, OsString>,
@@ -994,6 +1011,7 @@ impl LocalCommand {
     pub fn new(program: impl Into<PathBuf>, current_dir: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            inherited_program: None,
             args: Vec::new(),
             current_dir: current_dir.into(),
             environment: BTreeMap::new(),
@@ -1003,6 +1021,17 @@ impl LocalCommand {
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
         self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn inherited_program(descriptor: i32, current_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            program: PathBuf::from(format!("/proc/self/fd/{descriptor}")),
+            inherited_program: Some(descriptor),
+            args: Vec::new(),
+            current_dir: current_dir.into(),
+            environment: BTreeMap::new(),
+        }
     }
 
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
@@ -1528,6 +1557,7 @@ fn bubblewrap_args(
     current_dir: &Path,
     environment: &BTreeMap<OsString, OsString>,
     args: &[OsString],
+    inherited_program: Option<i32>,
 ) -> Vec<OsString> {
     let mut sandbox_args = [
         "--unshare-user",
@@ -1552,6 +1582,16 @@ fn bubblewrap_args(
     .into_iter()
     .map(OsString::from)
     .collect::<Vec<_>>();
+    if let Some(descriptor) = inherited_program {
+        sandbox_args.extend([
+            OsString::from("--ro-bind-data"),
+            OsString::from(descriptor.to_string()),
+            OsString::from("/run/kit-extension"),
+            OsString::from("--chmod"),
+            OsString::from("0500"),
+            OsString::from("/run/kit-extension"),
+        ]);
+    }
     for directory in LINUX_SYSTEM_DIRS {
         sandbox_args.extend([
             OsString::from("--ro-bind-try"),
@@ -1559,7 +1599,8 @@ fn bubblewrap_args(
             OsString::from(directory),
         ]);
     }
-    if translate_linux_path(host_program, paths).is_none()
+    if inherited_program.is_none()
+        && translate_linux_path(host_program, paths).is_none()
         && !LINUX_SYSTEM_DIRS
             .into_iter()
             .any(|directory| host_program.starts_with(directory))
@@ -1588,7 +1629,13 @@ fn bubblewrap_args(
     for (key, value) in environment {
         sandbox_args.extend([OsString::from("--setenv"), key.clone(), value.clone()]);
     }
-    sandbox_args.extend([OsString::from("--"), program.as_os_str().to_owned()]);
+    sandbox_args.extend([
+        OsString::from("--"),
+        inherited_program.map_or_else(
+            || program.as_os_str().to_owned(),
+            |_| OsString::from("/run/kit-extension"),
+        ),
+    ]);
     sandbox_args.extend_from_slice(args);
     sandbox_args
 }

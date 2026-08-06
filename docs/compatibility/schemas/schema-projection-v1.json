@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","additionalProperties":false,"properties":{"schema":{"type":"object"},"target":{"enum":["json_schema_2020_12"]}},"required":["target","schema"],"title":"Kit schema projection v1","type":"object"}

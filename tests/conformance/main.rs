@@ -28,6 +28,7 @@ mod exec_api;
 mod exec_contracts;
 mod exec_profile;
 mod ext_m002;
+mod ext_m006;
 mod fixtures_selftest;
 mod grammar_edit_path;
 mod grant_ext;

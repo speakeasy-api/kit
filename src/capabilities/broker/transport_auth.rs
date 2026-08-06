@@ -338,6 +338,9 @@ pub struct TransportAuthorization {
     scope: Option<String>,
     credential: Option<SecretHandle>,
     egress: Option<EgressConstraint>,
+    credentials: std::collections::BTreeSet<SecretHandle>,
+    egresses: std::collections::BTreeSet<EgressConstraint>,
+    effect: grant::EffectClass,
     binding: TransportBinding,
     operation: TransportOperation,
     arguments: Vec<u8>,
@@ -396,6 +399,68 @@ impl TransportAuthorization {
             && self.binding.same_connection(&other.binding)
     }
 
+    pub(crate) fn matches_extension_route(
+        &self,
+        principal_id: &str,
+        project_id: &str,
+        protocol: &str,
+        route_id: &str,
+    ) -> bool {
+        self.principal_id == principal_id
+            && self.project_id == project_id
+            && protocol == "mcp"
+            && self.binding.server_id == route_id
+            && matches!(self.binding.transport.as_str(), "stdio" | "http")
+            && self.binding.discovered_schema_digest == self.binding.bound_schema_digest
+    }
+
+    pub(crate) fn matches_contract_digests(
+        &self,
+        schema_digest: &str,
+        implementation_digest: &str,
+    ) -> bool {
+        self.binding.bound_schema_digest == schema_digest
+            && self.binding.capability_implementation_digest == implementation_digest
+    }
+
+    pub(crate) fn is_brokered_egress_only(&self) -> bool {
+        self.effect == grant::EffectClass::NetworkEgress
+            && self.binding.transport == "http"
+            && self.egress.is_some()
+    }
+
+    pub(crate) fn allows_profile(
+        &self,
+        profile: &crate::executor::profile::ExecutorProfile,
+    ) -> bool {
+        if self.effect != grant::EffectClass::ProcessSpawn {
+            return false;
+        }
+        let credentials = self
+            .credential
+            .iter()
+            .chain(self.credentials.iter())
+            .map(SecretHandle::identifier)
+            .collect::<std::collections::BTreeSet<_>>();
+        if profile
+            .credentials()
+            .iter()
+            .any(|credential| !credentials.contains(credential.handle.as_str()))
+        {
+            return false;
+        }
+        let egresses = self
+            .egress
+            .iter()
+            .chain(self.egresses.iter())
+            .map(|egress| (egress.host(), egress.port()))
+            .collect::<std::collections::BTreeSet<_>>();
+        profile.egress().iter().all(|egress| {
+            egress.transport() == crate::executor::profile::EgressTransport::Tcp
+                && egresses.contains(&(egress.destination(), egress.port()))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         operation: TransportOperation,
@@ -426,6 +491,9 @@ impl TransportAuthorization {
             scope: Some("mcp.connect".to_owned()),
             credential,
             egress,
+            credentials: Default::default(),
+            egresses: Default::default(),
+            effect: grant::EffectClass::ProcessSpawn,
             binding,
             operation,
             arguments: b"{}".to_vec(),
@@ -572,6 +640,9 @@ fn authorize_inner(
                 .map(|egress| egress.credential().clone())
         }),
         egress: envelope.extension.egress().cloned(),
+        credentials: envelope.extension.credentials().clone(),
+        egresses: envelope.extension.egresses().clone(),
+        effect: envelope.effect,
         binding: binding.clone(),
         operation: operation.clone(),
         arguments: arguments.to_vec(),

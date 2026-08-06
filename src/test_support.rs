@@ -470,3 +470,50 @@ where
         .receive_current_notification(service_id, deadline_tick)
         .map(|received| received.into_disposition())
 }
+pub fn mcp_stdio_worker_main(arguments: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    if arguments.get(1).and_then(|value| value.to_str()) != Some("--kit-mcp-conformance-worker") {
+        return None;
+    }
+    use std::io::{BufRead as _, Write as _};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let request: serde_json::Value =
+            match line.ok().and_then(|line| serde_json::from_str(&line).ok()) {
+                Some(request) => request,
+                None => return Some(std::process::ExitCode::FAILURE),
+            };
+        let Some(id) = request.get("id").cloned() else {
+            continue;
+        };
+        let result = match request.get("method").and_then(serde_json::Value::as_str) {
+            Some("initialize") => serde_json::json!({
+                "protocolVersion":"2025-11-25",
+                "capabilities":{"tools":{}},
+                "serverInfo":{"name":"kit-conformance-worker","version":"1"}
+            }),
+            Some("tools/list") => serde_json::json!({"tools":[{
+                "name":"fixture_echo",
+                "description":"Echo fixture text.",
+                "inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}
+            }]}),
+            Some("tools/call") => serde_json::json!({
+                "content":[{"type":"text","text":"fixture result"}],
+                "isError":false
+            }),
+            _ => serde_json::json!({}),
+        };
+        if serde_json::to_writer(
+            &mut stdout,
+            &serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+        )
+        .is_err()
+            || stdout.write_all(b"\n").is_err()
+            || stdout.flush().is_err()
+        {
+            return Some(std::process::ExitCode::FAILURE);
+        }
+    }
+    Some(std::process::ExitCode::SUCCESS)
+}

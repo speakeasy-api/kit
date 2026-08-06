@@ -115,6 +115,7 @@ impl OwnedBrokerInvocation {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_lifecycle(
         server: &str,
+        contract: &crate::capabilities::extensions::ExtensionContract,
         initialize_arguments: serde_json::Value,
         authenticated: &crate::api::auth::contract::AuthenticatedPrincipal,
         config: &crate::domain::config::RunConfigSnapshot,
@@ -134,7 +135,7 @@ impl OwnedBrokerInvocation {
                     },
                     identity::{
                         CapabilityIdentity, CapabilityName, CapabilityNamespace, CapabilitySource,
-                        CapabilityVersion, Digest, DigestAlgorithm,
+                        CapabilityVersion, DigestAlgorithm,
                     },
                     invoke::{ApprovalState, RetrySafety},
                 },
@@ -154,7 +155,7 @@ impl OwnedBrokerInvocation {
             return Err(BrokerError::InvalidAuthState);
         }
         let schema = NormalizedSchema::ingest(
-            br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            include_bytes!("../../../docs/compatibility/schemas/mcp-lifecycle-v1.json"),
             JSON_SCHEMA_2020_12,
             b"run-owned MCP lifecycle",
             DigestAlgorithm::Sha256,
@@ -171,10 +172,15 @@ impl OwnedBrokerInvocation {
                 .map_err(|_| BrokerError::InvalidAuthState)?,
             CapabilityName::new(server).map_err(|_| BrokerError::InvalidAuthState)?,
             CapabilityVersion::new("1").map_err(|_| BrokerError::InvalidAuthState)?,
-            Digest::of(DigestAlgorithm::Sha256, server.as_bytes()),
+            contract.implementation_kernel_digest(),
         );
+        if contract.schema_kernel_digest() != schema.source().normalized_digest() {
+            return Err(BrokerError::InvalidAuthState);
+        }
         let constraints =
-            ArgumentConstraints::new([format!("mcp.lifecycle={server}").into_bytes()]);
+            ArgumentConstraints::new([
+                format!("mcp.extension={}", contract.canonical_identity()).into_bytes()
+            ]);
         let grants = CapabilityGrantSnapshot::new(
             config,
             [CapabilityGrant::new(
