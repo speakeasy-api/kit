@@ -61,6 +61,8 @@ impl<'a> RuntimeRetention<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TelemetryHealth {
     pub ready: bool,
+    pub learning_ready: bool,
+    pub learning_healthy: bool,
     pub exporter_healthy: bool,
     pub retention_healthy: bool,
     pub queue_healthy: bool,
@@ -69,6 +71,7 @@ pub struct TelemetryHealth {
     pub dropped: u64,
     pub retention_status: TelemetryRetentionStatus,
     pub last_error: Option<String>,
+    pub learning_last_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -76,6 +79,7 @@ pub enum TelemetryRuntimeError {
     Adapter(AdapterError),
     Export(ExportError),
     Retention(RetentionError),
+    LearningSinkUnavailable,
 }
 
 impl fmt::Display for TelemetryRuntimeError {
@@ -84,6 +88,8 @@ impl fmt::Display for TelemetryRuntimeError {
             Self::Adapter(error) => error.fmt(formatter),
             Self::Export(error) => write!(formatter, "telemetry export failed: {error}"),
             Self::Retention(error) => error.fmt(formatter),
+            Self::LearningSinkUnavailable => formatter
+                .write_str("tool-learning telemetry requires an encrypted access-controlled sink"),
         }
     }
 }
@@ -97,8 +103,10 @@ struct RuntimeState<'a> {
     exporter_healthy: bool,
     retention_healthy: bool,
     queue_healthy: bool,
+    learning_healthy: bool,
     shutting_down: bool,
     last_error: Option<String>,
+    learning_last_error: Option<String>,
     next_span: u64,
 }
 
@@ -126,8 +134,10 @@ impl<'a> TelemetryRuntime<'a> {
                 exporter_healthy: true,
                 retention_healthy: true,
                 queue_healthy: true,
+                learning_healthy: true,
                 shutting_down: false,
                 last_error: None,
+                learning_last_error: None,
                 next_span: 1,
             }),
             readiness_policy,
@@ -212,6 +222,424 @@ impl<'a> TelemetryRuntime<'a> {
             canonical: Some(Box::new(envelope)),
             ..RunEnvelope::default()
         }))
+    }
+
+    pub fn export_learning_outbox(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+    ) -> Result<usize, TelemetryRuntimeError> {
+        let result = self.export_learning_outbox_claim(store, hasher);
+        match result {
+            Ok(Some(exported)) => {
+                self.record_learning_result(
+                    store,
+                    hasher,
+                    &Ok::<_, TelemetryRuntimeError>(exported),
+                );
+                Ok(exported)
+            }
+            Ok(None) => {
+                self.mark_learning_failure("durable learning export is owned by another worker");
+                Ok(0)
+            }
+            Err(error) => {
+                self.mark_learning_failure(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn export_learning_outbox_claim(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+    ) -> Result<Option<usize>, TelemetryRuntimeError> {
+        let claim = store
+            .claim_learning_export(hasher.project().as_str())
+            .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())));
+        match claim {
+            Ok(Some(token)) => {
+                let exported = self.export_learning_outbox_inner(store, hasher);
+                let released = store
+                    .release_learning_export(hasher.project().as_str(), &token)
+                    .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())));
+                match (exported, released) {
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                    (Ok(count), Ok(())) => Ok(Some(count)),
+                }
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn reconcile_learning_backlog(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+    ) -> Result<usize, TelemetryRuntimeError> {
+        match self.reconcile_learning_backlog_inner(store, hasher) {
+            Ok(Some(exported)) => {
+                self.record_learning_result(
+                    store,
+                    hasher,
+                    &Ok::<_, TelemetryRuntimeError>(exported),
+                );
+                Ok(exported)
+            }
+            Ok(None) => {
+                self.mark_learning_failure("durable learning export is owned by another worker");
+                Ok(0)
+            }
+            Err(error) => {
+                self.mark_learning_failure(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_learning_backlog_inner(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+    ) -> Result<Option<usize>, TelemetryRuntimeError> {
+        let projects = store
+            .pending_learning_projects()
+            .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?;
+        if projects
+            .iter()
+            .any(|project| project != hasher.project().as_str())
+            || store
+                .pending_catalog_stats_projects()
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?
+                .iter()
+                .any(|project| project != hasher.project().as_str())
+        {
+            return Err(TelemetryRuntimeError::Export(ExportError(
+                "durable learning outbox contains another project authority".to_owned(),
+            )));
+        }
+        let Some(mut exported) = self.export_learning_outbox_claim(store, hasher)? else {
+            return Ok(None);
+        };
+        if !store
+            .pending_learning_outbox(hasher.project().as_str(), 1)
+            .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?
+            .is_empty()
+        {
+            return Err(TelemetryRuntimeError::Export(ExportError(
+                "durable learning outbox remains in progress".to_owned(),
+            )));
+        }
+        loop {
+            let reconciled = store
+                .reconcile_learning_markers(hasher.project().as_str(), 256)
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?;
+            if reconciled == 0 {
+                if store
+                    .has_learning_markers(hasher.project().as_str())
+                    .map_err(|error| {
+                        TelemetryRuntimeError::Export(ExportError(error.to_string()))
+                    })?
+                {
+                    return Err(TelemetryRuntimeError::Export(ExportError(
+                        "durable learning reconciliation remains in progress".to_owned(),
+                    )));
+                }
+                break;
+            }
+            let Some(count) = self.export_learning_outbox_claim(store, hasher)? else {
+                return Ok(None);
+            };
+            exported = exported.saturating_add(count);
+        }
+        loop {
+            let runs = store
+                .pending_catalog_stats_runs(hasher.project().as_str())
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?;
+            if runs.is_empty() {
+                break;
+            }
+            for run in runs {
+                let run = RunId::parse(&run).map_err(|_| {
+                    TelemetryRuntimeError::Export(ExportError(
+                        "durable catalog statistics have no run authority".to_owned(),
+                    ))
+                })?;
+                self.export_catalog_stats_snapshot(store, hasher, run)?;
+                exported = exported.saturating_add(1);
+            }
+        }
+        Ok(Some(exported))
+    }
+
+    fn export_learning_outbox_inner(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+    ) -> Result<usize, TelemetryRuntimeError> {
+        let mut state = self.lock();
+        let mut exported = 0;
+        loop {
+            let pending = store
+                .pending_learning_outbox(hasher.project().as_str(), 256)
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?;
+            if pending.is_empty() {
+                break;
+            }
+            for row in pending {
+                let event: crate::telemetry::tool_learning::ToolLearningEvent =
+                    serde_json::from_slice(&row.payload).map_err(|error| {
+                        TelemetryRuntimeError::Export(ExportError(format!(
+                            "invalid durable learning outbox record: {error}"
+                        )))
+                    })?;
+                event.validate_with(hasher).map_err(|error| {
+                    TelemetryRuntimeError::Export(ExportError(format!(
+                        "unauthenticated durable learning outbox record: {error}"
+                    )))
+                })?;
+                let expected_run = hasher.pointer(
+                    crate::telemetry::tool_learning::PointerDomain::Run,
+                    row.run_id.as_bytes(),
+                );
+                if row.project != hasher.project().as_str()
+                    || event.common().project != *hasher.project()
+                    || event.common().run != expected_run
+                    || row.frame_id != event.common().event_id.as_str()
+                    || crate::domain::ids::EventId::from_stable_bytes(
+                        event.common().event_id.as_str().as_bytes(),
+                    ) != row.event_id
+                {
+                    return Err(TelemetryRuntimeError::Export(ExportError(
+                        "learning outbox event linkage mismatch".to_owned(),
+                    )));
+                }
+                let frame = crate::telemetry::otel::EncryptedLearningFrame {
+                    frame_id: row.frame_id.clone(),
+                    ciphertext: hasher
+                        .encrypt_export_frame(&row.frame_id, &row.payload)
+                        .map_err(|error| {
+                            TelemetryRuntimeError::Export(ExportError(error.to_string()))
+                        })?,
+                };
+                if let Err(error) = state.exporter.export_encrypted_learning(&frame) {
+                    return Err(TelemetryRuntimeError::Export(error));
+                }
+                let labels = BTreeMap::from([
+                    ("event_class".to_owned(), event.class_name().to_owned()),
+                    (
+                        "operation".to_owned(),
+                        event.common().operation.as_str().to_owned(),
+                    ),
+                    (
+                        "status".to_owned(),
+                        learning_metric_status(&event).to_owned(),
+                    ),
+                ]);
+                if !matches!(
+                    Metric::new(
+                        MetricName::ToolLearningEvents,
+                        "1",
+                        MetricValue::Counter { value: 1 },
+                        labels,
+                        0,
+                    )
+                    .and_then(|metric| {
+                        state
+                            .adapter
+                            .enqueue(TelemetryItem::Metric(metric))
+                            .map_err(|_| crate::telemetry::otel::MetricError::InvalidLearningRecord)
+                    }),
+                    Ok(EnqueueOutcome::Accepted)
+                ) {
+                    state.queue_healthy = false;
+                    state.last_error =
+                        Some("tool-learning metric queue capacity exceeded".to_owned());
+                }
+                store
+                    .acknowledge_learning_outbox(hasher.project().as_str(), &row.frame_id)
+                    .map_err(|error| {
+                        TelemetryRuntimeError::Export(ExportError(error.to_string()))
+                    })?;
+                exported += 1;
+            }
+        }
+        Ok(exported)
+    }
+
+    pub fn export_catalog_stats_snapshot(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+        run_id: RunId,
+    ) -> Result<(), TelemetryRuntimeError> {
+        let result = self.export_catalog_stats_snapshot_inner(store, hasher, run_id);
+        self.record_learning_result(store, hasher, &result);
+        result
+    }
+
+    fn export_catalog_stats_snapshot_inner(
+        &self,
+        store: &mut crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+        run_id: RunId,
+    ) -> Result<(), TelemetryRuntimeError> {
+        if !store
+            .catalog_stats_run_terminal(run_id)
+            .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?
+        {
+            return Err(TelemetryRuntimeError::Export(ExportError(
+                "catalog statistics run is not durably terminal".to_owned(),
+            )));
+        }
+        let run = hasher.pointer(
+            crate::telemetry::tool_learning::PointerDomain::Run,
+            run_id.to_string().as_bytes(),
+        );
+        loop {
+            let Some(snapshot) = store
+                .catalog_stats_snapshot(run_id, run.as_str())
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?
+            else {
+                return Ok(());
+            };
+            let entries = &snapshot.entries;
+            let records = crate::telemetry::tool_learning::records(store, run_id, hasher)
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?;
+            let calls = records
+                .iter()
+                .filter_map(|record| match record {
+                    crate::telemetry::tool_learning::ToolLearningEvent::Call {
+                        call,
+                        binding: Some(binding),
+                        ..
+                    } => Some((call, binding)),
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            let outcomes = records
+                .iter()
+                .filter_map(|record| match record {
+                    crate::telemetry::tool_learning::ToolLearningEvent::Outcome {
+                        common,
+                        call,
+                        status,
+                        ..
+                    } => calls.get(call).map(|binding| (*binding, common, *status)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut authenticated = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let matching = outcomes
+                    .iter()
+                    .filter(|(binding, _, _)| binding.as_str() == entry.binding)
+                    .collect::<Vec<_>>();
+                let count = usize::try_from(entry.attempts).map_err(|_| {
+                    TelemetryRuntimeError::Export(ExportError(
+                        "catalog statistics count is invalid".to_owned(),
+                    ))
+                })?;
+                let Some(last) = matching
+                    .iter()
+                    .position(|(_, common, _)| common.event_id.as_str() == entry.source_event)
+                else {
+                    return Err(TelemetryRuntimeError::Export(ExportError(
+                        "catalog statistics authentication mismatch".to_owned(),
+                    )));
+                };
+                let end = last + 1;
+                let start = end.checked_sub(count).ok_or_else(|| {
+                    TelemetryRuntimeError::Export(ExportError(
+                        "catalog statistics authentication mismatch".to_owned(),
+                    ))
+                })?;
+                let mut verified = crate::store::sqlite::append::DurableCatalogStats {
+                    project: entry.project.clone(),
+                    run: entry.run.clone(),
+                    binding: entry.binding.clone(),
+                    attempts: 0,
+                    succeeded: 0,
+                    failed: 0,
+                    cancelled: 0,
+                    outcome_unknown: 0,
+                    source_event: String::new(),
+                    revision: entry.revision,
+                };
+                for (_, common, status) in matching.into_iter().skip(start).take(count) {
+                    if common.project.as_str() != entry.project || common.run.as_str() != entry.run
+                    {
+                        return Err(TelemetryRuntimeError::Export(ExportError(
+                            "catalog statistics row binding mismatch".to_owned(),
+                        )));
+                    }
+                    verified.attempts += 1;
+                    match status {
+                        crate::telemetry::tool_learning::LearningStatus::Succeeded => {
+                            verified.succeeded += 1
+                        }
+                        crate::telemetry::tool_learning::LearningStatus::Cancelled => {
+                            verified.cancelled += 1
+                        }
+                        crate::telemetry::tool_learning::LearningStatus::OutcomeUnknown => {
+                            verified.outcome_unknown += 1
+                        }
+                        crate::telemetry::tool_learning::LearningStatus::Failed
+                        | crate::telemetry::tool_learning::LearningStatus::Interrupted
+                        | crate::telemetry::tool_learning::LearningStatus::Unavailable => {
+                            verified.failed += 1
+                        }
+                    }
+                    verified.source_event = common.event_id.as_str().to_owned();
+                }
+                authenticated.push(verified);
+            }
+            if *entries != authenticated {
+                return Err(TelemetryRuntimeError::Export(ExportError(
+                    "catalog statistics authentication mismatch".to_owned(),
+                )));
+            }
+            for entry in entries {
+                if entry.project != hasher.project().as_str() || entry.run != run.as_str() {
+                    return Err(TelemetryRuntimeError::Export(ExportError(
+                        "catalog statistics row binding mismatch".to_owned(),
+                    )));
+                }
+                let binding =
+                    crate::telemetry::tool_learning::LearningPointer::parse(entry.binding.clone())
+                        .map_err(|error| {
+                            TelemetryRuntimeError::Export(ExportError(error.to_string()))
+                        })?;
+                hasher
+                    .validate(
+                        &binding,
+                        crate::telemetry::tool_learning::PointerDomain::Binding,
+                    )
+                    .map_err(|error| {
+                        TelemetryRuntimeError::Export(ExportError(error.to_string()))
+                    })?;
+            }
+            let frame = crate::telemetry::otel::EncryptedLearningFrame {
+                frame_id: snapshot.frame_id.clone(),
+                ciphertext: hasher
+                    .encrypt_export_frame(&snapshot.frame_id, &snapshot.payload)
+                    .map_err(|error| {
+                        TelemetryRuntimeError::Export(ExportError(error.to_string()))
+                    })?,
+            };
+            self.lock()
+                .exporter
+                .export_encrypted_learning(&frame)
+                .map_err(TelemetryRuntimeError::Export)?;
+            if store
+                .acknowledge_catalog_stats(&snapshot)
+                .map_err(|error| TelemetryRuntimeError::Export(ExportError(error.to_string())))?
+            {
+                continue;
+            }
+        }
     }
 
     pub fn emit_api_command(&self, observation: CommandObservation<'_>) {
@@ -408,7 +836,10 @@ impl<'a> TelemetryRuntime<'a> {
         };
         TelemetryHealth {
             ready: !state.shutting_down
-                && (self.readiness_policy == TelemetryReadinessPolicy::BestEffort || healthy),
+                && (self.readiness_policy == TelemetryReadinessPolicy::BestEffort
+                    || healthy && state.learning_healthy),
+            learning_ready: !state.shutting_down && state.learning_healthy,
+            learning_healthy: state.learning_healthy,
             exporter_healthy: state.exporter_healthy,
             retention_healthy: state.retention_healthy,
             queue_healthy: state.queue_healthy,
@@ -417,6 +848,50 @@ impl<'a> TelemetryRuntime<'a> {
             dropped: state.adapter.dropped(),
             retention_status,
             last_error: state.last_error.clone(),
+            learning_last_error: state.learning_last_error.clone(),
+        }
+    }
+
+    pub fn learning_admission_ready(&self) -> bool {
+        self.readiness_policy == TelemetryReadinessPolicy::BestEffort
+            || self.lock().learning_healthy
+    }
+
+    pub fn learning_required(&self) -> bool {
+        self.readiness_policy == TelemetryReadinessPolicy::Required
+    }
+
+    pub(crate) fn mark_learning_failure(&self, error: impl Into<String>) {
+        let mut state = self.lock();
+        state.learning_healthy = false;
+        state.learning_last_error = Some(error.into());
+    }
+
+    fn record_learning_result<T>(
+        &self,
+        store: &crate::store::sqlite::append::SqliteStore,
+        hasher: &crate::telemetry::tool_learning::ProjectPointerHasher,
+        result: &Result<T, TelemetryRuntimeError>,
+    ) {
+        let mut state = self.lock();
+        match result {
+            Ok(_) => match store.learning_backlog_drained(hasher.project().as_str()) {
+                Ok(true) => {
+                    state.learning_healthy = true;
+                    state.learning_last_error = None;
+                }
+                Ok(false) => {
+                    state.learning_healthy = false;
+                }
+                Err(error) => {
+                    state.learning_healthy = false;
+                    state.learning_last_error = Some(error.to_string());
+                }
+            },
+            Err(error) => {
+                state.learning_healthy = false;
+                state.learning_last_error = Some(error.to_string());
+            }
         }
     }
 
@@ -425,6 +900,32 @@ impl<'a> TelemetryRuntime<'a> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn learning_metric_status(
+    event: &crate::telemetry::tool_learning::ToolLearningEvent,
+) -> &'static str {
+    use crate::telemetry::tool_learning::{LearningStatus, RetryClass, ToolLearningEvent};
+
+    let status = match event {
+        ToolLearningEvent::Search { status, .. }
+        | ToolLearningEvent::Inspection { status, .. }
+        | ToolLearningEvent::Outcome { status, .. } => *status,
+        ToolLearningEvent::Error { retry, .. } => {
+            if matches!(
+                retry,
+                RetryClass::AuthorizationResume | RetryClass::UrlResume
+            ) {
+                LearningStatus::Interrupted
+            } else {
+                LearningStatus::Failed
+            }
+        }
+        ToolLearningEvent::Opportunity { .. } | ToolLearningEvent::Call { .. } => {
+            LearningStatus::Succeeded
+        }
+    };
+    status.as_str()
 }
 
 fn enqueue_lifecycle(state: &mut RuntimeState<'_>, item: TelemetryItem) {

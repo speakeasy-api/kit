@@ -266,7 +266,7 @@
         "policies"
       ],
       "properties": {
-        "schema_version": { "const": "1.1" },
+        "schema_version": { "enum": ["1.1", "1.2"] },
         "kind": { "const": "preregistration" },
         "experiment_id": { "$ref": "#/$defs/id" },
         "digests": { "$ref": "#/$defs/digests" },
@@ -308,8 +308,35 @@
         "alpha": { "const": 0.05 },
         "ci_method": { "const": "finite_sample_paired_v1" },
         "noninferiority": { "$ref": "#/$defs/noninferiority" },
-        "policies": { "$ref": "#/$defs/policies" }
-      }
+        "policies": { "$ref": "#/$defs/policies" },
+        "tool_learning_experiments": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["experiment", "pair_id", "capability", "schema", "surface", "description_only", "frozen_factors", "baseline_sequence", "candidate_sequence"],
+            "properties": {
+              "experiment": { "$ref": "#/$defs/learning_experiment_pointer" },
+              "pair_id": { "$ref": "#/$defs/id" },
+              "capability": { "$ref": "#/$defs/learning_capability_pointer" },
+              "schema": { "$ref": "#/$defs/learning_schema_pointer" },
+              "surface": { "enum": ["eager", "deferred", "generic", "discovery"] },
+              "description_only": { "type": "boolean" },
+              "frozen_factors": { "$ref": "#/$defs/learning_artifact_pointer" },
+              "baseline_sequence": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/learning_sequence_step" } },
+              "candidate_sequence": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/learning_sequence_step" } }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "schema_version": { "const": "1.1" } }, "required": ["schema_version"] },
+          "then": { "properties": { "tool_learning_experiments": false } },
+          "else": { "required": ["tool_learning_experiments"], "properties": { "tool_learning_experiments": { "minItems": 1 } } }
+        }
+      ]
     },
     "registration_receipt": {
       "type": "object",
@@ -342,12 +369,19 @@
       "additionalProperties": false,
       "required": ["schema_version", "kind", "preregistration", "preregistration_digest", "registration"],
       "properties": {
-        "schema_version": { "const": "1.0" },
+        "schema_version": { "enum": ["1.0", "1.1"] },
         "kind": { "const": "registered_preregistration" },
         "preregistration": { "$ref": "#/$defs/preregistration" },
         "preregistration_digest": { "$ref": "#/$defs/digest" },
         "registration": { "$ref": "#/$defs/registration_receipt" }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "schema_version": { "const": "1.0" } }, "required": ["schema_version"] },
+          "then": { "properties": { "preregistration": { "properties": { "schema_version": { "const": "1.1" } } } } },
+          "else": { "properties": { "preregistration": { "properties": { "schema_version": { "const": "1.2" } } } } }
+        }
+      ]
     },
     "trial_record": {
       "type": "object",
@@ -484,6 +518,80 @@
         "paired_delta": { "$ref": "#/$defs/finite" }
       }
     },
+    "learning_pointer": {
+      "type": "string",
+      "minLength": 138,
+      "maxLength": 138,
+      "pattern": "^tlp_v1_[0-9a-f]{2}_[0-9a-f]{128}$"
+    },
+    "learning_experiment_pointer": { "type": "string", "minLength": 138, "maxLength": 138, "pattern": "^tlp_v1_0b_[0-9a-f]{128}$" },
+    "learning_capability_pointer": { "type": "string", "minLength": 138, "maxLength": 138, "pattern": "^tlp_v1_03_[0-9a-f]{128}$" },
+    "learning_schema_pointer": { "type": "string", "minLength": 138, "maxLength": 138, "pattern": "^tlp_v1_04_[0-9a-f]{128}$" },
+    "learning_artifact_pointer": { "type": "string", "minLength": 138, "maxLength": 138, "pattern": "^tlp_v1_0c_[0-9a-f]{128}$" },
+    "learning_field_pointer": { "type": "string", "minLength": 138, "maxLength": 138, "pattern": "^tlp_v1_0f_[0-9a-f]{128}$" },
+    "learning_sequence_pointer": { "type": "string", "minLength": 138, "maxLength": 138, "pattern": "^tlp_v1_0e_[0-9a-f]{128}$" },
+    "learning_sequence_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability", "schema", "surface", "ordinal"],
+      "properties": {
+        "capability": { "$ref": "#/$defs/learning_capability_pointer" },
+        "schema": { "$ref": "#/$defs/learning_schema_pointer" },
+        "surface": { "enum": ["eager", "deferred", "generic", "discovery"] },
+        "ordinal": { "type": "integer", "minimum": 1, "maximum": 128 }
+      }
+    },
+    "learning_finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signal", "capability", "schema", "surface", "field", "sequence"],
+      "properties": {
+        "signal": { "enum": ["poor_description", "harmful_decoy", "misunderstood_field", "valuable_sequence"] },
+        "capability": { "$ref": "#/$defs/learning_capability_pointer" },
+        "schema": { "$ref": "#/$defs/learning_schema_pointer" },
+        "surface": { "enum": ["eager", "deferred", "generic", "discovery"] },
+        "field": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/learning_field_pointer" }] },
+        "sequence": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/learning_sequence_pointer" }] }
+      }
+    },
+    "learning_result": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["Available"],
+          "properties": {
+            "Available": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["findings", "direct_passes", "competing_passes"],
+              "properties": {
+                "findings": { "type": "array", "maxItems": 10000, "uniqueItems": true, "items": { "$ref": "#/$defs/learning_finding" } },
+                "direct_passes": { "type": "integer", "minimum": 0, "maximum": 65535 },
+                "competing_passes": { "type": "integer", "minimum": 0, "maximum": 65535 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["Unavailable"],
+          "properties": {
+            "Unavailable": { "enum": ["MissingPreregistration", "MissingArm", "MissingDownstreamGrade", "BoundExceeded", "MissingLinkage", "MissingCandidate", "MissingAuthority", "MissingLearningRecords"] }
+          }
+        }
+      ]
+    },
+    "learning_analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "input_digests"],
+      "properties": {
+        "result": { "$ref": "#/$defs/learning_result" },
+        "input_digests": { "type": "array", "minItems": 1, "maxItems": 40000, "uniqueItems": true, "items": { "$ref": "#/$defs/digest" } }
+      }
+    },
     "statistical_report": {
       "type": "object",
       "additionalProperties": false,
@@ -501,7 +609,7 @@
         "metrics"
       ],
       "properties": {
-        "schema_version": { "const": "1.0" },
+        "schema_version": { "enum": ["1.0", "1.1"] },
         "kind": { "const": "core_statistical_report" },
         "preregistration": { "$ref": "#/$defs/preregistration" },
         "preregistration_digest": { "$ref": "#/$defs/digest" },
@@ -551,8 +659,32 @@
               { "$ref": "#/$defs/exploratory_metric" }
             ]
           }
+        },
+        "learning_analysis": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/learning_analysis" }
+          ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "schema_version": { "const": "1.0" } }, "required": ["schema_version"] },
+          "then": {
+            "properties": {
+              "preregistration": { "properties": { "schema_version": { "const": "1.1" } } },
+              "learning_analysis": false
+            }
+          },
+          "else": {
+            "required": ["learning_analysis"],
+            "properties": {
+              "preregistration": { "properties": { "schema_version": { "const": "1.2" } } },
+              "learning_analysis": { "$ref": "#/$defs/learning_analysis" }
+            }
+          }
+        }
+      ]
     },
     "statistical_report_receipt": {
       "type": "object",

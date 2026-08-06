@@ -443,6 +443,8 @@ pub struct SandboxedStdioLauncher {
     service: Arc<dyn OwnedStdioProcessService>,
     environment: Option<OwnedStdioEnvironment>,
     scanners: Vec<SensitiveDataScanner>,
+    #[cfg(debug_assertions)]
+    process: Option<Arc<dyn OwnedStdioProcess>>,
 }
 
 impl SandboxedStdioLauncher {
@@ -454,6 +456,37 @@ impl SandboxedStdioLauncher {
                 values: BTreeMap::new(),
             }),
             scanners: Vec::new(),
+            #[cfg(debug_assertions)]
+            process: None,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn for_test(process: Arc<dyn OwnedStdioProcess>) -> Self {
+        struct UnusedService;
+
+        #[async_trait::async_trait]
+        impl OwnedStdioProcessService for UnusedService {
+            async fn launch(
+                &self,
+                _token: PreparedCommandToken,
+                _environment: OwnedStdioEnvironment,
+                _limits: OwnedStdioLimits,
+            ) -> Result<OwnedStdioProcessLaunch, OwnedStdioLaunchError> {
+                Err(OwnedStdioLaunchError::Unavailable)
+            }
+
+            async fn abort_and_reap(&self, _process_identity: &str) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        Self {
+            token: None,
+            service: Arc::new(UnusedService),
+            environment: None,
+            scanners: Vec::new(),
+            process: Some(process),
         }
     }
 
@@ -467,6 +500,8 @@ impl SandboxedStdioLauncher {
             service,
             environment: Some(environment),
             scanners: Vec::new(),
+            #[cfg(debug_assertions)]
+            process: None,
         }
     }
 
@@ -478,6 +513,13 @@ impl SandboxedStdioLauncher {
         &mut self,
         limits: TransportLimits,
     ) -> Result<OwnedStdioProcessLaunch, TransportError> {
+        #[cfg(debug_assertions)]
+        if let Some(process) = self.process.take() {
+            return Ok(OwnedStdioProcessLaunch {
+                process,
+                scanners: std::mem::take(&mut self.scanners),
+            });
+        }
         let token = self
             .token
             .take()

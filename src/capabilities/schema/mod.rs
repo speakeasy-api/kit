@@ -34,11 +34,11 @@ pub struct NormalizedSchema {
     documentation_digest: Digest,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchemaValidation {
     Unsupported,
     Valid,
-    Invalid,
+    Invalid(String),
 }
 
 impl NormalizedSchema {
@@ -111,8 +111,12 @@ impl NormalizedSchema {
 
     pub(crate) fn validate(&self, instance: &Value) -> SchemaValidation {
         match &self.validator {
-            Some(validator) if validator.is_valid(instance) => SchemaValidation::Valid,
-            Some(_) => SchemaValidation::Invalid,
+            Some(validator) => validator
+                .iter_errors(instance)
+                .next()
+                .map_or(SchemaValidation::Valid, |error| {
+                    SchemaValidation::Invalid(error.instance_path().to_string())
+                }),
             None => SchemaValidation::Unsupported,
         }
     }

@@ -1354,6 +1354,7 @@ impl NativeRepoWorker {
                     outcome_event_id,
                     occurred_at: &occurred_at,
                     trace_id: &trace_id,
+                    learning: None,
                 },
                 descriptor.normalized_schema(),
                 &mut store,

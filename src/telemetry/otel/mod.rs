@@ -7,7 +7,10 @@ pub use crate::runtime::telemetry::{
     InstrumentedRuntime, RuntimeRetention, TelemetryHealth, TelemetryReadinessPolicy,
     TelemetryRetentionStatus, TelemetryRuntime, TelemetryRuntimeError,
 };
-pub use adapter::{Adapter, AdapterError, DropPolicy, EnqueueOutcome, ExportError, Exporter};
+pub use adapter::{
+    Adapter, AdapterError, DropPolicy, EncryptedLearningFrame, EnqueueOutcome, ExportError,
+    Exporter,
+};
 pub use local::DurableLocalExporter;
 pub use model::{
     ADAPTER_VERSION, AttributeValue, CacheUsage, CheckResult, ExportBatch, LogRecord, LogSeverity,

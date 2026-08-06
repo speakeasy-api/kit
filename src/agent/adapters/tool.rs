@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::Pin,
     sync::{
@@ -12,8 +12,9 @@ use std::{
 
 use agentkit_core::{MetadataMap, ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
-    ApprovalReason, ApprovalRequest, PermissionCode, PermissionDenial, ToolContext, ToolError,
-    ToolExecutionOutcome, ToolExecutor, ToolInterruption, ToolRequest, ToolResult, ToolSpec,
+    ApprovalReason, ApprovalRequest, PermissionCode, PermissionDenial, ToolCatalogEvent,
+    ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolInterruption, ToolRequest,
+    ToolResult, ToolSpec,
 };
 use serde_json::Value;
 
@@ -33,7 +34,14 @@ use crate::{
         },
     },
     capabilities::schema::NormalizedSchema,
-    capabilities::{discovery::CapabilityBinding, registration::BoundRegistrationCall},
+    capabilities::{
+        catalog::CatalogSnapshot,
+        discovery::{CapabilityBinding, CapabilityInspection, DiscoveryHandle, DiscoverySession},
+        registration::{
+            BindingRegistry, BoundRegistrationCall, DirectInvokeCall, PortableInvokeCall,
+            ProviderCapabilityContract, RegistrationCall, RegistrationMode, RegistrationPlan,
+        },
+    },
     domain::{
         config::RunConfigSnapshot,
         events::{TraceId, UtcDateTime},
@@ -44,6 +52,11 @@ use crate::{
     runtime::scheduler::{limits::Spend, reserve::BudgetLedger},
     store::artifacts::ArtifactStore,
     store::sqlite::{append::SqliteStore, idempotency::IdempotencyKey},
+    telemetry::tool_learning::{
+        self, ErrorClass, ErrorCode, ErrorStage, LearningCandidate, LearningCapabilityKind,
+        LearningCommon, LearningOperation, LearningStatus, LearningSurface, PointerDomain,
+        PreparedLearningCapture, ProjectPointerHasher, RetryClass, ToolLearningEvent,
+    },
 };
 
 const MAX_PROVIDER_CALL_ID_BYTES: usize = 256;
@@ -60,6 +73,9 @@ const MCP_AUTH_SCOPE_METADATA: &str = "kit.mcp.auth_scope";
 const MCP_AUTH_CHALLENGE_KIND_METADATA: &str = "kit.mcp.auth_challenge_kind";
 const MCP_AUTH_CHALLENGE_GENERATION_METADATA: &str = "kit.mcp.auth_challenge_generation";
 const MCP_AUTH_CHALLENGE_ID_METADATA: &str = "kit.mcp.auth_challenge_id";
+const LEARNING_SURFACE_METADATA: &str = "kit.learning_surface";
+const LEARNING_OPERATION_SEQUENCE_METADATA: &str = "kit.operation_sequence";
+const LEARNING_ROUTE_METADATA: &str = "kit.learning_route";
 type CostEstimator = Arc<dyn Fn(&Value) -> Result<Spend, String> + Send + Sync>;
 
 #[derive(Clone)]
@@ -190,14 +206,51 @@ enum ToolInvocation {
     ),
     AuthRequired(crate::capabilities::broker::AuthChallenge),
     Failed(InvokeError),
+    TransportFailed(crate::protocols::mcp::transport::TransportError),
 }
 
 #[derive(Clone)]
 pub struct ToolExecutorAdapter {
-    bindings: BTreeMap<String, ToolBinding>,
+    bindings: Arc<Mutex<BTreeMap<String, ToolBinding>>>,
     context: ToolKernelContext,
     runtime: Arc<Mutex<KernelRuntime>>,
     mcp: Option<McpToolRuntime>,
+    discovery: Option<Arc<Mutex<DiscoveryToolRuntime>>>,
+    catalog_events: Arc<Mutex<Vec<ToolCatalogEvent>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DiscoveryAuthority {
+    pub constraints: ArgumentConstraints,
+    pub extension: crate::capabilities::kernel::grant_ext::RequestExtension,
+}
+
+pub(crate) struct ToolDiscoveryConfig {
+    pub catalog: CatalogSnapshot,
+    pub authorities: Vec<DiscoveryAuthority>,
+    pub provider: ProviderCapabilityContract,
+    pub telemetry: Option<Arc<crate::runtime::telemetry::TelemetryRuntime<'static>>>,
+    pub pointer_key: [u8; 32],
+}
+
+struct DiscoveryToolRuntime {
+    catalog: CatalogSnapshot,
+    authorities: Vec<DiscoveryAuthority>,
+    provider: ProviderCapabilityContract,
+    bound: BTreeMap<crate::capabilities::discovery::BindingId, Arc<CapabilityBinding>>,
+    hasher: ProjectPointerHasher,
+    opportunity: u64,
+    telemetry: Option<Arc<crate::runtime::telemetry::TelemetryRuntime<'static>>>,
+}
+
+struct EarlyLearningCall {
+    common: LearningCommon,
+    call: crate::telemetry::tool_learning::LearningPointer,
+    binding: Option<crate::telemetry::tool_learning::LearningPointer>,
+    source: Option<crate::telemetry::tool_learning::LearningPointer>,
+    kind: Option<LearningCapabilityKind>,
+    sequence: Option<crate::telemetry::tool_learning::LearningPointer>,
+    sequence_order: Option<u16>,
 }
 
 impl ToolExecutorAdapter {
@@ -214,17 +267,16 @@ impl ToolExecutorAdapter {
                 return Err(ToolAdapterError::DuplicateTool(name));
             }
         }
-        if by_name.is_empty() {
-            return Err(ToolAdapterError::EmptyCatalog);
-        }
         Ok(Self {
-            bindings: by_name,
+            bindings: Arc::new(Mutex::new(by_name)),
             context,
             runtime: Arc::new(Mutex::new(KernelRuntime {
                 store,
                 capability: Box::new(capability),
             })),
             mcp: None,
+            discovery: None,
+            catalog_events: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -242,17 +294,192 @@ impl ToolExecutorAdapter {
         self
     }
 
+    pub(crate) fn with_discovery(mut self, config: ToolDiscoveryConfig) -> Result<Self, String> {
+        let hasher = ProjectPointerHasher::new(self.context.project_id, &config.pointer_key);
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| "tool kernel runtime lock is poisoned".to_owned())?;
+        let mut recovered =
+            tool_learning::records(&runtime.store, self.context.config.run_id(), &hasher)
+                .map_err(|error| error.to_string())?;
+        let committed = runtime.store.events().map_err(|error| error.to_string())?;
+        let terminal_calls = recovered
+            .iter()
+            .filter_map(|event| match event {
+                ToolLearningEvent::Outcome { call, .. } => Some(call.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let resumable_calls = recovered
+            .iter()
+            .filter_map(|event| match event {
+                ToolLearningEvent::Error {
+                    call,
+                    retry: RetryClass::AuthorizationResume | RetryClass::UrlResume,
+                    ..
+                } => Some(call.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let incomplete = recovered
+            .iter()
+            .filter_map(|event| match event {
+                ToolLearningEvent::Call {
+                    common,
+                    call,
+                    kernel_intent: Some(kernel_intent),
+                    ..
+                } if !terminal_calls.contains(call) && !resumable_calls.contains(call) => {
+                    Some((common.clone(), call.clone(), kernel_intent.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (common, call, kernel_intent) in incomplete {
+            let Some(intent) = committed.iter().find(|stored| {
+                stored.event.event_type.as_str() == "capability.invocation_intent"
+                    && hasher.pointer(
+                        PointerDomain::KernelEvent,
+                        stored.event.id.to_string().as_bytes(),
+                    ) == kernel_intent
+            }) else {
+                continue;
+            };
+            let dispatched = committed.iter().any(|stored| {
+                stored.event.stream == intent.event.stream
+                    && stored.event.event_type.as_str() == "capability.invocation_dispatched"
+            });
+            if committed.iter().any(|stored| {
+                stored.event.stream == intent.event.stream
+                    && stored.event.event_type.as_str() == "capability.invocation_outcome"
+            }) {
+                continue;
+            }
+            if !dispatched {
+                continue;
+            }
+            let ordinal = tool_learning::next_ordinal(&runtime.store, self.context.config.run_id())
+                .map_err(|error| error.to_string())?;
+            let recovered_common = |ordinal, suffix: &[u8]| {
+                LearningCommon::new(
+                    &hasher,
+                    self.context.config.run_id(),
+                    ordinal,
+                    LearningOperation::Invoke,
+                    common.surface,
+                    suffix,
+                    common.request.clone(),
+                    common.capability.clone(),
+                    common.schema.clone(),
+                )
+            };
+            let events = [
+                ToolLearningEvent::Error {
+                    common: recovered_common(ordinal, b"recovered-incomplete-error"),
+                    call: call.clone(),
+                    stage: ErrorStage::Dispatch,
+                    class: ErrorClass::System,
+                    code: ErrorCode::OutcomeUnknown,
+                    field: None,
+                    retry: RetryClass::Unknown,
+                    dispatched: true,
+                    known: false,
+                },
+                ToolLearningEvent::Outcome {
+                    common: recovered_common(
+                        ordinal.saturating_add(1),
+                        b"recovered-incomplete-outcome",
+                    ),
+                    call,
+                    status: LearningStatus::OutcomeUnknown,
+                    dispatched: true,
+                    known: false,
+                    cost_microusd: None,
+                    kernel_outcome: None,
+                },
+            ];
+            tool_learning::append_many(
+                &mut runtime.store,
+                self.context.attempt,
+                self.context.claim,
+                &hasher,
+                UtcDateTime::now().map_err(|error| error.to_string())?,
+                TraceId::parse("tool-learning-recovery")
+                    .expect("tool-learning recovery trace ID is valid"),
+                &events,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        recovered = tool_learning::records(&runtime.store, self.context.config.run_id(), &hasher)
+            .map_err(|error| error.to_string())?;
+        if let Some(telemetry) = &config.telemetry {
+            let _ = telemetry.export_learning_outbox(&mut runtime.store, &hasher);
+        }
+        let opportunity = recovered
+            .iter()
+            .filter(|event| matches!(event, ToolLearningEvent::Opportunity { .. }))
+            .count() as u64;
+        let stored_bindings = runtime
+            .store
+            .discovery_bindings(hasher.project().as_str(), self.context.config.run_id())
+            .map_err(|error| error.to_string())?;
+        let mut discovery = DiscoveryToolRuntime {
+            catalog: config.catalog,
+            authorities: config.authorities,
+            provider: config.provider,
+            bound: BTreeMap::new(),
+            hasher,
+            opportunity,
+            telemetry: config.telemetry,
+        };
+        for stored in stored_bindings {
+            let id = crate::capabilities::discovery::BindingId::parse(&stored)
+                .map_err(|error| error.to_string())?;
+            let binding = discovery.authorities.iter().find_map(|authority| {
+                discovery.catalog.entries().iter().find_map(|entry| {
+                    discovery
+                        .session(&self.context, authority)
+                        .bind_identity(entry.identity())
+                        .filter(|binding| binding.id() == id)
+                })
+            });
+            let Some(binding) = binding else {
+                runtime
+                    .store
+                    .remove_discovery_binding(
+                        discovery.hasher.project().as_str(),
+                        self.context.config.run_id(),
+                        &stored,
+                    )
+                    .map_err(|error| error.to_string())?;
+                continue;
+            };
+            discovery.bound.insert(id, Arc::new(binding));
+        }
+        drop(runtime);
+        let mut tools = self
+            .bindings
+            .lock()
+            .map_err(|_| "tool binding lock is poisoned".to_owned())?;
+        for binding in discovery.bound.values() {
+            let wire_name = crate::capabilities::registration::direct_wire_name(binding.id());
+            tools.insert(
+                wire_name.clone(),
+                discovery_tool_binding(&discovery, &self.context, wire_name, Arc::clone(binding))?,
+            );
+        }
+        drop(tools);
+        self.discovery = Some(Arc::new(Mutex::new(discovery)));
+        Ok(self)
+    }
+
     fn execute_kernel(
         &self,
-        request: ToolRequest,
+        mut request: ToolRequest,
         ctx: KernelToolContext,
         approved: Option<&ApprovalRequest>,
     ) -> ToolExecutionOutcome {
-        let Some(binding) = self.bindings.get(&request.tool_name.0) else {
-            return ToolExecutionOutcome::FailedBeforeInvocation(ToolError::NotFound(
-                request.tool_name,
-            ));
-        };
         if request.session_id.0 != self.context.config.run_id().to_string()
             || ctx.session_id.as_ref() != Some(&request.session_id)
             || ctx.turn_id.as_ref() != Some(&request.turn_id)
@@ -283,12 +510,47 @@ impl ToolExecutorAdapter {
         if store.verify_driver_claim(self.context.claim).is_err() {
             return internal("tool attempt driver claim is stale");
         }
+        if let Some(discovery) = &self.discovery {
+            let mut discovery = match discovery.lock() {
+                Ok(discovery) => discovery,
+                Err(_) => return internal("tool discovery runtime lock is poisoned"),
+            };
+            match discovery.prepare(
+                &self.context,
+                store,
+                request,
+                &self.bindings,
+                &self.catalog_events,
+            ) {
+                Ok(DiscoveryPrepared::Completed(outcome)) => return outcome,
+                Ok(DiscoveryPrepared::Invoke(prepared)) => request = prepared,
+                Err(outcome) => return outcome,
+            }
+        }
+        let binding = match self.bindings.lock() {
+            Ok(bindings) => bindings.get(&request.tool_name.0).cloned(),
+            Err(_) => return internal("tool binding lock is poisoned"),
+        };
+        let Some(binding) = binding else {
+            return ToolExecutionOutcome::FailedBeforeInvocation(ToolError::NotFound(
+                request.tool_name,
+            ));
+        };
         let base_ids = match persisted_invocation_ids(store, self.context.attempt, &request.call_id)
             .and_then(|ids| {
                 ids.map_or_else(|| InvocationIds::mint(&self.context, &request, false), Ok)
             }) {
             Ok(ids) => ids,
-            Err(message) => return invalid_input(message),
+            Err(message) => {
+                return self.fail_before_kernel(
+                    store,
+                    &request,
+                    &binding,
+                    ErrorStage::Parsing,
+                    ErrorCode::MalformedInput,
+                    message,
+                );
+            }
         };
         let (ids, approval) = match approved {
             None => (base_ids, binding.approval),
@@ -308,21 +570,53 @@ impl ToolExecutorAdapter {
         };
         let arguments = match serde_json::to_vec(&request.input) {
             Ok(arguments) => arguments,
-            Err(error) => return invalid_input(error.to_string()),
+            Err(error) => {
+                return self.fail_before_kernel(
+                    store,
+                    &request,
+                    &binding,
+                    ErrorStage::Parsing,
+                    ErrorCode::MalformedInput,
+                    &error.to_string(),
+                );
+            }
         };
-        if arguments.len() > crate::capabilities::native::MAX_NATIVE_INPUT_BYTES {
-            return invalid_input("tool arguments exceed the trusted input byte limit");
-        }
-        let validator = match jsonschema::validator_for(&binding.spec.input_schema) {
-            Ok(validator) => validator,
-            Err(_) => return internal("bound tool schema is invalid"),
-        };
-        if !validator.is_valid(&request.input) {
-            return invalid_input("tool arguments do not match the bound Draft 2020-12 schema");
-        }
         let reservation = match binding.reservation(&request.input) {
             Ok(reservation) => reservation,
-            Err(error) => return invalid_input(error),
+            Err(error) => {
+                return self.fail_before_kernel(
+                    store,
+                    &request,
+                    &binding,
+                    ErrorStage::SchemaValidation,
+                    ErrorCode::InvalidSchema,
+                    &error,
+                );
+            }
+        };
+        let learning = match prepared_learning_capture(
+            self.discovery.as_ref(),
+            &self.context,
+            &request,
+            &binding,
+        ) {
+            Ok(learning) => learning,
+            Err(error) => {
+                let required = self.discovery.as_ref().is_some_and(|discovery| {
+                    discovery
+                        .lock()
+                        .ok()
+                        .and_then(|discovery| discovery.telemetry.clone())
+                        .is_some_and(|telemetry| {
+                            telemetry.mark_learning_failure(error.clone());
+                            telemetry.learning_required()
+                        })
+                });
+                if required {
+                    return internal(error);
+                }
+                None
+            }
         };
 
         let correlation = match tool_correlation(store, &self.context, &ids) {
@@ -341,7 +635,7 @@ impl ToolExecutorAdapter {
                 pending.approval,
             ));
         }
-        let binding_snapshot = binding_snapshot(binding, reservation);
+        let binding_snapshot = binding_snapshot(&binding, reservation);
         if let Err(error) = append_tool_journal(
             store,
             &self.context,
@@ -357,21 +651,6 @@ impl ToolExecutorAdapter {
                     input: request.input.clone(),
                     binding: binding_snapshot.clone(),
                 },
-            }),
-        ) {
-            return internal(error);
-        }
-        if matches!(
-            approval,
-            ApprovalState::NotRequired | ApprovalState::Approved
-        ) && let Err(error) = append_tool_journal(
-            store,
-            &self.context,
-            &correlation,
-            "dispatch",
-            LoopRecord::EffectDispatched(EffectDispatched {
-                kind: EffectKind::Tool,
-                correlation: correlation.clone(),
             }),
         ) {
             return internal(error);
@@ -404,6 +683,7 @@ impl ToolExecutorAdapter {
             outcome_event_id: ids.outcome_event_id,
             occurred_at: &ids.occurred_at,
             trace_id: &ids.trace_id,
+            learning: learning.as_ref(),
         };
         let result = if let Some(external) = &binding.external {
             let Some(mcp) = &self.mcp else {
@@ -459,7 +739,7 @@ impl ToolExecutorAdapter {
                 Ok(crate::capabilities::broker::BrokerOutcome::AuthRequired(challenge)) => {
                     ToolInvocation::AuthRequired(challenge)
                 }
-                Err(_) => ToolInvocation::Failed(InvokeError::BrokerAuth),
+                Err(error) => ToolInvocation::TransportFailed(error),
             }
         } else {
             let mut bounded_capability =
@@ -474,6 +754,20 @@ impl ToolExecutorAdapter {
             .map(|result| ToolInvocation::Completed(result, None))
             .unwrap_or_else(ToolInvocation::Failed)
         };
+        if kernel_dispatched(store, ids.invocation_id)
+            && let Err(error) = append_tool_journal(
+                store,
+                &self.context,
+                &correlation,
+                "dispatch",
+                LoopRecord::EffectDispatched(EffectDispatched {
+                    kind: EffectKind::Tool,
+                    correlation: correlation.clone(),
+                }),
+            )
+        {
+            return internal(error);
+        }
         match result {
             ToolInvocation::AuthRequired(challenge) => {
                 if let Err(error) = append_tool_journal(
@@ -503,17 +797,18 @@ impl ToolExecutorAdapter {
                     | InvocationStatus::ApprovalRequired
                     | InvocationStatus::ApprovalDenied => EffectStatus::Failed,
                 };
+                let outcome_record = LoopRecord::EffectOutcome(EffectOutcome {
+                    kind: EffectKind::Tool,
+                    correlation: correlation.clone(),
+                    status,
+                    snapshot: None,
+                });
                 if let Err(error) = append_tool_journal(
                     store,
                     &self.context,
                     &correlation,
                     "outcome",
-                    LoopRecord::EffectOutcome(EffectOutcome {
-                        kind: EffectKind::Tool,
-                        correlation: correlation.clone(),
-                        status,
-                        snapshot: None,
-                    }),
+                    outcome_record,
                 ) {
                     return internal(error);
                 }
@@ -577,8 +872,1172 @@ impl ToolExecutorAdapter {
                 }
                 map_invoke_error(error)
             }
+            ToolInvocation::TransportFailed(error) => {
+                if let Err(journal_error) = append_tool_journal(
+                    store,
+                    &self.context,
+                    &correlation,
+                    "outcome",
+                    LoopRecord::EffectOutcome(EffectOutcome {
+                        kind: EffectKind::Tool,
+                        correlation: correlation.clone(),
+                        status: transport_effect_status(&error, binding.retry_safety),
+                        snapshot: None,
+                    }),
+                ) {
+                    return internal(journal_error);
+                }
+                map_transport_error(error)
+            }
         }
     }
+
+    fn fail_before_kernel(
+        &self,
+        store: &mut SqliteStore,
+        request: &ToolRequest,
+        binding: &ToolBinding,
+        stage: ErrorStage,
+        code: ErrorCode,
+        message: &str,
+    ) -> ToolExecutionOutcome {
+        let Some(discovery) = &self.discovery else {
+            return invalid_input(message);
+        };
+        let discovery = match discovery.lock() {
+            Ok(discovery) => discovery,
+            Err(_) => return internal("tool discovery runtime lock is poisoned"),
+        };
+        let surface = learning_surface(request).unwrap_or(LearningSurface::Eager);
+        let call = discovery.call_common_bound(&self.context, store, request, surface, binding);
+        discovery.fail_call(
+            &self.context,
+            store,
+            &call,
+            surface,
+            stage,
+            ErrorClass::Input,
+            code,
+            None,
+        )
+    }
+}
+
+fn kernel_dispatched(store: &SqliteStore, invocation_id: ToolCallId) -> bool {
+    store.events().is_ok_and(|events| {
+        events.iter().any(|event| {
+            event.event.stream == crate::domain::events::EntityId::ToolCall(invocation_id)
+                && event.event.event_type.as_str() == "capability.invocation_dispatched"
+        })
+    })
+}
+
+enum DiscoveryPrepared {
+    Completed(ToolExecutionOutcome),
+    Invoke(ToolRequest),
+}
+
+#[allow(clippy::result_large_err)]
+impl DiscoveryToolRuntime {
+    fn capability_pointer(
+        &self,
+        identity: &CapabilityIdentity,
+    ) -> crate::telemetry::tool_learning::LearningPointer {
+        self.hasher.pointer(
+            PointerDomain::Capability,
+            &serde_json::to_vec(&capability_snapshot(identity))
+                .expect("capability pointer input is serializable"),
+        )
+    }
+
+    fn session<'a>(
+        &'a self,
+        context: &'a ToolKernelContext,
+        authority: &'a DiscoveryAuthority,
+    ) -> DiscoverySession<'a> {
+        DiscoverySession::new(
+            &self.catalog,
+            &context.authenticated,
+            &context.config,
+            &context.grants,
+            context.delegation.as_ref(),
+            context.workspace_id,
+            context.project_id,
+            &authority.constraints,
+            authority.extension.clone(),
+        )
+    }
+
+    fn binding_valid(&self, context: &ToolKernelContext, binding: &CapabilityBinding) -> bool {
+        self.authorities
+            .iter()
+            .any(|authority| binding.validate(&self.session(context, authority)).is_ok())
+    }
+
+    fn plan(
+        &self,
+        context: &ToolKernelContext,
+    ) -> Result<(BindingRegistry, RegistrationPlan), String> {
+        let registry = BindingRegistry::new(self.bound.values().cloned())
+            .map_err(|error| error.to_string())?;
+        let plan = registry
+            .plan_authorized(&self.provider, |binding| {
+                self.binding_valid(context, binding)
+            })
+            .map_err(|error| error.to_string())?;
+        Ok((registry, plan))
+    }
+
+    fn specs(
+        &self,
+        context: &ToolKernelContext,
+    ) -> Result<(Vec<ToolSpec>, RegistrationMode), String> {
+        if self.authorities.is_empty() {
+            return Ok((Vec::new(), RegistrationMode::PortableGeneric));
+        }
+        let (registry, plan) = self.plan(context)?;
+        let mode = plan.mode();
+        let mut specs = plan.eager_tools().to_vec();
+        if mode == RegistrationMode::Deferred {
+            specs.extend(
+                plan.deferred_tools_authorized(&registry, |binding| {
+                    self.binding_valid(context, binding)
+                })
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(|definition| definition.spec().clone()),
+            );
+        }
+        Ok((specs, mode))
+    }
+
+    fn search(
+        &self,
+        context: &ToolKernelContext,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::capabilities::discovery::SearchResult>, String> {
+        let mut results = Vec::new();
+        let mut seen = BTreeSet::new();
+        for authority in &self.authorities {
+            for result in self
+                .session(context, authority)
+                .search(query, crate::capabilities::discovery::MAX_SEARCH_RESULTS)
+                .map_err(|error| error.to_string())?
+            {
+                if seen.insert(result.handle()) {
+                    results.push(result);
+                }
+                if results.len() == limit {
+                    return Ok(results);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    fn inspect(
+        &self,
+        context: &ToolKernelContext,
+        handle: DiscoveryHandle,
+    ) -> Option<CapabilityInspection> {
+        self.authorities
+            .iter()
+            .find_map(|authority| self.session(context, authority).inspect(handle))
+    }
+
+    fn bind(
+        &self,
+        context: &ToolKernelContext,
+        inspection: &CapabilityInspection,
+    ) -> Option<CapabilityBinding> {
+        self.authorities
+            .iter()
+            .find_map(|authority| self.session(context, authority).bind(inspection).ok())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn common(
+        &self,
+        context: &ToolKernelContext,
+        store: &SqliteStore,
+        operation: LearningOperation,
+        surface: LearningSurface,
+        stable_key: &[u8],
+        capability: Option<crate::telemetry::tool_learning::LearningPointer>,
+        schema: Option<crate::telemetry::tool_learning::LearningPointer>,
+    ) -> LearningCommon {
+        self.common_at(
+            context,
+            tool_learning::next_ordinal(store, context.config.run_id()).unwrap_or(u64::MAX),
+            operation,
+            surface,
+            stable_key,
+            capability,
+            schema,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn common_at(
+        &self,
+        context: &ToolKernelContext,
+        ordinal: u64,
+        operation: LearningOperation,
+        surface: LearningSurface,
+        stable_key: &[u8],
+        capability: Option<crate::telemetry::tool_learning::LearningPointer>,
+        schema: Option<crate::telemetry::tool_learning::LearningPointer>,
+    ) -> LearningCommon {
+        LearningCommon::new(
+            &self.hasher,
+            context.config.run_id(),
+            ordinal,
+            operation,
+            surface,
+            stable_key,
+            None,
+            capability,
+            schema,
+        )
+    }
+
+    fn persist(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        event: ToolLearningEvent,
+    ) -> Result<(), String> {
+        self.persist_many(context, store, std::slice::from_ref(&event))?;
+        Ok(())
+    }
+
+    fn persist_many(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        events: &[ToolLearningEvent],
+    ) -> Result<(), String> {
+        self.persist_many_inner(context, store, events, false)
+    }
+
+    fn persist_many_strict(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        events: &[ToolLearningEvent],
+    ) -> Result<(), String> {
+        self.persist_many_inner(context, store, events, true)
+    }
+
+    fn persist_many_inner(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        events: &[ToolLearningEvent],
+        strict: bool,
+    ) -> Result<(), String> {
+        let appended = tool_learning::append_many(
+            store,
+            context.attempt,
+            context.claim,
+            &self.hasher,
+            UtcDateTime::now().map_err(|error| error.to_string())?,
+            TraceId::parse("tool-learning").expect("tool-learning trace ID is valid"),
+            events,
+        );
+        let appended = match appended {
+            Ok(appended) => appended,
+            Err(error) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.mark_learning_failure(error.to_string());
+                    if strict || telemetry.learning_required() {
+                        return Err(error.to_string());
+                    }
+                } else if strict {
+                    return Err(error.to_string());
+                }
+                return Ok(());
+            }
+        };
+        if matches!(
+            appended,
+            crate::store::sqlite::append::AppendOutcome::Committed(_)
+        ) && let Some(telemetry) = &self.telemetry
+        {
+            let _ = telemetry.export_learning_outbox(store, &self.hasher);
+        }
+        Ok(())
+    }
+
+    fn persist_bind(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        event: &ToolLearningEvent,
+        binding_id: &str,
+    ) -> Result<(), String> {
+        let appended = tool_learning::append_bind(
+            store,
+            context.attempt,
+            context.claim,
+            &self.hasher,
+            UtcDateTime::now().map_err(|error| error.to_string())?,
+            TraceId::parse("tool-learning").expect("tool-learning trace ID is valid"),
+            event,
+            binding_id,
+        );
+        let appended = match appended {
+            Ok(appended) => appended,
+            Err(error) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.mark_learning_failure(error.to_string());
+                }
+                return Err(error.to_string());
+            }
+        };
+        if matches!(
+            appended,
+            crate::store::sqlite::append::AppendOutcome::Committed(_)
+        ) && let Some(telemetry) = &self.telemetry
+        {
+            let _ = telemetry.export_learning_outbox(store, &self.hasher);
+        }
+        Ok(())
+    }
+
+    fn prepare(
+        &mut self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        request: ToolRequest,
+        bindings: &Arc<Mutex<BTreeMap<String, ToolBinding>>>,
+        catalog_events: &Arc<Mutex<Vec<ToolCatalogEvent>>>,
+    ) -> Result<DiscoveryPrepared, ToolExecutionOutcome> {
+        match request.tool_name.0.as_str() {
+            "tools_search" => self.execute_search(context, store, request),
+            "tools_inspect" => self.execute_inspect(context, store, request),
+            "tools_bind" => self.execute_bind(context, store, request, bindings, catalog_events),
+            "tools_invoke" => self.prepare_registered(context, store, request, true),
+            _ => {
+                let external = bindings
+                    .lock()
+                    .map_err(|_| internal("tool binding lock is poisoned"))?
+                    .get(&request.tool_name.0)
+                    .map(|binding| binding.external.is_some());
+                match external {
+                    Some(true) => self.prepare_registered(context, store, request, false),
+                    Some(false) => Ok(DiscoveryPrepared::Invoke(request)),
+                    None => {
+                        let call = self.call_common(
+                            context,
+                            store,
+                            &request,
+                            LearningSurface::Deferred,
+                            None,
+                        );
+                        Err(self.fail_call(
+                            context,
+                            store,
+                            &call,
+                            LearningSurface::Deferred,
+                            ErrorStage::Routing,
+                            ErrorClass::Input,
+                            ErrorCode::UnknownTool,
+                            None,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn execute_search(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        request: ToolRequest,
+    ) -> Result<DiscoveryPrepared, ToolExecutionOutcome> {
+        let parsed = search_input(&request.input);
+        let query = parsed.map(|(query, _)| query);
+        let query_pointer = self
+            .hasher
+            .pointer(PointerDomain::Query, query.unwrap_or_default().as_bytes());
+        let stable = format!("search:{}", request.call_id.0);
+        if parsed.is_none() {
+            let call = self.call_common(context, store, &request, LearningSurface::Discovery, None);
+            let ordinal = tool_learning::next_ordinal(store, context.config.run_id())
+                .map_err(|_| internal("tool-learning operation admission failed"))?;
+            let events = self.failure_events(
+                context,
+                ordinal,
+                &call,
+                LearningSurface::Discovery,
+                LearningOperation::Search,
+                ErrorStage::SchemaValidation,
+                ErrorClass::Input,
+                ErrorCode::InvalidSchema,
+                None,
+            );
+            self.persist_many_strict(context, store, &events)
+                .map_err(internal)?;
+            return Err(invalid_input("capability search input is invalid"));
+        }
+        let (query, limit) = parsed.expect("validated search input");
+        let results = self.search(context, query, limit);
+        let (status, count) = match &results {
+            Ok(results) => (LearningStatus::Succeeded, results.len()),
+            Err(_) => (LearningStatus::Failed, 0),
+        };
+        let event = ToolLearningEvent::Search {
+            common: self.common(
+                context,
+                store,
+                LearningOperation::Search,
+                LearningSurface::Discovery,
+                stable.as_bytes(),
+                None,
+                None,
+            ),
+            query: query_pointer,
+            status,
+            result_count: u16::try_from(count).unwrap_or(u16::MAX),
+            detail_artifact: None,
+        };
+        self.persist(context, store, event).map_err(internal)?;
+        let results = results.map_err(invalid_input)?;
+        let value = serde_json::json!({
+            "results": results.into_iter().map(|result| serde_json::json!({
+                "handle": result.handle().to_string(),
+                "name": result.identity().name().as_str(),
+                "namespace": result.identity().namespace().as_str(),
+                "summary": result.summary(),
+                "version": result.identity().version().as_str(),
+            })).collect::<Vec<_>>()
+        });
+        Ok(DiscoveryPrepared::Completed(discovery_completed(
+            request, value,
+        )))
+    }
+
+    fn execute_inspect(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        request: ToolRequest,
+    ) -> Result<DiscoveryPrepared, ToolExecutionOutcome> {
+        let handle_text = request
+            .input
+            .get("handle")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let handle_pointer = self
+            .hasher
+            .pointer(PointerDomain::Handle, handle_text.as_bytes());
+        let inspection = DiscoveryHandle::parse(handle_text)
+            .ok()
+            .and_then(|handle| self.inspect(context, handle));
+        let event = ToolLearningEvent::Inspection {
+            common: self.common(
+                context,
+                store,
+                LearningOperation::Inspect,
+                LearningSurface::Discovery,
+                format!("inspect:{}", request.call_id.0).as_bytes(),
+                inspection
+                    .as_ref()
+                    .map(|inspection| self.capability_pointer(inspection.definition().identity())),
+                inspection.as_ref().map(|inspection| {
+                    self.hasher.pointer(
+                        PointerDomain::Schema,
+                        inspection
+                            .definition()
+                            .schemas()
+                            .input()
+                            .schema()
+                            .source()
+                            .normalized_digest()
+                            .to_string()
+                            .as_bytes(),
+                    )
+                }),
+            ),
+            handle: handle_pointer,
+            status: if inspection.is_some() {
+                LearningStatus::Succeeded
+            } else {
+                LearningStatus::Unavailable
+            },
+        };
+        self.persist(context, store, event).map_err(internal)?;
+        let inspection =
+            inspection.ok_or_else(|| invalid_input("capability inspection is unavailable"))?;
+        let entry = inspection.definition();
+        let value = serde_json::json!({
+            "handle": inspection.handle().to_string(),
+            "identity": {
+                "name": entry.identity().name().as_str(),
+                "namespace": entry.identity().namespace().as_str(),
+                "version": entry.identity().version().as_str(),
+            },
+            "input_schema": crate::protocols::mcp::features::model_schema_projection(
+                entry.schemas().input().schema().value().clone()
+            ),
+            "summary": entry.search().summary(),
+        });
+        Ok(DiscoveryPrepared::Completed(discovery_completed(
+            request, value,
+        )))
+    }
+
+    fn execute_bind(
+        &mut self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        request: ToolRequest,
+        bindings: &Arc<Mutex<BTreeMap<String, ToolBinding>>>,
+        catalog_events: &Arc<Mutex<Vec<ToolCatalogEvent>>>,
+    ) -> Result<DiscoveryPrepared, ToolExecutionOutcome> {
+        let handle_text = request
+            .input
+            .get("handle")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let inspection = DiscoveryHandle::parse(handle_text)
+            .ok()
+            .and_then(|handle| self.inspect(context, handle));
+        let binding = inspection
+            .as_ref()
+            .and_then(|inspection| self.bind(context, inspection))
+            .map(Arc::new);
+        let event = ToolLearningEvent::Inspection {
+            common: self.common(
+                context,
+                store,
+                LearningOperation::Bind,
+                LearningSurface::Discovery,
+                format!("bind:{}", request.call_id.0).as_bytes(),
+                inspection
+                    .as_ref()
+                    .map(|inspection| self.capability_pointer(inspection.definition().identity())),
+                inspection.as_ref().map(|inspection| {
+                    self.hasher.pointer(
+                        PointerDomain::Schema,
+                        inspection
+                            .definition()
+                            .schemas()
+                            .input()
+                            .schema()
+                            .source()
+                            .normalized_digest()
+                            .to_string()
+                            .as_bytes(),
+                    )
+                }),
+            ),
+            handle: binding.as_ref().map_or_else(
+                || {
+                    self.hasher
+                        .pointer(PointerDomain::Handle, handle_text.as_bytes())
+                },
+                |binding| {
+                    self.hasher
+                        .pointer(PointerDomain::Binding, binding.id().to_string().as_bytes())
+                },
+            ),
+            status: if binding.is_some() {
+                LearningStatus::Succeeded
+            } else {
+                LearningStatus::Unavailable
+            },
+        };
+        let binding = match binding {
+            Some(binding) => binding,
+            None => {
+                let call =
+                    self.call_common(context, store, &request, LearningSurface::Discovery, None);
+                let ordinal = tool_learning::next_ordinal(store, context.config.run_id())
+                    .map_err(|_| internal("tool-learning operation admission failed"))?;
+                let mut failure = self.failure_events(
+                    context,
+                    ordinal + 1,
+                    &call,
+                    LearningSurface::Discovery,
+                    LearningOperation::Bind,
+                    ErrorStage::Authorization,
+                    ErrorClass::Policy,
+                    ErrorCode::BindingExpired,
+                    None,
+                );
+                let mut events = Vec::with_capacity(4);
+                events.push(event);
+                events.append(&mut failure);
+                self.persist_many_strict(context, store, &events)
+                    .map_err(internal)?;
+                return Err(invalid_input("capability binding is unavailable"));
+            }
+        };
+        let wire_name = crate::capabilities::registration::direct_wire_name(binding.id());
+        self.persist_bind(context, store, &event, &binding.id().to_string())
+            .map_err(internal)?;
+        self.bound.insert(binding.id(), Arc::clone(&binding));
+        bindings
+            .lock()
+            .map_err(|_| internal("tool binding lock is poisoned"))?
+            .insert(
+                wire_name.clone(),
+                discovery_tool_binding(self, context, wire_name.clone(), Arc::clone(&binding))
+                    .map_err(internal)?,
+            );
+        let (_, plan) = self.plan(context).map_err(internal)?;
+        if plan.mode() == RegistrationMode::Deferred {
+            let mut event = ToolCatalogEvent::new("kit.discovery");
+            event.added.push(wire_name.clone());
+            catalog_events
+                .lock()
+                .map_err(|_| internal("tool catalog event lock is poisoned"))?
+                .push(event);
+        }
+        Ok(DiscoveryPrepared::Completed(discovery_completed(
+            request,
+            serde_json::json!({
+                "binding_id": binding.id().to_string(),
+                "route": if plan.mode() == RegistrationMode::Deferred { wire_name } else { "tools_invoke".to_owned() },
+            }),
+        )))
+    }
+
+    fn prepare_registered(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        mut request: ToolRequest,
+        generic: bool,
+    ) -> Result<DiscoveryPrepared, ToolExecutionOutcome> {
+        let surface = if generic {
+            LearningSurface::Generic
+        } else {
+            LearningSurface::Deferred
+        };
+        request.metadata.insert(
+            LEARNING_SURFACE_METADATA.to_owned(),
+            Value::String(surface.as_str().to_owned()),
+        );
+        request.metadata.insert(
+            LEARNING_ROUTE_METADATA.to_owned(),
+            Value::String(request.tool_name.0.clone()),
+        );
+        let resolved = if generic {
+            request
+                .input
+                .get("binding_id")
+                .and_then(Value::as_str)
+                .and_then(|id| {
+                    self.bound
+                        .values()
+                        .find(|binding| binding.id().to_string() == id)
+                })
+        } else {
+            self.bound.values().find(|binding| {
+                crate::capabilities::registration::direct_wire_name(binding.id())
+                    == request.tool_name.0
+            })
+        };
+        let early_call = self.call_common(context, store, &request, surface, resolved);
+        let bytes = serde_json::to_vec(&request.input).map_err(|_| {
+            self.fail_call(
+                context,
+                store,
+                &early_call,
+                surface,
+                ErrorStage::Parsing,
+                ErrorClass::Input,
+                ErrorCode::MalformedInput,
+                None,
+            )
+        })?;
+        let (registry, plan) = self.plan(context).map_err(|_| {
+            self.fail_call(
+                context,
+                store,
+                &early_call,
+                surface,
+                ErrorStage::Authorization,
+                ErrorClass::Policy,
+                ErrorCode::BindingExpired,
+                None,
+            )
+        })?;
+        let call = if generic {
+            RegistrationCall::Portable(PortableInvokeCall::new(bytes))
+        } else {
+            RegistrationCall::Direct(DirectInvokeCall::new(request.tool_name.0.clone(), bytes))
+        };
+        let bound = plan
+            .invoke_authorized(&registry, call, |binding| {
+                self.binding_valid(context, binding)
+            })
+            .map_err(|error| {
+                let (stage, code) = match error {
+                    crate::capabilities::registration::InvocationError::SchemaInvalid(path) => {
+                        return self.fail_call(
+                            context,
+                            store,
+                            &early_call,
+                            surface,
+                            ErrorStage::SchemaValidation,
+                            ErrorClass::Input,
+                            ErrorCode::InvalidSchema,
+                            Some(&path),
+                        );
+                    }
+                    crate::capabilities::registration::InvocationError::SchemaUnsupported => {
+                        (ErrorStage::SchemaValidation, ErrorCode::UnsupportedSchema)
+                    }
+                    crate::capabilities::registration::InvocationError::BindingExpired => {
+                        (ErrorStage::Authorization, ErrorCode::BindingExpired)
+                    }
+                    crate::capabilities::registration::InvocationError::UnknownBinding => {
+                        (ErrorStage::Routing, ErrorCode::StaleBinding)
+                    }
+                    crate::capabilities::registration::InvocationError::UnknownWireName => {
+                        (ErrorStage::Routing, ErrorCode::UnknownTool)
+                    }
+                    _ => (ErrorStage::Parsing, ErrorCode::MalformedInput),
+                };
+                self.fail_call(
+                    context,
+                    store,
+                    &early_call,
+                    surface,
+                    stage,
+                    ErrorClass::Input,
+                    code,
+                    None,
+                )
+            })?;
+        let binding = self
+            .bound
+            .get(&bound.binding().id())
+            .expect("registration plan references a live binding");
+        let wire_name = crate::capabilities::registration::direct_wire_name(binding.id());
+        Ok(DiscoveryPrepared::Invoke(ToolRequest {
+            tool_name: agentkit_tools_core::ToolName::new(wire_name),
+            input: bound.context().input().clone(),
+            ..request
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_call(
+        &self,
+        context: &ToolKernelContext,
+        store: &mut SqliteStore,
+        call: &EarlyLearningCall,
+        surface: LearningSurface,
+        stage: ErrorStage,
+        class: ErrorClass,
+        code: ErrorCode,
+        instance_path: Option<&str>,
+    ) -> ToolExecutionOutcome {
+        let ordinal = match tool_learning::next_ordinal(store, context.config.run_id()) {
+            Ok(ordinal) => ordinal,
+            Err(error) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.mark_learning_failure(error.to_string());
+                    if telemetry.learning_required() {
+                        return internal("tool-learning operation admission failed");
+                    }
+                }
+                return invalid_input("registered capability call is invalid");
+            }
+        };
+        let events = self.failure_events(
+            context,
+            ordinal,
+            call,
+            surface,
+            LearningOperation::Invoke,
+            stage,
+            class,
+            code,
+            instance_path,
+        );
+        if self.persist_many_strict(context, store, &events).is_err() {
+            return internal("tool-learning failure persistence failed");
+        }
+        invalid_input("registered capability call is invalid")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn failure_events(
+        &self,
+        context: &ToolKernelContext,
+        ordinal: u64,
+        call: &EarlyLearningCall,
+        surface: LearningSurface,
+        operation: LearningOperation,
+        stage: ErrorStage,
+        class: ErrorClass,
+        code: ErrorCode,
+        instance_path: Option<&str>,
+    ) -> Vec<ToolLearningEvent> {
+        let call_event = ToolLearningEvent::Call {
+            common: self.common_at(
+                context,
+                ordinal,
+                operation,
+                surface,
+                format!("call:{}", call.call.as_str()).as_bytes(),
+                call.common.capability.clone(),
+                call.common.schema.clone(),
+            ),
+            call: call.call.clone(),
+            binding: call.binding.clone(),
+            source: call.source.clone(),
+            kind: call.kind,
+            sequence: call.sequence.clone(),
+            sequence_order: call.sequence_order,
+            kernel_intent: None,
+        };
+        let error = ToolLearningEvent::Error {
+            common: self.common_at(
+                context,
+                ordinal.saturating_add(1),
+                operation,
+                surface,
+                format!("error:{}:{stage:?}:{code:?}", call.call.as_str()).as_bytes(),
+                call.common.capability.clone(),
+                call.common.schema.clone(),
+            ),
+            call: call.call.clone(),
+            stage,
+            class,
+            code,
+            field: instance_path
+                .zip(call.common.schema.as_ref())
+                .map(|(path, schema)| {
+                    self.hasher.pointer(
+                        PointerDomain::Field,
+                        format!("{}:{path}", schema.as_str()).as_bytes(),
+                    )
+                }),
+            retry: RetryClass::Never,
+            dispatched: false,
+            known: true,
+        };
+        let outcome = ToolLearningEvent::Outcome {
+            common: self.common_at(
+                context,
+                ordinal.saturating_add(2),
+                operation,
+                surface,
+                format!("outcome:{}", call.call.as_str()).as_bytes(),
+                call.common.capability.clone(),
+                call.common.schema.clone(),
+            ),
+            call: call.call.clone(),
+            status: LearningStatus::Failed,
+            dispatched: false,
+            known: true,
+            cost_microusd: None,
+            kernel_outcome: None,
+        };
+        vec![call_event, error, outcome]
+    }
+
+    fn call_common(
+        &self,
+        context: &ToolKernelContext,
+        store: &SqliteStore,
+        request: &ToolRequest,
+        surface: LearningSurface,
+        binding: Option<&Arc<CapabilityBinding>>,
+    ) -> EarlyLearningCall {
+        let input = serde_json::to_vec(&request.input).unwrap_or_default();
+        let request_pointer = self.hasher.pointer(PointerDomain::Request, &input);
+        let mut identity = Vec::new();
+        let operation_sequence = request
+            .metadata
+            .get(LEARNING_OPERATION_SEQUENCE_METADATA)
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let run = self.hasher.pointer(
+            PointerDomain::Run,
+            context.config.run_id().to_string().as_bytes(),
+        );
+        let route = request
+            .metadata
+            .get(LEARNING_ROUTE_METADATA)
+            .and_then(Value::as_str)
+            .unwrap_or(&request.tool_name.0);
+        for value in [
+            run.as_str().as_bytes(),
+            request.turn_id.to_string().as_bytes(),
+            &operation_sequence.to_be_bytes(),
+            route.as_bytes(),
+            request.call_id.0.as_bytes(),
+            request_pointer.as_str().as_bytes(),
+        ] {
+            identity.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            identity.extend_from_slice(value);
+        }
+        let call = self.hasher.pointer(PointerDomain::Call, &identity);
+        let entry = binding.map(|binding| binding.pinned_entry());
+        let common = LearningCommon::new(
+            &self.hasher,
+            context.config.run_id(),
+            tool_learning::next_ordinal(store, context.config.run_id()).unwrap_or(u64::MAX),
+            LearningOperation::Invoke,
+            surface,
+            &identity,
+            Some(request_pointer),
+            entry.map(|entry| self.capability_pointer(entry.identity())),
+            entry.map(|entry| {
+                self.hasher.pointer(
+                    PointerDomain::Schema,
+                    entry
+                        .schemas()
+                        .input()
+                        .schema()
+                        .source()
+                        .normalized_digest()
+                        .to_string()
+                        .as_bytes(),
+                )
+            }),
+        );
+        let sequence_order = u16::try_from(operation_sequence.saturating_add(1)).ok();
+        let sequence = sequence_order.map(|_| {
+            self.hasher.pointer(
+                PointerDomain::Sequence,
+                format!("{}:{}", context.config.run_id(), request.turn_id).as_bytes(),
+            )
+        });
+        EarlyLearningCall {
+            common,
+            call,
+            binding: binding.map(|binding| {
+                self.hasher
+                    .pointer(PointerDomain::Binding, binding.id().to_string().as_bytes())
+            }),
+            source: entry.map(|entry| {
+                self.hasher.pointer(
+                    PointerDomain::Source,
+                    entry.identity().source().as_str().as_bytes(),
+                )
+            }),
+            kind: entry.map(|_| LearningCapabilityKind::Tool),
+            sequence,
+            sequence_order,
+        }
+    }
+
+    fn call_common_bound(
+        &self,
+        context: &ToolKernelContext,
+        store: &SqliteStore,
+        request: &ToolRequest,
+        surface: LearningSurface,
+        binding: &ToolBinding,
+    ) -> EarlyLearningCall {
+        let input = serde_json::to_vec(&request.input).unwrap_or_default();
+        let request_pointer = self.hasher.pointer(PointerDomain::Request, &input);
+        let operation_sequence = request
+            .metadata
+            .get(LEARNING_OPERATION_SEQUENCE_METADATA)
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let run = self.hasher.pointer(
+            PointerDomain::Run,
+            context.config.run_id().to_string().as_bytes(),
+        );
+        let route = request
+            .metadata
+            .get(LEARNING_ROUTE_METADATA)
+            .and_then(Value::as_str)
+            .unwrap_or(&request.tool_name.0);
+        let mut identity = Vec::new();
+        for value in [
+            run.as_str().as_bytes(),
+            request.turn_id.to_string().as_bytes(),
+            &operation_sequence.to_be_bytes(),
+            route.as_bytes(),
+            request.call_id.0.as_bytes(),
+            request_pointer.as_str().as_bytes(),
+        ] {
+            identity.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            identity.extend_from_slice(value);
+        }
+        let capability = self.hasher.pointer(
+            PointerDomain::Capability,
+            &serde_json::to_vec(&capability_snapshot(&binding.capability))
+                .expect("capability pointer input is serializable"),
+        );
+        let schema = self.hasher.pointer(
+            PointerDomain::Schema,
+            binding.bound_schema_digest.to_string().as_bytes(),
+        );
+        let sequence_order = u16::try_from(operation_sequence.saturating_add(1)).ok();
+        EarlyLearningCall {
+            common: LearningCommon::new(
+                &self.hasher,
+                context.config.run_id(),
+                tool_learning::next_ordinal(store, context.config.run_id()).unwrap_or(u64::MAX),
+                LearningOperation::Invoke,
+                surface,
+                &identity,
+                Some(request_pointer),
+                Some(capability),
+                Some(schema),
+            ),
+            call: self.hasher.pointer(PointerDomain::Call, &identity),
+            binding: Some(
+                self.hasher.pointer(
+                    PointerDomain::Binding,
+                    binding
+                        .external
+                        .as_ref()
+                        .map_or_else(
+                            || binding.capability.implementation_digest().to_string(),
+                            |external| external.id().to_string(),
+                        )
+                        .as_bytes(),
+                ),
+            ),
+            source: Some(self.hasher.pointer(
+                PointerDomain::Source,
+                binding.capability.source().as_str().as_bytes(),
+            )),
+            kind: Some(LearningCapabilityKind::Tool),
+            sequence: sequence_order.map(|_| {
+                self.hasher.pointer(
+                    PointerDomain::Sequence,
+                    format!("{}:{}", context.config.run_id(), request.turn_id).as_bytes(),
+                )
+            }),
+            sequence_order,
+        }
+    }
+}
+
+fn discovery_completed(request: ToolRequest, value: Value) -> ToolExecutionOutcome {
+    ToolExecutionOutcome::Completed(ToolResult::new(ToolResultPart {
+        call_id: request.call_id,
+        output: ToolOutput::Structured(value),
+        is_error: false,
+        metadata: MetadataMap::new(),
+    }))
+}
+
+fn search_input(input: &Value) -> Option<(&str, usize)> {
+    let input = input.as_object()?;
+    if input.len() != 2 || !input.contains_key("query") || !input.contains_key("limit") {
+        return None;
+    }
+    let query = input.get("query")?.as_str()?;
+    let limit = usize::try_from(input.get("limit")?.as_u64()?).ok()?;
+    (!query.is_empty()
+        && query.chars().count() <= 64
+        && query.len() <= crate::capabilities::discovery::MAX_SEARCH_QUERY_BYTES
+        && (1..=crate::capabilities::discovery::MAX_SEARCH_RESULTS).contains(&limit))
+    .then_some((query, limit))
+}
+
+fn discovery_tool_binding(
+    discovery: &DiscoveryToolRuntime,
+    context: &ToolKernelContext,
+    wire_name: String,
+    binding: Arc<CapabilityBinding>,
+) -> Result<ToolBinding, String> {
+    let authority = discovery
+        .authorities
+        .iter()
+        .find(|authority| {
+            binding
+                .validate(&discovery.session(context, authority))
+                .is_ok()
+        })
+        .ok_or_else(|| "discovery binding has no live authorization".to_owned())?;
+    Ok(ToolBinding::mcp(
+        ToolSpec::new(
+            agentkit_tools_core::ToolName::new(wire_name),
+            binding.pinned_entry().search().summary(),
+            crate::protocols::mcp::features::model_schema_projection(
+                binding
+                    .pinned_entry()
+                    .schemas()
+                    .input()
+                    .schema()
+                    .value()
+                    .clone(),
+            ),
+        ),
+        binding,
+        authority.constraints.clone(),
+        authority.extension.clone(),
+    ))
+}
+
+fn learning_surface(request: &ToolRequest) -> Option<LearningSurface> {
+    match request
+        .metadata
+        .get(LEARNING_SURFACE_METADATA)
+        .and_then(Value::as_str)
+    {
+        Some("generic") => Some(LearningSurface::Generic),
+        Some("deferred") => Some(LearningSurface::Deferred),
+        Some("eager") => Some(LearningSurface::Eager),
+        Some("discovery") => Some(LearningSurface::Discovery),
+        _ => None,
+    }
+}
+
+fn prepared_learning_capture(
+    discovery: Option<&Arc<Mutex<DiscoveryToolRuntime>>>,
+    context: &ToolKernelContext,
+    request: &ToolRequest,
+    binding: &ToolBinding,
+) -> Result<Option<PreparedLearningCapture>, String> {
+    let Some(discovery) = discovery else {
+        return Ok(None);
+    };
+    let operation_sequence = request
+        .metadata
+        .get(LEARNING_OPERATION_SEQUENCE_METADATA)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "provider tool call has no operation sequence".to_owned())?;
+    let discovery = discovery
+        .lock()
+        .map_err(|_| "tool discovery runtime lock is poisoned".to_owned())?;
+    let capability = serde_json::to_vec(&capability_snapshot(&binding.capability))
+        .map_err(|error| error.to_string())?;
+    let binding_identity = binding.external.as_ref().map_or_else(
+        || binding.capability.implementation_digest().to_string(),
+        |external| external.id().to_string(),
+    );
+    PreparedLearningCapture::new(
+        discovery.hasher.clone(),
+        context.config.run_id(),
+        request.turn_id.to_string(),
+        operation_sequence,
+        request
+            .metadata
+            .get(LEARNING_ROUTE_METADATA)
+            .and_then(Value::as_str)
+            .unwrap_or(&request.tool_name.0),
+        request.call_id.0.clone(),
+        &serde_json::to_vec(&request.input).map_err(|error| error.to_string())?,
+        learning_surface(request).unwrap_or(LearningSurface::Eager),
+        &capability,
+        binding.bound_schema_digest.to_string().as_bytes(),
+        Some(binding_identity.as_bytes()),
+        binding.capability.source().as_str().as_bytes(),
+        LearningCapabilityKind::Tool,
+    )
+    .map(|capture| capture.with_telemetry(discovery.telemetry.clone()))
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 fn resolved_mcp_auth(
@@ -729,10 +2188,131 @@ fn persisted_invocation_ids(
 
 impl ToolExecutor for ToolExecutorAdapter {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.bindings
+        let mut runtime = match self.runtime.lock() {
+            Ok(runtime) => runtime,
+            Err(_) => return Vec::new(),
+        };
+        let bindings = match self.bindings.lock() {
+            Ok(bindings) => bindings,
+            Err(_) => return Vec::new(),
+        };
+        let mut specs = bindings
             .values()
+            .filter(|binding| binding.external.is_none())
             .map(|binding| binding.spec.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        drop(bindings);
+        if let Some(discovery) = &self.discovery
+            && let Ok(mut discovery) = discovery.lock()
+            && let Ok((mut projected, mode)) = discovery.specs(&self.context)
+        {
+            specs.append(&mut projected);
+            specs.sort_by(|left, right| left.name.0.cmp(&right.name.0));
+            let projection = serde_json::to_vec(&specs).unwrap_or_default();
+            let offered_names = specs
+                .iter()
+                .map(|spec| spec.name.0.as_str())
+                .collect::<BTreeSet<_>>();
+            let generic_available = offered_names.contains("tools_invoke");
+            let candidates = self
+                .bindings
+                .lock()
+                .map(|bindings| {
+                    specs
+                        .iter()
+                        .filter_map(|spec| {
+                            if let Some(binding) = bindings.get(&spec.name.0) {
+                                return Some(LearningCandidate {
+                                    capability: discovery.capability_pointer(&binding.capability),
+                                    schema: discovery.hasher.pointer(
+                                        PointerDomain::Schema,
+                                        binding.bound_schema_digest.to_string().as_bytes(),
+                                    ),
+                                    surface: offered_candidate_surface(
+                                        binding.external.is_some(),
+                                        true,
+                                        mode,
+                                        generic_available,
+                                    )?,
+                                    authorized: true,
+                                    offered: true,
+                                });
+                            }
+                            (mode == RegistrationMode::PortableGeneric)
+                                .then(|| spec.metadata.get("kit.operation")?.as_str())
+                                .flatten()
+                                .map(|operation| LearningCandidate {
+                                    capability: discovery
+                                        .hasher
+                                        .pointer(PointerDomain::Capability, operation.as_bytes()),
+                                    schema: discovery.hasher.pointer(
+                                        PointerDomain::Schema,
+                                        &serde_json::to_vec(&spec.input_schema).unwrap_or_default(),
+                                    ),
+                                    surface: LearningSurface::Generic,
+                                    authorized: true,
+                                    offered: true,
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let offered = specs.len();
+            let generic = candidates
+                .iter()
+                .filter(|candidate| candidate.surface == LearningSurface::Generic)
+                .count();
+            if offered > usize::from(tool_learning::MAX_LEARNING_CANDIDATES) || generic > 4 {
+                if let Some(telemetry) = &discovery.telemetry {
+                    telemetry.mark_learning_failure("tool-learning candidate limit exceeded");
+                }
+                return specs;
+            }
+            let event = ToolLearningEvent::Opportunity {
+                common: discovery.common(
+                    &self.context,
+                    &runtime.store,
+                    LearningOperation::Projection,
+                    LearningSurface::Discovery,
+                    format!("opportunity:{}", discovery.opportunity).as_bytes(),
+                    None,
+                    None,
+                ),
+                offered: u16::try_from(offered).expect("offered set is bounded"),
+                eager: u16::try_from(
+                    candidates
+                        .iter()
+                        .filter(|candidate| candidate.surface == LearningSurface::Eager)
+                        .count(),
+                )
+                .unwrap_or(u16::MAX),
+                deferred: u16::try_from(
+                    candidates
+                        .iter()
+                        .filter(|candidate| candidate.surface == LearningSurface::Deferred)
+                        .count(),
+                )
+                .unwrap_or(u16::MAX),
+                generic_available,
+                projection: discovery.hasher.pointer(PointerDomain::Schema, &projection),
+                candidates,
+                detail_artifact: None,
+            };
+            if discovery
+                .persist(&self.context, &mut runtime.store, event)
+                .is_ok()
+            {
+                discovery.opportunity = discovery.opportunity.saturating_add(1);
+            }
+        }
+        specs
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        self.catalog_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
     }
 
     fn execute<'life0, 'life1, 'life2, 'async_trait>(
@@ -803,16 +2383,30 @@ impl ToolExecutor for ToolExecutorAdapter {
     }
 }
 
+fn offered_candidate_surface(
+    external: bool,
+    directly_offered: bool,
+    mode: RegistrationMode,
+    generic_available: bool,
+) -> Option<LearningSurface> {
+    match (external, mode) {
+        (false, _) if directly_offered => Some(LearningSurface::Eager),
+        (true, RegistrationMode::Deferred) if directly_offered => Some(LearningSurface::Deferred),
+        (true, RegistrationMode::PortableGeneric) if generic_available => {
+            Some(LearningSurface::Generic)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolAdapterError {
-    EmptyCatalog,
     DuplicateTool(String),
 }
 
 impl std::fmt::Display for ToolAdapterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyCatalog => formatter.write_str("tool catalog must not be empty"),
             Self::DuplicateTool(name) => write!(formatter, "duplicate tool binding: {name}"),
         }
     }
@@ -1315,6 +2909,73 @@ fn map_invoke_error(error: InvokeError) -> ToolExecutionOutcome {
     }
 }
 
+fn transport_effect_status(
+    error: &crate::protocols::mcp::transport::TransportError,
+    retry_safety: RetrySafety,
+) -> EffectStatus {
+    match error {
+        crate::protocols::mcp::transport::TransportError::Cancelled => EffectStatus::Cancelled,
+        crate::protocols::mcp::transport::TransportError::UrlElicitationUnavailable => {
+            EffectStatus::OutcomeUnknown
+        }
+        crate::protocols::mcp::transport::TransportError::AuthRequired(_) => {
+            EffectStatus::AuthRequired
+        }
+        error if retry_safety == RetrySafety::NonIdempotent && uncertain_transport(error) => {
+            EffectStatus::OutcomeUnknown
+        }
+        _ => EffectStatus::Failed,
+    }
+}
+
+fn map_transport_error(
+    error: crate::protocols::mcp::transport::TransportError,
+) -> ToolExecutionOutcome {
+    use crate::protocols::mcp::transport::TransportError;
+
+    let code = error.completion_code().to_owned();
+    match error {
+        TransportError::Cancelled => ToolExecutionOutcome::Failed(ToolError::Cancelled),
+        TransportError::AuthorizationMismatch
+        | TransportError::BindingExpired
+        | TransportError::PolicyAuthorizationMismatch
+        | TransportError::Broker(_)
+        | TransportError::Egress(_) => ToolExecutionOutcome::FailedBeforeInvocation(
+            ToolError::PermissionDenied(PermissionDenial {
+                code: PermissionCode::CustomPolicyDenied,
+                message: code,
+                metadata: MetadataMap::new(),
+            }),
+        ),
+        TransportError::AuthRequired(_)
+        | TransportError::Credential(_)
+        | TransportError::UrlElicitation { .. }
+        | TransportError::UrlElicitationUnavailable => {
+            ToolExecutionOutcome::Failed(ToolError::Unavailable(code))
+        }
+        TransportError::UrlElicitationDeclined => {
+            ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(code))
+        }
+        _ => ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(code)),
+    }
+}
+
+fn uncertain_transport(error: &crate::protocols::mcp::transport::TransportError) -> bool {
+    use crate::protocols::mcp::transport::TransportError;
+    matches!(
+        error,
+        TransportError::Timeout(_)
+            | TransportError::ConnectionRetired
+            | TransportError::Io(_)
+            | TransportError::Cleanup { .. }
+            | TransportError::SessionExpired
+            | TransportError::RefreshClosed
+            | TransportError::RefreshRetriesExhausted
+            | TransportError::OwnedProcessUnavailable
+            | TransportError::Agentkit(_)
+    )
+}
+
 fn invalid_input(message: impl Into<String>) -> ToolExecutionOutcome {
     ToolExecutionOutcome::FailedBeforeInvocation(ToolError::InvalidInput(message.into()))
 }
@@ -1343,4 +3004,75 @@ fn clip_utf8_bytes(bytes: &[u8], maximum: usize) -> (&[u8], bool) {
         end -= 1;
     }
     (&bytes[..end], true)
+}
+
+#[cfg(test)]
+mod discovery_input_tests {
+    use super::{offered_candidate_surface, search_input};
+    use crate::{
+        capabilities::registration::RegistrationMode, telemetry::tool_learning::LearningSurface,
+    };
+
+    #[test]
+    fn search_input_matches_the_advertised_closed_schema() {
+        assert_eq!(
+            search_input(&serde_json::json!({"query":"database", "limit":100})),
+            Some(("database", 100))
+        );
+        for invalid in [
+            serde_json::json!({"query":"database", "limit":0}),
+            serde_json::json!({"query":"database", "limit":101}),
+            serde_json::json!({"query":"database", "limit":1.5}),
+            serde_json::json!({"query":7, "limit":1}),
+            serde_json::json!({"query":"", "limit":1}),
+            serde_json::json!({"query":"x".repeat(65), "limit":1}),
+            serde_json::json!({"query":"database", "limit":1, "extra":true}),
+            serde_json::json!(["database", 1]),
+        ] {
+            assert_eq!(search_input(&invalid), None, "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn opportunity_surfaces_cover_native_direct_mcp_generic_and_hide_unoffered_bindings() {
+        let cases = [
+            (
+                false,
+                true,
+                RegistrationMode::Deferred,
+                false,
+                Some(LearningSurface::Eager),
+            ),
+            (
+                true,
+                true,
+                RegistrationMode::Deferred,
+                false,
+                Some(LearningSurface::Deferred),
+            ),
+            (
+                true,
+                true,
+                RegistrationMode::Deferred,
+                false,
+                Some(LearningSurface::Deferred),
+            ),
+            (
+                true,
+                false,
+                RegistrationMode::PortableGeneric,
+                true,
+                Some(LearningSurface::Generic),
+            ),
+            (false, false, RegistrationMode::Deferred, false, None),
+            (true, false, RegistrationMode::Deferred, false, None),
+            (true, false, RegistrationMode::PortableGeneric, false, None),
+        ];
+        assert_eq!(
+            cases.map(|(external, direct, mode, generic, _)| {
+                offered_candidate_surface(external, direct, mode, generic)
+            }),
+            cases.map(|(_, _, _, _, expected)| expected)
+        );
+    }
 }

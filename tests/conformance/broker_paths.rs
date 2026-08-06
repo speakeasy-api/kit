@@ -318,6 +318,7 @@ fn run_with_preexisting(
         outcome_event_id: inputs.outcome_event_id,
         occurred_at: &inputs.occurred_at,
         trace_id: &inputs.trace_id,
+        learning: None,
     };
     let request = match path {
         TestPath::Direct => BrokerInvocation::native(envelope),
@@ -518,6 +519,7 @@ fn auth_request_with<'a>(
             outcome_event_id: inputs.outcome_event_id,
             occurred_at: &inputs.occurred_at,
             trace_id: &inputs.trace_id,
+            learning: None,
         },
         schema,
     )

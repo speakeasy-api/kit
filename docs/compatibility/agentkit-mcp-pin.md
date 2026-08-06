@@ -5,7 +5,7 @@
 - Patch ID: `m006-mcp-protocol-revision-pin`
 - W07a snapshot SHA-256: `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`
 - Previous snapshot SHA-256: `cbcb095e304bbd2188524d0f1131061746aba5c3e592612b69371c73cf0c16c2`
-- Current snapshot SHA-256: `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4` (local overlays)
+- Current snapshot SHA-256: `776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49` (local overlays)
 - Upstream status: pending submission; upstream acceptance is non-blocking
 - Blocker closed locally: `BLK-05` (`docs/decisions/PRE-0005-protocol-revisions.md`)
 
@@ -142,10 +142,12 @@ The contiguous local-only W07c chain adds sanitized responder delivery,
 reconnect commit fencing, generation controls, durable callback accounting,
 provider usage normalization, and the Ollama output cap while retaining 357
 payload files. W08 adds exact URL-elicitation capability advertisement and
-produces current aggregate
-`5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4`.
+produced aggregate `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4`.
+W09 adds turn-monotonic operation sequencing and restart restoration, producing
+the current aggregate
+`776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49`.
 All overlay steps and their exact before/after file hashes are recorded in
 `src/protocols/mcp/agentkit_patch/manifest.yaml`; the snapshot manifest,
-metadata, pin document, build manifest, and `requirements/reports/m006-w08.md`
+metadata, pin document, build manifest, and `requirements/reports/m006-w09.md`
 carry the current aggregate.
 `vendor/agentkit/Cargo.lock` is unchanged; no new vendor dependency was added.

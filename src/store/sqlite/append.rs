@@ -3,14 +3,17 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+use serde::Serialize;
 
 use crate::api::service::AttemptDriverClaim;
 use crate::domain::commands::ExpectedVersion;
 use crate::domain::events::{
     CommitPosition, EntityId, EventType, SchemaVersion, StreamSequence, TraceId, UtcDateTime,
 };
-use crate::domain::ids::{AttemptId, CommandId, EventId};
+use crate::domain::ids::{AttemptId, CommandId, EventId, RunId};
 
 #[cfg(any(test, debug_assertions))]
 use super::idempotency::ClaimOutcome;
@@ -22,6 +25,33 @@ use super::idempotency::{insert_pending, insert_position, lookup, positions, set
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEMA_VERSION: i64 = 1;
+const TOOL_LEARNING_EVENT: &str = "tool_learning.recorded";
+const MAX_RETAINED_EXPORTED_LEARNING: i64 = 10_000;
+const MAX_LEARNING_OUTBOX_ROWS: i64 = 30_000;
+const MAX_PROJECT_LEARNING_OUTBOX_ROWS: i64 = 30_000;
+const RESERVED_TERMINAL_OUTBOX_ROWS: i64 = 20_000;
+const MAX_LEARNING_OUTBOX_BYTES: i64 = 128 * 1024 * 1024;
+const MAX_PROJECT_LEARNING_OUTBOX_BYTES: i64 = 128 * 1024 * 1024;
+const RESERVED_TERMINAL_OUTBOX_BYTES: i64 = 64 * 1024 * 1024;
+const MAX_LEARNING_MARKER_ROWS: i64 = 10_000;
+const MAX_PROJECT_LEARNING_MARKER_ROWS: i64 = 5_000;
+const MAX_LEARNING_MARKER_BYTES: i64 = 4 * 1024 * 1024;
+const MAX_PROJECT_LEARNING_MARKER_BYTES: i64 = 2 * 1024 * 1024;
+const RESERVED_TERMINAL_MARKER_ROWS: i64 = 2;
+const RESERVED_TERMINAL_MARKER_BYTES: i64 = 16 * 1024;
+const MAX_CATALOG_STATS_ROWS: i64 = 30_000;
+const MAX_PROJECT_CATALOG_STATS_ROWS: i64 = 10_000;
+const MAX_CATALOG_STATS_BYTES: i64 = 32 * 1024 * 1024;
+const MAX_PROJECT_CATALOG_STATS_BYTES: i64 = 16 * 1024 * 1024;
+const MAX_CATALOG_SNAPSHOT_ROWS: i64 = 30_000;
+const MAX_PROJECT_CATALOG_SNAPSHOT_ROWS: i64 = 10_000;
+const MAX_CATALOG_SNAPSHOT_BYTES: i64 = 64 * 1024 * 1024;
+const MAX_PROJECT_CATALOG_SNAPSHOT_BYTES: i64 = 32 * 1024 * 1024;
+const MAX_RETAINED_EXPORTED_SNAPSHOTS: i64 = 10_000;
+const MAX_DISCOVERY_BINDING_ROWS: i64 = 30_000;
+const MAX_PROJECT_DISCOVERY_BINDING_ROWS: i64 = 10_000;
+const MAX_DISCOVERY_BINDING_BYTES: i64 = 8 * 1024 * 1024;
+const MAX_PROJECT_DISCOVERY_BINDING_BYTES: i64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedStreamVersion {
@@ -49,6 +79,42 @@ pub struct StoredEvent {
     pub event: NewEvent,
     pub sequence: StreamSequence,
     pub commit_position: CommitPosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LearningOutboxRow {
+    pub cursor: u64,
+    pub frame_id: String,
+    pub event_id: EventId,
+    pub run_id: String,
+    pub project: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DurableCatalogStats {
+    pub project: String,
+    pub run: String,
+    pub binding: String,
+    pub attempts: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub outcome_unknown: u64,
+    pub source_event: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogStatsSnapshot {
+    pub project: String,
+    pub raw_run_id: RunId,
+    pub generation: u64,
+    pub overlay_digest: String,
+    pub frame_id: String,
+    pub payload_bytes: u64,
+    pub payload: Vec<u8>,
+    pub entries: Vec<DurableCatalogStats>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -326,7 +392,7 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        guard_driver_claim(&transaction, claim, false)?;
+        guard_driver_claim(&transaction, claim, true)?;
         let changed = transaction.execute(
             "UPDATE attempt_driver_claims SET quiescent = 1
              WHERE run_id = ?1 AND attempt_id = ?2 AND principal_id = ?3
@@ -339,7 +405,7 @@ impl SqliteStore {
                 i64::try_from(claim.lease_version).map_err(|_| StoreError::StaleDriverClaim)?,
             ],
         )?;
-        if changed != 1 {
+        if changed > 1 {
             return Err(StoreError::StaleDriverClaim);
         }
         transaction.commit()?;
@@ -400,7 +466,47 @@ impl SqliteStore {
     pub(crate) fn append_with_hook(
         &mut self,
         command: AppendCommand,
+        crash: impl FnMut(CrashPoint) -> bool,
+    ) -> Result<AppendOutcome, StoreError> {
+        self.append_with_options(command, crash, None, None)
+    }
+
+    pub(crate) fn append_with_discovery_binding(
+        &mut self,
+        command: AppendCommand,
+        project: &str,
+        run_id: RunId,
+        binding_id: &str,
+    ) -> Result<AppendOutcome, StoreError> {
+        self.append_with_options(
+            command,
+            |_| false,
+            Some((project, run_id, binding_id)),
+            None,
+        )
+    }
+
+    pub(crate) fn append_with_learning_reconciliation(
+        &mut self,
+        command: AppendCommand,
+        project: &str,
+        operation_id: &str,
+        required: bool,
+    ) -> Result<AppendOutcome, StoreError> {
+        self.append_with_options(
+            command,
+            |_| false,
+            None,
+            Some((project, operation_id, required)),
+        )
+    }
+
+    fn append_with_options(
+        &mut self,
+        command: AppendCommand,
         mut crash: impl FnMut(CrashPoint) -> bool,
+        discovery_binding: Option<(&str, RunId, &str)>,
+        reconciliation: Option<(&str, &str, bool)>,
     ) -> Result<AppendOutcome, StoreError> {
         validate_command(&command)?;
         let publication = self.pending_artifact_publication.take();
@@ -460,6 +566,10 @@ impl SqliteStore {
         }
 
         let mut committed_positions = Vec::with_capacity(command.events.len());
+        if reconciliation.is_none() {
+            admit_learning_outbox(&transaction, &command.events)?;
+        }
+        let mut reconciliation_range = None::<(i64, i64, i64, i64)>;
         for event in &command.events {
             let stream = event.stream.to_string();
             let sequence = versions.get_mut(&stream).ok_or(StoreError::InvalidRequest(
@@ -473,6 +583,28 @@ impl SqliteStore {
                 .ok_or(StoreError::PositionExhausted)?;
             ensure_event_absent(&transaction, event.id)?;
             insert_event_row(&transaction, event, *sequence, watermark)?;
+            if event.event_type.as_str() == TOOL_LEARNING_EVENT {
+                let learning: crate::telemetry::tool_learning::ToolLearningEvent =
+                    serde_json::from_slice(&event.payload)
+                        .map_err(|_| StoreError::InvalidRequest("invalid tool learning payload"))?;
+                if reconciliation.is_some() {
+                    let bytes = i64::try_from(event.payload.len())
+                        .map_err(|_| StoreError::PositionExhausted)?;
+                    reconciliation_range = Some(match reconciliation_range {
+                        Some((first, _, rows, total)) => (
+                            first,
+                            watermark,
+                            rows.checked_add(1).ok_or(StoreError::PositionExhausted)?,
+                            total
+                                .checked_add(bytes)
+                                .ok_or(StoreError::PositionExhausted)?,
+                        ),
+                        None => (watermark, watermark, 1, bytes),
+                    });
+                } else {
+                    insert_learning_indexes(&transaction, event, &learning)?;
+                }
+            }
             insert_position(
                 &transaction,
                 scope,
@@ -487,6 +619,12 @@ impl SqliteStore {
             inject(&mut crash, CrashPoint::AfterEventInsert)?;
         }
 
+        if let (Some((project, operation_id, required)), Some(range)) =
+            (reconciliation, reconciliation_range)
+        {
+            upsert_learning_marker(&transaction, project, operation_id, required, Some(range))?;
+        }
+
         for (stream, version) in versions {
             transaction.execute(
                 "UPDATE stream_heads SET version = ?2 WHERE stream = ?1",
@@ -499,6 +637,9 @@ impl SqliteStore {
             [watermark],
         )?;
         inject(&mut crash, CrashPoint::AfterWatermarkUpdate)?;
+        if let Some((project, run_id, binding_id)) = discovery_binding {
+            persist_discovery_binding(&transaction, project, run_id, binding_id)?;
+        }
         inject(&mut crash, CrashPoint::BeforeIdempotencyTerminal)?;
         if !set_terminal(&transaction, scope, key, &command.response)? {
             return Err(StoreError::CorruptData(
@@ -515,6 +656,19 @@ impl SqliteStore {
             response: command.response,
             commit_positions: committed_positions,
         }))
+    }
+
+    pub(crate) fn reserve_learning_reconciliation(
+        &mut self,
+        project: &str,
+        operation_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_learning_marker(&transaction, project, operation_id, true, None)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn arm_artifact_publication(
@@ -567,6 +721,78 @@ impl SqliteStore {
         rows.map(|row| decode_event(row?)).collect()
     }
 
+    pub(crate) fn invocation_was_dispatched(
+        &self,
+        invocation_id: crate::domain::ids::ToolCallId,
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events
+                 WHERE stream=?1 AND event_type='capability.invocation_dispatched'
+                   AND commit_position <= (SELECT position FROM commit_watermark WHERE singleton=1))",
+                [EntityId::ToolCall(invocation_id).to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn events_for_correlation(
+        &self,
+        correlation: EntityId,
+        event_type: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, stream, sequence, commit_position, event_type, schema_version,
+                    occurred_at, causation_id, correlation_id, attempt_id, trace_id,
+                    payload, artifacts
+             FROM events
+             WHERE correlation_id=?1 AND event_type=?2
+               AND commit_position <= (SELECT position FROM commit_watermark WHERE singleton=1)
+             ORDER BY commit_position LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                correlation.to_string(),
+                event_type,
+                i64::try_from(limit).map_err(|_| StoreError::PositionExhausted)?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u16>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, Vec<u8>>(12)?,
+                ))
+            },
+        )?;
+        rows.map(|row| decode_event(row?)).collect()
+    }
+
+    pub(crate) fn stream_version(&self, stream: EntityId) -> Result<u64, StoreError> {
+        let version = self
+            .connection
+            .query_row(
+                "SELECT version FROM stream_heads WHERE stream=?1",
+                [stream.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(0),
+                error => Err(error),
+            })?;
+        u64::try_from(version).map_err(|_| StoreError::CorruptData("negative stream version"))
+    }
+
     pub fn committed_through(&self) -> Result<u64, StoreError> {
         let position: i64 = self.connection.query_row(
             "SELECT position FROM commit_watermark WHERE singleton = 1",
@@ -575,6 +801,957 @@ impl SqliteStore {
         )?;
         u64::try_from(position).map_err(|_| StoreError::CorruptData("negative commit watermark"))
     }
+
+    pub fn pending_learning_outbox(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<LearningOutboxRow>, StoreError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(StoreError::InvalidRequest("invalid learning outbox limit"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT cursor,frame_id,event_id,run_id,project,payload
+             FROM tool_learning_outbox WHERE project=?1 AND exported=0 ORDER BY cursor LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                project,
+                i64::try_from(limit).map_err(|_| StoreError::PositionExhausted)?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )?;
+        rows.map(|row| {
+            let (cursor, frame_id, event_id, run_id, project, payload) = row?;
+            Ok(LearningOutboxRow {
+                cursor: u64::try_from(cursor)
+                    .map_err(|_| StoreError::CorruptData("invalid learning outbox cursor"))?,
+                frame_id,
+                event_id: event_id.parse().map_err(|_| {
+                    StoreError::CorruptData("invalid learning outbox event identifier")
+                })?,
+                run_id,
+                project,
+                payload,
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn pending_learning_projects(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT project FROM (
+                 SELECT project FROM tool_learning_outbox WHERE exported=0
+                 UNION SELECT project FROM tool_learning_reconciliation
+             ) ORDER BY project LIMIT 10001",
+        )?;
+        let projects = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if projects.len() > 10_000 {
+            return Err(StoreError::CorruptData(
+                "pending learning project capacity exceeded",
+            ));
+        }
+        Ok(projects)
+    }
+
+    pub(crate) fn reconcile_learning_markers(
+        &mut self,
+        project: &str,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(StoreError::InvalidRequest(
+                "invalid learning reconciliation limit",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut marker_statement = transaction.prepare(
+            "SELECT operation_id,first_position,last_position,row_count FROM tool_learning_reconciliation
+             WHERE project=?1 AND first_position IS NOT NULL
+             ORDER BY created_at,operation_id LIMIT ?2",
+        )?;
+        let markers = marker_statement
+            .query_map(
+                params![
+                    project,
+                    i64::try_from(limit).map_err(|_| StoreError::PositionExhausted)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(marker_statement);
+        if markers.is_empty() {
+            transaction.commit()?;
+            return Ok(0);
+        }
+        let mut reconciled = 0;
+        for (operation_id, first, last, expected_rows) in markers {
+            let mut statement = transaction.prepare(
+                "SELECT event_id,stream,sequence,commit_position,event_type,schema_version,
+                        occurred_at,causation_id,correlation_id,attempt_id,trace_id,payload,artifacts
+                 FROM events WHERE commit_position BETWEEN ?1 AND ?2 AND event_type=?3
+                 ORDER BY commit_position",
+            )?;
+            let additions = statement
+                .query_map(params![first, last, TOOL_LEARNING_EVENT], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u16>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Vec<u8>>(11)?,
+                        row.get::<_, Vec<u8>>(12)?,
+                    ))
+                })?
+                .map(|row| decode_event(row?).map(|stored| stored.event))
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            drop(statement);
+            if additions.len() != usize::try_from(expected_rows).unwrap_or(usize::MAX) {
+                return Err(StoreError::CorruptData(
+                    "learning reconciliation marker range mismatch",
+                ));
+            }
+            transaction.execute(
+                "DELETE FROM tool_learning_reconciliation WHERE operation_id=?1",
+                [&operation_id],
+            )?;
+            match admit_learning_outbox(&transaction, &additions) {
+                Ok(()) => {}
+                Err(StoreError::InvalidRequest(_)) => return Ok(0),
+                Err(error) => return Err(error),
+            }
+            for event in &additions {
+                let learning: crate::telemetry::tool_learning::ToolLearningEvent =
+                    serde_json::from_slice(&event.payload).map_err(|_| {
+                        StoreError::CorruptData("invalid durable tool learning payload")
+                    })?;
+                insert_learning_indexes(&transaction, event, &learning)?;
+            }
+            reconciled += 1;
+        }
+        transaction.commit()?;
+        Ok(reconciled)
+    }
+
+    pub(crate) fn has_learning_markers(&self, project: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tool_learning_reconciliation WHERE project=?1)",
+                [project],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn has_learning_marker(&self, operation_id: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tool_learning_reconciliation WHERE operation_id=?1)",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn claim_learning_export(
+        &mut self,
+        project: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now: i64 = transaction.query_row(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "DELETE FROM tool_learning_export_claims
+             WHERE project=?1 AND claimed_at < ?2",
+            params![project, now.saturating_sub(3_600_000_000)],
+        )?;
+        let token = EventId::generate()
+            .map_err(|_| StoreError::RandomnessUnavailable)?
+            .to_string();
+        let changed = transaction.execute(
+            "INSERT INTO tool_learning_export_claims (project,token,claimed_at)
+             VALUES (?1,?2,?3) ON CONFLICT(project) DO NOTHING",
+            params![project, token, now],
+        )?;
+        transaction.commit()?;
+        Ok((changed == 1).then_some(token))
+    }
+
+    pub(crate) fn release_learning_export(
+        &mut self,
+        project: &str,
+        token: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM tool_learning_export_claims WHERE project=?1 AND token=?2",
+            params![project, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn acknowledge_learning_outbox(
+        &mut self,
+        project: &str,
+        frame_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE tool_learning_outbox SET exported=1
+             WHERE project=?1 AND frame_id=?2 AND exported=0",
+            params![project, frame_id],
+        )?;
+        if changed > 1 {
+            return Err(StoreError::CorruptData("duplicate learning outbox frame"));
+        }
+        transaction.execute(
+            "DELETE FROM tool_learning_outbox
+             WHERE project=?1 AND exported=1 AND cursor <= COALESCE(
+               (SELECT MAX(cursor)-?2 FROM tool_learning_outbox
+                 WHERE project=?1 AND exported=1), 0)",
+            params![project, MAX_RETAINED_EXPORTED_LEARNING],
+        )?;
+        transaction.execute(
+            "DELETE FROM tool_learning_outbox
+             WHERE exported=1 AND cursor <= COALESCE(
+               (SELECT MAX(cursor)-?1 FROM tool_learning_outbox WHERE exported=1), 0)",
+            [MAX_RETAINED_EXPORTED_LEARNING],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn catalog_stats(&self, run: &str) -> Result<Vec<DurableCatalogStats>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT project,run_id,binding,attempts,succeeded,failed,cancelled,outcome_unknown,source_event,revision
+             FROM catalog_stats_overlay WHERE run_id=?1 ORDER BY binding",
+        )?;
+        let rows = statement.query_map([run], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                project,
+                run,
+                binding,
+                attempts,
+                succeeded,
+                failed,
+                cancelled,
+                outcome_unknown,
+                source_event,
+                revision,
+            ) = row?;
+            let value = |value| {
+                u64::try_from(value)
+                    .map_err(|_| StoreError::CorruptData("negative durable catalog statistic"))
+            };
+            Ok(DurableCatalogStats {
+                project,
+                run,
+                binding,
+                attempts: value(attempts)?,
+                succeeded: value(succeeded)?,
+                failed: value(failed)?,
+                cancelled: value(cancelled)?,
+                outcome_unknown: value(outcome_unknown)?,
+                source_event,
+                revision: value(revision)?,
+            })
+        })
+        .collect()
+    }
+
+    pub(crate) fn catalog_stats_snapshot(
+        &mut self,
+        raw_run_id: RunId,
+        run: &str,
+    ) -> Result<Option<CatalogStatsSnapshot>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_catalog_snapshots(&transaction)?;
+        if let Some((
+            stored_project,
+            generation,
+            overlay_digest,
+            row_count,
+            payload_bytes,
+            frame_id,
+        )) = transaction
+            .query_row(
+                "SELECT project,generation,overlay_digest,row_count,payload_bytes,frame_id
+                 FROM catalog_stats_snapshots
+                 WHERE raw_run_id=?1 AND status='pending' ORDER BY generation LIMIT 1",
+                [raw_run_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            let entries = catalog_snapshot_entries(&transaction, &frame_id)?;
+            let generation = u64::try_from(generation)
+                .map_err(|_| StoreError::CorruptData("invalid catalog snapshot generation"))?;
+            let snapshot =
+                catalog_snapshot(raw_run_id, generation, overlay_digest, frame_id, entries)?;
+            if snapshot.project != stored_project
+                || snapshot.entries.len() != usize::try_from(row_count).unwrap_or(usize::MAX)
+                || snapshot.payload_bytes != u64::try_from(payload_bytes).unwrap_or(u64::MAX)
+            {
+                return Err(StoreError::CorruptData(
+                    "catalog statistics snapshot metadata mismatch",
+                ));
+            }
+            transaction.commit()?;
+            return Ok(Some(snapshot));
+        }
+        let entries = catalog_stats_in(&transaction, run)?;
+        if entries.is_empty() {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let project = entries[0].project.clone();
+        if entries
+            .iter()
+            .any(|entry| entry.project != project || entry.run != run)
+        {
+            return Err(StoreError::CorruptData(
+                "catalog statistics snapshot crosses authorities",
+            ));
+        }
+        let generation: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(generation),0)+1 FROM catalog_stats_snapshots WHERE raw_run_id=?1",
+            [raw_run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if generation <= 0 {
+            return Err(StoreError::PositionExhausted);
+        }
+        let generation_u64 =
+            u64::try_from(generation).map_err(|_| StoreError::PositionExhausted)?;
+        let payload = catalog_stats_payload(run, generation_u64, &entries)?;
+        let digest = crate::domain::crypto::sha256(&payload);
+        let overlay_digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let frame_id = format!("catalog_stats_v1_{overlay_digest}");
+        let payload_bytes =
+            i64::try_from(payload.len()).map_err(|_| StoreError::PositionExhausted)?;
+        let (global_rows, global_bytes, project_rows, project_bytes): (i64, i64, i64, i64) =
+            transaction.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(payload_bytes),0),
+                        COALESCE(SUM(CASE WHEN project=?1 THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(CASE WHEN project=?1 THEN payload_bytes ELSE 0 END),0)
+                 FROM catalog_stats_snapshots",
+                [&project],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        if global_rows >= MAX_CATALOG_SNAPSHOT_ROWS
+            || project_rows >= MAX_PROJECT_CATALOG_SNAPSHOT_ROWS
+            || global_bytes.saturating_add(payload_bytes) > MAX_CATALOG_SNAPSHOT_BYTES
+            || project_bytes.saturating_add(payload_bytes) > MAX_PROJECT_CATALOG_SNAPSHOT_BYTES
+        {
+            return Err(StoreError::InvalidRequest(
+                "catalog statistics snapshot capacity exceeded",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO catalog_stats_snapshots
+             (project,raw_run_id,generation,overlay_digest,row_count,payload_bytes,frame_id,status)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'pending')",
+            params![
+                project,
+                raw_run_id.to_string(),
+                generation,
+                overlay_digest,
+                i64::try_from(entries.len()).map_err(|_| StoreError::PositionExhausted)?,
+                payload_bytes,
+                frame_id,
+            ],
+        )?;
+        for entry in &entries {
+            transaction.execute(
+                "INSERT INTO catalog_stats_snapshot_rows
+                 (frame_id,project,run_id,binding,attempts,succeeded,failed,cancelled,
+                  outcome_unknown,source_event,revision)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    frame_id,
+                    entry.project,
+                    entry.run,
+                    entry.binding,
+                    i64::try_from(entry.attempts).map_err(|_| StoreError::PositionExhausted)?,
+                    i64::try_from(entry.succeeded).map_err(|_| StoreError::PositionExhausted)?,
+                    i64::try_from(entry.failed).map_err(|_| StoreError::PositionExhausted)?,
+                    i64::try_from(entry.cancelled).map_err(|_| StoreError::PositionExhausted)?,
+                    i64::try_from(entry.outcome_unknown)
+                        .map_err(|_| StoreError::PositionExhausted)?,
+                    entry.source_event,
+                    i64::try_from(entry.revision).map_err(|_| StoreError::PositionExhausted)?,
+                ],
+            )?;
+        }
+        transaction.execute("DELETE FROM catalog_stats_overlay WHERE run_id=?1", [run])?;
+        transaction.commit()?;
+        Ok(Some(CatalogStatsSnapshot {
+            project,
+            raw_run_id,
+            generation: generation_u64,
+            overlay_digest,
+            frame_id,
+            payload_bytes: u64::try_from(payload_bytes)
+                .map_err(|_| StoreError::CorruptData("negative snapshot size"))?,
+            payload,
+            entries,
+        }))
+    }
+
+    pub(crate) fn pending_catalog_stats_runs(
+        &self,
+        project: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let scheduler_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !scheduler_exists {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT raw_run_id FROM (
+                 SELECT overlay.raw_run_id FROM catalog_stats_overlay AS overlay
+                 JOIN scheduler_runs AS run ON run.run_id=overlay.raw_run_id
+                 WHERE overlay.project=?1 AND run.phase IN ('terminal','canceled')
+                 UNION
+                 SELECT raw_run_id FROM catalog_stats_snapshots
+                 WHERE project=?1 AND status='pending'
+             ) ORDER BY raw_run_id LIMIT 10001",
+        )?;
+        let runs = statement
+            .query_map([project], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if runs.len() > 10_000 {
+            return Err(StoreError::CorruptData(
+                "pending catalog statistics run capacity exceeded",
+            ));
+        }
+        Ok(runs)
+    }
+
+    pub(crate) fn catalog_stats_run_terminal(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let scheduler_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !scheduler_exists {
+            return Ok(false);
+        }
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scheduler_runs
+                 WHERE run_id=?1 AND phase IN ('terminal','canceled'))",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn pending_catalog_stats_projects(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT project FROM (
+                 SELECT project FROM catalog_stats_overlay
+                 UNION SELECT project FROM catalog_stats_snapshots WHERE status='pending'
+             ) ORDER BY project LIMIT 10001",
+        )?;
+        let projects = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if projects.len() > 10_000 {
+            return Err(StoreError::CorruptData(
+                "pending catalog statistics project capacity exceeded",
+            ));
+        }
+        Ok(projects)
+    }
+
+    pub(crate) fn learning_backlog_drained(&self, project: &str) -> Result<bool, StoreError> {
+        let scheduler_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        let query = if scheduler_exists {
+            "SELECT
+               NOT EXISTS(SELECT 1 FROM tool_learning_outbox
+                          WHERE project=?1 AND exported=0)
+               AND NOT EXISTS(SELECT 1 FROM tool_learning_reconciliation
+                              WHERE project=?1)
+               AND NOT EXISTS(SELECT 1 FROM catalog_stats_snapshots
+                              WHERE project=?1 AND status='pending')
+               AND NOT EXISTS(
+                 SELECT 1 FROM catalog_stats_overlay AS overlay
+                 JOIN scheduler_runs AS run ON run.run_id=overlay.raw_run_id
+                 WHERE overlay.project=?1 AND run.phase IN ('terminal','canceled')
+               )"
+        } else {
+            "SELECT
+               NOT EXISTS(SELECT 1 FROM tool_learning_outbox
+                          WHERE project=?1 AND exported=0)
+               AND NOT EXISTS(SELECT 1 FROM tool_learning_reconciliation
+                              WHERE project=?1)
+               AND NOT EXISTS(SELECT 1 FROM catalog_stats_snapshots
+                              WHERE project=?1 AND status='pending')
+               AND NOT EXISTS(SELECT 1 FROM catalog_stats_overlay WHERE project=?1)"
+        };
+        self.connection
+            .query_row(query, [project], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn acknowledge_catalog_stats(
+        &mut self,
+        snapshot: &CatalogStatsSnapshot,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let terminal: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduler_runs
+             WHERE run_id=?1 AND phase IN ('terminal','canceled'))",
+            [snapshot.raw_run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !terminal || snapshot.entries.is_empty() {
+            return Err(StoreError::InvalidRequest(
+                "catalog statistics snapshot requires a terminal run",
+            ));
+        }
+        let stored: Option<(String, i64, i64, String, i64, String)> = transaction
+            .query_row(
+                "SELECT project,row_count,payload_bytes,frame_id,generation,status FROM catalog_stats_snapshots
+                 WHERE raw_run_id=?1 AND overlay_digest=?2",
+                params![snapshot.raw_run_id.to_string(), snapshot.overlay_digest],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()?;
+        let expected = (
+            snapshot.project.clone(),
+            i64::try_from(snapshot.entries.len()).map_err(|_| StoreError::PositionExhausted)?,
+            i64::try_from(snapshot.payload_bytes).map_err(|_| StoreError::PositionExhausted)?,
+            snapshot.frame_id.clone(),
+            i64::try_from(snapshot.generation).map_err(|_| StoreError::PositionExhausted)?,
+        );
+        let Some((project, rows, bytes, frame, generation, status)) = stored else {
+            return Err(StoreError::CorruptData(
+                "catalog statistics snapshot authority mismatch",
+            ));
+        };
+        if (project, rows, bytes, frame, generation) != expected {
+            return Err(StoreError::CorruptData(
+                "catalog statistics snapshot authority mismatch",
+            ));
+        }
+        if status == "exported" {
+            transaction.commit()?;
+            return Ok(true);
+        }
+        if status != "pending" {
+            return Err(StoreError::CorruptData(
+                "catalog statistics snapshot has invalid status",
+            ));
+        }
+        if catalog_snapshot_entries(&transaction, &snapshot.frame_id)? != snapshot.entries {
+            return Err(StoreError::CorruptData(
+                "catalog statistics snapshot rows changed",
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE catalog_stats_snapshots SET status='exported'
+             WHERE raw_run_id=?1 AND overlay_digest=?2 AND status='pending'",
+            params![snapshot.raw_run_id.to_string(), snapshot.overlay_digest],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(true);
+        }
+        transaction.execute(
+            "DELETE FROM catalog_stats_snapshot_rows WHERE frame_id=?1",
+            [&snapshot.frame_id],
+        )?;
+        prune_catalog_snapshots(&transaction)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_discovery_binding(
+        &mut self,
+        project: &str,
+        run_id: RunId,
+        binding_id: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        persist_discovery_binding(&transaction, project, run_id, binding_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn discovery_bindings(
+        &mut self,
+        project: &str,
+        run_id: RunId,
+    ) -> Result<Vec<String>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let scheduler_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_runs')",
+            [],
+            |row| row.get(0),
+        )?;
+        if scheduler_exists {
+            transaction.execute(
+                "DELETE FROM discovery_bindings
+                 WHERE run_id IN (SELECT run_id FROM scheduler_runs
+                                  WHERE phase IN ('terminal','canceled'))
+                   AND run_id<>?1",
+                [run_id.to_string()],
+            )?;
+        }
+        let mut statement = transaction.prepare(
+            "SELECT binding_id FROM discovery_bindings
+             WHERE project=?1 AND run_id=?2 ORDER BY binding_id LIMIT 10001",
+        )?;
+        let rows = statement.query_map(params![project, run_id.to_string()], |row| row.get(0))?;
+        let bindings = rows.collect::<Result<Vec<_>, _>>()?;
+        if bindings.len() > 10_000 {
+            return Err(StoreError::CorruptData(
+                "discovery binding capacity exceeded",
+            ));
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(bindings)
+    }
+
+    pub(crate) fn remove_discovery_binding(
+        &mut self,
+        project: &str,
+        run_id: RunId,
+        binding_id: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "DELETE FROM discovery_bindings
+             WHERE project=?1 AND run_id=?2 AND binding_id=?3",
+            params![project, run_id.to_string(), binding_id],
+        )?;
+        Ok(())
+    }
+}
+
+fn catalog_stats_in(
+    transaction: &Transaction<'_>,
+    run: &str,
+) -> Result<Vec<DurableCatalogStats>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT project,run_id,binding,attempts,succeeded,failed,cancelled,outcome_unknown,
+                source_event,revision
+         FROM catalog_stats_overlay WHERE run_id=?1 ORDER BY binding",
+    )?;
+    let rows = statement.query_map([run], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            project,
+            run,
+            binding,
+            attempts,
+            succeeded,
+            failed,
+            cancelled,
+            outcome_unknown,
+            source_event,
+            revision,
+        ) = row?;
+        let value = |value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::CorruptData("negative durable catalog statistic"))
+        };
+        Ok(DurableCatalogStats {
+            project,
+            run,
+            binding,
+            attempts: value(attempts)?,
+            succeeded: value(succeeded)?,
+            failed: value(failed)?,
+            cancelled: value(cancelled)?,
+            outcome_unknown: value(outcome_unknown)?,
+            source_event,
+            revision: value(revision)?,
+        })
+    })
+    .collect()
+}
+
+fn catalog_snapshot_entries(
+    transaction: &Transaction<'_>,
+    frame_id: &str,
+) -> Result<Vec<DurableCatalogStats>, StoreError> {
+    let mut statement = transaction.prepare(
+        "SELECT project,run_id,binding,attempts,succeeded,failed,cancelled,outcome_unknown,
+                source_event,revision FROM catalog_stats_snapshot_rows
+         WHERE frame_id=?1 ORDER BY binding",
+    )?;
+    let rows = statement.query_map([frame_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (
+            project,
+            run,
+            binding,
+            attempts,
+            succeeded,
+            failed,
+            cancelled,
+            outcome_unknown,
+            source_event,
+            revision,
+        ) = row?;
+        let value = |value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::CorruptData("negative durable catalog statistic"))
+        };
+        Ok(DurableCatalogStats {
+            project,
+            run,
+            binding,
+            attempts: value(attempts)?,
+            succeeded: value(succeeded)?,
+            failed: value(failed)?,
+            cancelled: value(cancelled)?,
+            outcome_unknown: value(outcome_unknown)?,
+            source_event,
+            revision: value(revision)?,
+        })
+    })
+    .collect()
+}
+
+fn catalog_stats_payload(
+    run: &str,
+    generation: u64,
+    entries: &[DurableCatalogStats],
+) -> Result<Vec<u8>, StoreError> {
+    serde_json::to_vec(&serde_json::json!({
+        "format": "tool_learning.catalog_stats.v1",
+        "run": run,
+        "generation": generation,
+        "entries": entries.iter().map(|entry| serde_json::json!({
+            "binding": entry.binding,
+            "attempts": entry.attempts,
+            "succeeded": entry.succeeded,
+            "failed": entry.failed,
+            "cancelled": entry.cancelled,
+            "outcome_unknown": entry.outcome_unknown,
+            "source_event": entry.source_event,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(|_| StoreError::CorruptData("catalog statistics snapshot is invalid"))
+}
+
+fn catalog_snapshot(
+    raw_run_id: RunId,
+    generation: u64,
+    overlay_digest: String,
+    frame_id: String,
+    entries: Vec<DurableCatalogStats>,
+) -> Result<CatalogStatsSnapshot, StoreError> {
+    let first = entries.first().ok_or(StoreError::CorruptData(
+        "catalog snapshot has no immutable rows",
+    ))?;
+    if entries
+        .iter()
+        .any(|entry| entry.project != first.project || entry.run != first.run)
+    {
+        return Err(StoreError::CorruptData(
+            "catalog statistics snapshot crosses authorities",
+        ));
+    }
+    let project = first.project.clone();
+    let payload = catalog_stats_payload(&first.run, generation, &entries)?;
+    let expected = crate::domain::crypto::sha256(&payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if expected != overlay_digest || frame_id != format!("catalog_stats_v1_{expected}") {
+        return Err(StoreError::CorruptData(
+            "catalog statistics snapshot digest mismatch",
+        ));
+    }
+    Ok(CatalogStatsSnapshot {
+        project,
+        raw_run_id,
+        generation,
+        overlay_digest,
+        frame_id,
+        payload_bytes: payload.len() as u64,
+        payload,
+        entries,
+    })
+}
+
+fn prune_catalog_snapshots(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction.execute(
+        "DELETE FROM catalog_stats_snapshots
+         WHERE status IN ('exported','superseded') AND rowid NOT IN (
+             SELECT rowid FROM catalog_stats_snapshots
+             WHERE status IN ('exported','superseded') ORDER BY rowid DESC LIMIT ?1
+         )",
+        [MAX_RETAINED_EXPORTED_SNAPSHOTS],
+    )?;
+    Ok(())
+}
+
+fn persist_discovery_binding(
+    transaction: &Transaction<'_>,
+    project: &str,
+    run_id: RunId,
+    binding_id: &str,
+) -> Result<(), StoreError> {
+    let run = run_id.to_string();
+    let scheduler_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_runs')",
+        [],
+        |row| row.get(0),
+    )?;
+    if scheduler_exists {
+        transaction.execute(
+            "DELETE FROM discovery_bindings
+             WHERE run_id IN (SELECT run_id FROM scheduler_runs
+                              WHERE phase IN ('terminal','canceled'))
+               AND run_id<>?1",
+            [&run],
+        )?;
+    }
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM discovery_bindings
+         WHERE project=?1 AND run_id=?2 AND binding_id=?3)",
+        params![project, run, binding_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        let (global_rows, project_rows, run_rows, global_bytes, project_bytes):
+            (i64, i64, i64, i64, i64) = transaction.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN project=?1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN project=?1 AND run_id=?2 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(length(project)+length(run_id)+length(binding_id)),0),
+                    COALESCE(SUM(CASE WHEN project=?1 THEN length(project)+length(run_id)+length(binding_id) ELSE 0 END),0)
+             FROM discovery_bindings",
+            params![project, run],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        let added_bytes = i64::try_from(project.len() + run.len() + binding_id.len())
+            .map_err(|_| StoreError::PositionExhausted)?;
+        if global_rows >= MAX_DISCOVERY_BINDING_ROWS
+            || project_rows >= MAX_PROJECT_DISCOVERY_BINDING_ROWS
+            || run_rows >= 10_000
+            || global_bytes.saturating_add(added_bytes) > MAX_DISCOVERY_BINDING_BYTES
+            || project_bytes.saturating_add(added_bytes) > MAX_PROJECT_DISCOVERY_BINDING_BYTES
+        {
+            return Err(StoreError::InvalidRequest(
+                "discovery binding capacity exceeded",
+            ));
+        }
+    }
+    transaction.execute(
+        "INSERT INTO discovery_bindings (project,run_id,binding_id,created_at)
+         VALUES (?1,?2,?3,CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER))
+         ON CONFLICT(project,run_id,binding_id) DO NOTHING",
+        params![project, run, binding_id],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn append_canonical_event(
@@ -811,13 +1988,558 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
              expires_at_unix_micros INTEGER NOT NULL CHECK (expires_at_unix_micros >= 0),
               quiescent INTEGER NOT NULL DEFAULT 0 CHECK (quiescent IN (0, 1))
           );
-          CREATE TABLE IF NOT EXISTS artifact_publication_journal (
+           CREATE TABLE IF NOT EXISTS artifact_publication_journal (
               artifact_reference TEXT PRIMARY KEY, artifact_digest TEXT NOT NULL,
               purpose TEXT NOT NULL, subject_id TEXT NOT NULL, principal_id TEXT NOT NULL,
-              project_id TEXT NOT NULL, run_id TEXT NOT NULL
-          );",
+               project_id TEXT NOT NULL, run_id TEXT NOT NULL
+           );
+           CREATE TABLE IF NOT EXISTS tool_learning_outbox (
+               cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+               frame_id TEXT NOT NULL UNIQUE,
+               event_id TEXT NOT NULL UNIQUE,
+               run_id TEXT NOT NULL,
+               project TEXT NOT NULL,
+               payload BLOB NOT NULL,
+               exported INTEGER NOT NULL DEFAULT 0 CHECK (exported IN (0, 1))
+           );
+           CREATE TABLE IF NOT EXISTS catalog_stats_overlay (
+               project TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               raw_run_id TEXT NOT NULL DEFAULT '',
+               binding TEXT NOT NULL,
+               attempts INTEGER NOT NULL CHECK (attempts >= 0),
+               succeeded INTEGER NOT NULL CHECK (succeeded >= 0),
+               failed INTEGER NOT NULL CHECK (failed >= 0),
+               cancelled INTEGER NOT NULL CHECK (cancelled >= 0),
+               outcome_unknown INTEGER NOT NULL CHECK (outcome_unknown >= 0),
+               source_event TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+               PRIMARY KEY (run_id,binding)
+           );
+           CREATE TABLE IF NOT EXISTS catalog_stats_snapshots (
+               project TEXT NOT NULL,
+               raw_run_id TEXT NOT NULL,
+               generation INTEGER NOT NULL CHECK (generation > 0),
+               overlay_digest TEXT NOT NULL,
+               row_count INTEGER NOT NULL CHECK (row_count > 0),
+               payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
+               frame_id TEXT NOT NULL UNIQUE,
+               status TEXT NOT NULL CHECK (status IN ('pending','exported','superseded')),
+               PRIMARY KEY (raw_run_id,overlay_digest)
+           );
+           CREATE TABLE IF NOT EXISTS catalog_stats_snapshot_rows (
+               frame_id TEXT NOT NULL REFERENCES catalog_stats_snapshots(frame_id),
+               project TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               binding TEXT NOT NULL,
+               attempts INTEGER NOT NULL CHECK (attempts >= 0),
+               succeeded INTEGER NOT NULL CHECK (succeeded >= 0),
+               failed INTEGER NOT NULL CHECK (failed >= 0),
+               cancelled INTEGER NOT NULL CHECK (cancelled >= 0),
+               outcome_unknown INTEGER NOT NULL CHECK (outcome_unknown >= 0),
+               source_event TEXT NOT NULL,
+               revision INTEGER NOT NULL CHECK (revision > 0),
+               PRIMARY KEY (frame_id,binding)
+           );
+           CREATE TABLE IF NOT EXISTS discovery_bindings (
+               project TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               binding_id TEXT NOT NULL,
+               created_at INTEGER NOT NULL DEFAULT 0 CHECK (created_at >= 0),
+               PRIMARY KEY (project,run_id,binding_id)
+           );
+           CREATE TABLE IF NOT EXISTS tool_learning_export_claims (
+               project TEXT PRIMARY KEY,
+               token TEXT NOT NULL UNIQUE,
+               claimed_at INTEGER NOT NULL CHECK (claimed_at >= 0)
+           );
+           CREATE TABLE IF NOT EXISTS tool_learning_reconciliation (
+               operation_id TEXT PRIMARY KEY,
+               project TEXT NOT NULL,
+               first_position INTEGER,
+               last_position INTEGER,
+               row_count INTEGER NOT NULL CHECK (row_count > 0),
+               payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
+               required INTEGER NOT NULL CHECK (required IN (0,1)),
+               created_at INTEGER NOT NULL CHECK (created_at >= 0),
+               CHECK ((first_position IS NULL) = (last_position IS NULL))
+           );",
     )?;
+    let has_learning_project: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tool_learning_outbox') WHERE name='project')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_learning_project {
+        transaction.execute_batch(
+            "ALTER TABLE tool_learning_outbox
+             ADD COLUMN project TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    let has_raw_stats_run: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('catalog_stats_overlay')
+         WHERE name='raw_run_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_raw_stats_run {
+        transaction.execute_batch(
+            "ALTER TABLE catalog_stats_overlay
+             ADD COLUMN raw_run_id TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+    let has_stats_revision: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('catalog_stats_overlay')
+         WHERE name='revision')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_stats_revision {
+        transaction.execute_batch(
+            "ALTER TABLE catalog_stats_overlay
+             ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0);",
+        )?;
+    }
+    let content_addressed_snapshots: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('catalog_stats_snapshots')
+         WHERE name='overlay_digest')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !content_addressed_snapshots {
+        transaction.execute_batch(
+            "ALTER TABLE catalog_stats_snapshots RENAME TO catalog_stats_snapshots_legacy;
+             CREATE TABLE catalog_stats_snapshots (
+                 project TEXT NOT NULL,
+                 raw_run_id TEXT NOT NULL,
+                 generation INTEGER NOT NULL CHECK (generation > 0),
+                 overlay_digest TEXT NOT NULL,
+                 row_count INTEGER NOT NULL CHECK (row_count > 0),
+                 payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
+                 frame_id TEXT NOT NULL UNIQUE,
+                 status TEXT NOT NULL CHECK (status IN ('pending','exported','superseded')),
+                 PRIMARY KEY (raw_run_id,overlay_digest)
+             );
+             INSERT INTO catalog_stats_snapshots
+                 (project,raw_run_id,generation,overlay_digest,row_count,payload_bytes,frame_id,status)
+             SELECT '',raw_run_id,1,frame_id,1,1,frame_id,'exported'
+             FROM catalog_stats_snapshots_legacy;
+             DROP TABLE catalog_stats_snapshots_legacy;",
+        )?;
+    }
+    let has_snapshot_generation: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('catalog_stats_snapshots')
+         WHERE name='generation')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_snapshot_generation {
+        transaction.execute_batch(
+            "ALTER TABLE catalog_stats_snapshots
+             ADD COLUMN generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0);
+             UPDATE catalog_stats_snapshots SET status='superseded' WHERE status='pending';",
+        )?;
+    }
+    let compact_learning_markers: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tool_learning_reconciliation')
+         WHERE name='operation_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !compact_learning_markers {
+        transaction.execute_batch(
+            "ALTER TABLE tool_learning_reconciliation RENAME TO tool_learning_reconciliation_legacy;
+             CREATE TABLE tool_learning_reconciliation (
+                 operation_id TEXT PRIMARY KEY,
+                 project TEXT NOT NULL,
+                 first_position INTEGER,
+                 last_position INTEGER,
+                 row_count INTEGER NOT NULL CHECK (row_count > 0),
+                 payload_bytes INTEGER NOT NULL CHECK (payload_bytes > 0),
+                 required INTEGER NOT NULL CHECK (required IN (0,1)),
+                 created_at INTEGER NOT NULL CHECK (created_at >= 0),
+                 CHECK ((first_position IS NULL) = (last_position IS NULL))
+             );
+             INSERT INTO tool_learning_reconciliation
+                 (operation_id,project,first_position,last_position,row_count,payload_bytes,required,created_at)
+             SELECT MIN(marker.event_id),marker.project,MIN(event.commit_position),MAX(event.commit_position),
+                    COUNT(*),SUM(length(event.payload)),0,MIN(event.commit_position)
+             FROM tool_learning_reconciliation_legacy AS marker
+             JOIN events AS event ON event.event_id=marker.event_id
+             GROUP BY marker.project,event.stream;
+             DROP TABLE tool_learning_reconciliation_legacy;",
+        )?;
+    }
+    let has_binding_created_at: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('discovery_bindings')
+         WHERE name='created_at')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_binding_created_at {
+        transaction.execute_batch(
+            "ALTER TABLE discovery_bindings
+             ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0 CHECK (created_at >= 0);",
+        )?;
+    }
     transaction.commit()?;
+    Ok(())
+}
+
+fn marker_bytes(project: &str, operation_id: &str) -> Result<i64, StoreError> {
+    i64::try_from(project.len() + operation_id.len() + 64)
+        .map_err(|_| StoreError::PositionExhausted)
+}
+
+fn upsert_learning_marker(
+    transaction: &Transaction<'_>,
+    project: &str,
+    operation_id: &str,
+    required: bool,
+    range: Option<(i64, i64, i64, i64)>,
+) -> Result<(), StoreError> {
+    if project.is_empty() || operation_id.is_empty() {
+        return Err(StoreError::InvalidRequest(
+            "learning reconciliation marker has no authority",
+        ));
+    }
+    let existing: Option<(String, i64, i64, bool)> = transaction
+        .query_row(
+            "SELECT project,row_count,payload_bytes,required FROM tool_learning_reconciliation
+             WHERE operation_id=?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((found_project, reserved_rows, reserved_bytes, found_required)) = &existing {
+        if found_project != project || *found_required != required {
+            return Err(StoreError::CorruptData(
+                "learning reconciliation marker authority mismatch",
+            ));
+        }
+        if let Some((_, _, rows, bytes)) = range
+            && required
+            && (rows > *reserved_rows || bytes > *reserved_bytes)
+        {
+            return Err(StoreError::InvalidRequest(
+                "required learning terminal exceeded its reservation",
+            ));
+        }
+    }
+    if existing.is_none() {
+        let added_bytes = marker_bytes(project, operation_id)?;
+        loop {
+            let (global_rows, project_rows, global_bytes, project_bytes): (i64, i64, i64, i64) =
+                transaction.query_row(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN project=?1 THEN 1 ELSE 0 END),0),
+                            COALESCE(SUM(length(project)+length(operation_id)+64),0),
+                            COALESCE(SUM(CASE WHEN project=?1 THEN length(project)+length(operation_id)+64 ELSE 0 END),0)
+                     FROM tool_learning_reconciliation",
+                    [project],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+            if global_rows < MAX_LEARNING_MARKER_ROWS
+                && project_rows < MAX_PROJECT_LEARNING_MARKER_ROWS
+                && global_bytes.saturating_add(added_bytes) <= MAX_LEARNING_MARKER_BYTES
+                && project_bytes.saturating_add(added_bytes) <= MAX_PROJECT_LEARNING_MARKER_BYTES
+            {
+                break;
+            }
+            let evicted = transaction.execute(
+                "DELETE FROM tool_learning_reconciliation WHERE operation_id=(
+                     SELECT operation_id FROM tool_learning_reconciliation
+                     WHERE required=0 AND (?1=0 OR project=?2)
+                     ORDER BY created_at,operation_id LIMIT 1
+                 )",
+                params![
+                    if project_rows >= MAX_PROJECT_LEARNING_MARKER_ROWS
+                        || project_bytes.saturating_add(added_bytes)
+                            > MAX_PROJECT_LEARNING_MARKER_BYTES
+                    {
+                        1
+                    } else {
+                        0
+                    },
+                    project
+                ],
+            )?;
+            if evicted == 0 {
+                if required {
+                    return Err(StoreError::InvalidRequest(
+                        "learning reconciliation marker capacity exceeded",
+                    ));
+                }
+                return Ok(());
+            }
+        }
+        let (rows, bytes) = range.map(|(_, _, rows, bytes)| (rows, bytes)).unwrap_or((
+            RESERVED_TERMINAL_MARKER_ROWS,
+            RESERVED_TERMINAL_MARKER_BYTES,
+        ));
+        let (pending_rows, pending_bytes, project_pending_rows, project_pending_bytes):
+            (i64, i64, i64, i64) = transaction.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM tool_learning_outbox WHERE exported=0)
+                   +COALESCE(SUM(row_count),0),
+                 (SELECT COALESCE(SUM(length(payload)),0) FROM tool_learning_outbox WHERE exported=0)
+                   +COALESCE(SUM(payload_bytes),0),
+                 (SELECT COUNT(*) FROM tool_learning_outbox WHERE exported=0 AND project=?1)
+                   +COALESCE(SUM(CASE WHEN project=?1 THEN row_count ELSE 0 END),0),
+                 (SELECT COALESCE(SUM(length(payload)),0) FROM tool_learning_outbox WHERE exported=0 AND project=?1)
+                   +COALESCE(SUM(CASE WHEN project=?1 THEN payload_bytes ELSE 0 END),0)
+             FROM tool_learning_reconciliation",
+            [project],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if pending_rows.saturating_add(rows) > MAX_LEARNING_OUTBOX_ROWS
+            || project_pending_rows.saturating_add(rows) > MAX_PROJECT_LEARNING_OUTBOX_ROWS
+            || pending_bytes.saturating_add(bytes) > MAX_LEARNING_OUTBOX_BYTES
+            || project_pending_bytes.saturating_add(bytes) > MAX_PROJECT_LEARNING_OUTBOX_BYTES
+        {
+            if required {
+                return Err(StoreError::InvalidRequest(
+                    "required learning terminal reservation capacity exceeded",
+                ));
+            }
+            return Ok(());
+        }
+        transaction.execute(
+            "INSERT INTO tool_learning_reconciliation
+             (operation_id,project,first_position,last_position,row_count,payload_bytes,required,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,
+                     CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER))",
+            params![
+                operation_id,
+                project,
+                range.map(|value| value.0),
+                range.map(|value| value.1),
+                rows,
+                bytes,
+                required,
+            ],
+        )?;
+        return Ok(());
+    }
+    if let Some((first, last, rows, bytes)) = range {
+        transaction.execute(
+            "UPDATE tool_learning_reconciliation
+             SET first_position=?2,last_position=?3,row_count=?4,payload_bytes=?5
+             WHERE operation_id=?1",
+            params![operation_id, first, last, rows, bytes],
+        )?;
+    }
+    Ok(())
+}
+
+fn admit_learning_outbox(
+    transaction: &Transaction<'_>,
+    events: &[NewEvent],
+) -> Result<(), StoreError> {
+    use crate::telemetry::tool_learning::ToolLearningEvent;
+
+    let learning = events
+        .iter()
+        .filter(|event| event.event_type.as_str() == TOOL_LEARNING_EVENT)
+        .map(|event| {
+            serde_json::from_slice::<ToolLearningEvent>(&event.payload)
+                .map(|record| (record, event.payload.len()))
+                .map_err(|_| StoreError::InvalidRequest("invalid tool learning payload"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if learning.is_empty() {
+        return Ok(());
+    }
+    let project = learning[0].0.common().project.as_str();
+    if learning
+        .iter()
+        .any(|(record, _)| record.common().project.as_str() != project)
+    {
+        return Err(StoreError::InvalidRequest(
+            "tool learning append crosses projects",
+        ));
+    }
+    let (global_rows, global_bytes): (i64, i64) = transaction.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM tool_learning_outbox WHERE exported=0)
+               +(SELECT COALESCE(SUM(row_count),0) FROM tool_learning_reconciliation),
+             (SELECT COALESCE(SUM(length(payload)),0) FROM tool_learning_outbox WHERE exported=0)
+               +(SELECT COALESCE(SUM(payload_bytes),0) FROM tool_learning_reconciliation)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (project_rows, project_bytes): (i64, i64) = transaction.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM tool_learning_outbox WHERE project=?1 AND exported=0)
+               +(SELECT COALESCE(SUM(row_count),0) FROM tool_learning_reconciliation WHERE project=?1),
+             (SELECT COALESCE(SUM(length(payload)),0) FROM tool_learning_outbox WHERE project=?1 AND exported=0)
+               +(SELECT COALESCE(SUM(payload_bytes),0) FROM tool_learning_reconciliation WHERE project=?1)",
+        [project],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let added_rows = i64::try_from(learning.len()).map_err(|_| StoreError::PositionExhausted)?;
+    let added_bytes = learning.iter().try_fold(0_i64, |total, (_, bytes)| {
+        total
+            .checked_add(i64::try_from(*bytes).map_err(|_| StoreError::PositionExhausted)?)
+            .ok_or(StoreError::PositionExhausted)
+    })?;
+    let terminal_batch = learning
+        .iter()
+        .any(|(event, _)| matches!(event, ToolLearningEvent::Outcome { .. }));
+    let (global_row_limit, project_row_limit, global_byte_limit, project_byte_limit) =
+        if !terminal_batch {
+            (
+                MAX_LEARNING_OUTBOX_ROWS - RESERVED_TERMINAL_OUTBOX_ROWS,
+                MAX_PROJECT_LEARNING_OUTBOX_ROWS - RESERVED_TERMINAL_OUTBOX_ROWS,
+                MAX_LEARNING_OUTBOX_BYTES - RESERVED_TERMINAL_OUTBOX_BYTES,
+                MAX_PROJECT_LEARNING_OUTBOX_BYTES - RESERVED_TERMINAL_OUTBOX_BYTES,
+            )
+        } else {
+            (
+                MAX_LEARNING_OUTBOX_ROWS,
+                MAX_PROJECT_LEARNING_OUTBOX_ROWS,
+                MAX_LEARNING_OUTBOX_BYTES,
+                MAX_PROJECT_LEARNING_OUTBOX_BYTES,
+            )
+        };
+    if global_rows.saturating_add(added_rows) > global_row_limit
+        || project_rows.saturating_add(added_rows) > project_row_limit
+        || global_bytes.saturating_add(added_bytes) > global_byte_limit
+        || project_bytes.saturating_add(added_bytes) > project_byte_limit
+    {
+        return Err(StoreError::InvalidRequest(
+            "tool learning outbox capacity exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_learning_indexes(
+    transaction: &Transaction<'_>,
+    event: &NewEvent,
+    learning: &crate::telemetry::tool_learning::ToolLearningEvent,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO tool_learning_outbox
+         (frame_id,event_id,run_id,project,payload,exported)
+         VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT(event_id) DO NOTHING",
+        params![
+            learning.common().event_id.as_str(),
+            event.id.to_string(),
+            event.correlation_id.to_string(),
+            learning.common().project.as_str(),
+            event.payload,
+        ],
+    )?;
+    update_catalog_stats(transaction, event)
+}
+
+fn update_catalog_stats(transaction: &Transaction<'_>, event: &NewEvent) -> Result<(), StoreError> {
+    use crate::telemetry::tool_learning::{LearningStatus, ToolLearningEvent};
+
+    let outcome: ToolLearningEvent = serde_json::from_slice(&event.payload)
+        .map_err(|_| StoreError::InvalidRequest("invalid tool learning payload"))?;
+    let ToolLearningEvent::Outcome {
+        common,
+        call,
+        status,
+        ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let mut statement = transaction.prepare(
+        "SELECT payload FROM events WHERE event_type=?1 AND correlation_id=?2
+         ORDER BY commit_position",
+    )?;
+    let payloads = statement.query_map(
+        params![TOOL_LEARNING_EVENT, event.correlation_id.to_string()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut binding = None;
+    for payload in payloads {
+        let record: ToolLearningEvent = serde_json::from_slice(&payload?)
+            .map_err(|_| StoreError::CorruptData("invalid durable tool learning payload"))?;
+        if let ToolLearningEvent::Call {
+            call: found,
+            binding: found_binding,
+            ..
+        } = record
+            && found == call
+        {
+            binding = found_binding;
+            break;
+        }
+    }
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM catalog_stats_overlay WHERE run_id=?1 AND binding=?2)",
+        params![common.run.as_str(), binding.as_str()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        let (global, project, global_bytes, project_bytes): (i64, i64, i64, i64) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN project=?1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(length(project)+length(run_id)+length(raw_run_id)+length(binding)+length(source_event)+72),0),
+                    COALESCE(SUM(CASE WHEN project=?1 THEN length(project)+length(run_id)+length(raw_run_id)+length(binding)+length(source_event)+72 ELSE 0 END),0)
+             FROM catalog_stats_overlay",
+            [common.project.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let added_bytes = i64::try_from(
+            common.project.as_str().len()
+                + common.run.as_str().len()
+                + event.correlation_id.to_string().len()
+                + binding.as_str().len()
+                + common.event_id.as_str().len()
+                + 72,
+        )
+        .map_err(|_| StoreError::PositionExhausted)?;
+        if global >= MAX_CATALOG_STATS_ROWS
+            || project >= MAX_PROJECT_CATALOG_STATS_ROWS
+            || global_bytes.saturating_add(added_bytes) > MAX_CATALOG_STATS_BYTES
+            || project_bytes.saturating_add(added_bytes) > MAX_PROJECT_CATALOG_STATS_BYTES
+        {
+            return Err(StoreError::InvalidRequest(
+                "catalog statistics capacity exceeded",
+            ));
+        }
+    }
+    let (succeeded, failed, cancelled, unknown) = match status {
+        LearningStatus::Succeeded => (1, 0, 0, 0),
+        LearningStatus::Cancelled => (0, 0, 1, 0),
+        LearningStatus::OutcomeUnknown => (0, 0, 0, 1),
+        LearningStatus::Failed | LearningStatus::Interrupted | LearningStatus::Unavailable => {
+            (0, 1, 0, 0)
+        }
+    };
+    transaction.execute(
+        "INSERT INTO catalog_stats_overlay
+         (project,run_id,raw_run_id,binding,attempts,succeeded,failed,cancelled,outcome_unknown,source_event)
+         VALUES (?1,?2,?3,?4,1,?5,?6,?7,?8,?9)
+         ON CONFLICT(run_id,binding) DO UPDATE SET
+           raw_run_id=excluded.raw_run_id,
+           attempts=attempts+1,
+           succeeded=succeeded+excluded.succeeded,
+           failed=failed+excluded.failed,
+           cancelled=cancelled+excluded.cancelled,
+           outcome_unknown=outcome_unknown+excluded.outcome_unknown,
+           source_event=excluded.source_event,
+           revision=revision+1",
+        params![
+            common.project.as_str(),
+            common.run.as_str(),
+            event.correlation_id.to_string(),
+            binding.as_str(),
+            succeeded,
+            failed,
+            cancelled,
+            unknown,
+            common.event_id.as_str(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -1054,4 +2776,224 @@ fn decode_event(row: EventRow) -> Result<StoredEvent, StoreError> {
 
 fn corrupt_event<T>(_: T) -> StoreError {
     StoreError::CorruptData("invalid stored event envelope")
+}
+
+#[cfg(test)]
+mod learning_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_binding_authority_replays_idempotently_after_store_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-discovery-binding-store-{}",
+            crate::domain::ids::EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let run = RunId::generate().unwrap();
+        let binding = format!("binding_v1_{}", "ab".repeat(32));
+        let mut store = crate::test_support::open_sqlite_store(&database).unwrap();
+        store
+            .persist_discovery_binding("project-authority", run, &binding)
+            .unwrap();
+        store
+            .persist_discovery_binding("project-authority", run, &binding)
+            .unwrap();
+        drop(store);
+
+        let mut store = crate::test_support::open_sqlite_store(&database).unwrap();
+        assert_eq!(
+            store.discovery_bindings("project-authority", run).unwrap(),
+            [binding]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_snapshot_detaches_exact_rows_before_late_overlay_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-catalog-snapshot-cas-{}",
+            crate::domain::ids::EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let run = RunId::generate().unwrap();
+        let pointer = "run-pointer";
+        let mut store = crate::test_support::open_sqlite_store(&database).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE scheduler_runs (run_id TEXT PRIMARY KEY, phase TEXT NOT NULL);",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO scheduler_runs (run_id,phase) VALUES (?1,'terminal')",
+                [run.to_string()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO catalog_stats_overlay
+                 (project,run_id,raw_run_id,binding,attempts,succeeded,failed,cancelled,
+                  outcome_unknown,source_event,revision)
+                 VALUES ('project',?1,?2,'binding',1,1,0,0,0,'event-1',1)",
+                params![pointer, run.to_string()],
+            )
+            .unwrap();
+
+        let first = store.catalog_stats_snapshot(run, pointer).unwrap().unwrap();
+        assert!(store.catalog_stats(pointer).unwrap().is_empty());
+        store
+            .connection
+            .execute(
+                "INSERT INTO catalog_stats_overlay
+                 (project,run_id,raw_run_id,binding,attempts,succeeded,failed,cancelled,
+                  outcome_unknown,source_event,revision)
+                 VALUES ('project',?1,?2,'binding',1,1,0,0,0,'event-2',1)",
+                params![pointer, run.to_string()],
+            )
+            .unwrap();
+        let retry = store.catalog_stats_snapshot(run, pointer).unwrap().unwrap();
+        assert_eq!(retry.frame_id, first.frame_id);
+        assert!(store.acknowledge_catalog_stats(&first).unwrap());
+        assert_eq!(
+            store.catalog_stats(pointer).unwrap()[0].source_event,
+            "event-2"
+        );
+
+        let second = store.catalog_stats_snapshot(run, pointer).unwrap().unwrap();
+        assert_ne!(first.frame_id, second.frame_id);
+        assert_eq!(second.generation, first.generation + 1);
+        assert!(store.acknowledge_catalog_stats(&second).unwrap());
+        assert!(store.catalog_stats(pointer).unwrap().is_empty());
+        assert!(
+            store
+                .catalog_stats_snapshot(run, pointer)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sustained_learning_backlog_keeps_markers_bounded_and_reserves_required_work() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-learning-marker-cap-{}",
+            crate::domain::ids::EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let mut store = crate::test_support::open_sqlite_store(&database).unwrap();
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for index in 0..MAX_PROJECT_LEARNING_MARKER_ROWS {
+            transaction
+                .execute(
+                    "INSERT INTO tool_learning_reconciliation
+                     (operation_id,project,first_position,last_position,row_count,payload_bytes,
+                      required,created_at) VALUES (?1,'project',1,1,1,1,0,?2)",
+                    params![format!("best-effort-{index:05}"), index],
+                )
+                .unwrap();
+        }
+        upsert_learning_marker(
+            &transaction,
+            "project",
+            "best-effort-new",
+            false,
+            Some((1, 1, 1, 1)),
+        )
+        .unwrap();
+        let (rows, bytes): (i64, i64) = transaction
+            .query_row(
+                "SELECT COUNT(*),SUM(length(project)+length(operation_id)+64)
+                 FROM tool_learning_reconciliation WHERE project='project'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, MAX_PROJECT_LEARNING_MARKER_ROWS);
+        assert!(bytes <= MAX_PROJECT_LEARNING_MARKER_BYTES);
+        transaction
+            .execute("UPDATE tool_learning_reconciliation SET required=1", [])
+            .unwrap();
+        assert!(
+            upsert_learning_marker(&transaction, "project", "required-over-cap", true, None)
+                .is_err()
+        );
+        upsert_learning_marker(
+            &transaction,
+            "project",
+            "best-effort-over-cap",
+            false,
+            Some((1, 1, 1, 1)),
+        )
+        .unwrap();
+        let dropped: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tool_learning_reconciliation
+                 WHERE operation_id='best-effort-over-cap')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!dropped);
+        transaction.rollback().unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_binding_lifecycle_prunes_terminal_runs_but_keeps_current_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-discovery-binding-lifecycle-{}",
+            crate::domain::ids::EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let active = RunId::generate().unwrap();
+        let terminal = RunId::generate().unwrap();
+        let mut store = crate::test_support::open_sqlite_store(&database).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE scheduler_runs (run_id TEXT PRIMARY KEY, phase TEXT NOT NULL);",
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO scheduler_runs (run_id,phase) VALUES (?1,'terminal'),(?2,'running')",
+                params![terminal.to_string(), active.to_string()],
+            )
+            .unwrap();
+        store
+            .persist_discovery_binding("project", terminal, "terminal-binding")
+            .unwrap();
+        store
+            .persist_discovery_binding("project", active, "active-binding")
+            .unwrap();
+        drop(store);
+
+        let mut store = crate::test_support::open_sqlite_store(&database).unwrap();
+        assert_eq!(
+            store.discovery_bindings("project", active).unwrap(),
+            ["active-binding"]
+        );
+        let terminal_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM discovery_bindings WHERE run_id=?1",
+                [terminal.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

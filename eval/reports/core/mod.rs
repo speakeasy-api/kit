@@ -47,6 +47,8 @@ pub struct Preregistration {
     pub ci_method: CiMethod,
     pub noninferiority: NoninferiorityPlan,
     pub policies: Policies,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_learning_experiments: Vec<ToolLearningExperimentPlan>,
 }
 
 impl Preregistration {
@@ -84,29 +86,51 @@ impl Preregistration {
             domain: "kit-dataset-roster-v2",
             roster: &self.roster,
         })?);
-        let experiment = sha256(&canonical_bytes(&ExperimentDesignCommitment {
-            domain: "kit-experiment-design-v2",
-            experiment_id: &self.experiment_id,
-            task_set: &task_set,
-            dataset: &dataset,
-            harness: &self.digests.harness,
-            execution_environment: &self.execution_environment.digest,
-            task_pins: &task_pins,
-            roster: &self.roster,
-            primary_hypothesis: &self.primary_hypothesis,
-            primary_metric: &self.primary_metric,
-            exploratory_metrics: &self.exploratory_metrics,
-            sample_size: &self.sample_size,
-            alpha: self.alpha,
-            ci_method: self.ci_method,
-            noninferiority: &self.noninferiority,
-            policies: &self.policies,
-        })?);
+        let experiment = if self.tool_learning_experiments.is_empty() {
+            sha256(&canonical_bytes(&ExperimentDesignCommitment {
+                domain: "kit-experiment-design-v2",
+                experiment_id: &self.experiment_id,
+                task_set: &task_set,
+                dataset: &dataset,
+                harness: &self.digests.harness,
+                execution_environment: &self.execution_environment.digest,
+                task_pins: &task_pins,
+                roster: &self.roster,
+                primary_hypothesis: &self.primary_hypothesis,
+                primary_metric: &self.primary_metric,
+                exploratory_metrics: &self.exploratory_metrics,
+                sample_size: &self.sample_size,
+                alpha: self.alpha,
+                ci_method: self.ci_method,
+                noninferiority: &self.noninferiority,
+                policies: &self.policies,
+            })?)
+        } else {
+            sha256(&canonical_bytes(&serde_json::json!({
+                "domain": "kit-experiment-design-v3",
+                "experiment_id": self.experiment_id,
+                "task_set": task_set,
+                "dataset": dataset,
+                "harness": self.digests.harness,
+                "execution_environment": self.execution_environment.digest,
+                "task_pins": task_pins,
+                "roster": self.roster,
+                "primary_hypothesis": self.primary_hypothesis,
+                "primary_metric": self.primary_metric,
+                "exploratory_metrics": self.exploratory_metrics,
+                "sample_size": self.sample_size,
+                "alpha": self.alpha,
+                "ci_method": self.ci_method,
+                "noninferiority": self.noninferiority,
+                "policies": self.policies,
+                "tool_learning_experiments": self.tool_learning_experiments,
+            }))?)
+        };
         Ok((experiment, task_set, dataset))
     }
 
     fn validate(&self) -> Result<(), StatsError> {
-        if self.schema_version != "1.1"
+        if !matches!(self.schema_version.as_str(), "1.1" | "1.2")
             || self.kind != "preregistration"
             || !valid_id(&self.experiment_id)
             || placeholder(&self.experiment_id)
@@ -207,6 +231,18 @@ impl Preregistration {
             return invalid_plan("invalid confirmatory method, direction, or margin");
         }
         self.policies.validate()?;
+        if (self.schema_version == "1.1" && !self.tool_learning_experiments.is_empty())
+            || (self.schema_version == "1.2" && self.tool_learning_experiments.is_empty())
+            || self.tool_learning_experiments.len() > MAX_TRIALS
+            || self.tool_learning_experiments.iter().any(|experiment| {
+                !experiment.valid() || !pair_arms.contains_key(experiment.pair_id.as_str())
+            })
+            || !strictly_ordered_by(&self.tool_learning_experiments, |experiment| {
+                experiment.experiment.clone()
+            })
+        {
+            return invalid_plan("invalid tool-learning preregistration");
+        }
         let (experiment, task_set, dataset) = self.derived_design_digests()?;
         if self.digests.experiment != experiment
             || self.digests.task_set != task_set
@@ -217,6 +253,66 @@ impl Preregistration {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolLearningExperimentPlan {
+    pub experiment: String,
+    pub pair_id: String,
+    pub capability: String,
+    pub schema: String,
+    pub surface: String,
+    pub description_only: bool,
+    pub frozen_factors: String,
+    pub baseline_sequence: Vec<ToolLearningSequenceStepPlan>,
+    pub candidate_sequence: Vec<ToolLearningSequenceStepPlan>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolLearningSequenceStepPlan {
+    pub capability: String,
+    pub schema: String,
+    pub surface: String,
+    pub ordinal: u16,
+}
+
+impl ToolLearningExperimentPlan {
+    fn valid(&self) -> bool {
+        use kit::telemetry::tool_learning::{LearningPointer, PointerDomain};
+
+        let pointer = |value: &str, domain| {
+            LearningPointer::parse(value)
+                .is_ok_and(|pointer| matches!(pointer.domain(), Ok(found) if found == domain))
+        };
+        valid_id(&self.pair_id)
+            && pointer(&self.experiment, PointerDomain::Experiment)
+            && pointer(&self.capability, PointerDomain::Capability)
+            && pointer(&self.schema, PointerDomain::Schema)
+            && pointer(&self.frozen_factors, PointerDomain::Artifact)
+            && matches!(
+                self.surface.as_str(),
+                "eager" | "deferred" | "generic" | "discovery"
+            )
+            && [
+                self.baseline_sequence.as_slice(),
+                self.candidate_sequence.as_slice(),
+            ]
+            .into_iter()
+            .all(|sequence| {
+                sequence.len() <= 128
+                    && sequence.iter().enumerate().all(|(index, step)| {
+                        pointer(&step.capability, PointerDomain::Capability)
+                            && pointer(&step.schema, PointerDomain::Schema)
+                            && matches!(
+                                step.surface.as_str(),
+                                "eager" | "deferred" | "generic" | "discovery"
+                            )
+                            && usize::from(step.ordinal) == index + 1
+                    })
+            })
     }
 }
 
@@ -968,7 +1064,12 @@ impl RegistrationAuthority {
         let registration_authentication =
             authentication(&self.credential, &canonical_bytes(&message)?)?;
         let registered = RegisteredPreregistration {
-            schema_version: "1.0".to_owned(),
+            schema_version: if preregistration.schema_version == "1.2" {
+                "1.1"
+            } else {
+                "1.0"
+            }
+            .to_owned(),
             kind: "registered_preregistration".to_owned(),
             preregistration,
             preregistration_digest,
@@ -1606,6 +1707,7 @@ impl RegistrationAuthority {
             latency_imputed: false,
             durable_usage: None,
             verification_passed: derived.verification_passed,
+            harm_receipt: derived.harm_receipt,
             failure_reason: derived.failure_reason,
             exclusion_reason: derived.exclusion_reason,
             authentication: Authentication {
@@ -1756,6 +1858,7 @@ impl RegistrationAuthority {
             latency_imputed: evidence.latency_imputed,
             durable_usage: evidence.durable_usage.clone(),
             verification_passed: false,
+            harm_receipt: None,
             failure_reason: reason.to_owned(),
             exclusion_reason: String::new(),
             authentication: Authentication {
@@ -1959,6 +2062,20 @@ impl RegistrationAuthority {
         &mut self,
         registered: &RegisteredPreregistration,
     ) -> Result<StatisticalReportEnvelope, StatsError> {
+        self.build_report_with_learning(registered, None)
+    }
+
+    pub(crate) fn build_report_with_learning(
+        &mut self,
+        registered: &RegisteredPreregistration,
+        learning_analysis: Option<kit::telemetry::tool_learning::FrozenLearningAnalysis>,
+    ) -> Result<StatisticalReportEnvelope, StatsError> {
+        if learning_analysis.is_some()
+            != (registered.schema_version == "1.1"
+                && registered.preregistration.schema_version == "1.2")
+        {
+            return Err(StatsError::InvalidReportReceipt);
+        }
         self.recover_anchor()?;
         self.verify_chain()?;
         self.verify_registered(registered)?;
@@ -1983,7 +2100,9 @@ impl RegistrationAuthority {
                 receipt,
             };
             self.verify_report(registered, &envelope)?;
-            if envelope.receipt.ledger_cutoff != ledger_cutoff {
+            if envelope.receipt.ledger_cutoff != ledger_cutoff
+                || envelope.report.learning_analysis != learning_analysis
+            {
                 return Err(StatsError::InvalidReportReceipt);
             }
             return Ok(envelope);
@@ -2060,7 +2179,12 @@ impl RegistrationAuthority {
                 trial_digest: receipt.harness_report_digest.clone(),
             });
         let report = StatisticalReport {
-            schema_version: "1.0".to_owned(),
+            schema_version: if learning_analysis.is_some() {
+                "1.1"
+            } else {
+                "1.0"
+            }
+            .to_owned(),
             kind: "core_statistical_report".to_owned(),
             preregistration: registered.preregistration.clone(),
             preregistration_digest: registered.preregistration_digest.clone(),
@@ -2071,6 +2195,7 @@ impl RegistrationAuthority {
             trials,
             analysis_status,
             metrics,
+            learning_analysis,
         };
         let bytes = canonical_bytes(&report)?;
         if bytes.len() > MAX_REPORT_BYTES {
@@ -2187,8 +2312,11 @@ impl RegistrationAuthority {
         if envelope.receipt.ledger_position <= frozen_position
             || envelope.receipt.ledger_cutoff != ledger_cutoff
             || envelope.receipt.freeze_position != frozen_position
-            || canonical_bytes(&self.reconstruct_report(registered, ledger_cutoff)?)?
-                != envelope.bytes
+            || canonical_bytes(&self.reconstruct_report(
+                registered,
+                ledger_cutoff,
+                envelope.report.learning_analysis.clone(),
+            )?)? != envelope.bytes
         {
             return Err(StatsError::InvalidReportReceipt);
         }
@@ -2222,6 +2350,7 @@ impl RegistrationAuthority {
         &self,
         registered: &RegisteredPreregistration,
         ledger_cutoff: u64,
+        learning_analysis: Option<kit::telemetry::tool_learning::FrozenLearningAnalysis>,
     ) -> Result<StatisticalReport, StatsError> {
         let mut statement = self
             .connection
@@ -2295,7 +2424,12 @@ impl RegistrationAuthority {
                 trial_digest: receipt.harness_report_digest.clone(),
             });
         Ok(StatisticalReport {
-            schema_version: "1.0".to_owned(),
+            schema_version: if learning_analysis.is_some() {
+                "1.1"
+            } else {
+                "1.0"
+            }
+            .to_owned(),
             kind: "core_statistical_report".to_owned(),
             preregistration: registered.preregistration.clone(),
             preregistration_digest: registered.preregistration_digest.clone(),
@@ -2306,6 +2440,7 @@ impl RegistrationAuthority {
             trials,
             analysis_status,
             metrics,
+            learning_analysis,
         })
     }
 
@@ -2522,6 +2657,7 @@ impl RegistrationAuthority {
                 || receipt.elapsed_millis == 0
                 || (!receipt.cost_imputed && receipt.durable_usage.is_none())
                 || receipt.verification_passed
+                || receipt.harm_receipt.is_some()
                 || !valid_text(&receipt.failure_reason, 4096)
                 || !receipt.exclusion_reason.is_empty()
                 || receipt.recorded_at <= registered.registration.registered_at
@@ -2577,6 +2713,7 @@ impl RegistrationAuthority {
             || receipt.latency_imputed
             || receipt.durable_usage.is_some()
             || receipt.verification_passed != derived.verification_passed
+            || receipt.harm_receipt != derived.harm_receipt
             || receipt.failure_reason != derived.failure_reason
             || receipt.exclusion_reason != derived.exclusion_reason
             || receipt.recorded_at <= registered.registration.registered_at
@@ -3294,6 +3431,14 @@ impl BoundTrialEnvelope {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+
+    pub(crate) fn harness_report_bytes(&self) -> &[u8] {
+        &self.harness_report_bytes
+    }
+
+    pub(crate) fn events_bytes(&self) -> &[u8] {
+        &self.events_bytes
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -3336,6 +3481,8 @@ pub struct MeasuredTrialReceipt {
     pub latency_imputed: bool,
     pub durable_usage: Option<TerminalDurableUsage>,
     pub verification_passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harm_receipt: Option<kit::telemetry::tool_learning::HarmReceiptKind>,
     pub failure_reason: String,
     pub exclusion_reason: String,
     pub authentication: Authentication,
@@ -3479,6 +3626,8 @@ struct MeasuredMessage<'a> {
     latency_imputed: bool,
     durable_usage: &'a Option<TerminalDurableUsage>,
     verification_passed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harm_receipt: &'a Option<kit::telemetry::tool_learning::HarmReceiptKind>,
     failure_reason: &'a str,
     exclusion_reason: &'a str,
 }
@@ -3522,6 +3671,7 @@ impl<'a> From<&'a MeasuredTrialReceipt> for MeasuredMessage<'a> {
             latency_imputed: value.latency_imputed,
             durable_usage: &value.durable_usage,
             verification_passed: value.verification_passed,
+            harm_receipt: &value.harm_receipt,
             failure_reason: &value.failure_reason,
             exclusion_reason: &value.exclusion_reason,
         }
@@ -3755,6 +3905,8 @@ struct RuntimeEventBinding {
     kind: String,
     event_position: u64,
     admission_token_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_digest: Option<String>,
 }
 
 struct DerivedMeasurement {
@@ -3765,6 +3917,7 @@ struct DerivedMeasurement {
     cost_usd: f64,
     latency_ms: f64,
     verification_passed: bool,
+    harm_receipt: Option<kit::telemetry::tool_learning::HarmReceiptKind>,
     failure_reason: String,
     exclusion_reason: String,
     event_high_watermark: u64,
@@ -3818,6 +3971,11 @@ fn validate_trial_evidence(
                 && event.event_position > run_config.event_start_watermark
                 && event.event_position <= events.event_high_watermark
                 && event.admission_token_digest == run_config.admission_token_digest
+                && (evidence_source != EvidenceSource::ProductionTrusted
+                    || event
+                        .event_digest
+                        .as_ref()
+                        .is_some_and(|digest| valid_digest(digest)))
         })
         && positions.iter().next_back().copied() == Some(events.event_high_watermark);
     if events.schema_version != 1
@@ -3914,6 +4072,18 @@ fn validate_trial_evidence(
                 TrialOutcome::Success => unreachable!(),
             })
     };
+    let harm_receipt = match (report.outcome, report.grade.diagnostic.as_deref()) {
+        (TrialOutcome::Failure, Some("security_harm")) => {
+            Some(kit::telemetry::tool_learning::HarmReceiptKind::Security)
+        }
+        (TrialOutcome::Failure, Some("rollback_harm")) => {
+            Some(kit::telemetry::tool_learning::HarmReceiptKind::Rollback)
+        }
+        (TrialOutcome::Failure, Some("defect_harm")) => {
+            Some(kit::telemetry::tool_learning::HarmReceiptKind::Defect)
+        }
+        _ => None,
+    };
     Ok(DerivedMeasurement {
         config_digest,
         model_digest,
@@ -3922,6 +4092,7 @@ fn validate_trial_evidence(
         cost_usd: cost_microusd as f64 / 1_000_000.0,
         latency_ms,
         verification_passed,
+        harm_receipt,
         failure_reason,
         exclusion_reason: events.exclusion_reason,
         event_high_watermark: events.event_high_watermark,
@@ -4059,6 +4230,8 @@ pub struct StatisticalReport {
     pub trials: Vec<TrialRecord>,
     pub analysis_status: AnalysisStatus,
     pub metrics: Vec<MetricSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_analysis: Option<kit::telemetry::tool_learning::FrozenLearningAnalysis>,
 }
 
 #[derive(Clone, Debug)]
@@ -5163,7 +5336,12 @@ fn verify_registration(
     registered: &RegisteredPreregistration,
 ) -> Result<(), StatsError> {
     let receipt = &registered.registration;
-    if registered.schema_version != "1.0"
+    if registered.schema_version
+        != if registered.preregistration.schema_version == "1.2" {
+            "1.1"
+        } else {
+            "1.0"
+        }
         || registered.kind != "registered_preregistration"
         || registered.preregistration_digest != registered.preregistration.digest()?
         || receipt.authority_id != credential.authority_id
@@ -5513,6 +5691,69 @@ impl std::error::Error for StatsError {}
 #[cfg(test)]
 mod numerical_tests {
     use super::*;
+
+    #[test]
+    fn strict_report_schema_preserves_the_legacy_1_0_fixture_bytes() {
+        let bytes = include_bytes!(
+            "../../../requirements/reports/m004/source-semantics/statistical-report.json"
+        );
+        validate_schema(bytes, "statistical_report").unwrap();
+        let report: StatisticalReport = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(report.schema_version, "1.0");
+        assert!(report.learning_analysis.is_none());
+        assert_eq!(canonical_bytes(&report).unwrap(), bytes);
+    }
+
+    #[test]
+    fn strict_report_schema_accepts_only_versioned_learning_fixture_fields() {
+        let mut report: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../requirements/reports/m004/source-semantics/statistical-report.json"
+        ))
+        .unwrap();
+        let pointer =
+            |tag: &str, byte: char| format!("tlp_v1_{tag}_{}", byte.to_string().repeat(128));
+        report["schema_version"] = "1.1".into();
+        report["preregistration"]["schema_version"] = "1.2".into();
+        report["preregistration"]["tool_learning_experiments"] = serde_json::json!([{
+            "experiment": pointer("0b", '1'),
+            "pair_id": "pair-a",
+            "capability": pointer("03", '2'),
+            "schema": pointer("04", '3'),
+            "surface": "deferred",
+            "description_only": true,
+            "frozen_factors": pointer("0c", '4'),
+            "baseline_sequence": [],
+            "candidate_sequence": []
+        }]);
+        report["learning_analysis"] = serde_json::json!({
+            "result": {"Unavailable": "MissingLearningRecords"},
+            "input_digests": [format!("sha256:{}", "5".repeat(64))]
+        });
+        let bytes = serde_json::to_vec(&report).unwrap();
+        validate_schema(&bytes, "statistical_report").unwrap();
+
+        report["preregistration"]["tool_learning_experiments"][0]["baseline_sequence"] = serde_json::json!([{
+            "capability": pointer("03", '2'),
+            "schema": pointer("04", '3'),
+            "surface": "deferred",
+            "ordinal": 1
+        }]);
+        validate_schema(&serde_json::to_vec(&report).unwrap(), "statistical_report").unwrap();
+        report["preregistration"]["tool_learning_experiments"][0]["baseline_sequence"][0]["call"] =
+            pointer("08", '6').into();
+        assert!(
+            validate_schema(&serde_json::to_vec(&report).unwrap(), "statistical_report").is_err()
+        );
+        report["preregistration"]["tool_learning_experiments"][0]["baseline_sequence"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("call");
+
+        report["schema_version"] = "1.0".into();
+        assert!(
+            validate_schema(&serde_json::to_vec(&report).unwrap(), "statistical_report").is_err()
+        );
+    }
 
     #[test]
     fn finite_sample_t_known_critical_and_interval() {

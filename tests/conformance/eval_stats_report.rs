@@ -18,7 +18,7 @@ mod stats;
 use stats::{
     AnalysisStatus, BoundTrialEnvelope, ConformanceLedgerAnchor, CoreMetric, Direction,
     EvidenceSource, FailurePolicy, IntervalMethod, MetricRole, MetricSummary, MetricUnit,
-    Preregistration, RegistrationAuthority, StatsError, TerminalDurableUsage,
+    Preregistration, RegistrationAuthority, StatisticalReport, StatsError, TerminalDurableUsage,
     TerminalErrorEvidence, TrialOutcome, TrialRunConfig,
 };
 
@@ -254,6 +254,12 @@ fn tamper_event(mut evidence: Evidence, pointer: &str, replacement: Value) -> Ev
 fn production_source(mut evidence: Evidence) -> Evidence {
     let mut events: Value = serde_json::from_slice(&evidence.events_bytes).unwrap();
     events["source"] = json!("production_authenticated");
+    for class in ["scheduler_events", "provider_events", "tool_events"] {
+        for event in events[class].as_array_mut().unwrap() {
+            event["event_digest"] =
+                json!(stats::sha256(event["kind"].as_str().unwrap().as_bytes()));
+        }
+    }
     evidence.events_bytes = serde_json::to_vec(&events).unwrap();
     let mut report: Value = serde_json::from_slice(&evidence.harness_report_bytes).unwrap();
     report["admission_source"] = json!("production_authenticated");
@@ -401,6 +407,7 @@ fn eval_stats_report_uses_exact_binary_primary_and_exploratory_point_estimates_o
             .all(|metric| matches!(metric, MetricSummary::Exploratory { .. }))
     );
     let value: Value = serde_json::from_slice(&report.bytes).unwrap();
+    assert!(value.get("learning_analysis").is_none());
     assert!(value["metrics"][1].get("confidence_interval").is_none());
     assert_eq!(stats::sha256(&report.bytes), report.digest);
     authority.verify_report(&registered, &report).unwrap();
@@ -440,6 +447,15 @@ fn eval_stats_report_uses_exact_binary_primary_and_exploratory_point_estimates_o
         authority.verify_report(&registered, &caller_rehashed),
         Err(StatsError::InvalidReportReceipt)
     );
+}
+
+#[test]
+fn legacy_statistical_report_without_learning_analysis_round_trips_exact_bytes() {
+    let bytes =
+        include_bytes!("../../requirements/reports/m004/source-semantics/statistical-report.json");
+    let report: StatisticalReport = serde_json::from_slice(bytes).unwrap();
+    assert!(report.learning_analysis.is_none());
+    assert_eq!(serde_json::to_vec(&report).unwrap(), bytes);
 }
 
 #[test]

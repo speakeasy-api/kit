@@ -34,7 +34,43 @@ impl DiscoveryHandle {
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    pub fn parse(value: &str) -> Result<Self, InvalidDiscoveryHandle> {
+        let hex = value
+            .strip_prefix("discovery_v1_")
+            .ok_or(InvalidDiscoveryHandle)?;
+        if hex.len() != 64 {
+            return Err(InvalidDiscoveryHandle);
+        }
+        let mut bytes = [0_u8; 32];
+        for (output, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            *output = (hex_nibble(pair[0]).ok_or(InvalidDiscoveryHandle)? << 4)
+                | hex_nibble(pair[1]).ok_or(InvalidDiscoveryHandle)?;
+        }
+        Ok(Self(bytes))
+    }
 }
+
+impl fmt::Display for DiscoveryHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("discovery_v1_")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidDiscoveryHandle;
+
+impl fmt::Display for InvalidDiscoveryHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid discovery handle")
+    }
+}
+
+impl std::error::Error for InvalidDiscoveryHandle {}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BindingId([u8; 32]);
@@ -109,6 +145,10 @@ pub struct CapabilityInspection {
 impl CapabilityInspection {
     pub fn definition(&self) -> &CatalogEntry {
         &self.entry
+    }
+
+    pub const fn handle(&self) -> DiscoveryHandle {
+        self.handle
     }
 }
 
@@ -342,7 +382,7 @@ impl<'a> DiscoverySession<'a> {
         })
     }
 
-    pub(crate) fn bind_identity(&self, identity: &CapabilityIdentity) -> Option<CapabilityBinding> {
+    pub fn bind_identity(&self, identity: &CapabilityIdentity) -> Option<CapabilityBinding> {
         let entry = self
             .catalog
             .entries()

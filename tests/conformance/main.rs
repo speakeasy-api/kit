@@ -60,6 +60,7 @@ mod structural_rewrite;
 mod syntax_index;
 mod telemetry_export;
 mod terminal_lease;
+mod tool_telemetry;
 #[allow(clippy::duplicate_mod)]
 mod usage_reconcile;
 mod verify_feedback;

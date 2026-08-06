@@ -598,7 +598,11 @@ impl From<StatsError> for CoordinatorError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::PathBuf,
+    };
 
     use rusqlite::{Connection, params};
     use serde_json::json;
@@ -661,6 +665,18 @@ mod tests {
     }
 
     fn harness_with_task_version_and_arm(task_version: &str, arm: Arm) -> CoreHarness {
+        let trial_id = match arm {
+            Arm::Baseline => "empty-trial",
+            Arm::Candidate => "empty-trial-candidate",
+        };
+        harness_with_task_version_arm_and_id(task_version, arm, trial_id)
+    }
+
+    fn harness_with_task_version_arm_and_id(
+        task_version: &str,
+        arm: Arm,
+        trial_id: &str,
+    ) -> CoreHarness {
         let bounds = GraderBounds {
             max_patch_bytes: 16 * 1024,
             max_source_bytes: 64 * 1024,
@@ -721,8 +737,8 @@ mod tests {
         let mut trial: serde_json::Value =
             serde_json::from_slice(include_bytes!("../../eval/manifests/examples/trial.json"))
                 .unwrap();
+        trial["trial_id"] = trial_id.into();
         if arm == Arm::Candidate {
-            trial["trial_id"] = "empty-trial-candidate".into();
             trial["environment"]["model"]["model_digest"] =
                 format!("sha256:{}", "7".repeat(64)).into();
             trial["environment"]["model"]["settings_digest"] =
@@ -812,6 +828,268 @@ mod tests {
     }
 
     struct Evidence;
+
+    struct LearningEvidence {
+        database: PathBuf,
+        hasher: crate::telemetry::tool_learning::ProjectPointerHasher,
+        capability: crate::telemetry::tool_learning::LearningPointer,
+        schema: crate::telemetry::tool_learning::LearningPointer,
+        second_capability: crate::telemetry::tool_learning::LearningPointer,
+        second_schema: crate::telemetry::tool_learning::LearningPointer,
+        baseline_call: crate::telemetry::tool_learning::LearningPointer,
+        candidate_call: crate::telemetry::tool_learning::LearningPointer,
+    }
+
+    impl LearningEvidence {
+        fn record(&self, run_id: RunId, config: &TrialRunConfig) -> Result<(), CoordinatorError> {
+            use crate::telemetry::tool_learning::{
+                LearningCandidate, LearningCommon, LearningOperation, LearningStatus,
+                LearningSurface, PointerDomain, ToolLearningEvent,
+            };
+
+            if config.pair_id != "pair-a" {
+                return Ok(());
+            }
+            let call = match config.arm {
+                Arm::Baseline => self.baseline_call.clone(),
+                Arm::Candidate => self.candidate_call.clone(),
+            };
+            let common = |ordinal, operation, identity: &[u8], capability, schema| {
+                LearningCommon::new(
+                    &self.hasher,
+                    run_id,
+                    ordinal,
+                    operation,
+                    LearningSurface::Deferred,
+                    identity,
+                    None,
+                    capability,
+                    schema,
+                )
+            };
+            let mut events = vec![ToolLearningEvent::Opportunity {
+                common: common(1, LearningOperation::Projection, b"opportunity", None, None),
+                offered: 1,
+                eager: 0,
+                deferred: 1,
+                generic_available: false,
+                projection: self.hasher.pointer(PointerDomain::Schema, b"projection"),
+                candidates: vec![LearningCandidate {
+                    capability: self.capability.clone(),
+                    schema: self.schema.clone(),
+                    surface: LearningSurface::Deferred,
+                    authorized: true,
+                    offered: true,
+                }],
+                detail_artifact: None,
+            }];
+            for order in 1..=2 {
+                let (step_capability, step_schema, step_call) = if order == 1 {
+                    (self.capability.clone(), self.schema.clone(), call.clone())
+                } else {
+                    (
+                        self.second_capability.clone(),
+                        self.second_schema.clone(),
+                        self.hasher.pointer(
+                            PointerDomain::Call,
+                            format!("{run_id}:second-call").as_bytes(),
+                        ),
+                    )
+                };
+                events.extend([
+                    ToolLearningEvent::Call {
+                        common: common(
+                            order * 2,
+                            LearningOperation::Invoke,
+                            step_call.as_str().as_bytes(),
+                            Some(step_capability.clone()),
+                            Some(step_schema.clone()),
+                        ),
+                        call: step_call.clone(),
+                        binding: Some(self.hasher.pointer(PointerDomain::Binding, b"binding")),
+                        source: Some(self.hasher.pointer(PointerDomain::Source, b"source")),
+                        kind: Some(crate::telemetry::tool_learning::LearningCapabilityKind::Tool),
+                        sequence: Some(
+                            self.hasher
+                                .pointer(PointerDomain::Sequence, run_id.to_string().as_bytes()),
+                        ),
+                        sequence_order: Some(order as u16),
+                        kernel_intent: Some(
+                            self.hasher
+                                .pointer(PointerDomain::KernelEvent, b"kernel-intent"),
+                        ),
+                    },
+                    ToolLearningEvent::Outcome {
+                        common: common(
+                            order * 2 + 1,
+                            LearningOperation::Invoke,
+                            format!("outcome:{order}").as_bytes(),
+                            Some(step_capability),
+                            Some(step_schema),
+                        ),
+                        call: step_call,
+                        status: LearningStatus::Succeeded,
+                        dispatched: true,
+                        known: true,
+                        cost_microusd: Some(match config.arm {
+                            Arm::Baseline => 10,
+                            Arm::Candidate => 5,
+                        }),
+                        kernel_outcome: Some(
+                            self.hasher
+                                .pointer(PointerDomain::KernelEvent, b"kernel-outcome"),
+                        ),
+                    },
+                ]);
+            }
+            for event in &mut events {
+                let mut value = serde_json::to_value(&*event)
+                    .map_err(|_| CoordinatorError::Evidence("learning serialization"))?;
+                value
+                    .get_mut("common")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .and_then(|common| common.remove("event_id"))
+                    .ok_or(CoordinatorError::Evidence("learning event authority"))?;
+                let authority = self.hasher.pointer(
+                    PointerDomain::Event,
+                    &serde_json::to_vec(&value)
+                        .map_err(|_| CoordinatorError::Evidence("learning serialization"))?,
+                );
+                match event {
+                    ToolLearningEvent::Opportunity { common, .. }
+                    | ToolLearningEvent::Search { common, .. }
+                    | ToolLearningEvent::Inspection { common, .. }
+                    | ToolLearningEvent::Call { common, .. }
+                    | ToolLearningEvent::Error { common, .. }
+                    | ToolLearningEvent::Outcome { common, .. } => common.event_id = authority,
+                }
+            }
+
+            let connection = Connection::open(&self.database)
+                .map_err(|_| CoordinatorError::Evidence("learning database"))?;
+            let start = i64::try_from(config.event_start_watermark)
+                .map_err(|_| CoordinatorError::Evidence("learning watermark"))?;
+            connection
+                .execute(
+                    "INSERT INTO stream_heads (stream,version) VALUES (?1,5)",
+                    [run_id.to_string()],
+                )
+                .map_err(|_| CoordinatorError::Evidence("learning stream"))?;
+            for (offset, event) in events.iter().enumerate() {
+                let common = event.common();
+                let event_id = crate::domain::ids::EventId::from_stable_bytes(
+                    common.event_id.as_str().as_bytes(),
+                );
+                connection
+                    .execute(
+                        "INSERT INTO events (event_id,stream,sequence,commit_position,event_type,
+                         schema_version,occurred_at,causation_id,correlation_id,attempt_id,trace_id,
+                         payload,artifacts) VALUES (?1,?2,?3,?4,'tool_learning.recorded',1,
+                         '2026-01-01T00:00:00Z',?1,?2,NULL,'learning-analysis',?5,X'5b5d')",
+                        params![
+                            event_id.to_string(),
+                            run_id.to_string(),
+                            i64::try_from(offset + 1).unwrap(),
+                            start + i64::try_from(offset + 1).unwrap(),
+                            serde_json::to_vec(event).unwrap(),
+                        ],
+                    )
+                    .map_err(|_| CoordinatorError::Evidence("learning event"))?;
+            }
+            connection
+                .execute(
+                    "UPDATE commit_watermark SET position=max(position,?1) WHERE singleton=1",
+                    [start + 5],
+                )
+                .map_err(|_| CoordinatorError::Evidence("learning watermark"))?;
+            Ok(())
+        }
+    }
+
+    impl EventEvidenceStore for LearningEvidence {
+        fn source(&self) -> &'static str {
+            "production_authenticated"
+        }
+
+        fn capture_start(
+            &self,
+            _: RunId,
+            pending: &crate::runtime::scheduler::PendingStatisticalTrial,
+        ) -> Result<PreparedEventEvidence, CoordinatorError> {
+            Ok(PreparedEventEvidence {
+                source: self.source().to_owned(),
+                event_start_watermark: pending.consumption_position.saturating_mul(10),
+            })
+        }
+
+        fn finalize_terminal(
+            &self,
+            scheduler: &DurableScheduler,
+            run_id: RunId,
+            config: &TrialRunConfig,
+        ) -> Result<u64, CoordinatorError> {
+            scheduler.finish_run(run_id, false)?;
+            Ok(config.event_start_watermark + 5)
+        }
+
+        fn trusted_events(
+            &self,
+            run_id: RunId,
+            config: &TrialRunConfig,
+            event_high_watermark: u64,
+        ) -> Result<Vec<u8>, CoordinatorError> {
+            self.record(run_id, config)?;
+            let bytes = Evidence.trusted_events(run_id, config, event_high_watermark)?;
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|_| CoordinatorError::Evidence("learning event evidence"))?;
+            value["source"] = self.source().into();
+            let connection = Connection::open(&self.database)
+                .map_err(|_| CoordinatorError::Evidence("learning event evidence database"))?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT commit_position,event_type,payload FROM events
+                     WHERE correlation_id=?1 AND event_type='tool_learning.recorded'
+                     ORDER BY commit_position",
+                )
+                .map_err(|_| CoordinatorError::Evidence("learning event evidence query"))?;
+            let bindings = statement
+                .query_map([run_id.to_string()], |row| {
+                    let position = row.get::<_, u64>(0)?;
+                    let kind = row.get::<_, String>(1)?;
+                    let payload = row.get::<_, Vec<u8>>(2)?;
+                    Ok(json!({
+                        "kind": kind,
+                        "event_position": position,
+                        "admission_token_digest": config.admission_token_digest,
+                        "event_digest": crate::evaluation::reports::sha256(&payload),
+                    }))
+                })
+                .map_err(|_| CoordinatorError::Evidence("learning event evidence rows"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| CoordinatorError::Evidence("learning event evidence row"))?;
+            if bindings.is_empty() {
+                for class in ["scheduler_events", "provider_events", "tool_events"] {
+                    let event = value
+                        .get_mut(class)
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|events| events.first_mut())
+                        .ok_or(CoordinatorError::Evidence("learning event evidence count"))?;
+                    event["event_digest"] = crate::evaluation::reports::sha256(
+                        event["kind"].as_str().unwrap_or_default().as_bytes(),
+                    )
+                    .into();
+                }
+            } else if bindings.len() == 5 {
+                value["scheduler_events"] = json!([bindings[0].clone()]);
+                value["provider_events"] = json!([bindings[1].clone()]);
+                value["tool_events"] = json!(bindings[2..].to_vec());
+            } else {
+                return Err(CoordinatorError::Evidence("learning event evidence count"));
+            }
+            serde_json::to_vec(&value)
+                .map_err(|_| CoordinatorError::Evidence("learning event evidence"))
+        }
+    }
 
     struct DurableEvidenceExecutor<'a> {
         inner: ConformanceCoreTrialExecutor,
@@ -1203,7 +1481,290 @@ mod tests {
     }
 
     #[test]
-    fn production_entrypoint_uses_real_durable_evidence_then_freezes_and_reports() {
+    fn conformance_tool_learning_report_uses_preregistered_arms_and_verified_receipts() {
+        use crate::telemetry::tool_learning::{
+            CausalResult, CausalUnavailable, PointerDomain, ProjectPointerHasher,
+        };
+
+        let harnesses = [
+            harness_with_task_version_arm_and_id("1", Arm::Baseline, "pair-a-baseline"),
+            harness_with_task_version_arm_and_id("1", Arm::Candidate, "pair-a-candidate"),
+            harness_with_task_version_arm_and_id("2", Arm::Candidate, "pair-b-candidate"),
+            harness_with_task_version_arm_and_id("2", Arm::Baseline, "pair-b-baseline"),
+            harness_with_task_version_arm_and_id("3", Arm::Baseline, "pair-c-baseline"),
+            harness_with_task_version_arm_and_id("3", Arm::Candidate, "pair-c-candidate"),
+        ];
+        let mut measured = Vec::new();
+        for harness in &harnesses {
+            let mut executor = ConformanceCoreTrialExecutor::source_semantics_fake(
+                crate::evaluation::harness::trial_runner::trusted_source_semantics_token(),
+            );
+            let calibration = harness.self_validate(&mut executor).unwrap();
+            let report = harness
+                .measure(&mut executor, &calibration.token, REFERENCE)
+                .unwrap();
+            measured.push((calibration, report));
+        }
+
+        let project = crate::domain::ids::ProjectId::generate().unwrap();
+        let key = [73; 32];
+        let hasher = ProjectPointerHasher::new(project, &key);
+        let capability = hasher.pointer(PointerDomain::Capability, b"fixture-capability");
+        let schema = hasher.pointer(PointerDomain::Schema, b"fixture-schema");
+        let second_capability =
+            hasher.pointer(PointerDomain::Capability, b"fixture-second-capability");
+        let second_schema = hasher.pointer(PointerDomain::Schema, b"fixture-second-schema");
+        let baseline_call = hasher.pointer(PointerDomain::Call, b"baseline-call");
+        let candidate_call = hasher.pointer(PointerDomain::Call, b"candidate-call");
+        let experiment = hasher.pointer(PointerDomain::Experiment, b"pair-a-experiment");
+
+        let mut plan = Preregistration::from_json(include_bytes!(
+            "../../eval/preregistration/templates/core-paired-v1.json"
+        ))
+        .unwrap();
+        for ((entry, _), (_, report)) in plan.roster.iter_mut().zip(&harnesses).zip(&measured) {
+            entry.trial_id = report.report.trial_id.clone();
+            entry.task_manifest_digest = report.report.task_manifest_digest.clone();
+            entry.model_digest = report.report.model_digest.clone();
+            entry.model_settings_digest = report.report.model_settings_digest.clone();
+            entry.config_digest = report.report.config_digest.clone();
+            entry.provider_capability_digest = report.report.provider_capability_digest.clone();
+        }
+        plan.digests.harness = harnesses[0].harness_config_digest().to_owned();
+        plan.execution_environment.pins.harness = plan.digests.harness.clone();
+        plan.execution_environment =
+            ProductionExecutionEnvironment::new(plan.execution_environment.pins.clone()).unwrap();
+        plan.schema_version = "1.2".to_owned();
+        plan.tool_learning_experiments =
+            vec![crate::evaluation::reports::ToolLearningExperimentPlan {
+                experiment: experiment.as_str().to_owned(),
+                pair_id: "pair-a".to_owned(),
+                capability: capability.as_str().to_owned(),
+                schema: schema.as_str().to_owned(),
+                surface: "deferred".to_owned(),
+                description_only: false,
+                frozen_factors: hasher
+                    .pointer(PointerDomain::Artifact, b"frozen-factors")
+                    .as_str()
+                    .to_owned(),
+                baseline_sequence: vec![
+                    crate::evaluation::reports::ToolLearningSequenceStepPlan {
+                        capability: capability.as_str().to_owned(),
+                        schema: schema.as_str().to_owned(),
+                        surface: "deferred".to_owned(),
+                        ordinal: 1,
+                    },
+                    crate::evaluation::reports::ToolLearningSequenceStepPlan {
+                        capability: second_capability.as_str().to_owned(),
+                        schema: second_schema.as_str().to_owned(),
+                        surface: "deferred".to_owned(),
+                        ordinal: 2,
+                    },
+                ],
+                candidate_sequence: vec![
+                    crate::evaluation::reports::ToolLearningSequenceStepPlan {
+                        capability: capability.as_str().to_owned(),
+                        schema: schema.as_str().to_owned(),
+                        surface: "deferred".to_owned(),
+                        ordinal: 1,
+                    },
+                    crate::evaluation::reports::ToolLearningSequenceStepPlan {
+                        capability: second_capability.as_str().to_owned(),
+                        schema: second_schema.as_str().to_owned(),
+                        surface: "deferred".to_owned(),
+                        ordinal: 2,
+                    },
+                ],
+            }];
+        let (experiment_digest, task_set, dataset) = plan.derived_design_digests().unwrap();
+        plan.digests.experiment = experiment_digest;
+        plan.digests.task_set = task_set;
+        plan.digests.dataset = dataset;
+        let pins = plan.execution_environment.pins.clone();
+
+        let root = Root::new("production-learning-report");
+        let database = root.0.join("state.sqlite3");
+        drop(crate::test_support::open_service_store(&database).unwrap());
+        fs::create_dir(root.0.join("evaluation")).unwrap();
+        let anchor = ConformanceLedgerAnchor::source_semantics_fake();
+        let mut authority =
+            RegistrationAuthority::open_with_anchor(root.0.join("evaluation"), anchor.clone())
+                .unwrap();
+        let registered = authority.register(plan).unwrap();
+        let scheduler = DurableScheduler::open(&database).unwrap();
+        let operations = SqliteCoordinatorOperationStore::open(&database).unwrap();
+        let evidence = Evidence;
+        let learning = LearningEvidence {
+            database: database.clone(),
+            hasher,
+            capability,
+            schema,
+            second_capability,
+            second_schema,
+            baseline_call,
+            candidate_call,
+        };
+        let principal = PrincipalId::generate().unwrap();
+
+        for (index, harness) in harnesses.iter().enumerate() {
+            let admission = authority.admit_next(&registered).unwrap();
+            let run_id = RunId::generate().unwrap();
+            let idempotency_key = format!("production-learning-{index}");
+            scheduler
+                .register_statistical_trial_run(
+                    run_id,
+                    principal,
+                    &idempotency_key,
+                    &registered.preregistration.roster[index].config_digest,
+                )
+                .unwrap();
+            let binding = TrialRunBinding {
+                trial_id: registered.preregistration.roster[index].trial_id.clone(),
+                trial_digest: registered.preregistration_digest.clone(),
+                task_digest: registered.preregistration.roster[index]
+                    .task_manifest_digest
+                    .clone(),
+                model_digest: registered.preregistration.roster[index]
+                    .model_digest
+                    .clone(),
+                config_digest: registered.preregistration.roster[index]
+                    .config_digest
+                    .clone(),
+                attempt: AttemptOwnership::new(
+                    AttemptId::generate().unwrap(),
+                    principal,
+                    FencingToken::new(1),
+                ),
+                admission: Some(admission.scheduler_token().unwrap()),
+            };
+            let mut executor = ConformanceCoreTrialExecutor::source_semantics_fake(
+                crate::evaluation::harness::trial_runner::trusted_source_semantics_token(),
+            );
+            let receipt = StatisticalTrialCoordinator::new(
+                &mut authority,
+                &scheduler,
+                harness,
+                &evidence,
+                &evidence,
+                &learning,
+                &evidence,
+            )
+            .with_operations(&operations)
+            .run_production_verified(
+                &mut executor,
+                ProductionStatisticalTrialRequest {
+                    run_id,
+                    binding: &binding,
+                    registered: &registered,
+                    admission: &admission,
+                    patch: REFERENCE,
+                },
+                &measured[index].0.token.inner,
+                |_| {
+                    if index == 1 {
+                        Err(CoordinatorError::Evidence("forced terminal trial"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                receipt.receipt().outcome,
+                if index == 1 {
+                    crate::evaluation::reports::TrialOutcome::Error
+                } else {
+                    crate::evaluation::reports::TrialOutcome::Success
+                },
+                "{:?}",
+                receipt.receipt().failure_reason
+            );
+        }
+        let operation_summary: (i64, String) = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(group_concat(phase || ':' || event_source), '')
+                 FROM statistical_coordinator_operations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(operation_summary.0, 6, "{}", operation_summary.1);
+        let recorded: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM statistical_coordinator_operations
+                 WHERE phase='recorded' AND harness_bytes IS NOT NULL AND events_bytes IS NOT NULL
+                   AND execution_receipt_bytes IS NOT NULL AND event_source='production_authenticated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 5, "{}", operation_summary.1);
+        drop(authority);
+
+        let mut service =
+            crate::evaluation::ProductionEvaluationService::open_with_pins(&root.0, anchor, pins)
+                .unwrap()
+                .with_learning_authority(project, key);
+        let report = service.build_final_report(&registered).unwrap();
+        assert_eq!(report.report.sample_counts.failed_trials, 1);
+        assert_eq!(report.report.trials.len(), 6);
+        service.verify_final_report(&registered, &report).unwrap();
+        let analysis = report.report.learning_analysis.as_ref().unwrap();
+        assert_eq!(
+            analysis.result,
+            CausalResult::Unavailable(CausalUnavailable::MissingDownstreamGrade)
+        );
+        let connection = Connection::open(&database).unwrap();
+        let mut expected_inputs = BTreeSet::from([registered.preregistration_digest.clone()]);
+        let mut statement = connection
+            .prepare(
+                "SELECT run_config_digest,execution_receipt_digest,harness_digest,events_digest,
+                        terminal_evidence_digest
+                 FROM statistical_coordinator_operations
+                 WHERE phase IN ('recorded','terminal_error') ORDER BY run_id",
+            )
+            .unwrap();
+        for row in statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (config, receipt, harness, events, terminal) = row.unwrap();
+            expected_inputs.extend([config, receipt]);
+            expected_inputs.extend(harness);
+            expected_inputs.extend(events);
+            expected_inputs.extend(terminal);
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT payload FROM events WHERE event_type='tool_learning.recorded'
+                 ORDER BY commit_position",
+            )
+            .unwrap();
+        for payload in statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+        {
+            expected_inputs.insert(sha256(&payload.unwrap()));
+        }
+        assert_eq!(analysis.input_digests, expected_inputs);
+        assert_eq!(
+            service.build_final_report(&registered).unwrap().bytes,
+            report.bytes
+        );
+    }
+
+    #[test]
+    fn production_evaluation_service_pins_evidence_and_interruption_recovery() {
         let harness = harness();
         let candidate_harness = harness_with_task_version_and_arm("1", Arm::Candidate);
         let mut calibration_executor = ConformanceCoreTrialExecutor::source_semantics_fake(

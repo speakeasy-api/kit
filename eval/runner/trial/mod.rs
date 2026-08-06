@@ -647,12 +647,12 @@ pub struct ProductionCoreTrialExecutor<'a> {
         &'a kit::executor::cancel::SqliteCancellationCoordinator,
         kit::executor::cancel::WorkspaceIdentity,
     )>,
-    pub agent_command: &'a AgentCommand,
+    pub agent_command: &'a AgentCommand<'a>,
     pub usage_receipt: &'a TrialUsageReceipt,
     pub usage_receipts: &'a dyn TrialUsageReceiptStore,
 }
 
-pub type AgentCommand = dyn Fn(&[u8]) -> Result<Vec<std::ffi::OsString>, CoreTrialError>;
+pub type AgentCommand<'a> = dyn Fn(&[u8]) -> Result<Vec<std::ffi::OsString>, CoreTrialError> + 'a;
 
 impl CoreTrialExecutor for ProductionCoreTrialExecutor<'_> {
     fn execute_core(

@@ -35,7 +35,10 @@ use crate::{
             CostTable, LogicalModelUsage, ModelOutcome, SpeculationOutcome, ToolMeasurement,
             UsageEnvelope,
         },
-        adapters::tool::{ToolBinding, ToolExecutorAdapter, ToolKernelContext},
+        adapters::tool::{
+            DiscoveryAuthority, ToolBinding, ToolDiscoveryConfig, ToolExecutorAdapter,
+            ToolKernelContext,
+        },
         adapters::{
             grammar_edit::{GrammarEditContext, GrammarEditLimits, GrammarEditModelAdapter},
             model::{DurableModelAdapter, ModelPolicy, ModelSecurity, ProviderIdempotency},
@@ -46,7 +49,7 @@ use crate::{
         context::{ContextProjection, project_canonical_prompt},
         driver::restart::{
             BoundarySnapshot, EffectJournal, EffectJournalAppend, LoopRecord, RecoveryState,
-            RestartProjection, SafeBoundary,
+            RestartProjection, SafeBoundary, effect_records,
         },
         extensions::{
             EffectiveExtensionConfig, ExtensionDescriptor, ExtensionError, ExtensionPoint,
@@ -77,8 +80,8 @@ use crate::{
     },
     domain::{
         config::{Provider as ConfigProvider, RunConfigSnapshot},
-        events::{AttemptState, EntityId, RunState, TraceId},
-        ids::{CommandId, EventId, RunId, WorkspaceId},
+        events::{AttemptState, EntityId, RunState, TraceId, UtcDateTime},
+        ids::{CommandId, EventId, ProjectId, RunId, WorkspaceId},
         lifecycle::AttemptOwnership,
         secret::SecretLease,
     },
@@ -139,6 +142,7 @@ pub struct RunExecutorConfig {
     pub model_reservation: Spend,
     pub cancellation_coordinator: Arc<dyn ExecutorCancellationCoordinator>,
     pub telemetry: Option<Arc<crate::runtime::telemetry::TelemetryRuntime<'static>>>,
+    tool_learning_key: Option<[u8; 32]>,
     mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
     mcp_stdio_profiles:
         Option<Arc<dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>>,
@@ -191,6 +195,7 @@ impl RunExecutorConfig {
             claim_renewal_interval: Duration::from_secs(1),
             model_reservation: Spend::new(0, 1, 1, 0, 0),
             telemetry: None,
+            tool_learning_key: None,
             mcp_servers: Vec::new(),
             mcp_stdio_profiles: None,
             mcp_responder_outcomes: Default::default(),
@@ -216,6 +221,11 @@ impl RunExecutorConfig {
 
     pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.project_root = root.into();
+        self
+    }
+
+    pub fn with_tool_learning_key(mut self, key: [u8; 32]) -> Self {
+        self.tool_learning_key = Some(key);
         self
     }
 
@@ -591,7 +601,7 @@ impl AttemptMcpRuntime {
         config: &RunExecutorConfig,
         cancellation: Arc<AtomicBool>,
         revision_live: Arc<AtomicBool>,
-        project_root: PathBuf,
+        workspace: crate::workspace::revision::ManagedWorkspace,
         workspace_revision: String,
     ) -> Result<Self, ExecutorError> {
         let (shutdown, _) = watch::channel(false);
@@ -644,12 +654,12 @@ impl AttemptMcpRuntime {
                     }
                     _ = tokio::time::sleep(Duration::from_millis(250)) => {}
                 }
-                let root = project_root.clone();
+                let workspace = workspace.clone();
                 let revision = tokio::time::timeout(
                     Duration::from_secs(2),
                     tokio::task::spawn_blocking(move || {
-                        crate::workspace::revision::ManagedWorkspace::open(root)
-                            .and_then(|workspace| workspace.current_revision())
+                        workspace
+                            .current_revision()
                             .map(|revision| revision.id().to_string())
                     }),
                 )
@@ -884,37 +894,53 @@ async fn execute_attempt(
             ),
         );
     }
+    if config.telemetry.is_some() {
+        flush_learning(config, job.project_id, job.run.id);
+        if config
+            .telemetry
+            .as_ref()
+            .is_some_and(|telemetry| !telemetry.learning_admission_ready())
+        {
+            heartbeat.stop()?;
+            return Ok(AttemptExit::Waiting);
+        }
+    }
     config.model_adapter.select(snapshot.effective().provider)?;
-    let authority_snapshot = if config.mcp_servers.is_empty() {
-        None
-    } else {
-        let root = config.project_root.clone();
-        Some(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || {
-                    let root = std::fs::canonicalize(root).map_err(|error| {
-                        ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
-                    })?;
-                    let revision = crate::workspace::revision::ManagedWorkspace::open(&root)
-                        .and_then(|workspace| workspace.current_revision())
-                        .map_err(|error| ExecutorError::Worker(error.to_string()))?
-                        .id()
-                        .to_string();
-                    Ok::<_, ExecutorError>((root, revision))
-                }),
-            )
-            .await
-            .map_err(|_| ExecutorError::Worker("trusted project root scan timed out".to_owned()))?
-            .map_err(|error| {
-                ExecutorError::Worker(format!("trusted project root scan: {error}"))
-            })??,
-        )
-    };
-    let authority_revision = authority_snapshot
-        .as_ref()
-        .map(|(_, revision)| revision.as_str());
-    let prepared_prompt = prepare_prompt(config, &job, &snapshot, authority_revision)?;
+    let root = config.project_root.clone();
+    let authority_snapshot = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let root = std::fs::canonicalize(root).map_err(|error| {
+                ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
+            })?;
+            let workspace = crate::workspace::revision::ManagedWorkspace::open(&root)
+                .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+            let revision = workspace
+                .current_revision()
+                .map_err(|error| ExecutorError::Worker(error.to_string()))?
+                .id()
+                .to_string();
+            Ok::<_, ExecutorError>((root, revision, workspace))
+        }),
+    )
+    .await
+    .map_err(|_| ExecutorError::Worker("trusted project root scan timed out".to_owned()))?
+    .map_err(|error| ExecutorError::Worker(format!("trusted project root scan: {error}")))??;
+    let prompt_revision = authority_snapshot.1.as_str();
+    let prepared_prompt = prepare_prompt(config, &job, &snapshot, Some(prompt_revision))?;
+    let current_revision = authority_snapshot
+        .2
+        .current_revision()
+        .map_err(|error| ExecutorError::Worker(error.to_string()))?
+        .id()
+        .to_string();
+    if current_revision != authority_snapshot.1 {
+        heartbeat.stop()?;
+        return Err(ExecutorError::Worker(
+            "workspace revision changed while compiling the authoritative prompt".to_owned(),
+        ));
+    }
+    let authority_revision = authority_snapshot.1.as_str();
     config.scheduler.register_run_with_snapshot(
         job.run.id,
         job.principal_id,
@@ -959,10 +985,16 @@ async fn execute_attempt(
             return Ok(AttemptExit::Waiting);
         }
         RecoveryState::Cancelled(_) => {
+            settle_cancelled_learning(config, &job)?;
             heartbeat.stop()?;
             return cancel_attempt(config, job);
         }
         RecoveryState::OutcomeUnknown(_) => {
+            settle_learning(
+                config,
+                &job,
+                crate::telemetry::tool_learning::LearningStatus::OutcomeUnknown,
+            )?;
             heartbeat.stop()?;
             return fail_attempt(
                 config,
@@ -1074,11 +1106,7 @@ async fn execute_attempt(
                 .map(|(server, scope)| (server.clone(), scope.secrets.clone()))
                 .collect(),
             policies: sampling_policies,
-            workspace_revision: authority_revision
-                .ok_or_else(|| {
-                    ExecutorError::Worker("MCP workspace revision is unavailable".to_owned())
-                })?
-                .to_owned(),
+            workspace_revision: authority_revision.to_owned(),
             artifact_retention_days: snapshot.effective().artifact_retention_days,
         }));
     }
@@ -1110,15 +1138,8 @@ async fn execute_attempt(
             authenticated: &authenticated,
             config: &snapshot,
             workspace_id: workspace,
-            workspace_revision: authority_revision.ok_or_else(|| {
-                ExecutorError::Worker("MCP workspace revision is unavailable".to_owned())
-            })?,
-            project_root: authority_snapshot
-                .as_ref()
-                .map(|(root, _)| root.as_path())
-                .ok_or_else(|| {
-                    ExecutorError::Worker("MCP source root is unavailable".to_owned())
-                })?,
+            workspace_revision: authority_revision,
+            project_root: authority_snapshot.0.as_path(),
             attempt: job.attempt.owner,
             claim: job.claim,
             current_fence: Arc::clone(&current_fence),
@@ -1197,14 +1218,8 @@ async fn execute_attempt(
                     config,
                     Arc::clone(&live_cancellation),
                     Arc::clone(&revision_live),
-                    authority_snapshot
-                        .as_ref()
-                        .expect("MCP authority snapshot exists")
-                        .0
-                        .clone(),
-                    authority_revision
-                        .expect("MCP authority revision exists")
-                        .to_owned(),
+                    authority_snapshot.2.clone(),
+                    authority_revision.to_owned(),
                 )?;
                 mcp_runtime = Some(runtime);
                 mcp_attempt_runtime = Some(owned);
@@ -1236,7 +1251,12 @@ async fn execute_attempt(
         &job,
         &snapshot,
         true,
-        mcp_runtime.as_ref(),
+        mcp_runtime.as_ref().map(|runtime| {
+            (
+                runtime,
+                authority_revision,
+            )
+        }),
         Arc::clone(&live_cancellation),
         budget,
     )?;
@@ -1571,6 +1591,65 @@ async fn execute_attempt(
         };
     }
     attempt_result
+}
+
+fn settle_cancelled_learning(
+    config: &RunExecutorConfig,
+    job: &WorkerRun,
+) -> Result<(), ExecutorError> {
+    if config.tool_learning_key.is_none() {
+        return Ok(());
+    }
+    let denied = effect_records(&append_store(config)?, job.attempt.owner)
+        .map_err(|error| ExecutorError::Worker(error.to_string()))?
+        .iter()
+        .any(|record| matches!(
+            record,
+            LoopRecord::WaitingResolved(resolved)
+                if matches!(
+                    resolved.resolution,
+                    crate::agent::driver::waiting::WaitingResolution::Approval {
+                        decision: crate::domain::events::ApprovalDecision::Denied
+                    } | crate::agent::driver::waiting::WaitingResolution::Auth { granted: false }
+                )
+        ));
+    settle_learning(
+        config,
+        job,
+        if denied {
+            crate::telemetry::tool_learning::LearningStatus::Failed
+        } else {
+            crate::telemetry::tool_learning::LearningStatus::Cancelled
+        },
+    )
+}
+
+fn settle_learning(
+    config: &RunExecutorConfig,
+    job: &WorkerRun,
+    status: crate::telemetry::tool_learning::LearningStatus,
+) -> Result<(), ExecutorError> {
+    let Some(key) = config.tool_learning_key else {
+        return Ok(());
+    };
+    let hasher = crate::telemetry::tool_learning::ProjectPointerHasher::new(job.project_id, &key);
+    let result = crate::telemetry::tool_learning::settle_unresolved_continuations(
+        &mut append_store(config)?,
+        job.attempt.owner,
+        job.claim,
+        &hasher,
+        job.run.id,
+        UtcDateTime::now().map_err(|error| ExecutorError::Worker(error.to_string()))?,
+        TraceId::parse("tool-learning-continuation")
+            .expect("tool-learning continuation trace ID is valid"),
+        status,
+    );
+    if let Err(error) = result
+        && let Some(telemetry) = &config.telemetry
+    {
+        telemetry.mark_learning_failure(error.to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -2676,7 +2755,10 @@ fn tool_adapter(
     job: &WorkerRun,
     snapshot: &RunConfigSnapshot,
     resolve_native_revision: bool,
-    mcp_runtime: Option<&Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>>,
+    mcp: Option<(
+        &Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
+        &str,
+    )>,
     live_cancellation: Arc<AtomicBool>,
     budget: Arc<BudgetLedger>,
 ) -> Result<(ToolExecutorAdapter, Option<String>), ExecutorError> {
@@ -2684,21 +2766,7 @@ fn tool_adapter(
     let project_root = std::fs::canonicalize(&config.project_root).map_err(|error| {
         ExecutorError::Worker(format!("trusted project root unavailable: {error}"))
     })?;
-    let mcp_workspace = mcp_runtime
-        .map(|_| {
-            crate::workspace::revision::ManagedWorkspace::open(&project_root)
-                .map_err(|error| ExecutorError::Worker(error.to_string()))
-        })
-        .transpose()?;
-    let mcp_revision = mcp_workspace
-        .as_ref()
-        .map(|workspace| {
-            workspace
-                .current_revision()
-                .map(|revision| revision.id().to_string())
-                .map_err(|error| ExecutorError::Worker(error.to_string()))
-        })
-        .transpose()?;
+    let (mcp_runtime, mcp_revision) = mcp.unzip();
     let descriptors = crate::capabilities::native::NativeCatalog::enabled(snapshot);
     let configured = descriptors
         .iter()
@@ -2714,12 +2782,7 @@ fn tool_adapter(
         .collect::<Vec<_>>();
     let mcp_catalog = mcp_runtime
         .map(|runtime| {
-            runtime.catalog_snapshot_for(
-                job.principal_id,
-                job.project_id,
-                workspace,
-                mcp_revision.as_deref(),
-            )
+            runtime.catalog_snapshot_for(job.principal_id, job.project_id, workspace, mcp_revision)
         })
         .transpose()
         .map_err(|error| ExecutorError::Worker(error.to_string()))?;
@@ -2794,7 +2857,7 @@ fn tool_adapter(
         job.project_id,
         snapshot.effective_authority().iter().copied(),
     ));
-    let mut bindings = configured
+    let bindings = configured
         .iter()
         .map(|(descriptor, constraints)| {
             let binding = ToolBinding::new(
@@ -2839,38 +2902,34 @@ fn tool_adapter(
             }
         })
         .collect::<Vec<_>>();
-    if let Some(catalog) = &mcp_catalog {
-        for (entry, constraints, _, extension) in &mcp_configured {
-            let session = crate::capabilities::discovery::DiscoverySession::new(
-                catalog,
-                &authenticated,
-                snapshot,
-                &grants,
-                None,
-                workspace,
-                job.project_id,
-                constraints,
-                extension.clone(),
-            );
-            let binding = session.bind_identity(entry.identity()).ok_or_else(|| {
-                ExecutorError::Worker("configured MCP capability is not authorized".to_owned())
-            })?;
-            let spec = agentkit_tools_core::ToolSpec::new(
-                agentkit_tools_core::ToolName::new(
-                    crate::capabilities::registration::direct_wire_name(binding.id()),
-                ),
-                entry.search().summary(),
-                crate::protocols::mcp::features::model_schema_projection(
-                    entry.schemas().input().schema().value().clone(),
-                ),
-            );
-            bindings.push(ToolBinding::mcp(
-                spec,
-                Arc::new(binding),
-                constraints.clone(),
-                extension.clone(),
-            ));
-        }
+    let discovery = config
+        .tool_learning_key
+        .map(|pointer_key| {
+            Ok::<_, ExecutorError>(ToolDiscoveryConfig {
+                catalog: match &mcp_catalog {
+                    Some(catalog) => catalog.clone(),
+                    None => crate::capabilities::catalog::CatalogSnapshot::from_native(
+                        DigestAlgorithm::Sha256,
+                    )
+                    .map_err(|error| ExecutorError::Worker(error.to_string()))?,
+                },
+                authorities: mcp_configured
+                    .iter()
+                    .map(|(_, constraints, _, extension)| DiscoveryAuthority {
+                        constraints: constraints.clone(),
+                        extension: extension.clone(),
+                    })
+                    .collect(),
+                provider: provider_capability_contract(config, snapshot)?,
+                telemetry: config.telemetry.clone(),
+                pointer_key,
+            })
+        })
+        .transpose()?;
+    if mcp_catalog.is_some() && discovery.is_none() {
+        return Err(ExecutorError::Worker(
+            "MCP tool learning requires a durable project pointer key".to_owned(),
+        ));
     }
     let scratch = config
         .workspace_scratch
@@ -3021,12 +3080,11 @@ fn tool_adapter(
     let native_revision = resolve_native_revision
         .then(|| dispatcher.revision().map_err(ExecutorError::Worker))
         .transpose()?;
-    if mcp_revision.is_some() && mcp_revision != native_revision {
+    if mcp_revision.is_some() && mcp_revision != native_revision.as_deref() {
         return Err(ExecutorError::Worker(
             "MCP owner workspace revision changed during executor initialization".to_owned(),
         ));
     }
-    drop(mcp_workspace);
     let adapter = ToolExecutorAdapter::new(
         bindings,
         ToolKernelContext {
@@ -3055,7 +3113,56 @@ fn tool_adapter(
         ),
         None => adapter,
     };
+    let adapter = match discovery {
+        Some(discovery) => adapter
+            .with_discovery(discovery)
+            .map_err(ExecutorError::Worker)?,
+        None => adapter,
+    };
     Ok((adapter, native_revision))
+}
+
+fn provider_capability_contract(
+    config: &RunExecutorConfig,
+    snapshot: &RunConfigSnapshot,
+) -> Result<crate::capabilities::registration::ProviderCapabilityContract, ExecutorError> {
+    use crate::capabilities::{
+        kernel::identity::DigestAlgorithm,
+        registration::{ProviderCapabilityContract, ValidatedProjectionSupport},
+        schema::{JSON_SCHEMA_2020_12, ProjectionProfile, ProjectionTarget},
+    };
+
+    let provider = snapshot.effective().provider;
+    let profile = ProjectionProfile::new(
+        ProjectionTarget::new(
+            config.model_adapter.provider_name(provider),
+            config.model_adapter.model_name(provider),
+            "agentkit",
+            1,
+        )
+        .map_err(|error| ExecutorError::Worker(error.to_string()))?,
+        JSON_SCHEMA_2020_12,
+        BTreeSet::from([
+            "$schema".to_owned(),
+            "additionalProperties".to_owned(),
+            "maxLength".to_owned(),
+            "maximum".to_owned(),
+            "minLength".to_owned(),
+            "minimum".to_owned(),
+            "pattern".to_owned(),
+            "properties".to_owned(),
+            "required".to_owned(),
+            "type".to_owned(),
+        ]),
+        serde_json::Value::Bool(true),
+        1024 * 1024,
+        DigestAlgorithm::Sha256,
+    )
+    .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    Ok(ProviderCapabilityContract::portable(
+        ValidatedProjectionSupport::validate(&profile)
+            .map_err(|error| ExecutorError::Worker(error.to_string()))?,
+    ))
 }
 
 fn durable_tool_budget(
@@ -3353,6 +3460,10 @@ fn complete_attempt(
                 telemetry_digest,
             },
         )?;
+    let run_id = job.run.id;
+    let project_id = job.project_id;
+    finish_attempt(config, job)?;
+    flush_learning(config, project_id, run_id);
     if let Some(telemetry) = &config.telemetry {
         telemetry
             .emit_canonical_run_envelope(envelope)
@@ -3363,7 +3474,7 @@ fn complete_attempt(
     if let Some(barrier) = config.model_adapter.fake_barrier() {
         barrier.wait(FakeBarrierCheckpoint::AfterJournalBoundary);
     }
-    finish_attempt(config, job)
+    Ok(())
 }
 
 fn finish_attempt(config: &RunExecutorConfig, mut job: WorkerRun) -> Result<(), ExecutorError> {
@@ -3373,6 +3484,7 @@ fn finish_attempt(config: &RunExecutorConfig, mut job: WorkerRun) -> Result<(), 
     transition_attempt(config, job.attempt.id, AttemptState::Succeeded)?;
     transition_run(config, job.run.id, RunState::Completed)?;
     config.scheduler.finish_run(job.run.id, false)?;
+    append_store(config)?.quiesce_driver_claim(job.claim)?;
     Ok(())
 }
 
@@ -3577,6 +3689,7 @@ fn cancel_attempt(
     config: &RunExecutorConfig,
     mut job: WorkerRun,
 ) -> Result<AttemptExit, ExecutorError> {
+    settle_cancelled_learning(config, &job)?;
     if job.attempt.state != AttemptState::Quiescing {
         job = transition_attempt(config, job.attempt.id, AttemptState::Quiescing)?;
     }
@@ -3594,6 +3707,7 @@ fn cancel_attempt(
     }
     transition_run(config, job.run.id, RunState::Cancelled)?;
     config.scheduler.finish_run(job.run.id, true)?;
+    flush_learning(config, job.project_id, job.run.id);
     Ok(AttemptExit::Completed)
 }
 
@@ -3608,7 +3722,24 @@ fn fail_attempt(
         .unwrap_or_else(|error| error.into_inner())
         .fail_worker_run(job.run.id, job.claim, failure)?;
     config.scheduler.finish_run(job.run.id, false)?;
+    flush_learning(config, job.project_id, job.run.id);
     Ok(AttemptExit::Completed)
+}
+
+fn flush_learning(config: &RunExecutorConfig, project_id: ProjectId, run_id: RunId) {
+    let (Some(telemetry), Some(key)) = (&config.telemetry, config.tool_learning_key) else {
+        return;
+    };
+    let hasher = crate::telemetry::tool_learning::ProjectPointerHasher::new(project_id, &key);
+    match append_store(config) {
+        Ok(mut store) => {
+            let _ = telemetry.export_learning_outbox(&mut store, &hasher);
+            if store.catalog_stats_run_terminal(run_id).unwrap_or(false) {
+                let _ = telemetry.export_catalog_stats_snapshot(&mut store, &hasher, run_id);
+            }
+        }
+        Err(error) => telemetry.mark_learning_failure(error.to_string()),
+    }
 }
 
 struct ProgressObserver {
@@ -4062,6 +4193,9 @@ pub struct FakeProvider {
 pub enum FakeScenario {
     Complete,
     Tool,
+    ToolInvalid,
+    ToolInvalidCheck,
+    DeferredMcp,
     NativeCoding,
     #[cfg(debug_assertions)]
     ToolBarrier(FakeProviderBarrier),
@@ -4407,6 +4541,32 @@ impl ModelSession for FakeSession {
                 {
                     FakeTurn::tool(response, correlation.as_ref(), native_revision.as_deref())?
                 }
+                FakeScenario::ToolInvalid
+                    if !transcript.iter().any(|item| item.kind == ItemKind::Tool) =>
+                {
+                    FakeTurn::tool_request(
+                        response,
+                        correlation.as_ref(),
+                        "kit_discover",
+                        serde_json::json!({}),
+                    )?
+                }
+                FakeScenario::ToolInvalidCheck
+                    if !transcript.iter().any(|item| item.kind == ItemKind::Tool) =>
+                {
+                    FakeTurn::tool_request(
+                        response,
+                        correlation.as_ref(),
+                        "kit_check",
+                        serde_json::json!({}),
+                    )?
+                }
+                FakeScenario::DeferredMcp if completed_tools < 5 => FakeTurn::deferred_mcp_tool(
+                    response,
+                    correlation.as_ref(),
+                    completed_tools,
+                    transcript,
+                )?,
                 FakeScenario::NativeCoding if completed_tools < 6 => FakeTurn::native_coding_tool(
                     response,
                     correlation.as_ref(),
@@ -4690,6 +4850,72 @@ impl FakeTurn {
                     "limits":{"cpu_millis":1000,"memory_bytes":268435456,"pids":64,"file_bytes":16777216,"disk_bytes":268435456,"io_bytes":67108864,"output_bytes":65536,"wall_time_millis":10000}
                 }),
             ),
+            _ => unreachable!(),
+        };
+        Self::tool_request(response, correlation, name, input)
+    }
+
+    fn deferred_mcp_tool(
+        response: FakeResponse,
+        correlation: Option<&crate::agent::driver::restart::EffectCorrelation>,
+        step: usize,
+        transcript: &[Item],
+    ) -> Result<Self, LoopError> {
+        let latest = || {
+            transcript.iter().rev().find_map(|item| {
+                item.parts.iter().find_map(|part| match part {
+                    agentkit_core::Part::ToolResult(result) => match &result.output {
+                        agentkit_core::ToolOutput::Structured(value) => Some(value.clone()),
+                        agentkit_core::ToolOutput::Text(value) => serde_json::from_str(value).ok(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+            })
+        };
+        let (name, input) = match step {
+            0 => (
+                "tools_search",
+                serde_json::json!({"query":"fixture","limit":1}),
+            ),
+            1 => {
+                let handle = latest()
+                    .and_then(|value| value.pointer("/results/0/handle").cloned())
+                    .ok_or_else(|| LoopError::Provider("MCP search returned no handle".into()))?;
+                ("tools_inspect", serde_json::json!({"handle":handle}))
+            }
+            2 => {
+                let handle = latest()
+                    .and_then(|value| value.get("handle").cloned())
+                    .ok_or_else(|| {
+                        LoopError::Provider("MCP inspection returned no handle".into())
+                    })?;
+                ("tools_bind", serde_json::json!({"handle":handle}))
+            }
+            3 | 4 => {
+                let binding = transcript
+                    .iter()
+                    .rev()
+                    .find_map(|item| {
+                        item.parts.iter().find_map(|part| match part {
+                            agentkit_core::Part::ToolResult(result) => match &result.output {
+                                agentkit_core::ToolOutput::Structured(value) => {
+                                    value.get("binding_id").cloned()
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                    })
+                    .ok_or_else(|| LoopError::Provider("MCP bind returned no identity".into()))?;
+                (
+                    "tools_invoke",
+                    serde_json::json!({
+                        "binding_id":binding,
+                        "input": if step == 3 { serde_json::json!({}) } else { serde_json::json!({"text":"hello"}) }
+                    }),
+                )
+            }
             _ => unreachable!(),
         };
         Self::tool_request(response, correlation, name, input)

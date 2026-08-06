@@ -31,6 +31,11 @@ use crate::{
             CanonicalRequestDigest, IdempotencyKey, IdempotencyScope, IdempotencyStatus,
         },
     },
+    telemetry::tool_learning::{
+        ErrorClass as LearningErrorClass, ErrorCode as LearningErrorCode,
+        ErrorStage as LearningErrorStage, LearningFailure, LearningStatus, PreparedLearningCapture,
+        RetryClass as LearningRetryClass,
+    },
 };
 
 use super::{
@@ -164,6 +169,7 @@ pub struct InvocationEnvelope<'a> {
     pub outcome_event_id: EventId,
     pub occurred_at: &'a UtcDateTime,
     pub trace_id: &'a TraceId,
+    pub learning: Option<&'a PreparedLearningCapture>,
 }
 
 impl InvocationEnvelope<'_> {
@@ -272,6 +278,7 @@ impl<'a> InvocationEnvelope<'a> {
             outcome_event_id: self.outcome_event_id,
             occurred_at: self.occurred_at,
             trace_id: self.trace_id,
+            learning: self.learning,
         }
     }
 
@@ -314,6 +321,7 @@ impl<'a> InvocationEnvelope<'a> {
             outcome_event_id: self.outcome_event_id,
             occurred_at: self.occurred_at,
             trace_id: self.trace_id,
+            learning: self.learning,
         }
     }
 }
@@ -535,14 +543,63 @@ pub(crate) fn prepare(
     envelope: &InvocationEnvelope<'_>,
     runtime: &mut InvocationPhaseRuntime<'_>,
 ) -> Result<PrepareOutcome, InvokeError> {
-    prepare_inner(envelope, runtime, false)
+    prepare_with_learning(envelope, runtime, false)
 }
 
 pub(crate) fn prepare_resuming_dispatch(
     envelope: &InvocationEnvelope<'_>,
     runtime: &mut InvocationPhaseRuntime<'_>,
 ) -> Result<PrepareOutcome, InvokeError> {
-    prepare_inner(envelope, runtime, true)
+    prepare_with_learning(envelope, runtime, true)
+}
+
+fn prepare_with_learning(
+    envelope: &InvocationEnvelope<'_>,
+    runtime: &mut InvocationPhaseRuntime<'_>,
+    resume_dispatched: bool,
+) -> Result<PrepareOutcome, InvokeError> {
+    let result = prepare_inner(envelope, runtime, resume_dispatched);
+    if let Err(error) = &result
+        && let Some(failure) = pre_kernel_learning_failure(error)
+    {
+        let _ = capture_rejected(envelope, runtime.store, failure);
+    }
+    result
+}
+
+fn pre_kernel_learning_failure(error: &InvokeError) -> Option<LearningFailure> {
+    let (stage, class, code, retry) = match error {
+        InvokeError::AuthorizationDenied(_) => (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Policy,
+            LearningErrorCode::AuthorizationDenied,
+            LearningRetryClass::Never,
+        ),
+        InvokeError::SchemaBindingMismatch
+        | InvokeError::InvalidArguments
+        | InvokeError::UnsupportedValidation => (
+            LearningErrorStage::SchemaValidation,
+            LearningErrorClass::Input,
+            LearningErrorCode::InvalidSchema,
+            LearningRetryClass::Never,
+        ),
+        InvokeError::Budget(_) | InvokeError::ToolReservationRequired => (
+            LearningErrorStage::Dispatch,
+            LearningErrorClass::Budget,
+            LearningErrorCode::BudgetUnavailable,
+            LearningRetryClass::Safe,
+        ),
+        _ => return None,
+    };
+    Some(LearningFailure {
+        stage,
+        class,
+        code,
+        field: None,
+        retry,
+        dispatched: false,
+        known: true,
+    })
 }
 
 pub(crate) fn replay(
@@ -560,11 +617,85 @@ pub(crate) fn replay(
     let Some(result) = persisted_outcome(envelope, runtime.store, request_digest)? else {
         return Ok(None);
     };
+    reconcile_persisted_learning(envelope, runtime.store, request_digest, &result)?;
     let reservation_id = reservation_id(request_digest);
     runtime
         .budget
         .reserve(reservation_id, envelope.reservation)?;
     settle(runtime.budget, reservation_id, result, true).map(Some)
+}
+
+pub(crate) fn capture_rejected(
+    envelope: &InvocationEnvelope<'_>,
+    store: &mut SqliteStore,
+    failure: LearningFailure,
+) -> Result<(), InvokeError> {
+    let Some(capture) = envelope.learning else {
+        return Ok(());
+    };
+    let decision_digest = grant::decide(envelope.grant_request()).snapshot_digest();
+    let request_digest = request_digest(envelope, decision_digest);
+    let claim = envelope
+        .driver_claim
+        .ok_or(InvokeError::MissingDriverClaim)?;
+    let prepared = if matches!(
+        failure.retry,
+        LearningRetryClass::AuthorizationResume | LearningRetryClass::UrlResume
+    ) {
+        crate::telemetry::tool_learning::prepare_invocation_interruption(
+            store,
+            claim,
+            capture,
+            envelope.occurred_at.clone(),
+            envelope.trace_id.clone(),
+            request_digest.as_bytes(),
+            failure.clone(),
+        )
+    } else {
+        crate::telemetry::tool_learning::prepare_invocation_terminal(
+            store,
+            claim,
+            capture,
+            envelope.occurred_at.clone(),
+            envelope.trace_id.clone(),
+            request_digest.as_bytes(),
+            Some(failure.clone()),
+            if failure.known {
+                LearningStatus::Failed
+            } else {
+                LearningStatus::OutcomeUnknown
+            },
+            failure.dispatched,
+            failure.known,
+            None,
+            None,
+            true,
+        )
+    };
+    persist_learning(envelope, store, capture, "rejected", prepared, false)
+}
+
+pub(crate) fn capture_external_failure(
+    envelope: &InvocationEnvelope<'_>,
+    store: &mut SqliteStore,
+    code: &str,
+) -> Result<(), InvokeError> {
+    let dispatched = store.invocation_was_dispatched(envelope.invocation_id)?;
+    let failure = external_failure(code, envelope.retry_safety, dispatched);
+    capture_rejected(envelope, store, failure)
+}
+
+fn external_failure(code: &str, retry_safety: RetrySafety, dispatched: bool) -> LearningFailure {
+    let result = if dispatched {
+        unknown(code, true)
+    } else {
+        terminal(InvocationStatus::Failed, None, Some(code), false)
+    };
+    let mut failure = learning_failure(&result, retry_safety, dispatched)
+        .expect("failed external invocation has learning failure metadata");
+    failure.dispatched = dispatched;
+    failure.known = !dispatched;
+    failure
 }
 
 fn prepare_inner(
@@ -596,6 +727,7 @@ fn prepare_inner(
 
     append_intent(envelope, runtime.store, request_digest, reservation_id)?;
     if let Some(result) = persisted_outcome(envelope, runtime.store, request_digest)? {
+        reconcile_persisted_learning(envelope, runtime.store, request_digest, &result)?;
         return settle(runtime.budget, reservation_id, result, true)
             .map(Box::new)
             .map(PrepareOutcome::Completed);
@@ -909,6 +1041,18 @@ fn append_intent(
         "reservation_id": reservation_id.get().to_string(),
         "reservation": spend_value(envelope.reservation),
     }))?;
+    let stream = EntityId::ToolCall(envelope.invocation_id);
+    let expected_versions = vec![ExpectedStreamVersion {
+        stream,
+        version: ExpectedVersion::new(0),
+    }];
+    let events = vec![event(
+        envelope,
+        envelope.intent_event_id,
+        INTENT_EVENT,
+        payload,
+        b"[]".to_vec(),
+    )];
     let outcome = store.append(AppendCommand {
         idempotency_scope: scope(envelope, INTENT_COMMAND)?,
         idempotency_key: envelope.idempotency_key.clone(),
@@ -916,19 +1060,30 @@ fn append_intent(
         claim: None,
         driver_claim: envelope.driver_claim,
         allow_quiescent_driver_claim: false,
-        expected_versions: vec![ExpectedStreamVersion {
-            stream: EntityId::ToolCall(envelope.invocation_id),
-            version: ExpectedVersion::new(0),
-        }],
-        events: vec![event(
-            envelope,
-            envelope.intent_event_id,
-            INTENT_EVENT,
-            payload,
-            b"[]".to_vec(),
-        )],
+        expected_versions,
+        events,
         response: b"intent-v1".to_vec(),
     })?;
+    if let Some(capture) = envelope.learning {
+        let prepared = crate::telemetry::tool_learning::prepare_invocation_intent(
+            store,
+            envelope
+                .driver_claim
+                .ok_or(InvokeError::MissingDriverClaim)?,
+            capture,
+            envelope.occurred_at.clone(),
+            envelope.trace_id.clone(),
+            request_digest.as_bytes(),
+            envelope.intent_event_id,
+        );
+        persist_learning(envelope, store, capture, "intent", prepared, true)?;
+        if capture.required() {
+            store.reserve_learning_reconciliation(
+                capture.hasher().project().as_str(),
+                &envelope.invocation_id.to_string(),
+            )?;
+        }
+    }
     Ok(matches!(outcome, AppendOutcome::Replayed(_)))
 }
 
@@ -1008,30 +1163,233 @@ fn append_outcome(
         "attempt_fence": envelope.attempt.fencing_token.get(),
         "result": result,
     }))?;
-    let outcome = store.append(AppendCommand {
+    let stream = EntityId::ToolCall(envelope.invocation_id);
+    let mut expected_versions = vec![ExpectedStreamVersion {
+        stream,
+        version: ExpectedVersion::new(if dispatched { 2 } else { 1 }),
+    }];
+    let mut events = vec![event(
+        envelope,
+        envelope.outcome_event_id,
+        OUTCOME_EVENT,
+        payload,
+        artifacts,
+    )];
+    if let Some(capture) = envelope.learning {
+        let (status, known) = learning_status(result);
+        let failure = learning_failure(result, envelope.retry_safety, dispatched);
+        let interruption = failure.as_ref().is_some_and(|failure| {
+            matches!(
+                failure.retry,
+                LearningRetryClass::AuthorizationResume | LearningRetryClass::UrlResume
+            )
+        });
+        let prepared = if interruption {
+            crate::telemetry::tool_learning::prepare_invocation_interruption(
+                store,
+                envelope
+                    .driver_claim
+                    .ok_or(InvokeError::MissingDriverClaim)?,
+                capture,
+                envelope.occurred_at.clone(),
+                envelope.trace_id.clone(),
+                request_digest.as_bytes(),
+                failure.expect("learning interruption has a failure"),
+            )
+        } else {
+            crate::telemetry::tool_learning::prepare_invocation_terminal(
+                store,
+                envelope
+                    .driver_claim
+                    .ok_or(InvokeError::MissingDriverClaim)?,
+                capture,
+                envelope.occurred_at.clone(),
+                envelope.trace_id.clone(),
+                request_digest.as_bytes(),
+                failure,
+                status,
+                dispatched,
+                known,
+                dispatched.then_some(envelope.reservation.cost_microusd()),
+                Some(envelope.outcome_event_id),
+                true,
+            )
+        };
+        match prepared {
+            Ok(Some((version, mut learning_events))) => {
+                expected_versions.push(version);
+                events.append(&mut learning_events);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                capture.mark_failure(&error);
+            }
+        }
+    }
+    let command = AppendCommand {
         idempotency_scope: scope(envelope, OUTCOME_COMMAND)?,
         idempotency_key: envelope.idempotency_key.clone(),
         request_digest,
         claim: None,
         driver_claim: envelope.driver_claim,
         allow_quiescent_driver_claim: false,
-        expected_versions: vec![ExpectedStreamVersion {
-            stream: EntityId::ToolCall(envelope.invocation_id),
-            version: ExpectedVersion::new(if dispatched { 2 } else { 1 }),
-        }],
-        events: vec![event(
-            envelope,
-            envelope.outcome_event_id,
-            OUTCOME_EVENT,
-            payload,
-            artifacts,
-        )],
+        expected_versions,
+        events,
         response,
-    })?;
-    let bytes = match outcome {
-        AppendOutcome::Committed(response) | AppendOutcome::Replayed(response) => response.response,
     };
-    serde_json::from_slice(&bytes).map_err(|_| InvokeError::InvalidPersistedOutcome)
+    let outcome = if let Some(capture) = envelope.learning {
+        let mut provider_only = command.clone();
+        provider_only.expected_versions.truncate(1);
+        provider_only.events.truncate(1);
+        match store.append_with_learning_reconciliation(
+            command,
+            capture.hasher().project().as_str(),
+            &envelope.invocation_id.to_string(),
+            capture.required(),
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if !capture.required() => {
+                capture.mark_failure(&crate::telemetry::tool_learning::ToolLearningError::Store(
+                    error,
+                ));
+                store.append(provider_only)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        store.append(command)
+    }?;
+    let (bytes, replayed) = match outcome {
+        AppendOutcome::Committed(response) => (response.response, false),
+        AppendOutcome::Replayed(response) => (response.response, true),
+    };
+    let persisted: CanonicalInvocationResult =
+        serde_json::from_slice(&bytes).map_err(|_| InvokeError::InvalidPersistedOutcome)?;
+    if let Some(capture) = envelope.learning {
+        if !replayed {
+            match store.has_learning_marker(&envelope.invocation_id.to_string()) {
+                Ok(true) => {}
+                Ok(false) => capture.mark_failure(
+                    &crate::telemetry::tool_learning::ToolLearningError::BoundExceeded,
+                ),
+                Err(error) => capture.mark_failure(
+                    &crate::telemetry::tool_learning::ToolLearningError::Store(error),
+                ),
+            }
+        }
+        match store.reconcile_learning_markers(capture.hasher().project().as_str(), 256) {
+            Ok(_) => match store.has_learning_marker(&envelope.invocation_id.to_string()) {
+                Ok(false) => {}
+                Ok(true) => capture.mark_failure(
+                    &crate::telemetry::tool_learning::ToolLearningError::BoundExceeded,
+                ),
+                Err(error) => capture.mark_failure(
+                    &crate::telemetry::tool_learning::ToolLearningError::Store(error),
+                ),
+            },
+            Err(error) => capture.mark_failure(
+                &crate::telemetry::tool_learning::ToolLearningError::Store(error),
+            ),
+        }
+    }
+    Ok(persisted)
+}
+
+fn reconcile_persisted_learning(
+    envelope: &InvocationEnvelope<'_>,
+    store: &mut SqliteStore,
+    request_digest: CanonicalRequestDigest,
+    result: &CanonicalInvocationResult,
+) -> Result<(), InvokeError> {
+    let Some(capture) = envelope.learning else {
+        return Ok(());
+    };
+    let dispatched = match store.events() {
+        Ok(events) => events.iter().any(|stored| {
+            stored.event.stream == EntityId::ToolCall(envelope.invocation_id)
+                && stored.event.event_type.as_str() == DISPATCH_EVENT
+        }),
+        Err(error) => {
+            capture.mark_failure(&crate::telemetry::tool_learning::ToolLearningError::Store(
+                error,
+            ));
+            return Ok(());
+        }
+    };
+    let (status, known) = learning_status(result);
+    let failure = learning_failure(result, envelope.retry_safety, dispatched);
+    let prepared = crate::telemetry::tool_learning::prepare_invocation_terminal(
+        store,
+        envelope
+            .driver_claim
+            .ok_or(InvokeError::MissingDriverClaim)?,
+        capture,
+        envelope.occurred_at.clone(),
+        envelope.trace_id.clone(),
+        request_digest.as_bytes(),
+        failure,
+        status,
+        dispatched,
+        known,
+        dispatched.then_some(envelope.reservation.cost_microusd()),
+        Some(envelope.outcome_event_id),
+        false,
+    );
+    persist_learning(envelope, store, capture, "outcome", prepared, false)
+}
+
+fn persist_learning(
+    envelope: &InvocationEnvelope<'_>,
+    store: &mut SqliteStore,
+    capture: &PreparedLearningCapture,
+    phase: &str,
+    prepared: Result<
+        Option<(ExpectedStreamVersion, Vec<NewEvent>)>,
+        crate::telemetry::tool_learning::ToolLearningError,
+    >,
+    pre_effect: bool,
+) -> Result<(), InvokeError> {
+    let result = prepared.and_then(|prepared| {
+        let Some((version, events)) = prepared else {
+            return Ok(());
+        };
+        let mut bytes = Vec::new();
+        for event in &events {
+            bytes.extend_from_slice(&event.payload);
+        }
+        let key = IdempotencyKey::parse(&format!("learning-{phase}-{}", envelope.invocation_id))
+            .map_err(|_| crate::telemetry::tool_learning::ToolLearningError::InvalidRecord)?;
+        store
+            .append(AppendCommand {
+                idempotency_scope: IdempotencyScope::new(
+                    envelope.authenticated.principal_id(),
+                    "capability.invoke.learning",
+                    EntityId::ToolCall(envelope.invocation_id),
+                )
+                .map_err(|_| crate::telemetry::tool_learning::ToolLearningError::InvalidRecord)?,
+                idempotency_key: key,
+                request_digest: CanonicalRequestDigest::new(crate::domain::crypto::sha256(&bytes)),
+                claim: None,
+                driver_claim: envelope.driver_claim,
+                allow_quiescent_driver_claim: false,
+                expected_versions: vec![version],
+                events,
+                response: format!("learning-{phase}-v1").into_bytes(),
+            })
+            .map(|_| ())
+            .map_err(crate::telemetry::tool_learning::ToolLearningError::Store)
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            capture.mark_failure(&error);
+            if pre_effect && capture.required() {
+                Err(learning_store_error(error))
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 fn scope(
@@ -1078,6 +1436,293 @@ fn output_artifacts(result: &CanonicalInvocationResult) -> Result<Vec<u8>, Invok
         return Err(InvokeError::ArtifactDigestLimit);
     }
     serde_json::to_vec(&artifacts).map_err(InvokeError::Serialization)
+}
+
+fn learning_store_error(error: crate::telemetry::tool_learning::ToolLearningError) -> InvokeError {
+    match error {
+        crate::telemetry::tool_learning::ToolLearningError::Store(error) => {
+            InvokeError::Store(error)
+        }
+        _ => InvokeError::InvalidPersistedOutcome,
+    }
+}
+
+fn learning_status(result: &CanonicalInvocationResult) -> (LearningStatus, bool) {
+    let ambiguous = result.code.as_deref().is_some_and(learning_code_ambiguous);
+    match result.status {
+        InvocationStatus::Succeeded => (LearningStatus::Succeeded, true),
+        InvocationStatus::Cancelled => (LearningStatus::Cancelled, true),
+        InvocationStatus::ApprovalRequired => (LearningStatus::Interrupted, true),
+        InvocationStatus::OutcomeUnknown => (LearningStatus::OutcomeUnknown, false),
+        InvocationStatus::Failed if ambiguous => (LearningStatus::OutcomeUnknown, false),
+        InvocationStatus::Failed | InvocationStatus::ApprovalDenied => {
+            (LearningStatus::Failed, true)
+        }
+    }
+}
+
+fn learning_failure(
+    result: &CanonicalInvocationResult,
+    retry_safety: RetrySafety,
+    dispatched: bool,
+) -> Option<LearningFailure> {
+    if result.status == InvocationStatus::Succeeded {
+        return None;
+    }
+    let code = result.code.as_deref().unwrap_or_default();
+    let ambiguous =
+        learning_code_ambiguous(code) || (dispatched && retry_safety == RetrySafety::NonIdempotent);
+    let (stage, class, mapped, retry) = if code.contains("egress_invalid") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Input,
+            LearningErrorCode::InvalidEndpoint,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("egress_denied") {
+        (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Policy,
+            LearningErrorCode::EgressDenied,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("operation_queue_full") {
+        (
+            LearningErrorStage::Dispatch,
+            LearningErrorClass::System,
+            LearningErrorCode::QueueFull,
+            LearningRetryClass::Safe,
+        )
+    } else if code.contains("sensitive_payload") {
+        (
+            LearningErrorStage::ResultValidation,
+            LearningErrorClass::Result,
+            LearningErrorCode::SensitiveResponse,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("invalid_response") || code.contains("missing_payload") {
+        (
+            LearningErrorStage::ResultValidation,
+            LearningErrorClass::Result,
+            if code.contains("missing_payload") {
+                LearningErrorCode::MissingPayload
+            } else {
+                LearningErrorCode::InvalidResponse
+            },
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("response_too_large") {
+        (
+            LearningErrorStage::ResultValidation,
+            LearningErrorClass::Result,
+            LearningErrorCode::ResponseTooLarge,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("invalid_limits") {
+        (
+            LearningErrorStage::Parsing,
+            LearningErrorClass::Input,
+            LearningErrorCode::InvalidLimits,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("invalid_endpoint") {
+        (
+            LearningErrorStage::Routing,
+            LearningErrorClass::Input,
+            LearningErrorCode::InvalidEndpoint,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("invalid_header") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Input,
+            LearningErrorCode::InvalidHeader,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("protocol_version_refused") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::ProtocolVersionRefused,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("protocol_failed") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::Protocol,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("process_unavailable") {
+        (
+            LearningErrorStage::Dispatch,
+            LearningErrorClass::System,
+            LearningErrorCode::ProcessUnavailable,
+            LearningRetryClass::Safe,
+        )
+    } else if code.contains("refresh_retries_exhausted") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::RefreshRetriesExhausted,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("refresh_closed") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::RefreshClosed,
+            LearningRetryClass::Unknown,
+        )
+    } else if code.contains("session_expired") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::SessionExpired,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("feature_failed") {
+        (
+            LearningErrorStage::ResultValidation,
+            LearningErrorClass::Remote,
+            LearningErrorCode::FeatureFailed,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("discovery_failed") {
+        (
+            LearningErrorStage::Routing,
+            LearningErrorClass::Remote,
+            LearningErrorCode::DiscoveryFailed,
+            LearningRetryClass::Safe,
+        )
+    } else if code.contains("stale_binding") {
+        (
+            LearningErrorStage::Routing,
+            LearningErrorClass::Policy,
+            LearningErrorCode::StaleBinding,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("binding_expired") {
+        (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Policy,
+            LearningErrorCode::BindingExpired,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("authorization_failed") {
+        (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Policy,
+            LearningErrorCode::AuthorizationDenied,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("credential") {
+        (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Auth,
+            LearningErrorCode::CredentialUnavailable,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("auth_required")
+        || code.contains("auth_interrupted")
+        || code.contains("approval_required")
+    {
+        (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Auth,
+            LearningErrorCode::AuthRequired,
+            LearningRetryClass::AuthorizationResume,
+        )
+    } else if code.contains("auth_denied") || result.status == InvocationStatus::ApprovalDenied {
+        (
+            LearningErrorStage::Authorization,
+            LearningErrorClass::Auth,
+            LearningErrorCode::AuthDenied,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("url_elicitation_required") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Url,
+            LearningErrorCode::UrlElicitationRequired,
+            LearningRetryClass::UrlResume,
+        )
+    } else if code.contains("url_elicitation_declined") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Url,
+            LearningErrorCode::UrlElicitationDeclined,
+            LearningRetryClass::Never,
+        )
+    } else if code.contains("timeout") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::Timeout,
+            LearningRetryClass::Unknown,
+        )
+    } else if code.contains("connection_retired") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::ConnectionRetired,
+            LearningRetryClass::Unknown,
+        )
+    } else if code.contains("transport_io") || code.contains("cleanup") {
+        (
+            LearningErrorStage::Transport,
+            LearningErrorClass::Transport,
+            LearningErrorCode::Io,
+            LearningRetryClass::Unknown,
+        )
+    } else if ambiguous || result.status == InvocationStatus::OutcomeUnknown {
+        (
+            LearningErrorStage::Dispatch,
+            LearningErrorClass::Transport,
+            LearningErrorCode::OutcomeUnknown,
+            LearningRetryClass::Unknown,
+        )
+    } else if result.status == InvocationStatus::Cancelled {
+        (
+            LearningErrorStage::Dispatch,
+            LearningErrorClass::System,
+            LearningErrorCode::Cancelled,
+            LearningRetryClass::Never,
+        )
+    } else {
+        (
+            LearningErrorStage::Dispatch,
+            LearningErrorClass::Remote,
+            LearningErrorCode::Internal,
+            LearningRetryClass::Never,
+        )
+    };
+    Some(LearningFailure {
+        stage,
+        class,
+        code: mapped,
+        field: None,
+        retry,
+        dispatched,
+        known: !ambiguous && result.status != InvocationStatus::OutcomeUnknown,
+    })
+}
+
+fn learning_code_ambiguous(code: &str) -> bool {
+    [
+        "timeout",
+        "retired",
+        "io",
+        "cleanup",
+        "outcome_unknown",
+        "session_expired",
+        "refresh_closed",
+        "retries_exhausted",
+        "unavailable_after_dispatch",
+        "interrupted_after_dispatch",
+    ]
+    .iter()
+    .any(|needle| code.contains(needle))
 }
 
 fn put_spend(bytes: &mut Vec<u8>, spend: Spend) {
@@ -1142,5 +1787,72 @@ mod tests {
             output_artifacts(&result),
             Err(InvokeError::ArtifactDigestLimit)
         ));
+    }
+
+    #[test]
+    fn every_mcp_completion_class_has_a_fixed_learning_mapping() {
+        use crate::telemetry::tool_learning::{ErrorCode, ErrorStage};
+
+        #[rustfmt::skip]
+        let cases = [
+            ("mcp.invalid_limits", ErrorStage::Parsing, ErrorCode::InvalidLimits),
+            ("mcp.invalid_endpoint", ErrorStage::Routing, ErrorCode::InvalidEndpoint),
+            ("mcp.invalid_header", ErrorStage::Transport, ErrorCode::InvalidHeader),
+            ("mcp.response_too_large", ErrorStage::ResultValidation, ErrorCode::ResponseTooLarge),
+            ("mcp.protocol_version_refused", ErrorStage::Transport, ErrorCode::ProtocolVersionRefused),
+            ("mcp.missing_payload", ErrorStage::ResultValidation, ErrorCode::MissingPayload),
+            ("mcp.process_unavailable", ErrorStage::Dispatch, ErrorCode::ProcessUnavailable),
+            ("mcp.transport_timeout", ErrorStage::Transport, ErrorCode::Timeout),
+            ("mcp.transport_auth_interrupted", ErrorStage::Authorization, ErrorCode::AuthRequired),
+            ("mcp.sensitive_payload", ErrorStage::ResultValidation, ErrorCode::SensitiveResponse),
+            ("mcp.session_expired", ErrorStage::Transport, ErrorCode::SessionExpired),
+            ("mcp.url_elicitation_required", ErrorStage::Transport, ErrorCode::UrlElicitationRequired),
+            ("mcp.url_elicitation_outcome_unknown", ErrorStage::Dispatch, ErrorCode::OutcomeUnknown),
+            ("mcp.url_elicitation_declined", ErrorStage::Transport, ErrorCode::UrlElicitationDeclined),
+            ("mcp.credential_failed", ErrorStage::Authorization, ErrorCode::CredentialUnavailable),
+            ("mcp.egress_denied", ErrorStage::Authorization, ErrorCode::EgressDenied),
+            ("mcp.egress_invalid", ErrorStage::Transport, ErrorCode::InvalidEndpoint),
+            ("mcp.invalid_response", ErrorStage::ResultValidation, ErrorCode::InvalidResponse),
+            ("mcp.authorization_failed", ErrorStage::Authorization, ErrorCode::AuthorizationDenied),
+            ("mcp.connection_retired", ErrorStage::Transport, ErrorCode::ConnectionRetired),
+            ("mcp.binding_expired", ErrorStage::Authorization, ErrorCode::BindingExpired),
+            ("mcp.stale_binding", ErrorStage::Routing, ErrorCode::StaleBinding),
+            ("mcp.operation_queue_full", ErrorStage::Dispatch, ErrorCode::QueueFull),
+            ("mcp.cancelled", ErrorStage::Dispatch, ErrorCode::Cancelled),
+            ("mcp.refresh_closed", ErrorStage::Transport, ErrorCode::RefreshClosed),
+            ("mcp.refresh_retries_exhausted", ErrorStage::Transport, ErrorCode::RefreshRetriesExhausted),
+            ("mcp.transport_io", ErrorStage::Transport, ErrorCode::Io),
+            ("mcp.feature_failed", ErrorStage::ResultValidation, ErrorCode::FeatureFailed),
+            ("mcp.discovery_failed", ErrorStage::Routing, ErrorCode::DiscoveryFailed),
+            ("mcp.protocol_failed", ErrorStage::Transport, ErrorCode::Protocol),
+        ];
+        for (completion, stage, code) in cases {
+            let result = CanonicalInvocationResult {
+                status: if completion == "mcp.cancelled" {
+                    InvocationStatus::Cancelled
+                } else if completion == "mcp.url_elicitation_outcome_unknown" {
+                    InvocationStatus::OutcomeUnknown
+                } else {
+                    InvocationStatus::Failed
+                },
+                output: None,
+                code: Some(completion.to_owned()),
+                charged: false,
+            };
+            let mapped = learning_failure(&result, RetrySafety::Idempotent, true).unwrap();
+            assert_eq!((mapped.stage, mapped.code), (stage, code), "{completion}");
+        }
+    }
+
+    #[test]
+    fn external_errors_preserve_committed_dispatch_evidence() {
+        let before = external_failure("mcp.authorization_failed", RetrySafety::Idempotent, false);
+        assert!(!before.dispatched);
+        assert!(before.known);
+
+        let after = external_failure("mcp.transport_io", RetrySafety::Idempotent, true);
+        assert!(after.dispatched);
+        assert!(!after.known);
+        assert_eq!(after.code, LearningErrorCode::Io);
     }
 }

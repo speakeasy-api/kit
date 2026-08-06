@@ -17,6 +17,21 @@ impl std::error::Error for ExportError {}
 
 pub trait Exporter {
     fn export(&mut self, batch: &ExportBatch) -> Result<(), ExportError>;
+
+    fn export_encrypted_learning(
+        &mut self,
+        _frame: &EncryptedLearningFrame,
+    ) -> Result<(), ExportError> {
+        Err(ExportError(
+            "exporter is not an authenticated learning sink".to_owned(),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedLearningFrame {
+    pub frame_id: String,
+    pub ciphertext: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -167,11 +167,11 @@ pub(crate) struct McpResponseScanner {
 
 impl McpResponseScanner {
     pub(crate) fn new(credentials: &[SecretLease]) -> Self {
-        let redactor = CaptureRedactor::new(credentials);
+        let scanner = CaptureRedactor::new(credentials).scanner();
         Self {
-            ingress: Mutex::new(redactor.scanner()),
-            canonical: Mutex::new(redactor.scanner()),
-            callback: Mutex::new(redactor.scanner()),
+            ingress: Mutex::new(scanner.fork()),
+            canonical: Mutex::new(scanner.fork()),
+            callback: Mutex::new(scanner),
         }
     }
 
@@ -516,10 +516,10 @@ impl McpEgressConnector {
             .await
             .map_err(|_| McpEgressError::Timeout)?
             .map_err(McpEgressError::Credential)?;
-            if credentials
+            let credential_changed = credentials
                 .last()
-                .is_none_or(|previous: &SecretLease| previous.expose() != lease.expose())
-            {
+                .is_none_or(|previous: &SecretLease| previous.expose() != lease.expose());
+            if credential_changed {
                 outbound_scanner =
                     Some(CaptureRedactor::new(std::slice::from_ref(&lease)).scanner());
             }
@@ -544,7 +544,9 @@ impl McpEgressConnector {
             let mut outbound = reqwest::Request::new(request.method.clone(), current.clone());
             *outbound.headers_mut() = headers;
             *outbound.body_mut() = Some(reqwest::Body::from(request.body.clone()));
-            credentials.push(lease);
+            if credential_changed {
+                credentials.push(lease);
+            }
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .filter(|remaining| !remaining.is_zero())
@@ -575,20 +577,20 @@ impl McpEgressConnector {
                 }
                 self.policy.validate_peer(&authorization, peer)?;
             }
+            let mut response_scanner = CaptureRedactor::new(&credentials).scanner();
             check_response_metadata(
                 current.as_str().as_bytes(),
                 dialed.response.headers(),
                 self.limits,
-                &credentials,
+                &mut response_scanner,
             )?;
 
             if !is_redirect(dialed.response.status()) {
-                let scanner = Arc::new(McpResponseScanner::new(&credentials));
                 return Ok(McpEgressResponse {
                     response: dialed.response,
                     redirects: hop,
                     deadline,
-                    scanner,
+                    scanner: Arc::new(McpResponseScanner::new(&credentials)),
                 });
             }
             if matches!(
@@ -600,7 +602,7 @@ impl McpEgressConnector {
                 return Err(McpEgressError::AmbiguousMethodRewrite);
             }
             let location = exact_location(dialed.response.headers(), self.limits)?;
-            scan_secret_bytes(location.as_bytes(), &credentials)?;
+            scan_secret_bytes(location.as_bytes(), &mut response_scanner)?;
             validate_location_reference(location)?;
             let next = current
                 .join(location)
@@ -609,7 +611,7 @@ impl McpEgressConnector {
             if next.as_str().len() > MAX_EGRESS_URL_BYTES {
                 return Err(McpEgressError::RedirectLocation);
             }
-            scan_secret_bytes(next.as_str().as_bytes(), &credentials)?;
+            scan_secret_bytes(next.as_str().as_bytes(), &mut response_scanner)?;
             if current.scheme() == "https" && next.scheme() != "https" {
                 return Err(McpEgressError::HttpsDowngrade);
             }
@@ -739,17 +741,14 @@ fn check_response_metadata(
     url: &[u8],
     headers: &HeaderMap,
     limits: McpEgressLimits,
-    credentials: &[SecretLease],
+    scanner: &mut SensitiveDataScanner,
 ) -> Result<(), McpEgressError> {
     check_headers(headers, limits)?;
-    let mut scanner = CaptureRedactor::new(credentials).scanner();
-    if scan_field(&mut scanner, url) {
+    if scan_field(scanner, url) {
         return Err(McpEgressError::InvalidHeader);
     }
     for (name, value) in headers {
-        if scan_field(&mut scanner, name.as_str().as_bytes())
-            || scan_field(&mut scanner, value.as_bytes())
-        {
+        if scan_field(scanner, name.as_str().as_bytes()) || scan_field(scanner, value.as_bytes()) {
             return Err(McpEgressError::InvalidHeader);
         }
     }
@@ -762,10 +761,11 @@ fn scan_field(scanner: &mut SensitiveDataScanner, bytes: &[u8]) -> bool {
     scanner.found()
 }
 
-fn scan_secret_bytes(bytes: &[u8], credentials: &[SecretLease]) -> Result<(), McpEgressError> {
-    let mut scanner = CaptureRedactor::new(credentials).scanner();
-    scanner.push(bytes);
-    if scanner.found() {
+fn scan_secret_bytes(
+    bytes: &[u8],
+    scanner: &mut SensitiveDataScanner,
+) -> Result<(), McpEgressError> {
+    if scan_field(scanner, bytes) {
         Err(McpEgressError::InvalidHeader)
     } else {
         Ok(())
@@ -977,6 +977,25 @@ mod tests {
     }
 
     #[test]
+    fn response_scanner_does_not_continue_outbound_residual_state() {
+        let lease = SecretLease::new(b"cross-direction-secret".to_vec());
+        let mut outbound = CaptureRedactor::new(std::slice::from_ref(&lease)).scanner();
+        outbound.push(b"cross-direction-");
+
+        let response = McpResponseScanner::new(&[lease]);
+        assert!(!response.scan_ingress(b"secret").unwrap());
+    }
+
+    #[test]
+    fn response_scanner_matches_across_chunks_in_one_stream() {
+        let response =
+            McpResponseScanner::new(&[SecretLease::new(b"split-response-secret".to_vec())]);
+
+        assert!(!response.scan_ingress(b"split-response-").unwrap());
+        assert!(response.scan_ingress(b"secret").unwrap());
+    }
+
+    #[test]
     fn valid_header_names_are_scanned_on_request_and_response() {
         let lease = SecretLease::new(b"credential-canary".to_vec());
         let mut headers = HeaderMap::new();
@@ -1003,7 +1022,7 @@ mod tests {
                     request_timeout: Duration::from_secs(1),
                     connect_timeout: Duration::from_secs(1),
                 },
-                &[lease],
+                &mut scanner,
             ),
             Err(McpEgressError::InvalidHeader)
         ));

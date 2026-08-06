@@ -484,6 +484,87 @@ async fn every_safe_boundary_restarts_without_duplicate_provider_or_transcript_i
 }
 
 #[tokio::test]
+async fn multi_turn_restart_uses_persisted_next_and_current_turn_indices() {
+    let completed = [
+        text(ItemKind::User, "one"),
+        text(ItemKind::Assistant, "first"),
+        text(ItemKind::User, "two"),
+        text(ItemKind::Assistant, "second"),
+        text(ItemKind::User, "three"),
+    ];
+    let owner = new_owner();
+    let projection = make_projection(owner);
+    let mut journal = Journal::new();
+    journal.append(
+        owner,
+        0,
+        LoopRecord::Boundary(boundary(
+            SafeBoundary::BeforeModelDispatch,
+            &completed,
+            Some(4),
+            None,
+        )),
+    );
+    let adapter = FakeAdapter::with_result(result("third"));
+    let mut driver = ready(RestartProjection::reconstruct(&projection, &journal.events()).unwrap())
+        .start(&projection, adapter.clone(), |builder| builder)
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.poll(&projection).await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    assert_eq!(adapter.requests()[0].turn_id.to_string(), "turn-3");
+
+    let call = ToolCallPart {
+        id: AgentkitToolCallId::new("third-turn-call"),
+        name: "echo".into(),
+        input: serde_json::json!({"value": "three"}),
+        metadata: MetadataMap::new(),
+    };
+    let continuing = [
+        text(ItemKind::User, "one"),
+        text(ItemKind::Assistant, "first"),
+        text(ItemKind::User, "two"),
+        text(ItemKind::Assistant, "second"),
+        text(ItemKind::User, "three"),
+        Item::new(ItemKind::Assistant, vec![Part::ToolCall(call.clone())]),
+        Item::new(
+            ItemKind::Tool,
+            vec![Part::ToolResult(ToolResultPart {
+                call_id: call.id,
+                output: ToolOutput::Text("continued".into()),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            })],
+        ),
+    ];
+    let owner = new_owner();
+    let projection = make_projection(owner);
+    let mut journal = Journal::new();
+    journal.append(
+        owner,
+        0,
+        LoopRecord::Boundary(boundary(
+            SafeBoundary::AfterToolOutcome,
+            &continuing,
+            Some(6),
+            None,
+        )),
+    );
+    let adapter = FakeAdapter::with_result(result("continued-third"));
+    let mut driver = ready(RestartProjection::reconstruct(&projection, &journal.events()).unwrap())
+        .start(&projection, adapter.clone(), |builder| builder)
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.poll(&projection).await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    assert_eq!(adapter.requests()[0].turn_id.to_string(), "turn-3");
+}
+
+#[tokio::test]
 async fn input_approval_and_auth_waits_survive_and_require_authenticated_resolution() {
     let owner = new_owner();
     let projection = make_projection(owner);

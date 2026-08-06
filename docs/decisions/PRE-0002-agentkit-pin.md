@@ -16,7 +16,7 @@ The snapshot in `vendor/agentkit/` was built without modifying
 - tracked files: `356`
 - tracked dirty modifications: `23`
 - dirty binary patch SHA-256:
-  `92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1`
+  `0a529f0fa475e872540779e003aff0c546f944985700b1a0bcaabb4a7519bd5d`
 
 The adjacent checkout was not modified, staged, cleaned, stashed, or otherwise
 changed. The captured payload was subsequently normalized only for the compose
@@ -116,6 +116,10 @@ The local-only M006-W07b `m006-mcp-feature-adaptation` overlay produced
 `3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`;
 the complete payload after the local M006-W08 URL-capability overlay is
 `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4`;
+the M006-W09 turn-monotonic tool-operation sequence overlay produces
+`74dd252cbbab95fddf276e3261d39825ef2114fa2476069db151903390e3208b`,
+and its restart-continuation correction produces
+`776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49`;
 exact changed-file hashes are
 recorded in `src/agent/agentkit_patch/manifest.yaml` and
 `src/protocols/mcp/agentkit_patch/manifest.yaml`, and the local-only scope and

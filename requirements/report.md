@@ -20,10 +20,10 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 
 ## Lifecycle
 
-- active: 70
+- active: 79
 - implemented: 393
 - mitigated: 6
-- proposed: 568
+- proposed: 559
 - tombstoned: 1
 
 ## Applicability

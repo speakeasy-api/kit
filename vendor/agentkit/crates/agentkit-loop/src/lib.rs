@@ -1647,6 +1647,9 @@ where
             .tool_executor
             .clone()
             .unwrap_or_else(|| Arc::new(BasicToolExecutor::new(self.tool_sources.clone())));
+        let next_turn_index = restored_turn_index(&self.transcript, &self.input)?;
+        let restored_operation_sequence =
+            restored_operation_sequence(&self.transcript, &self.input)?;
         let driver = LoopDriver {
             session_id: session_id.clone(),
             observed_session_id: Arc::new(session_id.clone()),
@@ -1675,7 +1678,9 @@ where
             active_tool_round: None,
             pending_round_resume: None,
             pending_checkpoint: None,
-            next_turn_index: 1,
+            next_turn_index,
+            next_operation_sequence: restored_operation_sequence.unwrap_or(0),
+            continue_restored_turn: restored_operation_sequence.is_some(),
             detached_call_ids: HashSet::new(),
             tool_cancellations: HashMap::new(),
         };
@@ -1978,6 +1983,8 @@ where
     pending_round_resume: Option<PendingTurnResume>,
     pending_checkpoint: Option<PendingCheckpoint>,
     next_turn_index: u64,
+    next_operation_sequence: u64,
+    continue_restored_turn: bool,
     /// Call ids whose original tool_use was already paired with a
     /// synthetic detach tool_result. When the real result eventually
     /// arrives via the task manager, we MUST NOT emit a second
@@ -2830,7 +2837,8 @@ where
         let now = Timestamp::now();
         let usage = result.usage.clone();
         let finish_reason = result.finish_reason.clone();
-        let output_items: Vec<Item> = result
+        let turn_index = turn_index(&turn_id)?;
+        let mut output_items: Vec<Item> = result
             .output_items
             .drain(..)
             .map(|mut item| {
@@ -2845,26 +2853,43 @@ where
                 if item.created_at.is_none() {
                     item.created_at = Some(now);
                 }
+                item.metadata.insert(
+                    "agentkit.turn_index".to_owned(),
+                    serde_json::Value::from(turn_index),
+                );
                 item
             })
             .collect();
-        self.extend_transcript(output_items.clone());
 
         if saw_tool_call {
-            let pending_calls = extract_tool_calls(&output_items)
-                .into_iter()
-                .map(|call| {
+            let mut pending_calls = VecDeque::new();
+            for item in &mut output_items {
+                for part in &mut item.parts {
+                    let Part::ToolCall(call) = part else {
+                        continue;
+                    };
+                    let sequence = self.next_operation_sequence;
+                    self.next_operation_sequence = sequence.checked_add(1).ok_or_else(|| {
+                        LoopError::InvalidState("tool operation sequence exhausted".into())
+                    })?;
+                    let mut metadata = call.metadata.clone();
+                    metadata.insert(
+                        "kit.operation_sequence".to_owned(),
+                        serde_json::Value::from(sequence),
+                    );
+                    call.metadata = metadata.clone();
                     let tool_request = ToolRequest {
                         call_id: call.id.clone(),
                         tool_name: agentkit_tools_core::ToolName::new(call.name.clone()),
                         input: call.input.clone(),
                         session_id: self.session_id.clone(),
                         turn_id: turn_id.clone(),
-                        metadata: call.metadata.clone(),
+                        metadata,
                     };
-                    (call, tool_request)
-                })
-                .collect();
+                    pending_calls.push_back((call.clone(), tool_request));
+                }
+            }
+            self.extend_transcript(output_items.clone());
             self.active_tool_round = Some(ActiveToolRound {
                 turn_id: turn_id.clone(),
                 pending_calls,
@@ -2882,6 +2907,8 @@ where
                 },
             )));
         }
+
+        self.extend_transcript(output_items.clone());
 
         let turn_result = TurnResult {
             turn_id,
@@ -3231,7 +3258,17 @@ where
         // continuation turn; background task results drained just above are
         // already in the transcript.
         if let Some(resume) = self.pending_round_resume.take() {
-            let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
+            let turn_index = turn_index(&resume.turn_id)?;
+            let drained: Vec<Item> = std::mem::take(&mut self.pending_input)
+                .into_iter()
+                .map(|mut item| {
+                    item.metadata.insert(
+                        "agentkit.turn_index".to_owned(),
+                        serde_json::Value::from(turn_index),
+                    );
+                    item
+                })
+                .collect();
             self.extend_transcript(drained);
             return self
                 .drive_turn(
@@ -3253,8 +3290,23 @@ where
         }
 
         let turn_id = agentkit_core::TurnId::new(format!("turn-{}", self.next_turn_index));
-        self.next_turn_index += 1;
-        let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
+        let turn_index = self.next_turn_index;
+        self.next_turn_index = turn_index
+            .checked_add(1)
+            .ok_or_else(|| LoopError::InvalidState("turn index exhausted".into()))?;
+        if !std::mem::take(&mut self.continue_restored_turn) {
+            self.next_operation_sequence = 0;
+        }
+        let drained: Vec<Item> = std::mem::take(&mut self.pending_input)
+            .into_iter()
+            .map(|mut item| {
+                item.metadata.insert(
+                    "agentkit.turn_index".to_owned(),
+                    serde_json::Value::from(turn_index),
+                );
+                item
+            })
+            .collect();
         self.extend_transcript(drained);
         let cancellation = self
             .cancellation
@@ -3458,16 +3510,89 @@ fn transcript_has_pending_input(transcript: &[Item]) -> bool {
     )
 }
 
-fn extract_tool_calls(items: &[Item]) -> Vec<ToolCallPart> {
-    let mut calls = Vec::new();
-    for item in items {
-        for part in &item.parts {
-            if let Part::ToolCall(call) = part {
-                calls.push(call.clone());
-            }
-        }
+fn restored_operation_sequence(
+    transcript: &[Item],
+    input: &[Item],
+) -> Result<Option<u64>, LoopError> {
+    if input.is_empty() {
+        return Ok(None);
     }
-    calls
+    let items = transcript.iter().chain(input);
+    let current_turn = items
+        .clone()
+        .enumerate()
+        .filter_map(|(index, item)| (item.kind == ItemKind::User).then_some(index))
+        .last()
+        .map_or(0, |index| index + 1);
+    let maximum = items
+        .skip(current_turn)
+        .flat_map(|item| &item.parts)
+        .filter_map(|part| {
+            let metadata = match part {
+                Part::ToolCall(call) => &call.metadata,
+                Part::ToolResult(result) => &result.metadata,
+                _ => return None,
+            };
+            metadata
+                .get("kit.operation_sequence")
+                .and_then(Value::as_u64)
+        })
+        .max();
+    maximum
+        .map(|sequence| {
+            sequence.checked_add(1).ok_or_else(|| {
+                LoopError::InvalidState("restored tool operation sequence exhausted".into())
+            })
+        })
+        .transpose()
+}
+
+fn restored_turn_index(transcript: &[Item], input: &[Item]) -> Result<u64, LoopError> {
+    let tagged = transcript
+        .iter()
+        .chain(input)
+        .filter_map(|item| {
+            item.metadata
+                .get("agentkit.turn_index")
+                .and_then(Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0);
+    let user_turns = u64::try_from(
+        transcript
+            .iter()
+            .scan(false, |previous_user, item| {
+                let starts_user_group = item.kind == ItemKind::User && !*previous_user;
+                *previous_user = item.kind == ItemKind::User;
+                Some(starts_user_group)
+            })
+            .filter(|starts| *starts)
+            .count(),
+    )
+    .map_err(|_| LoopError::InvalidState("restored turn index exhausted".into()))?;
+    let fallback = if input.is_empty() || input.iter().any(|item| item.kind == ItemKind::User) {
+        user_turns
+            .checked_add(1)
+            .ok_or_else(|| LoopError::InvalidState("restored turn index exhausted".into()))?
+    } else {
+        user_turns.max(1)
+    };
+    let next = tagged.max(fallback);
+    if next == u64::MAX {
+        Err(LoopError::InvalidState(
+            "restored turn index exhausted".into(),
+        ))
+    } else {
+        Ok(next)
+    }
+}
+
+fn turn_index(turn_id: &agentkit_core::TurnId) -> Result<u64, LoopError> {
+    turn_id
+        .to_string()
+        .strip_prefix("turn-")
+        .and_then(|index| index.parse().ok())
+        .ok_or_else(|| LoopError::InvalidState("generated turn id has no numeric index".into()))
 }
 
 fn tool_result_is_error(item: &Item) -> bool {
@@ -3637,6 +3762,7 @@ mod tests {
     }
     struct MultiToolAdapter;
     struct DualApprovalAdapter;
+    struct SerialToolAdapter;
 
     struct FakeSession;
     struct SlowSession;
@@ -3649,6 +3775,7 @@ mod tests {
     }
     struct MultiToolSession;
     struct DualApprovalSession;
+    struct SerialToolSession;
 
     struct FakeTurn {
         events: VecDeque<ModelTurnEvent>,
@@ -3781,6 +3908,15 @@ mod tests {
 
         async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
             Ok(DualApprovalSession)
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for SerialToolAdapter {
+        type Session = SerialToolSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(SerialToolSession)
         }
     }
 
@@ -4099,6 +4235,109 @@ mod tests {
             };
 
             Ok(DualApprovalTurn { events })
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for SerialToolSession {
+        type Turn = FakeTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let current_turn = request
+                .transcript
+                .iter()
+                .rposition(|item| item.kind == ItemKind::User)
+                .map_or(request.transcript.as_slice(), |index| {
+                    &request.transcript[index..]
+                });
+            let completed = current_turn
+                .iter()
+                .flat_map(|item| &item.parts)
+                .filter(|part| matches!(part, Part::ToolResult(_)))
+                .count();
+            let (call, result) = if completed < 3 {
+                let call = ToolCallPart {
+                    id: ToolCallId::new(format!("serial-{completed}")),
+                    name: "serial".into(),
+                    input: json!({"step": completed}),
+                    metadata: MetadataMap::new(),
+                };
+                (
+                    Some(call.clone()),
+                    ModelTurnResult {
+                        model: None,
+                        response_id: Some(format!("response-{completed}")),
+                        finish_reason: FinishReason::ToolCall,
+                        output_items: vec![Item {
+                            id: None,
+                            kind: ItemKind::Assistant,
+                            parts: vec![Part::ToolCall(call)],
+                            metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        }],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                    },
+                )
+            } else {
+                (
+                    None,
+                    ModelTurnResult {
+                        model: None,
+                        response_id: Some("response-complete".into()),
+                        finish_reason: FinishReason::Completed,
+                        output_items: vec![Item::text(ItemKind::Assistant, "done")],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                    },
+                )
+            };
+            Ok(FakeTurn {
+                events: call
+                    .into_iter()
+                    .map(ModelTurnEvent::ToolCall)
+                    .chain(std::iter::once(ModelTurnEvent::Finished(result)))
+                    .collect(),
+            })
+        }
+    }
+
+    struct SequenceRecordingExecutor {
+        sequences: StdArc<StdMutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SequenceRecordingExecutor {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec::new(
+                "serial",
+                "serial test tool",
+                json!({"type":"object"}),
+            )]
+        }
+
+        async fn execute(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> ToolExecutionOutcome {
+            self.sequences.lock().unwrap().push(
+                request.metadata["kit.operation_sequence"]
+                    .as_u64()
+                    .expect("operation sequence metadata"),
+            );
+            ToolExecutionOutcome::Completed(ToolResult::new(ToolResultPart {
+                call_id: request.call_id,
+                output: ToolOutput::Text("ok".into()),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            }))
         }
     }
 
@@ -4891,6 +5130,142 @@ mod tests {
             }
             other => panic!("unexpected loop step: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn operation_sequence_is_turn_monotonic_across_responses_and_replay() {
+        async fn run() -> (Vec<u64>, Vec<u64>) {
+            let sequences = StdArc::new(StdMutex::new(Vec::new()));
+            let agent = Agent::builder()
+                .model(SerialToolAdapter)
+                .tool_executor(SequenceRecordingExecutor {
+                    sequences: sequences.clone(),
+                })
+                .input(vec![Item::text(ItemKind::User, "serial")])
+                .build()
+                .unwrap();
+            let mut driver = agent
+                .start(SessionConfig::new("serial-sequence"))
+                .await
+                .unwrap();
+            let _ = run_until_finished(&mut driver).await;
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "second turn")])
+                .unwrap();
+            let _ = run_until_finished(&mut driver).await;
+            let replayable = driver
+                .snapshot()
+                .transcript
+                .iter()
+                .flat_map(|item| &item.parts)
+                .filter_map(|part| match part {
+                    Part::ToolCall(call) => call
+                        .metadata
+                        .get("kit.operation_sequence")
+                        .and_then(Value::as_u64),
+                    _ => None,
+                })
+                .collect();
+            let recorded = sequences.lock().unwrap().clone();
+            (recorded, replayable)
+        }
+
+        let first = run().await;
+        let replay = run().await;
+        assert_eq!(first, (vec![0, 1, 2, 0, 1, 2], vec![0, 1, 2, 0, 1, 2]));
+        assert_eq!(replay, first);
+    }
+
+    #[tokio::test]
+    async fn restored_after_tool_turn_continues_sequence_and_replay_is_deterministic() {
+        async fn run() -> Vec<u64> {
+            let sequences = StdArc::new(StdMutex::new(Vec::new()));
+            let mut metadata = MetadataMap::new();
+            metadata.insert("kit.operation_sequence".into(), Value::from(4));
+            let call_id = ToolCallId::new("restored-call");
+            let agent = Agent::builder()
+                .model(SerialToolAdapter)
+                .tool_executor(SequenceRecordingExecutor {
+                    sequences: sequences.clone(),
+                })
+                .transcript(vec![
+                    Item::text(ItemKind::User, "serial"),
+                    Item {
+                        id: None,
+                        kind: ItemKind::Assistant,
+                        parts: vec![Part::ToolCall(ToolCallPart {
+                            id: call_id.clone(),
+                            name: "serial".into(),
+                            input: json!({"step": 0}),
+                            metadata: metadata.clone(),
+                        })],
+                        metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
+                    },
+                ])
+                .input(vec![Item {
+                    id: None,
+                    kind: ItemKind::Tool,
+                    parts: vec![Part::ToolResult(ToolResultPart {
+                        call_id,
+                        output: ToolOutput::Text("ok".into()),
+                        is_error: false,
+                        metadata,
+                    })],
+                    metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                }])
+                .build()
+                .unwrap();
+            let mut driver = agent
+                .start(SessionConfig::new("restored-serial-sequence"))
+                .await
+                .unwrap();
+            let _ = run_until_finished(&mut driver).await;
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "new turn")])
+                .unwrap();
+            let _ = run_until_finished(&mut driver).await;
+            let recorded = sequences.lock().unwrap().clone();
+            recorded
+        }
+
+        let first = run().await;
+        assert_eq!(first, vec![5, 6, 0, 1, 2]);
+        assert_eq!(run().await, first);
+    }
+
+    #[test]
+    fn fresh_and_restored_turn_indices_follow_conversation_boundaries() {
+        let users = vec![
+            Item::text(ItemKind::User, "first part"),
+            Item::text(ItemKind::User, "second part"),
+        ];
+        assert_eq!(restored_turn_index(&[], &[]).unwrap(), 1);
+        assert_eq!(restored_turn_index(&[], &users).unwrap(), 1);
+
+        let completed = vec![
+            Item::text(ItemKind::User, "one"),
+            Item::text(ItemKind::Assistant, "done"),
+            Item::text(ItemKind::User, "two"),
+            Item::text(ItemKind::Assistant, "done"),
+        ];
+        assert_eq!(restored_turn_index(&completed, &[]).unwrap(), 3);
+        assert_eq!(restored_turn_index(&completed, &users).unwrap(), 3);
+        assert_eq!(
+            restored_turn_index(&completed, &[Item::text(ItemKind::Tool, "result")]).unwrap(),
+            2
+        );
+
+        let mut exhausted = Item::text(ItemKind::User, "invalid");
+        exhausted
+            .metadata
+            .insert("agentkit.turn_index".to_owned(), Value::from(u64::MAX));
+        assert!(restored_turn_index(&[], &[exhausted]).is_err());
     }
 
     /// Test helper: drives the loop, transparently resuming non-blocking

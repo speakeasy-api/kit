@@ -3,7 +3,7 @@
 - Work package: `M009-W01`
 - Agentkit release: `0.10.2`
 - Patch ID: `m009-post-validation-checkpoint`
-- Snapshot SHA-256: `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4` (current payload after the local M006-W08 URL-capability overlay; `M006-W07c` produced `0f8daf8b32585f2900ffa0f2c15084dccb0d1f3bc312919906f710f3b8f85af0`, `M006-W07b` produced `3cc4569be6990cd88265f9e3d5d2c057c1cfd4eefad5da4ff0ece4150d758077`, and `M006-W07a` produced `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`)
+- Snapshot SHA-256: `776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49` (current payload after the local M006-W09 restart-operation-sequence overlay; M006-W08 produced `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4`)
 - Upstream status: pending submission; upstream acceptance is non-blocking
 - Semantic compaction: disabled until `M009-W06`
 

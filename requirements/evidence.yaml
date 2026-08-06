@@ -1741,7 +1741,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1034
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_824 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1751,7 +1751,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1035
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_825 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1761,7 +1761,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1036
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_826 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1771,7 +1771,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1037
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_827 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1781,7 +1781,7 @@ records:
   evidence_type: conformance
   evidence_id: EV-1.04-C-1038
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_828 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_828_description_routing_requires_both_preregistered_arms_and_candidates -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1789,9 +1789,9 @@ records:
   revalidation_rule: Re-run when the implementation of KIT-CAP-828 or its source contract changes.
 - requirement_id: KIT-CAP-832
   evidence_type: conformance
-  evidence_id: EV-1.04-C-832
+  evidence_id: EV-1.04-C-1064
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_832 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_832_poor_description_has_exact_subject_and_rejects_other_factor_changes -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1799,9 +1799,9 @@ records:
   revalidation_rule: Re-run when KIT-CAP-832 or its source contract changes.
 - requirement_id: KIT-CAP-833
   evidence_type: conformance
-  evidence_id: EV-1.04-C-833
+  evidence_id: EV-1.04-C-1065
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_833 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_833_harmful_decoy_has_exact_subject_and_requires_verified_grade -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1809,9 +1809,9 @@ records:
   revalidation_rule: Re-run when KIT-CAP-833 or its source contract changes.
 - requirement_id: KIT-CAP-834
   evidence_type: conformance
-  evidence_id: EV-1.04-C-834
+  evidence_id: EV-1.04-C-1066
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_834 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_834_misunderstood_field_has_exact_subject_and_linkage -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -1819,9 +1819,9 @@ records:
   revalidation_rule: Re-run when KIT-CAP-834 or its source contract changes.
 - requirement_id: KIT-CAP-835
   evidence_type: conformance
-  evidence_id: EV-1.04-C-835
+  evidence_id: EV-1.04-C-1067
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_835 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_835_valuable_sequence_has_exact_subject_and_enforces_bounds -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

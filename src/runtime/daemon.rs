@@ -44,7 +44,7 @@ use crate::{
         },
         service::{
             ArtifactService, CapabilityService, Command, DeletionEffect, LeaseService, Scheduler,
-            Service, ServiceError, SqliteServiceStore,
+            Service, ServiceError, SqliteServiceStore, WorkerStore,
         },
         stream::{CursorKey, SqliteStreamAdapter, StreamCancellation, StreamConfig},
     },
@@ -947,7 +947,10 @@ impl Daemon {
                 &state_root,
                 config.evaluation_anchor.clone(),
             ) {
-                Ok(service) => (Some(service), None),
+                Ok(service) => (
+                    Some(service.with_learning_authority(identity.project_id, identity.cursor_key)),
+                    None,
+                ),
                 Err(crate::evaluation::ProductionEvaluationError::Unavailable(detail)) => {
                     (None, Some(detail.to_owned()))
                 }
@@ -1011,6 +1014,26 @@ impl Daemon {
             SqliteServiceStore::open(&database, &authority)
                 .map_err(|error| DaemonError::Setup(error.to_string()))?,
         ));
+        {
+            let hasher = crate::telemetry::tool_learning::ProjectPointerHasher::new(
+                identity.project_id,
+                &identity.cursor_key,
+            );
+            let result = worker_store
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .worker_append_store()
+                .map_err(|error| error.to_string())
+                .and_then(|mut store| {
+                    telemetry
+                        .reconcile_learning_backlog(&mut store, &hasher)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = result {
+                telemetry.mark_learning_failure(error);
+            }
+        }
         let terminal_store = SqliteTerminalSnapshotStore::open(&database)
             .map_err(|error| DaemonError::Setup(error.to_string()))?;
         let terminal_snapshots = terminal_store
@@ -1089,6 +1112,7 @@ impl Daemon {
             scheduler.clone(),
             model_adapter,
         )
+        .with_tool_learning_key(identity.cursor_key)
         .with_callback_secret_registry(callback_secrets.clone())
         .with_project_root(&config.project_root)
         .with_process_registry(exec_manager.clone())

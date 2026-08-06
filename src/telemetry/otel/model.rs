@@ -223,6 +223,8 @@ pub enum MetricName {
     VerificationChecks,
     #[serde(rename = "kit.errors")]
     Errors,
+    #[serde(rename = "kit.tool_learning.events")]
+    ToolLearningEvents,
 }
 
 impl MetricName {
@@ -236,6 +238,7 @@ impl MetricName {
             Self::CacheTokens => "kit.cache.tokens",
             Self::VerificationChecks => "kit.verification.checks",
             Self::Errors => "kit.errors",
+            Self::ToolLearningEvents => "kit.tool_learning.events",
         }
     }
 
@@ -248,6 +251,7 @@ impl MetricName {
             Self::CacheTokens => &["cache_category"],
             Self::VerificationChecks => &["check_result"],
             Self::Errors => &["error_class"],
+            Self::ToolLearningEvents => &["event_class", "operation", "status"],
         }
     }
 
@@ -276,6 +280,25 @@ impl MetricName {
             (Self::Errors, "error_class") => matches!(
                 value,
                 "model" | "tool" | "verification" | "system" | "policy" | "unknown"
+            ),
+            (Self::ToolLearningEvents, "event_class") => matches!(
+                value,
+                "opportunity" | "search" | "inspection" | "call" | "error" | "outcome"
+            ),
+            (Self::ToolLearningEvents, "operation") => {
+                matches!(
+                    value,
+                    "projection" | "search" | "inspect" | "bind" | "invoke"
+                )
+            }
+            (Self::ToolLearningEvents, "status") => matches!(
+                value,
+                "succeeded"
+                    | "failed"
+                    | "cancelled"
+                    | "interrupted"
+                    | "outcome_unknown"
+                    | "unavailable"
             ),
             _ => false,
         }
@@ -363,6 +386,7 @@ pub enum MetricError {
         value: String,
     },
     NonFinite,
+    InvalidLearningRecord,
 }
 
 impl std::fmt::Display for MetricError {
@@ -381,6 +405,7 @@ impl std::fmt::Display for MetricError {
                 write!(formatter, "{} has unbounded label {key}", metric.as_str())
             }
             Self::NonFinite => formatter.write_str("metric values must be finite"),
+            Self::InvalidLearningRecord => formatter.write_str("invalid tool learning record"),
         }
     }
 }

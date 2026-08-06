@@ -631,6 +631,7 @@ impl EventEvidenceStore for SqliteEventEvidenceStore {
                 "kind": event.kind,
                 "event_position": event.position,
                 "admission_token_digest": config.admission_token_digest,
+                "event_digest": event.payload_digest,
             });
             if event.kind.starts_with("model_call.") {
                 verify_event_owner(&event, &binding)?;
@@ -765,6 +766,7 @@ struct StoredEvent {
     position: u64,
     kind: String,
     attempt_id: Option<String>,
+    payload_digest: String,
     payload: Value,
 }
 
@@ -818,12 +820,14 @@ fn all_events(
         .map_err(evidence_database)?
         .map(|row| {
             let (position, kind, attempt_id, payload) = row.map_err(evidence_database)?;
+            let payload_digest = crate::evaluation::reports::sha256(&payload);
             let payload = serde_json::from_slice(&payload)
                 .map_err(|_| CoordinatorError::Evidence("durable event payload is corrupt"))?;
             Ok(StoredEvent {
                 position,
                 kind,
                 attempt_id,
+                payload_digest,
                 payload,
             })
         })

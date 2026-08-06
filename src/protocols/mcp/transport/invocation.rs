@@ -373,7 +373,7 @@ fn validate_tool_output(
     };
     match output.schema().validate(structured) {
         SchemaValidation::Valid => Ok(None),
-        SchemaValidation::Invalid => Ok(Some("mcp.output_schema_invalid")),
+        SchemaValidation::Invalid(_) => Ok(Some("mcp.output_schema_invalid")),
         SchemaValidation::Unsupported => Ok(Some("mcp.output_schema_unsupported")),
     }
 }

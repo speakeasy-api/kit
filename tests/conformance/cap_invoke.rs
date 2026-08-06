@@ -46,6 +46,10 @@ use kit::{
     runtime::scheduler::{budget::RunBudget, limits::Spend, reserve::BudgetLedger},
     store::sqlite::append::SqliteStore,
     store::sqlite::idempotency::IdempotencyKey,
+    telemetry::tool_learning::{
+        LearningCapabilityKind, LearningSurface, PreparedLearningCapture, ProjectPointerHasher,
+        ToolLearningEvent,
+    },
 };
 
 const UID: u32 = 501;
@@ -101,6 +105,7 @@ struct Fixture {
     outcome_event_id: EventId,
     occurred_at: UtcDateTime,
     trace_id: TraceId,
+    learning: Option<PreparedLearningCapture>,
 }
 
 impl Fixture {
@@ -182,6 +187,7 @@ impl Fixture {
             outcome_event_id: EventId::generate().unwrap(),
             occurred_at: UtcDateTime::parse("2026-07-22T12:00:00Z").unwrap(),
             trace_id: TraceId::parse("trace-cap-invoke").unwrap(),
+            learning: None,
         }
     }
 }
@@ -218,6 +224,7 @@ fn call(
         outcome_event_id,
         occurred_at,
         trace_id,
+        learning,
         ..
     } = fixture;
     let envelope = InvocationEnvelope {
@@ -248,6 +255,7 @@ fn call(
         outcome_event_id: *outcome_event_id,
         occurred_at,
         trace_id,
+        learning: learning.as_ref(),
     };
     let runtime = BrokerRuntime::new(store, budget, backend);
     let runtime = match crash_at {
@@ -576,6 +584,228 @@ fn crash_points_never_invent_success_or_blindly_redispatch() {
                 serde_json::from_slice(&events.last().unwrap().event.payload).unwrap();
             assert_eq!(outcome["result"]["status"], "outcome_unknown");
         }
+    }
+}
+
+#[test]
+fn crashed_terminal_persistence_replays_with_one_learning_outcome() {
+    for point in [
+        InvocationCrashPoint::AfterDispatch,
+        InvocationCrashPoint::BeforeOutcome,
+    ] {
+        let mut fixture = Fixture::new();
+        let hasher = ProjectPointerHasher::new(fixture.project_id, &[77; 32]);
+        fixture.learning = Some(
+            PreparedLearningCapture::new(
+                hasher.clone(),
+                fixture.config.run_id(),
+                "turn-1",
+                1,
+                "native_read",
+                "provider-call-1",
+                &fixture.arguments,
+                LearningSurface::Eager,
+                b"native-read",
+                fixture.schema.to_string().as_bytes(),
+                Some(b"native-binding"),
+                b"native",
+                LearningCapabilityKind::Tool,
+            )
+            .unwrap(),
+        );
+        let error = call(
+            &mut fixture,
+            RetrySafety::NonIdempotent,
+            ApprovalState::NotRequired,
+            Some(point),
+            &mut success,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::Invoke(InvokeError::InjectedCrash(found)) if found == point
+        ));
+
+        let mut dispatches = 0;
+        let replay = call(
+            &mut fixture,
+            RetrySafety::NonIdempotent,
+            ApprovalState::NotRequired,
+            None,
+            &mut |_| {
+                dispatches += 1;
+                panic!("terminal replay redispatched")
+            },
+        )
+        .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(dispatches, 0);
+        let learning = kit::telemetry::tool_learning::records(
+            &fixture.store,
+            fixture.config.run_id(),
+            &hasher,
+        )
+        .unwrap();
+        assert_eq!(
+            learning
+                .iter()
+                .filter(|event| matches!(event, ToolLearningEvent::Outcome { .. }))
+                .count(),
+            1
+        );
+        let stored = fixture.store.events().unwrap();
+        assert!(
+            stored.iter().any(|event| {
+                event.event.event_type.as_str() == "capability.invocation_outcome"
+            })
+        );
+    }
+}
+
+#[test]
+fn replay_preserves_provider_result_when_learning_persistence_fails() {
+    for (name, provider) in [
+        (
+            "success",
+            success as fn(&AuthorizedInvocation) -> DispatchOutcome,
+        ),
+        ("failure", |_| DispatchOutcome::Failed {
+            code: "provider_failed".to_owned(),
+        }),
+    ] {
+        let mut fixture = Fixture::new();
+        let first = call(
+            &mut fixture,
+            RetrySafety::Idempotent,
+            ApprovalState::NotRequired,
+            None,
+            &mut |authorized| provider(authorized),
+        )
+        .unwrap();
+        let hasher = ProjectPointerHasher::new(fixture.project_id, &[78; 32]);
+        fixture.learning = Some(
+            PreparedLearningCapture::new(
+                hasher.clone(),
+                fixture.config.run_id(),
+                "turn-1",
+                1,
+                "native_read",
+                format!("provider-call-{name}"),
+                &fixture.arguments,
+                LearningSurface::Eager,
+                b"native-read",
+                fixture.schema.to_string().as_bytes(),
+                Some(b"native-binding"),
+                b"native",
+                LearningCapabilityKind::Tool,
+            )
+            .unwrap(),
+        );
+        rusqlite::Connection::open(fixture._database.path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_learning_insert
+                 BEFORE INSERT ON events
+                 WHEN NEW.event_type='tool_learning.recorded'
+                 BEGIN SELECT RAISE(ABORT, 'injected learning persistence failure'); END;",
+            )
+            .unwrap();
+
+        let mut dispatches = 0;
+        let replay = call(
+            &mut fixture,
+            RetrySafety::Idempotent,
+            ApprovalState::NotRequired,
+            None,
+            &mut |_| {
+                dispatches += 1;
+                panic!("persisted provider result was redispatched")
+            },
+        )
+        .unwrap();
+        assert_eq!(dispatches, 0, "{name}");
+        assert_eq!(replay.canonical, first.canonical, "{name}");
+        assert!(replay.replayed, "{name}");
+        assert!(
+            kit::telemetry::tool_learning::records(
+                &fixture.store,
+                fixture.config.run_id(),
+                &hasher,
+            )
+            .unwrap()
+            .is_empty(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn provider_completion_survives_atomic_best_effort_learning_failure() {
+    for (name, provider) in [
+        (
+            "success",
+            success as fn(&AuthorizedInvocation) -> DispatchOutcome,
+        ),
+        ("failure", |_| DispatchOutcome::Failed {
+            code: "provider_failed".to_owned(),
+        }),
+    ] {
+        let mut fixture = Fixture::new();
+        let hasher = ProjectPointerHasher::new(fixture.project_id, &[79; 32]);
+        fixture.learning = Some(
+            PreparedLearningCapture::new(
+                hasher.clone(),
+                fixture.config.run_id(),
+                "turn-1",
+                1,
+                "native_read",
+                format!("provider-call-{name}"),
+                &fixture.arguments,
+                LearningSurface::Eager,
+                b"native-read",
+                fixture.schema.to_string().as_bytes(),
+                Some(b"native-binding"),
+                b"native",
+                LearningCapabilityKind::Tool,
+            )
+            .unwrap(),
+        );
+        rusqlite::Connection::open(fixture._database.path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_learning_insert
+                 BEFORE INSERT ON events
+                 WHEN NEW.event_type='tool_learning.recorded'
+                 BEGIN SELECT RAISE(ABORT, 'injected learning persistence failure'); END;",
+            )
+            .unwrap();
+
+        let result = call(
+            &mut fixture,
+            RetrySafety::Idempotent,
+            ApprovalState::NotRequired,
+            None,
+            &mut |authorized| provider(authorized),
+        )
+        .unwrap();
+        assert_eq!(
+            result.canonical.status,
+            if name == "success" {
+                InvocationStatus::Succeeded
+            } else {
+                InvocationStatus::Failed
+            },
+            "{name}"
+        );
+        assert!(
+            fixture
+                .store
+                .events()
+                .unwrap()
+                .iter()
+                .all(|event| { event.event.event_type.as_str() != "tool_learning.recorded" }),
+            "{name}"
+        );
     }
 }
 

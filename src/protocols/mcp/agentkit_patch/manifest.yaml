@@ -255,7 +255,7 @@ subsequent_overlays:
         reason: advertise the exact configured form and URL elicitation capability modes
     public_contract:
       - McpHandlerConfig::with_elicitation_responder_modes
-current_snapshot_sha256: 5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4
+current_snapshot_sha256: 776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49
 public_contract:
   - PINNED_PROTOCOL_VERSION
   - enforce_pinned_protocol_version

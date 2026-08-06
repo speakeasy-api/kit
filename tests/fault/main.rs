@@ -24,6 +24,7 @@ mod sched_crash;
 mod store_append_crash;
 #[path = "../fixtures/storefault/mod.rs"]
 mod storefault;
+mod tool_learning_crash;
 
 #[test]
 fn deterministic_crash_schedule_replays_named_occurrences() {

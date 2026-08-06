@@ -7581,14 +7581,14 @@
   source_quote: 'Kit records selection opportunities, searches, inspections, calls, errors, and outcomes. Offline analysis identifies:'
   source_fingerprint: f68c59cca68b7169e71540356ff56a661b4dc408b16fce961b9df1a48a67621d
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Tool learning records selection opportunities.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_824 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -7603,13 +7603,19 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/telemetry/tool_learning.rs
+  - src/agent/adapters/tool.rs
+  - src/agent/executor/mod.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - tests/integration/agent_run.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
   evidence_id: EV-1.04-C-1034
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_824 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7627,14 +7633,14 @@
   source_quote: 'Kit records selection opportunities, searches, inspections, calls, errors, and outcomes. Offline analysis identifies:'
   source_fingerprint: f68c59cca68b7169e71540356ff56a661b4dc408b16fce961b9df1a48a67621d
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Tool learning records searches and inspections.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_825 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -7649,13 +7655,19 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/discovery/mod.rs
+  - src/agent/adapters/tool.rs
+  - src/telemetry/tool_learning.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - tests/adversarial/tool_learning_canary.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
   evidence_id: EV-1.04-C-1035
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_825 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7673,14 +7685,14 @@
   source_quote: 'Kit records selection opportunities, searches, inspections, calls, errors, and outcomes. Offline analysis identifies:'
   source_fingerprint: f68c59cca68b7169e71540356ff56a661b4dc408b16fce961b9df1a48a67621d
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Tool learning records calls and errors.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_826 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -7695,13 +7707,21 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/agent/adapters/tool.rs
+  - src/protocols/mcp/transport/mod.rs
+  - src/telemetry/tool_learning.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - tests/fault/tool_learning_crash.rs
+  - tests/adversarial/tool_learning_canary.rs
+  - tests/integration/agent_run.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
   evidence_id: EV-1.04-C-1036
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_826 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7719,14 +7739,14 @@
   source_quote: 'Kit records selection opportunities, searches, inspections, calls, errors, and outcomes. Offline analysis identifies:'
   source_fingerprint: f68c59cca68b7169e71540356ff56a661b4dc408b16fce961b9df1a48a67621d
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Tool learning records capability outcomes.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_827 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -7741,13 +7761,21 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/agent/adapters/tool.rs
+  - src/telemetry/tool_learning.rs
+  - src/telemetry/otel/model.rs
+  - src/telemetry/otel/local.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - tests/fault/tool_learning_crash.rs
+  - tests/integration/agent_run.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
   evidence_id: EV-1.04-C-1037
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_827 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test integration agent_run::agent_run_tests::production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7765,14 +7793,15 @@
   source_quote: Description changes are evaluated as routing interventions, with both direct and competing surfaces available.
   source_fingerprint: 069ed738abea92274467026973c5e57b20cb257aff2a15f4941a0d7201e3364e
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Capability-description changes are evaluated as routing interventions against direct and competing surfaces.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_828 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance tool_telemetry::kit_cap_828_description_routing_requires_both_preregistered_arms_and_candidates -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
+  - A separate trusted production final-report run covers both preregistered arms and direct and competing candidates with authenticated learning and grade receipts; the one-trial trusted-helper smoke test is not acceptance.
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
@@ -7787,13 +7816,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/telemetry/tool_learning.rs
+  - src/evaluation/service.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
   evidence_id: EV-1.04-C-1038
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_828 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_828_description_routing_requires_both_preregistered_arms_and_candidates -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7811,14 +7844,15 @@
   source_quote: '- tools never selected because their descriptions are poor,'
   source_fingerprint: d3774e1e7483b8172205d03649ffc73e3254e6ce50d1c68948c198fffa93f7cf
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Offline tool analysis identifies tools not selected because of poor descriptions.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_832 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance tool_telemetry::kit_cap_832_poor_description_has_exact_subject_and_rejects_other_factor_changes -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
+  - A separate trusted production final-report run supplies authenticated preregistration, frozen-factor, learning, and grade receipts; the one-trial trusted-helper smoke test is not acceptance.
   primary_milestone: M006
   contributing_milestones:
   - M004
@@ -7835,13 +7869,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/telemetry/tool_learning.rs
+  - src/evaluation/service.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
-  evidence_id: EV-1.04-C-832
+  evidence_id: EV-1.04-C-1064
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_832 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_832_poor_description_has_exact_subject_and_rejects_other_factor_changes -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7859,14 +7897,15 @@
   source_quote: '- tools selected for harmful task shapes,'
   source_fingerprint: aa95f691ad91353c7b3d7a454c23be354a509f2d42c2ffef32ce3f186cc1b132
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Offline tool analysis identifies tools selected for harmful task shapes.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_833 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance tool_telemetry::kit_cap_833_harmful_decoy_has_exact_subject_and_requires_verified_grade -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
+  - A separate trusted production final-report run supplies authenticated harmful-task grade receipts and exact decoy linkage; the one-trial trusted-helper smoke test is not acceptance.
   primary_milestone: M006
   contributing_milestones:
   - M004
@@ -7883,13 +7922,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/telemetry/tool_learning.rs
+  - src/evaluation/service.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
-  evidence_id: EV-1.04-C-833
+  evidence_id: EV-1.04-C-1065
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_833 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_833_harmful_decoy_has_exact_subject_and_requires_verified_grade -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7907,14 +7950,15 @@
   source_quote: '- schema fields repeatedly misunderstood,'
   source_fingerprint: 96afcef2bd9ecbc4c7fdd329b3daba94ba4ede4d3c2095a3e0381a92623cd8dd
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Offline tool analysis identifies schema fields repeatedly misunderstood.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_834 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance tool_telemetry::kit_cap_834_misunderstood_field_has_exact_subject_and_linkage -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
+  - A separate trusted production final-report run supplies authenticated field-specific failure linkage and grade receipts; the one-trial trusted-helper smoke test is not acceptance.
   primary_milestone: M006
   contributing_milestones:
   - M004
@@ -7931,13 +7975,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/telemetry/tool_learning.rs
+  - src/evaluation/service.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
-  evidence_id: EV-1.04-C-834
+  evidence_id: EV-1.04-C-1066
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_834 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_834_misunderstood_field_has_exact_subject_and_linkage -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null
@@ -7955,14 +8003,15 @@
   source_quote: '- high-value tool sequences suitable for composition or deterministic macros.'
   source_fingerprint: 9181a6079731d84263219a2b87efed6c796e2eacd12f7960244c6c7b84ab469b
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-CAP
   applicability: mandatory
   interpretation: Offline tool analysis identifies high-value tool sequences for composition or deterministic macros.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises -- kit_cap_835 exits 0 with 1 passed and 0 failed
+  - cargo test --locked --test conformance tool_telemetry::kit_cap_835_valuable_sequence_has_exact_subject_and_enforces_bounds -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
+  - A separate trusted production final-report run supplies authenticated ordered sequence, noninferior grade, and attributable cost or latency evidence; the one-trial trusted-helper smoke test is not acceptance.
   primary_milestone: M006
   contributing_milestones:
   - M004
@@ -7979,13 +8028,17 @@
   - hostile
   release_gates:
   - G06
-  implementation_links: []
+  implementation_links:
+  - src/telemetry/tool_learning.rs
+  - src/evaluation/service.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - tests/conformance/tool_telemetry.rs
+  - requirements/reports/m006-w09.md
   evidence_type: conformance
-  evidence_id: EV-1.04-C-835
+  evidence_id: EV-1.04-C-1067
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises -- kit_cap_835 exits 0 with 1 passed and 0 failed
+  expected_result: cargo test --locked --test conformance tool_telemetry::kit_cap_835_valuable_sequence_has_exact_subject_and_enforces_bounds -- --exact --test-threads=1 exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

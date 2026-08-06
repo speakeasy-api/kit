@@ -440,6 +440,18 @@ impl McpRuntimeServer {
     }
 }
 
+fn capture_registered_failure(
+    envelope: &InvocationEnvelope<'_>,
+    store: &mut SqliteStore,
+    error: &TransportError,
+) {
+    let _ = crate::capabilities::kernel::invoke::capture_external_failure(
+        envelope,
+        store,
+        error.completion_code(),
+    );
+}
+
 impl McpCapabilityRuntime {
     pub fn new(catalog: McpCatalog) -> Self {
         Self {
@@ -637,7 +649,6 @@ impl McpCapabilityRuntime {
     ) -> Result<BrokerOutcome, TransportError> {
         let context = call.context();
         let binding = context.binding();
-        let server = McpOperation::configured_server(binding)?;
         let envelope = envelope.bind_external(
             context.capability(),
             context.schema_digest(),
@@ -645,35 +656,87 @@ impl McpCapabilityRuntime {
             context.retry_safety(),
             context.input_bytes(),
         );
-        let request = BrokerInvocation::bound_external(envelope, &context)?;
+        let learning_envelope = envelope.clone();
+        let request = match BrokerInvocation::bound_external(envelope, &context) {
+            Ok(request) => request,
+            Err(error) => {
+                let error = TransportError::from(error);
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
+        let server = match McpOperation::configured_server(binding) {
+            Ok(server) => server,
+            Err(error) => {
+                let error = TransportError::from(error);
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
         // Exact durable outcomes survive catalog removal, but replay still runs
         // current run authority and artifact-owner checks and never dispatches.
-        if let Some(result) = broker::replay(&request, store, budget, artifacts)? {
-            return Ok(BrokerOutcome::Completed(result));
+        match broker::replay(&request, store, budget, artifacts) {
+            Ok(Some(result)) => return Ok(BrokerOutcome::Completed(result)),
+            Ok(None) => {}
+            Err(error) => {
+                let error = TransportError::from(error);
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
         }
-        let _lifecycle = self
-            .lifecycle
-            .read()
-            .map_err(|_| TransportError::AuthorizationMismatch)?;
+        let _lifecycle = match self.lifecycle.read() {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                let error = TransportError::AuthorizationMismatch;
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
         {
             let catalog = self
                 .catalog
                 .read()
-                .map_err(|_| TransportError::AuthorizationMismatch)?;
+                .map_err(|_| TransportError::AuthorizationMismatch);
+            let catalog = match catalog {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    capture_registered_failure(&learning_envelope, store, &error);
+                    return Err(error);
+                }
+            };
             let current = catalog
                 .snapshot()
                 .get_identity(binding.pinned_entry().identity())
-                .ok_or(TransportError::BindingExpired)?;
+                .ok_or(TransportError::BindingExpired);
+            let current = match current {
+                Ok(current) => current,
+                Err(error) => {
+                    capture_registered_failure(&learning_envelope, store, &error);
+                    return Err(error);
+                }
+            };
             if current.digest() != binding.entry_digest()
                 || current.availability() == crate::capabilities::catalog::Availability::Unavailable
             {
-                return Err(TransportError::BindingExpired);
+                let error = TransportError::BindingExpired;
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
             }
         }
-        let (_generation, connection) = self.connections.get_registered(server)?;
-        connection
+        let (_generation, connection) = match self.connections.get_registered(server) {
+            Ok(connection) => connection,
+            Err(error) => {
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
+        let result = connection
             .invoke_bound(request, store, budget, artifacts, policy)
-            .await
+            .await;
+        if let Err(error) = &result {
+            capture_registered_failure(&learning_envelope, store, error);
+        }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -689,14 +752,8 @@ impl McpCapabilityRuntime {
         challenge_generation: u64,
         store: &mut SqliteStore,
     ) -> Result<bool, TransportError> {
-        let _lifecycle = self
-            .lifecycle
-            .read()
-            .map_err(|_| TransportError::AuthorizationMismatch)?;
         let context = call.context();
         let binding = context.binding();
-        let server = McpOperation::configured_server(binding)?;
-        let connection = self.connections.get(server)?;
         let envelope = envelope.bind_external(
             context.capability(),
             context.schema_digest(),
@@ -704,14 +761,45 @@ impl McpCapabilityRuntime {
             context.retry_safety(),
             context.input_bytes(),
         );
-        let request = BrokerInvocation::bound_external(envelope, &context)?;
+        let learning_envelope = envelope.clone();
+        let request = match BrokerInvocation::bound_external(envelope, &context) {
+            Ok(request) => request,
+            Err(error) => {
+                let error = TransportError::from(error);
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
+        let _lifecycle = match self.lifecycle.read() {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                let error = TransportError::AuthorizationMismatch;
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
+        let server = match McpOperation::configured_server(binding) {
+            Ok(server) => server,
+            Err(error) => {
+                let error = TransportError::from(error);
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
+        let connection = match self.connections.get(server) {
+            Ok(connection) => connection,
+            Err(error) => {
+                capture_registered_failure(&learning_envelope, store, &error);
+                return Err(error);
+            }
+        };
         if current.challenge_id != challenge_id
             || current.kind != challenge_kind
             || current.generation != challenge_generation
         {
             return Ok(false);
         }
-        match challenge_kind {
+        let result = (|| match challenge_kind {
             crate::capabilities::broker::AuthChallengeKind::Broker => {
                 broker::resolve_auth_expected(
                     &request,
@@ -756,7 +844,11 @@ impl McpCapabilityRuntime {
                 )?;
                 Ok(true)
             }
+        })();
+        if let Err(error) = &result {
+            capture_registered_failure(&learning_envelope, store, error);
         }
+        result
     }
 
     pub async fn drive_refresh<'a, F>(
@@ -3888,8 +3980,15 @@ impl TransportError {
         )
     }
 
-    fn completion_code(&self) -> &'static str {
+    pub(crate) fn completion_code(&self) -> &'static str {
         match self {
+            Self::InvalidLimits => "mcp.invalid_limits",
+            Self::InvalidEndpoint => "mcp.invalid_endpoint",
+            Self::InvalidHeader => "mcp.invalid_header",
+            Self::ResponseTooLarge | Self::SseEventTooLarge => "mcp.response_too_large",
+            Self::ProtocolVersionRefused => "mcp.protocol_version_refused",
+            Self::MissingPayload => "mcp.missing_payload",
+            Self::OwnedProcessUnavailable => "mcp.process_unavailable",
             Self::Timeout(_) => "mcp.transport_timeout",
             Self::AuthRequired(_) => "mcp.transport_auth_interrupted",
             Self::SensitivePayload => "mcp.sensitive_payload",
@@ -3898,30 +3997,43 @@ impl TransportError {
             Self::UrlElicitationUnavailable => "mcp.url_elicitation_outcome_unknown",
             Self::UrlElicitationDeclined => "mcp.url_elicitation_declined",
             Self::Credential(_) => "mcp.credential_failed",
-            Self::Egress(_) => "mcp.egress_denied",
+            Self::Egress(error) => match error {
+                crate::protocols::mcp::egress::McpEgressError::Denied(_)
+                | crate::protocols::mcp::egress::McpEgressError::RedirectLoop
+                | crate::protocols::mcp::egress::McpEgressError::HttpsDowngrade
+                | crate::protocols::mcp::egress::McpEgressError::AmbiguousMethodRewrite => {
+                    "mcp.egress_denied"
+                }
+                crate::protocols::mcp::egress::McpEgressError::InvalidRequest
+                | crate::protocols::mcp::egress::McpEgressError::RedirectLocation
+                | crate::protocols::mcp::egress::McpEgressError::PeerUnavailable => {
+                    "mcp.egress_invalid"
+                }
+                crate::protocols::mcp::egress::McpEgressError::InvalidHeader => {
+                    "mcp.invalid_header"
+                }
+                crate::protocols::mcp::egress::McpEgressError::Timeout => "mcp.transport_timeout",
+                crate::protocols::mcp::egress::McpEgressError::Credential(_) => {
+                    "mcp.credential_failed"
+                }
+                crate::protocols::mcp::egress::McpEgressError::Io(_) => "mcp.transport_io",
+            },
             Self::Payload(_) | Self::Result(_) => "mcp.invalid_response",
             Self::Cleanup { primary, .. } => primary.completion_code(),
-            Self::Broker(_)
-            | Self::AuthorizationMismatch
-            | Self::ConnectionRetired
-            | Self::BindingExpired
-            | Self::PolicyAuthorizationMismatch => "mcp.authorization_failed",
+            Self::ConnectionRetired => "mcp.connection_retired",
+            Self::BindingExpired => "mcp.binding_expired",
+            Self::Broker(BrokerError::AuthDenied) => "mcp.auth_denied",
+            Self::Broker(_) | Self::AuthorizationMismatch | Self::PolicyAuthorizationMismatch => {
+                "mcp.authorization_failed"
+            }
             Self::OperationQueueFull => "mcp.operation_queue_full",
             Self::Cancelled => "mcp.cancelled",
             Self::RefreshClosed => "mcp.refresh_closed",
             Self::RefreshRetriesExhausted => "mcp.refresh_retries_exhausted",
-            Self::InvalidLimits
-            | Self::InvalidEndpoint
-            | Self::InvalidHeader
-            | Self::ResponseTooLarge
-            | Self::SseEventTooLarge
-            | Self::ProtocolVersionRefused
-            | Self::MissingPayload
-            | Self::OwnedProcessUnavailable
-            | Self::Agentkit(_)
-            | Self::Io(_)
-            | Self::Feature(_)
-            | Self::Discovery(_) => "mcp.transport_failed",
+            Self::Io(_) => "mcp.transport_io",
+            Self::Feature(_) => "mcp.feature_failed",
+            Self::Discovery(_) => "mcp.discovery_failed",
+            Self::Agentkit(_) => "mcp.protocol_failed",
         }
     }
 }
@@ -4022,6 +4134,10 @@ mod tests {
         },
         runtime::scheduler::{budget::RunBudget, limits::Spend, reserve::BudgetLedger},
         store::{artifacts::ArtifactStore, sqlite::idempotency::IdempotencyKey},
+        telemetry::tool_learning::{
+            ErrorCode as LearningErrorCode, LearningStatus, LearningSurface, PointerDomain,
+            PreparedLearningCapture, ProjectPointerHasher, ToolLearningEvent,
+        },
         test_support,
     };
 
@@ -4433,7 +4549,126 @@ mod tests {
                 outcome_event_id: EventId::generate().unwrap(),
                 occurred_at: &self.occurred_at,
                 trace_id: &self.trace,
+                learning: None,
             }
+        }
+    }
+
+    #[test]
+    fn mcp_auth_resolution_denial_invalid_and_expired_use_canonical_failure_capture() {
+        for (name, error, expected_code, expected_status) in [
+            (
+                "denied",
+                TransportError::Broker(BrokerError::AuthDenied),
+                LearningErrorCode::AuthDenied,
+                LearningStatus::Failed,
+            ),
+            (
+                "invalid",
+                TransportError::Broker(BrokerError::InvalidAuthState),
+                LearningErrorCode::AuthorizationDenied,
+                LearningStatus::Failed,
+            ),
+            (
+                "expired",
+                TransportError::SessionExpired,
+                LearningErrorCode::SessionExpired,
+                LearningStatus::Failed,
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "kit-mcp-auth-capture-{name}-{}",
+                EventId::generate().unwrap()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let mut store = test_support::open_sqlite_store(root.join("events.sqlite3")).unwrap();
+            let inputs = RuntimeInputs::new();
+            store.install_driver_claim_for_test(inputs.claim).unwrap();
+            let schema = NormalizedSchema::ingest(
+                br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+                JSON_SCHEMA_2020_12,
+                b"auth capture schema",
+                DigestAlgorithm::Sha256,
+            )
+            .unwrap();
+            let capability = CapabilityIdentity::new(
+                CapabilitySource::new("mcp-auth-capture").unwrap(),
+                CapabilityNamespace::new("mcp.auth.capture").unwrap(),
+                CapabilityName::new("resolve").unwrap(),
+                CapabilityVersion::new("1").unwrap(),
+                Digest::of(DigestAlgorithm::Sha256, b"auth capture implementation"),
+            );
+            let grants = CapabilityGrantSnapshot::new(
+                &inputs.config,
+                [CapabilityGrant::new(
+                    inputs.authenticated.principal_id(),
+                    inputs.project,
+                    inputs.workspace,
+                    capability.clone(),
+                    schema.source().normalized_digest(),
+                    EffectClass::WorkspaceRead,
+                    inputs.constraints.clone(),
+                )],
+                DigestAlgorithm::Sha256,
+            );
+            let hasher = ProjectPointerHasher::new(inputs.project, &[91; 32]);
+            let capture = PreparedLearningCapture::new(
+                hasher.clone(),
+                inputs.config.run_id(),
+                "turn-auth",
+                1,
+                "tools_invoke",
+                format!("auth-{name}"),
+                b"{}",
+                LearningSurface::Generic,
+                b"auth capability",
+                b"auth schema",
+                Some(b"auth binding"),
+                b"mcp",
+                crate::telemetry::tool_learning::LearningCapabilityKind::Tool,
+            )
+            .unwrap();
+            let key = IdempotencyKey::parse(&format!("auth-capture-{name}")).unwrap();
+            let mut envelope = inputs.envelope(
+                &grants,
+                &capability,
+                schema.source().normalized_digest(),
+                b"{}",
+                ToolCallId::generate().unwrap(),
+                &key,
+            );
+            envelope.learning = Some(&capture);
+            capture_registered_failure(&envelope, &mut store, &error);
+            let records =
+                crate::telemetry::tool_learning::records(&store, inputs.config.run_id(), &hasher)
+                    .unwrap();
+            assert_eq!(records.len(), 3, "{name}: {records:?}");
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|event| matches!(event, ToolLearningEvent::Call { .. }))
+                    .count(),
+                1
+            );
+            assert!(records.iter().any(|event| matches!(
+                event,
+                ToolLearningEvent::Error { code, .. } if *code == expected_code
+            )));
+            assert!(
+                records.iter().any(|event| matches!(
+                    event,
+                    ToolLearningEvent::Outcome { status, .. } if *status == expected_status
+                )),
+                "{name}: {records:?}"
+            );
+            assert!(records.iter().all(|event| {
+                event.common().run
+                    == hasher.pointer(
+                        PointerDomain::Run,
+                        inputs.config.run_id().to_string().as_bytes(),
+                    )
+            }));
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

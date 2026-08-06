@@ -1017,7 +1017,10 @@ fn assert_stale_stream_fence(database: &std::path::Path, correlation: EffectCorr
             )),
         )
         .unwrap_err();
-    assert!(error.to_string().contains("stale provider stream fence"));
+    assert!(
+        error.to_string().contains("stale provider stream fence"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]

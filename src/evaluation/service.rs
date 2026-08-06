@@ -1,5 +1,11 @@
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    sync::Arc,
+};
 
+use crate::domain::ids::{ProjectId, RunId};
 use crate::runtime::scheduler::DurableScheduler;
 
 use super::{
@@ -31,6 +37,8 @@ pub struct ProductionEvaluationService {
     operations: SqliteCoordinatorOperationStore,
     pins: ProductionEvaluationPins,
     calibrations: BTreeMap<(String, String), ProductionCalibrationToken>,
+    database: std::path::PathBuf,
+    learning_authority: Option<(ProjectId, [u8; 32])>,
 }
 
 pub struct ProductionCalibrationToken {
@@ -125,7 +133,14 @@ impl ProductionEvaluationService {
             operations: SqliteCoordinatorOperationStore::open(&database)?,
             pins,
             calibrations: BTreeMap::new(),
+            database,
+            learning_authority: None,
         })
+    }
+
+    pub(crate) fn with_learning_authority(mut self, project_id: ProjectId, key: [u8; 32]) -> Self {
+        self.learning_authority = Some((project_id, key));
+        self
     }
 
     pub fn register(
@@ -242,12 +257,56 @@ impl ProductionEvaluationService {
         &mut self,
         registered: &RegisteredPreregistration,
     ) -> Result<StatisticalReportEnvelope, ProductionEvaluationError> {
-        let report = self.authority.build_report(registered)?;
-        self.verify_final_report(registered, &report)?;
+        let ledger_cutoff = self.authority.freeze_experiment(registered)?;
+        let report = if supports_learning_report(registered) {
+            let learning = self.load_learning_analysis(registered, ledger_cutoff)?;
+            let report = self
+                .authority
+                .build_report_with_learning(registered, Some(learning.clone()))?;
+            self.verify_final_report_with_learning(registered, &report, &learning)?;
+            report
+        } else {
+            let report = self.authority.build_report(registered)?;
+            self.verify_final_report_evidence(registered, &report)?;
+            report
+        };
         Ok(report)
     }
 
     pub fn verify_final_report(
+        &self,
+        registered: &RegisteredPreregistration,
+        report: &StatisticalReportEnvelope,
+    ) -> Result<(), ProductionEvaluationError> {
+        self.authority.verify_report(registered, report)?;
+        if supports_learning_report(registered) {
+            let learning = self.load_learning_analysis(registered, report.receipt.ledger_cutoff)?;
+            self.verify_final_report_with_learning(registered, report, &learning)
+        } else if report.report.learning_analysis.is_none() {
+            self.verify_final_report_evidence(registered, report)
+        } else {
+            Err(ProductionEvaluationError::Unavailable(
+                "legacy report version cannot carry learning analysis",
+            ))
+        }
+    }
+
+    fn verify_final_report_with_learning(
+        &self,
+        registered: &RegisteredPreregistration,
+        report: &StatisticalReportEnvelope,
+        learning: &crate::telemetry::tool_learning::FrozenLearningAnalysis,
+    ) -> Result<(), ProductionEvaluationError> {
+        self.verify_final_report_evidence(registered, report)?;
+        if report.report.learning_analysis.as_ref() != Some(learning) {
+            return Err(ProductionEvaluationError::Unavailable(
+                "frozen learning analysis does not match its authority inputs",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_final_report_evidence(
         &self,
         registered: &RegisteredPreregistration,
         report: &StatisticalReportEnvelope,
@@ -286,6 +345,632 @@ impl ProductionEvaluationService {
             harness_config_digest.to_owned(),
         ))
     }
+
+    fn load_learning_analysis(
+        &self,
+        registered: &RegisteredPreregistration,
+        ledger_cutoff: u64,
+    ) -> Result<crate::telemetry::tool_learning::FrozenLearningAnalysis, ProductionEvaluationError>
+    {
+        use crate::telemetry::tool_learning::{
+            CausalResult, CausalUnavailable, DownstreamGrade, DownstreamGradeRecord, ExperimentArm,
+            FrozenFactors, FrozenLearningAnalysis, LearningPointer, LearningSurface, PointerDomain,
+            PreregisteredExperiment, ProjectPointerHasher, SequenceObservation,
+            ToolLearningAnalyzer, ToolLearningEvent,
+        };
+
+        let unavailable = |reason| FrozenLearningAnalysis {
+            result: CausalResult::Unavailable(reason),
+            input_digests: BTreeSet::from([registered.preregistration_digest.clone()]),
+        };
+        let Some((project_id, key)) = self.learning_authority else {
+            return Ok(unavailable(CausalUnavailable::MissingAuthority));
+        };
+        if registered
+            .preregistration
+            .tool_learning_experiments
+            .is_empty()
+        {
+            return Ok(unavailable(CausalUnavailable::MissingPreregistration));
+        }
+        let hasher = ProjectPointerHasher::new(project_id, &key);
+        let connection = rusqlite::Connection::open(&self.database).map_err(|_| {
+            ProductionEvaluationError::Unavailable("learning coordinator records unavailable")
+        })?;
+        let (operation_count, operation_bytes): (u64, u64) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(
+                   length(run_config_bytes)+COALESCE(length(harness_bytes),0)+
+                   COALESCE(length(events_bytes),0)+length(execution_receipt_bytes)+
+                   COALESCE(length(terminal_evidence_bytes),0)),0)
+                 FROM statistical_coordinator_operations
+                 WHERE phase IN ('recorded','terminal_error')
+                   AND execution_receipt_bytes IS NOT NULL
+                   AND json_extract(CAST(run_config_bytes AS TEXT),'$.preregistration_digest')=?1",
+                [&registered.preregistration_digest],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| {
+                ProductionEvaluationError::Unavailable("learning coordinator records unavailable")
+            })?;
+        const MAX_ANALYSIS_BYTES: u64 = 64 * 1024 * 1024;
+        if operation_count > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS as u64
+            || operation_bytes > MAX_ANALYSIS_BYTES
+        {
+            return Ok(unavailable(CausalUnavailable::BoundExceeded));
+        }
+        let raw_learning_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events AS event
+                 JOIN statistical_coordinator_operations AS operation
+                   ON operation.run_id=event.correlation_id
+                 WHERE event.event_type='tool_learning.recorded'
+                   AND operation.phase IN ('recorded','terminal_error')
+                   AND json_extract(CAST(operation.run_config_bytes AS TEXT),
+                                    '$.preregistration_digest')=?1",
+                [&registered.preregistration_digest],
+                |row| row.get(0),
+            )
+            .map_err(|_| ProductionEvaluationError::Unavailable("learning records unavailable"))?;
+        let maximum_input_digests = operation_count
+            .checked_mul(4)
+            .and_then(|count| count.checked_add(raw_learning_count))
+            .and_then(|count| count.checked_add(1));
+        if maximum_input_digests.is_none_or(|count| {
+            count > crate::telemetry::tool_learning::MAX_LEARNING_ANALYSIS_INPUT_DIGESTS
+        }) {
+            return Ok(unavailable(CausalUnavailable::BoundExceeded));
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id,phase,run_config_digest,run_config_bytes,harness_digest,harness_bytes,
+                        events_digest,events_bytes,execution_receipt_digest,execution_receipt_bytes,
+                        terminal_evidence_digest,terminal_evidence_bytes,event_source
+                  FROM statistical_coordinator_operations
+                  WHERE phase IN ('recorded','terminal_error')
+                    AND execution_receipt_bytes IS NOT NULL
+                    AND json_extract(CAST(run_config_bytes AS TEXT),'$.preregistration_digest')=?1
+                   ORDER BY run_id LIMIT 10001",
+            )
+            .map_err(|_| {
+                ProductionEvaluationError::Unavailable("learning coordinator records unavailable")
+            })?;
+        let rows = statement
+            .query_map([&registered.preregistration_digest], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<Vec<u8>>>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            })
+            .map_err(|_| {
+                ProductionEvaluationError::Unavailable("learning coordinator records unavailable")
+            })?;
+        let mut events = Vec::new();
+        let mut experiments = Vec::new();
+        let mut grades = Vec::new();
+        let mut candidate_count = 0_usize;
+        let mut sequence_count = 0_usize;
+        let mut schedules = BTreeSet::new();
+        let mut input_digests = BTreeSet::from([registered.preregistration_digest.clone()]);
+        for row in rows {
+            let (
+                run_text,
+                phase,
+                config_digest,
+                config_bytes,
+                harness_digest,
+                harness_bytes,
+                events_digest,
+                events_bytes,
+                execution_digest,
+                execution_bytes,
+                terminal_evidence_digest,
+                terminal_evidence_bytes,
+                event_source,
+            ) = row.map_err(|_| {
+                ProductionEvaluationError::Unavailable("learning coordinator record is corrupt")
+            })?;
+            let terminal = phase == "terminal_error";
+            if !matches!(phase.as_str(), "recorded" | "terminal_error")
+                || config_digest != sha256(&config_bytes)
+                || execution_digest != sha256(&execution_bytes)
+                || event_source != "production_authenticated"
+                || (!terminal
+                    && (harness_digest.as_deref()
+                        != harness_bytes.as_deref().map(sha256).as_deref()
+                        || events_digest.as_deref()
+                            != events_bytes.as_deref().map(sha256).as_deref()
+                        || harness_bytes.is_none()
+                        || events_bytes.is_none()
+                        || terminal_evidence_bytes.is_some()))
+                || (terminal
+                    && (harness_bytes.is_some()
+                        || events_bytes.is_some()
+                        || terminal_evidence_digest.as_deref()
+                            != terminal_evidence_bytes.as_deref().map(sha256).as_deref()
+                        || terminal_evidence_bytes.is_none()))
+            {
+                return Err(ProductionEvaluationError::Unavailable(
+                    "learning coordinator artifact digest mismatch",
+                ));
+            }
+            let config: super::reports::TrialRunConfig = serde_json::from_slice(&config_bytes)
+                .map_err(|_| {
+                    ProductionEvaluationError::Unavailable("learning run binding is corrupt")
+                })?;
+            let harness_bytes = harness_bytes.unwrap_or_default();
+            let events_bytes = events_bytes.unwrap_or_default();
+            if config.preregistration_digest != registered.preregistration_digest {
+                continue;
+            }
+            let roster = registered
+                .preregistration
+                .roster
+                .get(config.schedule_index)
+                .ok_or(ProductionEvaluationError::Unavailable(
+                    "learning trial is outside the preregistered roster",
+                ))?;
+            if roster.trial_id != config.trial_id
+                || roster.pair_id != config.pair_id
+                || roster.arm != config.arm
+                || roster.config_digest != config.config_digest
+                || roster.model_digest != config.model_digest
+            {
+                return Err(ProductionEvaluationError::Unavailable(
+                    "learning trial authority binding mismatch",
+                ));
+            }
+            let receipt: super::reports::MeasuredTrialReceipt =
+                serde_json::from_slice(&execution_bytes).map_err(|_| {
+                    ProductionEvaluationError::Unavailable("learning execution receipt is corrupt")
+                })?;
+            if receipt.preregistration_digest != registered.preregistration_digest
+                || receipt.schedule_index != config.schedule_index
+                || receipt.trial_id != config.trial_id
+                || receipt.pair_id != config.pair_id
+                || receipt.arm != config.arm
+                || receipt.scheduler_run_id != run_text
+                || receipt.harness_report_digest != sha256(&harness_bytes)
+                || receipt.events_digest != sha256(&events_bytes)
+                || receipt.recorded_at <= registered.registration.registered_at
+                || receipt.authority_position > ledger_cutoff
+                || receipt.evidence_source != EvidenceSource::ProductionTrusted
+            {
+                return Err(ProductionEvaluationError::Unavailable(
+                    "learning execution receipt authority mismatch",
+                ));
+            }
+            if !schedules.insert(config.schedule_index) {
+                return Err(ProductionEvaluationError::Unavailable(
+                    "learning frozen receipt set contains a duplicate trial",
+                ));
+            }
+            let verified = self
+                .authority
+                .load_harness_trial(registered, &config)?
+                .ok_or(ProductionEvaluationError::Unavailable(
+                    "learning execution receipt is not stored by the evaluation authority",
+                ))?;
+            if verified.receipt() != &receipt
+                || verified.digest() != execution_digest
+                || verified.harness_report_bytes() != harness_bytes
+                || verified.events_bytes() != events_bytes
+            {
+                return Err(ProductionEvaluationError::Unavailable(
+                    "learning execution evidence does not match the evaluation authority",
+                ));
+            }
+            let run = RunId::parse(&run_text).map_err(|_| {
+                ProductionEvaluationError::Unavailable("learning run identity is corrupt")
+            })?;
+            let high = receipt.event_high_watermark;
+            let mut expected_learning = BTreeMap::new();
+            let mut authenticated_latency_ms = None;
+            if !terminal {
+                let event_manifest: serde_json::Value = serde_json::from_slice(&events_bytes)
+                    .map_err(|_| {
+                        ProductionEvaluationError::Unavailable("learning event manifest is corrupt")
+                    })?;
+                let started = event_manifest
+                    .get("started_monotonic_millis")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(ProductionEvaluationError::Unavailable(
+                        "learning event manifest has no start time",
+                    ))?;
+                let latency_ms = event_manifest
+                    .get("finished_monotonic_millis")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|finished| finished.checked_sub(started))
+                    .ok_or(ProductionEvaluationError::Unavailable(
+                        "learning event manifest has invalid latency",
+                    ))?;
+                if latency_ms == 0
+                    || latency_ms > crate::telemetry::tool_learning::MAX_SEQUENCE_LATENCY_MS
+                    || receipt.elapsed_millis != latency_ms
+                    || receipt.latency_ms != latency_ms as f64
+                {
+                    return Err(ProductionEvaluationError::Unavailable(
+                        "learning receipt latency does not match authenticated events",
+                    ));
+                }
+                authenticated_latency_ms = Some(latency_ms);
+                for class in ["scheduler_events", "provider_events", "tool_events"] {
+                    let bindings = event_manifest
+                        .get(class)
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or(ProductionEvaluationError::Unavailable(
+                            "learning event manifest is corrupt",
+                        ))?;
+                    if bindings.len() > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS {
+                        return Ok(unavailable(CausalUnavailable::BoundExceeded));
+                    }
+                    for binding in bindings {
+                        if binding.get("kind").and_then(serde_json::Value::as_str)
+                            == Some("tool_learning.recorded")
+                        {
+                            let position = binding
+                                .get("event_position")
+                                .and_then(serde_json::Value::as_u64)
+                                .ok_or(ProductionEvaluationError::Unavailable(
+                                    "learning event manifest has no position",
+                                ))?;
+                            let digest = binding
+                                .get("event_digest")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|digest| {
+                                    digest.starts_with("sha256:") && digest.len() == 71
+                                })
+                                .ok_or(ProductionEvaluationError::Unavailable(
+                                    "learning event manifest has no authenticated digest",
+                                ))?;
+                            if expected_learning
+                                .insert(position, digest.to_owned())
+                                .is_some()
+                            {
+                                return Err(ProductionEvaluationError::Unavailable(
+                                    "learning event manifest contains a duplicate position",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut run_events = Vec::new();
+            let run_pointer = hasher.pointer(PointerDomain::Run, run.to_string().as_bytes());
+            if !terminal {
+                let (raw_count, raw_bytes, raw_candidates): (u64, u64, u64) = connection
+                    .query_row(
+                        "SELECT COUNT(*),COALESCE(SUM(length(payload)),0),COALESCE(SUM(
+                       CASE WHEN json_extract(CAST(payload AS TEXT),'$.event_class')='opportunity'
+                       THEN json_array_length(CAST(payload AS TEXT),'$.candidates') ELSE 0 END),0)
+                     FROM events
+                     WHERE correlation_id=?1 AND event_type='tool_learning.recorded'",
+                        [run.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(|_| {
+                        ProductionEvaluationError::Unavailable("learning records unavailable")
+                    })?;
+                if raw_count > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS as u64
+                    || raw_bytes > MAX_ANALYSIS_BYTES
+                    || raw_candidates > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS as u64
+                    || events.len().saturating_add(raw_count as usize)
+                        > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS
+                {
+                    return Ok(unavailable(CausalUnavailable::BoundExceeded));
+                }
+                if raw_count as usize != expected_learning.len() {
+                    return Err(ProductionEvaluationError::Unavailable(
+                        "learning records do not exactly match authenticated event evidence",
+                    ));
+                }
+                let mut event_statement = connection
+                    .prepare(
+                        "SELECT commit_position,event_id,stream,correlation_id,payload FROM events
+                     WHERE correlation_id=?1 AND event_type='tool_learning.recorded'
+                     ORDER BY commit_position",
+                    )
+                    .map_err(|_| {
+                        ProductionEvaluationError::Unavailable("learning records unavailable")
+                    })?;
+                let records = event_statement
+                    .query_map([run.to_string()], |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                        ))
+                    })
+                    .map_err(|_| {
+                        ProductionEvaluationError::Unavailable("learning records unavailable")
+                    })?;
+                for stored in records {
+                    let (position, event_id, stream, correlation, payload) =
+                        stored.map_err(|_| {
+                            ProductionEvaluationError::Unavailable("learning record is corrupt")
+                        })?;
+                    if position <= config.event_start_watermark
+                        || position > high
+                        || expected_learning.remove(&position).as_deref()
+                            != Some(sha256(&payload).as_str())
+                    {
+                        return Err(ProductionEvaluationError::Unavailable(
+                            "learning record is missing, extra, or relocated",
+                        ));
+                    }
+                    let event: ToolLearningEvent =
+                        serde_json::from_slice(&payload).map_err(|_| {
+                            ProductionEvaluationError::Unavailable("learning record is corrupt")
+                        })?;
+                    event.validate_with(&hasher).map_err(|_| {
+                        ProductionEvaluationError::Unavailable(
+                            "learning record authentication failed",
+                        )
+                    })?;
+                    if let ToolLearningEvent::Opportunity { candidates, .. } = &event {
+                        candidate_count = candidate_count.saturating_add(candidates.len());
+                        if candidate_count > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS {
+                            return Ok(unavailable(CausalUnavailable::BoundExceeded));
+                        }
+                    }
+                    if stream != run_text
+                        || correlation != run_text
+                        || event.common().run != run_pointer
+                        || event_id
+                            != crate::domain::ids::EventId::from_stable_bytes(
+                                event.common().event_id.as_str().as_bytes(),
+                            )
+                            .to_string()
+                    {
+                        return Err(ProductionEvaluationError::Unavailable(
+                            "learning record row binding mismatch",
+                        ));
+                    }
+                    input_digests.insert(sha256(&payload));
+                    run_events.push(event);
+                }
+                if !expected_learning.is_empty() {
+                    return Err(ProductionEvaluationError::Unavailable(
+                        "authenticated learning event evidence is missing a raw record",
+                    ));
+                }
+            }
+            let grade = if receipt.harm_receipt.is_some() {
+                DownstreamGrade::Harmful
+            } else if receipt.outcome == super::reports::TrialOutcome::Success
+                && receipt.verification_passed
+            {
+                DownstreamGrade::Passed
+            } else {
+                DownstreamGrade::Failed
+            };
+            let cost_microusd = (receipt.cost_usd * 1_000_000.0).round() as u64;
+            for plan in registered
+                .preregistration
+                .tool_learning_experiments
+                .iter()
+                .filter(|plan| plan.pair_id == config.pair_id)
+            {
+                if experiments.len() >= crate::telemetry::tool_learning::MAX_LEARNING_EVENTS
+                    || grades.len() >= crate::telemetry::tool_learning::MAX_LEARNING_EVENTS
+                {
+                    return Ok(unavailable(CausalUnavailable::BoundExceeded));
+                }
+                sequence_count = sequence_count
+                    .saturating_add(plan.baseline_sequence.len() + plan.candidate_sequence.len());
+                if sequence_count > crate::telemetry::tool_learning::MAX_LEARNING_EVENTS {
+                    return Ok(unavailable(CausalUnavailable::BoundExceeded));
+                }
+                let parse = |value: &str, domain| {
+                    let pointer = LearningPointer::parse(value.to_owned()).map_err(|_| {
+                        ProductionEvaluationError::Unavailable(
+                            "learning preregistration pointer is invalid",
+                        )
+                    })?;
+                    hasher.validate(&pointer, domain).map_err(|_| {
+                        ProductionEvaluationError::Unavailable(
+                            "learning preregistration authority mismatch",
+                        )
+                    })?;
+                    Ok::<_, ProductionEvaluationError>(pointer)
+                };
+                let experiment = parse(&plan.experiment, PointerDomain::Experiment)?;
+                let capability = parse(&plan.capability, PointerDomain::Capability)?;
+                let schema = parse(&plan.schema, PointerDomain::Schema)?;
+                let declaration_artifact = parse(&plan.frozen_factors, PointerDomain::Artifact)?;
+                let step_surface = |surface: &str| match surface {
+                    "eager" => Ok(LearningSurface::Eager),
+                    "deferred" => Ok(LearningSurface::Deferred),
+                    "generic" => Ok(LearningSurface::Generic),
+                    "discovery" => Ok(LearningSurface::Discovery),
+                    _ => Err(ProductionEvaluationError::Unavailable(
+                        "learning preregistration surface is invalid",
+                    )),
+                };
+                let expected = match config.arm {
+                    super::reports::Arm::Baseline => &plan.baseline_sequence,
+                    super::reports::Arm::Candidate => &plan.candidate_sequence,
+                }
+                .iter()
+                .map(|step| {
+                    Ok::<_, ProductionEvaluationError>(
+                        crate::telemetry::tool_learning::PreregisteredSequenceStep {
+                            capability: parse(&step.capability, PointerDomain::Capability)?,
+                            schema: parse(&step.schema, PointerDomain::Schema)?,
+                            surface: step_surface(&step.surface)?,
+                            ordinal: step.ordinal,
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+                let sequence = (!expected.is_empty())
+                    .then(|| {
+                        crate::telemetry::tool_learning::bind_sequence_calls(
+                            &run_events,
+                            &run_pointer,
+                            &expected,
+                        )
+                        .and_then(|(_, calls)| {
+                            calls.iter().try_fold(0_u64, |total, expected| {
+                                run_events.iter().find_map(|event| match event {
+                                    ToolLearningEvent::Outcome {
+                                        call,
+                                        status: crate::telemetry::tool_learning::LearningStatus::Succeeded,
+                                        known: true,
+                                        cost_microusd: Some(cost),
+                                        ..
+                                    } if call == expected => total.checked_add(*cost),
+                                    _ => None,
+                                })
+                            })
+                        })
+                        .filter(|cost| {
+                            *cost
+                                <= crate::telemetry::tool_learning::MAX_SEQUENCE_COST_MICROUSD
+                        })
+                        .zip(authenticated_latency_ms)
+                        .map(|(cost_microusd, latency_ms)| SequenceObservation {
+                            cost_microusd,
+                            latency_ms,
+                        })
+                    })
+                    .flatten();
+                let surface = step_surface(&plan.surface)?;
+                let mut authorized = false;
+                let mut offered = false;
+                let mut offered_factors = BTreeSet::new();
+                for event in &run_events {
+                    if let ToolLearningEvent::Opportunity {
+                        offered: offered_count,
+                        eager,
+                        deferred,
+                        generic_available,
+                        candidates,
+                        ..
+                    } = event
+                    {
+                        offered_factors.insert((
+                            offered_count,
+                            eager,
+                            deferred,
+                            generic_available,
+                            candidates,
+                        ));
+                        for candidate in candidates.iter().filter(|candidate| {
+                            candidate.capability == capability
+                                && candidate.schema == schema
+                                && candidate.surface == surface
+                        }) {
+                            authorized |= candidate.authorized;
+                            offered |= candidate.offered;
+                        }
+                    }
+                }
+                let actual_configuration = serde_json::to_vec(&serde_json::json!({
+                    "task_id": config.task_id,
+                    "dataset_member_id": config.dataset_member_id,
+                    "task_manifest_digest": config.task_manifest_digest,
+                    "task_set_digest": registered.preregistration.digests.task_set,
+                    "dataset_digest": registered.preregistration.digests.dataset,
+                    "model_digest": config.model_digest,
+                    "model_settings_digest": config.model_settings_digest,
+                    "config_digest": config.config_digest,
+                    "seed": config.seed,
+                    "harness_digest": registered.preregistration.digests.harness,
+                    "execution_environment_digest": registered.preregistration.execution_environment.digest,
+                    "alpha": registered.preregistration.alpha,
+                    "ci_method": registered.preregistration.ci_method,
+                    "noninferiority": registered.preregistration.noninferiority,
+                    "policies": registered.preregistration.policies,
+                    "capability": capability,
+                    "schema": schema,
+                    "surface": plan.surface,
+                    "expected_sequence": expected,
+                    "offered_tools": offered_factors,
+                    "provider_capability_digest": (!plan.description_only)
+                        .then_some(&config.provider_capability_digest),
+                }))
+                .map_err(|_| {
+                    ProductionEvaluationError::Unavailable(
+                        "learning actual arm configuration is not canonical",
+                    )
+                })?;
+                let frozen_factors = FrozenFactors {
+                    canonical_actual_config_digest: sha256(&actual_configuration),
+                    arm_config: hasher.pointer(PointerDomain::Artifact, &config_bytes),
+                    receipt: hasher.pointer(PointerDomain::Artifact, execution_digest.as_bytes()),
+                    declaration_artifact,
+                };
+                experiments.push(PreregisteredExperiment {
+                    experiment: experiment.clone(),
+                    run: run_pointer.clone(),
+                    arm: match config.arm {
+                        super::reports::Arm::Baseline => ExperimentArm::Direct,
+                        super::reports::Arm::Candidate => ExperimentArm::Competing,
+                    },
+                    capability,
+                    schema,
+                    surface,
+                    authorized,
+                    offered,
+                    description_only: plan.description_only,
+                    frozen_factors,
+                    expected_sequence: expected,
+                });
+                if !terminal {
+                    grades.push(DownstreamGradeRecord {
+                        experiment,
+                        run: run_pointer.clone(),
+                        grade,
+                        cost_microusd,
+                        latency_ms: receipt.latency_ms.round() as u64,
+                        receipt: hasher
+                            .pointer(PointerDomain::Artifact, execution_digest.as_bytes()),
+                        harm_receipt: receipt.harm_receipt,
+                        sequence,
+                    });
+                }
+            }
+            input_digests.extend([config_digest, execution_digest]);
+            input_digests.extend(harness_digest);
+            input_digests.extend(events_digest);
+            input_digests.extend(terminal_evidence_digest);
+            events.extend(run_events);
+        }
+        if schedules.len() != registered.preregistration.roster.len() {
+            return Err(ProductionEvaluationError::Unavailable(
+                "learning frozen receipt set is incomplete",
+            ));
+        }
+        if events.is_empty() {
+            return Ok(FrozenLearningAnalysis {
+                result: CausalResult::Unavailable(CausalUnavailable::MissingLearningRecords),
+                input_digests,
+            });
+        }
+        Ok(FrozenLearningAnalysis {
+            result: ToolLearningAnalyzer::new(crate::telemetry::tool_learning::MAX_LEARNING_EVENTS)
+                .analyze(&events, &experiments, &grades),
+            input_digests,
+        })
+    }
+}
+
+fn supports_learning_report(registered: &RegisteredPreregistration) -> bool {
+    registered.schema_version == "1.1" && registered.preregistration.schema_version == "1.2"
 }
 
 #[cfg(any(test, debug_assertions))]

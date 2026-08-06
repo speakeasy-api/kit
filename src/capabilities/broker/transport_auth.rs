@@ -5,7 +5,7 @@ use crate::{
     capabilities::kernel::{
         grant,
         grant_ext::EgressConstraint,
-        invoke::{InvocationEnvelope, InvokeError},
+        invoke::{self as kernel_invoke, InvocationEnvelope, InvokeError},
     },
     domain::{
         commands::ExpectedVersion,
@@ -859,6 +859,15 @@ pub(crate) fn resume_expected(
         .map_err(BrokerError::Invoke)?;
     request.preflight_transport()?;
     if request.envelope.cancellation.load(Ordering::Acquire) {
+        kernel_invoke::capture_rejected(
+            &request.envelope,
+            store,
+            super::learning_broker_failure(
+                &BrokerError::AuthResolutionCancelled,
+                request.envelope.retry_safety,
+            ),
+        )
+        .map_err(BrokerError::Invoke)?;
         return Err(BrokerError::AuthResolutionCancelled);
     }
     let requirement = auth_requirement(request)?;
@@ -914,7 +923,16 @@ pub(crate) fn resume_expected(
         &binding,
         resolution,
         &TRANSPORT_CHANNEL,
-    )
+    )?;
+    if resolution == AuthResolution::Denied {
+        kernel_invoke::capture_rejected(
+            &request.envelope,
+            store,
+            super::learning_broker_failure(&BrokerError::AuthDenied, request.envelope.retry_safety),
+        )
+        .map_err(BrokerError::Invoke)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn resume_bound_expected(
@@ -1772,6 +1790,7 @@ mod tests {
                     outcome_event_id: self.outcome_event_id,
                     occurred_at: &self.occurred_at,
                     trace_id: &self.trace_id,
+                    learning: None,
                 },
                 &self.normalized_schema,
             )

@@ -474,30 +474,85 @@ pub trait EffectJournal {
 
 impl EffectJournal for SqliteStore {
     fn append_effect(&mut self, append: EffectJournalAppend) -> Result<AppendOutcome, StoreError> {
-        let stream = EntityId::Attempt(append.owner.attempt_id);
-        let expected_stream_version = self
-            .events()?
-            .into_iter()
-            .filter(|event| event.event.stream == stream)
-            .map(|event| event.sequence.get())
-            .max()
-            .unwrap_or(0);
-        append_loop_record(
-            self,
-            LoopCommit {
-                owner: append.owner,
-                claim: append.claim,
-                expected_stream_version,
-                idempotency_key: append.idempotency_key,
-                command_id: append.command_id,
-                event_id: append.event_id,
-                occurred_at: append.occurred_at,
-                trace_id: append.trace_id,
-                artifacts: append.artifacts,
-                record: append.record,
-            },
-        )
+        append_effect_with_events(self, append, Vec::new(), Vec::new())
     }
+}
+
+pub(crate) fn append_effect_with_events(
+    store: &mut SqliteStore,
+    append: EffectJournalAppend,
+    mut additional_versions: Vec<ExpectedStreamVersion>,
+    mut additional_events: Vec<NewEvent>,
+) -> Result<AppendOutcome, StoreError> {
+    if append
+        .record
+        .correlation()
+        .is_some_and(|correlation| correlation.owner != append.owner)
+        || append
+            .claim
+            .is_some_and(|claim| claim.owner() != append.owner)
+    {
+        return Err(StoreError::InvalidRequest(
+            "effect journal authority does not match its owner",
+        ));
+    }
+    let stream = EntityId::Attempt(append.owner.attempt_id);
+    let expected_stream_version = store
+        .events()?
+        .into_iter()
+        .filter(|event| event.event.stream == stream)
+        .map(|event| event.sequence.get())
+        .max()
+        .unwrap_or(0);
+    let payload = serde_json::to_vec(&DurableRecord {
+        schema_version: RECORD_SCHEMA_VERSION,
+        owner: append.owner,
+        claim: append.claim,
+        record: append.record,
+    })
+    .map_err(|_| StoreError::InvalidRequest("loop record is not serializable"))?;
+    let artifacts = serde_json::to_vec(&append.artifacts)
+        .map_err(|_| StoreError::InvalidRequest("artifact references are not serializable"))?;
+    let mut request = payload.clone();
+    for event in &additional_events {
+        request.extend_from_slice(&(event.payload.len() as u64).to_be_bytes());
+        request.extend_from_slice(&event.payload);
+    }
+    let scope = IdempotencyScope::new(append.owner.principal_id, LOOP_COMMAND, stream)
+        .map_err(|_| StoreError::InvalidRequest("invalid loop idempotency scope"))?;
+    additional_versions.insert(
+        0,
+        ExpectedStreamVersion {
+            stream,
+            version: ExpectedVersion::new(expected_stream_version),
+        },
+    );
+    let mut events = vec![NewEvent {
+        id: append.event_id,
+        stream,
+        event_type: EventType::parse(EFFECT_JOURNAL_EVENT)
+            .expect("effect journal event name is valid"),
+        schema_version: SchemaVersion::CURRENT,
+        occurred_at: append.occurred_at,
+        causation_id: append.command_id,
+        correlation_id: EntityId::Attempt(append.owner.attempt_id),
+        attempt_id: Some(append.owner.attempt_id),
+        trace_id: append.trace_id,
+        payload,
+        artifacts,
+    }];
+    events.append(&mut additional_events);
+    store.append(AppendCommand {
+        idempotency_scope: scope,
+        idempotency_key: append.idempotency_key,
+        request_digest: CanonicalRequestDigest::new(sha256(&request)),
+        claim: None,
+        driver_claim: append.claim,
+        allow_quiescent_driver_claim: false,
+        expected_versions: additional_versions,
+        events,
+        response: b"loop-record-v1".to_vec(),
+    })
 }
 
 pub fn effect_records(

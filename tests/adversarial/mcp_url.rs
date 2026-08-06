@@ -30,7 +30,7 @@ fn limits() -> McpEgressLimits {
         max_location_bytes: 1024,
         max_headers: 32,
         max_header_bytes: 4096,
-        request_timeout: Duration::from_secs(1),
+        request_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
     }
 }

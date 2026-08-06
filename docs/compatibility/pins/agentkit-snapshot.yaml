@@ -7,7 +7,7 @@ source:
   tracked_file_count: 356
 dirty_overlay:
   format: "git diff HEAD --binary --no-ext-diff"
-  sha256: "92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1"
+  sha256: "0a529f0fa475e872540779e003aff0c546f944985700b1a0bcaabb4a7519bd5d"
   tracked_modification_count: 23
   tracked_files:
     - "Cargo.lock"
@@ -254,6 +254,28 @@ maintenance:
     files:
       - "crates/agentkit-mcp/src/lib.rs"
     contract: "the host advertises only the configured form and URL elicitation capability modes"
+  tool_operation_sequence:
+    patch_id: "m006-tool-operation-sequence"
+    work_package: "M006-W09"
+    classification: "local_only"
+    previous_snapshot_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
+    patched_snapshot_sha256: "74dd252cbbab95fddf276e3261d39825ef2114fa2476069db151903390e3208b"
+    files:
+      - path: "crates/agentkit-loop/src/lib.rs"
+        previous_sha256: "cc051f7975345e823130c0d772c95d7040b5219ab31e84448c0292de9103186c"
+        patched_sha256: "eaabc361e938eedd2ea242c44a6dd3669b6c28abdf1fe7f97306eae948b5a91a"
+    contract: "provider tool calls carry a zero-based turn-monotonic kit.operation_sequence across continuations and persist it in replayable transcript metadata"
+  restart_operation_sequence:
+    patch_id: "m006-restart-operation-sequence"
+    work_package: "M006-W09"
+    classification: "local_only"
+    previous_snapshot_sha256: "74dd252cbbab95fddf276e3261d39825ef2114fa2476069db151903390e3208b"
+    patched_snapshot_sha256: "776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49"
+    files:
+      - path: "crates/agentkit-loop/src/lib.rs"
+        previous_sha256: "eaabc361e938eedd2ea242c44a6dd3669b6c28abdf1fe7f97306eae948b5a91a"
+        patched_sha256: "963756a667b6111d2953cb5eac1ec005e05c1f780fe49c3f90837acfd3874e08"
+    contract: "restored conversations derive the next/current turn index and operation sequence from transcript metadata while new conversations start at turn one"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -269,7 +291,7 @@ final_snapshot:
   manifest: "vendor/agentkit/SNAPSHOT-MANIFEST.sha256"
   generated_target_roots_excluded:
     - "target"
-  aggregate_sha256: "5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4"
+  aggregate_sha256: "776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   symlink_hashing: "SHA-256 of link target bytes"
   license_preserved: "LICENSE"
@@ -843,7 +865,7 @@ files:
     sha256: "7f3f839ee6d60d1806532d176b7c62c3198603d3da784cc4a105b8b5e322ce9d"
   - path: "crates/agentkit-loop/src/lib.rs"
     mode: "100644"
-    sha256: "cc051f7975345e823130c0d772c95d7040b5219ab31e84448c0292de9103186c"
+    sha256: "963756a667b6111d2953cb5eac1ec005e05c1f780fe49c3f90837acfd3874e08"
   - path: "crates/agentkit-mcp/Cargo.toml"
     mode: "100644"
     sha256: "f261f25abd55cdaeba3c77962ff3f962b1cc98caa0d54c1c407ef344a012ec4f"

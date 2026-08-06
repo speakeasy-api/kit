@@ -188,6 +188,7 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
                     outcome_event_id: EventId::generate().unwrap(),
                     occurred_at: &occurred_at,
                     trace_id: &trace_id,
+                    learning: None,
                 },
                 &normalized_schema,
             );

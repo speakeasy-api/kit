@@ -4,13 +4,17 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use kit::domain::{
     ids::{AttemptId, DaemonServiceId, PrincipalId, ProcessId, ProjectId, RunId},
     lifecycle::{AttemptOwnership, FencingToken, ProcessClaim, ProcessOwnership},
 };
+use kit::evaluation::{ProductionEvaluationService, ProductionStatisticalTrialRequest};
 #[cfg(not(target_os = "linux"))]
 use kit::executor::backends::container::limits::NotAvailableReason;
 use kit::executor::process::own::{
@@ -23,7 +27,8 @@ use kit::executor::trial::{
     TrialUsageReceipt, TrustedInput, TrustedInputSource, orchestrate_conformance,
 };
 use kit::runtime::scheduler::{
-    AdmissionKind, DurableScheduler, ReservationRequest, limits::Spend, reserve::ReservationId,
+    AdmissionKind, DurableScheduler, ReservationRequest, TrialRunBinding, limits::Spend,
+    reserve::ReservationId,
 };
 use kit::store::sqlite::trial_usage::SqliteTrialUsageReceiptStore;
 use kit::workspace::acquire::{
@@ -31,8 +36,7 @@ use kit::workspace::acquire::{
     acquire,
 };
 
-#[path = "../../eval/harness/core/mod.rs"]
-mod harness_core;
+use kit::evaluation::harness as harness_core;
 
 fn manifest() -> ImmutableTrialManifest {
     ImmutableTrialManifest::from_phase0_bytes(include_bytes!(
@@ -401,6 +405,135 @@ fn production_request_with_hidden<'a>(
         expected_sha256: hidden_tests_digest,
     };
     request
+}
+
+fn seed_evaluation_evidence(
+    database: &Path,
+    run_id: RunId,
+    owner: AttemptOwnership,
+    registered: &kit::evaluation::reports::RegisteredPreregistration,
+) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE provider_stream_watermark (
+                 singleton INTEGER PRIMARY KEY, position INTEGER NOT NULL);
+             INSERT INTO provider_stream_watermark VALUES (1, 1);
+             CREATE TABLE provider_streams (
+                 attempt_id TEXT NOT NULL, model_call_id TEXT NOT NULL, fence INTEGER NOT NULL,
+                 idempotency_key TEXT NOT NULL, committed_sequence INTEGER NOT NULL,
+                 outcome_position INTEGER, outcome BLOB, outcome_artifacts BLOB,
+                 PRIMARY KEY (attempt_id, model_call_id, fence, idempotency_key));",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO provider_streams VALUES (?1, ?2, 1, 'provider-effect', 0, 1, X'7b7d', X'5b5d')",
+            rusqlite::params![owner.attempt_id.to_string(), "model_call_00000000000000000000000001"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO stream_heads (stream, version) VALUES (?1, 7)",
+            [run_id.to_string()],
+        )
+        .unwrap();
+    let common = serde_json::json!({
+        "schema_version": 1,
+        "attempt_id": owner.attempt_id,
+        "attempt_fence": 1,
+        "model_call_id": "model_call_00000000000000000000000001",
+        "reservation_id": "00000000000000000000000000000001",
+    });
+    let mut intent = common.clone();
+    intent["provider"] = "external-production-provider".into();
+    intent["model"] = "external-production-model".into();
+    intent["model_snapshot_digest"] = registered.preregistration.roster[0]
+        .model_digest
+        .clone()
+        .into();
+    intent["config_snapshot_digest"] = registered.preregistration.roster[0]
+        .config_digest
+        .clone()
+        .into();
+    let mut outcome = common.clone();
+    outcome["status"] = "succeeded".into();
+    outcome["charged"] = true.into();
+    outcome["provider_request_id"] = "external-production-response".into();
+    outcome["usage"] = serde_json::json!({
+        "tokens": {
+            "input_tokens": 4,
+            "output_tokens": 2,
+            "reasoning_tokens": 3,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0
+        },
+        "cost": {"currency": "USD", "provider_amount": "0.000006"}
+    });
+    let tool = |kind: &str| {
+        serde_json::json!({
+            "schema_version": 1,
+            "attempt_id": owner.attempt_id,
+            "attempt_fence": 1,
+            "invocation_id": "invocation_00000000000000000000000001",
+            "kind": kind,
+        })
+    };
+    let events = [
+        (2, "run.start", serde_json::json!({"schema_version": 1})),
+        (3, "model_call.intent", intent),
+        (4, "model_call.dispatched", common),
+        (5, "model_call.outcome", outcome),
+        (6, "capability.invocation_intent", tool("intent")),
+        (7, "capability.invocation_dispatched", tool("dispatched")),
+        (8, "capability.invocation_outcome", tool("outcome")),
+    ];
+    for (sequence, kind, payload) in events {
+        connection
+            .execute(
+                "INSERT INTO events (event_id, stream, sequence, commit_position, event_type,
+                 schema_version, occurred_at, causation_id, correlation_id, attempt_id,
+                 trace_id, payload, artifacts)
+                 VALUES (?1, ?2, ?3, ?3, ?4, 1, '2026-01-01T00:00:00Z', ?1, ?7, ?5,
+                 'evaluation-trace', ?6, X'5b5d')",
+                rusqlite::params![
+                    format!("evaluation-event-{sequence}"),
+                    run_id.to_string(),
+                    sequence,
+                    kind,
+                    (sequence != 2).then(|| owner.attempt_id.to_string()),
+                    serde_json::to_vec(&payload).unwrap(),
+                    if sequence == 2 {
+                        run_id.to_string()
+                    } else {
+                        "seeded-before-dispatch".to_owned()
+                    }
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE commit_watermark SET position = 8 WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+}
+
+fn append_evaluation_execution_events(database: &Path, run_id: RunId) -> rusqlite::Result<()> {
+    let connection = rusqlite::Connection::open(database)?;
+    connection.execute(
+        "INSERT INTO events SELECT 'execution-event-' || (commit_position + 8), stream,
+         sequence + 8, commit_position + 8, event_type, schema_version, occurred_at,
+         'execution-event-' || (commit_position + 8), stream, attempt_id, trace_id,
+         payload, artifacts FROM events WHERE stream = ?1 AND commit_position BETWEEN 2 AND 8",
+        [run_id.to_string()],
+    )?;
+    connection.execute(
+        "UPDATE commit_watermark SET position = 16 WHERE singleton = 1",
+        [],
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -976,4 +1109,107 @@ fn production_core_harness_calibrates_and_reproduces_through_trusted_helper() {
         .unwrap();
     assert_eq!(first.bytes, second.bytes);
     assert_eq!(first.digest, second.digest);
+
+    let pins = kit::evaluation::ProductionEvaluationPins {
+        harness: harness.harness_config_digest().to_owned(),
+        grader_manifest: harness.grader_manifest_digest().to_owned(),
+        helper: first.report.agent.helper_identity.clone(),
+        runtime: first.report.agent.runtime_identity.clone(),
+        agent_image: harness.agent_image_digest().to_owned(),
+        grader_image: harness.grader_image_digest().to_owned(),
+    };
+    let mut plan = kit::evaluation::reports::Preregistration::from_json(include_bytes!(
+        "../../eval/preregistration/templates/core-paired-v1.json"
+    ))
+    .unwrap();
+    let roster = &mut plan.roster[0];
+    roster.trial_id = first.report.trial_id.clone();
+    roster.task_manifest_digest = first.report.task_manifest_digest.clone();
+    roster.model_digest = first.report.model_digest.clone();
+    roster.model_settings_digest = first.report.model_settings_digest.clone();
+    roster.config_digest = first.report.config_digest.clone();
+    roster.provider_capability_digest = first.report.provider_capability_digest.clone();
+    plan.digests.harness = pins.harness.clone();
+    plan.execution_environment =
+        kit::evaluation::reports::ProductionExecutionEnvironment::new(pins.clone()).unwrap();
+    let (experiment, task_set, dataset) = plan.derived_design_digests().unwrap();
+    plan.digests.experiment = experiment;
+    plan.digests.task_set = task_set;
+    plan.digests.dataset = dataset;
+
+    let state_root = fixture.root.join("production-evaluation-service");
+    fs::create_dir(&state_root).unwrap();
+    let database = state_root.join("state.sqlite3");
+    drop(kit::test_support::open_service_store(&database).unwrap());
+    let anchor = kit::evaluation::reports::ConformanceLedgerAnchor::source_semantics_fake();
+    let mut service =
+        ProductionEvaluationService::open_with_pins(&state_root, anchor, pins).unwrap();
+    let registered = service.register(plan).unwrap();
+    let admission = service.admit_next(&registered).unwrap();
+    let run_id = RunId::generate().unwrap();
+    let principal = PrincipalId::generate().unwrap();
+    let owner = AttemptOwnership::new(
+        AttemptId::generate().unwrap(),
+        principal,
+        FencingToken::new(1),
+    );
+    DurableScheduler::open(&database)
+        .unwrap()
+        .register_statistical_trial_run(
+            run_id,
+            principal,
+            "external-production-evaluation",
+            &registered.preregistration.roster[0].config_digest,
+        )
+        .unwrap();
+    let binding = TrialRunBinding {
+        trial_id: registered.preregistration.roster[0].trial_id.clone(),
+        trial_digest: registered.preregistration_digest.clone(),
+        task_digest: registered.preregistration.roster[0]
+            .task_manifest_digest
+            .clone(),
+        model_digest: registered.preregistration.roster[0].model_digest.clone(),
+        config_digest: registered.preregistration.roster[0].config_digest.clone(),
+        attempt: owner,
+        admission: Some(admission.scheduler_token().unwrap()),
+    };
+    seed_evaluation_evidence(&database, run_id, owner, &registered);
+    let calls = AtomicUsize::new(0);
+    let production_command = |patch: &[u8]| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 5 {
+            append_evaluation_execution_events(&database, run_id)
+                .map_err(|error| harness_core::CoreTrialError::Executor(error.to_string()))?;
+        }
+        command(patch)
+    };
+    let template_command = [OsString::from("/bin/true")];
+    let template = production_request(&fixture, &manifest, &template_command);
+    let mut production_executor = harness_core::ProductionCoreTrialExecutor {
+        workspace: &fixture.workspace,
+        record_root: &evidence_root,
+        owner: template.owner,
+        process_registry: template.process_registry,
+        cancellation: None,
+        agent_command: &production_command,
+        usage_receipt: fixture.usage_receipt.as_ref().unwrap(),
+        usage_receipts: &fixture.usage_receipts,
+    };
+    let receipt = service
+        .run(
+            &harness,
+            &mut production_executor,
+            ProductionStatisticalTrialRequest {
+                run_id,
+                binding: &binding,
+                registered: &registered,
+                admission: &admission,
+                patch: &gold_patch,
+            },
+        )
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(
+        receipt.receipt().outcome,
+        kit::evaluation::reports::TrialOutcome::Success
+    );
 }

@@ -1,7 +1,7 @@
 mod agent_run_tests {
     use std::{
-        collections::{BTreeMap, BTreeSet},
-        fs,
+        collections::{BTreeMap, BTreeSet, VecDeque},
+        fs, io,
         path::PathBuf,
         sync::{
             Arc,
@@ -75,6 +75,118 @@ mod agent_run_tests {
         calls: AtomicUsize,
     }
 
+    struct MemoryMcpProcess {
+        responses: tokio::sync::Mutex<VecDeque<Vec<u8>>>,
+        ready: tokio::sync::Notify,
+        closed: AtomicBool,
+        methods: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MemoryMcpProcess {
+        fn new() -> Self {
+            Self {
+                responses: tokio::sync::Mutex::new(VecDeque::new()),
+                ready: tokio::sync::Notify::new(),
+                closed: AtomicBool::new(false),
+                methods: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.methods.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl kit::protocols::mcp::transport::OwnedStdioProcess for MemoryMcpProcess {
+        async fn send_frame(&self, frame: &[u8]) -> io::Result<()> {
+            let request: serde_json::Value =
+                serde_json::from_slice(frame).map_err(io::Error::other)?;
+            let Some(method) = request.get("method").and_then(serde_json::Value::as_str) else {
+                return Ok(());
+            };
+            self.methods.lock().unwrap().push(method.to_owned());
+            let Some(id) = request.get("id").cloned() else {
+                return Ok(());
+            };
+            let result = match method {
+                "initialize" => serde_json::json!({
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{"tools":{}},
+                    "serverInfo":{"name":"learning-fixture","version":"1"}
+                }),
+                "tools/list" => serde_json::json!({"tools":[mcp_tool_descriptor()]}),
+                "resources/list" => serde_json::json!({"resources":[]}),
+                "resources/templates/list" => serde_json::json!({"resourceTemplates":[]}),
+                "prompts/list" => serde_json::json!({"prompts":[]}),
+                "tools/call" => serde_json::json!({
+                    "content":[{"type":"text","text":"fixture result"}],
+                    "isError":false
+                }),
+                _ => serde_json::json!({}),
+            };
+            self.responses.lock().await.push_back(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":id, "result":result
+                }))
+                .map_err(io::Error::other)?,
+            );
+            self.ready.notify_waiters();
+            Ok(())
+        }
+
+        async fn receive_frame(&self) -> io::Result<Option<Vec<u8>>> {
+            loop {
+                let notified = self.ready.notified();
+                if let Some(response) = self.responses.lock().await.pop_front() {
+                    return Ok(Some(response));
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                notified.await;
+            }
+        }
+
+        async fn close_and_reap(&self) -> io::Result<()> {
+            self.closed.store(true, Ordering::Release);
+            self.ready.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct MemoryMcpProfiles(Arc<MemoryMcpProcess>);
+
+    impl kit::protocols::mcp::transport::OwnedStdioProfileProvider for MemoryMcpProfiles {
+        fn prepare(
+            &self,
+            _profile: &str,
+            _owner: AttemptOwnership,
+            _authorized_credentials: &Arc<
+                BTreeMap<kit::domain::secret::SecretHandle, Arc<SecretLease>>,
+            >,
+        ) -> Result<
+            kit::protocols::mcp::transport::SandboxedStdioLauncher,
+            kit::protocols::mcp::transport::OwnedStdioProfileError,
+        > {
+            Ok(kit::protocols::mcp::transport::SandboxedStdioLauncher::for_test(self.0.clone()))
+        }
+    }
+
+    fn mcp_tool_descriptor() -> serde_json::Value {
+        serde_json::json!({
+            "name":"fixture_echo",
+            "description":"Echo fixture text.",
+            "inputSchema":{
+                "$schema":"https://json-schema.org/draft/2020-12/schema",
+                "additionalProperties":false,
+                "properties":{"text":{"type":"string"}},
+                "required":["text"],
+                "type":"object"
+            }
+        })
+    }
+
     impl TestCancellationCoordinator {
         fn new(outcome: ExecutorCancellationOutcome, released: bool) -> Self {
             Self {
@@ -106,6 +218,17 @@ mod agent_run_tests {
         }
 
         fn new_for_provider(provider: ConfigProvider) -> Self {
+            Self::new_for_provider_with_grants(provider, &[])
+        }
+
+        fn new_with_verification() -> Self {
+            Self::new_for_provider_with_grants(
+                ConfigProvider::OpenAi,
+                &[Grant::VerificationTargeted],
+            )
+        }
+
+        fn new_for_provider_with_grants(provider: ConfigProvider, extra_grants: &[Grant]) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "kit-agent-run-{}-{}",
                 std::process::id(),
@@ -132,7 +255,10 @@ mod agent_run_tests {
                 Grant::WorkspaceWrite,
                 Grant::ProcessSpawn,
                 Grant::NetworkEgress,
-            ];
+            ]
+            .into_iter()
+            .chain(extra_grants.iter().copied())
+            .collect::<Vec<_>>();
             let principal = LocalPeerAuthenticator::new(BTreeMap::from([(
                 1000,
                 GrantSnapshot::new(principal_id, project_id, grants),
@@ -1267,22 +1393,532 @@ mod agent_run_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tool_roundtrip_uses_kernel_and_commits_after_tool_boundary() {
+    async fn production_mcp_deferred_learning_path_records_search_inspect_bind_call_error_outcome()
+    {
         let fixture = Fixture::new();
+        let process = Arc::new(MemoryMcpProcess::new());
+        let identity =
+            kit::protocols::mcp::features::ConfiguredServerIdentity::new("learning-fixture")
+                .unwrap();
+        let descriptor_digest = kit::protocols::mcp::features::decode_tools_page(
+            &identity,
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc":"2.0", "id":1, "result":{"tools":[mcp_tool_descriptor()]}
+            }))
+            .unwrap(),
+            kit::protocols::mcp::features::PayloadLimits::default(),
+        )
+        .unwrap()
+        .items()[0]
+            .normalize()
+            .unwrap()
+            .descriptor_digest();
+        let platform = if cfg!(target_os = "windows") {
+            kit::executor::profile::Platform::Windows
+        } else if cfg!(target_os = "macos") {
+            kit::executor::profile::Platform::MacOs
+        } else {
+            kit::executor::profile::Platform::Linux
+        };
+        let architecture = if cfg!(target_arch = "aarch64") {
+            kit::executor::profile::Architecture::Aarch64
+        } else {
+            kit::executor::profile::Architecture::X86_64
+        };
+        let profile = kit::executor::profile::ProfileSpec::isolated(
+            kit::executor::profile::TrustTier::TrustedLocal,
+            platform,
+            architecture,
+            kit::executor::profile::ResourceLimits::new(
+                10_000,
+                256 * 1024 * 1024,
+                16,
+                16 * 1024 * 1024,
+                64 * 1024 * 1024,
+                64 * 1024 * 1024,
+                16 * 1024 * 1024,
+                30_000,
+            ),
+        );
+        let profile_digest = kit::executor::profile::ExecutorProfile::new(profile.clone())
+            .unwrap()
+            .digest()
+            .to_string();
+        let server = kit::protocols::mcp::config::McpServerConfig {
+            id: "learning-fixture".to_owned(),
+            transport: kit::protocols::mcp::config::McpTransportConfig::Stdio {
+                owned_process_profile: "memory".to_owned(),
+                argv: vec!["/memory".to_owned()],
+                profile: Box::new(profile),
+                profile_digest,
+                environment: BTreeMap::new(),
+            },
+            owner: kit::protocols::mcp::config::McpOwnerConfig {
+                principal_id: fixture.principal_id,
+                project_id: fixture.project_id,
+                workspace_id: None,
+            },
+            source: "mcp.learning-fixture".to_owned(),
+            trust_domain: "local".to_owned(),
+            namespace: "fixture".to_owned(),
+            version: "1".to_owned(),
+            credential_handle: None,
+            credential_scope: None,
+            egress: None,
+            descriptors: vec![kit::protocols::mcp::config::McpDescriptorPolicyConfig {
+                kind: kit::capabilities::catalog::CapabilityKind::Tool,
+                remote: "fixture_echo".to_owned(),
+                descriptor_digest,
+                effect: kit::capabilities::kernel::grant::EffectClass::ProcessSpawn,
+                retry_safety: kit::capabilities::kernel::invoke::RetrySafety::Idempotent,
+                required_grants: BTreeSet::from([Grant::ProcessSpawn]),
+                auth_scopes: BTreeSet::new(),
+                availability: kit::capabilities::catalog::Availability::Available,
+            }],
+            responders: Default::default(),
+        };
         let provider = Arc::new(FakeProvider::with_scenario(
             FakeResponse::completed("tool complete"),
-            FakeScenario::Tool,
+            FakeScenario::DeferredMcp,
         ));
-        let executor = RunExecutor::start(fixture.config(Arc::clone(&provider))).unwrap();
+        let executor = RunExecutor::start(
+            fixture
+                .config(Arc::clone(&provider))
+                .with_tool_learning_key([41; 32])
+                .with_mcp_servers([server])
+                .with_mcp_stdio_profiles(Arc::new(MemoryMcpProfiles(Arc::clone(&process)))),
+        )
+        .unwrap();
         fixture.wait_for(RunState::Completed).await;
         executor.shutdown().await.unwrap();
 
         let persisted = fixture.event_json();
-        assert!(persisted.contains("kit_discover"));
+        assert!(persisted.contains("tools_search"));
+        assert!(persisted.contains("tools_inspect"));
+        assert!(persisted.contains("tools_bind"));
+        assert!(persisted.contains("tools_invoke"));
         assert!(persisted.contains("capability.invocation_intent"));
         assert!(persisted.contains("capability.invocation_outcome"));
         assert!(persisted.contains("after_tool_outcome"));
-        assert_eq!(provider.dispatch_count(), 2);
+        assert_eq!(provider.dispatch_count(), 6);
+        let store = test_support::open_sqlite_store(&fixture.database).unwrap();
+        let learning = kit::telemetry::tool_learning::records(
+            &store,
+            fixture.run_id,
+            &kit::telemetry::tool_learning::ProjectPointerHasher::new(
+                fixture.project_id,
+                &[41; 32],
+            ),
+        )
+        .unwrap();
+        let opportunities = learning
+            .iter()
+            .filter_map(|event| match event {
+                kit::telemetry::tool_learning::ToolLearningEvent::Opportunity {
+                    common,
+                    offered,
+                    candidates,
+                    ..
+                } => Some((common, *offered, candidates)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(opportunities.iter().all(|(_, offered, candidates)| {
+            *offered <= kit::telemetry::tool_learning::MAX_LEARNING_CANDIDATES
+                && candidates.len() == usize::from(*offered)
+                && candidates
+                    .iter()
+                    .all(|candidate| candidate.authorized && candidate.offered)
+        }));
+        assert!(opportunities.iter().any(|(_, _, candidates)| {
+            candidates.iter().any(|candidate| {
+                candidate.surface == kit::telemetry::tool_learning::LearningSurface::Eager
+            })
+        }));
+        assert!(opportunities.iter().any(|(_, _, candidates)| {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.surface == kit::telemetry::tool_learning::LearningSurface::Generic
+                })
+                .count()
+                == 4
+        }));
+        let learning_hasher =
+            kit::telemetry::tool_learning::ProjectPointerHasher::new(fixture.project_id, &[41; 32]);
+        let generic_capabilities = opportunities
+            .iter()
+            .flat_map(|(_, _, candidates)| candidates.iter())
+            .filter(|candidate| {
+                candidate.surface == kit::telemetry::tool_learning::LearningSurface::Generic
+            })
+            .map(|candidate| candidate.capability.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            generic_capabilities,
+            [
+                "tools.search",
+                "tools.inspect",
+                "tools.bind",
+                "tools.invoke",
+            ]
+            .map(|operation| {
+                learning_hasher.pointer(
+                    kit::telemetry::tool_learning::PointerDomain::Capability,
+                    operation.as_bytes(),
+                )
+            })
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            learning
+                .iter()
+                .map(kit::telemetry::tool_learning::ToolLearningEvent::class_name)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "opportunity",
+                "search",
+                "inspection",
+                "call",
+                "error",
+                "outcome",
+            ])
+        );
+        assert!(learning.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Search {
+                status: kit::telemetry::tool_learning::LearningStatus::Succeeded,
+                result_count: 1,
+                ..
+            }
+        )));
+        assert!(learning.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Inspection {
+                common,
+                status: kit::telemetry::tool_learning::LearningStatus::Succeeded,
+                ..
+            } if common.operation == kit::telemetry::tool_learning::LearningOperation::Inspect
+        )));
+        assert!(learning.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Inspection {
+                common,
+                status: kit::telemetry::tool_learning::LearningStatus::Succeeded,
+                ..
+            } if common.operation == kit::telemetry::tool_learning::LearningOperation::Bind
+        )));
+        assert!(learning.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Call {
+                common,
+                binding: Some(_),
+                source: Some(_),
+                kind: Some(_),
+                sequence: Some(_),
+                kernel_intent: Some(_),
+                ..
+            } if common.capability.is_some() && common.schema.is_some() && common.request.is_some()
+        )));
+        assert!(learning.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Error {
+                stage: kit::telemetry::tool_learning::ErrorStage::SchemaValidation,
+                code: kit::telemetry::tool_learning::ErrorCode::InvalidSchema,
+                dispatched: false,
+                known: true,
+                ..
+            }
+        )));
+        assert!(learning.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Outcome {
+                status: kit::telemetry::tool_learning::LearningStatus::Succeeded,
+                dispatched: true,
+                known: true,
+                ..
+            }
+        )));
+        let run =
+            kit::telemetry::tool_learning::ProjectPointerHasher::new(fixture.project_id, &[41; 32])
+                .pointer(
+                    kit::telemetry::tool_learning::PointerDomain::Run,
+                    fixture.run_id.to_string().as_bytes(),
+                );
+        assert_eq!(store.catalog_stats(run.as_str()).unwrap()[0].succeeded, 1);
+        assert_eq!(
+            process
+                .methods()
+                .iter()
+                .filter(|method| method.as_str() == "tools/call")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_learning_failure_preserves_completed_provider_result_and_blocks_admission() {
+        struct OrdinaryOnly;
+
+        impl kit::telemetry::otel::Exporter for OrdinaryOnly {
+            fn export(
+                &mut self,
+                _: &kit::telemetry::otel::ExportBatch,
+            ) -> Result<(), kit::telemetry::otel::ExportError> {
+                Ok(())
+            }
+        }
+
+        let fixture = Fixture::new();
+        let provider = Arc::new(FakeProvider::with_scenario(
+            FakeResponse::completed("provider result survives learning failure"),
+            FakeScenario::Tool,
+        ));
+        let telemetry = Arc::new(
+            kit::telemetry::otel::TelemetryRuntime::encrypted_local(
+                kit::telemetry::otel::Resource::default(),
+                &[],
+                32,
+                kit::telemetry::otel::DropPolicy::DropNewest,
+                OrdinaryOnly,
+                kit::telemetry::otel::TelemetryReadinessPolicy::Required,
+            )
+            .unwrap(),
+        );
+        let mut config = fixture
+            .config(Arc::clone(&provider))
+            .with_tool_learning_key([43; 32]);
+        config.telemetry = Some(Arc::clone(&telemetry));
+        let executor = RunExecutor::start(config).unwrap();
+        fixture.wait_for(RunState::Completed).await;
+        executor.shutdown().await.unwrap();
+
+        let QueryProjection::Run(run) = fixture
+            .store
+            .lock()
+            .unwrap()
+            .query(&Query::GetRun {
+                run_id: fixture.run_id,
+            })
+            .unwrap()
+        else {
+            panic!("unexpected projection")
+        };
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(
+            run.output.unwrap().preview,
+            "provider result survives learning failure"
+        );
+        assert!(!telemetry.health().learning_healthy);
+        assert!(!telemetry.learning_admission_ready());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn best_effort_learning_failure_preserves_completed_provider_result_and_admission() {
+        struct OrdinaryOnly;
+
+        impl kit::telemetry::otel::Exporter for OrdinaryOnly {
+            fn export(
+                &mut self,
+                _: &kit::telemetry::otel::ExportBatch,
+            ) -> Result<(), kit::telemetry::otel::ExportError> {
+                Ok(())
+            }
+        }
+
+        let fixture = Fixture::new();
+        let provider = Arc::new(FakeProvider::with_scenario(
+            FakeResponse::completed("provider result survives best-effort learning failure"),
+            FakeScenario::Tool,
+        ));
+        let telemetry = Arc::new(
+            kit::telemetry::otel::TelemetryRuntime::encrypted_local(
+                kit::telemetry::otel::Resource::default(),
+                &[],
+                32,
+                kit::telemetry::otel::DropPolicy::DropNewest,
+                OrdinaryOnly,
+                kit::telemetry::otel::TelemetryReadinessPolicy::BestEffort,
+            )
+            .unwrap(),
+        );
+        let mut config = fixture
+            .config(Arc::clone(&provider))
+            .with_tool_learning_key([44; 32]);
+        config.telemetry = Some(Arc::clone(&telemetry));
+        let executor = RunExecutor::start(config).unwrap();
+        fixture.wait_for(RunState::Completed).await;
+        executor.shutdown().await.unwrap();
+
+        let QueryProjection::Run(run) = fixture
+            .store
+            .lock()
+            .unwrap()
+            .query(&Query::GetRun {
+                run_id: fixture.run_id,
+            })
+            .unwrap()
+        else {
+            panic!("unexpected projection")
+        };
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(
+            run.output.unwrap().preview,
+            "provider result survives best-effort learning failure"
+        );
+        assert!(!telemetry.health().learning_healthy);
+        assert!(telemetry.learning_admission_ready());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_native_schema_failure_commits_learning_triple_before_dispatch() {
+        let fixture = Fixture::new();
+        let provider = Arc::new(FakeProvider::with_scenario(
+            FakeResponse::completed("invalid tool handled"),
+            FakeScenario::ToolInvalid,
+        ));
+        let executor = RunExecutor::start(
+            fixture
+                .config(Arc::clone(&provider))
+                .with_tool_learning_key([42; 32]),
+        )
+        .unwrap();
+        fixture.wait_for(RunState::Completed).await;
+        executor.shutdown().await.unwrap();
+
+        let store = test_support::open_sqlite_store(&fixture.database).unwrap();
+        let records = kit::telemetry::tool_learning::records(
+            &store,
+            fixture.run_id,
+            &kit::telemetry::tool_learning::ProjectPointerHasher::new(
+                fixture.project_id,
+                &[42; 32],
+            ),
+        )
+        .unwrap();
+        let call = records.iter().find_map(|event| match event {
+            kit::telemetry::tool_learning::ToolLearningEvent::Call { call, .. } => {
+                Some(call.clone())
+            }
+            _ => None,
+        });
+        assert!(call.is_some());
+        let hasher =
+            kit::telemetry::tool_learning::ProjectPointerHasher::new(fixture.project_id, &[42; 32]);
+        assert!(records.iter().any(|event| match event {
+            kit::telemetry::tool_learning::ToolLearningEvent::Error {
+                common,
+                call: found,
+                stage: kit::telemetry::tool_learning::ErrorStage::SchemaValidation,
+                code: kit::telemetry::tool_learning::ErrorCode::InvalidSchema,
+                field: Some(field),
+                dispatched: false,
+                known: true,
+                ..
+            } =>
+                Some(found) == call.as_ref()
+                    && common.schema.as_ref().is_some_and(|schema| {
+                        field
+                            == &hasher.pointer(
+                                kit::telemetry::tool_learning::PointerDomain::Field,
+                                format!("{}:", schema.as_str()).as_bytes(),
+                            )
+                    }),
+            _ => false,
+        }));
+        assert!(records.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Outcome {
+                call: found,
+                dispatched: false,
+                known: true,
+                kernel_outcome: None,
+                ..
+            } if Some(found) == call.as_ref()
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_check_reservation_commits_learning_triple_without_effect_dispatch() {
+        let fixture = Fixture::new_with_verification();
+        let provider = Arc::new(FakeProvider::with_scenario(
+            FakeResponse::completed("invalid check handled"),
+            FakeScenario::ToolInvalidCheck,
+        ));
+        let executor = RunExecutor::start(
+            fixture
+                .config(Arc::clone(&provider))
+                .with_tool_learning_key([45; 32]),
+        )
+        .unwrap();
+        fixture.wait_for(RunState::Completed).await;
+        executor.shutdown().await.unwrap();
+
+        let store = test_support::open_sqlite_store(&fixture.database).unwrap();
+        let records = kit::telemetry::tool_learning::records(
+            &store,
+            fixture.run_id,
+            &kit::telemetry::tool_learning::ProjectPointerHasher::new(
+                fixture.project_id,
+                &[45; 32],
+            ),
+        )
+        .unwrap();
+        let call = records.iter().find_map(|event| match event {
+            kit::telemetry::tool_learning::ToolLearningEvent::Call { common, call, .. }
+                if common.capability.is_some() && common.schema.is_some() =>
+            {
+                Some(call)
+            }
+            _ => None,
+        });
+        assert!(call.is_some());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|event| match event {
+                    kit::telemetry::tool_learning::ToolLearningEvent::Call {
+                        call: found, ..
+                    }
+                    | kit::telemetry::tool_learning::ToolLearningEvent::Error {
+                        call: found, ..
+                    }
+                    | kit::telemetry::tool_learning::ToolLearningEvent::Outcome {
+                        call: found,
+                        ..
+                    } => Some(found) == call,
+                    _ => false,
+                })
+                .count(),
+            3
+        );
+        assert!(records.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Error {
+                call: found,
+                stage: kit::telemetry::tool_learning::ErrorStage::SchemaValidation,
+                code: kit::telemetry::tool_learning::ErrorCode::InvalidSchema,
+                dispatched: false,
+                known: true,
+                ..
+            } if Some(found) == call
+        )));
+        assert!(records.iter().any(|event| matches!(
+            event,
+            kit::telemetry::tool_learning::ToolLearningEvent::Outcome {
+                call: found,
+                status: kit::telemetry::tool_learning::LearningStatus::Failed,
+                dispatched: false,
+                known: true,
+                ..
+            } if Some(found) == call
+        )));
+        assert!(
+            !fixture
+                .event_json()
+                .contains("capability.invocation_dispatched")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1392,7 +2028,12 @@ mod agent_run_tests {
             FakeResponse::completed("approved"),
             FakeScenario::Approval,
         ));
-        let executor = RunExecutor::start(fixture.config(Arc::clone(&provider))).unwrap();
+        let executor = RunExecutor::start(
+            fixture
+                .config(Arc::clone(&provider))
+                .with_tool_learning_key([44; 32]),
+        )
+        .unwrap();
         fixture.wait_for(RunState::WaitingForApproval).await;
         let QueryProjection::Approvals(approvals) = fixture
             .store
@@ -1420,6 +2061,25 @@ mod agent_run_tests {
         executor.shutdown().await.unwrap();
         assert_eq!(provider.dispatch_count(), 2);
         assert!(fixture.event_json().contains("approved"));
+        let learning = kit::telemetry::tool_learning::records(
+            &test_support::open_sqlite_store(&fixture.database).unwrap(),
+            fixture.run_id,
+            &kit::telemetry::tool_learning::ProjectPointerHasher::new(
+                fixture.project_id,
+                &[44; 32],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            learning
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    kit::telemetry::tool_learning::ToolLearningEvent::Outcome { .. }
+                ))
+                .count(),
+            1
+        );
 
         let fixture = Fixture::new();
         let provider = Arc::new(FakeProvider::with_scenario(
@@ -1458,7 +2118,12 @@ mod agent_run_tests {
             FakeResponse::completed("not used"),
             FakeScenario::Approval,
         ));
-        let executor = RunExecutor::start(fixture.config(Arc::clone(&provider))).unwrap();
+        let executor = RunExecutor::start(
+            fixture
+                .config(Arc::clone(&provider))
+                .with_tool_learning_key([43; 32]),
+        )
+        .unwrap();
         fixture.wait_for(RunState::WaitingForApproval).await;
         let QueryProjection::Approvals(approvals) = fixture
             .store
@@ -1484,5 +2149,25 @@ mod agent_run_tests {
         fixture.wait_for(RunState::Cancelled).await;
         executor.shutdown().await.unwrap();
         assert_eq!(provider.dispatch_count(), 1);
+        let store = test_support::open_sqlite_store(&fixture.database).unwrap();
+        let records = kit::telemetry::tool_learning::records(
+            &store,
+            fixture.run_id,
+            &kit::telemetry::tool_learning::ProjectPointerHasher::new(
+                fixture.project_id,
+                &[43; 32],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    kit::telemetry::tool_learning::ToolLearningEvent::Outcome { .. }
+                ))
+                .count(),
+            1
+        );
     }
 }

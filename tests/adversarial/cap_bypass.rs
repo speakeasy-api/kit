@@ -360,6 +360,7 @@ fn run(
             outcome_event_id: *outcome_event_id,
             occurred_at,
             trace_id,
+            learning: None,
         },
         normalized_schema,
     );

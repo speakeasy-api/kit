@@ -23,7 +23,7 @@ use crate::{
     domain::{config::Grant, secret::SecretHandle},
 };
 
-pub const CATALOG_FORMAT_VERSION: u16 = 4;
+pub const CATALOG_FORMAT_VERSION: u16 = 5;
 pub const MAX_CATALOG_ENTRIES: usize = 4096;
 pub const MAX_CATALOG_SOURCES: usize = 512;
 pub const MAX_SUMMARY_BYTES: usize = 1024;
@@ -340,7 +340,7 @@ pub enum Availability {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReliabilityStats {
     attempts: u64,
     succeeded: u64,
@@ -394,7 +394,7 @@ impl ReliabilityStats {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum LatencyStats {
     Unobserved,
     Measured {
@@ -422,7 +422,7 @@ impl LatencyStats {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CostStats {
     Unobserved,
     Measured {
@@ -810,13 +810,7 @@ impl CatalogEntry {
             None => output.push(0),
         }
         output.push(availability_tag(self.availability));
-        output.extend_from_slice(&self.reliability.attempts.to_be_bytes());
-        output.extend_from_slice(&self.reliability.succeeded.to_be_bytes());
-        output.extend_from_slice(&self.reliability.failed.to_be_bytes());
-        output.extend_from_slice(&self.reliability.cancelled.to_be_bytes());
-        output.extend_from_slice(&self.reliability.outcome_unknown.to_be_bytes());
-        write_latency(output, self.latency);
-        write_cost(output, &self.cost);
+        // Operational observations are held in CatalogStatsOverlay and never bind a schema.
     }
 }
 
@@ -1008,6 +1002,7 @@ pub enum CatalogError {
     SourceMismatch,
     SourceConflict,
     AuthorityMismatch,
+    UnknownIdentity,
     InvalidText(&'static str),
     TextTooLong(&'static str),
     LimitExceeded(CatalogLimit),
@@ -1036,6 +1031,7 @@ impl fmt::Display for CatalogError {
             Self::AuthorityMismatch => {
                 formatter.write_str("catalog authority does not grant its side effect")
             }
+            Self::UnknownIdentity => formatter.write_str("catalog overlay identity is unknown"),
             Self::InvalidText(field) => write!(
                 formatter,
                 "catalog {field} is empty or contains control characters"
@@ -1342,43 +1338,6 @@ fn write_text_set(output: &mut Vec<u8>, values: &BTreeSet<Arc<str>>) {
     output.extend_from_slice(&(values.len() as u64).to_be_bytes());
     for value in values {
         put_bytes(output, value.as_bytes());
-    }
-}
-
-fn write_latency(output: &mut Vec<u8>, latency: LatencyStats) {
-    match latency {
-        LatencyStats::Unobserved => output.push(0),
-        LatencyStats::Measured {
-            samples,
-            minimum_micros,
-            maximum_micros,
-            total_micros,
-        } => {
-            output.push(1);
-            output.extend_from_slice(&samples.to_be_bytes());
-            output.extend_from_slice(&minimum_micros.to_be_bytes());
-            output.extend_from_slice(&maximum_micros.to_be_bytes());
-            output.extend_from_slice(&total_micros.to_be_bytes());
-        }
-    }
-}
-
-fn write_cost(output: &mut Vec<u8>, cost: &CostStats) {
-    match cost {
-        CostStats::Unobserved => output.push(0),
-        CostStats::Measured {
-            samples,
-            minimum,
-            maximum,
-            total,
-        } => {
-            output.push(1);
-            output.extend_from_slice(&samples.to_be_bytes());
-            put_bytes(output, minimum.currency.as_bytes());
-            output.extend_from_slice(&minimum.micros.to_be_bytes());
-            output.extend_from_slice(&maximum.micros.to_be_bytes());
-            output.extend_from_slice(&total.micros.to_be_bytes());
-        }
     }
 }
 

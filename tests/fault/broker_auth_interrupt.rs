@@ -217,6 +217,7 @@ impl Inputs {
                 outcome_event_id: self.outcome_event_id,
                 occurred_at: &self.occurred_at,
                 trace_id: &self.trace_id,
+                learning: None,
             },
             &self.normalized_schema,
         )

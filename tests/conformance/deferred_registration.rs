@@ -599,7 +599,7 @@ mod deferred_registration_tests {
             registry,
             &fixture.session(),
             DirectInvokeCall::new(wire, br#"{"count":1,"value":""}"#.as_slice()).into(),
-            InvocationError::SchemaInvalid,
+            InvocationError::SchemaInvalid("/value".to_owned()),
         );
         let invalid_wrapper = format!(
             r#"{{"binding_id":"{id}","input":{{"count":1,"value":"","extra":true}}}}"#
@@ -609,7 +609,7 @@ mod deferred_registration_tests {
             registry,
             &fixture.session(),
             PortableInvokeCall::new(invalid_wrapper.as_bytes()).into(),
-            InvocationError::SchemaInvalid,
+            InvocationError::SchemaInvalid("/value".to_owned()),
         );
 
         let oversized = vec![b' '; MAX_INVOCATION_ARGUMENT_BYTES + 1];

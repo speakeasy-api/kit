@@ -267,6 +267,16 @@ impl SensitiveDataScanner {
         self.found
     }
 
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            patterns: self.patterns.clone(),
+            state: self.state,
+            decoded_states: self.decoded_states.clone(),
+            decoders: self.decoders.clone(),
+            found: self.found,
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         self.state = self
             .patterns
@@ -315,7 +325,7 @@ impl SensitiveDataScanner {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PercentDecoder {
     pending: [u8; 2],
     len: u8,
@@ -568,6 +578,7 @@ impl Drop for SanitizedCapture {
     }
 }
 
+#[derive(Clone)]
 struct SecretPatterns {
     values: Vec<Vec<u8>>,
     raw: Vec<Vec<u8>>,

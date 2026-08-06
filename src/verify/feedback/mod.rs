@@ -4288,7 +4288,7 @@ mod tests {
                 store.register_pending(
                     record,
                     &leases,
-                    Instant::now() + Duration::from_secs(1),
+                    Instant::now() + Duration::from_secs(5),
                     &mut FeedbackBudget::default(),
                 ),
                 Err(FeedbackError::SecretDetected)

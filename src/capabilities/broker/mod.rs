@@ -108,6 +108,7 @@ pub(crate) struct OwnedBrokerInvocation {
     occurred_at: crate::domain::events::UtcDateTime,
     trace_id: crate::domain::events::TraceId,
     auth: Option<BrokerAuthRequirement>,
+    learning: Option<crate::telemetry::tool_learning::PreparedLearningCapture>,
 }
 
 impl OwnedBrokerInvocation {
@@ -251,6 +252,7 @@ impl OwnedBrokerInvocation {
             trace_id: TraceId::parse("mcp-run-lifecycle")
                 .map_err(|_| BrokerError::InvalidAuthState)?,
             auth,
+            learning: None,
         })
     }
 
@@ -284,6 +286,7 @@ impl OwnedBrokerInvocation {
             occurred_at: envelope.occurred_at.clone(),
             trace_id: envelope.trace_id.clone(),
             auth: request.auth.clone(),
+            learning: envelope.learning.cloned(),
         }
     }
 
@@ -319,6 +322,7 @@ impl OwnedBrokerInvocation {
             occurred_at: self.occurred_at.clone(),
             trace_id: self.trace_id.clone(),
             auth: self.auth.clone(),
+            learning: self.learning.clone(),
         })
     }
 
@@ -360,6 +364,7 @@ impl OwnedBrokerInvocation {
                 outcome_event_id: self.outcome_event_id,
                 occurred_at: &self.occurred_at,
                 trace_id: &self.trace_id,
+                learning: self.learning.as_ref(),
             },
             validation_schema: &self.schema,
             binding: None,
@@ -904,8 +909,17 @@ pub fn invoke(
             .envelope
             .preflight_authority(runtime.store, false)
             .map_err(BrokerError::Invoke)?;
-        preflight(&request)?;
+        preflight_with_learning(&request, runtime.store)?;
         if request.envelope.reservation.tools() == 0 {
+            kernel_invoke::capture_rejected(
+                &request.envelope,
+                runtime.store,
+                learning_broker_failure(
+                    &BrokerError::ToolReservationRequired,
+                    request.envelope.retry_safety,
+                ),
+            )
+            .map_err(BrokerError::Invoke)?;
             return Err(BrokerError::ToolReservationRequired);
         }
         let kernel_runtime = InvocationRuntime::new(runtime.store, runtime.budget, runtime.backend);
@@ -943,7 +957,7 @@ pub(crate) fn prepare(
     budget: &BudgetLedger,
     crash_at: Option<InvocationCrashPoint>,
 ) -> Result<BrokerPrepareOutcome, BrokerError> {
-    prepare_inner(request, store, budget, crash_at, false)
+    prepare_with_learning(request, store, budget, crash_at, false)
 }
 
 pub(crate) fn prepare_resuming_transport(
@@ -952,7 +966,34 @@ pub(crate) fn prepare_resuming_transport(
     budget: &BudgetLedger,
     crash_at: Option<InvocationCrashPoint>,
 ) -> Result<BrokerPrepareOutcome, BrokerError> {
-    prepare_inner(request, store, budget, crash_at, true)
+    prepare_with_learning(request, store, budget, crash_at, true)
+}
+
+fn prepare_with_learning(
+    request: &BrokerInvocation<'_>,
+    store: &mut SqliteStore,
+    budget: &BudgetLedger,
+    crash_at: Option<InvocationCrashPoint>,
+    resume_transport: bool,
+) -> Result<BrokerPrepareOutcome, BrokerError> {
+    let result = prepare_inner(request, store, budget, crash_at, resume_transport);
+    if let Err(error) = &result
+        && !matches!(
+            error,
+            BrokerError::Invoke(_)
+                | BrokerError::SchemaBindingMismatch
+                | BrokerError::UnsupportedValidation
+                | BrokerError::InvalidArguments
+        )
+    {
+        kernel_invoke::capture_rejected(
+            &request.envelope,
+            store,
+            learning_broker_failure(error, request.envelope.retry_safety),
+        )
+        .map_err(BrokerError::Invoke)?;
+    }
+    result
 }
 
 pub(crate) fn replay(
@@ -965,7 +1006,7 @@ pub(crate) fn replay(
         .envelope
         .preflight_authority(store, true)
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
+    preflight_with_learning(request, store)?;
     let replayed = kernel_invoke::replay(
         &request.envelope,
         &mut InvocationPhaseRuntime::new(store, budget, None),
@@ -1004,7 +1045,7 @@ fn prepare_inner(
         .envelope
         .preflight_authority(store, false)
         .map_err(BrokerError::Invoke)?;
-    preflight(request)?;
+    preflight_with_learning(request, store)?;
     if request.envelope.reservation.tools() == 0 {
         return Err(BrokerError::ToolReservationRequired);
     }
@@ -1489,6 +1530,15 @@ fn resolve_auth_inner(
         .map_err(BrokerError::Invoke)?;
     preflight(request)?;
     if request.envelope.cancellation.load(Ordering::Acquire) {
+        kernel_invoke::capture_rejected(
+            &request.envelope,
+            store,
+            learning_broker_failure(
+                &BrokerError::AuthResolutionCancelled,
+                request.envelope.retry_safety,
+            ),
+        )
+        .map_err(BrokerError::Invoke)?;
         return Err(BrokerError::AuthResolutionCancelled);
     }
     let requirement = request.auth.as_ref().ok_or(BrokerError::AuthNotRequired)?;
@@ -1525,11 +1575,175 @@ fn resolve_auth_inner(
         &binding,
         resolution,
         &REQUIREMENT_CHANNEL,
-    )
+    )?;
+    if resolution == AuthResolution::Denied {
+        kernel_invoke::capture_rejected(
+            &request.envelope,
+            store,
+            learning_broker_failure(&BrokerError::AuthDenied, request.envelope.retry_safety),
+        )
+        .map_err(BrokerError::Invoke)?;
+    }
+    Ok(())
 }
 
 fn preflight(request: &BrokerInvocation<'_>) -> Result<(), BrokerError> {
     validate(request.validation_schema, &request.envelope)
+}
+
+fn preflight_with_learning(
+    request: &BrokerInvocation<'_>,
+    store: &mut SqliteStore,
+) -> Result<(), BrokerError> {
+    match preflight(request) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let mut failure = learning_broker_failure(&error, request.envelope.retry_safety);
+            if failure.code == crate::telemetry::tool_learning::ErrorCode::InvalidSchema
+                && let Some(capture) = request.envelope.learning
+                && let Ok(arguments) = serde_json::from_slice(request.envelope.arguments)
+                && let SchemaValidation::Invalid(path) =
+                    request.validation_schema.validate(&arguments)
+            {
+                failure.field = Some(capture.field(&path));
+            }
+            kernel_invoke::capture_rejected(&request.envelope, store, failure)
+                .map_err(BrokerError::Invoke)?;
+            Err(error)
+        }
+    }
+}
+
+fn learning_broker_failure(
+    error: &BrokerError,
+    retry_safety: kernel_invoke::RetrySafety,
+) -> crate::telemetry::tool_learning::LearningFailure {
+    use crate::telemetry::tool_learning::{
+        ErrorClass, ErrorCode, ErrorStage, LearningFailure, RetryClass,
+    };
+    let (stage, class, code, retry, dispatched, known) = match error {
+        BrokerError::SchemaBindingMismatch
+        | BrokerError::UnsupportedValidation
+        | BrokerError::InvalidArguments
+        | BrokerError::Invoke(InvokeError::SchemaBindingMismatch)
+        | BrokerError::Invoke(InvokeError::InvalidArguments)
+        | BrokerError::Invoke(InvokeError::UnsupportedValidation) => (
+            ErrorStage::SchemaValidation,
+            ErrorClass::Input,
+            ErrorCode::InvalidSchema,
+            RetryClass::Never,
+            false,
+            true,
+        ),
+        BrokerError::AuthCredentialMismatch | BrokerError::AuthNotRequired => (
+            ErrorStage::Authorization,
+            ErrorClass::Auth,
+            ErrorCode::CredentialUnavailable,
+            RetryClass::Never,
+            false,
+            true,
+        ),
+        BrokerError::AuthDenied
+        | BrokerError::AuthPrincipalMismatch
+        | BrokerError::AuthScopeMismatch
+        | BrokerError::ReplayNotAuthorized
+        | BrokerError::ReplayPermitConsumed => (
+            ErrorStage::Authorization,
+            ErrorClass::Auth,
+            ErrorCode::AuthDenied,
+            RetryClass::Never,
+            false,
+            true,
+        ),
+        BrokerError::TransportOutcomeUnknown
+        | BrokerError::TransportAlreadyCompleted
+        | BrokerError::Invoke(InvokeError::InjectedCrash(_)) => (
+            ErrorStage::Transport,
+            ErrorClass::Transport,
+            ErrorCode::OutcomeUnknown,
+            RetryClass::Unknown,
+            true,
+            false,
+        ),
+        BrokerError::AuthResolutionCancelled
+        | BrokerError::TransportAuthCancelled
+        | BrokerError::Invoke(InvokeError::StaleFence) => (
+            ErrorStage::Authorization,
+            ErrorClass::Auth,
+            ErrorCode::Cancelled,
+            RetryClass::Never,
+            false,
+            true,
+        ),
+        BrokerError::InvalidResultProvenance(_) => (
+            ErrorStage::ResultValidation,
+            ErrorClass::Result,
+            ErrorCode::InvalidResponse,
+            RetryClass::Never,
+            true,
+            true,
+        ),
+        BrokerError::AuthStore(_) | BrokerError::Invoke(InvokeError::Store(_)) => (
+            ErrorStage::Persistence,
+            ErrorClass::Store,
+            ErrorCode::PersistenceFailed,
+            RetryClass::Unknown,
+            false,
+            false,
+        ),
+        BrokerError::Invoke(InvokeError::AuthorizationDenied(_)) => (
+            ErrorStage::Authorization,
+            ErrorClass::Policy,
+            ErrorCode::AuthorizationDenied,
+            RetryClass::Never,
+            false,
+            true,
+        ),
+        BrokerError::Invoke(InvokeError::Budget(_))
+        | BrokerError::Invoke(InvokeError::ToolReservationRequired)
+        | BrokerError::ToolReservationRequired => (
+            ErrorStage::Dispatch,
+            ErrorClass::Budget,
+            ErrorCode::BudgetUnavailable,
+            RetryClass::Safe,
+            false,
+            true,
+        ),
+        BrokerError::NativeCapabilityBinding
+        | BrokerError::BindingMismatch
+        | BrokerError::InvalidAuthRequirement
+        | BrokerError::InvalidTransportOperation
+        | BrokerError::RepeatedAuthChallenge
+        | BrokerError::InvalidAuthState
+        | BrokerError::Invoke(InvokeError::MissingDriverClaim)
+        | BrokerError::Invoke(InvokeError::InvalidPersistedOutcome)
+        | BrokerError::Invoke(InvokeError::ArtifactDigestLimit)
+        | BrokerError::Invoke(InvokeError::Serialization(_))
+        | BrokerError::Invoke(InvokeError::NativeCapabilityBinding)
+        | BrokerError::Invoke(InvokeError::BrokerAuth)
+        | BrokerError::Invoke(InvokeError::Accounting(_))
+        | BrokerError::Accounting(_) => (
+            ErrorStage::Dispatch,
+            ErrorClass::System,
+            ErrorCode::Internal,
+            if retry_safety == kernel_invoke::RetrySafety::NonIdempotent {
+                RetryClass::Unknown
+            } else {
+                RetryClass::Never
+            },
+            false,
+            retry_safety == kernel_invoke::RetrySafety::Idempotent,
+        ),
+    };
+    LearningFailure {
+        stage,
+        class,
+        code,
+        field: None,
+        retry,
+        dispatched,
+        known,
+    }
 }
 
 fn ensure_auth_credential(
@@ -1844,6 +2058,53 @@ fn append_auth(
     let event_id = EventId::from_stable_bytes(
         format!("{}:{stream}", auth_identity(envelope, event_type)).as_bytes(),
     );
+    let approval_stream = EntityId::Approval(stream);
+    let mut expected_versions = vec![ExpectedStreamVersion {
+        stream: approval_stream,
+        version: ExpectedVersion::new(version),
+    }];
+    let mut events = vec![NewEvent {
+        id: event_id,
+        stream: approval_stream,
+        event_type: EventType::parse(event_type).expect("broker auth event type is valid"),
+        schema_version: SchemaVersion::CURRENT,
+        occurred_at: envelope.occurred_at.clone(),
+        causation_id: envelope.command_id,
+        correlation_id: EntityId::Run(envelope.config.run_id()),
+        attempt_id: Some(envelope.attempt.attempt_id),
+        trace_id: envelope.trace_id.clone(),
+        payload: payload.clone(),
+        artifacts: b"[]".to_vec(),
+    }];
+    if event_type.ends_with("_challenged")
+        && let Some(capture) = envelope.learning
+    {
+        let decision = grant::decide(envelope.grant_request());
+        let request_digest = envelope.canonical_request_digest(decision.snapshot_digest());
+        if let Some((expected, mut learning)) =
+            crate::telemetry::tool_learning::prepare_invocation_interruption(
+                store,
+                envelope.driver_claim.ok_or(BrokerError::InvalidAuthState)?,
+                capture,
+                envelope.occurred_at.clone(),
+                envelope.trace_id.clone(),
+                request_digest.as_bytes(),
+                crate::telemetry::tool_learning::LearningFailure {
+                    stage: crate::telemetry::tool_learning::ErrorStage::Authorization,
+                    class: crate::telemetry::tool_learning::ErrorClass::Auth,
+                    code: crate::telemetry::tool_learning::ErrorCode::AuthRequired,
+                    field: None,
+                    retry: crate::telemetry::tool_learning::RetryClass::AuthorizationResume,
+                    dispatched: false,
+                    known: true,
+                },
+            )
+            .map_err(|error| BrokerError::Invoke(learning_invoke_error(error)))?
+        {
+            expected_versions.push(expected);
+            events.append(&mut learning);
+        }
+    }
     store
         .append(AppendCommand {
             idempotency_scope: auth_scope(envelope, stream, command)?,
@@ -1852,26 +2113,20 @@ fn append_auth(
             claim: None,
             driver_claim: envelope.driver_claim,
             allow_quiescent_driver_claim,
-            expected_versions: vec![ExpectedStreamVersion {
-                stream: EntityId::Approval(stream),
-                version: ExpectedVersion::new(version),
-            }],
-            events: vec![NewEvent {
-                id: event_id,
-                stream: EntityId::Approval(stream),
-                event_type: EventType::parse(event_type).expect("broker auth event type is valid"),
-                schema_version: SchemaVersion::CURRENT,
-                occurred_at: envelope.occurred_at.clone(),
-                causation_id: envelope.command_id,
-                correlation_id: EntityId::Run(envelope.config.run_id()),
-                attempt_id: Some(envelope.attempt.attempt_id),
-                trace_id: envelope.trace_id.clone(),
-                payload: payload.clone(),
-                artifacts: b"[]".to_vec(),
-            }],
+            expected_versions,
+            events,
             response: payload,
         })
         .map_err(BrokerError::AuthStore)
+}
+
+fn learning_invoke_error(error: crate::telemetry::tool_learning::ToolLearningError) -> InvokeError {
+    match error {
+        crate::telemetry::tool_learning::ToolLearningError::Store(error) => {
+            InvokeError::Store(error)
+        }
+        _ => InvokeError::InvalidPersistedOutcome,
+    }
 }
 
 fn auth_identity(envelope: &InvocationEnvelope<'_>, kind: &str) -> String {
@@ -1951,13 +2206,9 @@ fn validate(
     }
     let arguments = serde_json::from_slice(envelope.arguments)
         .map_err(|_| BrokerError::Invoke(InvokeError::InvalidArguments))?;
-    let validation = schema.validate(&arguments);
-    if validation == SchemaValidation::Unsupported {
-        return Err(BrokerError::UnsupportedValidation);
-    }
-    match validation {
+    match schema.validate(&arguments) {
         SchemaValidation::Valid => Ok(()),
-        SchemaValidation::Invalid => Err(BrokerError::InvalidArguments),
-        SchemaValidation::Unsupported => unreachable!("handled above"),
+        SchemaValidation::Invalid(_) => Err(BrokerError::InvalidArguments),
+        SchemaValidation::Unsupported => Err(BrokerError::UnsupportedValidation),
     }
 }

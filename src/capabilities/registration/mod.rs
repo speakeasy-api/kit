@@ -248,6 +248,20 @@ impl RegistrationPlan {
         Ok(&self.deferred)
     }
 
+    pub(crate) fn deferred_tools_authorized<'a>(
+        &'a self,
+        registry: &BindingRegistry,
+        mut validate: impl FnMut(&CapabilityBinding) -> bool,
+    ) -> Result<&'a [DeferredToolDefinition], RegistrationError> {
+        if self.registry_digest != registry.digest {
+            return Err(RegistrationError::RegistryMismatch);
+        }
+        if registry.bindings.values().any(|binding| !validate(binding)) {
+            return Err(RegistrationError::BindingExpired);
+        }
+        Ok(&self.deferred)
+    }
+
     pub fn invoke(
         &self,
         registry: &BindingRegistry,
@@ -285,7 +299,54 @@ impl RegistrationPlan {
             .validate(&normalized.input)
         {
             SchemaValidation::Valid => {}
-            SchemaValidation::Invalid => return Err(InvocationError::SchemaInvalid),
+            SchemaValidation::Invalid(path) => return Err(InvocationError::SchemaInvalid(path)),
+            SchemaValidation::Unsupported => return Err(InvocationError::SchemaUnsupported),
+        }
+        Ok(BoundRegistrationCall {
+            binding: Arc::clone(binding),
+            input: normalized.input,
+            input_bytes: normalized.bytes,
+        })
+    }
+
+    pub(crate) fn invoke_authorized(
+        &self,
+        registry: &BindingRegistry,
+        call: RegistrationCall,
+        mut validate: impl FnMut(&CapabilityBinding) -> bool,
+    ) -> Result<BoundRegistrationCall, InvocationError> {
+        if self.registry_digest != registry.digest {
+            return Err(InvocationError::RegistryMismatch);
+        }
+        let normalized = match (self.mode, call) {
+            (RegistrationMode::Deferred, RegistrationCall::Direct(call)) => {
+                let binding_id = self
+                    .deferred
+                    .binary_search_by(|definition| definition.wire_name().cmp(&call.wire_name))
+                    .ok()
+                    .map(|index| self.deferred[index].binding_id())
+                    .ok_or(InvocationError::UnknownWireName)?;
+                NormalizedCall::direct(binding_id, &call.bytes)?
+            }
+            (_, RegistrationCall::Portable(call)) => NormalizedCall::portable(&call.bytes)?,
+            _ => return Err(InvocationError::WrongMode),
+        };
+        let binding = registry
+            .bindings
+            .get(&normalized.binding_id)
+            .ok_or(InvocationError::UnknownBinding)?;
+        if !validate(binding) {
+            return Err(InvocationError::BindingExpired);
+        }
+        match binding
+            .pinned_entry()
+            .schemas()
+            .input()
+            .schema()
+            .validate(&normalized.input)
+        {
+            SchemaValidation::Valid => {}
+            SchemaValidation::Invalid(path) => return Err(InvocationError::SchemaInvalid(path)),
             SchemaValidation::Unsupported => return Err(InvocationError::SchemaUnsupported),
         }
         Ok(BoundRegistrationCall {
@@ -373,10 +434,16 @@ impl BindingRegistry {
         provider: &ProviderCapabilityContract,
         current: &DiscoverySession<'_>,
     ) -> Result<RegistrationPlan, RegistrationError> {
-        for binding in self.bindings.values() {
-            binding
-                .validate(current)
-                .map_err(|_| RegistrationError::BindingExpired)?;
+        self.plan_authorized(provider, |binding| binding.validate(current).is_ok())
+    }
+
+    pub(crate) fn plan_authorized(
+        &self,
+        provider: &ProviderCapabilityContract,
+        mut validate: impl FnMut(&CapabilityBinding) -> bool,
+    ) -> Result<RegistrationPlan, RegistrationError> {
+        if self.bindings.values().any(|binding| !validate(binding)) {
+            return Err(RegistrationError::BindingExpired);
         }
 
         let declaration = provider
@@ -530,7 +597,7 @@ impl BoundRegistrationCall {
                 input: normalized.input,
                 input_bytes: normalized.bytes,
             }),
-            SchemaValidation::Invalid => Err(InvocationError::SchemaInvalid),
+            SchemaValidation::Invalid(path) => Err(InvocationError::SchemaInvalid(path)),
             SchemaValidation::Unsupported => Err(InvocationError::SchemaUnsupported),
         }
     }
@@ -652,7 +719,7 @@ impl fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvocationError {
     MalformedInput,
     MalformedGenericWrapper,
@@ -663,7 +730,7 @@ pub enum InvocationError {
     UnknownWireName,
     UnknownBinding,
     BindingExpired,
-    SchemaInvalid,
+    SchemaInvalid(String),
     SchemaUnsupported,
 }
 
@@ -679,7 +746,7 @@ impl fmt::Display for InvocationError {
             Self::UnknownWireName => "deferred capability wire name is unknown",
             Self::UnknownBinding => "capability binding is unknown",
             Self::BindingExpired => "capability binding expired",
-            Self::SchemaInvalid => "capability invocation input does not match its schema",
+            Self::SchemaInvalid(_) => "capability invocation input does not match its schema",
             Self::SchemaUnsupported => "capability invocation schema cannot be validated",
         })
     }

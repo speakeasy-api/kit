@@ -8,9 +8,9 @@ Kit targets only the repository-vendored snapshot in `vendor/agentkit/`:
 | --- | --- |
 | Source commit | `c3926f1c4f3c945d400c8b6ef039da1f84826fcd` |
 | Source tree | `5befb5676ea31703f4485e2d4b5869c39a39cb0f` |
-| Dirty overlay SHA-256 | `92178443493858a217a04387442b56ecd2499e86b05b699aa76b685be146abd1` |
+| Dirty overlay SHA-256 | `0a529f0fa475e872540779e003aff0c546f944985700b1a0bcaabb4a7519bd5d` |
 | Excluded generated-path list SHA-256 | `6013053000cc27b0e77ed61964266ff38e246bee41fee9ef829c0d8763ecd3ae` |
-| Agentkit aggregate SHA-256 | `5bf963f65dcab767a1585a45bf4fbdd21c56dbbb57ea936727825d5809e11dc4` |
+| Agentkit aggregate SHA-256 | `776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49` |
 | Runlet aggregate SHA-256 | `fef525f0008de628b1aff655d2e5685d2c826c76c8517c50e1ce8a88cfcbb8ef` |
 | Agentkit version | `0.10.2` |
 | Runlet version/source | `0.1.0`, repository path `vendor/runlet` |
@@ -25,8 +25,9 @@ The base snapshot retains its recorded rustfmt normalization evidence. M009-W01 
 behavioral overlay `m009-post-validation-checkpoint` in the loop and compaction crates. M006-W07a
 then produced aggregate `0b10acaf53d52a4aa6cbfd183366de7bb401cf2d194efb239fddeed585c419c2`;
 the local-only M006-W07b adaptation modifies exactly `crates/agentkit-mcp/src/lib.rs` and
-`crates/agentkit-mcp/tests/protocol_revision_pin.rs` to produce the current aggregate above. Exact
-before/after file hashes are recorded in the two patch manifests. `docs/compatibility/agentkit-hook.md`
+`crates/agentkit-mcp/tests/protocol_revision_pin.rs`; the later M006-W08 and M006-W09 overlays
+produce the current aggregate above. Exact before/after file hashes are recorded in the snapshot
+metadata and patch manifests. `docs/compatibility/agentkit-hook.md`
 defines the checkpoint compatibility and authority contract.
 
 ## Mapping Contract
