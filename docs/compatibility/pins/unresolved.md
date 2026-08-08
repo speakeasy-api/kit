@@ -32,3 +32,30 @@
 - Blocks: release-mode build provenance. Normal CI remains honest by retaining
   this explicit external blocker and never representing `ubuntu-latest` or a
   mutable hosted-runner label as a reproducible pin.
+
+## EXT-23: ChatGPT Responses Backend
+
+- Status: open
+- Owner: compatibility owner
+- Evidence: `openai-subscription` calls the exact internal endpoint
+  `https://chatgpt.com/backend-api/codex/responses`. The service publishes no immutable protocol
+  revision or release-stability contract, and accepted fields and behavior can change independently
+  of Kit.
+- Action: keep the adapter explicitly unstable, fail closed on unknown protocol transitions, and
+  update fixtures whenever observed protocol behavior changes. Do not claim release stability
+  unless OpenAI publishes an immutable supported contract for this endpoint.
+- Verification: `scripts/verify_pins.sh` reports one unpinned mutable protocol while this blocker is
+  open, and release pin verification remains blocked.
+- Blocks: protocol pin closure and any claim that the ChatGPT subscription backend is release-stable.
+
+## EXT-24: OpenAI Subscription Model Aliases
+
+- Status: open
+- Owner: compatibility owner
+- Evidence: the `openai-subscription` allowlist contains provider-controlled aliases whose resolved
+  model revisions and account entitlements can change without a Kit release.
+- Action: retain the explicit allowlist, report the provider-observed model identity, and update the
+  compatibility evidence whenever aliases or entitlements change.
+- Verification: `scripts/verify_pins.sh` reports one unpinned mutable model while this blocker is
+  open; local G00 pin evidence remains blocked rather than claiming zero mutable models.
+- Blocks: immutable model pin closure and G00 evidence regeneration.

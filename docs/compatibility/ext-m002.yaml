@@ -21,7 +21,7 @@ vendor_pins:
   agentkit:
     version: 0.10.2
     commit: c3926f1c4f3c945d400c8b6ef039da1f84826fcd
-    snapshot_sha256: 776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49
+    snapshot_sha256: 9cf3f5547531310811c77d3454f68584b4f553725f3e2357770532a4abfabe8f
     source: vendor/agentkit/SNAPSHOT-METADATA.yaml
 
 built_ins:
@@ -29,7 +29,7 @@ built_ins:
     identity: kit.durable-model-adapter
     version: 0.1.0
     schema_digest: sha256:e8c7cfcf4cf66cbad65763720f48e1d2c571759fb45585b5cfd1fd3631c35fd1
-    implementation_digest: sha256:216a2046418a820575e2f61ec73f1cdcf49d3402465e8da49493c566a7e613ee
+    implementation_digest: sha256:09a0ad4e848739803aa21dd32c38b712f8e4744e9b631d371f713f93827e8c5e
     source: src/agent/adapters/model.rs
   - extension_point: prompt_module
     identity: kit.prompt-modules

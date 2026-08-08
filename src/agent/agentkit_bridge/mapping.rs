@@ -81,8 +81,8 @@ pub enum CanonicalPart {
     Reasoning {
         summary: Option<String>,
         redacted: bool,
-        hidden_data: Option<()>,
-        provider_metadata: Option<()>,
+        #[serde(default)]
+        metadata: Metadata,
     },
     ToolCall {
         id: String,
@@ -395,8 +395,11 @@ pub fn from_agentkit_part(part: &upstream::Part) -> CanonicalPart {
         upstream::Part::Reasoning(part) => CanonicalPart::Reasoning {
             summary: part.summary.clone(),
             redacted: part.redacted,
-            hidden_data: None,
-            provider_metadata: None,
+            metadata: if part.redacted && part.summary.is_none() && part.data.is_none() {
+                part.metadata.clone()
+            } else {
+                Metadata::new()
+            },
         },
         upstream::Part::ToolCall(part) => CanonicalPart::ToolCall {
             id: part.id.0.clone(),
@@ -663,12 +666,14 @@ fn to_agentkit_part(part: &CanonicalPart) -> upstream::Part {
             metadata: metadata.clone(),
         }),
         CanonicalPart::Reasoning {
-            summary, redacted, ..
+            summary,
+            redacted,
+            metadata,
         } => upstream::Part::Reasoning(upstream::ReasoningPart {
             summary: summary.clone(),
             data: None,
             redacted: *redacted,
-            metadata: Metadata::new(),
+            metadata: metadata.clone(),
         }),
         CanonicalPart::ToolCall {
             id,

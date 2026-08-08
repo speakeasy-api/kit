@@ -740,7 +740,7 @@ fn expired_cursor_is_rfc_9457_with_current_snapshot_and_recovery_cursor() {
     assert_eq!(rejection.status(), 410);
     assert_eq!(rejection.content_type(), PROBLEM_MEDIA_TYPE);
     let body: Value = serde_json::from_slice(rejection.body()).unwrap();
-    assert_eq!(body["type"], "https://kit.dev/problems/cursor_expired");
+    assert_eq!(body["type"], "/problems/cursor_expired");
     assert_eq!(body["status"], 410);
     assert_eq!(body["code"], "cursor_expired");
     assert_eq!(body["snapshot"]["id"], project.to_string());

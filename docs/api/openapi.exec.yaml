@@ -534,7 +534,7 @@ components:
           examples:
             platform_unavailable:
               value:
-                type: https://kit.dev/problems/platform_unavailable
+                type: /problems/platform_unavailable
                 title: Platform unavailable
                 status: 501
                 detail: Native PTY execution is unavailable on this platform.
@@ -542,7 +542,7 @@ components:
                 code: platform_unavailable
             profile_unavailable:
               value:
-                type: https://kit.dev/problems/profile_unavailable
+                type: /problems/profile_unavailable
                 title: Executor profile unavailable
                 status: 501
                 detail: Attempt-owned PTY execution is unavailable in this executor profile.
@@ -557,7 +557,7 @@ components:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
           example:
-            type: https://kit.dev/problems/not_found
+            type: /problems/not_found
             title: Resource not found
             status: 404
             detail: The requested resource was not found.
@@ -786,14 +786,17 @@ components:
       additionalProperties: false
     ProblemDetails:
       type: object
+      description: >-
+        RFC 9457 Problem Details. Type is the relative Kit problem reference
+        /problems/{code}; code is the stable Kit problem identifier.
       required: [type, title, status, detail, instance, code]
       properties:
-        type: { type: string, format: uri }
+        type: { type: string, format: uri-reference, pattern: '^/problems/[a-z][a-z0-9_]{0,63}$' }
         title: { type: string }
         status: { type: integer, minimum: 400, maximum: 599 }
         detail: { type: string }
         instance: { type: string }
-        code: { type: string }
+        code: { type: string, minLength: 1, maxLength: 64, pattern: '^[a-z][a-z0-9_]{0,63}$' }
         invalid_parameters:
           type: array
           items: { $ref: '#/components/schemas/InvalidParameter' }

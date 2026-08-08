@@ -2258,7 +2258,9 @@ mod tests {
                 &mut store,
             ),
             Err(crate::protocols::mcp::transport::TransportError::Broker(
-                BrokerError::Invoke(InvokeError::Store(StoreError::StaleDriverClaim))
+                BrokerError::Invoke(InvokeError::Store(
+                    StoreError::StaleDriverClaim | StoreError::StaleDriverClaimDetail(_)
+                ))
             ))
         ));
     }

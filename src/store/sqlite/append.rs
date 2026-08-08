@@ -187,6 +187,7 @@ pub enum StoreError {
     IdempotencyConflict(IdempotencyKey),
     IdempotencyPending(IdempotencyKey),
     StaleDriverClaim,
+    StaleDriverClaimDetail(String),
     PositionExhausted,
     RandomnessUnavailable,
     InjectedCrash(CrashPoint),
@@ -224,6 +225,9 @@ impl fmt::Display for StoreError {
                 write!(f, "idempotency key {key} has a pending request")
             }
             Self::StaleDriverClaim => f.write_str("attempt driver claim is stale or inactive"),
+            Self::StaleDriverClaimDetail(detail) => {
+                write!(f, "attempt driver claim is stale or inactive ({detail})")
+            }
             Self::PositionExhausted => f.write_str("SQLite event position space exhausted"),
             Self::RandomnessUnavailable => {
                 f.write_str("secure randomness unavailable for idempotency claim")
@@ -2800,7 +2804,33 @@ fn guard_driver_claim(
     if owns {
         Ok(())
     } else {
-        Err(StoreError::StaleDriverClaim)
+        let row = transaction
+            .query_row(
+                "SELECT fence, lease_version, quiescent, expires_at_unix_micros
+                 FROM attempt_driver_claims WHERE run_id = ?1",
+                params![claim.run_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .ok();
+        let detail = match row {
+            Some((fence, lease, quiescent, expires)) => format!(
+                "presented run={} fence={}/lease={} attempt={}; stored fence={fence}/lease={lease} quiescent={quiescent} expired={} allow_quiescent={allow_quiescent}",
+                claim.run_id,
+                claim.fence.get(),
+                claim.lease_version,
+                claim.attempt_id,
+                expires <= now,
+            ),
+            None => "no stored claim for run".to_owned(),
+        };
+        Err(StoreError::StaleDriverClaimDetail(detail))
     }
 }
 

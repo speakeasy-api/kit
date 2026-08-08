@@ -208,6 +208,7 @@ pub enum ClientErrorKind {
 pub struct ClientError {
     pub kind: ClientErrorKind,
     pub message: String,
+    pub code: Option<String>,
 }
 
 impl ClientError {
@@ -215,6 +216,15 @@ impl ClientError {
         Self {
             kind,
             message: message.into(),
+            code: None,
+        }
+    }
+
+    pub(crate) fn problem(kind: ClientErrorKind, message: impl Into<String>, code: String) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            code: Some(code),
         }
     }
 

@@ -2,3 +2,4 @@ schema_version: 1
 name: licenses
 commands:
   - cargo deny check licenses
+  - python3 scripts/verify_third_party.py --self-test

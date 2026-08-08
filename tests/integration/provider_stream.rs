@@ -9,7 +9,7 @@ use std::{
 
 use agentkit_core::{
     DataRef, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind,
-    ReasoningPart, TextPart, TokenUsage, TurnCancellation, Usage,
+    ReasoningPart, TextPart, TokenUsage, ToolCallPart, TurnCancellation, Usage,
 };
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
@@ -79,11 +79,11 @@ impl ModelTurn for FakeTurn {
 
 #[derive(Clone, Default)]
 struct FakeProvider {
-    state: Arc<Mutex<FakeProviderState>>,
+    state: Arc<Mutex<FakeProviderData>>,
 }
 
 #[derive(Default)]
-struct FakeProviderState {
+struct FakeProviderData {
     failures: VecDeque<String>,
     scripts: VecDeque<VecDeque<Step>>,
     requests: Vec<TurnRequest>,
@@ -1176,10 +1176,47 @@ fn sqlite_stream_restarts_at_committed_chunk_and_outcome_boundaries() {
     let committed_part = ModelTurnEvent::Delta(Delta::CommitPart {
         part: Part::file(DataRef::handle(artifact)),
     });
+    let continuation = |kind: &str, item_id: &str, output_index: u64| {
+        MetadataMap::from([
+            (
+                "openai.subscription.v1".to_owned(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "account_binding": {
+                        "account_id_digest": "a".repeat(64),
+                        "login_generation": "generation-1",
+                    },
+                    "model": "gpt-5.6-sol",
+                    "session_id": "session-1",
+                    "response_id": "response-1",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "kind": kind,
+                }),
+            ),
+            ("kit.operation_sequence".to_owned(), output_index.into()),
+        ])
+    };
+    let mut reasoning_metadata = continuation("reasoning", "reasoning-1", 0);
+    reasoning_metadata
+        .get_mut("openai.subscription.v1")
+        .unwrap()["encrypted_content"] = serde_json::json!("opaque-ciphertext");
     let outcome = ModelTurnResult {
         output_items: vec![Item::new(
             ItemKind::Assistant,
-            vec![Part::file(DataRef::handle(artifact))],
+            vec![
+                Part::file(DataRef::handle(artifact)),
+                Part::Reasoning(ReasoningPart {
+                    summary: None,
+                    data: None,
+                    redacted: true,
+                    metadata: reasoning_metadata,
+                }),
+                Part::ToolCall(
+                    ToolCallPart::new("call-1", "read", serde_json::json!({}))
+                        .with_metadata(continuation("function_call", "function-1", 1)),
+                ),
+            ],
         )],
         ..result("durable")
     };

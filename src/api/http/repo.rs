@@ -26,7 +26,7 @@ use crate::{
         auth::contract::{AuthenticatedPrincipal, GrantSnapshot, PrincipalGrant},
         http::{
             core::{JSON_BODY_LIMIT, RouteDescriptor},
-            errors::{PROBLEM_MEDIA_TYPE, ProblemDetails},
+            errors::{PROBLEM_MEDIA_TYPE, ProblemDetails, problem_type},
         },
     },
     capabilities::{
@@ -3789,7 +3789,7 @@ fn problem(error: RepoError) -> Response {
     let mut response = (
         status,
         Json(json!({
-            "type": format!("https://kit.dev/problems/{code}"),
+            "type": problem_type(code),
             "title": title,
             "status": status.as_u16(),
             "detail": detail,

@@ -43,7 +43,9 @@ REQUIRED_IDS = {
     "runlet.registry_checksum", "runlet.snapshot_sha256", "runlet.application_source",
     "protocol.acp.wire", "protocol.acp.direct_crate", "protocol.acp.tokio_helper",
     "protocol.acp.single_linked_version", "protocol.a2a.wire", "protocol.mcp.revision",
-    "protocol.mcp.rmcp_crate", "protocol.mcp.application", "schema.json.dialect",
+    "protocol.mcp.rmcp_crate", "protocol.mcp.application",
+    "protocol.chatgpt.responses_backend", "model.openai_subscription_allowlist",
+    "schema.json.dialect",
     "toon.spec", "toon.spec_commit", "toon.spec_tarball_sha256",
     "toon.fixture_manifest_sha256", "toon.serde_toon2", "toon.conformance",
     "grammar.runtime", "grammar.languages", "grammar.queries",
@@ -160,7 +162,7 @@ EVIDENCE_PATH = re.compile(
     r"(?::(?P<start>[0-9]+)(?:-(?P<end>[0-9]+))?)?(?:\s|$)"
 )
 AUTHORITATIVE_URL_HOSTS = {
-    "api.github.com", "crates.io", "github.com", "json-schema.org", "pypi.org",
+    "api.github.com", "chatgpt.com", "crates.io", "github.com", "json-schema.org", "pypi.org",
 }
 EVIDENCE_COMMANDS = {
     "tool.check_jsonschema": "check-jsonschema --version",
@@ -1731,9 +1733,19 @@ def main(argv=None):
         print("pin verifier self-test passed: rogue write job/command, corrupt digest, floating Rust, reproducibility-pin removal, reproducible-build contract mutations, unlisted payload, unsafe URL, unsafe act URL, fake blocker, release blockers, duplicate/equivalent/merge keys rejected, and safe value alias accepted")
     else:
         print(f"pin manifest verified ({'release' if args.release else 'normal'} mode): {manifest}")
-        print("unpinned.mutable_protocols=0")
+        mutable_protocols = sum(
+            record["status"] == "blocked"
+            and record["id"] == "protocol.chatgpt.responses_backend"
+            for record in load_manifest(manifest)["pins"]
+        )
+        print(f"unpinned.mutable_protocols={mutable_protocols}")
         print("unpinned.mutable_datasets=0")
-        print("unpinned.mutable_models=0")
+        mutable_models = sum(
+            record["status"] == "blocked"
+            and record["id"] == "model.openai_subscription_allowlist"
+            for record in load_manifest(manifest)["pins"]
+        )
+        print(f"unpinned.mutable_models={mutable_models}")
         print("unpinned.mutable_harnesses=0")
     return 0
 

@@ -727,7 +727,19 @@ fn validate_part(part: &Part, allow_summary: bool) -> Result<(), LoopError> {
         }
         Part::ToolCall(part) => {
             validate_provider_value(&part.input, false)?;
+            if part
+                .metadata
+                .contains_key(super::openai_subscription::CONTINUATION_METADATA)
+                && !super::openai_subscription::durable_tool_call_metadata(&part.metadata)
+            {
+                return Err(persistence_error(
+                    "OpenAI tool continuation metadata is not durable",
+                ));
+            }
             &part.metadata
+        }
+        Part::Reasoning(part) if super::openai_subscription::durable_reasoning(part) => {
+            return Ok(());
         }
         Part::Reasoning(part)
             if allow_summary
@@ -756,19 +768,26 @@ fn validate_usage(usage: &Usage) -> Result<(), LoopError> {
 
 fn validate_metadata(metadata: &MetadataMap) -> Result<(), LoopError> {
     for (name, value) in metadata {
-        if private_field(name) {
-            return Err(persistence_error(
-                "private reasoning metadata is not durable",
-            ));
-        }
-        if classify_field(name) == DataClass::Secret
-            && value != &serde_json::Value::String(REDACTED.to_owned())
-        {
-            return Err(persistence_error("unredacted secret field is not durable"));
-        }
-        validate_provider_value(value, name.eq_ignore_ascii_case("headers"))?;
+        validate_metadata_entry(name, value)?;
     }
     Ok(())
+}
+
+pub(super) fn validate_metadata_entry(
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<(), LoopError> {
+    if private_field(name) {
+        return Err(persistence_error(
+            "private reasoning metadata is not durable",
+        ));
+    }
+    if classify_field(name) == DataClass::Secret
+        && value != &serde_json::Value::String(REDACTED.to_owned())
+    {
+        return Err(persistence_error("unredacted secret field is not durable"));
+    }
+    validate_provider_value(value, name.eq_ignore_ascii_case("headers"))
 }
 
 fn validate_provider_value(value: &serde_json::Value, headers: bool) -> Result<(), LoopError> {

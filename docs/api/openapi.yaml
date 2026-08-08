@@ -1680,7 +1680,7 @@ components:
                       - not: {pattern: '^/'}
                       - not: {pattern: '^[A-Za-z]:'}
                       - not: {pattern: '\\'}
-                      - not: {pattern: '\p{Cc}'}
+                      - not: {pattern: '[\x00-\x1F\x7F-\x9F]'}
                       - not: {pattern: '[?*"<>|:]'}
                       - not: {pattern: '(?:^|/)(?:/|$)'}
                       - not: {pattern: '(?:^|/)\.{1,2}(?:/|$)'}
@@ -1700,7 +1700,7 @@ components:
                       - not: {pattern: '^/'}
                       - not: {pattern: '^[A-Za-z]:'}
                       - not: {pattern: '\\'}
-                      - not: {pattern: '\p{Cc}'}
+                      - not: {pattern: '[\x00-\x1F\x7F-\x9F]'}
                       - not: {pattern: '[?*"<>|:]'}
                       - not: {pattern: '(?:^|/)(?:/|$)'}
                       - not: {pattern: '(?:^|/)\.{1,2}(?:/|$)'}
@@ -1728,7 +1728,7 @@ components:
                       - not: {pattern: '^/'}
                       - not: {pattern: '^[A-Za-z]:'}
                       - not: {pattern: '\\'}
-                      - not: {pattern: '\p{Cc}'}
+                      - not: {pattern: '[\x00-\x1F\x7F-\x9F]'}
                       - not: {pattern: '[?*"<>|:]'}
                       - not: {pattern: '(?:^|/)(?:/|$)'}
                       - not: {pattern: '(?:^|/)\.{1,2}(?:/|$)'}
@@ -3070,13 +3070,15 @@ components:
       additionalProperties: false
     ProblemDetails:
       type: object
-      description: RFC 9457 Problem Details with stable Kit extensions.
+      description: >-
+        RFC 9457 Problem Details. Type is the relative Kit problem reference
+        /problems/{code}; code is the stable Kit problem identifier.
       required: [type, title, status, detail, instance, code]
       properties:
         type:
           type: string
-          format: uri
-          pattern: '^https://kit\.dev/problems/[a-z_]+$'
+          format: uri-reference
+          pattern: '^/problems/[a-z][a-z0-9_]{0,63}$'
         title:
           type: string
         status:
@@ -3090,7 +3092,9 @@ components:
           minLength: 1
         code:
           type: string
-          pattern: '^[a-z_]+$'
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z][a-z0-9_]{0,63}$'
         invalid_parameters:
           type: array
           items:

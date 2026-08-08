@@ -44,7 +44,8 @@ the digest remains unchanged when the checkout is unchanged.
 
 Missing native isolation, sealed helper, syntax worker, formatter image, verification registry, or
 diagnostic adapter makes only the dependent tool unavailable. Responses use RFC 9457 problem
-details or a failed durable result with the native failure code. Kit does not execute an equivalent
+details with the relative Kit reference `type: /problems/{code}` and a stable Kit `code`, or a
+failed durable result with the native failure code. Kit does not execute an equivalent
 host command and does not claim successful release evidence. Unsupported local isolation remains
 tracked by `EXT-22` on Linux and `EXT-19` on Windows; production formatter and syntax images require
 their separately attested external artifacts.

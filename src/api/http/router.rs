@@ -51,7 +51,7 @@ use super::{
         DEFAULT_TIMEOUT_SECONDS, HttpAuthenticator, JSON_BODY_LIMIT, MAX_PAGE_SIZE, ServiceHandler,
         decode_cursor, encode_cursor,
     },
-    errors::ProblemDetails,
+    errors::{ProblemDetails, problem_type},
     health::{self, HealthState},
     retention,
 };
@@ -2028,7 +2028,7 @@ fn stream_rejection(rejection: StreamRejection) -> Response {
 
 fn unavailable(instance: &str, title: &str, detail: &str, code: &str) -> Response {
     let body = json!({
-        "type": format!("https://kit.dev/problems/{code}"),
+        "type": problem_type(code),
         "title": title,
         "status": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
         "detail": detail,

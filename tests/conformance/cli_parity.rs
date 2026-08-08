@@ -53,7 +53,7 @@ fn cli_service_and_openapi_have_zero_uncovered_operations() {
         .collect::<Vec<_>>();
     assert_eq!(
         CLI_OPERATIONS.len(),
-        6 + ROUTES.len() + EXEC_ROUTES.len(),
+        9 + ROUTES.len() + EXEC_ROUTES.len(),
         "{}",
         parity_table()
     );

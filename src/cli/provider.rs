@@ -20,6 +20,7 @@ pub enum ProviderCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderKind {
     OpenAi,
+    OpenAiSubscription,
     Anthropic,
     OpenRouter,
     Ollama,
@@ -166,6 +167,9 @@ impl ProviderAdd {
                 self.max_completion_tokens,
             )
             .map_err(invalid)?,
+            ProviderKind::OpenAiSubscription => {
+                ProviderProfile::openai_subscription(self.model.clone())
+            }
             ProviderKind::Anthropic => {
                 let (api_key, auth_token) = if let Some(variable) = &self.auth_token_env {
                     (None, Some(credential(variable)?))
@@ -266,6 +270,24 @@ impl ProviderAdd {
                     return Err(invalid("--auth-token-env is not valid for this provider"));
                 }
             }
+            ProviderKind::OpenAiSubscription => {
+                if self.api_key_env.is_some()
+                    || self.auth_token_env.is_some()
+                    || self.base_url.is_some()
+                    || self.max_tokens.is_some()
+                    || self.max_completion_tokens.is_some()
+                    || self.version.is_some()
+                    || self.beta.is_some()
+                    || self.app_name.is_some()
+                    || self.site_url.is_some()
+                    || self.temperature.is_some()
+                    || self.reasoning_effort.is_some()
+                {
+                    return Err(invalid(
+                        "openai-subscription accepts only --model and stores no credential in config",
+                    ));
+                }
+            }
             ProviderKind::Anthropic => {
                 if self.api_key_env.is_some() && self.auth_token_env.is_some() {
                     return Err(invalid(
@@ -296,6 +318,7 @@ impl ProviderKind {
     pub fn parse(value: &str) -> Self {
         match value {
             "openai" => Self::OpenAi,
+            "openai-subscription" => Self::OpenAiSubscription,
             "anthropic" => Self::Anthropic,
             "openrouter" => Self::OpenRouter,
             "ollama" => Self::Ollama,
@@ -306,6 +329,7 @@ impl ProviderKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
+            Self::OpenAiSubscription => "openai-subscription",
             Self::Anthropic => "anthropic",
             Self::OpenRouter => "openrouter",
             Self::Ollama => "ollama",

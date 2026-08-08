@@ -113,6 +113,21 @@ where
                 self.inner.begin_turn(request, cancellation).await.map_err(
                     |error| match error {
                         LoopError::Cancelled => LoopError::Cancelled,
+                        LoopError::TransientProvider {
+                            message,
+                            retry_after,
+                        } => LoopError::TransientProvider {
+                            message: redactor.redact_text(&message),
+                            retry_after,
+                        },
+                        LoopError::ProviderNotDispatched {
+                            message,
+                            retry_after,
+                        } => LoopError::ProviderNotDispatched {
+                            message: redactor.redact_text(&message),
+                            retry_after,
+                        },
+                        LoopError::SessionStale(message) => LoopError::SessionStale(message),
                         error => LoopError::Provider(redactor.redact_text(&error.to_string())),
                     },
                 )?;

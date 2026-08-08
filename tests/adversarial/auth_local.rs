@@ -4,8 +4,8 @@ use hmac::{Hmac, Mac};
 use kit::{
     api::auth::{
         contract::{
-            AuthDenial, AuthReadiness, Authenticator, Authorizer, GrantSnapshot, ResourceScope,
-            ScopedAuthorizer,
+            AuthDenial, AuthReadiness, Authenticator, Authorizer, GrantSnapshot, PrincipalGrant,
+            ResourceScope, ScopedAuthorizer,
         },
         local_peer::{LocalPeerAuthenticator, LocalPeerObservation},
         loopback::{
@@ -285,6 +285,44 @@ fn authorization_denials_do_not_disclose_cross_resource_state() {
         denials
             .into_iter()
             .all(|decision| decision == Err(AuthDenial::Unauthorized))
+    );
+}
+
+#[test]
+fn owned_project_access_is_same_principal_and_does_not_expand_grants() {
+    let principal = PrincipalId::generate().unwrap();
+    let authenticated = local(
+        grants(principal, ProjectId::generate().unwrap())
+            .with_principal_grant(PrincipalGrant::AccessOwnedProjects),
+    )
+    .authenticate(&LocalPeerObservation::from_transport(UID, PID, UID))
+    .unwrap();
+    let other_project = ProjectId::generate().unwrap();
+
+    assert!(
+        ScopedAuthorizer
+            .authorize(
+                &authenticated,
+                ResourceScope::new(principal, other_project),
+                Grant::WorkspaceRead,
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        ScopedAuthorizer.authorize(
+            &authenticated,
+            ResourceScope::new(PrincipalId::generate().unwrap(), other_project),
+            Grant::WorkspaceRead,
+        ),
+        Err(AuthDenial::Unauthorized)
+    );
+    assert_eq!(
+        ScopedAuthorizer.authorize(
+            &authenticated,
+            ResourceScope::new(principal, other_project),
+            Grant::ProcessSpawn,
+        ),
+        Err(AuthDenial::Unauthorized)
     );
 }
 

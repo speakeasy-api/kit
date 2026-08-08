@@ -56,6 +56,7 @@ impl GrantSnapshot {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PrincipalGrant {
     CreateProject,
+    AccessOwnedProjects,
     ResolveApproval,
 }
 
@@ -171,7 +172,10 @@ impl Authorizer for ScopedAuthorizer {
                 project_id,
             } => {
                 snapshot.principal_id() == principal_id
-                    && snapshot.project_id() == project_id
+                    && (snapshot.project_id() == project_id
+                        || snapshot
+                            .principal_grants()
+                            .contains(&PrincipalGrant::AccessOwnedProjects))
                     && snapshot.grants().contains(&required)
             }
             ResourceScope::ProjectCreation {

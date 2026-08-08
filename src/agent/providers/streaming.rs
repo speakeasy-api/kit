@@ -853,6 +853,10 @@ fn sanitize_result(
         let mut parts = Vec::with_capacity(item.parts.len());
         for mut part in std::mem::take(&mut item.parts) {
             if let Part::Reasoning(reasoning) = part {
+                if super::openai_subscription::durable_reasoning(&reasoning) {
+                    parts.push(Part::Reasoning(reasoning));
+                    continue;
+                }
                 if retain_reasoning_summaries && let Some(summary) = reasoning.summary {
                     parts.push(Part::Reasoning(ReasoningPart::redacted_summary(
                         redactor.redact_text(&summary),
@@ -902,6 +906,9 @@ fn sanitize_part(
         }
         Part::ToolCall(part) => {
             sanitize_provider_value(&mut part.input, false);
+            if super::openai_subscription::durable_tool_call_metadata(&part.metadata) {
+                return Ok(());
+            }
             &mut part.metadata
         }
         Part::Reasoning(part)

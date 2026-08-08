@@ -58,6 +58,9 @@ use crate::{
         prompt::{PromptInput, TaskContract, compile},
         providers::{
             adapter::{ModelStreamPolicy, StreamCommitFactory, StreamPolicyAdapter},
+            openai_subscription::{
+                OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
+            },
             persistence::SqliteStreamCommitFactory,
             streaming::{CanaryRedactor, StreamCommit, StreamLimits},
         },
@@ -195,7 +198,11 @@ impl RunExecutorConfig {
             concurrency: 4,
             queue_capacity: 64,
             poll_interval: Duration::from_millis(250),
-            lease_duration: Duration::from_secs(5),
+            // The heartbeat renews under the shared service lock, so the lease must
+            // outlast the longest lock-holding tool operation (multi-file edits with
+            // verification have been observed >30s); expiry mid-run fences out the
+            // driver and fails the run with a stale claim.
+            lease_duration: Duration::from_secs(120),
             claim_renewal_interval: Duration::from_secs(1),
             model_reservation: Spend::new(0, 1, 1, 0, 0),
             telemetry: None,
@@ -3987,6 +3994,14 @@ impl SelectedModelAdapter {
             .ok_or(ExecutorError::ProviderUnavailable(provider))
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_is_openai_subscription(&self, provider: ConfigProvider) -> bool {
+        matches!(
+            self.select(provider),
+            Ok(SelectedAdapter::OpenAiSubscription(_))
+        )
+    }
+
     fn configured(&self, provider: ConfigProvider) -> &ConfiguredModelAdapter {
         self.providers
             .get(&provider)
@@ -4007,6 +4022,7 @@ impl SelectedModelAdapter {
     fn max_output_tokens(&self, provider: ConfigProvider) -> u32 {
         match &self.configured(provider).adapter {
             SelectedAdapter::OpenAi(adapter) => adapter.max_output_tokens().unwrap_or(u32::MAX),
+            SelectedAdapter::OpenAiSubscription(_) => u32::MAX,
             SelectedAdapter::Anthropic(adapter) => adapter.max_output_tokens(),
             SelectedAdapter::OpenRouter(adapter) => adapter.max_output_tokens().unwrap_or(u32::MAX),
             SelectedAdapter::Ollama(adapter) => adapter.max_output_tokens().unwrap_or(u32::MAX),
@@ -4170,6 +4186,7 @@ impl SelectedModelAdapter {
 #[derive(Clone)]
 pub(crate) enum SelectedAdapter {
     OpenAi(OpenAIAdapter),
+    OpenAiSubscription(OpenAiSubscriptionAdapter),
     Anthropic(AnthropicAdapter),
     OpenRouter(OpenRouterAdapter),
     Ollama(OllamaAdapter),
@@ -4202,6 +4219,9 @@ impl ModelAdapter for SelectedAdapter {
                 Self::OpenAi(adapter) => {
                     SelectedSession::OpenAi(adapter.start_session(config).await?)
                 }
+                Self::OpenAiSubscription(adapter) => {
+                    SelectedSession::OpenAiSubscription(adapter.start_session(config).await?)
+                }
                 Self::Anthropic(adapter) => {
                     SelectedSession::Anthropic(adapter.start_session(config).await?)
                 }
@@ -4222,6 +4242,7 @@ impl ModelAdapter for SelectedAdapter {
     fn provider_name(&self) -> Option<&str> {
         match self {
             Self::OpenAi(adapter) => adapter.provider_name(),
+            Self::OpenAiSubscription(adapter) => adapter.provider_name(),
             Self::Anthropic(adapter) => adapter.provider_name(),
             Self::OpenRouter(adapter) => adapter.provider_name(),
             Self::Ollama(adapter) => adapter.provider_name(),
@@ -4233,6 +4254,7 @@ impl ModelAdapter for SelectedAdapter {
 
 pub(crate) enum SelectedSession {
     OpenAi(OpenAISession),
+    OpenAiSubscription(OpenAiSubscriptionSession),
     Anthropic(AnthropicSession),
     OpenRouter(OpenRouterSession),
     Ollama(OllamaSession),
@@ -4257,6 +4279,9 @@ impl ModelSession for SelectedSession {
                 Self::OpenAi(session) => {
                     SelectedTurn::OpenAi(session.begin_turn(request, cancellation).await?)
                 }
+                Self::OpenAiSubscription(session) => SelectedTurn::OpenAiSubscription(Box::new(
+                    session.begin_turn(request, cancellation).await?,
+                )),
                 Self::Anthropic(session) => {
                     SelectedTurn::Anthropic(session.begin_turn(request, cancellation).await?)
                 }
@@ -4277,6 +4302,7 @@ impl ModelSession for SelectedSession {
     fn model_name(&self) -> Option<&str> {
         match self {
             Self::OpenAi(session) => session.model_name(),
+            Self::OpenAiSubscription(session) => session.model_name(),
             Self::Anthropic(session) => session.model_name(),
             Self::OpenRouter(session) => session.model_name(),
             Self::Ollama(session) => session.model_name(),
@@ -4288,6 +4314,7 @@ impl ModelSession for SelectedSession {
     fn prepare_turn(&mut self, request: &mut TurnRequest) -> Result<(), LoopError> {
         match self {
             Self::OpenAi(session) => session.prepare_turn(request),
+            Self::OpenAiSubscription(session) => session.prepare_turn(request),
             Self::Anthropic(session) => session.prepare_turn(request),
             Self::OpenRouter(session) => session.prepare_turn(request),
             Self::Ollama(session) => session.prepare_turn(request),
@@ -4299,6 +4326,7 @@ impl ModelSession for SelectedSession {
     fn structured_output_capability(&self) -> Option<&agentkit_loop::StructuredOutputCapability> {
         match self {
             Self::OpenAi(session) => session.structured_output_capability(),
+            Self::OpenAiSubscription(session) => session.structured_output_capability(),
             Self::Anthropic(session) => session.structured_output_capability(),
             Self::OpenRouter(session) => session.structured_output_capability(),
             Self::Ollama(session) => session.structured_output_capability(),
@@ -4310,6 +4338,7 @@ impl ModelSession for SelectedSession {
 
 pub(crate) enum SelectedTurn {
     OpenAi(OpenAITurn),
+    OpenAiSubscription(Box<OpenAiSubscriptionTurn>),
     Anthropic(AnthropicTurn),
     OpenRouter(OpenRouterTurn),
     Ollama(OllamaTurn),
@@ -4330,6 +4359,7 @@ impl ModelTurn for SelectedTurn {
     {
         match self {
             Self::OpenAi(turn) => turn.next_event(cancellation),
+            Self::OpenAiSubscription(turn) => turn.next_event(cancellation),
             Self::Anthropic(turn) => turn.next_event(cancellation),
             Self::OpenRouter(turn) => turn.next_event(cancellation),
             Self::Ollama(turn) => turn.next_event(cancellation),

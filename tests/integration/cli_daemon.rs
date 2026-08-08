@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read},
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::mpsc,
@@ -32,7 +33,7 @@ fn parse_errors_preserve_authoritative_json_format() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let problem: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(problem["type"], "https://kit.dev/problems/invalid_request");
+    assert_eq!(problem["type"], "/problems/invalid_request");
     assert_eq!(problem["status"], 400);
     assert_eq!(problem["code"], "invalid_request");
 
@@ -391,6 +392,28 @@ fn cli_auto_start_is_opt_in_and_bounded() {
     assert_success(&daemonized);
     assert!(read_discovery(&daemonized_root.0).is_ok());
     terminate_daemons(&daemonized_root.0);
+}
+
+#[test]
+fn newly_created_project_can_create_thread() {
+    let root = TestRoot::new("project-thread-route");
+    fs::create_dir_all(&root.0).unwrap();
+    let state_root = fs::canonicalize(&root.0).unwrap();
+    let mut daemon = OwnedDaemon::start(&state_root);
+    wait_for_discovery(&state_root, &mut daemon.child);
+
+    let created = cli(&state_root, &["--json", "project", "create"]);
+    assert_success(&created);
+    let project = json_output(&created)["resource"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let thread = cli(
+        &state_root,
+        &["--json", "thread", "create", "--project", &project],
+    );
+    assert_success(&thread);
 }
 
 #[test]
@@ -784,6 +807,47 @@ fn start_daemon(root: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("start foreground daemon")
+}
+
+struct OwnedDaemon {
+    child: Child,
+}
+
+impl OwnedDaemon {
+    fn start(root: &Path) -> Self {
+        prepare_project_root(root);
+        let mut command = kit_command();
+        command
+            .args(["daemon", "--state-root"])
+            .arg(root)
+            .env("KIT_PROJECT_ROOT", root.join("unconfigured-project"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        Self {
+            child: command.spawn().expect("start owned foreground daemon"),
+        }
+    }
+}
+
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            // SAFETY: start() places this owned child in a process group led by its PID.
+            unsafe {
+                libc::killpg(self.child.id() as libc::pid_t, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
 }
 
 fn prepare_project_root(root: &Path) {

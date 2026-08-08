@@ -17,7 +17,7 @@ use crate::{
     api::{
         http::{
             core::{JSON_BODY_LIMIT, ROUTES, RouteDescriptor, decode_cursor, encode_cursor},
-            errors::PROBLEM_MEDIA_TYPE,
+            errors::{PROBLEM_MEDIA_TYPE, known_problem_code, valid_problem_type},
         },
         service::{
             ApprovalProjection, ArtifactMetadataProjection, AuthRequestProjection,
@@ -1026,17 +1026,10 @@ fn problem(response: Response) -> ClientError {
         .flatten()
         .and_then(|bytes| serde_json::from_slice::<ProblemDetails>(&bytes).ok())
         .filter(|problem| problem.status == status.as_u16());
-    let message = parsed
-        .map(|problem| {
-            let _ = (
-                problem.problem_type,
-                problem.title,
-                problem.instance,
-                problem.code,
-            );
-            problem.detail
-        })
-        .unwrap_or_else(|| format!("daemon returned HTTP {}", status.as_u16()));
+    problem_error(status, parsed)
+}
+
+fn problem_error(status: StatusCode, parsed: Option<ProblemDetails>) -> ClientError {
     let kind = match status.as_u16() {
         401 | 403 => ClientErrorKind::Authentication,
         404 => ClientErrorKind::NotFound,
@@ -1046,7 +1039,17 @@ fn problem(response: Response) -> ClientError {
         504 => ClientErrorKind::Timeout,
         _ => ClientErrorKind::Internal,
     };
-    ClientError::new(kind, message)
+    match parsed.filter(|problem| {
+        kind != ClientErrorKind::Authentication
+            && known_problem_code(&problem.code)
+            && valid_problem_type(&problem.problem_type, &problem.code)
+    }) {
+        Some(problem) => {
+            let _ = (problem.title, problem.instance);
+            ClientError::problem(kind, problem.detail, problem.code)
+        }
+        None => ClientError::new(kind, format!("daemon returned HTTP {}", status.as_u16())),
+    }
 }
 
 async fn problem_async(response: reqwest::Response, timeout: Duration) -> ClientError {
@@ -1066,27 +1069,7 @@ async fn problem_async(response: reqwest::Response, timeout: Duration) -> Client
     } else {
         None
     };
-    let message = parsed
-        .map(|problem| {
-            let _ = (
-                problem.problem_type,
-                problem.title,
-                problem.instance,
-                problem.code,
-            );
-            problem.detail
-        })
-        .unwrap_or_else(|| format!("daemon returned HTTP {}", status.as_u16()));
-    let kind = match status.as_u16() {
-        401 | 403 => ClientErrorKind::Authentication,
-        404 => ClientErrorKind::NotFound,
-        409 | 423 => ClientErrorKind::Conflict,
-        400..=499 => ClientErrorKind::Invalid,
-        503 => ClientErrorKind::Unavailable,
-        504 => ClientErrorKind::Timeout,
-        _ => ClientErrorKind::Internal,
-    };
-    ClientError::new(kind, message)
+    problem_error(status, parsed)
 }
 
 fn response_bytes(mut response: Response) -> Result<Vec<u8>, ClientError> {
@@ -1323,6 +1306,7 @@ struct StreamRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::core::{OutputFormat, render_error};
     use crate::domain::{
         events::SchemaVersion,
         ids::McpCallbackId,
@@ -1342,6 +1326,63 @@ mod tests {
             content,
             artifact_refs: Vec::new(),
         }
+    }
+
+    fn wire_problem(status: u16, code: &str) -> ProblemDetails {
+        ProblemDetails {
+            problem_type: format!("/problems/{code}"),
+            title: "Problem".to_owned(),
+            status,
+            detail: format!("{code} detail"),
+            instance: "/v1/test".to_owned(),
+            code: code.to_owned(),
+        }
+    }
+
+    #[test]
+    fn daemon_problem_codes_survive_cli_rendering() {
+        for (status, code) in [(409, "cursor_upgrade_required"), (404, "not_found")] {
+            let error = problem_error(
+                StatusCode::from_u16(status).unwrap(),
+                Some(wire_problem(status, code)),
+            );
+            let output = render_error(&error, OutputFormat::Json);
+            let rendered: Value = serde_json::from_str(&output.stderr).unwrap();
+            assert_eq!(rendered["code"], code);
+            assert_eq!(rendered["type"], format!("/problems/{code}"));
+        }
+    }
+
+    #[test]
+    fn unknown_or_malformed_problem_codes_render_generically() {
+        let unknown = problem_error(StatusCode::NOT_FOUND, None);
+        assert_eq!(unknown.code, None);
+
+        let unknown = problem_error(
+            StatusCode::NOT_FOUND,
+            Some(wire_problem(404, "project_exists")),
+        );
+        assert_eq!(unknown.code, None);
+
+        let mut malformed = wire_problem(404, "not_found");
+        malformed.problem_type = "/problems/project_exists".to_owned();
+        let malformed = problem_error(StatusCode::NOT_FOUND, Some(malformed));
+        assert_eq!(malformed.code, None);
+        assert_eq!(malformed.message, "daemon returned HTTP 404");
+
+        let rendered = render_error(&malformed, OutputFormat::Json);
+        let rendered: Value = serde_json::from_str(&rendered.stderr).unwrap();
+        assert_eq!(rendered["code"], "not_found");
+        assert_eq!(rendered["type"], "/problems/not_found");
+
+        let authentication = problem_error(
+            StatusCode::UNAUTHORIZED,
+            Some(wire_problem(401, "unauthenticated")),
+        );
+        assert_eq!(authentication.code, None);
+        let rendered = render_error(&authentication, OutputFormat::Json);
+        let rendered: Value = serde_json::from_str(&rendered.stderr).unwrap();
+        assert_eq!(rendered["code"], "not_found");
     }
 
     #[test]

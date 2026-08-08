@@ -25,7 +25,7 @@ use crate::{
         auth::contract::AuthenticatedPrincipal,
         http::{
             core::{JSON_BODY_LIMIT, RouteDescriptor},
-            errors::ProblemDetails,
+            errors::{ProblemDetails, problem_type},
         },
     },
     domain::{
@@ -2547,7 +2547,7 @@ impl<D: PtyDriver, S: TerminalSnapshotStore, C: ExecutorCancellationCoordinator>
                 .collect::<Vec<_>>();
             attachments.sort_by(|left, right| left.attachment_id.cmp(&right.attachment_id));
             return Err(ExecError::CursorExpired(json!({
-                "type": "https://kit.dev/problems/cursor_expired",
+                "type": problem_type("cursor_expired"),
                 "title": "Executor cursor expired",
                 "status": 410,
                 "detail": "The requested executor cursor is outside retained history.",
@@ -2966,7 +2966,7 @@ fn exec_problem(status: StatusCode, code: &str, title: &str, detail: &str) -> Re
     let mut response = (
         status,
         Json(json!({
-            "type": format!("https://kit.dev/problems/{code}"),
+            "type": problem_type(code),
             "title": title,
             "status": status.as_u16(),
             "detail": detail,
@@ -2986,7 +2986,7 @@ fn unavailable_response() -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
-            "type": "https://kit.dev/problems/executor_unavailable",
+            "type": problem_type("executor_unavailable"),
             "title": "Executor unavailable",
             "status": 503,
             "detail": "The executor service is not available.",

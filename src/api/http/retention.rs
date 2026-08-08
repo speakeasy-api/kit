@@ -19,7 +19,7 @@ use crate::{
         auth::contract::AuthenticatedPrincipal,
         http::{
             core::{LifecycleError, LifecycleMutation, LifecycleQuery, ServiceHandler},
-            errors::ProblemDetails,
+            errors::{ProblemDetails, problem_type},
         },
         service::RequestContext,
     },
@@ -615,7 +615,7 @@ fn legal_hold_problem(
     instance: &str,
 ) -> Response {
     let value = json!({
-        "type": "https://kit.dev/problems/legal_hold",
+        "type": problem_type("legal_hold"),
         "title": "Deletion blocked by legal hold",
         "status": StatusCode::LOCKED.as_u16(),
         "detail": "Physical deletion is prohibited while a legal hold applies.",
@@ -642,7 +642,7 @@ fn problem(
     job_id: Option<DeletionJobId>,
 ) -> Response {
     let mut value = json!({
-        "type": format!("https://kit.dev/problems/{code}"),
+        "type": problem_type(code),
         "title": title,
         "status": status.as_u16(),
         "detail": detail,

@@ -395,10 +395,11 @@ async fn every_safe_boundary_restarts_without_duplicate_provider_or_transcript_i
         })
         .await
         .unwrap();
-    assert!(matches!(
-        driver.poll(&projection).await.unwrap(),
-        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))
-    ));
+    let LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_round)) =
+        driver.poll(&projection).await.unwrap()
+    else {
+        panic!("expected tool boundary")
+    };
     assert_eq!(adapter.dispatches(), 0);
     assert_eq!(tool.calls(), 1);
 
@@ -425,16 +426,8 @@ async fn every_safe_boundary_restarts_without_duplicate_provider_or_transcript_i
         ),
     ];
     let mut journal = Journal::new();
-    journal.append(
-        owner,
-        0,
-        LoopRecord::Boundary(boundary(
-            SafeBoundary::AfterToolOutcome,
-            &transcript,
-            Some(2),
-            None,
-        )),
-    );
+    let after_tool = boundary(SafeBoundary::AfterToolOutcome, &transcript, Some(2), None);
+    journal.append(owner, 0, LoopRecord::Boundary(after_tool.clone()));
     let adapter = FakeAdapter::with_result(result("after-tool"));
     let mut driver = ready(RestartProjection::reconstruct(&projection, &journal.events()).unwrap())
         .start(&projection, adapter.clone(), |builder| builder)
@@ -516,11 +509,30 @@ async fn multi_turn_restart_uses_persisted_next_and_current_turn_indices() {
     ));
     assert_eq!(adapter.requests()[0].turn_id.to_string(), "turn-3");
 
+    let continuation = MetadataMap::from([
+        (
+            "openai.subscription.v1".to_owned(),
+            serde_json::json!({
+                "schema_version": 1,
+                "account_binding": {
+                    "account_id_digest": "a".repeat(64),
+                    "login_generation": "generation-1",
+                },
+                "model": "gpt-5.6-sol",
+                "session_id": "session-1",
+                "response_id": "response-1",
+                "item_id": "function-1",
+                "output_index": 0,
+                "kind": "function_call",
+            }),
+        ),
+        ("kit.operation_sequence".to_owned(), 4.into()),
+    ]);
     let call = ToolCallPart {
         id: AgentkitToolCallId::new("third-turn-call"),
         name: "echo".into(),
         input: serde_json::json!({"value": "three"}),
-        metadata: MetadataMap::new(),
+        metadata: continuation.clone(),
     };
     let continuing = [
         text(ItemKind::User, "one"),
@@ -562,6 +574,10 @@ async fn multi_turn_restart_uses_persisted_next_and_current_turn_indices() {
         LoopStep::Finished(_)
     ));
     assert_eq!(adapter.requests()[0].turn_id.to_string(), "turn-3");
+    let Part::ToolCall(restored) = &adapter.requests()[0].transcript[5].parts[0] else {
+        panic!("restarted transcript lost its tool call")
+    };
+    assert_eq!(restored.metadata, continuation);
 }
 
 #[tokio::test]

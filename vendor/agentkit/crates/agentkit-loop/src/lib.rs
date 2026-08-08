@@ -3627,6 +3627,25 @@ pub enum LoopError {
     /// An error originating from the model provider.
     #[error("provider error: {0}")]
     Provider(String),
+    /// A temporary provider failure that is safe for the caller's model retry policy.
+    #[error("transient provider error: {message}")]
+    TransientProvider {
+        /// Stable, secret-free provider failure detail.
+        message: String,
+        /// Provider-requested delay, already bounded by the adapter.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Provider rejected the request before accepting inference work.
+    #[error("provider did not dispatch inference: {message}")]
+    ProviderNotDispatched {
+        /// Stable, secret-free provider failure detail.
+        message: String,
+        /// Provider-requested delay, already bounded by the adapter.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Provider credentials changed after the model session was bound.
+    #[error("provider session is stale: {0}")]
+    SessionStale(String),
     /// An error originating from tool execution.
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
@@ -3642,6 +3661,25 @@ pub enum LoopError {
     /// The requested operation is not supported.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+}
+
+impl LoopError {
+    /// Whether a model retry policy may retry this failure.
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::TransientProvider { .. } | Self::ProviderNotDispatched { .. }
+        )
+    }
+
+    /// Returns the provider's bounded retry delay when present.
+    pub const fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::TransientProvider { retry_after, .. }
+            | Self::ProviderNotDispatched { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Internal [`EventEmitter`] backed by the driver's observer slice. Lives

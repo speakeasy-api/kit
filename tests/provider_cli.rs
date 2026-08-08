@@ -115,6 +115,44 @@ fn standard_openai_and_openrouter_credentials_are_used_by_default_without_leakin
 }
 
 #[test]
+fn openai_subscription_profile_is_credential_free_and_model_bounded() {
+    let root = temporary("subscription");
+    let config = root.join("kit/config.json");
+    let output = success(kit(&config).env("OPENAI_API_KEY", CANARY).args([
+        "--json",
+        "provider",
+        "add",
+        "subscription",
+        "--provider",
+        "openai-subscription",
+    ]));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(CANARY));
+    let persisted = fs::read_to_string(&config).unwrap();
+    assert!(!persisted.contains(CANARY));
+    let persisted: Value = serde_json::from_str(&persisted).unwrap();
+    assert_eq!(
+        persisted["providers"]["subscription"],
+        serde_json::json!({"provider":"openai-subscription","model":"gpt-5.6-sol"})
+    );
+
+    let rejected = kit(&config)
+        .args([
+            "provider",
+            "add",
+            "unsupported",
+            "--provider",
+            "openai-subscription",
+            "--model",
+            "not-a-subscription-model",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("supported model set"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn explicit_api_key_environment_overrides_standard_variables() {
     let root = temporary("credential-overrides");
     let config = root.join("kit/config.json");

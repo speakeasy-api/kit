@@ -4,7 +4,10 @@ use serde_json::Value;
 
 use kit::{
     api::service::PromptInput,
-    cli::core::{ClientRequest, Invocation, parse},
+    cli::{
+        auth::AuthCommand,
+        core::{ClientRequest, Invocation, parse},
+    },
 };
 
 const PROJECT: &str = "project_00000000000000000000000001";
@@ -23,6 +26,15 @@ fn kit() -> Command {
 
 fn unused_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kit-cli-{label}-{}", std::process::id()))
+}
+
+#[test]
+fn auth_logout_local_only_is_explicitly_parsed() {
+    let cli = parse(["auth", "logout", "openai", "--local-only"]).unwrap();
+    assert!(matches!(
+        cli.invocation,
+        Invocation::Auth(AuthCommand::Logout { local_only: true })
+    ));
 }
 
 #[test]
@@ -305,6 +317,23 @@ fn globals_are_singletons_across_command_depths() {
     assert_eq!(structured.status.code(), Some(2));
     let problem: Value = serde_json::from_slice(&structured.stderr).unwrap();
     assert_eq!(problem["code"], "invalid_request");
+}
+
+#[test]
+fn auth_timeout_defaults_preserve_explicit_global_values() {
+    for (arguments, expected_ms) in [
+        (vec!["kit", "auth", "status", "openai"], 30_000),
+        (vec!["kit", "auth", "logout", "openai"], 30_000),
+        (vec!["kit", "auth", "login", "openai"], 300_000),
+        (vec!["kit", "project", "create"], 5_000),
+        (vec!["kit", "auth", "status", "openai", "--timeout-ms=1"], 1),
+        (vec!["kit", "auth", "login", "openai", "--timeout-ms=1"], 1),
+    ] {
+        assert_eq!(
+            parse(arguments).unwrap().timeout,
+            std::time::Duration::from_millis(expected_ms)
+        );
+    }
 }
 
 #[test]
@@ -925,6 +954,7 @@ fn operation(invocation: &Invocation) -> &str {
         Invocation::Daemon(_) => "daemon",
         Invocation::Ui => "ui",
         Invocation::Provider(_) => "provider.local",
+        Invocation::Auth(_) => "auth.local",
         Invocation::Client(request) => request.operation(),
         Invocation::Exec(request) => request.operation,
         Invocation::Repo(request) => request.operation,

@@ -24,6 +24,7 @@ use crate::{
             ContentDigest, ExtensionConfigStack, ExtensionPoint, ExtensionRegistry,
             TrustedExtensionToken, built_in_descriptors,
         },
+        providers::openai_subscription::{OpenAiSubscriptionAdapter, SubscriptionConfig},
     },
     api::{
         auth::{
@@ -405,6 +406,7 @@ enum ModelAdapterImplementation {
         credential: Arc<SecretLease>,
     },
     Ollama(OllamaConfig),
+    OpenAiSubscription(SubscriptionConfig),
     #[cfg(debug_assertions)]
     DeterministicTest {
         response: FakeResponse,
@@ -426,6 +428,7 @@ impl DaemonModelAdapterConfig {
                         Arc::clone(credential),
                     )),
                     ModelAdapterImplementation::Ollama(_) => None,
+                    ModelAdapterImplementation::OpenAiSubscription(_) => None,
                     #[cfg(debug_assertions)]
                     ModelAdapterImplementation::DeterministicTest { .. } => None,
                 },
@@ -660,27 +663,40 @@ fn configured_model_adapter() -> Result<Option<DaemonModelAdapterConfig>, String
     };
     let (_, profile) = registry.current();
     let provider = profile.provider();
-    let implementation = match profile
-        .configure()
-        .map_err(|error| format!("persistent provider configuration: {error}"))?
-    {
-        crate::agent::providers::config::ConfiguredProvider::OpenAi { config, credential } => {
-            ModelAdapterImplementation::OpenAi { config, credential }
-        }
-        crate::agent::providers::config::ConfiguredProvider::Anthropic { config, credential } => {
-            ModelAdapterImplementation::Anthropic { config, credential }
-        }
-        crate::agent::providers::config::ConfiguredProvider::OpenRouter { config, credential } => {
-            ModelAdapterImplementation::OpenRouter { config, credential }
-        }
-        crate::agent::providers::config::ConfiguredProvider::Ollama(config) => {
-            ModelAdapterImplementation::Ollama(config)
-        }
-    };
+    let implementation = configured_profile_implementation(profile)?;
     Ok(Some(DaemonModelAdapterConfig::new(
         provider,
         BTreeMap::from([(provider, implementation)]),
     )))
+}
+
+fn configured_profile_implementation(
+    profile: &crate::agent::providers::config::ProviderProfile,
+) -> Result<ModelAdapterImplementation, String> {
+    Ok(
+        match profile
+            .configure()
+            .map_err(|error| format!("persistent provider configuration: {error}"))?
+        {
+            crate::agent::providers::config::ConfiguredProvider::OpenAi { config, credential } => {
+                ModelAdapterImplementation::OpenAi { config, credential }
+            }
+            crate::agent::providers::config::ConfiguredProvider::Anthropic {
+                config,
+                credential,
+            } => ModelAdapterImplementation::Anthropic { config, credential },
+            crate::agent::providers::config::ConfiguredProvider::OpenRouter {
+                config,
+                credential,
+            } => ModelAdapterImplementation::OpenRouter { config, credential },
+            crate::agent::providers::config::ConfiguredProvider::Ollama(config) => {
+                ModelAdapterImplementation::Ollama(config)
+            }
+            crate::agent::providers::config::ConfiguredProvider::OpenAiSubscription { model } => {
+                ModelAdapterImplementation::OpenAiSubscription(SubscriptionConfig::new(model)?)
+            }
+        },
+    )
 }
 
 fn configured_mcp_servers() -> Result<Vec<crate::protocols::mcp::config::McpServerConfig>, String> {
@@ -940,6 +956,11 @@ pub struct Daemon {
     evaluation_unavailable: Option<String>,
     shutdown: ShutdownHandle,
     task: Option<JoinHandle<Result<Vec<ReconciliationAction>, DaemonError>>>,
+    // Keeps the project workspace owner (and its revision epoch) alive for the
+    // daemon's lifetime: without a persistent handle, a run parking on approval
+    // drops the last workspace handle, and the resume mints a new epoch that
+    // invalidates every revision token the model captured before the wait.
+    _workspace_anchor: Option<crate::workspace::revision::ManagedWorkspace>,
 }
 
 impl Daemon {
@@ -1367,6 +1388,7 @@ impl Daemon {
             ],
         )
         .with_principal_grant(PrincipalGrant::CreateProject)
+        .with_principal_grant(PrincipalGrant::AccessOwnedProjects)
         .with_principal_grant(PrincipalGrant::ResolveApproval);
         let issued_at = now_unix_secs()?;
         let session_seconds = config.auth_session_lifetime.as_secs();
@@ -1586,6 +1608,10 @@ impl Daemon {
             evaluation_unavailable,
             shutdown,
             task: Some(task),
+            _workspace_anchor: crate::workspace::revision::ManagedWorkspace::open(
+                &config.project_root,
+            )
+            .ok(),
         })
     }
 
@@ -1738,6 +1764,15 @@ fn build_model_adapter(
                 let adapter = OllamaAdapter::new(config)
                     .map_err(|error| DaemonError::Setup(error.to_string()))?;
                 (SelectedAdapter::Ollama(adapter), model, Vec::new())
+            }
+            ModelAdapterImplementation::OpenAiSubscription(config) => {
+                let model = config.model.clone();
+                let adapter = OpenAiSubscriptionAdapter::new(config).map_err(DaemonError::Setup)?;
+                (
+                    SelectedAdapter::OpenAiSubscription(adapter),
+                    model,
+                    Vec::new(),
+                )
             }
             #[cfg(debug_assertions)]
             ModelAdapterImplementation::DeterministicTest {
@@ -1946,5 +1981,40 @@ fn remove_discovery(root: &Path) -> Result<(), DaemonError> {
             .map_err(DaemonError::Io),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(DaemonError::Io(error)),
+    }
+}
+
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::*;
+
+    #[test]
+    fn openai_subscription_profile_selects_the_concrete_executor_adapter() {
+        let profile = crate::agent::providers::config::ProviderProfile::openai_subscription(Some(
+            "gpt-5.6-sol".to_owned(),
+        ));
+        let implementation = configured_profile_implementation(&profile).unwrap();
+        assert!(matches!(
+            &implementation,
+            ModelAdapterImplementation::OpenAiSubscription(_)
+        ));
+
+        let config = DaemonModelAdapterConfig::new(
+            ConfigProvider::OpenAi,
+            BTreeMap::from([(ConfigProvider::OpenAi, implementation)]),
+        );
+        let trusted = TrustedExtensionToken::daemon_bootstrap();
+        let mut registry = ExtensionRegistry::default();
+        for descriptor in built_in_descriptors() {
+            registry.register_in_process(&trusted, descriptor).unwrap();
+        }
+        let extensions = config.extensions.materialize(&registry).unwrap();
+        let descriptor = registry
+            .get(extensions.selection(ExtensionPoint::ModelAdapter))
+            .unwrap()
+            .clone();
+        let selected =
+            build_model_adapter(config.implementations, &trusted, descriptor, extensions).unwrap();
+        assert!(selected.selected_is_openai_subscription(ConfigProvider::OpenAi));
     }
 }

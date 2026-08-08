@@ -86,7 +86,7 @@ fn global_args(scope: &'static str) -> [Arg; 6] {
             .conflicts_with_all([ids[1], ids[2]]),
         Arg::new(ids[1])
             .long("jsonl")
-            .help("Emit JSON Lines output for event streams")
+            .help("Emit streaming JSON Lines output")
             .action(ArgAction::Append)
             .num_args(0)
             .default_missing_value("true")
@@ -355,7 +355,49 @@ fn approval() -> Command {
 }
 
 fn auth() -> Command {
-    group("auth", "List and resolve authorization requests").subcommands([
+    group(
+        "auth",
+        "Manage provider authentication and authorization requests",
+    )
+    .subcommands([
+        leaf("login", "Authenticate a provider with native browser OAuth")
+            .mut_arg("leaf-timeout-ms", |arg| {
+                arg.help("Request timeout [default: 300000]")
+            })
+            .arg(
+                Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .index(1)
+                    .required(true)
+                    .value_parser(PossibleValuesParser::new(["openai"])),
+            ),
+        leaf("status", "Show provider authentication status")
+            .mut_arg("leaf-timeout-ms", |arg| {
+                arg.help("Request timeout [default: 30000]")
+            })
+            .arg(
+                Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .index(1)
+                    .required(true)
+                    .value_parser(PossibleValuesParser::new(["openai"])),
+            ),
+        leaf("logout", "Revoke and remove provider authentication")
+            .mut_arg("leaf-timeout-ms", |arg| {
+                arg.help("Request timeout [default: 30000]")
+            })
+            .arg(
+                Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .index(1)
+                    .required(true)
+                    .value_parser(PossibleValuesParser::new(["openai"])),
+            )
+            .arg(flag(
+                "local-only",
+                "local-only",
+                "WARNING: delete locally without revoking the remote token",
+            )),
         required_id(
             leaf("list", "List pending authorization requests"),
             "project",
@@ -763,7 +805,13 @@ fn provider() -> Command {
             )
             .arg(
                 required_value("provider", "provider", "PROVIDER", "Provider type").value_parser(
-                    PossibleValuesParser::new(["openai", "anthropic", "openrouter", "ollama"]),
+                    PossibleValuesParser::new([
+                        "openai",
+                        "openai-subscription",
+                        "anthropic",
+                        "openrouter",
+                        "ollama",
+                    ]),
                 ),
             )
             .arg(flag(

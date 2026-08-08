@@ -1836,7 +1836,12 @@ fn native_edit_error(
         EditOrchestrationError::Validation(error) => {
             return format!("edit_validation_failed:{}", validation_error_detail(&error));
         }
-        EditOrchestrationError::Stage(_) => "edit_stage_failed",
+        EditOrchestrationError::Stage(error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("edit stage failed: {error}");
+            let _ = error;
+            "edit_stage_failed"
+        }
         EditOrchestrationError::Verification(_) | EditOrchestrationError::VerificationRejected => {
             "edit_verification_failed"
         }

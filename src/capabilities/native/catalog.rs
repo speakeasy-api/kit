@@ -363,7 +363,9 @@ fn expansion_path() -> Value {
             {"not": {"pattern": "^/"}},
             {"not": {"pattern": "^[A-Za-z]:"}},
             {"not": {"pattern": r"\\"}},
-            {"not": {"pattern": r"\p{Cc}"}},
+            // Unicode C0/DEL/C1 controls spelled as ranges: \p{Cc} is not portable to
+            // ECMA-262 pattern validators (e.g. the OpenAI tool-schema checker).
+            {"not": {"pattern": r"[\x00-\x1F\x7F-\x9F]"}},
             {"not": {"pattern": r#"[?*"<>|:]"#}},
             {"not": {"pattern": "(?:^|/)(?:/|$)"}},
             {"not": {"pattern": r"(?:^|/)\.{1,2}(?:/|$)"}},

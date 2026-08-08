@@ -43,6 +43,7 @@ pub enum Invocation {
     Daemon(DaemonCommand),
     Ui,
     Provider(crate::cli::provider::ProviderCommand),
+    Auth(crate::cli::auth::AuthCommand),
     Client(Box<ClientRequest>),
     Exec(Box<crate::cli::exec::ExecRequest>),
     Repo(Box<crate::cli::repo::RepoRequest>),
@@ -70,6 +71,9 @@ pub const CLI_OPERATIONS: &[OperationDescriptor] = &[
     operation("provider list", None, None, None, false, false),
     operation("provider add", None, None, None, false, false),
     operation("provider use", None, None, None, false, false),
+    operation("auth login", None, None, None, false, false),
+    operation("auth status", None, None, None, false, false),
+    operation("auth logout", None, None, None, false, false),
     operation(
         "project create",
         Some("project.create"),
@@ -517,10 +521,20 @@ where
         .map_err(|message| ParseError::semantic(message, settings.format))?;
     let invocation = invocation(&matches, &idempotency_key)
         .map_err(|message| ParseError::semantic(message, settings.format))?;
-    let stream = matches!(&invocation, Invocation::Client(request) if request.is_stream());
+    let default_timeout_ms = match &invocation {
+        Invocation::Auth(crate::cli::auth::AuthCommand::Login) => 300_000,
+        Invocation::Auth(crate::cli::auth::AuthCommand::Status) => 30_000,
+        Invocation::Auth(crate::cli::auth::AuthCommand::Logout { .. }) => 30_000,
+        _ => 5_000,
+    };
+    let stream = matches!(&invocation, Invocation::Client(request) if request.is_stream())
+        || matches!(
+            &invocation,
+            Invocation::Auth(crate::cli::auth::AuthCommand::Login)
+        );
     if settings.format == OutputFormat::Jsonl && !stream {
         return Err(ParseError::semantic(
-            "--jsonl is only valid for event streams",
+            "--jsonl is only valid for event streams and auth login",
             settings.format,
         ));
     }
@@ -528,7 +542,7 @@ where
         format: settings.format,
         state_root: settings.state_root.map(PathBuf::from),
         auto_start: settings.auto_start,
-        timeout: Duration::from_millis(settings.timeout_ms.unwrap_or(5_000)),
+        timeout: Duration::from_millis(settings.timeout_ms.unwrap_or(default_timeout_ms)),
         invocation,
     })
 }
@@ -733,6 +747,11 @@ fn invocation(
             _ => unreachable!(),
         },
         "auth" => match subcommand(matches) {
+            ("login", _) => Ok(Invocation::Auth(crate::cli::auth::AuthCommand::Login)),
+            ("status", _) => Ok(Invocation::Auth(crate::cli::auth::AuthCommand::Status)),
+            ("logout", matches) => Ok(Invocation::Auth(crate::cli::auth::AuthCommand::Logout {
+                local_only: matches.get_flag("local-only"),
+            })),
             ("list", matches) => Ok(query(Query::PendingAuthRequests {
                 project_id: required_id(matches, "project", "project-id", "--project")?,
             })),

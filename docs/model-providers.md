@@ -36,6 +36,27 @@ OpenAI reads `OPENAI_API_KEY` by default. OpenRouter reads `OPENROUTER_API_KEY`.
 or `--auth-token-env ENV` only for nonstandard variable names; credentials are never accepted as
 raw command-line values.
 
+ChatGPT subscription authentication is separate from OpenAI API-key authentication. The native
+browser login stores tokens only in the operating system keyring; the provider profile stores only
+the selected model:
+
+```sh
+kit auth login openai
+kit auth status openai
+kit provider add chatgpt --provider openai-subscription --model gpt-5.6-sol
+kit provider use chatgpt
+# Restart the daemon after `provider use`.
+
+kit auth logout openai
+# If remote revocation is unavailable, explicitly delete only the local keyring record:
+kit auth logout openai --local-only
+```
+
+`kit auth status openai` reports the keyring-backed account, email, and plan when available and
+never prints tokens. Logging out removes the shared subscription credential; it does not remove the
+credential-free profile. API-key `openai` profiles and the `OPENAI_API_KEY` environment override
+continue to use the setup documented above and below.
+
 `kit provider path`, `list`, `add`, and `use` are local commands. They do not discover or start a
 daemon. `add` refuses an existing name unless `--replace` is supplied; the first profile becomes
 current automatically, while later additions preserve the current profile. Use `--json` or

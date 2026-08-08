@@ -4,6 +4,7 @@ commands:
   - python3 scripts/check_dogfood_harness.py
   - cargo build --locked --bin kit
   - cargo test --locked --test conformance --test integration
+  - cargo test --locked --test cli_frontend --test provider_cli
   - cargo test --locked --manifest-path dogfood-harness/Cargo.toml
   - test -z "$KIT_TRIAL_AGENT_IMAGE" || cargo test --locked --test adversarial trial_grader_access::production_helper_denies_agent_grader_input_reads_and_writes -- --ignored --exact
   - test -z "$KIT_TRIAL_AGENT_IMAGE" || cargo test --locked --test adversarial trial_grader_access::production_protocol_rejects_all_canary_encodings_before_persistence -- --ignored --exact

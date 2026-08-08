@@ -43,6 +43,9 @@ fn main() -> ExitCode {
                 Invocation::Ui => ui(state_root, cli.auto_start, cli.timeout, cli.format),
                 Invocation::Provider(command) => kit::cli::provider::execute(command, cli.format)
                     .unwrap_or_else(|error| render_error(&error, cli.format)),
+                Invocation::Auth(command) => {
+                    kit::cli::auth::execute(command, cli.format, cli.timeout)
+                }
                 Invocation::Client(request) => dispatch(
                     *request,
                     state_root,

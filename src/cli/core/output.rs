@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::api::{
-    http::core::encode_cursor,
+    http::{core::encode_cursor, errors::problem_type},
     service::{EventProjection, QueryProjection},
 };
 
@@ -54,7 +54,7 @@ pub fn render_exec_response(value: Value, format: OutputFormat) -> Result<Output
 }
 
 pub fn render_error(error: &ClientError, format: OutputFormat) -> Output {
-    let (exit_code, status, code) = match error.kind {
+    let (exit_code, status, default_code) = match error.kind {
         ClientErrorKind::Authentication => (EXIT_NOT_FOUND, 404, "not_found"),
         ClientErrorKind::NotFound => (EXIT_NOT_FOUND, 404, "not_found"),
         ClientErrorKind::Conflict => (EXIT_CONFLICT, 409, "conflict"),
@@ -63,8 +63,9 @@ pub fn render_error(error: &ClientError, format: OutputFormat) -> Output {
         ClientErrorKind::Timeout => (EXIT_TRANSPORT, 504, "request_timeout"),
         ClientErrorKind::Internal => (EXIT_INTERNAL, 500, "internal_error"),
     };
+    let code = error.code.as_deref().unwrap_or(default_code);
     let problem = json!({
-        "type": format!("https://kit.dev/problems/{code}"),
+        "type": problem_type(code),
         "title": error_title(error.kind),
         "status": status,
         "detail": error.message,

@@ -1638,7 +1638,7 @@ impl SqliteServiceStore {
     }
 
     fn driver_claim_for_command(
-        &self,
+        &mut self,
         command: &Command,
     ) -> Result<AttemptDriverClaim, ServiceError> {
         let run_id = match command {
@@ -1646,29 +1646,18 @@ impl SqliteServiceStore {
             | Command::TransitionRun { run_id, .. }
             | Command::RequestApproval { run_id, .. }
             | Command::RequestAuth { run_id, .. } => *run_id,
+            // Resolve through the attempt projection: an event-table join cannot see
+            // an attempt that has not appended events yet (e.g. a failover attempt
+            // transitioning Leased -> Executing), and any unscoped fallback would
+            // attach an unrelated run's claim.
             Command::TransitionAttempt { attempt_id, .. } => self
-                .driver_connection()?
-                .query_row(
-                    "SELECT claim.run_id FROM attempt_driver_claims AS claim
-                     JOIN events AS event ON event.correlation_id = claim.run_id
-                     WHERE event.attempt_id = ?1 LIMIT 1",
-                    [attempt_id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|run| RunId::parse(&run).ok())
-                .or_else(|| {
-                    self.driver_connection()
-                        .ok()?
-                        .query_row(
-                            "SELECT run_id FROM attempt_driver_claims LIMIT 1",
-                            [],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .ok()
-                        .and_then(|run| RunId::parse(&run).ok())
-                })
-                .ok_or_else(|| ServiceError::Conflict("attempt has no driver claim".to_owned()))?,
+                .state()?
+                .attempts
+                .get(attempt_id)
+                .map(|attempt| attempt.run_id)
+                .ok_or_else(|| {
+                    ServiceError::Conflict("attempt has no driver claim".to_owned())
+                })?,
             _ => {
                 return Err(ServiceError::Invalid(
                     "worker command is not driver-owned".to_owned(),
@@ -2369,14 +2358,22 @@ impl ServiceStore for SqliteServiceStore {
                 .get(project_id)
                 .map(|project| QueryProjection::Retention(project.retention))
                 .ok_or(ServiceError::NotFound),
-            Query::ListThreads { project_id } => Ok(QueryProjection::Threads(
-                state
+            Query::ListThreads { project_id } => {
+                let mut threads = state
                     .threads
                     .values()
                     .filter(|thread| thread.project_id == *project_id)
                     .cloned()
-                    .collect(),
-            )),
+                    .collect::<Vec<_>>();
+                let order = self.creation_order("thread_id")?;
+                threads.sort_by_key(|thread| {
+                    order
+                        .get(&thread.id.to_string())
+                        .copied()
+                        .unwrap_or(i64::MAX)
+                });
+                Ok(QueryProjection::Threads(threads))
+            }
             Query::GetThread { thread_id } => state
                 .threads
                 .get(thread_id)
@@ -2389,14 +2386,21 @@ impl ServiceStore for SqliteServiceStore {
             Query::ThreadEvents { .. } | Query::ThreadEventsProjected { .. } => {
                 unreachable!("event queries return before state load")
             }
-            Query::ListRuns { project_id } => Ok(QueryProjection::Runs(
-                state
+            Query::ListRuns { project_id } => {
+                let mut runs = state
                     .runs
                     .values()
                     .filter(|run| state.project_for_run(run.id) == Some(*project_id))
                     .cloned()
-                    .collect(),
-            )),
+                    .collect::<Vec<_>>();
+                // BTreeMap iteration is id order, which is random relative to run
+                // creation; present runs chronologically by first committed event.
+                let order = self.creation_order("run_id")?;
+                runs.sort_by_key(|run| {
+                    order.get(&run.id.to_string()).copied().unwrap_or(i64::MAX)
+                });
+                Ok(QueryProjection::Runs(runs))
+            }
             Query::GetRun { run_id } => state
                 .runs
                 .get(run_id)
@@ -2564,6 +2568,28 @@ impl ServiceStore for SqliteServiceStore {
 }
 
 impl SqliteServiceStore {
+    /// First committed event position per entity, keyed by the given index column
+    /// ("thread_id" or "run_id"): the chronological creation order for listings.
+    fn creation_order(
+        &mut self,
+        column: &'static str,
+    ) -> Result<std::collections::BTreeMap<String, i64>, ServiceError> {
+        self.projections
+            .with_store_time(|transaction, _| {
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT {column}, MIN(commit_position) FROM event_projection_index
+                     WHERE {column} IS NOT NULL GROUP BY {column}"
+                ))?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+                    .map_err(Into::into)
+            })
+            .map_err(|error| ServiceError::Store(error.to_string()))
+    }
+
     fn state(&mut self) -> Result<DomainReducer, ServiceError> {
         let (mut state, _) = self
             .projections

@@ -47,6 +47,11 @@ pub(crate) enum ProviderProfile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_completion_tokens: Option<u32>,
     },
+    #[serde(rename = "openai-subscription")]
+    OpenAiSubscription {
+        #[serde(default = "default_openai_subscription_model")]
+        model: String,
+    },
     #[serde(rename = "anthropic")]
     Anthropic {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,6 +119,9 @@ pub(crate) enum ConfiguredProvider {
         credential: Arc<SecretLease>,
     },
     Ollama(OllamaConfig),
+    OpenAiSubscription {
+        model: String,
+    },
 }
 
 #[derive(Debug)]
@@ -147,6 +155,12 @@ impl ProviderProfile {
             base_url,
             max_completion_tokens,
         })
+    }
+
+    pub fn openai_subscription(model: Option<String>) -> Self {
+        Self::OpenAiSubscription {
+            model: model.unwrap_or_else(default_openai_subscription_model),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -206,6 +220,7 @@ impl ProviderProfile {
     pub fn provider_name(&self) -> &'static str {
         match self {
             Self::OpenAi { .. } => "openai",
+            Self::OpenAiSubscription { .. } => "openai-subscription",
             Self::Anthropic { .. } => "anthropic",
             Self::OpenRouter { .. } => "openrouter",
             Self::Ollama { .. } => "ollama",
@@ -215,6 +230,7 @@ impl ProviderProfile {
     pub fn provider(&self) -> Provider {
         match self {
             Self::OpenAi { .. } => Provider::OpenAi,
+            Self::OpenAiSubscription { .. } => Provider::OpenAi,
             Self::Anthropic { .. } => Provider::Anthropic,
             Self::OpenRouter { .. } => Provider::OpenRouter,
             Self::Ollama { .. } => Provider::Ollama,
@@ -246,6 +262,15 @@ impl ProviderProfile {
                     ));
                 }
                 validate_credential_endpoint(base_url.as_deref())
+            }
+            Self::OpenAiSubscription { model } => {
+                required("openai-subscription model", model)?;
+                if !super::openai_subscription::supported_model(model) {
+                    return Err(ProviderConfigError::new(
+                        "openai-subscription model is not in the supported model set",
+                    ));
+                }
+                Ok(())
             }
             Self::Anthropic {
                 api_key,
@@ -326,6 +351,9 @@ impl ProviderProfile {
                     credential: lease(api_key),
                 }
             }
+            Self::OpenAiSubscription { model } => ConfiguredProvider::OpenAiSubscription {
+                model: model.clone(),
+            },
             Self::Anthropic {
                 api_key,
                 auth_token,
@@ -701,6 +729,10 @@ pub(crate) fn config_path() -> Result<PathBuf, ProviderConfigError> {
 
 fn default_openai_model() -> String {
     "gpt-4o".to_owned()
+}
+
+fn default_openai_subscription_model() -> String {
+    "gpt-5.6-sol".to_owned()
 }
 
 fn default_openrouter_model() -> String {

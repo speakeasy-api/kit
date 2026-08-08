@@ -59,6 +59,7 @@ const INTENT_EVENT: &str = "model_call.intent";
 const DISPATCH_EVENT: &str = "model_call.dispatched";
 const OUTCOME_EVENT: &str = "model_call.outcome";
 const PROVIDER_IDEMPOTENCY_KEY: &str = "kit.model_call.idempotency_key";
+const PROVIDER_REQUEST_DIGEST: &str = "kit.model_call.request_digest";
 
 pub type ModelOutcomeValidator =
     Arc<dyn Fn(&ModelTurnResult) -> Result<(), LoopError> + Send + Sync + 'static>;
@@ -366,6 +367,10 @@ where
                 serde_json::Value::String(key.as_str().to_owned()),
             );
             request.metadata.insert(
+                PROVIDER_REQUEST_DIGEST.to_owned(),
+                serde_json::Value::String(hex(request_digest.as_bytes())),
+            );
+            request.metadata.insert(
                 EFFECT_CORRELATION_METADATA.to_owned(),
                 serde_json::to_value(&intent.correlation).map_err(model_error)?,
             );
@@ -389,6 +394,17 @@ where
                 provider.await
             } {
                 Ok(turn) => turn,
+                Err(
+                    error @ (LoopError::ProviderNotDispatched { .. } | LoopError::SessionStale(_)),
+                ) => {
+                    self.kernel.commit_not_dispatched(
+                        &key,
+                        request_digest,
+                        &intent,
+                        dispatch.reservation_id,
+                    )?;
+                    return Err(error);
+                }
                 Err(error) => {
                     self.kernel.commit_unknown(
                         &key,
@@ -1240,6 +1256,18 @@ impl ModelKernel {
         self.settle(committed.reservation_id, committed.charged)
     }
 
+    fn commit_not_dispatched(
+        &self,
+        key: &IdempotencyKey,
+        digest: CanonicalRequestDigest,
+        intent: &IntentReceipt,
+        reservation_id: ReservationId,
+    ) -> Result<(), LoopError> {
+        let outcome = PersistedOutcome::not_dispatched(reservation_id);
+        let (committed, _) = self.append_outcome(key, digest, intent, true, &outcome, None)?;
+        self.settle(committed.reservation_id, false)
+    }
+
     fn commit_rejected(
         &self,
         key: &IdempotencyKey,
@@ -1271,6 +1299,7 @@ impl ModelKernel {
         }
         let status = match outcome.status {
             ModelOutcomeStatus::Succeeded => EffectStatus::Succeeded,
+            ModelOutcomeStatus::Failed => EffectStatus::Failed,
             ModelOutcomeStatus::Cancelled => EffectStatus::Cancelled,
             ModelOutcomeStatus::OutcomeUnknown => EffectStatus::OutcomeUnknown,
         };
@@ -1330,6 +1359,7 @@ struct DispatchReceipt {
 #[serde(rename_all = "snake_case")]
 enum ModelOutcomeStatus {
     Succeeded,
+    Failed,
     Cancelled,
     OutcomeUnknown,
 }
@@ -1373,6 +1403,20 @@ impl PersistedOutcome {
             usage: None,
             artifacts: Vec::new(),
             error: Some("cancelled_before_dispatch".to_owned()),
+            charged: false,
+            settlement: None,
+            policy_violation: None,
+            reservation_id,
+        }
+    }
+
+    fn not_dispatched(reservation_id: ReservationId) -> Self {
+        Self {
+            status: ModelOutcomeStatus::Failed,
+            result: None,
+            usage: None,
+            artifacts: Vec::new(),
+            error: Some("provider_not_dispatched".to_owned()),
             charged: false,
             settlement: None,
             policy_violation: None,
@@ -1464,6 +1508,11 @@ impl PersistedOutcome {
                     cancellation: None,
                     terminal: true,
                 })
+            }
+            ModelOutcomeStatus::Failed => {
+                Err(LoopError::Provider(self.error.unwrap_or_else(|| {
+                    "model call failed before dispatch".to_owned()
+                })))
             }
             ModelOutcomeStatus::Cancelled => Err(LoopError::Cancelled),
             ModelOutcomeStatus::OutcomeUnknown => Err(outcome_unknown()),
@@ -1663,8 +1712,10 @@ fn reservation_id(digest: [u8; 32], retry: u8) -> ReservationId {
 
 fn discard_reasoning(result: &mut ModelTurnResult) {
     for item in &mut result.output_items {
-        item.parts
-            .retain(|part| !matches!(part, Part::Reasoning(_)));
+        item.parts.retain(|part| {
+            !matches!(part, Part::Reasoning(_))
+                || matches!(part, Part::Reasoning(reasoning) if crate::agent::providers::openai_subscription::durable_reasoning(reasoning))
+        });
     }
 }
 

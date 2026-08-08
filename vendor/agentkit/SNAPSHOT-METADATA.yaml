@@ -259,6 +259,17 @@ maintenance:
         previous_sha256: "eaabc361e938eedd2ea242c44a6dd3669b6c28abdf1fe7f97306eae948b5a91a"
         patched_sha256: "963756a667b6111d2953cb5eac1ec005e05c1f780fe49c3f90837acfd3874e08"
     contract: "restored conversations derive the next/current turn index and operation sequence from transcript metadata while new conversations start at turn one"
+  transient_provider_errors:
+    patch_id: "kit-transient-provider-errors"
+    work_package: "openai-subscription-review"
+    classification: "local_only"
+    previous_snapshot_sha256: "776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49"
+    patched_snapshot_sha256: "9cf3f5547531310811c77d3454f68584b4f553725f3e2357770532a4abfabe8f"
+    files:
+      - path: "crates/agentkit-loop/src/lib.rs"
+        previous_sha256: "963756a667b6111d2953cb5eac1ec005e05c1f780fe49c3f90837acfd3874e08"
+        patched_sha256: "26dfb4a58a7d2334f946798d09752a973b03ddb6c4353e92a904fa034ddebedf"
+    contract: "transient model-provider failures carry a typed bounded retry-after hint"
   dead_code_removed:
     - "benchmarks/compose-bench/src/scenario.rs latency_ms builder"
     - "crates/agentkit-provider-cerebras/src/batch.rs marker and marker-only imports"
@@ -273,8 +284,8 @@ dependency_graph:
 final_snapshot:
   payload_file_count: 357
   manifest: "SNAPSHOT-MANIFEST.sha256"
-  manifest_sha256: "776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49"
-  aggregate_sha256: "776fc1476d67d8fead304b8ce1aa50cb884c53b37eff6fd49c8a7a77e0063b49"
+  manifest_sha256: "9cf3f5547531310811c77d3454f68584b4f553725f3e2357770532a4abfabe8f"
+  aggregate_sha256: "9cf3f5547531310811c77d3454f68584b4f553725f3e2357770532a4abfabe8f"
   aggregate_input: "sorted newline-terminated records: <sha256><two spaces><git mode><two spaces><path>"
   attestation_files_excluded_from_payload_digest:
     - "SNAPSHOT-MANIFEST.sha256"

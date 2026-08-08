@@ -8,7 +8,59 @@ use serde::Serialize;
 use crate::api::service::ServiceError;
 
 pub const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
-const TYPE_ROOT: &str = "https://kit.dev/problems/";
+pub const MAX_PROBLEM_CODE_LEN: usize = 64;
+
+pub fn valid_problem_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_PROBLEM_CODE_LEN
+        && code.as_bytes()[0].is_ascii_lowercase()
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+pub fn problem_type(code: &str) -> String {
+    assert!(valid_problem_code(code), "invalid Kit problem code");
+    format!("/problems/{code}")
+}
+
+pub fn valid_problem_type(value: &str, code: &str) -> bool {
+    valid_problem_code(code) && value.strip_prefix("/problems/") == Some(code)
+}
+
+pub fn known_problem_code(code: &str) -> bool {
+    matches!(
+        code,
+        "conflict"
+            | "cursor_expired"
+            | "cursor_upgrade_required"
+            | "deletion_job_conflict"
+            | "executor_unavailable"
+            | "idempotency_conflict"
+            | "internal_error"
+            | "invalid_cursor"
+            | "invalid_request"
+            | "invalid_stream_configuration"
+            | "legal_hold"
+            | "method_not_allowed"
+            | "not_found"
+            | "not_ready"
+            | "outcome_unknown"
+            | "payload_too_large"
+            | "platform_unavailable"
+            | "profile_unavailable"
+            | "repository_service_unavailable"
+            | "request_timeout"
+            | "stale_deletion_fence"
+            | "stale_revision"
+            | "stream_unavailable"
+            | "terminal_unavailable"
+            | "unauthenticated"
+            | "unavailable"
+            | "unsupported"
+            | "unsupported_media_type"
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InvalidParameter {
@@ -168,7 +220,7 @@ impl ProblemDetails {
         instance: impl Into<String>,
     ) -> Self {
         Self {
-            problem_type: format!("{TYPE_ROOT}{code}").into_boxed_str(),
+            problem_type: problem_type(code).into_boxed_str(),
             title,
             status: status.as_u16(),
             detail: detail.into().into_boxed_str(),
@@ -195,5 +247,25 @@ impl IntoResponse for ProblemDetails {
             );
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn problem_type_is_a_bounded_relative_reference() {
+        assert_eq!(
+            problem_type("cursor_upgrade_required"),
+            "/problems/cursor_upgrade_required"
+        );
+        assert!(valid_problem_type("/problems/not_found", "not_found"));
+        assert!(known_problem_code("not_found"));
+        assert!(!known_problem_code("project_exists"));
+        assert!(!valid_problem_code("Uppercase"));
+        assert!(!valid_problem_code("_leading"));
+        assert!(!valid_problem_code(&"a".repeat(MAX_PROBLEM_CODE_LEN + 1)));
+        assert!(!valid_problem_type("/problems/not_found", "conflict"));
     }
 }

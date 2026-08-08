@@ -15,6 +15,7 @@ use zeroize::Zeroize;
 use crate::{
     api::{
         auth::contract::{Authorizer, ResourceScope, ScopedAuthorizer},
+        http::errors::problem_type,
         service::{
             EventProjection, OperationKind, ProjectProjection, RequestContext, RunCompletionRecord,
             RunProgressRecord, RunPromptProjection, RunSemanticEnvelope, handlers,
@@ -850,7 +851,7 @@ impl StreamRejection {
         recovery: Option<CursorRecovery>,
     ) -> Self {
         let body = serde_json::to_vec(&ProblemDocument {
-            problem_type: format!("https://kit.dev/problems/{code}"),
+            problem_type: problem_type(code),
             title,
             status,
             detail,
