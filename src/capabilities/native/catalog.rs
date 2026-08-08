@@ -23,6 +23,10 @@ use crate::{
 pub const JSON_SCHEMA_DIALECT: &str = crate::capabilities::schema::JSON_SCHEMA_2020_12;
 pub const MAX_NATIVE_INPUT_BYTES: usize = MAX_INVOCATION_ARGUMENT_BYTES;
 pub const MAX_NATIVE_OUTPUT_BYTES: usize = 64 * 1024;
+const _: () = assert!(
+    crate::domain::secret::JsonProjectionState::MAX_SERIALIZED_BYTES * 2 + 4096
+        <= MAX_NATIVE_INPUT_BYTES
+);
 const VERSION: &str = "1.0.0";
 pub(crate) const NATIVE_MAP_MAX_ITEMS: usize = 200;
 pub(crate) const NATIVE_MAP_MAX_ESTIMATED_TOKENS: usize = 16_384;
@@ -472,7 +476,24 @@ fn input_schema(tool: NativeTool) -> Value {
         NativeTool::Search => {
             let mut lexical = object(
                 json!({
-                    "cursor": {"type": ["object", "null"]},
+                    "cursor": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "custody_revision": {"minimum": 0, "type": "integer"},
+                            "digest": {"type": "string"},
+                            "epoch": {"type": "string"},
+                            "frontier": {"minimum": 0, "type": "integer"},
+                            "index_digest": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+                            "options_digest": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+                            "projection_state": {"maxLength": crate::domain::secret::JsonProjectionState::MAX_SERIALIZED_BYTES * 2, "minLength": 1, "pattern": "^[0-9a-f]+$", "type": "string"},
+                            "projection_state_tag": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+                            "projection_state_version": {"const": 1},
+                            "query_digest": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+                            "revision": revision()
+                        },
+                        "required": ["epoch", "revision", "digest", "index_digest", "query_digest", "options_digest", "frontier"],
+                        "type": ["object", "null"]
+                    },
                     "expected_revision": revision(),
                     "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
                     "mode": {"enum": ["path", "content", "path_and_content"]},
@@ -513,6 +534,17 @@ fn input_schema(tool: NativeTool) -> Value {
         }
         NativeTool::Read => object(
             json!({
+                "cursor": {
+                    "additionalProperties": false,
+                    "properties": {
+                        "custody_revision": {"minimum": 0, "type": "integer"},
+                        "projection_state": {"maxLength": crate::domain::secret::JsonProjectionState::MAX_SERIALIZED_BYTES * 2, "minLength": 1, "pattern": "^[0-9a-f]+$", "type": "string"},
+                        "tag": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+                        "version": {"const": 1}
+                    },
+                    "required": ["version", "projection_state", "custody_revision", "tag"],
+                    "type": ["object", "null"]
+                },
                 "expected_revision": revision(),
                 "path": relative_path(),
                 "range": {

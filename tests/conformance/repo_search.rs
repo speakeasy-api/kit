@@ -11,11 +11,19 @@ use std::{
     time::Duration,
 };
 
-use kit::workspace::{
-    index::meta::{ContentState, IndexError, IndexOptions, MetadataIndex},
-    revision::{ManagedWorkspace, RevisionError, RevisionOptions},
-    search::lexical::{SearchError, SearchMode, SearchOptions, SearchQuery, search},
+use kit::{
+    domain::secret::{SecretCustody, SecretLease},
+    workspace::{
+        index::meta::{ContentState, IndexError, IndexOptions, MetadataIndex},
+        revision::{ManagedWorkspace, RevisionError, RevisionOptions},
+        search::lexical::{
+            SearchCursor, SearchError, SearchMode, SearchOptions, SearchQuery, search,
+            search_projected,
+        },
+    },
 };
+
+const CURSOR_KEY: [u8; 32] = [0x5a; 32];
 
 struct Fixture {
     root: PathBuf,
@@ -87,6 +95,230 @@ fn paths(index: &MetadataIndex) -> Vec<String> {
         .iter()
         .map(|entry| entry.path.to_string_lossy().into_owned())
         .collect()
+}
+
+#[test]
+fn projected_search_recomputes_and_enforces_the_wire_byte_bound() {
+    let fixture = Fixture::new();
+    for index in 0..12 {
+        fixture.write(&format!("file-{index:02}.txt"), "needle public suffix\n");
+    }
+    let (workspace, index) = fixture.index();
+    let request = query("needle", SearchMode::Content);
+    let baseline = search(
+        &workspace,
+        &index,
+        &request,
+        &SearchOptions::default(),
+        None,
+    )
+    .unwrap();
+    let options = SearchOptions {
+        max_result_bytes: SearchOptions::default().max_result_bytes,
+        ..SearchOptions::default()
+    };
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("needle"))]);
+    let projected = search_projected(
+        &workspace,
+        &index,
+        &request,
+        &options,
+        None,
+        &custody,
+        &CURSOR_KEY,
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&projected).unwrap();
+    assert_eq!(projected["result_bytes"], bytes.len());
+    assert!(bytes.len() <= options.max_result_bytes);
+    assert_eq!(
+        projected["matches"].as_array().unwrap().len(),
+        baseline.matches.len()
+    );
+}
+
+#[test]
+fn projected_search_advances_past_an_empty_page_and_reaches_later_matches() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "needle UNSAFE");
+    fixture.write("b.txt", "needle public");
+    let (workspace, index) = fixture.index();
+    let request = query("needle", SearchMode::Content);
+    let baseline_options = SearchOptions {
+        max_results: 1,
+        ..SearchOptions::default()
+    };
+    let options = SearchOptions {
+        max_result_bytes: SearchOptions::default().max_result_bytes,
+        ..baseline_options
+    };
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("UNSAFEBOUNDARY"))]);
+
+    let first = search_projected(
+        &workspace,
+        &index,
+        &request,
+        &options,
+        None,
+        &custody,
+        &CURSOR_KEY,
+    )
+    .unwrap();
+    assert_eq!(first["matches"].as_array().unwrap().len(), 1);
+    let cursor: SearchCursor = serde_json::from_value(first["cursor"].clone()).unwrap();
+
+    let second = search_projected(
+        &workspace,
+        &index,
+        &request,
+        &options,
+        Some(&cursor),
+        &custody,
+        &CURSOR_KEY,
+    )
+    .unwrap();
+    assert_eq!(second["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(second["matches"][0]["path"], "b.txt");
+    assert!(second["cursor"].is_null(), "paging must terminate");
+}
+
+#[test]
+fn projected_search_zero_fit_returns_typed_error_instead_of_a_stuck_cursor() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", format!("needle {}", "a".repeat(6000)));
+    let (workspace, index) = fixture.index();
+    let request = query("needle", SearchMode::Content);
+    let custody = SecretCustody::new([Arc::new(SecretLease::new(format!(
+        "truenull{}",
+        index.digest()
+    )))]);
+    for max_result_bytes in (512..10_000).step_by(32) {
+        let options = SearchOptions {
+            max_results: 1,
+            max_result_bytes,
+            max_snippet_bytes: 8 * 1024,
+            ..SearchOptions::default()
+        };
+        let result = search_projected(
+            &workspace,
+            &index,
+            &request,
+            &options,
+            None,
+            &custody,
+            &CURSOR_KEY,
+        );
+        if matches!(result, Err(SearchError::SingleResultTooLarge)) {
+            return;
+        }
+    }
+    panic!("projected zero-fit result did not return the typed oversized-item error");
+}
+
+#[test]
+fn byte_omitted_candidate_remains_at_the_cursor_frontier() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "needle short");
+    fixture.write("b.txt", format!("needle {}", "b".repeat(6000)));
+    let (workspace, index) = fixture.index();
+    let request = query("needle", SearchMode::Content);
+
+    for max_result_bytes in (512..10_000).step_by(32) {
+        let options = SearchOptions {
+            max_results: 2,
+            max_result_bytes,
+            max_snippet_bytes: 8 * 1024,
+            ..SearchOptions::default()
+        };
+        let Ok(page) = search(&workspace, &index, &request, &options, None) else {
+            continue;
+        };
+        if page.matches.len() != 1 || page.cursor.is_none() {
+            continue;
+        }
+        let cursor = page.cursor.unwrap();
+        assert_eq!(serde_json::to_value(&cursor).unwrap()["frontier"], 1);
+        assert!(matches!(
+            search(&workspace, &index, &request, &options, Some(&cursor)),
+            Err(SearchError::SingleResultTooLarge)
+        ));
+        return;
+    }
+    panic!("no byte budget retained the omitted candidate at its frontier");
+}
+
+#[test]
+fn authenticated_cursor_is_deterministic_exact_and_not_content_projected() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "needle first");
+    fixture.write("b.txt", "needle second");
+    let (workspace, index) = fixture.index();
+    let request = query("needle", SearchMode::Content);
+    let options = SearchOptions {
+        max_results: 1,
+        ..SearchOptions::default()
+    };
+    let empty = SecretCustody::default();
+    let first = search_projected(
+        &workspace,
+        &index,
+        &request,
+        &options,
+        None,
+        &empty,
+        &CURSOR_KEY,
+    )
+    .unwrap();
+    let token = first["cursor"].clone();
+    let overlapping = SecretCustody::new([Arc::new(SecretLease::new(token.to_string()))]);
+    let repeated = search_projected(
+        &workspace,
+        &index,
+        &request,
+        &options,
+        None,
+        &overlapping,
+        &CURSOR_KEY,
+    )
+    .unwrap();
+    assert!(repeated["cursor"].is_object());
+    assert!(!repeated["cursor"].to_string().contains(&request.text));
+    let repeated_cursor: SearchCursor = serde_json::from_value(repeated["cursor"].clone()).unwrap();
+
+    let resumed = search_projected(
+        &workspace,
+        &index,
+        &request,
+        &options,
+        Some(&repeated_cursor),
+        &overlapping,
+        &CURSOR_KEY,
+    )
+    .unwrap();
+    assert_eq!(resumed["matches"][0]["path"], "b.txt");
+
+    let mut tampered = first["cursor"].clone();
+    let tag = tampered["projection_state_tag"].as_str().unwrap();
+    let mut tag = tag.as_bytes().to_vec();
+    *tag.last_mut().unwrap() = if tag.last() == Some(&b'0') {
+        b'1'
+    } else {
+        b'0'
+    };
+    tampered["projection_state_tag"] = String::from_utf8(tag).unwrap().into();
+    let tampered: SearchCursor = serde_json::from_value(tampered).unwrap();
+    assert!(matches!(
+        search_projected(
+            &workspace,
+            &index,
+            &request,
+            &options,
+            Some(&tampered),
+            &empty,
+            &CURSOR_KEY,
+        ),
+        Err(SearchError::CursorMismatch)
+    ));
 }
 
 fn query(text: &str, mode: SearchMode) -> SearchQuery {
@@ -556,16 +788,11 @@ fn every_search_bound_marks_truncation_and_output_never_exceeds_limits() {
             ..bytes_options.clone()
         },
         None,
-    )
-    .unwrap();
-    assert!(one_byte_short.matches.is_empty());
-    assert!(one_byte_short.truncated && one_byte_short.cursor.is_none());
-    assert_eq!(one_byte_short.omitted, 12);
-    assert!(one_byte_short.omitted_complete);
-    assert_eq!(
-        one_byte_short.result_bytes,
-        serde_json::to_vec(&one_byte_short).unwrap().len()
     );
+    assert!(matches!(
+        one_byte_short,
+        Err(SearchError::SingleResultTooLarge)
+    ));
 
     let files = search(
         &workspace,
@@ -688,11 +915,11 @@ fn every_search_bound_marks_truncation_and_output_never_exceeds_limits() {
             ..SearchOptions::default()
         },
         None,
-    )
-    .unwrap();
-    assert!(short_escape.matches.is_empty() && short_escape.cursor.is_none());
-    assert_eq!(short_escape.omitted, 1);
-    assert!(short_escape.omitted_complete);
+    );
+    assert!(matches!(
+        short_escape,
+        Err(SearchError::SingleResultTooLarge)
+    ));
 
     let mut widest = bytes;
     widest.scanned_files = usize::MAX;

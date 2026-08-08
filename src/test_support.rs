@@ -27,6 +27,80 @@ use crate::{
 };
 use rusqlite::Transaction;
 
+struct RegisteredProcessBoundary {
+    identity: crate::executor::process::tree::BoundaryIdentity,
+    quiescent: bool,
+}
+
+impl RegisteredProcessBoundary {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            identity: crate::executor::process::tree::BoundaryIdentity::new(
+                crate::executor::process::tree::BoundaryKind::Container,
+                "test-registered-process",
+                "11".repeat(32),
+                "test-runtime-boundary",
+            )
+            .map_err(std::io::Error::other)?,
+            quiescent: false,
+        })
+    }
+}
+
+impl crate::executor::process::tree::BoundaryControl for RegisteredProcessBoundary {
+    fn identity(&self) -> &crate::executor::process::tree::BoundaryIdentity {
+        &self.identity
+    }
+
+    fn containment(&self) -> crate::executor::process::tree::Containment {
+        crate::executor::process::tree::Containment::Complete
+    }
+
+    fn release(&mut self, _deadline: std::time::Instant) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn kill_boundary(&mut self, _deadline: std::time::Instant) -> std::io::Result<()> {
+        self.quiescent = true;
+        Ok(())
+    }
+
+    fn wait_and_reap(&mut self, _deadline: std::time::Instant) -> std::io::Result<()> {
+        self.quiescent = true;
+        Ok(())
+    }
+
+    fn inspect(
+        &mut self,
+        _deadline: std::time::Instant,
+    ) -> std::io::Result<crate::executor::process::tree::Inspection> {
+        Ok(crate::executor::process::tree::Inspection {
+            identity: self.identity.clone(),
+            survivors: self.quiescent.then_some(0),
+            quiescent: self.quiescent,
+        })
+    }
+}
+
+pub fn spawn_registered_test_process(
+    command: std::process::Command,
+    owner: crate::domain::lifecycle::ProcessOwnership,
+    registration: crate::executor::process::own::ProcessRegistryRegistration,
+    limits: crate::executor::profile::ResourceLimits,
+) -> std::io::Result<crate::executor::process::own::OwnedProcess> {
+    let token = crate::executor::process::own::PreparedCommandToken::issue_observed_registered(
+        command,
+        owner,
+        RegisteredProcessBoundary::new()?,
+        |_: &crate::executor::process::tree::PersistedBoundary| Ok(()),
+        |_, _| Ok(()),
+        Some(registration),
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        limits,
+    )?;
+    crate::executor::process::own::spawn_owned(token, limits)
+}
+
 #[derive(Clone, Debug)]
 pub enum FormatterTestAction {
     Pass,
@@ -148,11 +222,84 @@ pub fn open_sqlite_store(path: impl AsRef<Path>) -> Result<SqliteStore, StoreErr
     SqliteStore::open(path, &authority())
 }
 
+pub fn open_project_store(
+    path: impl AsRef<Path>,
+    custody: crate::domain::secret::SecretCustody,
+) -> Result<SqliteStore, StoreError> {
+    SqliteStore::open(
+        path,
+        &crate::runtime::daemon::ControlPlaneAuthority::for_test_project(custody),
+    )
+}
+
 pub fn append(
     store: &mut SqliteStore,
     command: AppendCommand,
 ) -> Result<AppendOutcome, StoreError> {
     store.append(command)
+}
+
+pub fn project_event_export(
+    event: &crate::store::sqlite::append::StoredEvent,
+    custody: &crate::domain::secret::SecretCustody,
+) -> Result<Vec<u8>, String> {
+    project_event_export_projection(event, custody).map(|projected| projected.envelope)
+}
+
+pub(crate) fn project_event_export_projection(
+    event: &crate::store::sqlite::append::StoredEvent,
+    custody: &crate::domain::secret::SecretCustody,
+) -> Result<crate::api::service::ProjectedEventEnvelope, String> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        id: &'a crate::domain::ids::EventId,
+        stream: &'a crate::domain::events::EntityId,
+        sequence: crate::domain::events::StreamSequence,
+        commit_position: crate::domain::events::CommitPosition,
+        #[serde(rename = "type")]
+        event_type: &'a crate::domain::events::EventType,
+        schema_version: crate::domain::events::SchemaVersion,
+        occurred_at: &'a crate::domain::events::UtcDateTime,
+        causation_id: &'a crate::domain::ids::CommandId,
+        correlation_id: &'a crate::domain::events::EntityId,
+        attempt_id: Option<crate::domain::ids::AttemptId>,
+        trace_id: &'a crate::domain::events::TraceId,
+        payload: &'a serde_json::value::RawValue,
+        artifacts: &'a serde_json::value::RawValue,
+    }
+    let payload = serde_json::from_slice::<&serde_json::value::RawValue>(&event.event.payload)
+        .map_err(|error| error.to_string())?;
+    let artifacts = serde_json::from_slice::<&serde_json::value::RawValue>(&event.event.artifacts)
+        .map_err(|error| error.to_string())?;
+    let envelope = serde_json::to_vec(&Envelope {
+        id: &event.event.id,
+        stream: &event.event.stream,
+        sequence: event.sequence,
+        commit_position: event.commit_position,
+        event_type: &event.event.event_type,
+        schema_version: event.event.schema_version,
+        occurred_at: &event.event.occurred_at,
+        causation_id: &event.event.causation_id,
+        correlation_id: &event.event.correlation_id,
+        attempt_id: event.event.attempt_id,
+        trace_id: &event.event.trace_id,
+        payload,
+        artifacts,
+    })
+    .map_err(|error| error.to_string())?;
+    crate::api::service::project_event_envelopes(
+        custody,
+        vec![(envelope, event.event.payload.clone())],
+    )
+    .map(|mut projected| projected.remove(0))
+}
+
+pub fn project_composition_input(
+    custody: &crate::domain::secret::SecretCustody,
+    input: &crate::agent::prompt::PromptInput,
+) -> Result<crate::agent::prompt::PromptInput, String> {
+    crate::agent::executor::project_composition_input(custody, input)
+        .map_err(|error| error.to_string())
 }
 
 pub fn append_with_hook(
@@ -185,6 +332,16 @@ pub fn open_service_store(
     SqliteServiceStore::open(path, &authority())
 }
 
+pub fn open_project_service_store(
+    path: impl AsRef<Path>,
+    custody: crate::domain::secret::SecretCustody,
+) -> Result<SqliteServiceStore, crate::api::service::ServiceError> {
+    SqliteServiceStore::open(
+        path,
+        &crate::runtime::daemon::ControlPlaneAuthority::for_test_project(custody),
+    )
+}
+
 pub fn service<S, A>(store: S, authorizer: A) -> Service<S, A, NoopRuntime>
 where
     A: Authorizer,
@@ -197,6 +354,23 @@ where
     A: Authorizer,
 {
     Service::with_runtime(store, authorizer, runtime, &authority())
+}
+
+pub fn project_service_with_runtime<S, A, R>(
+    store: S,
+    authorizer: A,
+    runtime: R,
+    custody: crate::domain::secret::SecretCustody,
+) -> Service<S, A, R>
+where
+    A: Authorizer,
+{
+    Service::with_runtime(
+        store,
+        authorizer,
+        runtime,
+        &crate::runtime::daemon::ControlPlaneAuthority::for_test_project(custody),
+    )
 }
 
 pub fn service_with_runtime_and_config<S, A, R, M>(

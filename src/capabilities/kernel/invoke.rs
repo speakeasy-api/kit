@@ -708,12 +708,24 @@ fn prepare_inner(
     let decision = grant::decide(envelope.grant_request());
     let decision_digest = decision.snapshot_digest();
     let reason = decision.reason();
-    let authorized_inputs = decision
-        .into_authorized_inputs()
-        .ok_or(InvokeError::AuthorizationDenied(reason))?;
-
     let request_digest = request_digest(envelope, decision_digest);
     let reservation_id = reservation_id(request_digest);
+    let Some(authorized_inputs) = decision.into_authorized_inputs() else {
+        append_intent(envelope, runtime.store, request_digest, reservation_id)?;
+        append_outcome(
+            envelope,
+            runtime.store,
+            request_digest,
+            &terminal(
+                InvocationStatus::Failed,
+                None,
+                Some("authorization_denied"),
+                false,
+            ),
+            false,
+        )?;
+        return Err(InvokeError::AuthorizationDenied(reason));
+    };
     runtime
         .budget
         .reserve(reservation_id, envelope.reservation)?;
@@ -1034,6 +1046,8 @@ fn append_intent(
         "arguments_digest": Digest::of(DigestAlgorithm::Sha256, envelope.arguments).to_string(),
         "grant_snapshot_digest": envelope.grants.digest().to_string(),
         "config_snapshot_digest": hex(&envelope.config.digest()),
+        "authenticated_authority": envelope.authenticated.grant_snapshot().grants(),
+        "effective_authority": envelope.config.effective_authority(),
         "idempotency_key": envelope.idempotency_key.as_str(),
         "retry_safety": envelope.retry_safety,
         "attempt_id": envelope.attempt.attempt_id.to_string(),

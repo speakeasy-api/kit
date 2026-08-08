@@ -8,17 +8,21 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use kit::{
-    store::artifacts::{ArtifactDigest, ArtifactRetention, ArtifactStore, Reachability},
+    domain::secret::{SecretCustody, SecretLease},
+    store::artifacts::{
+        ArtifactClass, ArtifactDigest, ArtifactMetadata, ArtifactRetention, ArtifactStore,
+        Reachability,
+    },
     workspace::{
         index::meta::{IndexOptions, MetadataIndex},
         read::{
             ArtifactContext, ArtifactResolveOptions, Encoding, NewlineStyle, ReadError,
-            ReadOptions, ReadPublishPoint, ReadRange, ReadRequest, read, read_with_publish_hook,
-            read_with_stage_hook, resolve_artifact,
+            ReadOptions, ReadPublishPoint, ReadRange, ReadRequest, WorkspaceArtifactHandle, read,
+            read_projected, read_with_publish_hook, read_with_stage_hook, resolve_artifact,
         },
         revision::{ManagedWorkspace, RevisionError, RevisionOptions},
         search::discover::{DiscoverError, DiscoverKind, DiscoverOptions, DiscoverQuery, discover},
@@ -113,6 +117,345 @@ fn context(principal: &str) -> ArtifactContext {
         project: "project".to_owned(),
         retention: ArtifactRetention::Forever,
     }
+}
+
+fn legacy_v3_artifact(
+    workspace: &ManagedWorkspace,
+    store: &ArtifactStore,
+    context: &ArtifactContext,
+    request: &ReadRequest,
+    payload: &[u8],
+) -> WorkspaceArtifactHandle {
+    let epoch = workspace.current_revision().unwrap().epoch().to_string();
+    let revision = request.expected_revision.to_string();
+    let path = request.path.as_os_str().as_encoded_bytes();
+    let digest = blake3::hash(payload);
+    let mut binding = blake3::Hasher::new();
+    binding.update(b"kit-workspace-artifact-auth-v3\0");
+    for value in [
+        context.principal.as_bytes(),
+        context.project.as_bytes(),
+        epoch.as_bytes(),
+        revision.as_bytes(),
+        path,
+    ] {
+        binding.update(&(value.len() as u64).to_le_bytes());
+        binding.update(value);
+    }
+    binding.update(&[0]);
+    binding.update(&0_u64.to_le_bytes());
+    binding.update(&0_u64.to_le_bytes());
+    binding.update(&0_u64.to_le_bytes());
+    binding.update(&(payload.len() as u64).to_le_bytes());
+    binding.update(digest.as_bytes());
+
+    let mut envelope = b"kit-workspace-artifact-v3\0".to_vec();
+    for value in [epoch.as_bytes(), revision.as_bytes(), path] {
+        envelope.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        envelope.extend_from_slice(value);
+    }
+    envelope.push(0);
+    envelope.extend_from_slice(&0_u64.to_le_bytes());
+    envelope.extend_from_slice(&0_u64.to_le_bytes());
+    envelope.extend_from_slice(&0_u64.to_le_bytes());
+    envelope.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    let media_type = b"application/octet-stream";
+    envelope.extend_from_slice(&(media_type.len() as u64).to_le_bytes());
+    envelope.extend_from_slice(media_type);
+    envelope.extend_from_slice(binding.finalize().as_bytes());
+    envelope.push(0);
+    envelope.extend_from_slice(digest.as_bytes());
+    envelope.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    envelope.extend_from_slice(payload);
+
+    let staged = store
+        .stage(
+            &envelope,
+            ArtifactMetadata::new(
+                "application/vnd.kit.workspace-read-envelope",
+                ArtifactClass::File,
+                context.principal.clone(),
+                context.project.clone(),
+                context.retention,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let artifact_digest = staged.digest();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut committed = staged
+        .promote_pending()
+        .unwrap()
+        .commit_unissued_before(deadline)
+        .unwrap();
+    committed.issue_workspace_before(deadline).unwrap();
+    committed.finish().unwrap();
+
+    let mut mask = blake3::Hasher::new();
+    mask.update(b"kit-workspace-artifact-handle-v3\0");
+    for value in [
+        context.principal.as_bytes(),
+        context.project.as_bytes(),
+        revision.as_bytes(),
+        path,
+    ] {
+        mask.update(&(value.len() as u64).to_le_bytes());
+        mask.update(value);
+    }
+    mask.update(&[0]);
+    mask.update(&0_u64.to_le_bytes());
+    mask.update(&0_u64.to_le_bytes());
+    let mut opaque = artifact_digest.as_bytes();
+    for (byte, mask) in opaque.iter_mut().zip(mask.finalize().as_bytes()) {
+        *byte ^= mask;
+    }
+    WorkspaceArtifactHandle {
+        id: format!(
+            "kit-workspace-artifact:v3:{}",
+            opaque
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+        path: request.path.clone(),
+        path_digest: ArtifactDigest::digest(path).to_string(),
+    }
+}
+
+#[test]
+fn projected_read_reports_projected_coordinates_without_false_gaps() {
+    let fixture = Fixture::new();
+    let source = b"left workspace-secret\n";
+    fixture.write("secret.txt", source);
+    let (workspace, index) = fixture.indexed();
+    let revision = index.revision();
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("workspace-secret\n"))]);
+    let response = read_projected(
+        &workspace,
+        &index,
+        &fixture.artifacts(),
+        &context("projected-read"),
+        &ReadRequest {
+            expected_revision: revision,
+            path: PathBuf::from("secret.txt"),
+            range: ReadRange::Full,
+        },
+        &ReadOptions::default(),
+        &custody,
+    )
+    .unwrap();
+    assert_eq!(response.content, b"left [REDACTED]");
+    assert_eq!(response.byte_start, 0);
+    assert_eq!(response.byte_end, response.content.len());
+    assert_eq!(response.file_bytes, source.len());
+    assert_eq!(response.source_offset, Some(0));
+    assert_eq!(response.source_length, Some(source.len()));
+    assert_eq!(
+        response.source_digest.as_deref(),
+        Some(ArtifactDigest::digest(source).to_string().as_str())
+    );
+    assert_eq!(response.source_file_size, Some(source.len()));
+    assert_eq!(response.projected_offset, Some(0));
+    assert_eq!(response.projected_length, Some(response.content.len()));
+    assert_eq!(
+        response.projected_digest.as_deref(),
+        Some(
+            ArtifactDigest::digest(&response.content)
+                .to_string()
+                .as_str()
+        )
+    );
+    assert!(response.gap.is_none());
+    assert!(!response.truncated);
+    assert!(!response.final_newline);
+    assert_eq!(
+        response.result_bytes,
+        response.to_canonical_json().unwrap().len()
+    );
+}
+
+#[test]
+fn projected_read_hides_secret_filenames_and_projects_artifact_path_metadata() {
+    let fixture = Fixture::new();
+    fixture.write("workspace-secret.bin", b"public\0binary");
+    let (workspace, index) = fixture.indexed();
+    let artifacts = fixture.artifacts();
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("workspace-secret"))]);
+    let request = ReadRequest {
+        expected_revision: index.revision(),
+        path: PathBuf::from("workspace-secret.bin"),
+        range: ReadRange::Full,
+    };
+    let response = read_projected(
+        &workspace,
+        &index,
+        &artifacts,
+        &context("secret-filename"),
+        &request,
+        &ReadOptions::default(),
+        &custody,
+    )
+    .unwrap();
+
+    assert_eq!(response.path, Path::new("[REDACTED].bin"));
+    let artifact = response.artifact.as_ref().unwrap();
+    assert_eq!(artifact.path, Path::new("[REDACTED].bin"));
+    assert_eq!(
+        artifact.path_digest,
+        ArtifactDigest::digest(artifact.path.as_os_str().as_encoded_bytes()).to_string()
+    );
+    assert!(
+        !String::from_utf8_lossy(&response.to_canonical_json().unwrap())
+            .contains("workspace-secret")
+    );
+    assert_eq!(
+        resolve_artifact(
+            &workspace,
+            &artifacts,
+            &context("secret-filename"),
+            &request,
+            artifact,
+            &ArtifactResolveOptions::default(),
+        )
+        .unwrap(),
+        b"public\0binary"
+    );
+}
+
+#[test]
+fn projected_read_prevents_path_and_content_fragments_from_reconstructing() {
+    let fixture = Fixture::new();
+    fixture.write("split-", b"secret");
+    let (workspace, index) = fixture.indexed();
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("split-secret"))]);
+    let response = read_projected(
+        &workspace,
+        &index,
+        &fixture.artifacts(),
+        &context("split-path-content"),
+        &ReadRequest {
+            expected_revision: index.revision(),
+            path: PathBuf::from("split-"),
+            range: ReadRange::Full,
+        },
+        &ReadOptions::default(),
+        &custody,
+    )
+    .unwrap();
+
+    assert_eq!(response.path, Path::new("split-"));
+    assert_eq!(response.content, b"[REDACTED]");
+    let mut scanner = custody.redactor().scanner();
+    scanner.push(&response.to_canonical_json().unwrap());
+    assert!(!scanner.found());
+}
+
+#[test]
+fn unchanged_projected_partial_read_preserves_source_coordinates_exactly() {
+    let fixture = Fixture::new();
+    fixture.write("public.txt", b"prefix public suffix\n");
+    let (workspace, index) = fixture.indexed();
+    let request = ReadRequest {
+        expected_revision: index.revision(),
+        path: PathBuf::from("public.txt"),
+        range: ReadRange::Bytes { start: 7, end: 13 },
+    };
+    let baseline = read(
+        &workspace,
+        &index,
+        &fixture.artifacts(),
+        &context("plain-read"),
+        &request,
+        &ReadOptions::default(),
+    )
+    .unwrap();
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("absent-secret"))]);
+    let projected = read_projected(
+        &workspace,
+        &index,
+        &fixture.artifacts(),
+        &context("plain-read"),
+        &request,
+        &ReadOptions::default(),
+        &custody,
+    )
+    .unwrap();
+
+    assert_eq!(projected, baseline);
+    assert_eq!((projected.byte_start, projected.byte_end), (7, 13));
+    assert_eq!(projected.source_offset, None);
+    assert_eq!(projected.source_length, None);
+    assert_eq!(projected.source_digest, None);
+    assert_eq!(projected.projected_offset, None);
+    assert_eq!(projected.projected_digest, None);
+}
+
+#[test]
+fn changed_projected_partial_read_keeps_source_and_projected_coordinates_separate() {
+    let fixture = Fixture::new();
+    let source = b"prefix workspace-secret suffix\n";
+    fixture.write("secret.txt", source);
+    let (workspace, index) = fixture.indexed();
+    let artifacts = fixture.artifacts();
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("workspace-secret"))]);
+    let request = ReadRequest {
+        expected_revision: index.revision(),
+        path: PathBuf::from("secret.txt"),
+        range: ReadRange::Bytes { start: 7, end: 23 },
+    };
+    let response = read_projected(
+        &workspace,
+        &index,
+        &artifacts,
+        &context("partial-projected-read"),
+        &request,
+        &ReadOptions {
+            max_inline_bytes: 4,
+            ..ReadOptions::default()
+        },
+        &custody,
+    )
+    .unwrap();
+
+    assert_eq!(response.content, b"[RED");
+    assert_eq!(response.file_bytes, source.len());
+    assert_eq!((response.byte_start, response.byte_end), (0, 10));
+    assert_eq!(response.source_offset, Some(7));
+    assert_eq!(response.source_length, Some(16));
+    assert_eq!(
+        response.source_offset.unwrap() + response.source_length.unwrap(),
+        23
+    );
+    assert_eq!(
+        response.source_digest.as_deref(),
+        Some(
+            ArtifactDigest::digest(b"workspace-secret")
+                .to_string()
+                .as_str()
+        )
+    );
+    assert_eq!(response.source_file_size, Some(source.len()));
+    assert_eq!(response.projected_offset, Some(0));
+    assert_eq!(response.projected_length, Some(10));
+    assert_eq!(
+        response.projected_digest.as_deref(),
+        Some(ArtifactDigest::digest(b"[REDACTED]").to_string().as_str())
+    );
+    assert!(response.gap.is_some());
+    assert!(response.truncated);
+    assert_eq!(
+        resolve_artifact(
+            &workspace,
+            &artifacts,
+            &context("partial-projected-read"),
+            &request,
+            response.artifact.as_ref().unwrap(),
+            &ArtifactResolveOptions::default(),
+        )
+        .unwrap(),
+        b"[REDACTED]"
+    );
 }
 
 #[test]
@@ -313,6 +656,51 @@ fn binary_large_and_full_log_reads_use_revision_and_auth_bound_artifacts() {
             &ArtifactResolveOptions::default(),
         ),
         Err(ReadError::InvalidOptions(_))
+    ));
+}
+
+#[test]
+fn durable_v3_workspace_artifact_fixture_resolves_without_v4_semantic_confusion() {
+    let fixture = Fixture::new();
+    let payload = b"legacy\0workspace-artifact";
+    fixture.write("legacy.bin", payload);
+    let (workspace, index) = fixture.indexed();
+    let artifacts = fixture.artifacts();
+    let context = context("legacy-reader");
+    let request = ReadRequest {
+        expected_revision: index.revision(),
+        path: PathBuf::from("legacy.bin"),
+        range: ReadRange::Full,
+    };
+    let handle = legacy_v3_artifact(&workspace, &artifacts, &context, &request, payload);
+
+    assert_eq!(
+        resolve_artifact(
+            &workspace,
+            &artifacts,
+            &context,
+            &request,
+            &handle,
+            &ArtifactResolveOptions::default(),
+        )
+        .unwrap(),
+        payload
+    );
+    let confused = WorkspaceArtifactHandle {
+        id: handle.id.replacen(":v3:", ":v4:", 1),
+        path: handle.path.clone(),
+        path_digest: handle.path_digest.clone(),
+    };
+    assert!(matches!(
+        resolve_artifact(
+            &workspace,
+            &artifacts,
+            &context,
+            &request,
+            &confused,
+            &ArtifactResolveOptions::default(),
+        ),
+        Err(ReadError::ArtifactAuthorization)
     ));
 }
 

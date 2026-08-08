@@ -106,7 +106,15 @@ fn projection_value(projection: QueryProjection) -> Result<Value, ClientError> {
         QueryProjection::DeletionJob(value) => value,
         QueryProjection::Events(page) => json!({
             "items": page.events.into_iter().map(event_value).collect::<Result<Vec<_>, _>>()?,
-            "next_cursor": encode_cursor(page.next_cursor.position()),
+            "next_cursor": page.opaque_next_cursor
+                .unwrap_or_else(|| encode_cursor(page.next_cursor.position())),
+            "truncated": page.truncated,
+        }),
+        QueryProjection::ProjectedEvents(page) => json!({
+            "items": page.page.events.into_iter().map(event_value).collect::<Result<Vec<_>, _>>()?,
+            "next_cursor": page.page.opaque_next_cursor
+                .unwrap_or_else(|| encode_cursor(page.page.next_cursor.position())),
+            "truncated": page.page.truncated,
         }),
         QueryProjection::Runs(value) => json!({ "items": value }),
         QueryProjection::Run(value) => json!(value),
@@ -135,12 +143,18 @@ fn projection_value(projection: QueryProjection) -> Result<Value, ClientError> {
 fn event_value(event: EventProjection) -> Result<Value, ClientError> {
     let payload = serde_json::from_slice::<Value>(&event.payload)
         .map_err(|error| ClientError::internal(error.to_string()))?;
+    let projected_envelope = String::from_utf8(event.envelope)
+        .map_err(|error| ClientError::internal(error.to_string()))?;
     Ok(json!({
-        "cursor": encode_cursor(event.cursor.position()),
+        "cursor": event.opaque_cursor
+            .unwrap_or_else(|| encode_cursor(event.cursor.position())),
         "project_id": event.project_id,
         "operation": event.operation,
         "stream": event.stream,
         "payload": payload,
+        "authority_digest": event.authority_digest,
+        "projection_digest": event.projection_digest,
+        "projected_envelope": projected_envelope,
     }))
 }
 
@@ -179,5 +193,35 @@ fn error_title(kind: ClientErrorKind) -> &'static str {
         ClientErrorKind::Unavailable => "Service unavailable",
         ClientErrorKind::Timeout => "Request timed out",
         ClientErrorKind::Internal => "Internal server error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{api::service::EventCursor, domain::ids::ProjectId};
+
+    #[test]
+    fn event_output_keeps_verified_audit_fields() {
+        let value = event_value(EventProjection {
+            cursor: EventCursor::new(1),
+            opaque_cursor: None,
+            project_id: ProjectId::from_stable_bytes(b"cli-audit-project"),
+            operation: "run.progress".to_owned(),
+            stream: "run_00000000000000000000000000".to_owned(),
+            payload: b"{}".to_vec(),
+            envelope: br#"{"operation":"run.progress"}"#.to_vec(),
+            authority_digest: "sha256:authority".to_owned(),
+            projection_digest: "sha256:projection".to_owned(),
+        })
+        .unwrap();
+
+        assert_eq!(value["authority_digest"], "sha256:authority");
+        assert_eq!(value["projection_digest"], "sha256:projection");
+        assert_eq!(
+            value["projected_envelope"],
+            r#"{"operation":"run.progress"}"#
+        );
+        assert!(human(&value).unwrap().contains("authority_digest"));
     }
 }

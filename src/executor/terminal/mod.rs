@@ -1536,7 +1536,7 @@ impl<D: PtyDriver, S: TerminalSnapshotStore> TerminalManager<D, S> {
             .map_err(TerminalError::Driver)
     }
 
-    pub(crate) fn bind_process(
+    pub fn bind_process(
         &self,
         control: &TerminalControl,
         command: &mut Command,

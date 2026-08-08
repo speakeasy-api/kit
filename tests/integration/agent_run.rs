@@ -731,6 +731,7 @@ mod agent_run_tests {
                 run_id: fixture.run_id,
                 after: kit::api::service::EventCursor::START,
                 limit: 100,
+                opaque_cursor: None,
             })
             .unwrap()
         else {

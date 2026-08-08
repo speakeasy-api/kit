@@ -9,7 +9,7 @@ use std::{
 use kit::{
     api::service::CommandObservation,
     domain::events::TraceId,
-    domain::secret::SecretLease,
+    domain::secret::{SecretCustody, SecretLease},
     telemetry::otel::{
         ADAPTER_VERSION, Adapter, AeadProvider, AttributeValue, DropPolicy, EncryptionKeyHandle,
         EnqueueOutcome, ExportBatch, ExportError, Exporter, LogRecord, LogSeverity, Metric,
@@ -227,6 +227,66 @@ fn canary_is_absent_from_every_export_signal() {
     assert_eq!(adapter.flush(&mut exporter).unwrap(), 4);
     let corpus = String::from_utf8(exporter.0[0].to_canonical_json().unwrap()).unwrap();
     assert_eq!(corpus.matches(CANARY).count(), 0, "{corpus}");
+}
+
+#[test]
+fn ordered_otel_state_redacts_secrets_split_across_keys_values_and_events() {
+    let secrets = [SecretLease::new("split-secret-event-tail")];
+    let mut adapter =
+        Adapter::new(Resource::default(), &secrets, 1, DropPolicy::DropNewest).unwrap();
+    let mut trace = span(1, SpanName::ApiCommand, None);
+    trace.attributes.insert(
+        "split-secret-".to_owned(),
+        AttributeValue::String("event-".to_owned()),
+    );
+    trace.events.push(SpanEvent {
+        name: "tail".to_owned(),
+        timestamp_unix_nanos: 1,
+        attributes: BTreeMap::from([(
+            "valid.key".to_owned(),
+            AttributeValue::String("public".to_owned()),
+        )]),
+    });
+
+    adapter.enqueue(TelemetryItem::Span(trace)).unwrap();
+    let mut exporter = CaptureExporter::default();
+    adapter.flush(&mut exporter).unwrap();
+    let exported = serde_json::to_string(&exporter.0[0]).unwrap();
+    assert!(!exported.contains("split-secret-event-tail"));
+    assert!(exported.contains("redacted.0"));
+    assert!(exported.contains("[REDACTED]"));
+}
+
+#[test]
+fn complete_projected_batch_rejects_reconstruction_across_queued_nested_fields() {
+    let secret = "fragmentattribute-event-status-fragmentqueued";
+    let secrets = [SecretLease::new(secret)];
+    let mut adapter =
+        Adapter::new(Resource::default(), &secrets, 4, DropPolicy::DropNewest).unwrap();
+    let mut first = span(1, SpanName::ApiCommand, None);
+    first.attributes.insert(
+        "fragment".to_owned(),
+        AttributeValue::String("attribute-".to_owned()),
+    );
+    first.events.push(SpanEvent {
+        name: "event-".to_owned(),
+        timestamp_unix_nanos: 1,
+        attributes: BTreeMap::new(),
+    });
+    first.status = SpanStatus::Error(Some("status-".to_owned()));
+    assert_eq!(
+        adapter.enqueue(TelemetryItem::Span(first)).unwrap(),
+        EnqueueOutcome::Accepted
+    );
+
+    let mut second = span(2, SpanName::RunAttempt, Some(1));
+    second.attributes.insert(
+        "fragment".to_owned(),
+        AttributeValue::String("queued".to_owned()),
+    );
+    let error = adapter.enqueue(TelemetryItem::Span(second)).unwrap_err();
+    assert!(error.to_string().contains("reconstructs active secret"));
+    assert_eq!(adapter.queued(), 1);
 }
 
 #[test]
@@ -478,6 +538,51 @@ fn runtime_preserves_a_bounded_queue_and_recovers_required_readiness() {
     assert_eq!(runtime.flush().unwrap(), 2);
     assert!(runtime.health().ready);
     assert_eq!(batches.lock().unwrap()[0].run_envelopes.len(), 2);
+}
+
+#[test]
+fn pending_batch_failure_updates_required_health_until_the_queue_drains() {
+    let custody = SecretCustody::default();
+    let (exporter, _, _) = runtime_exporter();
+    let runtime = TelemetryRuntime::encrypted_project(
+        Resource::default(),
+        &custody,
+        4,
+        DropPolicy::DropNewest,
+        exporter,
+        TelemetryReadinessPolicy::Required,
+    )
+    .unwrap();
+    for body in ["pending-", "secret"] {
+        runtime
+            .emit(TelemetryItem::Log(LogRecord {
+                timestamp_unix_nanos: 1,
+                severity: LogSeverity::Info,
+                body: AttributeValue::String(body.to_owned()),
+                attributes: BTreeMap::new(),
+                trace_id: None,
+                span_id: None,
+            }))
+            .unwrap();
+    }
+    custody.register(
+        "runtime",
+        "test",
+        Arc::new(SecretLease::new("pending-secret")),
+    );
+
+    assert!(runtime.flush().is_err());
+    let failed = runtime.health();
+    assert!(!failed.queue_healthy);
+    assert!(!failed.ready);
+    assert_eq!(failed.queued, 2);
+
+    custody.remove_owner("runtime");
+    assert_eq!(runtime.flush().unwrap(), 2);
+    let recovered = runtime.health();
+    assert!(recovered.queue_healthy);
+    assert!(recovered.ready);
+    assert_eq!(recovered.queued, 0);
 }
 
 struct SyncAead(AtomicU64);

@@ -91,13 +91,13 @@ impl HttpCredentialBroker for RotatingCredentials {
         &self,
         _handle: &SecretHandle,
         _context: &HttpSecretContext<'_>,
-    ) -> Result<SecretLease, HttpCredentialError> {
+    ) -> Result<Arc<SecretLease>, HttpCredentialError> {
         let value = if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
             b"old-credential".as_slice()
         } else {
             b"rotated-credential".as_slice()
         };
-        Ok(SecretLease::new(value.to_vec()))
+        Ok(Arc::new(SecretLease::new(value.to_vec())))
     }
 }
 
@@ -107,7 +107,7 @@ impl HttpCredentialBroker for Credentials {
         &self,
         handle: &SecretHandle,
         context: &HttpSecretContext<'_>,
-    ) -> Result<SecretLease, HttpCredentialError> {
+    ) -> Result<Arc<SecretLease>, HttpCredentialError> {
         self.calls.fetch_add(1, Ordering::AcqRel);
         self.contexts.lock().unwrap().push((
             handle.identifier().to_owned(),
@@ -119,7 +119,7 @@ impl HttpCredentialBroker for Credentials {
             "env:B" => b"credential-b".as_slice(),
             _ => return Err(HttpCredentialError::Denied),
         };
-        Ok(SecretLease::new(value.to_vec()))
+        Ok(Arc::new(SecretLease::new(value.to_vec())))
     }
 }
 

@@ -327,6 +327,7 @@ fn harness_with_outcome(route: Route, capability_outcome: DispatchOutcome) -> Ha
                     kit::executor::cancel::SqliteCancellationCoordinator::new(&database),
                 ),
                 budget: Arc::new(BudgetLedger::new(budget)),
+                custody: kit::domain::secret::SecretCustody::default(),
             },
             store,
             move |_| {

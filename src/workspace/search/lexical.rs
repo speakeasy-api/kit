@@ -7,12 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::workspace::{
     index::meta::{ContentState, MetadataEntry, MetadataIndex},
     revision::{EpochId, LimitKind, ManagedWorkspace, RevisionError, RevisionId},
 };
+
+const SEARCH_CURSOR_STATE_TAG_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchMode {
@@ -91,13 +93,21 @@ pub struct SearchCursor {
     epoch: EpochId,
     revision: RevisionId,
     digest: String,
-    #[serde(serialize_with = "serialize_hex")]
+    #[serde(serialize_with = "serialize_hex", deserialize_with = "deserialize_hex")]
     index_digest: [u8; 32],
-    #[serde(serialize_with = "serialize_hex")]
+    #[serde(serialize_with = "serialize_hex", deserialize_with = "deserialize_hex")]
     query_digest: [u8; 32],
-    #[serde(serialize_with = "serialize_hex")]
+    #[serde(serialize_with = "serialize_hex", deserialize_with = "deserialize_hex")]
     options_digest: [u8; 32],
     frontier: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_state_version: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custody_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_state_tag: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -129,6 +139,7 @@ pub enum SearchError {
     InvalidQuery(&'static str),
     InvalidOptions(&'static str),
     CursorMismatch,
+    SingleResultTooLarge,
     Serialization(serde_json::Error),
 }
 
@@ -151,6 +162,9 @@ impl fmt::Display for SearchError {
             Self::CursorMismatch => {
                 formatter.write_str("search cursor does not match the query or options")
             }
+            Self::SingleResultTooLarge => {
+                formatter.write_str("one lexical search result exceeds the result byte bound")
+            }
             Self::Serialization(error) => write!(formatter, "serialize search response: {error}"),
         }
     }
@@ -172,6 +186,17 @@ pub fn search(
     query: &SearchQuery,
     options: &SearchOptions,
     cursor: Option<&SearchCursor>,
+) -> Result<SearchResponse, SearchError> {
+    search_inner(workspace, index, query, options, cursor, true)
+}
+
+fn search_inner(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    query: &SearchQuery,
+    options: &SearchOptions,
+    cursor: Option<&SearchCursor>,
+    enforce_result_bytes: bool,
 ) -> Result<SearchResponse, SearchError> {
     let started = Instant::now();
     let deadline = started.checked_add(options.max_time).unwrap_or(started);
@@ -338,11 +363,13 @@ pub fn search(
         truncated: false,
         cursor: None,
     };
+    let mut consumed = frontier;
     for candidate in candidates.into_iter().skip(frontier) {
         check_deadline(deadline)?;
         if response.matches.len() == options.max_results {
             break;
         }
+        consumed += 1;
         response.matches.push(candidate);
         set_page_metadata(
             &mut response,
@@ -353,12 +380,17 @@ pub fn search(
             options_digest,
             options,
             frontier,
+            consumed,
             retained,
             omitted,
         );
         set_result_bytes(&mut response, deadline)?;
-        if response.result_bytes > options.max_result_bytes {
+        if enforce_result_bytes && response.result_bytes > options.max_result_bytes {
             response.matches.pop();
+            consumed -= 1;
+            if response.matches.is_empty() {
+                return Err(SearchError::SingleResultTooLarge);
+            }
             break;
         }
     }
@@ -371,17 +403,285 @@ pub fn search(
         options_digest,
         options,
         frontier,
+        consumed,
         retained,
         omitted,
     );
     set_result_bytes(&mut response, deadline)?;
-    if response.result_bytes > options.max_result_bytes {
+    if enforce_result_bytes && response.result_bytes > options.max_result_bytes {
         return Err(SearchError::InvalidOptions(
             "result byte bound is smaller than response metadata",
         ));
     }
     workspace.validate_revision_until(index.revision(), deadline)?;
     Ok(response)
+}
+
+pub fn search_projected(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    query: &SearchQuery,
+    options: &SearchOptions,
+    cursor: Option<&SearchCursor>,
+    custody: &crate::domain::secret::SecretCustody,
+    cursor_key: &[u8; 32],
+) -> Result<serde_json::Value, SearchError> {
+    search_projected_with_state(
+        workspace,
+        index,
+        query,
+        options,
+        cursor,
+        custody,
+        &mut crate::domain::secret::JsonProjectionState::default(),
+        cursor_key,
+        "",
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_projected_with_state(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    query: &SearchQuery,
+    options: &SearchOptions,
+    cursor: Option<&SearchCursor>,
+    custody: &crate::domain::secret::SecretCustody,
+    projection_state: &mut crate::domain::secret::JsonProjectionState,
+    cursor_key: &[u8; 32],
+    principal: &str,
+    project: &str,
+) -> Result<serde_json::Value, SearchError> {
+    validate_query(query, options)?;
+    validate_options(options)?;
+    if projection_state.custody_revision() != custody.revision() {
+        *projection_state = custody.projection_state();
+    }
+    let mut initial_state = projection_state.clone();
+    if let Some(cursor) = cursor {
+        let cursor_state = open_projected_cursor(cursor, custody, cursor_key, principal, project)?;
+        if !initial_state.merge_forward(cursor_state) {
+            return Err(SearchError::CursorMismatch);
+        }
+    }
+    let frontier = cursor.map_or(0, |cursor| cursor.frontier);
+    let mut response = search_inner(workspace, index, query, options, cursor, false)?;
+    response.cursor = None;
+    let source_matches = std::mem::take(&mut response.matches);
+    let source_omitted = response.omitted;
+    let mut accepted = None;
+    for count in 0..=source_matches.len() {
+        let mut candidate = response.clone();
+        candidate.matches = source_matches[..count].to_vec();
+        candidate.omitted = source_omitted + source_matches.len() - count;
+        candidate.truncated |= candidate.omitted != 0;
+        let has_omitted = candidate.omitted != 0;
+        let mut state = initial_state.clone();
+        let value = serde_json::to_value(candidate).map_err(SearchError::Serialization)?;
+        let mut projected = custody.project_json_stream(
+            crate::telemetry::redact::CaptureBoundary::WorkspaceMetadata,
+            &value,
+            &mut state,
+        );
+        let next_frontier = frontier + count;
+        let projected_cursor = (has_omitted && next_frontier < options.max_cursor_offset)
+            .then(|| SearchCursor {
+                epoch: index.epoch(),
+                revision: index.revision(),
+                digest: index.digest().to_string(),
+                index_digest: *index.index_digest(),
+                query_digest: digest_query(query),
+                options_digest: digest_options(options),
+                frontier: next_frontier,
+                projection_state_version: None,
+                projection_state: None,
+                custody_revision: None,
+                projection_state_tag: None,
+            })
+            .map(|cursor| seal_projected_cursor(cursor, &state, cursor_key, principal, project))
+            .transpose()?;
+        projected["cursor"] = projected_cursor
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(SearchError::Serialization)?
+            .unwrap_or(serde_json::Value::Null);
+        settle_projected_size(&mut projected)?;
+        if projected["result_bytes"].as_u64().unwrap_or(u64::MAX) <= options.max_result_bytes as u64
+        {
+            accepted = Some((projected, state));
+        } else {
+            break;
+        }
+    }
+    let Some((projected, state)) = accepted else {
+        return Err(SearchError::InvalidOptions(
+            "result byte bound is smaller than projected response metadata",
+        ));
+    };
+    if projected["matches"].as_array().is_some_and(Vec::is_empty) && !source_matches.is_empty() {
+        return Err(SearchError::SingleResultTooLarge);
+    }
+    *projection_state = state;
+    Ok(projected)
+}
+
+fn seal_projected_cursor(
+    mut cursor: SearchCursor,
+    state: &crate::domain::secret::JsonProjectionState,
+    key: &[u8; 32],
+    principal: &str,
+    project: &str,
+) -> Result<SearchCursor, SearchError> {
+    let serialized = state.to_bounded_bytes().ok_or(SearchError::InvalidOptions(
+        "projection state exceeds cursor bound",
+    ))?;
+    let associated = cursor_associated(&cursor, principal, project);
+    let encrypted = xor_cursor_state(key, &associated, &serialized);
+    let revision = state.custody_revision();
+    let version = crate::domain::secret::JsonProjectionState::VERSION;
+    let tag = crate::domain::crypto::hmac_sha256_domain(
+        key,
+        b"KIT-LEXICAL-CURSOR-STATE-TAG\0",
+        &[
+            &associated,
+            &version.to_be_bytes(),
+            &revision.to_be_bytes(),
+            &encrypted,
+        ],
+    );
+    cursor.projection_state_version = Some(version);
+    cursor.projection_state = Some(hex(&encrypted));
+    cursor.custody_revision = Some(revision);
+    cursor.projection_state_tag = Some(hex(&tag[..SEARCH_CURSOR_STATE_TAG_BYTES]));
+    Ok(cursor)
+}
+
+fn open_projected_cursor(
+    cursor: &SearchCursor,
+    custody: &crate::domain::secret::SecretCustody,
+    key: &[u8; 32],
+    principal: &str,
+    project: &str,
+) -> Result<crate::domain::secret::JsonProjectionState, SearchError> {
+    let fields = (
+        cursor.projection_state_version,
+        cursor.projection_state.as_deref(),
+        cursor.custody_revision,
+        cursor.projection_state_tag.as_deref(),
+    );
+    let (Some(version), Some(encoded), Some(revision), Some(encoded_tag)) = fields else {
+        return if fields == (None, None, None, None) && custody.is_empty() {
+            Ok(crate::domain::secret::JsonProjectionState::default())
+        } else {
+            Err(SearchError::CursorMismatch)
+        };
+    };
+    if version != crate::domain::secret::JsonProjectionState::VERSION
+        || revision != custody.revision()
+    {
+        return Err(SearchError::CursorMismatch);
+    }
+    let encrypted = decode_hex(encoded).ok_or(SearchError::CursorMismatch)?;
+    let actual_tag = decode_hex(encoded_tag).ok_or(SearchError::CursorMismatch)?;
+    let associated = cursor_associated(cursor, principal, project);
+    let expected_tag = crate::domain::crypto::hmac_sha256_domain(
+        key,
+        b"KIT-LEXICAL-CURSOR-STATE-TAG\0",
+        &[
+            &associated,
+            &version.to_be_bytes(),
+            &revision.to_be_bytes(),
+            &encrypted,
+        ],
+    );
+    if !crate::domain::crypto::constant_time_eq(
+        &actual_tag,
+        &expected_tag[..SEARCH_CURSOR_STATE_TAG_BYTES],
+    ) {
+        return Err(SearchError::CursorMismatch);
+    }
+    let serialized = xor_cursor_state(key, &associated, &encrypted);
+    let state = crate::domain::secret::JsonProjectionState::from_bounded_bytes(&serialized)
+        .ok_or(SearchError::CursorMismatch)?;
+    (state.custody_revision() == revision)
+        .then_some(state)
+        .ok_or(SearchError::CursorMismatch)
+}
+
+fn xor_cursor_state(key: &[u8; 32], associated: &[u8], bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for (counter, chunk) in bytes.chunks(32).enumerate() {
+        let mask = crate::domain::crypto::hmac_sha256_domain(
+            key,
+            b"KIT-LEXICAL-CURSOR-STATE-MASK\0",
+            &[associated, &(counter as u64).to_be_bytes()],
+        );
+        output.extend(chunk.iter().zip(mask).map(|(byte, mask)| byte ^ mask));
+    }
+    output
+}
+
+fn cursor_associated(cursor: &SearchCursor, principal: &str, project: &str) -> Vec<u8> {
+    let mut bytes = b"KIT-LEXICAL-CURSOR\0\x02".to_vec();
+    put_bytes(&mut bytes, principal.as_bytes());
+    put_bytes(&mut bytes, project.as_bytes());
+    bytes.extend_from_slice(cursor.epoch.as_bytes());
+    bytes.extend_from_slice(cursor.revision.as_bytes());
+    put_bytes(&mut bytes, cursor.digest.as_bytes());
+    bytes.extend_from_slice(&cursor.index_digest);
+    bytes.extend_from_slice(&cursor.query_digest);
+    bytes.extend_from_slice(&cursor.options_digest);
+    bytes.extend_from_slice(&(cursor.frontier as u64).to_be_bytes());
+    bytes
+}
+
+fn put_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    push_hex(&mut output, bytes);
+    output
+}
+
+fn push_hex(output: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.is_ascii() {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|digits| {
+            let digits = std::str::from_utf8(digits).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
+}
+
+fn settle_projected_size(value: &mut serde_json::Value) -> Result<(), SearchError> {
+    for _ in 0..usize::MAX.to_string().len() + 2 {
+        let bytes = serde_json::to_vec(value)
+            .map_err(SearchError::Serialization)?
+            .len();
+        if value["result_bytes"].as_u64() == Some(bytes as u64) {
+            return Ok(());
+        }
+        value["result_bytes"] = serde_json::Value::from(bytes);
+    }
+    Err(SearchError::Serialization(serde_json::Error::io(
+        io::Error::other("projected search response length did not converge"),
+    )))
 }
 
 fn validate_query(query: &SearchQuery, options: &SearchOptions) -> Result<(), SearchError> {
@@ -583,16 +883,16 @@ fn set_page_metadata(
     options_digest: [u8; 32],
     options: &SearchOptions,
     frontier: usize,
+    consumed: usize,
     retained: usize,
     rank_omitted: usize,
 ) {
-    let consumed = frontier + response.matches.len();
-    response.omitted = rank_omitted + retained - consumed;
+    response.omitted = rank_omitted + retained - frontier - response.matches.len();
     response.omitted_complete = !work_cut;
     response.truncated = work_cut || snippet_cut || response.omitted != 0;
     response.cursor = (!work_cut
         && !snippet_cut
-        && response.omitted != 0
+        && (consumed < retained || rank_omitted != 0)
         && consumed > frontier
         && consumed < options.max_cursor_offset)
         .then(|| SearchCursor {
@@ -603,6 +903,10 @@ fn set_page_metadata(
             query_digest,
             options_digest,
             frontier: consumed,
+            projection_state_version: None,
+            projection_state: None,
+            custody_revision: None,
+            projection_state_tag: None,
         });
 }
 
@@ -690,6 +994,113 @@ where
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     serializer.serialize_str(&output)
+}
+
+fn deserialize_hex<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() != N * 2 {
+        return Err(de::Error::custom("invalid hex digest length"));
+    }
+    let mut output = [0_u8; N];
+    for (byte, digits) in output.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let digits =
+            std::str::from_utf8(digits).map_err(|_| de::Error::custom("invalid hex digest"))?;
+        *byte =
+            u8::from_str_radix(digits, 16).map_err(|_| de::Error::custom("invalid hex digest"))?;
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod projection_state_tests {
+    use super::*;
+    use crate::domain::secret::{REDACTED, SecretCustody, SecretLease};
+    use std::sync::Arc;
+
+    #[test]
+    fn cursorless_search_continues_the_callers_projection_state_and_seals_it() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-search-state-{}",
+            crate::domain::ids::RunId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "needle first\n").unwrap();
+        std::fs::write(root.join("b.txt"), "needle second\n").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let workspace = ManagedWorkspace::open(&root).unwrap();
+        let revision = workspace.current_revision().unwrap();
+        let index = MetadataIndex::build(
+            &workspace,
+            revision.id(),
+            &crate::workspace::index::meta::IndexOptions::default(),
+        )
+        .unwrap();
+        let custody = SecretCustody::new([Arc::new(SecretLease::new(format!(
+            "priornull{}",
+            index.digest()
+        )))]);
+        let mut state = custody.projection_state();
+        custody.project_json_stream(
+            crate::telemetry::redact::CaptureBoundary::WorkspaceMetadata,
+            &serde_json::json!("prior"),
+            &mut state,
+        );
+
+        let projected = search_projected_with_state(
+            &workspace,
+            &index,
+            &SearchQuery {
+                text: "needle".to_owned(),
+                mode: SearchMode::Content,
+            },
+            &SearchOptions {
+                max_results: 1,
+                ..SearchOptions::default()
+            },
+            None,
+            &custody,
+            &mut state,
+            &[7; 32],
+            "principal",
+            "project",
+        )
+        .unwrap();
+
+        assert_eq!(projected["digest"], REDACTED);
+        assert!(projected["cursor"]["projection_state"].is_string());
+        assert_eq!(state.custody_revision(), custody.revision());
+        let cursor: SearchCursor = serde_json::from_value(projected["cursor"].clone()).unwrap();
+        custody.project_json_stream(
+            crate::telemetry::redact::CaptureBoundary::WorkspaceMetadata,
+            &serde_json::json!("intervening output"),
+            &mut state,
+        );
+        assert!(matches!(
+            search_projected_with_state(
+                &workspace,
+                &index,
+                &SearchQuery {
+                    text: "needle".to_owned(),
+                    mode: SearchMode::Content,
+                },
+                &SearchOptions {
+                    max_results: 1,
+                    ..SearchOptions::default()
+                },
+                Some(&cursor),
+                &custody,
+                &mut state,
+                &[7; 32],
+                "principal",
+                "project",
+            ),
+            Err(SearchError::CursorMismatch)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn digest_query(query: &SearchQuery) -> [u8; 32] {

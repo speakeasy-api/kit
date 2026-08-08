@@ -541,7 +541,7 @@
   applicability: mandatory
   interpretation: Native and MCP tool, resource, prompt, sampling, form-elicitation, and roots operations pass through broker-derived authority; ACP callbacks and the remaining protocol surface keep this promise active.
   acceptance_criteria:
-  - cargo test --test conformance architectural_promises broker_authority exits 0 with 0 failed tests
+  - cargo test --locked --test conformance broker_paths::broker_auth_is_bound_durable_and_precedes_kernel_effects -- --exact --test-threads=1 exits 0 with exactly 1 passed, 0 failed, and 0 ignored
   primary_milestone: M006
   contributing_milestones:
   - M007
@@ -579,7 +579,7 @@
   evidence_type: conformance
   evidence_id: EV-7.14-C-201
   evidence_job: integration
-  expected_result: cargo test --test conformance architectural_promises broker_authority exits 0 with 0 failed tests
+  expected_result: cargo test --locked --test conformance broker_paths::broker_auth_is_bound_durable_and_precedes_kernel_effects -- --exact --test-threads=1 exits 0 with exactly 1 passed, 0 failed, and 0 ignored
   artifact_digest: null
   environment_digest: null
   versions: null

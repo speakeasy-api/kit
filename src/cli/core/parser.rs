@@ -1040,12 +1040,14 @@ fn events(matches: &ArgMatches) -> Result<Invocation, String> {
             run_id: parse_id("--run", run)?,
             after: EventCursor::START,
             limit,
+            opaque_cursor: None,
         }
     } else {
         Query::ThreadEvents {
             thread_id: parse_id("--thread", string(matches, "thread"))?,
             after: EventCursor::START,
             limit,
+            opaque_cursor: None,
         }
     };
     Ok(Invocation::Client(Box::new(ClientRequest::Query {

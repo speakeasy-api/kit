@@ -518,6 +518,8 @@ fn json_output_uses_openapi_component_envelopes() {
             query(QueryProjection::Events(EventPage {
                 events: Vec::new(),
                 next_cursor: EventCursor::START,
+                opaque_next_cursor: None,
+                truncated: false,
             })),
         ),
         ("ThreadList", query(QueryProjection::Threads(Vec::new()))),

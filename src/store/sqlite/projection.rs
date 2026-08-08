@@ -720,11 +720,15 @@ fn read_indexed_event_projections(
         let (position, project, operation, stream, payload) = row?;
         Ok(EventProjection {
             cursor: EventCursor::new(checked_positive(position, "invalid event position")?),
+            opaque_cursor: None,
             project_id: crate::domain::ids::ProjectId::parse(&project)
                 .map_err(|error| ProjectionError::Reducer(error.to_string()))?,
             operation,
             stream,
             payload,
+            envelope: Vec::new(),
+            authority_digest: String::new(),
+            projection_digest: String::new(),
         })
     })
     .collect()

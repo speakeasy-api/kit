@@ -101,7 +101,9 @@ pub trait HttpCredentialBroker: Send + Sync + 'static {
         &self,
         handle: &SecretHandle,
         context: &HttpSecretContext<'_>,
-    ) -> Result<SecretLease, HttpCredentialError>;
+    ) -> Result<Arc<SecretLease>, HttpCredentialError>;
+
+    fn revoke(&self, _invocation_id: &str, _handle: &SecretHandle, _lease: &Arc<SecretLease>) {}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,16 +165,37 @@ pub(crate) struct McpResponseScanner {
     ingress: Mutex<SensitiveDataScanner>,
     canonical: Mutex<SensitiveDataScanner>,
     callback: Mutex<SensitiveDataScanner>,
+    _credentials: Option<CredentialCustodyGuard>,
+}
+
+struct CredentialCustodyGuard {
+    broker: Arc<dyn HttpCredentialBroker>,
+    invocation_id: String,
+    registrations: Vec<(SecretHandle, Arc<SecretLease>)>,
+}
+
+impl Drop for CredentialCustodyGuard {
+    fn drop(&mut self) {
+        for (handle, lease) in &self.registrations {
+            self.broker.revoke(&self.invocation_id, handle, lease);
+        }
+    }
 }
 
 impl McpResponseScanner {
-    pub(crate) fn new(credentials: &[SecretLease]) -> Self {
-        let scanner = CaptureRedactor::new(credentials).scanner();
+    pub(crate) fn new(credentials: &[Arc<SecretLease>]) -> Self {
+        let scanner = CaptureRedactor::from_shared(credentials).scanner();
         Self {
             ingress: Mutex::new(scanner.fork()),
             canonical: Mutex::new(scanner.fork()),
             callback: Mutex::new(scanner),
+            _credentials: None,
         }
+    }
+
+    fn with_credential_guard(mut self, guard: CredentialCustodyGuard) -> Self {
+        self._credentials = Some(guard);
+        self
     }
 
     pub(crate) fn scan_ingress(&self, bytes: &[u8]) -> Result<bool, ()> {
@@ -474,7 +497,12 @@ impl McpEgressConnector {
             }
         };
         let mut seen = BTreeSet::from([current.as_str().to_owned()]);
-        let mut credentials = Vec::new();
+        let mut credentials = Vec::<Arc<SecretLease>>::new();
+        let mut credential_guard = CredentialCustodyGuard {
+            broker: Arc::clone(&self.credentials),
+            invocation_id: invocation_id.to_owned(),
+            registrations: Vec::new(),
+        };
         let mut outbound_scanner = None;
 
         loop {
@@ -516,12 +544,15 @@ impl McpEgressConnector {
             .await
             .map_err(|_| McpEgressError::Timeout)?
             .map_err(McpEgressError::Credential)?;
+            credential_guard
+                .registrations
+                .push((handle.clone(), Arc::clone(&lease)));
             let credential_changed = credentials
                 .last()
-                .is_none_or(|previous: &SecretLease| previous.expose() != lease.expose());
+                .is_none_or(|previous| previous.expose() != lease.expose());
             if credential_changed {
                 outbound_scanner =
-                    Some(CaptureRedactor::new(std::slice::from_ref(&lease)).scanner());
+                    Some(CaptureRedactor::from_shared(std::slice::from_ref(&lease)).scanner());
             }
             let mut headers = if hop == 0 {
                 request.headers.clone()
@@ -577,7 +608,7 @@ impl McpEgressConnector {
                 }
                 self.policy.validate_peer(&authorization, peer)?;
             }
-            let mut response_scanner = CaptureRedactor::new(&credentials).scanner();
+            let mut response_scanner = CaptureRedactor::from_shared(&credentials).scanner();
             check_response_metadata(
                 current.as_str().as_bytes(),
                 dialed.response.headers(),
@@ -590,7 +621,10 @@ impl McpEgressConnector {
                     response: dialed.response,
                     redirects: hop,
                     deadline,
-                    scanner: Arc::new(McpResponseScanner::new(&credentials)),
+                    scanner: Arc::new(
+                        McpResponseScanner::new(&credentials)
+                            .with_credential_guard(credential_guard),
+                    ),
                 });
             }
             if matches!(
@@ -965,11 +999,12 @@ mod tests {
             b"final-hop-credential".as_slice(),
         ] {
             let redirected = McpResponseScanner::new(&[
-                SecretLease::new(b"first-hop-credential".to_vec()),
-                SecretLease::new(b"final-hop-credential".to_vec()),
+                Arc::new(SecretLease::new(b"first-hop-credential".to_vec())),
+                Arc::new(SecretLease::new(b"final-hop-credential".to_vec())),
             ]);
-            let later =
-                McpResponseScanner::new(&[SecretLease::new(b"later-response-credential".to_vec())]);
+            let later = McpResponseScanner::new(&[Arc::new(SecretLease::new(
+                b"later-response-credential".to_vec(),
+            ))]);
 
             assert!(later.scan_ingress(b"later-response-credential").unwrap());
             assert!(redirected.scan_ingress(reflected).unwrap());
@@ -982,14 +1017,16 @@ mod tests {
         let mut outbound = CaptureRedactor::new(std::slice::from_ref(&lease)).scanner();
         outbound.push(b"cross-direction-");
 
-        let response = McpResponseScanner::new(&[lease]);
+        let response =
+            McpResponseScanner::new(&[Arc::new(SecretLease::new(lease.expose().to_vec()))]);
         assert!(!response.scan_ingress(b"secret").unwrap());
     }
 
     #[test]
     fn response_scanner_matches_across_chunks_in_one_stream() {
-        let response =
-            McpResponseScanner::new(&[SecretLease::new(b"split-response-secret".to_vec())]);
+        let response = McpResponseScanner::new(&[Arc::new(SecretLease::new(
+            b"split-response-secret".to_vec(),
+        ))]);
 
         assert!(!response.scan_ingress(b"split-response-").unwrap());
         assert!(response.scan_ingress(b"secret").unwrap());

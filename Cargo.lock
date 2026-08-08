@@ -1470,6 +1470,7 @@ dependencies = [
  "ast-grep-language",
  "async-trait",
  "axum",
+ "base64",
  "blake3",
  "bytes",
  "chacha20poly1305",

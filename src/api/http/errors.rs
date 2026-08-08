@@ -97,6 +97,16 @@ impl ProblemDetails {
         )
     }
 
+    pub fn cursor_upgrade_required(instance: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "Cursor upgrade required",
+            "The cursor predates active projection state. Restart from the first page without a cursor.",
+            "cursor_upgrade_required",
+            instance,
+        )
+    }
+
     pub fn timeout(instance: impl Into<String>) -> Self {
         Self::new(
             StatusCode::GATEWAY_TIMEOUT,

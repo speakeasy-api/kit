@@ -179,6 +179,7 @@ pub struct ToolKernelContext {
     pub cancellation: Arc<AtomicBool>,
     pub cancellation_coordinator: Arc<dyn ExecutorCancellationCoordinator>,
     pub budget: Arc<BudgetLedger>,
+    pub custody: crate::domain::secret::SecretCustody,
 }
 
 struct KernelRuntime {
@@ -492,6 +493,11 @@ impl ToolExecutorAdapter {
             .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
         {
             self.context.cancellation.store(true, Ordering::Release);
+        }
+        if self.context.custody.contains_json(&request.input) {
+            return invalid_input(
+                "active secret values are forbidden in tool input; use an opaque secret reference",
+            );
         }
         let _cancellation_watch = ctx.cancellation.map(|cancellation| {
             CancellationWatch::start(

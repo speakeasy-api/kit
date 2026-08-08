@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -27,7 +27,7 @@ use crate::{
         },
     },
     store::artifacts::{ArtifactRetention, ArtifactStore},
-    telemetry::redact::{CaptureBoundary, CaptureRedactor},
+    telemetry::redact::CaptureBoundary,
     verify::lsp::facts::SemanticFact,
     verify::profiles::{ProfileSelection, VerificationRegistry},
     workspace::{
@@ -50,11 +50,13 @@ use crate::{
             ScoreBand, SemanticRelationship, StackFrame, build_repository_map_with_history,
             build_repository_map_with_structure, validate_semantic_evidence,
         },
-        read::{ArtifactContext, ReadOptions, ReadRange, ReadRequest, read},
+        read::{ArtifactContext, ReadOptions, ReadRange, ReadRequest, read_projected_with_state},
         revision::{ManagedWorkspace, RevisionId, RevisionOptions},
         search::{
             discover::{DiscoverCursor, DiscoverOptions, DiscoverQuery, discover},
-            lexical::{SearchCursor, SearchMode, SearchOptions, SearchQuery, search},
+            lexical::{
+                SearchCursor, SearchMode, SearchOptions, SearchQuery, search_projected_with_state,
+            },
             structural::{StructuralOptions, StructuralQuery, search as structural_search},
         },
         syntax::SyntaxIndex,
@@ -191,6 +193,7 @@ pub(crate) struct NativeRuntime {
     pub container_image: Option<String>,
     pub verification_registry: VerificationRegistry,
     pub check_runner: Option<CheckRunner>,
+    pub custody: crate::domain::secret::SecretCustody,
     pub secrets: Vec<crate::domain::secret::SecretLease>,
     pub syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
     pub formatter_required: bool,
@@ -198,6 +201,7 @@ pub(crate) struct NativeRuntime {
     pub feedback: Option<NativeFeedbackRuntime>,
     pub semantic_evidence: NativeSemanticEvidenceStore,
     pub edit_validation_time: std::time::Duration,
+    pub cursor_key: [u8; 32],
     #[cfg(test)]
     pub run_runner: Option<CheckRunner>,
 }
@@ -393,6 +397,7 @@ pub(crate) struct NativeDispatcher {
     container_image: Option<String>,
     verification_registry: VerificationRegistry,
     check_runner: Option<CheckRunner>,
+    custody: crate::domain::secret::SecretCustody,
     secrets: Vec<crate::domain::secret::SecretLease>,
     syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
     formatter_required: bool,
@@ -400,6 +405,9 @@ pub(crate) struct NativeDispatcher {
     feedback: Option<NativeFeedbackRuntime>,
     semantic_evidence: NativeSemanticEvidenceStore,
     edit_validation_time: std::time::Duration,
+    cursor_key: [u8; 32],
+    projection_state: crate::domain::secret::JsonProjectionState,
+    read_replay: Option<ReadReplay>,
     #[cfg(test)]
     run_runner: Option<CheckRunner>,
 }
@@ -428,6 +436,7 @@ impl NativeDispatcher {
         std::fs::create_dir_all(&build).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
         let grants = authenticated.grant_snapshot().clone();
+        let projection_state = runtime.custody.projection_state();
         Ok(Self {
             extension_guard: runtime.extension_guard,
             root,
@@ -455,6 +464,7 @@ impl NativeDispatcher {
             container_image: runtime.container_image,
             verification_registry: runtime.verification_registry,
             check_runner: runtime.check_runner,
+            custody: runtime.custody,
             secrets: runtime.secrets,
             syntax_executors: runtime.syntax_executors,
             formatter_required: runtime.formatter_required,
@@ -462,6 +472,9 @@ impl NativeDispatcher {
             feedback: runtime.feedback,
             semantic_evidence: runtime.semantic_evidence,
             edit_validation_time: runtime.edit_validation_time,
+            cursor_key: runtime.cursor_key,
+            projection_state,
+            read_replay: None,
             #[cfg(test)]
             run_runner: runtime.run_runner,
         })
@@ -519,8 +532,20 @@ impl NativeDispatcher {
         }
         if descriptor.tool() == NativeTool::Edit {
             return match self.edit(invocation.arguments(), invocation.attempt()) {
-                Ok((data, artifacts, true)) => committed_output(data, artifacts, &self.artifacts),
-                Ok((data, artifacts, false)) => output(data, artifacts, &self.artifacts),
+                Ok((data, artifacts, true)) => committed_output(
+                    data,
+                    artifacts,
+                    &self.artifacts,
+                    &self.custody,
+                    &mut self.projection_state,
+                ),
+                Ok((data, artifacts, false)) => streaming_output(
+                    data,
+                    artifacts,
+                    &self.artifacts,
+                    &self.custody,
+                    &mut self.projection_state,
+                ),
                 Err(code) => failed(&code),
             };
         }
@@ -534,7 +559,18 @@ impl NativeDispatcher {
         };
         match result {
             Ok((_data, _artifacts)) if self.cancelled() => failed("cancelled_after_dispatch"),
-            Ok((data, artifacts)) => output(data, artifacts, &self.artifacts),
+            Ok((data, artifacts))
+                if matches!(descriptor.tool(), NativeTool::Search | NativeTool::Read) =>
+            {
+                projected_output(data, artifacts, &self.artifacts)
+            }
+            Ok((data, artifacts)) => streaming_output(
+                data,
+                artifacts,
+                &self.artifacts,
+                &self.custody,
+                &mut self.projection_state,
+            ),
             Err(code) => failed(&code),
         }
     }
@@ -965,9 +1001,10 @@ impl NativeDispatcher {
                 },
             )
             .map_err(code("structural_search_failed"))?;
-            let mut value =
-                serde_json::to_value(&response).map_err(code("serialization_failed"))?;
-            if let Some(rewrite) = response.rewrite.as_ref().filter(|rewrite| rewrite.changed) {
+            let value = serde_json::to_value(&response).map_err(code("serialization_failed"))?;
+            let token = if let Some(rewrite) =
+                response.rewrite.as_ref().filter(|rewrite| rewrite.changed)
+            {
                 let canonical_ir = rewrite.ir.canonical_bytes();
                 let retained_bytes = canonical_ir
                     .len()
@@ -975,7 +1012,7 @@ impl NativeDispatcher {
                     .and_then(|bytes| bytes.checked_add(rewrite.change_diff_digest.len()))
                     .and_then(|bytes| bytes.checked_add(512))
                     .ok_or_else(|| "structural_preview_unavailable".to_owned())?;
-                let token = self.structural_previews.insert(StructuralPreviewRecord {
+                Some(self.structural_previews.insert(StructuralPreviewRecord {
                     principal: self.authenticated.principal_id().to_string(),
                     project: self.config.project_id().to_string(),
                     workspace: self.workspace_id.to_string(),
@@ -988,16 +1025,25 @@ impl NativeDispatcher {
                     created: Instant::now(),
                     expires: Instant::now(),
                     retained_bytes,
-                })?;
+                })?)
+            } else {
+                None
+            };
+            let mut value = self.custody.project_json_stream(
+                CaptureBoundary::WorkspaceMetadata,
+                &value,
+                &mut self.projection_state,
+            );
+            if let Some(token) = token {
                 value["rewrite"]["apply"] = json!({"preview_token": token});
-                settle_result_bytes(&mut value)?;
             }
+            settle_result_bytes(&mut value)?;
             return Ok((value, Vec::new()));
         }
         if input.rewrite.is_some() {
             return Err("lexical_rewrite_rejected".to_owned());
         }
-        let response = search(
+        search_projected_with_state(
             &workspace,
             &index,
             &SearchQuery {
@@ -1012,18 +1058,44 @@ impl NativeDispatcher {
                 ..SearchOptions::default()
             },
             input.cursor.as_ref(),
+            &self.custody,
+            &mut self.projection_state,
+            &self.cursor_key,
+            &self.authenticated.principal_id().to_string(),
+            &self.config.project_id().to_string(),
         )
-        .map_err(code("search_failed"))?;
-        serde_json::to_value(response)
-            .map(|value| (value, Vec::new()))
-            .map_err(code("serialization_failed"))
+        .map(|value| (value, Vec::new()))
+        .map_err(code("search_failed"))
     }
 
     fn read(&mut self, bytes: &[u8]) -> Result<(Value, Vec<String>), String> {
         self.ensure_not_cancelled()?;
         let input: ReadInput = decode(bytes)?;
+        let cursor_binding = read_cursor_binding(
+            &input,
+            &self.authenticated.principal_id().to_string(),
+            &self.config.project_id().to_string(),
+        )?;
+        if let Some(cursor) = &input.cursor {
+            let cursor_state =
+                open_read_cursor(cursor, &cursor_binding, &self.cursor_key, &self.custody)?;
+            self.workspace_index(&input.expected_revision)?;
+            if let Some(replay) = &self.read_replay
+                && replay.cursor == *cursor
+                && replay.binding == cursor_binding
+                && replay.projection_state == self.projection_state
+            {
+                return Ok((replay.data.clone(), replay.artifacts.clone()));
+            }
+            if !self.projection_state.merge_forward(cursor_state) {
+                return Err("read_cursor_invalid".to_owned());
+            }
+        } else if self.projection_state.custody_revision() != self.custody.revision() {
+            self.projection_state = self.custody.projection_state();
+        }
+        let cursor_state = self.projection_state.clone();
         let (workspace, index) = self.workspace_index(&input.expected_revision)?;
-        let response = read(
+        let response = read_projected_with_state(
             &workspace,
             &index,
             &self.artifacts,
@@ -1043,6 +1115,8 @@ impl NativeDispatcher {
                 max_time: std::time::Duration::from_secs(30),
                 ..ReadOptions::default()
             },
+            &self.custody,
+            &mut self.projection_state,
         )
         .map_err(code("read_failed"))?;
         let artifacts = response
@@ -1050,9 +1124,17 @@ impl NativeDispatcher {
             .as_ref()
             .map(|artifact| vec![artifact.id.clone()])
             .unwrap_or_default();
-        serde_json::to_value(response)
-            .map(|value| (value, artifacts))
-            .map_err(code("serialization_failed"))
+        let mut value = serde_json::to_value(response).map_err(code("serialization_failed"))?;
+        let cursor = seal_read_cursor(&cursor_state, &cursor_binding, &self.cursor_key)?;
+        value["cursor"] = serde_json::to_value(&cursor).map_err(code("serialization_failed"))?;
+        self.read_replay = Some(ReadReplay {
+            cursor,
+            binding: cursor_binding,
+            projection_state: self.projection_state.clone(),
+            data: value.clone(),
+            artifacts: artifacts.clone(),
+        });
+        Ok((value, artifacts))
     }
 
     fn edit(
@@ -1716,8 +1798,7 @@ impl NativeDispatcher {
         class: crate::store::artifacts::ArtifactClass,
     ) -> Result<String, String> {
         self.ensure_not_cancelled()?;
-        let capture =
-            CaptureRedactor::new(&self.secrets).sanitize(CaptureBoundary::Artifact, bytes);
+        let capture = self.custody.project(CaptureBoundary::Artifact, bytes);
         let bytes = capture.bytes().map_err(code("artifact_redaction_failed"))?;
         self.artifacts
             .put(
@@ -1949,6 +2030,25 @@ struct ReadInput {
     expected_revision: String,
     path: String,
     range: ReadRangeInput,
+    #[serde(default)]
+    cursor: Option<ReadProjectionCursor>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReadProjectionCursor {
+    version: u16,
+    projection_state: String,
+    custody_revision: u64,
+    tag: String,
+}
+
+struct ReadReplay {
+    cursor: ReadProjectionCursor,
+    binding: Vec<u8>,
+    projection_state: crate::domain::secret::JsonProjectionState,
+    data: Value,
+    artifacts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1957,6 +2057,145 @@ enum ReadRangeInput {
     Full,
     Bytes { start: usize, end: usize },
     Lines { start: usize, end: usize },
+}
+
+fn read_cursor_binding(
+    input: &ReadInput,
+    principal: &str,
+    project: &str,
+) -> Result<Vec<u8>, String> {
+    let mut binding = b"KIT-NATIVE-READ-CURSOR\0\x01".to_vec();
+    for value in [
+        principal.as_bytes(),
+        project.as_bytes(),
+        input.expected_revision.as_bytes(),
+        input.path.as_bytes(),
+    ] {
+        binding.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        binding.extend_from_slice(value);
+    }
+    match &input.range {
+        ReadRangeInput::Full => binding.push(0),
+        ReadRangeInput::Bytes { start, end } => {
+            binding.push(1);
+            binding.extend_from_slice(
+                &u64::try_from(*start)
+                    .map_err(|_| "read_cursor_invalid".to_owned())?
+                    .to_be_bytes(),
+            );
+            binding.extend_from_slice(
+                &u64::try_from(*end)
+                    .map_err(|_| "read_cursor_invalid".to_owned())?
+                    .to_be_bytes(),
+            );
+        }
+        ReadRangeInput::Lines { start, end } => {
+            binding.push(2);
+            binding.extend_from_slice(
+                &u64::try_from(*start)
+                    .map_err(|_| "read_cursor_invalid".to_owned())?
+                    .to_be_bytes(),
+            );
+            binding.extend_from_slice(
+                &u64::try_from(*end)
+                    .map_err(|_| "read_cursor_invalid".to_owned())?
+                    .to_be_bytes(),
+            );
+        }
+    }
+    Ok(binding)
+}
+
+fn seal_read_cursor(
+    state: &crate::domain::secret::JsonProjectionState,
+    binding: &[u8],
+    key: &[u8; 32],
+) -> Result<ReadProjectionCursor, String> {
+    let serialized = state
+        .to_bounded_bytes()
+        .ok_or_else(|| "read_projection_state_too_large".to_owned())?;
+    let encrypted = xor_read_cursor_state(key, binding, &serialized);
+    let version = crate::domain::secret::JsonProjectionState::VERSION;
+    let revision = state.custody_revision();
+    let tag = crate::domain::crypto::hmac_sha256_domain(
+        key,
+        b"KIT-NATIVE-READ-CURSOR-TAG\0",
+        &[
+            binding,
+            &version.to_be_bytes(),
+            &revision.to_be_bytes(),
+            &encrypted,
+        ],
+    );
+    Ok(ReadProjectionCursor {
+        version,
+        projection_state: hex(&encrypted),
+        custody_revision: revision,
+        tag: hex(&tag),
+    })
+}
+
+fn open_read_cursor(
+    cursor: &ReadProjectionCursor,
+    binding: &[u8],
+    key: &[u8; 32],
+    custody: &crate::domain::secret::SecretCustody,
+) -> Result<crate::domain::secret::JsonProjectionState, String> {
+    if cursor.version != crate::domain::secret::JsonProjectionState::VERSION
+        || cursor.custody_revision != custody.revision()
+    {
+        return Err("read_cursor_invalid".to_owned());
+    }
+    let encrypted = decode_hex_bytes(&cursor.projection_state)
+        .ok_or_else(|| "read_cursor_invalid".to_owned())?;
+    let actual_tag =
+        decode_hex_bytes(&cursor.tag).ok_or_else(|| "read_cursor_invalid".to_owned())?;
+    let expected_tag = crate::domain::crypto::hmac_sha256_domain(
+        key,
+        b"KIT-NATIVE-READ-CURSOR-TAG\0",
+        &[
+            binding,
+            &cursor.version.to_be_bytes(),
+            &cursor.custody_revision.to_be_bytes(),
+            &encrypted,
+        ],
+    );
+    if !crate::domain::crypto::constant_time_eq(&actual_tag, &expected_tag) {
+        return Err("read_cursor_invalid".to_owned());
+    }
+    let serialized = xor_read_cursor_state(key, binding, &encrypted);
+    let state = crate::domain::secret::JsonProjectionState::from_bounded_bytes(&serialized)
+        .ok_or_else(|| "read_cursor_invalid".to_owned())?;
+    (state.custody_revision() == cursor.custody_revision)
+        .then_some(state)
+        .ok_or_else(|| "read_cursor_invalid".to_owned())
+}
+
+fn xor_read_cursor_state(key: &[u8; 32], binding: &[u8], bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for (counter, chunk) in bytes.chunks(32).enumerate() {
+        let mask = crate::domain::crypto::hmac_sha256_domain(
+            key,
+            b"KIT-NATIVE-READ-CURSOR-MASK\0",
+            &[binding, &(counter as u64).to_be_bytes()],
+        );
+        output.extend(chunk.iter().zip(mask).map(|(byte, mask)| byte ^ mask));
+    }
+    output
+}
+
+fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.is_ascii() {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|digits| {
+            let digits = std::str::from_utf8(digits).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
 }
 
 impl From<ReadRangeInput> for ReadRange {
@@ -2746,7 +2985,35 @@ fn code<E: std::fmt::Display>(prefix: &'static str) -> impl FnOnce(E) -> String 
     move |_| prefix.to_owned()
 }
 
-fn output(data: Value, artifacts: Vec<String>, store: &ArtifactStore) -> DispatchOutcome {
+#[cfg(test)]
+fn output(
+    data: Value,
+    artifacts: Vec<String>,
+    store: &ArtifactStore,
+    custody: &crate::domain::secret::SecretCustody,
+) -> DispatchOutcome {
+    projected_output(
+        custody.project_json(CaptureBoundary::WorkspaceMetadata, &data),
+        artifacts,
+        store,
+    )
+}
+
+fn streaming_output(
+    data: Value,
+    artifacts: Vec<String>,
+    store: &ArtifactStore,
+    custody: &crate::domain::secret::SecretCustody,
+    state: &mut crate::domain::secret::JsonProjectionState,
+) -> DispatchOutcome {
+    projected_output(
+        custody.project_json_stream(CaptureBoundary::WorkspaceMetadata, &data, state),
+        artifacts,
+        store,
+    )
+}
+
+fn projected_output(data: Value, artifacts: Vec<String>, store: &ArtifactStore) -> DispatchOutcome {
     let artifact_digests = match artifacts
         .iter()
         .map(|artifact| {
@@ -2784,8 +3051,14 @@ fn output(data: Value, artifacts: Vec<String>, store: &ArtifactStore) -> Dispatc
     }
 }
 
-fn committed_output(data: Value, artifacts: Vec<String>, store: &ArtifactStore) -> DispatchOutcome {
-    match output(data, artifacts, store) {
+fn committed_output(
+    data: Value,
+    artifacts: Vec<String>,
+    store: &ArtifactStore,
+    custody: &crate::domain::secret::SecretCustody,
+    state: &mut crate::domain::secret::JsonProjectionState,
+) -> DispatchOutcome {
+    match streaming_output(data, artifacts, store, custody, state) {
         DispatchOutcome::Succeeded(output) => DispatchOutcome::DurablyCommitted(output),
         outcome => outcome,
     }
@@ -2910,6 +3183,176 @@ mod tests {
         dispatcher_with_semantic(runner, |_, _| (Vec::new(), None))
     }
 
+    #[test]
+    fn native_pages_cannot_reconstruct_any_secret_representation_split() {
+        let (directory, dispatcher) = dispatcher(None);
+        let custody = crate::domain::secret::SecretCustody::new([Arc::new(
+            crate::domain::secret::SecretLease::new("cross-frame"),
+        )]);
+        for representation in [
+            "cross-frame",
+            "%63%72%6F%73%73%2D%66%72%61%6D%65",
+            "63726f73732d6672616d65",
+            "Y3Jvc3MtZnJhbWU=",
+        ] {
+            for split in 1..representation.len() {
+                let mut state = crate::domain::secret::JsonProjectionState::default();
+                let pages = [&representation[..split], &representation[split..]].map(|fragment| {
+                    let DispatchOutcome::Succeeded(output) = streaming_output(
+                        json!({"fragment": fragment}),
+                        Vec::new(),
+                        &dispatcher.artifacts,
+                        &custody,
+                        &mut state,
+                    ) else {
+                        panic!("native page projection failed");
+                    };
+                    output.body
+                });
+                assert!(pages.iter().any(|page| {
+                    String::from_utf8_lossy(page).contains(crate::domain::secret::REDACTED)
+                }));
+                let mut reconstructed = custody.redactor().scanner();
+                reconstructed.push(&pages[0]);
+                reconstructed.push(&pages[1]);
+                assert!(
+                    !reconstructed.found(),
+                    "native pages leaked {representation} at split {split}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_reads_share_projection_state_across_content_and_later_paths() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        std::fs::write(dispatcher.root.join("first"), "cross-").unwrap();
+        std::fs::write(dispatcher.root.join("read"), "").unwrap();
+        dispatcher.custody.register(
+            "read-test",
+            "split",
+            Arc::new(crate::domain::secret::SecretLease::new("cross-read")),
+        );
+        let revision = dispatcher.revision().unwrap();
+        let read = |path: &str| {
+            serde_json::to_vec(&json!({
+                "expected_revision": revision,
+                "path": path,
+                "range": {"kind": "full"},
+            }))
+            .unwrap()
+        };
+
+        let (first, _) = dispatcher.read(&read("first")).unwrap();
+        let (second, _) = dispatcher.read(&read("read")).unwrap();
+
+        assert_eq!(first["path"], "first");
+        assert_eq!(second["path"], crate::domain::secret::REDACTED);
+        let mut scanner = dispatcher.custody.redactor().scanner();
+        scanner.push(&serde_json::to_vec(&first).unwrap());
+        scanner.push(&serde_json::to_vec(&second).unwrap());
+        assert!(!scanner.found());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_read_cursor_replays_exactly_and_rejects_a_different_range() {
+        let (directory, mut dispatcher) = dispatcher(None);
+        std::fs::write(dispatcher.root.join("fragment"), "cross-").unwrap();
+        dispatcher.custody.register(
+            "read-cursor-test",
+            "split",
+            Arc::new(crate::domain::secret::SecretLease::new("cross-cross-")),
+        );
+        let revision = dispatcher.revision().unwrap();
+        let request = json!({
+            "expected_revision": revision,
+            "path": "fragment",
+            "range": {"kind": "bytes", "start": 0, "end": 6},
+        });
+        let (first, _) = dispatcher
+            .read(&serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        let mut replay = request.clone();
+        replay["cursor"] = first["cursor"].clone();
+        let (replayed, _) = dispatcher
+            .read(&serde_json::to_vec(&replay).unwrap())
+            .unwrap();
+        assert_eq!(replayed, first);
+        assert_eq!(
+            serde_json::to_vec(&replayed).unwrap(),
+            serde_json::to_vec(&first).unwrap()
+        );
+        assert_eq!(replayed["content"], json!([99, 114, 111, 115, 115, 45]));
+
+        std::fs::write(dispatcher.root.join("fragment"), "changed").unwrap();
+        assert_eq!(
+            dispatcher.read(&serde_json::to_vec(&replay).unwrap()),
+            Err("stale_revision".to_owned())
+        );
+        assert!(dispatcher.read_replay.is_some());
+
+        for changed in [
+            ("range", json!({"kind": "bytes", "start": 0, "end": 5})),
+            ("range", json!({"kind": "lines", "start": 1, "end": 1})),
+            ("path", json!("lib.rs")),
+            ("expected_revision", json!("other-read-revision")),
+        ] {
+            replay[changed.0] = changed.1;
+            assert_eq!(
+                dispatcher.read(&serde_json::to_vec(&replay).unwrap()),
+                Err("read_cursor_invalid".to_owned())
+            );
+            replay = request.clone();
+            replay["cursor"] = first["cursor"].clone();
+        }
+
+        let cursor: ReadProjectionCursor = serde_json::from_value(first["cursor"].clone()).unwrap();
+        let input: ReadInput = serde_json::from_value(request).unwrap();
+        for binding in [
+            read_cursor_binding(
+                &input,
+                "other-principal",
+                &dispatcher.config.project_id().to_string(),
+            )
+            .unwrap(),
+            read_cursor_binding(
+                &input,
+                &dispatcher.authenticated.principal_id().to_string(),
+                "other-project",
+            )
+            .unwrap(),
+        ] {
+            assert!(
+                open_read_cursor(
+                    &cursor,
+                    &binding,
+                    &dispatcher.cursor_key,
+                    &dispatcher.custody
+                )
+                .is_err()
+            );
+        }
+
+        std::fs::write(dispatcher.root.join("later"), "public").unwrap();
+        let later = json!({
+            "expected_revision": dispatcher.revision().unwrap(),
+            "path": "later",
+            "range": {"kind": "full"},
+        });
+        dispatcher
+            .read(&serde_json::to_vec(&later).unwrap())
+            .unwrap();
+        let mut stale = replay;
+        stale["cursor"] = serde_json::to_value(cursor).unwrap();
+        assert_eq!(
+            dispatcher.read(&serde_json::to_vec(&stale).unwrap()),
+            Err("stale_revision".to_owned())
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn dispatcher_with_semantic(
         runner: Option<CheckRunner>,
         evidence: impl FnOnce(
@@ -3011,6 +3454,7 @@ mod tests {
                 container_image: None,
                 verification_registry: registry,
                 check_runner: runner,
+                custody: crate::domain::secret::SecretCustody::default(),
                 secrets: Vec::new(),
                 syntax_executors: vec![
                     crate::executor::syntax::SyntaxExecutor::debug(
@@ -3048,6 +3492,7 @@ mod tests {
                 semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
+                cursor_key: [7; 32],
                 run_runner: None,
             },
         )
@@ -3532,9 +3977,12 @@ mod tests {
             )),
             Err("map_invalid_request".to_owned())
         );
-        let DispatchOutcome::Succeeded(canonical) =
-            output(first, Vec::new(), &dispatcher.artifacts)
-        else {
+        let DispatchOutcome::Succeeded(canonical) = output(
+            first,
+            Vec::new(),
+            &dispatcher.artifacts,
+            &dispatcher.custody,
+        ) else {
             panic!("bounded map output failed");
         };
         assert!(canonical.body.len() <= MAX_NATIVE_OUTPUT_BYTES);
@@ -4559,6 +5007,7 @@ mod tests {
                 cancellation: Arc::new(AtomicBool::new(false)),
                 cancellation_coordinator: Arc::new(SqliteCancellationCoordinator::new(&database)),
                 budget: Arc::clone(&budget),
+                custody: crate::domain::secret::SecretCustody::default(),
             },
             store,
             move |invocation| dispatcher.dispatch(invocation),

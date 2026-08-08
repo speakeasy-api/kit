@@ -825,6 +825,7 @@ pub struct McpBootstrapContext<'a> {
     pub stdio_profiles: Option<&'a dyn crate::protocols::mcp::transport::OwnedStdioProfileProvider>,
     pub resolved_secrets: &'a Arc<BTreeMap<SecretHandle, Arc<crate::domain::secret::SecretLease>>>,
     pub callback_secrets: &'a BTreeMap<String, Vec<Arc<crate::domain::secret::SecretLease>>>,
+    pub custody: crate::domain::secret::SecretCustody,
     pub extension_registry: &'a crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
 }
 
@@ -1265,7 +1266,8 @@ pub(crate) async fn bootstrap(
                                              context.config.project_id(),
                                              context.workspace_id,
                                              credential_scopes.clone(),
-                                        ).with_callback_scanner(responders.secret_scanner()),
+                                        ).with_callback_scanner(responders.secret_scanner())
+                                          .with_custody(context.custody.clone(), context.attempt.attempt_id.to_string()),
                                     ),
                                     store,
                                     TransportLimits::default(),
@@ -1297,7 +1299,8 @@ pub(crate) async fn bootstrap(
                                          context.config.project_id(),
                                          context.workspace_id,
                                          credential_scopes,
-                                    ).with_callback_scanner(responders.secret_scanner()),
+                                    ).with_callback_scanner(responders.secret_scanner())
+                                      .with_custody(context.custody.clone(), context.attempt.attempt_id.to_string()),
                                 ),
                                 store,
                                 TransportLimits::default(),

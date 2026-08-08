@@ -1302,3 +1302,93 @@ impl std::error::Error for StartError {
         }
     }
 }
+
+#[cfg(test)]
+mod authority_bytes_tests {
+    use super::*;
+    use crate::domain::ids::{AttemptId, PrincipalId};
+
+    #[test]
+    fn pre_upgrade_nonlexical_record_retries_and_restarts_with_old_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-effect-authority-{}",
+            EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let owner = AttemptOwnership::new(
+            AttemptId::generate().unwrap(),
+            PrincipalId::generate().unwrap(),
+            crate::domain::lifecycle::FencingToken::new(7),
+        );
+        let owner_json = serde_json::to_string(&owner).unwrap();
+        let payload = format!(
+            r#"{{"record":{{"record":"cancellation_requested"}},"claim":null,"owner":{owner_json},"schema_version":1}}"#
+        )
+        .into_bytes();
+        let old_digest = CanonicalRequestDigest::new(sha256(&payload));
+        let scope = IdempotencyScope::new(
+            owner.principal_id,
+            LOOP_COMMAND,
+            EntityId::Attempt(owner.attempt_id),
+        )
+        .unwrap();
+        let key = IdempotencyKey::parse("pre-upgrade-effect").unwrap();
+        let command = AppendCommand {
+            idempotency_scope: scope.clone(),
+            idempotency_key: key.clone(),
+            request_digest: old_digest,
+            claim: None,
+            driver_claim: None,
+            allow_quiescent_driver_claim: false,
+            expected_versions: vec![ExpectedStreamVersion {
+                stream: EntityId::Attempt(owner.attempt_id),
+                version: ExpectedVersion::new(0),
+            }],
+            events: vec![NewEvent {
+                id: EventId::generate().unwrap(),
+                stream: EntityId::Attempt(owner.attempt_id),
+                event_type: EventType::parse(EFFECT_JOURNAL_EVENT).unwrap(),
+                schema_version: SchemaVersion::CURRENT,
+                occurred_at: UtcDateTime::parse("2026-08-06T12:00:00Z").unwrap(),
+                causation_id: CommandId::generate().unwrap(),
+                correlation_id: EntityId::Attempt(owner.attempt_id),
+                attempt_id: Some(owner.attempt_id),
+                trace_id: TraceId::parse("pre-upgrade-effect").unwrap(),
+                payload: payload.clone(),
+                artifacts: b"[]".to_vec(),
+            }],
+            response: b"loop-record-v1".to_vec(),
+        };
+        let custody = crate::domain::secret::SecretCustody::new([std::sync::Arc::new(
+            crate::domain::secret::SecretLease::new("unrelated-active-custody"),
+        )]);
+        let mut store =
+            crate::test_support::open_project_store(&database, custody.clone()).unwrap();
+        assert!(matches!(
+            store.append(command.clone()).unwrap(),
+            AppendOutcome::Committed(_)
+        ));
+        assert_eq!(store.events().unwrap()[0].event.payload, payload);
+        drop(store);
+
+        let mut store = crate::test_support::open_project_store(&database, custody).unwrap();
+        assert!(matches!(
+            store.append(command).unwrap(),
+            AppendOutcome::Replayed(_)
+        ));
+        assert_eq!(store.events().unwrap()[0].event.payload, payload);
+        assert!(matches!(
+            store.idempotency_status(&scope, &key).unwrap(),
+            crate::store::sqlite::idempotency::IdempotencyStatus::Terminal {
+                request_digest,
+                ..
+            } if request_digest == old_digest
+        ));
+        assert_eq!(
+            effect_records(&store, owner).unwrap(),
+            [EffectJournalRecord::CancellationRequested]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

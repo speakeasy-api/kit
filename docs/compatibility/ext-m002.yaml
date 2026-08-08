@@ -35,7 +35,7 @@ built_ins:
     identity: kit.prompt-modules
     version: 3.03.2
     schema_digest: sha256:cde19ed7558f080ef23e9320bbb4e8cf4db80b9ed323637780a0b43f512c25b5
-    implementation_digest: sha256:ced139107ea4321e3ae12fcac03977b9c60ae533a3e23cdc90ea5fb0b57949bb
+    implementation_digest: sha256:d0a6f123fe2f702a3a518947bbfbdc00fe73d9b92d79daf532d8ecc31f103b66
     source: src/agent/prompt/mod.rs
   - extension_point: cost_table
     identity: kit.cost-table

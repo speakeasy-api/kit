@@ -2105,7 +2105,22 @@ components:
             mode: {enum: [path, content, path_and_content]}
             path_prefixes: {type: array, maxItems: 32, items: {$ref: '#/components/schemas/RepositoryRelativePath'}}
             languages: {type: array, maxItems: 32, items: {type: string}}
-            cursor: {type: [object, 'null']}
+            cursor:
+              type: [object, 'null']
+              required: [epoch, revision, digest, index_digest, query_digest, options_digest, frontier]
+              properties:
+                epoch: {type: string}
+                revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
+                digest: {type: string}
+                index_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+                query_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+                options_digest: {type: string, pattern: '^[0-9a-f]{64}$'}
+                frontier: {type: integer, minimum: 0}
+                projection_state_version: {const: 1}
+                projection_state: {type: string, minLength: 1, maxLength: 524352, pattern: '^[0-9a-f]+$'}
+                custody_revision: {type: integer, minimum: 0}
+                projection_state_tag: {type: string, pattern: '^[0-9a-f]{64}$'}
+              additionalProperties: false
           additionalProperties: false
         - type: object
           required: [expected_revision, text, mode, path_prefixes, languages]
@@ -2122,6 +2137,15 @@ components:
       type: object
       required: [expected_revision, path, range]
       properties:
+        cursor:
+          type: [object, 'null']
+          required: [version, projection_state, custody_revision, tag]
+          properties:
+            version: {const: 1}
+            projection_state: {type: string, minLength: 1, maxLength: 524352, pattern: '^[0-9a-f]+$'}
+            custody_revision: {type: integer, minimum: 0}
+            tag: {type: string, pattern: '^[0-9a-f]{64}$'}
+          additionalProperties: false
         expected_revision: {$ref: '#/components/schemas/RepositoryRevisionId'}
         path: {$ref: '#/components/schemas/RepositoryRelativePath'}
         range:
@@ -2291,13 +2315,16 @@ components:
       pattern: '^blake3:[0-9a-f]{64}$'
       description: Content-addressed artifact reference.
     PageCursor:
-      type: string
-      pattern: '^cursor_[0-9a-f]{16}$'
-      description: Opaque pagination and cursor-status value. It is not an SSE resume cursor.
+      oneOf:
+        - {type: string, pattern: '^cursor_[0-9a-f]{16}$'}
+        - {$ref: '#/components/schemas/OpaqueStreamCursor'}
+      description: Opaque pagination value. Legacy position-only values remain accepted only at a safe custody boundary.
     OpaqueStreamCursor:
       type: string
-      pattern: '^kitc1_[0-9a-f]{48}$'
-      description: Principal-, project-, filter-, and schema-bound durable SSE cursor.
+      minLength: 54
+      maxLength: 349644
+      pattern: '^kitc(?:1_[0-9a-f]{48}|2_[A-Za-z0-9_-]{70,})$'
+      description: Principal-, project-, filter-, schema-, custody-, and projection-state-bound durable cursor.
     Timestamp:
       type: string
       format: date-time
@@ -2964,10 +2991,17 @@ components:
         payload:
           type: object
           additionalProperties: true
+        authority_digest:
+          type: string
+        projection_digest:
+          type: string
+        projected_envelope:
+          type: string
+          description: Exact canonical projected event envelope bytes covered by projection_digest.
       additionalProperties: true
     EventPage:
       type: object
-      required: [items, next_cursor]
+      required: [items, next_cursor, truncated]
       properties:
         items:
           type: array
@@ -2975,6 +3009,9 @@ components:
             $ref: '#/components/schemas/Event'
         next_cursor:
           $ref: '#/components/schemas/PageCursor'
+        truncated:
+          type: boolean
+          description: True when more events remain after next_cursor because a count or byte bound was reached.
       additionalProperties: true
     EventStreamFrame:
       type: object
@@ -2994,6 +3031,13 @@ components:
         schema_version:
           type: integer
           minimum: 1
+        authority_digest:
+          type: string
+        projection_digest:
+          type: string
+        projected_envelope:
+          type: string
+          description: Exact canonical projected event envelope bytes covered by projection_digest.
       additionalProperties: true
     CursorStatus:
       type: object

@@ -30,8 +30,8 @@ use crate::{
     api::{
         auth::contract::{AuthDenial, AuthenticatedPrincipal},
         service::{
-            Command, EventCursor, PromptCommand, PromptInput, PromptReceipt, Query,
-            QueryProjection, RequestContext, ServiceError,
+            Command, EventCursor, MAX_EVENT_PAGE_BYTES, PromptCommand, PromptInput, PromptReceipt,
+            Query, QueryProjection, RequestContext, ServiceError,
         },
         stream::{
             EventFilter, OpaqueStreamCursor, SSE_MEDIA_TYPE, SqliteStreamAdapter,
@@ -1060,11 +1060,25 @@ async fn run_events(
     if accepts_sse(request.headers()) {
         return event_stream(state, request, StreamResource::Run(run_id)).await;
     }
-    event_page(&state, request, |after, limit| Query::RunTimeline {
-        run_id,
-        after,
-        limit,
-    })
+    event_page(
+        &state,
+        request,
+        EventFilter::run(run_id),
+        |after, limit, projection_state| match projection_state {
+            Some(projection_state) => Query::RunTimelineProjected {
+                run_id,
+                after,
+                limit,
+                projection_state,
+            },
+            None => Query::RunTimeline {
+                run_id,
+                after,
+                limit,
+                opaque_cursor: None,
+            },
+        },
+    )
     .await
 }
 
@@ -1081,11 +1095,25 @@ async fn thread_events(
     if accepts_sse(request.headers()) {
         return event_stream(state, request, StreamResource::Thread(thread_id)).await;
     }
-    event_page(&state, request, |after, limit| Query::ThreadEvents {
-        thread_id,
-        after,
-        limit,
-    })
+    event_page(
+        &state,
+        request,
+        EventFilter::thread(thread_id),
+        |after, limit, projection_state| match projection_state {
+            Some(projection_state) => Query::ThreadEventsProjected {
+                thread_id,
+                after,
+                limit,
+                projection_state,
+            },
+            None => Query::ThreadEvents {
+                thread_id,
+                after,
+                limit,
+                opaque_cursor: None,
+            },
+        },
+    )
     .await
 }
 
@@ -1103,13 +1131,93 @@ fn accepts_sse(headers: &HeaderMap) -> bool {
 async fn event_page(
     state: &ApiState,
     request: Request,
-    build_query: impl FnOnce(EventCursor, usize) -> Query,
+    filter: EventFilter,
+    build_query: impl FnOnce(
+        EventCursor,
+        usize,
+        Option<crate::domain::secret::JsonProjectionState>,
+    ) -> Query,
 ) -> Response {
     let instance = request.uri().to_string();
-    let after = match query_value(request.uri(), "cursor") {
-        None => EventCursor::START,
+    let limit = match page_limit(request.uri(), &instance) {
+        Ok(limit) => limit,
+        Err(problem) => return problem.into_response(),
+    };
+    let context = match query_context(&request) {
+        Ok(context) => context,
+        Err(problem) => return problem.into_response(),
+    };
+    let (after, projection_state) = match query_value(request.uri(), "cursor") {
+        None => (
+            EventCursor::START,
+            state
+                .stream
+                .as_ref()
+                .filter(|stream| !stream.accepts_legacy_cursor())
+                .map(SqliteStreamAdapter::projection_state),
+        ),
+        Some(value) if value.starts_with("kitc") => {
+            let Some(stream) = &state.stream else {
+                return ProblemDetails::invalid(
+                    instance,
+                    "cursor",
+                    "Cursor must be an opaque cursor returned by this API.",
+                )
+                .into_response();
+            };
+            let cursor = match OpaqueStreamCursor::parse(value.to_owned()) {
+                Ok(cursor) => cursor,
+                Err(_) => {
+                    return ProblemDetails::invalid(
+                        instance,
+                        "cursor",
+                        "Cursor must be an opaque cursor returned by this API.",
+                    )
+                    .into_response();
+                }
+            };
+            match stream.decode_page_cursor(
+                &context,
+                context.grant().project_id(),
+                &filter,
+                &cursor,
+            ) {
+                Ok((position, projection_state)) => {
+                    (EventCursor::new(position), Some(projection_state))
+                }
+                Err(rejection) if rejection.requires_cursor_upgrade() => {
+                    return ProblemDetails::cursor_upgrade_required(instance).into_response();
+                }
+                Err(_) => {
+                    return ProblemDetails::invalid(
+                        instance,
+                        "cursor",
+                        "Cursor must be an opaque cursor returned by this API.",
+                    )
+                    .into_response();
+                }
+            }
+        }
         Some(value) => match decode_cursor(value) {
-            Some(position) => EventCursor::new(position),
+            Some(0) if state.stream.is_some() => (
+                EventCursor::START,
+                state
+                    .stream
+                    .as_ref()
+                    .filter(|stream| !stream.accepts_legacy_cursor())
+                    .map(SqliteStreamAdapter::projection_state),
+            ),
+            Some(position)
+                if state
+                    .stream
+                    .as_ref()
+                    .is_none_or(SqliteStreamAdapter::accepts_legacy_cursor) =>
+            {
+                (EventCursor::new(position), None)
+            }
+            Some(_) => {
+                return ProblemDetails::cursor_upgrade_required(instance).into_response();
+            }
             None => {
                 return ProblemDetails::invalid(
                     instance,
@@ -1120,39 +1228,168 @@ async fn event_page(
             }
         },
     };
-    let limit = match page_limit(request.uri(), &instance) {
-        Ok(limit) => limit,
-        Err(problem) => return problem.into_response(),
-    };
-    let context = match query_context(&request) {
-        Ok(context) => context,
-        Err(problem) => return problem.into_response(),
-    };
-    match query(state, context, build_query(after, limit)).await {
-        Ok(QueryProjection::Events(page)) => {
-            let mut events = Vec::with_capacity(page.events.len());
-            for event in page.events {
-                let payload: Value = match serde_json::from_slice(&event.payload) {
+    match query(
+        state,
+        context.clone(),
+        build_query(after, limit, projection_state),
+    )
+    .await
+    {
+        Ok(projection) => {
+            let (page, projection_state, item_projection_states) = match projection {
+                QueryProjection::Events(page) => (page, None, None),
+                QueryProjection::ProjectedEvents(page) => (
+                    page.page,
+                    Some(page.projection_state),
+                    Some(page.item_projection_states),
+                ),
+                _ => return ProblemDetails::internal(instance).into_response(),
+            };
+            #[derive(serde::Serialize)]
+            struct EventResponse {
+                cursor: String,
+                project_id: crate::domain::ids::ProjectId,
+                operation: String,
+                stream: String,
+                payload: Box<serde_json::value::RawValue>,
+                authority_digest: String,
+                projection_digest: String,
+                projected_envelope: String,
+            }
+
+            #[derive(serde::Serialize)]
+            struct EventPageResponse<'a> {
+                items: &'a [EventResponse],
+                next_cursor: &'a str,
+                truncated: bool,
+            }
+
+            if item_projection_states
+                .as_ref()
+                .is_some_and(|states| states.len() != page.events.len())
+            {
+                return ProblemDetails::internal(instance).into_response();
+            }
+            let source_len = page.events.len();
+            let source_truncated = page.truncated;
+            let mut events = Vec::with_capacity(source_len);
+            let mut next_cursor = None;
+            for (index, event) in page.events.into_iter().enumerate() {
+                let payload = match serde_json::from_slice(&event.payload) {
                     Ok(payload) => payload,
                     Err(_) => return ProblemDetails::internal(instance).into_response(),
                 };
-                events.push(json!({
-                    "cursor": encode_cursor(event.cursor.position()),
-                    "project_id": event.project_id,
-                    "operation": event.operation,
-                    "stream": event.stream,
-                    "payload": payload,
-                }));
+                let projected_envelope = match String::from_utf8(event.envelope) {
+                    Ok(envelope) => envelope,
+                    Err(_) => return ProblemDetails::internal(instance).into_response(),
+                };
+                let cursor = if let (Some(stream), Some(states)) =
+                    (&state.stream, item_projection_states.as_ref())
+                {
+                    match stream.encode_page_cursor(
+                        &context,
+                        context.grant().project_id(),
+                        &filter,
+                        event.cursor.position(),
+                        &states[index],
+                    ) {
+                        Ok(cursor) => cursor.to_string(),
+                        Err(_) => return ProblemDetails::internal(instance).into_response(),
+                    }
+                } else {
+                    encode_cursor(event.cursor.position())
+                };
+                events.push(EventResponse {
+                    cursor: cursor.clone(),
+                    project_id: event.project_id,
+                    operation: event.operation,
+                    stream: event.stream,
+                    payload,
+                    authority_digest: event.authority_digest,
+                    projection_digest: event.projection_digest,
+                    projected_envelope,
+                });
+                let truncated = source_truncated || events.len() < source_len;
+                let candidate = EventPageResponse {
+                    items: &events,
+                    next_cursor: &cursor,
+                    truncated,
+                };
+                if !serialized_within(&candidate, MAX_EVENT_PAGE_BYTES) {
+                    events.pop();
+                    break;
+                }
+                next_cursor = Some(cursor);
             }
-            Json(json!({
-                "items": events,
-                "next_cursor": encode_cursor(page.next_cursor.position()),
-            }))
-            .into_response()
+            let truncated = source_truncated || events.len() < source_len;
+            let next_cursor = match next_cursor {
+                Some(cursor) => cursor,
+                None if source_len != 0 => {
+                    return ProblemDetails::internal(instance).into_response();
+                }
+                None => {
+                    if let (Some(stream), Some(projection_state)) =
+                        (&state.stream, projection_state.as_ref())
+                    {
+                        match stream.encode_page_cursor(
+                            &context,
+                            context.grant().project_id(),
+                            &filter,
+                            page.next_cursor.position(),
+                            projection_state,
+                        ) {
+                            Ok(cursor) => cursor.to_string(),
+                            Err(_) => {
+                                return ProblemDetails::internal(instance).into_response();
+                            }
+                        }
+                    } else {
+                        encode_cursor(page.next_cursor.position())
+                    }
+                }
+            };
+            let response = EventPageResponse {
+                items: &events,
+                next_cursor: &next_cursor,
+                truncated,
+            };
+            let body = match serde_json::to_vec(&response) {
+                Ok(body) if body.len() <= MAX_EVENT_PAGE_BYTES => body,
+                _ => return ProblemDetails::internal(instance).into_response(),
+            };
+            let mut response = Body::from(body).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
         }
-        Ok(_) => ProblemDetails::internal(instance).into_response(),
         Err(error) => ProblemDetails::service(error, instance).into_response(),
     }
+}
+
+fn serialized_within(value: &impl serde::Serialize, limit: usize) -> bool {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|bytes| *bytes <= self.limit)
+                .ok_or_else(|| std::io::Error::other("serialized response exceeds byte bound"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    serde_json::to_writer(&mut Counter { bytes: 0, limit }, value).is_ok()
 }
 
 async fn list_pending_approvals(

@@ -16,7 +16,10 @@ use crate::{
         result::{CallProvenance, CanonicalResult, Presentation, ResultError},
         schema::SchemaValidation,
     },
-    domain::events::ArtifactRef,
+    domain::{
+        events::ArtifactRef,
+        secret::{REDACTED, SecretCustody},
+    },
     store::artifacts::{
         ArtifactDigest, ArtifactError, ArtifactPublication, ArtifactReference, ArtifactStore,
     },
@@ -162,6 +165,7 @@ impl McpTypedResult<'_> {
 #[derive(Clone, Debug)]
 pub struct McpResultPolicy {
     max_presentation_bytes: usize,
+    custody: SecretCustody,
 }
 
 impl McpResultPolicy {
@@ -173,7 +177,13 @@ impl McpResultPolicy {
         }
         Ok(Self {
             max_presentation_bytes,
+            custody: SecretCustody::default(),
         })
+    }
+
+    pub fn with_custody(mut self, custody: SecretCustody) -> Self {
+        self.custody = custody;
+        self
     }
 }
 
@@ -181,6 +191,7 @@ impl Default for McpResultPolicy {
     fn default() -> Self {
         Self {
             max_presentation_bytes: MAX_INLINE_PRESENTATION_BYTES,
+            custody: SecretCustody::default(),
         }
     }
 }
@@ -296,7 +307,7 @@ pub(crate) fn normalize_invocation_result(
         return Err(McpResultError::KindMismatch);
     }
 
-    let body = presentation_body(result, policy.max_presentation_bytes);
+    let body = presentation_body(result, policy);
     let mut payload = json!({
         "kind": kind_name(bound_kind),
         "presentation": {
@@ -305,10 +316,27 @@ pub(crate) fn normalize_invocation_result(
             "spec_version": "mcp-2025-11-25"
         },
         "protocol": "mcp",
-        "result": result.value()?,
+        "result": policy.custody.project_json(
+            crate::telemetry::redact::CaptureBoundary::Artifact,
+            &result.value()?,
+        ),
     });
     canonicalize(&mut payload);
     let payload_bytes = serde_json::to_vec(&payload).map_err(|_| McpResultError::Serialization)?;
+    let projected = policy.custody.project(
+        crate::telemetry::redact::CaptureBoundary::Artifact,
+        &payload_bytes,
+    );
+    let payload_bytes = match projected.bytes().expect("finished MCP projection") {
+        bytes if bytes == REDACTED.as_bytes() => serde_json::to_vec(&json!({
+            "kind": kind_name(bound_kind),
+            "presentation": {"body": REDACTED, "encoding": "text", "spec_version": "mcp-2025-11-25"},
+            "protocol": "mcp",
+            "result": REDACTED,
+        }))
+        .map_err(|_| McpResultError::Serialization)?,
+        bytes => bytes.to_vec(),
+    };
 
     let failure = match result {
         McpTypedResult::Tool(tool) if tool.is_error == Some(true) => Some("mcp.tool_error"),
@@ -405,135 +433,143 @@ fn kind_name(kind: CapabilityKind) -> &'static str {
     }
 }
 
-fn presentation_body(result: McpTypedResult<'_>, maximum: usize) -> String {
-    const PREFIX: &str = "UNTRUSTED_MCP_DATA_JSON_LENGTH=";
-    let content_maximum = maximum.saturating_sub(PREFIX.len() + 24);
-    let mut framed = String::from("\"");
+fn presentation_body(result: McpTypedResult<'_>, policy: &McpResultPolicy) -> String {
+    let raw = presentation_text(result);
+    let projected = policy.custody.project(
+        crate::telemetry::redact::CaptureBoundary::Artifact,
+        raw.as_bytes(),
+    );
+    let projected = String::from_utf8_lossy(
+        projected
+            .bytes()
+            .expect("finished MCP presentation projection"),
+    );
+    frame_presentation(&projected, policy.max_presentation_bytes)
+}
+
+fn presentation_text(result: McpTypedResult<'_>) -> String {
+    let mut output = String::new();
     match result {
         McpTypedResult::Tool(result) => {
             for content in &result.content {
-                append_content_text(&mut framed, content, content_maximum);
+                append_content_text(&mut output, content);
             }
         }
         McpTypedResult::Resource(result) => {
             for resource in &result.contents {
                 match resource {
-                    McpResourceContents::TextResourceContents { text, .. } => {
-                        append_json_text(&mut framed, text, content_maximum);
-                    }
+                    McpResourceContents::TextResourceContents { text, .. } => output.push_str(text),
                     McpResourceContents::BlobResourceContents { .. } => {
-                        append_json_text(
-                            &mut framed,
-                            "[binary resource stored as artifact]",
-                            content_maximum,
-                        );
+                        output.push_str("[binary resource stored as artifact]");
                     }
                 }
             }
         }
         McpTypedResult::Prompt(result) => {
             for message in &result.messages {
-                append_json_text(
-                    &mut framed,
-                    match message.role {
-                        PromptMessageRole::User => "user: ",
-                        PromptMessageRole::Assistant => "assistant: ",
-                    },
-                    content_maximum,
-                );
+                output.push_str(match message.role {
+                    PromptMessageRole::User => "user: ",
+                    PromptMessageRole::Assistant => "assistant: ",
+                });
                 match &message.content {
-                    PromptMessageContent::Text { text } => {
-                        append_json_text(&mut framed, text, content_maximum);
-                    }
+                    PromptMessageContent::Text { text } => output.push_str(text),
                     PromptMessageContent::Resource { resource } => match &resource.resource {
                         McpResourceContents::TextResourceContents { text, .. } => {
-                            append_json_text(&mut framed, text, content_maximum);
+                            output.push_str(text);
                         }
-                        McpResourceContents::BlobResourceContents { .. } => append_json_text(
-                            &mut framed,
-                            "[binary prompt content stored as artifact]",
-                            content_maximum,
-                        ),
+                        McpResourceContents::BlobResourceContents { .. } => {
+                            output.push_str("[binary prompt content stored as artifact]");
+                        }
                     },
-                    PromptMessageContent::Image { .. } => append_json_text(
-                        &mut framed,
-                        "[image prompt content stored as artifact]",
-                        content_maximum,
-                    ),
+                    PromptMessageContent::Image { .. } => {
+                        output.push_str("[image prompt content stored as artifact]");
+                    }
                     PromptMessageContent::ResourceLink { link } => {
-                        append_json_text(&mut framed, "[resource link: ", content_maximum);
-                        append_json_text(&mut framed, &link.uri, content_maximum);
-                        append_json_text(&mut framed, "]", content_maximum);
+                        output.push_str("[resource link: ");
+                        output.push_str(&link.uri);
+                        output.push(']');
                     }
                 }
-                append_json_text(&mut framed, "\n", content_maximum);
+                output.push('\n');
             }
         }
     }
-    if framed.len() == 1 {
-        append_json_text(
-            &mut framed,
-            "[MCP result stored as artifact]",
-            content_maximum,
-        );
+    if output.is_empty() {
+        output.push_str("[MCP result stored as artifact]");
     }
-    framed.push('"');
-    let mut output = format!("{PREFIX}{}\n", framed.len());
-    output.push_str(&framed);
     output
 }
 
-fn append_content_text(output: &mut String, content: &Content, maximum: usize) {
+fn frame_presentation(value: &str, maximum: usize) -> String {
+    const PREFIX: &str = "UNTRUSTED_MCP_DATA_JSON_LENGTH=";
+    const MARKER: &str = "[oversized text stored as artifact]";
+    let framed_len = |json_len: usize| PREFIX.len() + json_len.to_string().len() + 1 + json_len;
+    let mut json = encode_json_text(value);
+    if framed_len(json.len()) > maximum {
+        let reserve_marker = framed_len(MARKER.len() + 2) <= maximum;
+        json.clear();
+        json.push('"');
+        for character in value.chars() {
+            let previous = json.len();
+            append_json_character(&mut json, character);
+            let suffix = usize::from(reserve_marker) * MARKER.len() + 1;
+            if framed_len(json.len() + suffix) > maximum {
+                json.truncate(previous);
+                break;
+            }
+        }
+        if reserve_marker {
+            json.push_str(MARKER);
+        }
+        json.push('"');
+    }
+    let mut output = format!("{PREFIX}{}\n", json.len());
+    output.push_str(&json);
+    debug_assert!(output.len() <= maximum);
+    output
+}
+
+fn encode_json_text(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        append_json_character(&mut output, character);
+    }
+    output.push('"');
+    output
+}
+
+fn append_content_text(output: &mut String, content: &Content) {
     match &content.raw {
-        RawContent::Text(text) => append_json_text(output, &text.text, maximum),
+        RawContent::Text(text) => output.push_str(&text.text),
         RawContent::Resource(resource) => match &resource.resource {
             McpResourceContents::TextResourceContents { text, .. } => {
-                append_json_text(output, text, maximum);
+                output.push_str(text);
             }
             McpResourceContents::BlobResourceContents { .. } => {
-                append_json_text(output, "[binary tool content stored as artifact]", maximum)
+                output.push_str("[binary tool content stored as artifact]");
             }
         },
         RawContent::Image(_) | RawContent::Audio(_) => {
-            append_json_text(output, "[binary tool content stored as artifact]", maximum)
+            output.push_str("[binary tool content stored as artifact]");
         }
         RawContent::ResourceLink(link) => {
-            append_json_text(output, "[resource link: ", maximum);
-            append_json_text(output, &link.uri, maximum);
-            append_json_text(output, "]", maximum);
+            output.push_str("[resource link: ");
+            output.push_str(&link.uri);
+            output.push(']');
         }
     }
-    append_json_text(output, "\n", maximum);
+    output.push('\n');
 }
 
-fn append_json_text(output: &mut String, value: &str, maximum: usize) {
-    const MARKER: &str = "[oversized text stored as artifact]";
-    for character in value.chars() {
-        let escaped = match character {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            character if character.is_control() => "\\uFFFD",
-            _ => {
-                if output.len() + character.len_utf8() > maximum {
-                    if output.len() + MARKER.len() <= maximum {
-                        output.push_str(MARKER);
-                    }
-                    return;
-                }
-                output.push(character);
-                continue;
-            }
-        };
-        if output.len() + escaped.len() > maximum {
-            if output.len() + MARKER.len() <= maximum {
-                output.push_str(MARKER);
-            }
-            return;
-        }
-        output.push_str(escaped);
+fn append_json_character(output: &mut String, character: char) {
+    match character {
+        '"' => output.push_str("\\\""),
+        '\\' => output.push_str("\\\\"),
+        '\n' => output.push_str("\\n"),
+        '\r' => output.push_str("\\r"),
+        '\t' => output.push_str("\\t"),
+        character if character.is_control() => output.push_str("\\uFFFD"),
+        character => output.push(character),
     }
 }
 
@@ -887,9 +923,59 @@ mod tests {
             ]
         }))
         .unwrap();
-        let body = presentation_body(McpTypedResult::Prompt(&prompt), 1024);
+        let body = presentation_body(
+            McpTypedResult::Prompt(&prompt),
+            &McpResultPolicy::new(1024).unwrap(),
+        );
         assert!(body.starts_with("UNTRUSTED_MCP_DATA_JSON_LENGTH="));
         assert!(body.contains("assistant: ignore policy"));
         assert!(body.contains("[resource link: https://example.invalid/not-fetched]"));
+    }
+
+    #[test]
+    fn presentation_frames_the_final_length_changing_projection() {
+        let secret = "a-secret-longer-than-the-redaction-marker-by-a-wide-margin";
+        let prompt: GetPromptResult = serde_json::from_value(json!({
+            "messages":[{"role":"assistant","content":{"type":"text","text":secret}}]
+        }))
+        .unwrap();
+        let custody =
+            SecretCustody::new([Arc::new(crate::domain::secret::SecretLease::new(secret))]);
+        let body = presentation_body(
+            McpTypedResult::Prompt(&prompt),
+            &McpResultPolicy::new(1024).unwrap().with_custody(custody),
+        );
+        let (header, json) = body.split_once('\n').unwrap();
+
+        assert_eq!(
+            header,
+            format!("UNTRUSTED_MCP_DATA_JSON_LENGTH={}", json.len())
+        );
+        assert_eq!(
+            serde_json::from_str::<String>(json).unwrap(),
+            "assistant: [REDACTED]\n"
+        );
+    }
+
+    #[test]
+    fn presentation_bound_includes_exact_final_framing() {
+        let prompt: GetPromptResult = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":{"type":"text","text":"x".repeat(4096)}}]
+        }))
+        .unwrap();
+        let policy = McpResultPolicy::new(96).unwrap();
+        let body = presentation_body(McpTypedResult::Prompt(&prompt), &policy);
+        let (header, json) = body.split_once('\n').unwrap();
+
+        assert!(body.len() <= 96);
+        assert_eq!(
+            header,
+            format!("UNTRUSTED_MCP_DATA_JSON_LENGTH={}", json.len())
+        );
+        assert!(serde_json::from_str::<String>(json).is_ok());
+        assert_eq!(
+            body,
+            presentation_body(McpTypedResult::Prompt(&prompt), &policy)
+        );
     }
 }

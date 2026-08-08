@@ -26,8 +26,9 @@ use kit::{
     domain::{
         config::{ConfigField, ConfigLayer, Grant, LayerKind, LayerStack, RunConfigSnapshot},
         events::{ArtifactRef, AttemptTransition, RunTransition, SchemaVersion, TraceId},
-        ids::{AttemptId, EventId, PrincipalId, ProjectId, RunId, TerminalId, ThreadId},
+        ids::{AttemptId, CommandId, EventId, PrincipalId, ProjectId, RunId, TerminalId, ThreadId},
         lifecycle::{AttemptOwnership, AttemptState, FencingToken, RunState},
+        secret::{SecretCustody, SecretLease},
     },
     store::sqlite::idempotency::IdempotencyKey,
 };
@@ -371,6 +372,22 @@ impl Fixture {
         Self {
             database,
             service: test_support::service_with_runtime(store, ScopedAuthorizer, TestRuntime),
+            serial: 0,
+        }
+    }
+
+    fn with_custody(name: &str, custody: SecretCustody) -> Self {
+        let database = TestDatabase::new(name);
+        let store =
+            test_support::open_project_service_store(&database.path, custody.clone()).unwrap();
+        Self {
+            database,
+            service: test_support::project_service_with_runtime(
+                store,
+                ScopedAuthorizer,
+                TestRuntime,
+                custody,
+            ),
             serial: 0,
         }
     }
@@ -817,6 +834,397 @@ fn cursor_is_tamper_evident_and_bound_to_principal_project_filter_and_schema() {
             .status(),
         400
     );
+}
+
+#[test]
+fn active_custody_rejects_forged_legacy_cursor_and_fresh_start_emits_kitc2() {
+    let mut fixture = Fixture::new("legacy-upgrade");
+    let principal = PrincipalId::generate().unwrap();
+    let project = ProjectId::generate().unwrap();
+    fixture.create_project(principal, project);
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("active-secret"))]);
+    let adapter = fixture.adapter(4).with_custody(custody);
+    let read = context(principal, project, 31_000);
+    let legacy = OpaqueStreamCursor::parse(format!("kitc1_{}", "0".repeat(48))).unwrap();
+
+    let rejection = adapter
+        .open(&read, project, EventFilter::all(), Some(&legacy))
+        .unwrap_err();
+    assert_eq!(rejection.status(), 400);
+    assert_eq!(
+        serde_json::from_slice::<Value>(rejection.body()).unwrap()["code"],
+        "invalid_cursor"
+    );
+
+    let fresh = adapter
+        .open(&read, project, EventFilter::all(), None)
+        .unwrap()
+        .last_durable_cursor();
+    assert!(fresh.as_str().starts_with("kitc2_"));
+}
+
+#[tokio::test]
+async fn event_pages_map_stale_custody_to_409_without_a_cursor_oracle() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use kit::api::http::{
+        core::HttpAuthenticator,
+        router::{RouterConfig, authenticated_router_with_stream},
+    };
+    use tower::ServiceExt;
+
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("unrelated-secret"))]);
+    let mut fixture = Fixture::with_custody("page-custody-upgrade", custody.clone());
+    let principal = PrincipalId::generate().unwrap();
+    let project = ProjectId::generate().unwrap();
+    fixture.create_project(principal, project);
+    let thread = fixture.create_threads(principal, project, 1)[0];
+    assert!(matches!(
+        fixture.query(principal, project, Query::GetThread { thread_id: thread }),
+        QueryProjection::Thread(_)
+    ));
+    fixture.execute(
+        principal,
+        project,
+        Command::SetThreadArchived {
+            schema_version: SchemaVersion::CURRENT,
+            thread_id: thread,
+            archived: true,
+            expected_version: 1,
+        },
+    );
+    let adapter = fixture.adapter(4).with_custody(custody.clone());
+    let authenticator = LocalPeerAuthenticator::new(BTreeMap::from([(
+        1000,
+        GrantSnapshot::new(
+            principal,
+            project,
+            [Grant::WorkspaceRead, Grant::WorkspaceWrite],
+        ),
+    )]));
+    let authenticator: Arc<dyn HttpAuthenticator> =
+        Arc::new(move |_: &axum::http::request::Parts| {
+            authenticator.authenticate(&LocalPeerObservation::from_transport(1000, 1, 1000))
+        });
+    let app = authenticated_router_with_stream(
+        Arc::new(Mutex::new(fixture.service)),
+        authenticator,
+        RouterConfig::default(),
+        adapter,
+    );
+    let page_path = format!("/v1/threads/{thread}/events");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{page_path}?limit=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+    assert_eq!(page["truncated"], true);
+    assert!(cursor.starts_with("kitc2_"));
+    let item_cursor = page["items"][0]["cursor"].as_str().unwrap().to_owned();
+    assert!(item_cursor.starts_with("kitc2_"));
+    assert_eq!(item_cursor, cursor);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{page_path}?limit=1&cursor={item_cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let resumed: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(resumed["items"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["truncated"], false);
+    assert_ne!(resumed["items"][0]["cursor"], item_cursor);
+    assert!(
+        resumed["items"][0]["cursor"]
+            .as_str()
+            .unwrap()
+            .starts_with("kitc2_")
+    );
+    assert!(
+        resumed["next_cursor"]
+            .as_str()
+            .unwrap()
+            .starts_with("kitc2_")
+    );
+
+    custody.register(
+        "page-test",
+        "new-secret",
+        Arc::new(SecretLease::new("new-secret")),
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{page_path}?cursor={cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let stale: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(stale["code"], "cursor_upgrade_required");
+
+    let mut tampered = cursor;
+    let replacement = if tampered.ends_with('0') { '1' } else { '0' };
+    tampered.pop();
+    tampered.push(replacement);
+    for invalid in [tampered, "kitc2_deadbeef".to_owned()] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{page_path}?cursor={invalid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["invalid_parameters"][0]["name"], "cursor");
+    }
+}
+
+#[tokio::test]
+async fn event_pages_bound_max_state_and_wire_and_resume_one_thousand_without_gaps() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use base64::Engine;
+    use kit::api::http::{
+        core::HttpAuthenticator,
+        router::{RouterConfig, authenticated_router_with_stream},
+    };
+    use std::collections::BTreeSet;
+    use tower::ServiceExt;
+
+    const PAGE_BYTES: usize = 8 * 1024 * 1024;
+    let custody = SecretCustody::new([Arc::new(SecretLease::new("active-secret"))]);
+    let mut fixture = Fixture::with_custody("page-bounds", custody.clone());
+    let principal = PrincipalId::generate().unwrap();
+    let project = ProjectId::generate().unwrap();
+    fixture.create_project(principal, project);
+    let thread = fixture.create_threads(principal, project, 1)[0];
+    let mut connection = rusqlite::Connection::open(&fixture.database.path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    let first_position: u64 = transaction
+        .query_row(
+            "SELECT position FROM commit_watermark WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for index in 0_u64..999 {
+        let position = first_position + index + 1;
+        let payload = serde_json::to_vec(&kit::domain::projections::PersistedCommand {
+            principal_id: principal,
+            stored_at_unix_micros: 0,
+            idempotency_key: if index < 15 {
+                "i".repeat(64 * 1024)
+            } else {
+                format!("page-{index}")
+            },
+            apply_projection: true,
+            command: Command::SetThreadArchived {
+                schema_version: SchemaVersion::CURRENT,
+                thread_id: thread,
+                archived: index.is_multiple_of(2),
+                expected_version: index + 1,
+            },
+        })
+        .unwrap();
+        let event_id = EventId::generate().unwrap();
+        let command_id = CommandId::generate().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO events
+                 (event_id, stream, sequence, commit_position, event_type, schema_version,
+                  occurred_at, causation_id, correlation_id, attempt_id, trace_id, payload,
+                  artifacts)
+                 VALUES (?1, ?2, ?3, ?4, 'thread.archive', 1,
+                         '2026-08-08T00:00:00.000000Z', ?5, ?2, NULL, 'trace-test', ?6, ?7)",
+                rusqlite::params![
+                    event_id.to_string(),
+                    thread.to_string(),
+                    index + 2,
+                    position,
+                    command_id.to_string(),
+                    payload,
+                    b"[]".as_slice(),
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO event_projection_index
+                 (commit_position, project_id, thread_id, run_id, event_class,
+                  stored_at_unix_micros, erased)
+                 VALUES (?1, ?2, ?3, NULL, 'event', 0, 0)",
+                rusqlite::params![position, project.to_string(), thread.to_string()],
+            )
+            .unwrap();
+    }
+    let last_position = first_position + 999;
+    transaction
+        .execute(
+            "UPDATE stream_heads SET version = 1000 WHERE stream = ?1",
+            [thread.to_string()],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE commit_watermark SET position = ?1 WHERE singleton = 1",
+            [last_position],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE event_projection_index_state SET indexed_through = ?1 WHERE singleton = 1",
+            [last_position],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let adapter = fixture.adapter(4).with_custody(custody);
+    let authenticator = LocalPeerAuthenticator::new(BTreeMap::from([(
+        1000,
+        GrantSnapshot::new(
+            principal,
+            project,
+            [Grant::WorkspaceRead, Grant::WorkspaceWrite],
+        ),
+    )]));
+    let authenticator: Arc<dyn HttpAuthenticator> =
+        Arc::new(move |_: &axum::http::request::Parts| {
+            authenticator.authenticate(&LocalPeerObservation::from_transport(1000, 1, 1000))
+        });
+    let app = authenticated_router_with_stream(
+        Arc::new(Mutex::new(fixture.service)),
+        authenticator,
+        RouterConfig::default(),
+        adapter,
+    );
+    let page_path = format!("/v1/threads/{thread}/events?limit=1000");
+    let mut cursor = None;
+    let mut digests = BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let uri = cursor.as_ref().map_or_else(
+            || page_path.clone(),
+            |cursor| format!("{page_path}&cursor={cursor}"),
+        );
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), PAGE_BYTES).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(body.len() <= PAGE_BYTES);
+        let page: Value = serde_json::from_slice(&body).unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        assert!(items.len() <= 16);
+        let state_bytes = items
+            .iter()
+            .map(|item| {
+                let encoded = item["cursor"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("kitc2_")
+                    .unwrap();
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .unwrap()
+                    .len()
+                    - 52
+            })
+            .sum::<usize>();
+        assert!(state_bytes <= PAGE_BYTES);
+        for item in items {
+            assert!(digests.insert(item["authority_digest"].as_str().unwrap().to_owned()));
+        }
+        pages += 1;
+        cursor = Some(page["next_cursor"].as_str().unwrap().to_owned());
+        if page["truncated"] == false {
+            break;
+        }
+    }
+    assert!(pages > 1);
+    assert_eq!(digests.len(), 1000);
+}
+
+#[test]
+fn custody_mutation_disconnects_without_emitting_queued_raw_frames() {
+    let mut fixture = Fixture::new("custody-mutation");
+    let principal = PrincipalId::generate().unwrap();
+    let project = ProjectId::generate().unwrap();
+    fixture.create_project(principal, project);
+    let custody = SecretCustody::default();
+    let adapter = fixture.adapter(4).with_custody(custody.clone());
+    let read = context(principal, project, 32_000);
+    let mut stream = adapter
+        .open(&read, project, EventFilter::all(), None)
+        .unwrap();
+    let authoritative = stream.last_durable_cursor();
+    let thread = fixture.create_threads(principal, project, 1)[0];
+    assert_eq!(stream.pump().unwrap(), PumpOutcome::Ready { queued: 1 });
+
+    custody.register(
+        "stream-test",
+        "thread-id",
+        Arc::new(SecretLease::new(thread.to_string())),
+    );
+
+    assert!(matches!(
+        stream.next_frame(),
+        Some(SseFrame::Disconnect {
+            cursor,
+            reason: "cursor_upgrade_required"
+        }) if cursor == authoritative
+    ));
+    assert_eq!(stream.last_durable_cursor(), authoritative);
+    assert!(stream.is_disconnected());
+    assert_eq!(stream.next_frame(), None);
+    let rejection = adapter
+        .open(&read, project, EventFilter::all(), Some(&authoritative))
+        .unwrap_err();
+    assert_eq!(rejection.status(), 409);
+    assert_eq!(
+        serde_json::from_slice::<Value>(rejection.body()).unwrap()["code"],
+        "cursor_upgrade_required"
+    );
+    adapter
+        .open(&read, project, EventFilter::all(), None)
+        .unwrap();
 }
 
 #[test]

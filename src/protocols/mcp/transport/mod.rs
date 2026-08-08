@@ -4504,8 +4504,8 @@ mod tests {
             &self,
             _handle: &crate::domain::secret::SecretHandle,
             _context: &crate::protocols::mcp::egress::HttpSecretContext<'_>,
-        ) -> Result<SecretLease, crate::protocols::mcp::egress::HttpCredentialError> {
-            Ok(SecretLease::new(b"credential-canary".to_vec()))
+        ) -> Result<Arc<SecretLease>, crate::protocols::mcp::egress::HttpCredentialError> {
+            Ok(Arc::new(SecretLease::new(b"credential-canary".to_vec())))
         }
     }
 
@@ -5965,12 +5965,12 @@ mod tests {
                 "configured-secret".into()
             ]),
         ));
-        let first = Arc::new(McpResponseScanner::new(&[SecretLease::new(
+        let first = Arc::new(McpResponseScanner::new(&[Arc::new(SecretLease::new(
             b"first-stream-secret".to_vec(),
-        )]));
-        let second = Arc::new(McpResponseScanner::new(&[SecretLease::new(
+        ))]));
+        let second = Arc::new(McpResponseScanner::new(&[Arc::new(SecretLease::new(
             b"second-stream-secret".to_vec(),
-        )]));
+        ))]));
         for (id, scanner) in [(1, first), (2, second)] {
             let payload = RawPayload::from_value(
                 serde_json::json!({
@@ -6120,9 +6120,9 @@ mod tests {
     #[test]
     fn connection_close_state_drops_unanswered_callback_scanners() {
         let gate = OperationGate::new();
-        let scanner = Arc::new(McpResponseScanner::new(&[SecretLease::new(
+        let scanner = Arc::new(McpResponseScanner::new(&[Arc::new(SecretLease::new(
             b"stream-secret".to_vec(),
-        )]));
+        ))]));
         let payload = RawPayload::from_value(
             serde_json::json!({
                 "jsonrpc":"2.0",

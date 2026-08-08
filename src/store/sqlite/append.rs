@@ -14,6 +14,7 @@ use crate::domain::events::{
     CommitPosition, EntityId, EventType, SchemaVersion, StreamSequence, TraceId, UtcDateTime,
 };
 use crate::domain::ids::{AttemptId, CommandId, EventId, PrincipalId, ProjectId, RunId};
+use crate::domain::secret::SecretCustody;
 
 #[cfg(any(test, debug_assertions))]
 use super::idempotency::ClaimOutcome;
@@ -260,6 +261,7 @@ impl From<rusqlite::Error> for StoreError {
 pub struct SqliteStore {
     connection: Connection,
     pending_artifact_publication: Option<PendingArtifactPublication>,
+    custody: SecretCustody,
     _authority: crate::runtime::daemon::ControlPlaneAuthority,
 }
 
@@ -283,6 +285,7 @@ impl SqliteStore {
         Ok(Self {
             connection,
             pending_artifact_publication: None,
+            custody: authority.secret_custody(),
             _authority: authority.clone(),
         })
     }
@@ -650,6 +653,7 @@ impl SqliteStore {
         discovery_binding: Option<(&str, RunId, &str)>,
         reconciliation: Option<(&str, &str, bool)>,
     ) -> Result<AppendOutcome, StoreError> {
+        reject_secret_authority_identifiers(&self.custody, &command.events)?;
         validate_command(&command)?;
         let publication = self.pending_artifact_publication.take();
         let transaction = self
@@ -1646,6 +1650,33 @@ impl SqliteStore {
         )?;
         Ok(())
     }
+}
+
+fn reject_secret_authority_identifiers(
+    custody: &SecretCustody,
+    events: &[NewEvent],
+) -> Result<(), StoreError> {
+    for event in events {
+        let attempt = event.attempt_id.map(|value| value.to_string());
+        for identifier in [
+            event.id.to_string(),
+            event.stream.to_string(),
+            event.event_type.as_str().to_owned(),
+            event.causation_id.to_string(),
+            event.correlation_id.to_string(),
+            event.trace_id.as_str().to_owned(),
+        ]
+        .into_iter()
+        .chain(attempt)
+        {
+            if custody.contains(identifier.as_bytes()) {
+                return Err(StoreError::InvalidRequest(
+                    "active secret is forbidden in an event authority identifier",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn catalog_stats_in(
@@ -2971,6 +3002,108 @@ fn corrupt_event<T>(_: T) -> StoreError {
 #[cfg(test)]
 mod learning_persistence_tests {
     use super::*;
+
+    #[test]
+    fn event_writer_preserves_canonical_content_and_rejects_secret_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "kit-event-custody-{}",
+            crate::domain::ids::EventId::generate().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("state.sqlite3");
+        let secret = "event-writer-canary";
+        let custody = SecretCustody::new([std::sync::Arc::new(
+            crate::domain::secret::SecretLease::new(secret),
+        )]);
+        let mut store =
+            crate::test_support::open_project_store(&database, custody.clone()).unwrap();
+        let principal = PrincipalId::generate().unwrap();
+        let run = RunId::generate().unwrap();
+        let stream = EntityId::Run(run);
+        let event_id = EventId::generate().unwrap();
+        let command_id = CommandId::generate().unwrap();
+        let event = NewEvent {
+            id: event_id,
+            stream,
+            event_type: EventType::parse("run.progress").unwrap(),
+            schema_version: SchemaVersion::CURRENT,
+            occurred_at: UtcDateTime::parse("2026-08-06T12:00:00Z").unwrap(),
+            causation_id: command_id,
+            correlation_id: stream,
+            attempt_id: None,
+            trace_id: TraceId::parse("event-writer").unwrap(),
+            payload: serde_json::to_vec(&serde_json::json!({
+                "content": format!("{secret} 6576656e742d7772697465722d63616e617279")
+            }))
+            .unwrap(),
+            artifacts: b"[]".to_vec(),
+        };
+        let canonical_payload = event.payload.clone();
+        store
+            .append(AppendCommand {
+                idempotency_scope: IdempotencyScope::new(principal, "event.writer", stream)
+                    .unwrap(),
+                idempotency_key: IdempotencyKey::parse("event-writer").unwrap(),
+                request_digest: CanonicalRequestDigest::new([7; 32]),
+                claim: None,
+                driver_claim: None,
+                allow_quiescent_driver_claim: false,
+                expected_versions: vec![ExpectedStreamVersion {
+                    stream,
+                    version: ExpectedVersion::new(0),
+                }],
+                events: vec![event],
+                response: b"ok".to_vec(),
+            })
+            .unwrap();
+        let stored = store.events().unwrap().remove(0);
+        assert_eq!(stored.event.payload, canonical_payload);
+        let projected =
+            crate::test_support::project_event_export_projection(&stored, &custody).unwrap();
+        assert!(!custody.contains(&projected.envelope));
+        assert_eq!(
+            projected.digest,
+            crate::capabilities::kernel::identity::Digest::of(
+                crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                &projected.envelope,
+            )
+            .to_string()
+        );
+        assert_ne!(projected.authority_digest, projected.digest);
+
+        let authority_secret = event_id.to_string();
+        let authority_custody = SecretCustody::new([std::sync::Arc::new(
+            crate::domain::secret::SecretLease::new(authority_secret),
+        )]);
+        let mut authority_store = crate::test_support::open_project_store(
+            root.join("authority.sqlite3"),
+            authority_custody,
+        )
+        .unwrap();
+        let mut rejected = stored.event;
+        rejected.payload = b"{}".to_vec();
+        assert!(matches!(
+            authority_store.append(AppendCommand {
+                idempotency_scope: IdempotencyScope::new(principal, "event.authority", stream)
+                    .unwrap(),
+                idempotency_key: IdempotencyKey::parse("event-authority").unwrap(),
+                request_digest: CanonicalRequestDigest::new([8; 32]),
+                claim: None,
+                driver_claim: None,
+                allow_quiescent_driver_claim: false,
+                expected_versions: vec![ExpectedStreamVersion {
+                    stream,
+                    version: ExpectedVersion::new(0),
+                }],
+                events: vec![rejected],
+                response: b"ok".to_vec(),
+            }),
+            Err(StoreError::InvalidRequest(
+                "active secret is forbidden in an event authority identifier"
+            ))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn discovery_binding_authority_replays_idempotently_after_store_restart() {

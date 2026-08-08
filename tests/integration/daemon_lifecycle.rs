@@ -1855,7 +1855,7 @@ async fn sigkill_model_provider_commit_windows_recover_exactly_once() {
         let expected = match checkpoint {
             "before_provider_dispatch" => (0, 0, 0, 0, 0, 0),
             "after_provider_dispatch" => (1, 0, 0, 0, 0, 0),
-            "after_first_stream_chunk" => (1, 1, 1, 0, 0, 0),
+            "after_first_stream_chunk" => (1, 0, 1, 0, 0, 0),
             "after_stream_outcome" => (1, 1, 4, 1, 0, 0),
             "after_model_outcome" => (1, 1, 4, 1, 1, 0),
             "after_journal_boundary" => (1, 1, 4, 1, 1, 1),
@@ -1901,7 +1901,7 @@ async fn sigkill_model_provider_commit_windows_recover_exactly_once() {
         let (dispatches, results, chunks, stream_outcomes, progress) = match checkpoint {
             "before_provider_dispatch" => (0, 0, 0, 0, 0),
             "after_provider_dispatch" => (1, 0, 0, 0, 0),
-            "after_first_stream_chunk" => (1, 1, 1, 0, 0),
+            "after_first_stream_chunk" => (1, 0, 1, 0, 0),
             "after_stream_outcome" => (1, 1, 4, 1, 4),
             "after_model_outcome" | "after_journal_boundary" => (1, 1, 4, 1, 4),
             _ => unreachable!(),

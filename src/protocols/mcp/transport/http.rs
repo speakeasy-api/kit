@@ -2,7 +2,10 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use agentkit_mcp::{
@@ -53,12 +56,17 @@ const SESSION_HEADER: &str = "mcp-session-id";
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SSE_CONTENT_TYPE: &str = "text/event-stream";
+type ActiveHttpLeases = BTreeMap<(String, String), Vec<(String, Arc<SecretLease>)>>;
+
 pub(crate) struct EnvironmentHttpCredentialBroker {
     principal_id: PrincipalId,
     project_id: ProjectId,
     workspace_id: WorkspaceId,
     credentials: BTreeMap<SecretHandle, crate::protocols::mcp::config::McpCredentialScopeConfig>,
     callback_scanner: Option<Arc<crate::protocols::mcp::responders::CallbackSecretScanner>>,
+    custody: Option<(crate::domain::secret::SecretCustody, String)>,
+    lease_sequence: AtomicU64,
+    active_leases: Mutex<ActiveHttpLeases>,
 }
 
 impl EnvironmentHttpCredentialBroker {
@@ -77,6 +85,9 @@ impl EnvironmentHttpCredentialBroker {
             workspace_id,
             credentials,
             callback_scanner: None,
+            custody: None,
+            lease_sequence: AtomicU64::new(0),
+            active_leases: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -87,6 +98,15 @@ impl EnvironmentHttpCredentialBroker {
         self.callback_scanner = Some(scanner);
         self
     }
+
+    pub(crate) fn with_custody(
+        mut self,
+        custody: crate::domain::secret::SecretCustody,
+        owner: impl Into<String>,
+    ) -> Self {
+        self.custody = Some((custody, owner.into()));
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -95,7 +115,7 @@ impl HttpCredentialBroker for EnvironmentHttpCredentialBroker {
         &self,
         handle: &SecretHandle,
         context: &HttpSecretContext<'_>,
-    ) -> Result<SecretLease, HttpCredentialError> {
+    ) -> Result<Arc<SecretLease>, HttpCredentialError> {
         if context.principal_id() != self.principal_id.to_string()
             || context.project_id() != self.project_id.to_string()
             || context.workspace_id() != self.workspace_id.to_string()
@@ -121,11 +141,53 @@ impl HttpCredentialBroker for EnvironmentHttpCredentialBroker {
         if value.is_empty() {
             return Err(HttpCredentialError::Invalid);
         }
-        let lease = SecretLease::new(value.into_bytes());
+        let lease = Arc::new(SecretLease::new(value.into_bytes()));
         if let Some(scanner) = &self.callback_scanner {
             scanner.add_secret(&lease);
         }
+        if let Some((custody, owner)) = &self.custody {
+            let source = format!(
+                "http:{}:{}:{}",
+                context.invocation_id(),
+                handle.identifier(),
+                self.lease_sequence.fetch_add(1, Ordering::Relaxed)
+            );
+            let mut active = self
+                .active_leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            custody.register(owner.clone(), source.clone(), Arc::clone(&lease));
+            active
+                .entry((
+                    context.invocation_id().to_owned(),
+                    handle.identifier().to_owned(),
+                ))
+                .or_default()
+                .push((source, Arc::clone(&lease)));
+        }
         Ok(lease)
+    }
+
+    fn revoke(&self, invocation_id: &str, handle: &SecretHandle, lease: &Arc<SecretLease>) {
+        if let Some((custody, owner)) = &self.custody {
+            let key = (invocation_id.to_owned(), handle.identifier().to_owned());
+            let mut active = self
+                .active_leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(sources) = active.get_mut(&key) {
+                if let Some(index) = sources
+                    .iter()
+                    .position(|(_, registered)| Arc::ptr_eq(registered, lease))
+                {
+                    let (source, _) = sources.remove(index);
+                    custody.remove(owner, &source);
+                }
+                if sources.is_empty() {
+                    active.remove(&key);
+                }
+            }
+        }
     }
 }
 
@@ -1861,8 +1923,10 @@ mod tests {
             &self,
             _handle: &SecretHandle,
             _context: &HttpSecretContext<'_>,
-        ) -> Result<SecretLease, HttpCredentialError> {
-            Ok(SecretLease::new(b"active-hop-credential".to_vec()))
+        ) -> Result<Arc<SecretLease>, HttpCredentialError> {
+            Ok(Arc::new(SecretLease::new(
+                b"active-hop-credential".to_vec(),
+            )))
         }
     }
 
@@ -1893,9 +1957,9 @@ mod tests {
     }
 
     fn response_scanner(secret: &[u8]) -> Arc<McpResponseScanner> {
-        Arc::new(McpResponseScanner::new(&[SecretLease::new(
+        Arc::new(McpResponseScanner::new(&[Arc::new(SecretLease::new(
             secret.to_vec(),
-        )]))
+        ))]))
     }
 
     #[async_trait::async_trait]
@@ -1904,11 +1968,43 @@ mod tests {
             &self,
             _handle: &SecretHandle,
             context: &HttpSecretContext<'_>,
-        ) -> Result<SecretLease, HttpCredentialError> {
+        ) -> Result<Arc<SecretLease>, HttpCredentialError> {
             assert!(!context.operation().is_empty());
             self.resolutions.fetch_add(1, Ordering::SeqCst);
-            Ok(SecretLease::new(b"test-token".to_vec()))
+            Ok(Arc::new(SecretLease::new(b"test-token".to_vec())))
         }
+    }
+
+    #[test]
+    fn overlapping_http_registrations_revoke_their_exact_custody_sources() {
+        let custody = crate::domain::secret::SecretCustody::default();
+        let owner = "http-overlap".to_owned();
+        let handle = SecretHandle::parse("env:KIT_TEST_HTTP_SECRET").unwrap();
+        let broker = EnvironmentHttpCredentialBroker::new(
+            PrincipalId::generate().unwrap(),
+            ProjectId::generate().unwrap(),
+            WorkspaceId::generate().unwrap(),
+            BTreeMap::new(),
+        )
+        .with_custody(custody.clone(), owner.clone());
+        let first = Arc::new(SecretLease::new("first-overlap-secret"));
+        let second = Arc::new(SecretLease::new("second-overlap-secret"));
+        custody.register(&owner, "first", Arc::clone(&first));
+        custody.register(&owner, "second", Arc::clone(&second));
+        broker.active_leases.lock().unwrap().insert(
+            ("invocation".to_owned(), handle.identifier().to_owned()),
+            vec![
+                ("first".to_owned(), Arc::clone(&first)),
+                ("second".to_owned(), Arc::clone(&second)),
+            ],
+        );
+
+        broker.revoke("invocation", &handle, &first);
+        assert!(!custody.contains(first.expose()));
+        assert!(custody.contains(second.expose()));
+        broker.revoke("invocation", &handle, &second);
+        assert!(custody.leases().is_empty());
+        assert!(broker.active_leases.lock().unwrap().is_empty());
     }
 
     struct RotatingCredentialBroker {
@@ -1921,13 +2017,13 @@ mod tests {
             &self,
             _handle: &SecretHandle,
             _context: &HttpSecretContext<'_>,
-        ) -> Result<SecretLease, HttpCredentialError> {
+        ) -> Result<Arc<SecretLease>, HttpCredentialError> {
             let secret = match self.resolutions.fetch_add(1, Ordering::SeqCst) {
                 0 => b"sse-credential".as_slice(),
                 1 => b"post-credential".as_slice(),
                 _ => return Err(HttpCredentialError::Unavailable),
             };
-            Ok(SecretLease::new(secret.to_vec()))
+            Ok(Arc::new(SecretLease::new(secret.to_vec())))
         }
     }
 

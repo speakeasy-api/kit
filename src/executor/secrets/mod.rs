@@ -580,6 +580,24 @@ impl PreparedSecrets {
         self.redactor().start(boundary)
     }
 
+    pub(crate) fn start_capture_with_custody(
+        &self,
+        boundary: CaptureBoundary,
+        custody: &crate::domain::secret::SecretCustody,
+    ) -> SanitizedCapture {
+        let (revision, shared) = custody.leases_with_revision();
+        CaptureRedactor::combined_process_bound(&self.leases, &shared, self.provenance)
+            .start(boundary)
+            .with_custody_and_fixed_patterns(
+                custody.clone(),
+                revision,
+                shared.len(),
+                CaptureRedactor::process_bound(&self.leases, self.provenance)
+                    .patterns()
+                    .clone(),
+            )
+    }
+
     pub(crate) const fn capture_policy(&self) -> CapturePersistencePolicy {
         CapturePersistencePolicy::process_bound(self.provenance)
     }
@@ -872,5 +890,48 @@ mod tests {
         assert_eq!(output.stdout, CANARY);
         let sanitized = prepared.sanitize(CaptureBoundary::Log, &output.stdout);
         assert!(!String::from_utf8_lossy(sanitized.bytes().unwrap()).contains(canary));
+    }
+
+    #[test]
+    fn process_capture_refreshes_custody_registered_during_live_output() {
+        let owner = ProcessOwnership::DaemonService(DaemonServiceId::generate().unwrap());
+        let claim = ProcessClaim::new(ProcessId::generate().unwrap(), owner);
+        let prepared = PreparedSecrets {
+            leases: vec![SecretLease::new("fixed-process-secret")],
+            bindings: Vec::new(),
+            files: Vec::new(),
+            descriptor_mappings: Vec::new(),
+            provenance: SanitizerProvenance::issue(claim, "test-profile", "live-pty").unwrap(),
+        };
+        let custody = crate::domain::secret::SecretCustody::default();
+        let mut capture =
+            prepared.start_capture_with_custody(CaptureBoundary::TerminalMetadata, &custody);
+        capture.push(b"late-").unwrap();
+
+        custody.register(
+            "live-process",
+            "rotated",
+            std::sync::Arc::new(SecretLease::new("late-secret")),
+        );
+        assert!(capture.take_ready().is_none());
+        capture.push(b"secret fixed-process-secret").unwrap();
+        capture.finish().unwrap();
+
+        let output = capture.bytes().unwrap();
+        assert!(
+            !output
+                .windows(b"late-secret".len())
+                .any(|value| value == b"late-secret")
+        );
+        assert!(
+            !output
+                .windows(b"fixed-process-secret".len())
+                .any(|value| value == b"fixed-process-secret")
+        );
+        assert!(
+            output
+                .windows(b"[REDACTED]".len())
+                .any(|value| value == b"[REDACTED]")
+        );
     }
 }

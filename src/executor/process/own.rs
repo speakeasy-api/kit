@@ -548,6 +548,7 @@ pub struct ProcessRegistryRegistration {
     pub registry: Arc<dyn ProcessRegistry>,
     pub context: ProcessRegistrationContext,
     terminal: ProcessTerminalConfig,
+    custody: crate::domain::secret::SecretCustody,
 }
 
 impl ProcessRegistryRegistration {
@@ -556,7 +557,13 @@ impl ProcessRegistryRegistration {
             registry,
             context,
             terminal: ProcessTerminalConfig::default(),
+            custody: crate::domain::secret::SecretCustody::default(),
         }
+    }
+
+    pub fn with_custody(mut self, custody: crate::domain::secret::SecretCustody) -> Self {
+        self.custody = custody;
+        self
     }
 
     pub fn with_pty(
@@ -1070,6 +1077,7 @@ impl OwnedProcess {
             let cleanup = self.terminate(cleanup_deadline());
             return Err(cleanup.err().unwrap_or(error));
         }
+        self.process.close_conpty();
         let output = match self
             .capture
             .take()
@@ -1450,8 +1458,18 @@ fn spawn_owned_inner_windows(
         |reader| {
             let observer = prepared.observer.as_ref().expect("PTY observer checked");
             let capture = custody.as_ref().map_or_else(
-                || CaptureRedactor::new(&[]).start(CaptureBoundary::TerminalMetadata),
-                |custody| custody.start_capture(CaptureBoundary::TerminalMetadata),
+                || {
+                    observer
+                        .custody
+                        .redactor()
+                        .start(CaptureBoundary::TerminalMetadata)
+                },
+                |custody| {
+                    custody.start_capture_with_custody(
+                        CaptureBoundary::TerminalMetadata,
+                        &observer.custody,
+                    )
+                },
             );
             CaptureThreads::from_pty(
                 reader,
@@ -1710,8 +1728,18 @@ fn spawn_owned_inner_portable(
         |reader| {
             let observer = prepared.observer.as_ref().expect("PTY observer checked");
             let capture = custody.as_ref().map_or_else(
-                || CaptureRedactor::new(&[]).start(CaptureBoundary::TerminalMetadata),
-                |custody| custody.start_capture(CaptureBoundary::TerminalMetadata),
+                || {
+                    observer
+                        .custody
+                        .redactor()
+                        .start(CaptureBoundary::TerminalMetadata)
+                },
+                |custody| {
+                    custody.start_capture_with_custody(
+                        CaptureBoundary::TerminalMetadata,
+                        &observer.custody,
+                    )
+                },
             );
             CaptureThreads::from_pty(
                 reader,

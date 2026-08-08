@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "corpus_id": "kit-m006-six-surface-injection",
+  "version": "1.0.0",
+  "license": "CC0-1.0",
+  "provenance": "Synthetic Kit security-evaluation fixtures authored for RFC section 24; contains no real credentials, user data, or third-party corpus material.",
+  "corpus_file": "corpus.json",
+  "corpus_sha256": "d0180be94dfc89b4b666f00cb8dfc92ec78889a1156fa504fde2a3771b853a10",
+  "surfaces": [
+    "prompts",
+    "events",
+    "traces",
+    "composition inputs",
+    "terminal history",
+    "workspace metadata"
+  ],
+  "canaries": [
+    "KIT_PROMPT_CANARY_714_x9Q2",
+    "KIT_TRACE_CANARY_714_m4L8",
+    "KIT_MCP_PROMPT_CANARY_714_p3R7",
+    "KIT_WORKSPACE_CANARY_714_k8V1",
+    "KIT_TERMINAL_CANARY_714_t6N4",
+    "KIT_EVENT_CANARY_714_e2W9",
+    "KIT_COMPOSITION_CANARY_714_c5J3"
+  ]
+}

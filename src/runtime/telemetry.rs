@@ -182,6 +182,33 @@ impl<'a> TelemetryRuntime<'a> {
         )
     }
 
+    pub fn encrypted_project(
+        resource: Resource,
+        custody: &crate::domain::secret::SecretCustody,
+        capacity: usize,
+        drop_policy: DropPolicy,
+        exporter: impl Exporter + Send + 'a,
+        readiness_policy: TelemetryReadinessPolicy,
+    ) -> Result<Self, TelemetryRuntimeError> {
+        Ok(Self {
+            state: Mutex::new(RuntimeState {
+                adapter: Adapter::with_custody(resource, custody, capacity, drop_policy)
+                    .map_err(TelemetryRuntimeError::Adapter)?,
+                exporter: Box::new(exporter),
+                retention: RuntimeRetention::EncryptedExporter,
+                exporter_healthy: true,
+                retention_healthy: true,
+                queue_healthy: true,
+                learning_healthy: true,
+                shutting_down: false,
+                last_error: None,
+                learning_last_error: None,
+                next_span: 1,
+            }),
+            readiness_policy,
+        })
+    }
+
     pub fn emit(&self, item: TelemetryItem) -> Result<EnqueueOutcome, TelemetryRuntimeError> {
         let mut state = self.lock();
         match state.adapter.enqueue(item) {
@@ -789,8 +816,22 @@ impl<'a> TelemetryRuntime<'a> {
 
     pub fn flush(&self) -> Result<usize, TelemetryRuntimeError> {
         let mut state = self.lock();
-        let Some(batch) = state.adapter.pending_batch() else {
-            return Ok(0);
+        let batch = match state.adapter.pending_batch() {
+            Ok(Some(batch)) => batch,
+            Ok(None) => {
+                if state.adapter.queued() == 0 {
+                    state.queue_healthy = true;
+                    if state.exporter_healthy && state.retention_healthy {
+                        state.last_error = None;
+                    }
+                }
+                return Ok(0);
+            }
+            Err(error) => {
+                state.queue_healthy = false;
+                state.last_error = Some(error.to_string());
+                return Err(TelemetryRuntimeError::Adapter(error));
+            }
         };
         let count = state.adapter.queued();
         if let Err(error) = batch.validate() {
@@ -814,8 +855,10 @@ impl<'a> TelemetryRuntime<'a> {
         }
         state.retention_healthy = true;
         state.adapter.acknowledge(count);
-        state.queue_healthy = true;
-        state.last_error = None;
+        if state.adapter.queued() == 0 {
+            state.queue_healthy = true;
+            state.last_error = None;
+        }
         Ok(count)
     }
 

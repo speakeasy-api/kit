@@ -287,6 +287,7 @@ pub struct NativeRepoOptions {
     pub diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
     pub feedback_limits: crate::verify::feedback::FeedbackLimits,
     pub edit_validation_time: Duration,
+    pub cursor_key: [u8; 32],
     pub capability_extensions: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
     #[cfg(debug_assertions)]
     pub check_completions: Vec<crate::executor::check::ConformanceCheck>,
@@ -692,6 +693,7 @@ impl NativeRepoService {
                 container_image: options.container_image,
                 verification_registry: options.verification_registry,
                 check_runner,
+                custody: authority.secret_custody(),
                 secrets: Vec::new(),
                 syntax_executors,
                 formatter_required: options.formatter_required,
@@ -705,6 +707,7 @@ impl NativeRepoService {
                 ),
                 semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: options.edit_validation_time,
+                cursor_key: options.cursor_key,
                 #[cfg(test)]
                 run_runner: None,
             },
@@ -3906,6 +3909,7 @@ mod tests {
                 feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
+                cursor_key: [7; 32],
                 capability_extensions: Arc::new(std::sync::RwLock::new(Default::default())),
                 #[cfg(debug_assertions)]
                 check_completions: Vec::new(),

@@ -40,7 +40,9 @@ use crate::store::artifacts::{
 use crate::store::sqlite::idempotency::IdempotencyKey;
 
 pub use crate::domain::retention::{RetentionPeriod, RetentionPolicy};
+pub(crate) use sqlite::project_event_envelopes_with_state;
 pub use sqlite::{DeletionEffect, DeletionWorkerReport, SqliteServiceStore};
+pub(crate) use sqlite::{ProjectedEventEnvelope, project_event_envelopes};
 
 pub const MAX_PROMPT_MESSAGE_BYTES: usize = 8 * 1024;
 const PROMPT_ORPHAN_GRACE_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
@@ -157,6 +159,15 @@ pub enum Query {
         thread_id: ThreadId,
         after: EventCursor,
         limit: usize,
+        #[serde(default)]
+        opaque_cursor: Option<String>,
+    },
+    #[doc(hidden)]
+    ThreadEventsProjected {
+        thread_id: ThreadId,
+        after: EventCursor,
+        limit: usize,
+        projection_state: crate::domain::secret::JsonProjectionState,
     },
     ListRuns {
         project_id: ProjectId,
@@ -180,6 +191,15 @@ pub enum Query {
         run_id: RunId,
         after: EventCursor,
         limit: usize,
+        #[serde(default)]
+        opaque_cursor: Option<String>,
+    },
+    #[doc(hidden)]
+    RunTimelineProjected {
+        run_id: RunId,
+        after: EventCursor,
+        limit: usize,
+        projection_state: crate::domain::secret::JsonProjectionState,
     },
     PendingApprovals {
         project_id: ProjectId,
@@ -409,16 +429,34 @@ pub struct ArtifactMetadataProjection {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EventProjection {
     pub cursor: EventCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_cursor: Option<String>,
     pub project_id: ProjectId,
     pub operation: String,
     pub stream: String,
     pub payload: Vec<u8>,
+    pub envelope: Vec<u8>,
+    pub authority_digest: String,
+    pub projection_digest: String,
 }
+
+pub(crate) const MAX_EVENT_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EventPage {
     pub events: Vec<EventProjection>,
     pub next_cursor: EventCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectedEventPage {
+    pub page: EventPage,
+    pub projection_state: crate::domain::secret::JsonProjectionState,
+    pub item_projection_states: Vec<crate::domain::secret::JsonProjectionState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -449,6 +487,8 @@ pub enum QueryProjection {
     Thread(ThreadProjection),
     DeletionJob(serde_json::Value),
     Events(EventPage),
+    #[doc(hidden)]
+    ProjectedEvents(ProjectedEventPage),
     Runs(Vec<RunProjection>),
     Run(RunProjection),
     RunCost(Box<RunCostProjection>),
@@ -527,6 +567,8 @@ macro_rules! service_registry {
             pub const fn descriptor(&self) -> &'static HandlerDescriptor {
                 let operation = match self {
                     $(Self::$query { .. } => $query_name,)+
+                    Self::ThreadEventsProjected { .. } => "thread.events",
+                    Self::RunTimelineProjected { .. } => "run.timeline",
                 };
                 descriptor(operation)
             }
@@ -1236,6 +1278,7 @@ pub struct Service<S, A, R, M = StaticRunConfigMaterializer> {
     authorizer: A,
     runtime: R,
     config_materializer: M,
+    custody: crate::domain::secret::SecretCustody,
 }
 
 impl<S, A> Service<S, A, NoopRuntime, StaticRunConfigMaterializer> {
@@ -1243,13 +1286,14 @@ impl<S, A> Service<S, A, NoopRuntime, StaticRunConfigMaterializer> {
     pub(crate) fn new(
         store: S,
         authorizer: A,
-        _authority: &crate::runtime::daemon::ControlPlaneAuthority,
+        authority: &crate::runtime::daemon::ControlPlaneAuthority,
     ) -> Self {
         Self {
             store,
             authorizer,
             runtime: NoopRuntime,
             config_materializer: StaticRunConfigMaterializer::default(),
+            custody: authority.secret_custody(),
         }
     }
 }
@@ -1260,13 +1304,14 @@ impl<S, A, M> Service<S, A, NoopRuntime, M> {
         store: S,
         authorizer: A,
         config_materializer: M,
-        _authority: &crate::runtime::daemon::ControlPlaneAuthority,
+        authority: &crate::runtime::daemon::ControlPlaneAuthority,
     ) -> Self {
         Self {
             store,
             authorizer,
             runtime: NoopRuntime,
             config_materializer,
+            custody: authority.secret_custody(),
         }
     }
 }
@@ -1277,13 +1322,14 @@ impl<S, A, R> Service<S, A, R, StaticRunConfigMaterializer> {
         store: S,
         authorizer: A,
         runtime: R,
-        _authority: &crate::runtime::daemon::ControlPlaneAuthority,
+        authority: &crate::runtime::daemon::ControlPlaneAuthority,
     ) -> Self {
         Self {
             store,
             authorizer,
             runtime,
             config_materializer: StaticRunConfigMaterializer::default(),
+            custody: authority.secret_custody(),
         }
     }
 }
@@ -1294,13 +1340,14 @@ impl<S, A, R, M> Service<S, A, R, M> {
         authorizer: A,
         runtime: R,
         config_materializer: M,
-        _authority: &crate::runtime::daemon::ControlPlaneAuthority,
+        authority: &crate::runtime::daemon::ControlPlaneAuthority,
     ) -> Self {
         Self {
             store,
             authorizer,
             runtime,
             config_materializer,
+            custody: authority.secret_custody(),
         }
     }
 
@@ -1341,7 +1388,13 @@ where
                         "message must contain 1 to {MAX_PROMPT_MESSAGE_BYTES} UTF-8 bytes"
                     )));
                 }
-                let bytes = message.into_bytes();
+                let bytes = self
+                    .custody
+                    .project_text_references(
+                        crate::telemetry::redact::CaptureBoundary::Prompt,
+                        &message,
+                    )
+                    .into_bytes();
                 let reference = ArtifactRef::parse(&ArtifactDigest::digest(&bytes).to_string())
                     .map_err(|_| {
                         ServiceError::Store("failed to encode prompt artifact".to_owned())

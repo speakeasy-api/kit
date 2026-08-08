@@ -55,7 +55,7 @@ use crate::{
     domain::{
         config::{Grant, Provider as ConfigProvider, StaticRunConfigMaterializer},
         ids::{PrincipalId, ProjectId},
-        secret::{SecretHandle, SecretLease},
+        secret::{SecretCustody, SecretHandle, SecretLease},
     },
     executor::{
         cancel::SqliteCancellationCoordinator,
@@ -120,6 +120,7 @@ mod browser_origin_tests {
 pub struct ExecutorRuntimeServices {
     registry: Arc<dyn ProcessRegistry>,
     cancellation: SqliteCancellationCoordinator,
+    custody: SecretCustody,
 }
 
 impl ExecutorRuntimeServices {
@@ -128,6 +129,7 @@ impl ExecutorRuntimeServices {
         context: ProcessRegistrationContext,
     ) -> ProcessRegistryRegistration {
         ProcessRegistryRegistration::new(Arc::clone(&self.registry), context)
+            .with_custody(self.custody.clone())
     }
 
     pub const fn cancellation_coordinator(&self) -> &SqliteCancellationCoordinator {
@@ -136,16 +138,25 @@ impl ExecutorRuntimeServices {
 }
 
 #[derive(Clone)]
-pub(crate) struct ControlPlaneAuthority(());
+pub(crate) struct ControlPlaneAuthority(SecretCustody);
 
 impl ControlPlaneAuthority {
-    fn new() -> Self {
-        Self(())
+    fn new(custody: SecretCustody) -> Self {
+        Self(custody)
     }
 
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn for_test() -> Self {
-        Self::new()
+        Self::new(SecretCustody::default())
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn for_test_project(custody: SecretCustody) -> Self {
+        Self::new(custody)
+    }
+
+    pub(crate) fn secret_custody(&self) -> SecretCustody {
+        self.0.clone()
     }
 }
 
@@ -400,6 +411,36 @@ enum ModelAdapterImplementation {
         scenario: FakeScenario,
         native_auto_approval: bool,
     },
+}
+
+impl DaemonModelAdapterConfig {
+    fn secret_custody(&self) -> SecretCustody {
+        SecretCustody::new_named(
+            "daemon-providers",
+            self.implementations.iter().filter_map(
+                |(provider, implementation)| match implementation {
+                    ModelAdapterImplementation::OpenAi { credential, .. }
+                    | ModelAdapterImplementation::Anthropic { credential, .. }
+                    | ModelAdapterImplementation::OpenRouter { credential, .. } => Some((
+                        format!("provider:{}", provider_name(*provider)),
+                        Arc::clone(credential),
+                    )),
+                    ModelAdapterImplementation::Ollama(_) => None,
+                    #[cfg(debug_assertions)]
+                    ModelAdapterImplementation::DeterministicTest { .. } => None,
+                },
+            ),
+        )
+    }
+}
+
+fn provider_name(provider: ConfigProvider) -> &'static str {
+    match provider {
+        ConfigProvider::OpenAi => "openai",
+        ConfigProvider::Anthropic => "anthropic",
+        ConfigProvider::OpenRouter => "openrouter",
+        ConfigProvider::Ollama => "ollama",
+    }
 }
 
 impl DaemonConfig {
@@ -920,7 +961,13 @@ impl Daemon {
         if let Some(error) = &config.mcp_config_error {
             return Err(DaemonError::Setup(error.clone()));
         }
-        let authority = ControlPlaneAuthority::new();
+        let secret_custody = config
+            .model_adapter
+            .as_ref()
+            .map(DaemonModelAdapterConfig::secret_custody)
+            .unwrap_or_default();
+        register_configured_mcp_secrets(&secret_custody, &config.mcp_servers)?;
+        let authority = ControlPlaneAuthority::new(secret_custody.clone());
         secure_state_root(&config.state_root)?;
         let mut lease_runtime =
             LocalLeaseRuntime::open(&config.state_root, &authority).map_err(map_lease)?;
@@ -1034,9 +1081,9 @@ impl Daemon {
         )
         .map_err(|error| DaemonError::Setup(error.to_string()))?;
         let telemetry: Arc<TelemetryRuntime<'static>> = Arc::new(
-            TelemetryRuntime::encrypted_local(
+            TelemetryRuntime::encrypted_project(
                 Resource::default(),
-                &[],
+                &secret_custody,
                 config.telemetry_capacity,
                 DropPolicy::DropNewest,
                 telemetry_exporter,
@@ -1146,6 +1193,7 @@ impl Daemon {
             scheduler.clone(),
             model_adapter,
         )
+        .with_secret_custody(secret_custody.clone())
         .with_tool_learning_key(identity.cursor_key)
         .with_callback_secret_registry(callback_secrets.clone())
         .with_project_root(&config.project_root)
@@ -1255,7 +1303,8 @@ impl Daemon {
                             project_id: identity.project_id,
                             principal_id: identity.principal_id,
                         },
-                    ),
+                    )
+                    .with_custody(secret_custody.clone()),
                     cancellation: cancellation_coordinator.clone(),
                     container_image: config.native_container_image.clone(),
                     verification_registry: config.verification_registry.clone(),
@@ -1264,6 +1313,7 @@ impl Daemon {
                     diagnostic_adapters: config.native_diagnostic_adapters.clone(),
                     feedback_limits: config.native_feedback_limits.clone(),
                     edit_validation_time: config.native_edit_validation_time,
+                    cursor_key: identity.cursor_key,
                     capability_extensions: Arc::clone(&capability_extensions),
                     #[cfg(debug_assertions)]
                     check_completions: config.native_check_completions.clone(),
@@ -1295,7 +1345,8 @@ impl Daemon {
             CursorKey::new(identity.cursor_key),
             StreamConfig::default(),
         )
-        .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        .map_err(|error| DaemonError::Setup(error.to_string()))?
+        .with_custody(secret_custody.clone());
         let listener = TcpListener::bind(config.bind_addr)
             .await
             .map_err(DaemonError::Io)?;
@@ -1339,6 +1390,12 @@ impl Daemon {
             LoopbackReplayPolicy::new(replay_seconds, config.auth_replay_capacity),
         )
         .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        let credential = Arc::new(credential);
+        secret_custody.register(
+            "daemon-loopback",
+            loopback.token_handle().identifier(),
+            Arc::clone(&credential),
+        );
         let loopback = Arc::new(loopback);
         let auth_readiness = AuthReadiness::new();
         auth_readiness.install_authenticator::<LoopbackObservation<'static>, _>(loopback.as_ref());
@@ -1418,10 +1475,15 @@ impl Daemon {
         let task_root = state_root.clone();
         let task_backup_runtime = Arc::clone(&backup_runtime);
         let signal_shutdown = shutdown.sender.clone();
+        let task_secret_custody = secret_custody.clone();
         let task = tokio::spawn(async move {
             let auth_health = task_health.clone();
+            let expiring_authenticator = Arc::clone(&loopback);
+            let expiring_custody = task_secret_custody.clone();
             let auth_expiry_task = tokio::spawn(async move {
                 tokio::time::sleep_until(auth_deadline).await;
+                expiring_authenticator.revoke();
+                expiring_custody.remove_owner("daemon-loopback");
                 auth_health.set_auth_ready(false);
             });
             let mut lifecycle_shutdown = shutdown_receiver.clone();
@@ -1462,6 +1524,8 @@ impl Daemon {
 
             task_health.set_admission_ready(false);
             task_health.begin_shutdown();
+            loopback.revoke();
+            task_secret_custody.remove_owner("daemon-loopback");
             stream_cancellation.cancel();
             lease_runtime.begin_shutdown();
             let discovery_result = remove_discovery(&task_root);
@@ -1508,6 +1572,7 @@ impl Daemon {
         let executor_runtime_services = ExecutorRuntimeServices {
             registry: exec_manager,
             cancellation: cancellation_coordinator,
+            custody: secret_custody,
         };
         Ok(Self {
             endpoint,
@@ -1587,6 +1652,54 @@ impl Daemon {
             .await
             .map_err(|error| DaemonError::Task(error.to_string()))?
     }
+}
+
+fn register_configured_mcp_secrets(
+    custody: &SecretCustody,
+    servers: &[crate::protocols::mcp::config::McpServerConfig],
+) -> Result<(), DaemonError> {
+    let mut handles = std::collections::BTreeSet::new();
+    for server in servers {
+        handles.extend(server.credential_handle.iter().cloned());
+        if let Some(egress) = &server.egress {
+            handles.extend(
+                egress
+                    .redirect_grants
+                    .iter()
+                    .map(|grant| grant.credential_handle.clone()),
+            );
+        }
+        if let crate::protocols::mcp::config::McpTransportConfig::Stdio { environment, .. } =
+            &server.transport
+        {
+            handles.extend(environment.values().map(|value| value.handle.clone()));
+        }
+    }
+    for handle in handles {
+        let variable = handle.identifier().strip_prefix("env:").ok_or_else(|| {
+            DaemonError::Setup("configured MCP secret handle is not environment-backed".to_owned())
+        })?;
+        let value = match std::env::var(variable) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => continue,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(DaemonError::Setup(format!(
+                    "configured MCP secret {variable:?} is not valid Unicode"
+                )));
+            }
+        };
+        if value.is_empty() {
+            return Err(DaemonError::Setup(format!(
+                "configured MCP secret {variable:?} is empty"
+            )));
+        }
+        custody.register(
+            "daemon-mcp",
+            handle.identifier(),
+            Arc::new(SecretLease::new(value.into_bytes())),
+        );
+    }
+    Ok(())
 }
 
 fn build_model_adapter(

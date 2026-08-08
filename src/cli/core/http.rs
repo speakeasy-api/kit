@@ -830,10 +830,14 @@ fn query_path(query: &Query) -> Result<String, ClientError> {
             thread_id,
             after,
             limit,
+            opaque_cursor,
         } => (
             vec![("thread_id", thread_id.to_string())],
             vec![
-                ("cursor", encode_cursor(after.position())),
+                (
+                    "cursor",
+                    event_page_cursor(*after, opaque_cursor.as_deref())?,
+                ),
                 ("limit", limit.to_string()),
             ],
         ),
@@ -845,10 +849,14 @@ fn query_path(query: &Query) -> Result<String, ClientError> {
             run_id,
             after,
             limit,
+            opaque_cursor,
         } => (
             vec![("run_id", run_id.to_string())],
             vec![
-                ("cursor", encode_cursor(after.position())),
+                (
+                    "cursor",
+                    event_page_cursor(*after, opaque_cursor.as_deref())?,
+                ),
                 ("limit", limit.to_string()),
             ],
         ),
@@ -862,7 +870,9 @@ fn query_path(query: &Query) -> Result<String, ClientError> {
             vec![("project_id", project_id.to_string())],
             vec![("cursor", encode_cursor(cursor.position()))],
         ),
-        Query::GetAttempt { .. } => {
+        Query::GetAttempt { .. }
+        | Query::ThreadEventsProjected { .. }
+        | Query::RunTimelineProjected { .. } => {
             return Err(ClientError::internal("query has no public CLI HTTP route"));
         }
     };
@@ -877,6 +887,18 @@ fn query_path(query: &Query) -> Result<String, ClientError> {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_owned(),
     })
+}
+
+fn event_page_cursor(
+    after: EventCursor,
+    opaque_cursor: Option<&str>,
+) -> Result<String, ClientError> {
+    match opaque_cursor {
+        Some(cursor) => OpaqueStreamCursor::parse(cursor.to_owned())
+            .map(|cursor| cursor.to_string())
+            .map_err(|_| ClientError::internal("invalid opaque event page cursor")),
+        None => Ok(encode_cursor(after.position())),
+    }
 }
 
 fn route_path(operation: &str, parameters: Parameters) -> Result<String, ClientError> {
@@ -915,7 +937,10 @@ fn query_response(query: Query, response: Response) -> Result<QueryProjection, C
         }
         Query::GetThread { .. } => QueryProjection::Thread(json_response(response)?),
         Query::GetDeletionJob { .. } => QueryProjection::DeletionJob(json_response(response)?),
-        Query::ThreadEvents { .. } | Query::RunTimeline { .. } => {
+        Query::ThreadEvents { .. }
+        | Query::ThreadEventsProjected { .. }
+        | Query::RunTimeline { .. }
+        | Query::RunTimelineProjected { .. } => {
             let page: WireEventPage = json_response(response)?;
             QueryProjection::Events(page.try_into()?)
         }
@@ -1169,6 +1194,8 @@ struct EffectiveRetention {
 struct WireEventPage {
     items: Vec<WireEvent>,
     next_cursor: String,
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -1178,6 +1205,12 @@ struct WireEvent {
     operation: String,
     stream: String,
     payload: Value,
+    #[serde(default)]
+    authority_digest: String,
+    #[serde(default)]
+    projection_digest: String,
+    #[serde(default)]
+    projected_envelope: Option<String>,
 }
 
 impl TryFrom<WireEventPage> for EventPage {
@@ -1188,20 +1221,70 @@ impl TryFrom<WireEventPage> for EventPage {
             .items
             .into_iter()
             .map(|event| {
+                let (cursor, opaque_cursor) = wire_event_cursor(&event.cursor)?;
+                let (envelope, projection_digest) = match event.projected_envelope {
+                    Some(projected_envelope) => {
+                        let envelope = projected_envelope.into_bytes();
+                        let digest = crate::capabilities::kernel::identity::Digest::of(
+                            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+                            &envelope,
+                        )
+                        .to_string();
+                        if event.projection_digest != digest {
+                            return Err(ClientError::internal(
+                                "daemon returned a projected event envelope digest mismatch",
+                            ));
+                        }
+                        serde_json::from_slice::<serde_json::Value>(&envelope).map_err(|_| {
+                            ClientError::internal(
+                                "daemon returned an invalid projected event envelope",
+                            )
+                        })?;
+                        (envelope, event.projection_digest)
+                    }
+                    None => (Vec::new(), String::new()),
+                };
                 Ok(EventProjection {
-                    cursor: cursor(&event.cursor)?,
+                    cursor,
+                    opaque_cursor,
                     project_id: event.project_id,
                     operation: event.operation,
                     stream: event.stream,
                     payload: serde_json::to_vec(&event.payload)
                         .map_err(|error| ClientError::internal(error.to_string()))?,
+                    envelope,
+                    authority_digest: event.authority_digest,
+                    projection_digest,
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
+        let (mut next_cursor, opaque_next_cursor) = wire_event_cursor(&value.next_cursor)?;
+        if opaque_next_cursor.is_some() {
+            next_cursor = events
+                .last()
+                .map(|event| event.cursor)
+                .unwrap_or(EventCursor::START);
+        }
         Ok(Self {
             events,
-            next_cursor: cursor(&value.next_cursor)?,
+            next_cursor,
+            opaque_next_cursor,
+            truncated: value.truncated,
         })
+    }
+}
+
+fn wire_event_cursor(value: &str) -> Result<(EventCursor, Option<String>), ClientError> {
+    if value.starts_with("kitc2_") {
+        OpaqueStreamCursor::parse(value.to_owned())
+            .map_err(|_| ClientError::internal("daemon returned an invalid cursor"))?;
+        return Ok((EventCursor::START, Some(value.to_owned())));
+    }
+    match cursor(value) {
+        Ok(cursor) => Ok((cursor, None)),
+        Err(_) => OpaqueStreamCursor::parse(value.to_owned())
+            .map(|_| (EventCursor::START, Some(value.to_owned())))
+            .map_err(|_| ClientError::internal("daemon returned an invalid cursor")),
     }
 }
 
@@ -1276,5 +1359,114 @@ mod tests {
             let (_, body) = command_wire(&resolution(action, None)).unwrap();
             assert!(body.get("content").is_none());
         }
+    }
+
+    #[test]
+    fn event_page_uses_and_verifies_exact_projected_envelope_bytes() {
+        let envelope = br#"{"z":1,"a":{"y":2,"b":3}}"#.to_vec();
+        let projection_digest = crate::capabilities::kernel::identity::Digest::of(
+            crate::capabilities::kernel::identity::DigestAlgorithm::Sha256,
+            &envelope,
+        )
+        .to_string();
+        let wire = |digest: String, projected_envelope: Option<String>| WireEventPage {
+            items: vec![WireEvent {
+                cursor: encode_cursor(1),
+                project_id: ProjectId::from_stable_bytes(b"event-wire-project"),
+                operation: "run.progress".to_owned(),
+                stream: "run_00000000000000000000000000".to_owned(),
+                payload: json!({"a": 1}),
+                authority_digest: "sha256:authority".to_owned(),
+                projection_digest: digest,
+                projected_envelope,
+            }],
+            next_cursor: encode_cursor(1),
+            truncated: false,
+        };
+
+        let page = EventPage::try_from(wire(
+            projection_digest.clone(),
+            Some(String::from_utf8(envelope.clone()).unwrap()),
+        ))
+        .unwrap();
+        assert_eq!(page.events[0].envelope, envelope);
+        assert_eq!(page.events[0].authority_digest, "sha256:authority");
+        assert_eq!(page.events[0].projection_digest, projection_digest);
+
+        assert!(
+            EventPage::try_from(wire(
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_owned(),
+                Some("{}".to_owned()),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn old_event_page_does_not_claim_a_digest_for_reconstructed_bytes() {
+        let page = EventPage::try_from(WireEventPage {
+            items: vec![WireEvent {
+                cursor: encode_cursor(1),
+                project_id: ProjectId::from_stable_bytes(b"legacy-event-wire"),
+                operation: "run.progress".to_owned(),
+                stream: "run_00000000000000000000000000".to_owned(),
+                payload: json!({"legacy": true}),
+                authority_digest: String::new(),
+                projection_digest: "sha256:unverifiable".to_owned(),
+                projected_envelope: None,
+            }],
+            next_cursor: encode_cursor(1),
+            truncated: false,
+        })
+        .unwrap();
+        assert!(page.events[0].envelope.is_empty());
+        assert!(page.events[0].projection_digest.is_empty());
+    }
+
+    #[test]
+    fn opaque_event_page_cursor_round_trips_into_the_next_request_exactly() {
+        let cursor = format!("kitc2_{}", "a".repeat(152));
+        let page = EventPage::try_from(WireEventPage {
+            items: vec![WireEvent {
+                cursor: cursor.clone(),
+                project_id: ProjectId::from_stable_bytes(b"opaque-page-project"),
+                operation: "thread.create".to_owned(),
+                stream: "thread_00000000000000000000000000".to_owned(),
+                payload: json!({}),
+                authority_digest: String::new(),
+                projection_digest: String::new(),
+                projected_envelope: None,
+            }],
+            next_cursor: cursor.clone(),
+            truncated: false,
+        })
+        .unwrap();
+        assert_eq!(page.opaque_next_cursor.as_deref(), Some(cursor.as_str()));
+        assert_eq!(
+            page.events[0].opaque_cursor.as_deref(),
+            Some(cursor.as_str())
+        );
+        let output = crate::cli::core::render_response(
+            crate::cli::core::ClientResponse::Query(Box::new(QueryProjection::Events(
+                page.clone(),
+            ))),
+            crate::cli::core::OutputFormat::Json,
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        assert_eq!(output["items"][0]["cursor"], cursor);
+        assert_eq!(output["next_cursor"], cursor);
+
+        let thread_id = crate::domain::ids::ThreadId::from_stable_bytes(b"opaque-page-thread");
+        let path = query_path(&Query::ThreadEvents {
+            thread_id,
+            after: page.next_cursor,
+            limit: 10,
+            opaque_cursor: page.opaque_next_cursor,
+        })
+        .unwrap();
+        assert!(path.contains(&format!("cursor={cursor}")));
+        assert!(!path.contains("cursor_0000000000000000"));
     }
 }

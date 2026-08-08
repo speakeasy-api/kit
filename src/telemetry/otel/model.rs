@@ -86,6 +86,72 @@ pub(crate) fn redact_attributes(
     if let AttributeValue::Object(safe) = value {
         *attributes = safe;
     }
+    if attributes_reconstruct_secret(attributes, redactor) {
+        redact_attribute_state(attributes);
+    }
+}
+
+fn attributes_reconstruct_secret(
+    attributes: &BTreeMap<String, AttributeValue>,
+    redactor: &CaptureRedactor<'_>,
+) -> bool {
+    let mut scanner = redactor.scanner();
+    scan_attributes(attributes, &mut scanner);
+    scanner.found()
+}
+
+fn scan_attributes(
+    attributes: &BTreeMap<String, AttributeValue>,
+    scanner: &mut crate::telemetry::redact::SensitiveDataScanner,
+) {
+    for (name, value) in attributes {
+        scanner.push(name.as_bytes());
+        scan_attribute(value, scanner);
+    }
+}
+
+fn scan_attribute(
+    value: &AttributeValue,
+    scanner: &mut crate::telemetry::redact::SensitiveDataScanner,
+) {
+    match value {
+        AttributeValue::String(value) => scanner.push(value.as_bytes()),
+        AttributeValue::Array(values) => {
+            for value in values {
+                scan_attribute(value, scanner);
+            }
+        }
+        AttributeValue::Object(attributes) => scan_attributes(attributes, scanner),
+        AttributeValue::Null => scanner.push(b"null"),
+        AttributeValue::Bool(value) => scanner.push(value.to_string().as_bytes()),
+        AttributeValue::I64(value) => scanner.push(value.to_string().as_bytes()),
+        AttributeValue::U64(value) => scanner.push(value.to_string().as_bytes()),
+        AttributeValue::F64(value) => scanner.push(value.to_string().as_bytes()),
+    }
+}
+
+fn redact_attribute_state(attributes: &mut BTreeMap<String, AttributeValue>) {
+    *attributes = std::mem::take(attributes)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, mut value))| {
+            redact_attribute_value(&mut value);
+            (format!("redacted.{index}"), value)
+        })
+        .collect();
+}
+
+fn redact_attribute_value(value: &mut AttributeValue) {
+    match value {
+        AttributeValue::String(value) => *value = crate::domain::secret::REDACTED.to_owned(),
+        AttributeValue::Array(values) => {
+            for value in values {
+                redact_attribute_value(value);
+            }
+        }
+        AttributeValue::Object(attributes) => redact_attribute_state(attributes),
+        _ => {}
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -193,6 +259,19 @@ impl Span {
         for event in &mut self.events {
             event.name = redactor.redact_text(CaptureBoundary::Trace, &event.name);
             redact_attributes(&mut event.attributes, CaptureBoundary::Trace, redactor);
+        }
+        let mut aggregate = redactor.scanner();
+        scan_attributes(&self.attributes, &mut aggregate);
+        for event in &self.events {
+            aggregate.push(event.name.as_bytes());
+            scan_attributes(&event.attributes, &mut aggregate);
+        }
+        if aggregate.found() {
+            redact_attribute_state(&mut self.attributes);
+            for event in &mut self.events {
+                event.name = crate::domain::secret::REDACTED.to_owned();
+                redact_attribute_state(&mut event.attributes);
+            }
         }
         if let SpanStatus::Error(Some(description)) = &mut self.status {
             *description = redactor.redact_text(CaptureBoundary::Trace, description);

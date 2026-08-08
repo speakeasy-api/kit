@@ -113,15 +113,40 @@ pub struct GapMarker {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceArtifactHandle {
     pub id: String,
+    pub path: PathBuf,
+    pub path_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReadResponse {
     pub revision: RevisionId,
     pub path: PathBuf,
+    /// Size of the authoritative source file.
     pub file_bytes: usize,
+    /// Returned range coordinates, projected only when `source_offset` is present.
     pub byte_start: usize,
     pub byte_end: usize,
+    /// Authoritative source coordinate for a range whose projection changed length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_offset: Option<usize>,
+    /// Byte length of the selected authoritative source range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_length: Option<usize>,
+    /// BLAKE3 digest of the selected authoritative source range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_digest: Option<String>,
+    /// Authoritative whole-file size for a range whose projection changed length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file_size: Option<usize>,
+    /// Offset within the independently projected selected range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_offset: Option<usize>,
+    /// Total projected length of the selected source range, not the whole source file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_length: Option<usize>,
+    /// BLAKE3 digest of the projected selected range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_digest: Option<String>,
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
     pub encoding: Encoding,
@@ -220,13 +245,60 @@ pub fn read(
     request: &ReadRequest,
     options: &ReadOptions,
 ) -> Result<ReadResponse, ReadError> {
-    read_with_publish_hook(
+    read_with_publish_hook_inner(
         workspace,
         index,
         artifacts,
         context,
         request,
         options,
+        None,
+        None,
+        |_| {},
+    )
+}
+
+pub fn read_projected(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    artifacts: &ArtifactStore,
+    context: &ArtifactContext,
+    request: &ReadRequest,
+    options: &ReadOptions,
+    custody: &crate::domain::secret::SecretCustody,
+) -> Result<ReadResponse, ReadError> {
+    read_projected_with_state(
+        workspace,
+        index,
+        artifacts,
+        context,
+        request,
+        options,
+        custody,
+        &mut crate::domain::secret::JsonProjectionState::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_projected_with_state(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    artifacts: &ArtifactStore,
+    context: &ArtifactContext,
+    request: &ReadRequest,
+    options: &ReadOptions,
+    custody: &crate::domain::secret::SecretCustody,
+    projection_state: &mut crate::domain::secret::JsonProjectionState,
+) -> Result<ReadResponse, ReadError> {
+    read_with_publish_hook_inner(
+        workspace,
+        index,
+        artifacts,
+        context,
+        request,
+        options,
+        Some(custody),
+        Some(projection_state),
         |_| {},
     )
 }
@@ -250,13 +322,15 @@ pub fn read_with_stage_hook(
     after_stage: impl FnOnce(),
 ) -> Result<ReadResponse, ReadError> {
     let mut after_stage = Some(after_stage);
-    read_with_publish_hook(
+    read_with_publish_hook_inner(
         workspace,
         index,
         artifacts,
         context,
         request,
         options,
+        None,
+        None,
         |point| {
             if point == ReadPublishPoint::ProvisionalSynced
                 && let Some(after_stage) = after_stage.take()
@@ -275,6 +349,31 @@ pub fn read_with_publish_hook(
     context: &ArtifactContext,
     request: &ReadRequest,
     options: &ReadOptions,
+    publish_hook: impl FnMut(ReadPublishPoint),
+) -> Result<ReadResponse, ReadError> {
+    read_with_publish_hook_inner(
+        workspace,
+        index,
+        artifacts,
+        context,
+        request,
+        options,
+        None,
+        None,
+        publish_hook,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_with_publish_hook_inner(
+    workspace: &ManagedWorkspace,
+    index: &MetadataIndex,
+    artifacts: &ArtifactStore,
+    context: &ArtifactContext,
+    request: &ReadRequest,
+    options: &ReadOptions,
+    custody: Option<&crate::domain::secret::SecretCustody>,
+    mut projection_state: Option<&mut crate::domain::secret::JsonProjectionState>,
     mut publish_hook: impl FnMut(ReadPublishPoint),
 ) -> Result<ReadResponse, ReadError> {
     let started = Instant::now();
@@ -298,20 +397,30 @@ pub fn read_with_publish_hook(
     let file =
         guard.read_file_range_before(&request.path, range, options.max_read_bytes, deadline)?;
     check_deadline(deadline)?;
-    let start = file.byte_start;
+    let source_path = request.path.as_os_str().as_encoded_bytes();
+    let display_path = custody.map_or_else(
+        || request.path.clone(),
+        |custody| {
+            projected_path(project_read_component(
+                custody,
+                &mut projection_state,
+                source_path,
+            ))
+        },
+    );
+    let source_start = file.byte_start;
     let requested_end = file.byte_end;
-    let end = start + file.bytes.len();
-    let selected = file.bytes.as_slice();
+    let projected;
+    let selected = if let Some(custody) = custody {
+        projected = project_read_component(custody, &mut projection_state, &file.bytes);
+        projected.as_slice()
+    } else {
+        file.bytes.as_slice()
+    };
     let encoding = if std::str::from_utf8(selected).is_ok() && !selected.contains(&0) {
         Encoding::Utf8
     } else {
         Encoding::Binary
-    };
-    let newline = match (file.has_lf, file.has_crlf) {
-        (false, false) => NewlineStyle::None,
-        (true, false) => NewlineStyle::Lf,
-        (false, true) => NewlineStyle::Crlf,
-        (true, true) => NewlineStyle::Mixed,
     };
     let must_artifact = encoding == Encoding::Binary
         || selected.len() > options.max_inline_bytes
@@ -320,16 +429,30 @@ pub fn read_with_publish_hook(
                 .path
                 .extension()
                 .is_some_and(|extension| extension == "log");
-    let prepared = must_artifact
-        .then(|| {
+    let artifact_path = must_artifact.then(|| {
+        custody.map_or_else(
+            || request.path.clone(),
+            |custody| {
+                projected_path(project_read_component(
+                    custody,
+                    &mut projection_state,
+                    source_path,
+                ))
+            },
+        )
+    });
+    let prepared = artifact_path
+        .as_ref()
+        .map(|artifact_path| {
             prepare_artifact(
                 artifacts,
                 context,
                 revision.epoch(),
                 request,
-                start,
-                end,
+                source_start,
+                &file.bytes,
                 selected,
+                artifact_path,
                 encoding,
                 options.max_artifact_bytes,
                 deadline,
@@ -344,17 +467,58 @@ pub fn read_with_publish_hook(
     if pending.is_some() {
         publish_hook(ReadPublishPoint::ProvisionalSynced);
     }
+    let projected_coordinates = custody.is_some() && selected != file.bytes;
+    let start = if projected_coordinates {
+        0
+    } else {
+        source_start
+    };
+    let end = if projected_coordinates {
+        selected.len()
+    } else {
+        requested_end
+    };
+    let (has_lf, has_crlf) = projected_newlines(selected);
+    let source_digest = blake3::hash(&file.bytes);
+    let projected_digest = blake3::hash(selected);
     let mut response = ReadResponse {
         revision: request.expected_revision,
-        path: request.path.clone(),
+        path: display_path,
         file_bytes: file.file_bytes,
         byte_start: start,
-        byte_end: requested_end,
+        byte_end: end,
+        source_offset: projected_coordinates.then_some(source_start),
+        source_length: projected_coordinates.then_some(file.bytes.len()),
+        source_digest: projected_coordinates
+            .then(|| format!("blake3:{}", hex(source_digest.as_bytes()))),
+        source_file_size: projected_coordinates.then_some(file.file_bytes),
+        projected_offset: projected_coordinates.then_some(0),
+        projected_length: projected_coordinates.then_some(selected.len()),
+        projected_digest: projected_coordinates
+            .then(|| format!("blake3:{}", hex(projected_digest.as_bytes()))),
         line_start: file.line_start,
         line_end: file.line_end,
         encoding,
-        newline,
-        final_newline: file.final_newline,
+        newline: if projected_coordinates {
+            match (has_lf, has_crlf) {
+                (false, false) => NewlineStyle::None,
+                (true, false) => NewlineStyle::Lf,
+                (false, true) => NewlineStyle::Crlf,
+                (true, true) => NewlineStyle::Mixed,
+            }
+        } else {
+            match (file.has_lf, file.has_crlf) {
+                (false, false) => NewlineStyle::None,
+                (true, false) => NewlineStyle::Lf,
+                (false, true) => NewlineStyle::Crlf,
+                (true, true) => NewlineStyle::Mixed,
+            }
+        },
+        final_newline: if projected_coordinates {
+            selected.last() == Some(&b'\n')
+        } else {
+            file.final_newline
+        },
         mode: FileMode {
             executable: entry.executable,
         },
@@ -370,7 +534,7 @@ pub fn read_with_publish_hook(
             &mut response,
             &selected[..selected.len().min(options.max_inline_bytes)],
             start,
-            requested_end,
+            end,
             options.max_result_bytes,
             deadline,
         )?;
@@ -409,6 +573,44 @@ pub fn read_with_publish_hook(
     Ok(response)
 }
 
+fn projected_newlines(bytes: &[u8]) -> (bool, bool) {
+    let crlf = bytes.windows(2).any(|pair| pair == b"\r\n");
+    let lf = bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'\n' && index.checked_sub(1).and_then(|at| bytes.get(at)) != Some(&b'\r')
+    });
+    (lf, crlf)
+}
+
+fn project_read_component(
+    custody: &crate::domain::secret::SecretCustody,
+    state: &mut Option<&mut crate::domain::secret::JsonProjectionState>,
+    bytes: &[u8],
+) -> Vec<u8> {
+    state.as_deref_mut().map_or_else(
+        || {
+            custody
+                .project(
+                    crate::telemetry::redact::CaptureBoundary::WorkspaceMetadata,
+                    bytes,
+                )
+                .bytes()
+                .expect("finished workspace projection")
+                .to_vec()
+        },
+        |state| {
+            custody.project_bytes_stream(
+                crate::telemetry::redact::CaptureBoundary::WorkspaceMetadata,
+                bytes,
+                state,
+            )
+        },
+    )
+}
+
+fn projected_path(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 pub fn resolve_artifact(
     workspace: &ManagedWorkspace,
     store: &ArtifactStore,
@@ -431,7 +633,7 @@ pub fn resolve_artifact(
     validate_artifact_context(context, deadline)?;
     validate_path_and_range(expected)?;
     let revision = workspace.validate_revision_until(expected.expected_revision, deadline)?;
-    let digest = opaque_digest(&handle.id, context, expected, deadline)
+    let (version, digest) = opaque_digest(&handle.id, context, expected, deadline)
         .map_err(|_| ReadError::ArtifactAuthorization)?;
     if !store
         .workspace_artifact_is_issued(digest)
@@ -456,18 +658,31 @@ pub fn resolve_artifact(
                 };
                 let mut magic = [0_u8; 26];
                 file.read_exact(&mut magic)?;
-                if &magic != b"kit-workspace-artifact-v3\0" {
+                if magic != version.envelope_magic() {
                     return Err(ArtifactError::InvalidManifest("unknown workspace envelope"));
                 }
                 let epoch = read_frame(&mut file, 80)?;
                 let bound_revision = read_frame(&mut file, 80)?;
                 let path = read_frame(&mut file, options.max_envelope_bytes)?;
+                let (projected_path, projected_path_digest) =
+                    if version == WorkspaceArtifactVersion::V4 {
+                        let projected_path = read_frame(&mut file, options.max_envelope_bytes)?;
+                        let mut projected_path_digest = [0_u8; 32];
+                        file.read_exact(&mut projected_path_digest)?;
+                        (projected_path, projected_path_digest)
+                    } else {
+                        (path.clone(), *blake3::hash(&path).as_bytes())
+                    };
                 let mut range_tag = [0_u8; 1];
                 file.read_exact(&mut range_tag)?;
                 let range_start = read_u64(&mut file)?;
                 let range_end = read_u64(&mut file)?;
-                let start = read_u64(&mut file)?;
-                let end = read_u64(&mut file)?;
+                let first_coordinate = read_u64(&mut file)?;
+                let second_coordinate = read_u64(&mut file)?;
+                let mut source_digest = [0_u8; 32];
+                if version == WorkspaceArtifactVersion::V4 {
+                    file.read_exact(&mut source_digest)?;
+                }
                 let media_type = read_frame(&mut file, 255)?;
                 let mut binding = [0_u8; 32];
                 file.read_exact(&mut binding)?;
@@ -478,32 +693,65 @@ pub fn resolve_artifact(
                     1 => ArtifactRetention::UntilUnixMicros(read_i64(&mut file)?),
                     _ => return Err(ArtifactError::InvalidManifest("invalid envelope retention")),
                 };
-                let mut payload_digest = [0_u8; 32];
-                file.read_exact(&mut payload_digest)?;
-                let payload_bytes = read_u64(&mut file)?;
-                let computed_binding = auth_binding_u64(
-                    context,
-                    &epoch,
-                    &bound_revision,
-                    &path,
-                    range_tag[0],
-                    range_start,
-                    range_end,
-                    start,
-                    end,
-                    &payload_digest,
-                );
+                let mut projected_digest = [0_u8; 32];
+                file.read_exact(&mut projected_digest)?;
+                let projected_length = read_u64(&mut file)?;
+                let computed_binding = match version {
+                    WorkspaceArtifactVersion::V3 => auth_binding_v3_u64(
+                        context,
+                        &epoch,
+                        &bound_revision,
+                        &path,
+                        range_tag[0],
+                        range_start,
+                        range_end,
+                        first_coordinate,
+                        second_coordinate,
+                        &projected_digest,
+                    ),
+                    WorkspaceArtifactVersion::V4 => auth_binding_u64(
+                        context,
+                        &epoch,
+                        &bound_revision,
+                        &path,
+                        range_tag[0],
+                        range_start,
+                        range_end,
+                        first_coordinate,
+                        second_coordinate,
+                        &source_digest,
+                        &projected_digest,
+                        projected_length,
+                        &projected_path,
+                        &projected_path_digest,
+                    ),
+                };
                 let canonical_path = !path.is_empty()
                     && path[0] != b'/'
                     && path
                         .split(|byte| *byte == b'/')
                         .all(|part| !part.is_empty() && part != b"." && part != b"..");
+                let canonical_projected_path = !projected_path.is_empty()
+                    && projected_path[0] != b'/'
+                    && projected_path
+                        .split(|byte| *byte == b'/')
+                        .all(|part| !part.is_empty() && part != b"." && part != b"..");
+                let expected_projected_path_digest = blake3::hash(&projected_path);
+                let projected_path_digest_text = format!("blake3:{}", hex(&projected_path_digest));
                 let authorized =
                     fixed_eq(manifest.principal.as_bytes(), context.principal.as_bytes())
                         & fixed_eq(manifest.project.as_bytes(), context.project.as_bytes())
                         & fixed_eq(&epoch, epoch_text.as_bytes())
                         & fixed_eq(&bound_revision, revision_text.as_bytes())
                         & fixed_eq(&path, expected_path)
+                        & fixed_eq(&projected_path, handle.path.as_os_str().as_encoded_bytes())
+                        & fixed_eq(
+                            projected_path_digest_text.as_bytes(),
+                            handle.path_digest.as_bytes(),
+                        )
+                        & bool::from(
+                            projected_path_digest.ct_eq(expected_projected_path_digest.as_bytes()),
+                        )
                         & (range_tag[0] == expected_range_tag)
                         & (range_start == expected_range_start)
                         & (range_end == expected_range_end)
@@ -515,32 +763,41 @@ pub fn resolve_artifact(
                         & (manifest.class == ArtifactClass::File)
                         & (manifest.retention == retention)
                         & (manifest.stored_at_unix_micros == 0)
-                        & (start <= end)
-                        & (end.checked_sub(start) == Some(payload_bytes))
+                        & match version {
+                            WorkspaceArtifactVersion::V3 => {
+                                first_coordinate <= second_coordinate
+                                    && second_coordinate.checked_sub(first_coordinate)
+                                        == Some(projected_length)
+                            }
+                            WorkspaceArtifactVersion::V4 => {
+                                first_coordinate.checked_add(second_coordinate).is_some()
+                            }
+                        }
                         & canonical_path
+                        & canonical_projected_path
                         & std::str::from_utf8(&media_type).is_ok();
                 if !authorized {
                     return Err(ArtifactError::InvalidManifest(
                         "workspace artifact authorization failed",
                     ));
                 }
-                if payload_bytes > options.max_payload_bytes as u64
-                    || payload_bytes > usize::MAX as u64
+                if projected_length > options.max_payload_bytes as u64
+                    || projected_length > usize::MAX as u64
                 {
                     return Err(ArtifactError::TooLarge {
-                        size: payload_bytes,
+                        size: projected_length,
                         max: options.max_payload_bytes as u64,
                     });
                 }
                 let mut payload = Vec::new();
                 payload
-                    .try_reserve_exact(payload_bytes as usize)
+                    .try_reserve_exact(projected_length as usize)
                     .map_err(|_| ArtifactError::TooLarge {
-                        size: payload_bytes,
+                        size: projected_length,
                         max: options.max_payload_bytes as u64,
                     })?;
                 let mut hash = blake3::Hasher::new();
-                let mut remaining = payload_bytes as usize;
+                let mut remaining = projected_length as usize;
                 let mut buffer = [0_u8; 64 * 1024];
                 while remaining != 0 {
                     if Instant::now() >= deadline {
@@ -564,10 +821,10 @@ pub fn resolve_artifact(
                         "trailing artifact payload bytes",
                     ));
                 }
-                let computed_payload_digest = *hash.finalize().as_bytes();
-                if !bool::from(payload_digest.ct_eq(&computed_payload_digest)) {
+                let computed_projected_digest = *hash.finalize().as_bytes();
+                if !bool::from(projected_digest.ct_eq(&computed_projected_digest)) {
                     return Err(ArtifactError::InvalidManifest(
-                        "workspace payload digest mismatch",
+                        "workspace projected payload digest mismatch",
                     ));
                 }
                 Ok(payload)
@@ -649,6 +906,28 @@ fn valid_auth_field(value: &str) -> bool {
 
 const ENVELOPE_MEDIA_TYPE: &str = "application/vnd.kit.workspace-read-envelope";
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WorkspaceArtifactVersion {
+    V3,
+    V4,
+}
+
+impl WorkspaceArtifactVersion {
+    const fn envelope_magic(self) -> [u8; 26] {
+        match self {
+            Self::V3 => *b"kit-workspace-artifact-v3\0",
+            Self::V4 => *b"kit-workspace-artifact-v4\0",
+        }
+    }
+
+    const fn handle_prefix(self) -> &'static str {
+        match self {
+            Self::V3 => "kit-workspace-artifact:v3:",
+            Self::V4 => "kit-workspace-artifact:v4:",
+        }
+    }
+}
+
 struct PreparedArtifact<'a> {
     handle: WorkspaceArtifactHandle,
     staged: StagedArtifact<'a>,
@@ -660,18 +939,23 @@ fn prepare_artifact<'a>(
     context: &ArtifactContext,
     epoch: EpochId,
     request: &ReadRequest,
-    start: usize,
-    end: usize,
-    bytes: &[u8],
+    source_offset: usize,
+    source: &[u8],
+    projected: &[u8],
+    projected_path: &std::path::Path,
     encoding: Encoding,
     max_artifact_bytes: usize,
     deadline: Instant,
 ) -> Result<PreparedArtifact<'a>, ReadError> {
     check_deadline(deadline)?;
-    let payload_digest = blake3::hash(bytes);
+    let source_digest = blake3::hash(source);
+    let projected_digest = blake3::hash(projected);
     let epoch = epoch.to_string();
     let revision = request.expected_revision.to_string();
     let path = request.path.as_os_str().as_encoded_bytes();
+    let projected_path_value = projected_path.to_path_buf();
+    let projected_path = projected_path.as_os_str().as_encoded_bytes();
+    let projected_path_digest = blake3::hash(projected_path);
     let payload_media_type = if encoding == Encoding::Utf8 {
         "text/plain; charset=utf-8"
     } else {
@@ -686,26 +970,33 @@ fn prepare_artifact<'a>(
         range_tag,
         range_start,
         range_end,
-        start,
-        end,
-        payload_digest.as_bytes(),
+        source_offset,
+        source.len(),
+        source_digest.as_bytes(),
+        projected_digest.as_bytes(),
+        projected.len(),
+        projected_path,
+        projected_path_digest.as_bytes(),
     )?;
     let retention_bytes = match context.retention {
         ArtifactRetention::Forever => 1,
         ArtifactRetention::UntilUnixMicros(_) => 1 + size_of::<i64>(),
     };
-    let required = b"kit-workspace-artifact-v3\0"
+    let required = b"kit-workspace-artifact-v4\0"
         .len()
         .checked_add(framed_size(epoch.len())?)
         .and_then(|size| size.checked_add(framed_size(revision.len()).ok()?))
         .and_then(|size| size.checked_add(framed_size(path.len()).ok()?))
+        .and_then(|size| size.checked_add(framed_size(projected_path.len()).ok()?))
+        .and_then(|size| size.checked_add(projected_path_digest.as_bytes().len()))
         .and_then(|size| size.checked_add(1 + size_of::<u64>() * 4))
         .and_then(|size| size.checked_add(framed_size(payload_media_type.len()).ok()?))
         .and_then(|size| size.checked_add(binding.len()))
         .and_then(|size| size.checked_add(retention_bytes))
-        .and_then(|size| size.checked_add(payload_digest.as_bytes().len()))
+        .and_then(|size| size.checked_add(source_digest.as_bytes().len()))
+        .and_then(|size| size.checked_add(projected_digest.as_bytes().len()))
         .and_then(|size| size.checked_add(size_of::<u64>()))
-        .and_then(|size| size.checked_add(bytes.len()))
+        .and_then(|size| size.checked_add(projected.len()))
         .ok_or(ReadError::InvalidOptions("artifact envelope size overflow"))?;
     if required > max_artifact_bytes {
         return Err(ReadError::ArtifactTooLarge {
@@ -714,29 +1005,32 @@ fn prepare_artifact<'a>(
         });
     }
     let header_size = required
-        .checked_sub(bytes.len())
+        .checked_sub(projected.len())
         .ok_or(ReadError::InvalidOptions("artifact envelope size overflow"))?;
     let mut envelope_header = Vec::new();
     envelope_header
         .try_reserve_exact(header_size)
         .map_err(|_| ReadError::InvalidOptions("artifact envelope allocation failed"))?;
-    envelope_header.extend_from_slice(b"kit-workspace-artifact-v3\0");
+    envelope_header.extend_from_slice(b"kit-workspace-artifact-v4\0");
     frame(&mut envelope_header, epoch.as_bytes())?;
     frame(&mut envelope_header, revision.as_bytes())?;
     frame(&mut envelope_header, path)?;
+    frame(&mut envelope_header, projected_path)?;
+    envelope_header.extend_from_slice(projected_path_digest.as_bytes());
     envelope_header.push(range_tag);
     envelope_header.extend_from_slice(&range_start.to_le_bytes());
     envelope_header.extend_from_slice(&range_end.to_le_bytes());
     envelope_header.extend_from_slice(
-        &u64::try_from(start)
-            .map_err(|_| ReadError::InvalidRange("byte start is out of range"))?
+        &u64::try_from(source_offset)
+            .map_err(|_| ReadError::InvalidRange("source offset is out of range"))?
             .to_le_bytes(),
     );
     envelope_header.extend_from_slice(
-        &u64::try_from(end)
-            .map_err(|_| ReadError::InvalidRange("byte end is out of range"))?
+        &u64::try_from(source.len())
+            .map_err(|_| ReadError::InvalidRange("source length is out of range"))?
             .to_le_bytes(),
     );
+    envelope_header.extend_from_slice(source_digest.as_bytes());
     frame(&mut envelope_header, payload_media_type.as_bytes())?;
     envelope_header.extend_from_slice(&binding);
     match context.retention {
@@ -746,16 +1040,16 @@ fn prepare_artifact<'a>(
             envelope_header.extend_from_slice(&value.to_le_bytes());
         }
     }
-    envelope_header.extend_from_slice(payload_digest.as_bytes());
+    envelope_header.extend_from_slice(projected_digest.as_bytes());
     envelope_header.extend_from_slice(
-        &u64::try_from(bytes.len())
+        &u64::try_from(projected.len())
             .map_err(|_| ReadError::InvalidOptions("artifact payload size overflow"))?
             .to_le_bytes(),
     );
     debug_assert_eq!(envelope_header.len(), header_size);
     let staged = store
         .stage_chunks_before(
-            [envelope_header.as_slice(), bytes],
+            [envelope_header.as_slice(), projected],
             required,
             ArtifactMetadata::new(
                 ENVELOPE_MEDIA_TYPE,
@@ -771,7 +1065,11 @@ fn prepare_artifact<'a>(
     check_deadline(deadline)?;
     let id = opaque_id(staged.digest(), context, request, deadline)?;
     Ok(PreparedArtifact {
-        handle: WorkspaceArtifactHandle { id },
+        handle: WorkspaceArtifactHandle {
+            id,
+            path: projected_path_value,
+            path_digest: format!("blake3:{}", hex(projected_path_digest.as_bytes())),
+        },
         staged,
     })
 }
@@ -801,12 +1099,16 @@ fn auth_binding(
     range_tag: u8,
     range_start: u64,
     range_end: u64,
-    start: usize,
-    end: usize,
-    payload_digest: &[u8; 32],
+    source_offset: usize,
+    source_length: usize,
+    source_digest: &[u8; 32],
+    projected_digest: &[u8; 32],
+    projected_length: usize,
+    projected_path: &[u8],
+    projected_path_digest: &[u8; 32],
 ) -> Result<[u8; 32], ReadError> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"kit-workspace-artifact-auth-v3\0");
+    hash.update(b"kit-workspace-artifact-auth-v4\0");
     for value in [
         context.principal.as_bytes(),
         context.project.as_bytes(),
@@ -825,21 +1127,77 @@ fn auth_binding(
     hash.update(&range_start.to_le_bytes());
     hash.update(&range_end.to_le_bytes());
     hash.update(
-        &u64::try_from(start)
-            .map_err(|_| ReadError::InvalidRange("byte start is out of range"))?
+        &u64::try_from(source_offset)
+            .map_err(|_| ReadError::InvalidRange("source offset is out of range"))?
             .to_le_bytes(),
     );
     hash.update(
-        &u64::try_from(end)
-            .map_err(|_| ReadError::InvalidRange("byte end is out of range"))?
+        &u64::try_from(source_length)
+            .map_err(|_| ReadError::InvalidRange("source length is out of range"))?
             .to_le_bytes(),
     );
-    hash.update(payload_digest);
+    hash.update(source_digest);
+    hash.update(projected_digest);
+    hash.update(
+        &u64::try_from(projected_length)
+            .map_err(|_| ReadError::InvalidRange("projected length is out of range"))?
+            .to_le_bytes(),
+    );
+    hash.update(
+        &u64::try_from(projected_path.len())
+            .map_err(|_| ReadError::InvalidRange("projected path is out of range"))?
+            .to_le_bytes(),
+    );
+    hash.update(projected_path);
+    hash.update(projected_path_digest);
     Ok(*hash.finalize().as_bytes())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn auth_binding_u64(
+    context: &ArtifactContext,
+    epoch: &[u8],
+    revision: &[u8],
+    path: &[u8],
+    range_tag: u8,
+    range_start: u64,
+    range_end: u64,
+    source_offset: u64,
+    source_length: u64,
+    source_digest: &[u8; 32],
+    projected_digest: &[u8; 32],
+    projected_length: u64,
+    projected_path: &[u8],
+    projected_path_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"kit-workspace-artifact-auth-v4\0");
+    for value in [
+        context.principal.as_bytes(),
+        context.project.as_bytes(),
+        epoch,
+        revision,
+        path,
+    ] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value);
+    }
+    hash.update(&[range_tag]);
+    hash.update(&range_start.to_le_bytes());
+    hash.update(&range_end.to_le_bytes());
+    hash.update(&source_offset.to_le_bytes());
+    hash.update(&source_length.to_le_bytes());
+    hash.update(source_digest);
+    hash.update(projected_digest);
+    hash.update(&projected_length.to_le_bytes());
+    hash.update(&(projected_path.len() as u64).to_le_bytes());
+    hash.update(projected_path);
+    hash.update(projected_path_digest);
+    *hash.finalize().as_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn auth_binding_v3_u64(
     context: &ArtifactContext,
     epoch: &[u8],
     revision: &[u8],
@@ -891,6 +1249,7 @@ fn range_binding(range: ReadRange) -> Result<(u8, u64, u64), ReadError> {
 }
 
 fn handle_mask(
+    version: WorkspaceArtifactVersion,
     context: &ArtifactContext,
     request: &ReadRequest,
     deadline: Instant,
@@ -899,7 +1258,10 @@ fn handle_mask(
     let (tag, start, end) = range_binding(request.range)?;
     let revision = request.expected_revision.to_string();
     let mut hash = blake3::Hasher::new();
-    hash.update(b"kit-workspace-artifact-handle-v3\0");
+    hash.update(match version {
+        WorkspaceArtifactVersion::V3 => b"kit-workspace-artifact-handle-v3\0",
+        WorkspaceArtifactVersion::V4 => b"kit-workspace-artifact-handle-v4\0",
+    });
     for value in [
         context.principal.as_bytes(),
         context.project.as_bytes(),
@@ -922,12 +1284,13 @@ fn opaque_id(
     request: &ReadRequest,
     deadline: Instant,
 ) -> Result<String, ReadError> {
-    let mask = handle_mask(context, request, deadline)?;
+    let version = WorkspaceArtifactVersion::V4;
+    let mask = handle_mask(version, context, request, deadline)?;
     let mut opaque = digest.as_bytes();
     for (byte, mask) in opaque.iter_mut().zip(mask) {
         *byte ^= mask;
     }
-    Ok(format!("kit-workspace-artifact:v3:{}", hex(&opaque)))
+    Ok(format!("{}{}", version.handle_prefix(), hex(&opaque)))
 }
 
 fn opaque_digest(
@@ -935,18 +1298,23 @@ fn opaque_digest(
     context: &ArtifactContext,
     request: &ReadRequest,
     deadline: Instant,
-) -> Result<ArtifactDigest, ArtifactError> {
-    let encoded = handle
-        .strip_prefix("kit-workspace-artifact:v3:")
+) -> Result<(WorkspaceArtifactVersion, ArtifactDigest), ArtifactError> {
+    let (version, encoded) = [WorkspaceArtifactVersion::V4, WorkspaceArtifactVersion::V3]
+        .into_iter()
+        .find_map(|version| {
+            handle
+                .strip_prefix(version.handle_prefix())
+                .map(|encoded| (version, encoded))
+        })
         .ok_or(ArtifactError::InvalidArtifactDigest)?;
     let opaque = ArtifactDigest::parse(&format!("blake3:{encoded}"))?.as_bytes();
-    let mask = handle_mask(context, request, deadline)
+    let mask = handle_mask(version, context, request, deadline)
         .map_err(|_| ArtifactError::InvalidArtifactDigest)?;
     let mut digest = opaque;
     for (byte, mask) in digest.iter_mut().zip(mask) {
         *byte ^= mask;
     }
-    ArtifactDigest::parse(&format!("blake3:{}", hex(&digest)))
+    ArtifactDigest::parse(&format!("blake3:{}", hex(&digest))).map(|digest| (version, digest))
 }
 
 fn read_frame(reader: &mut impl std::io::Read, max: usize) -> Result<Vec<u8>, ArtifactError> {
@@ -1095,6 +1463,20 @@ struct BorrowedReadResponse<'a> {
     file_bytes: usize,
     byte_start: usize,
     byte_end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_file_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projected_offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projected_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projected_digest: Option<&'a str>,
     line_start: Option<usize>,
     line_end: Option<usize>,
     encoding: Encoding,
@@ -1119,6 +1501,13 @@ fn serialized_bytes(
         file_bytes: response.file_bytes,
         byte_start: response.byte_start,
         byte_end: response.byte_end,
+        source_offset: response.source_offset,
+        source_length: response.source_length,
+        source_digest: response.source_digest.as_deref(),
+        source_file_size: response.source_file_size,
+        projected_offset: response.projected_offset,
+        projected_length: response.projected_length,
+        projected_digest: response.projected_digest.as_deref(),
         line_start: response.line_start,
         line_end: response.line_end,
         encoding: response.encoding,

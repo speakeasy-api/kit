@@ -29,6 +29,7 @@ use kit::{
             Command, CommandReceipt, Query, QueryProjection, RequestContext, RunFailureCode,
             RunFailureProjection, ServiceError, handlers,
         },
+        stream::{OPAQUE_STREAM_CURSOR_MAX_LENGTH, OpaqueStreamCursor},
     },
     domain::{
         config::{ConfigLayer, Grant},
@@ -215,6 +216,23 @@ fn openapi_run_config_and_failure_match_service_serde() {
         document["components"]["schemas"]["Run"]["properties"]["failure"]["oneOf"][0]["$ref"],
         "#/components/schemas/RunFailure"
     );
+}
+
+#[test]
+fn openapi_v2_cursor_accepts_the_implementation_maximum_and_rejects_one_more() {
+    let document = openapi();
+    let validator = component_validator(&document, "OpaqueStreamCursor");
+    let maximum = format!(
+        "kitc2_{}",
+        "A".repeat(OPAQUE_STREAM_CURSOR_MAX_LENGTH - "kitc2_".len())
+    );
+    assert_eq!(maximum.len(), 349_644);
+    validator.validate(&json!(maximum)).unwrap();
+    OpaqueStreamCursor::parse(maximum.clone()).unwrap();
+
+    let too_long = format!("{maximum}0");
+    assert!(validator.validate(&json!(too_long)).is_err());
+    assert!(OpaqueStreamCursor::parse(too_long).is_err());
 }
 
 #[test]

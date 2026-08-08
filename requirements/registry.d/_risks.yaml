@@ -875,9 +875,9 @@
   tombstone_reason: null
   area: KIT-SEC
   applicability: mandatory
-  interpretation: Repository and remote text cannot create, widen, or bypass an authenticated grant.
+  interpretation: Repository and remote text cannot create, widen, or bypass an authenticated grant; provider tool specs omit unauthorized names before model dispatch, while visible unauthorized routes remain kernel-enforced separately.
   acceptance_criteria:
-  - cargo test --test adversarial prompt_injection_authority exits 0 with 0 failed tests
+  - cargo test --locked --test adversarial six_surface_injection::six_surface_injection -- --exact --test-threads=1 exits 0 with exactly 1 passed, 0 failed, and 0 ignored; every injected surface has zero durable tool intents, broker denials, kernel intents, kernel dispatches, effect dispatches, and grant changes because unauthorized tool names are absent from provider specs; this local-only result is not trusted release evidence
   primary_milestone: M006
   contributing_milestones:
   - M002
@@ -898,13 +898,21 @@
   - G06
   - G10
   - G12
-  implementation_links: []
+  implementation_links:
+  - src/capabilities/broker/mod.rs
+  - src/capabilities/kernel/grant.rs
+  - src/capabilities/kernel/invoke.rs
+  - src/telemetry/redact.rs
   public_contract_links: []
-  telemetry_links: []
+  telemetry_links:
+  - eval/corpora/injection/manifest.json
+  - eval/corpora/injection/corpus.json
+  - tests/adversarial/six_surface_injection.rs
+  - requirements/reports/m006-six-surface-injection.md
   evidence_type: conformance
   evidence_id: EV-7.14-C-101
   evidence_job: adversarial
-  expected_result: cargo test --test adversarial prompt_injection_authority exits 0 with 0 failed tests
+  expected_result: cargo test --locked --test adversarial six_surface_injection::six_surface_injection -- --exact --test-threads=1 exits 0 with exactly 1 passed, 0 failed, and 0 ignored; every injected surface has zero durable tool intents, broker denials, kernel intents, kernel dispatches, effect dispatches, and grant changes because unauthorized tool names are absent from provider specs; this local-only result is not trusted release evidence
   artifact_digest: null
   environment_digest: null
   versions: null

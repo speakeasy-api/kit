@@ -53,7 +53,7 @@ built_ins:
       minimum: 1.0.0
       maximum_exclusive: 2.0.0
     schema_digest: sha256:192a510e776a5bea66a115469e772fff8280bce59d03e142ccebb151efa92e98
-    implementation_digest: sha256:a0f4626029cfc394c6213f257f63bdb5b2b26e1459f1a5d133ad50a2e1e4ab18
+    implementation_digest: sha256:e113651f4a3fb9354b4a9484ff5fc0cce3bf51fa6bdd8ec6d8ddfb2686306201
     schema_artifact: docs/compatibility/schemas/native-provider-v1.json
     implementation_sources:
       - src/capabilities/native/catalog.rs
@@ -78,7 +78,7 @@ built_ins:
 mcp_runtime:
   protocol_version: "2025-11-25"
   schema_digest: sha256:0ea11e4be269f053014f854ea7a63f56149da5c45dfc0a6c97c8ac79cbf8d65e
-  implementation_digest: sha256:09c93d0f075dafa8e1d1ff6321265e4507ce7c1fd60a7eada976413f871b04de
+  implementation_digest: sha256:057fe3d82885fe1f6310ed6bf1affaddcf4c6373126e6ddd50891e8794889c6a
   schema_artifact: docs/compatibility/schemas/mcp-lifecycle-v1.json
   implementation_sources:
     - src/protocols/mcp/config.rs

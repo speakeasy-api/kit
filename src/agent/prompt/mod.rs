@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const PROMPT_TEMPLATE_VERSION: &str = "3.03.2";
@@ -35,7 +36,7 @@ const TOOL_RULES: &[&str] = &[
     "Use available tools for inspection, changes, and executable verification.",
 ];
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PromptInput {
     pub tools: Vec<ToolDefinition>,
     pub repository_instructions: BTreeMap<String, String>,
@@ -46,21 +47,21 @@ pub struct PromptInput {
     pub experiment: Option<PromptExperiment>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PromptExperiment {
     pub identity: String,
     pub digest: String,
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskContract {
     pub goal: String,
     pub explicit_requirements: Vec<String>,
@@ -72,7 +73,7 @@ pub struct TaskContract {
     pub resource_budget: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelVariant {
     pub id: String,
     pub version: String,
@@ -80,7 +81,7 @@ pub struct ModelVariant {
     pub evaluation: VariantEvaluation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VariantEvaluation {
     pub evidence_id: String,
     pub security_not_weakened: bool,

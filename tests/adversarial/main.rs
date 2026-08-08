@@ -29,6 +29,7 @@ mod providers;
 mod repos;
 mod secret_leak;
 mod shadow_leak;
+mod six_surface_injection;
 mod tool_kernel_bypass;
 mod tool_learning_canary;
 mod trial_grader_access;

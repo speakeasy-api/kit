@@ -83,7 +83,7 @@ use crate::{
         events::{AttemptState, EntityId, RunState, TraceId, UtcDateTime},
         ids::{CommandId, EventId, ProjectId, RunId, WorkspaceId},
         lifecycle::AttemptOwnership,
-        secret::SecretLease,
+        secret::{SecretCustody, SecretLease},
     },
     executor::cancel::{
         ExecutorCancellationCoordinator, ExecutorCancellationOutcome, SqliteCancellationCoordinator,
@@ -103,7 +103,6 @@ use crate::{
     },
     telemetry::{
         otel::RunOutcome,
-        redact::CaptureRedactor,
         run_envelope::{
             CoreRunObservation, ProviderCacheObservation, ProviderModelDescriptor, RunCapture,
             RunEnvelope, SummaryRetentionPolicy,
@@ -134,6 +133,7 @@ pub struct RunExecutorConfig {
     pub store: SharedWorkerStore,
     pub scheduler: DurableScheduler,
     pub model_adapter: SelectedModelAdapter,
+    secret_custody: SecretCustody,
     pub concurrency: usize,
     pub queue_capacity: usize,
     pub poll_interval: Duration,
@@ -181,6 +181,7 @@ impl RunExecutorConfig {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("native-workspaces");
         let project_root = workspace_scratch.join("unconfigured-project");
+        let secret_custody = model_adapter.secret_custody();
         Self {
             cancellation_coordinator: Arc::new(SqliteCancellationCoordinator::new(
                 database.clone(),
@@ -190,6 +191,7 @@ impl RunExecutorConfig {
             store,
             scheduler,
             model_adapter,
+            secret_custody,
             concurrency: 4,
             queue_capacity: 64,
             poll_interval: Duration::from_millis(250),
@@ -225,6 +227,11 @@ impl RunExecutorConfig {
 
     pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.project_root = root.into();
+        self
+    }
+
+    pub(crate) fn with_secret_custody(mut self, custody: SecretCustody) -> Self {
+        self.secret_custody = custody;
         self
     }
 
@@ -956,8 +963,16 @@ async fn execute_attempt(
     .await
     .map_err(|_| ExecutorError::Worker("trusted project root scan timed out".to_owned()))?
     .map_err(|error| ExecutorError::Worker(format!("trusted project root scan: {error}")))??;
+    let workspace = workspace_id(job.attempt.id)?;
+    let runtime_secrets = runtime_secret_leases(config, &job, &snapshot, workspace)?;
     let prompt_revision = authority_snapshot.1.as_str();
-    let prepared_prompt = prepare_prompt(config, &job, &snapshot, Some(prompt_revision))?;
+    let prepared_prompt = prepare_prompt(
+        config,
+        &job,
+        &snapshot,
+        Some(prompt_revision),
+        &runtime_secrets.custody,
+    )?;
     let current_revision = authority_snapshot
         .2
         .current_revision()
@@ -1070,8 +1085,6 @@ async fn execute_attempt(
     let live_cancellation = Arc::new(AtomicBool::new(false));
     let revision_live = Arc::new(AtomicBool::new(true));
     let budget = durable_tool_budget(config, &snapshot)?;
-    let workspace = workspace_id(job.attempt.id)?;
-    let runtime_secrets = runtime_secret_leases(config, &job, &snapshot, workspace)?;
     let sampling_policies = config
         .mcp_servers
         .iter()
@@ -1201,6 +1214,7 @@ async fn execute_attempt(
             stdio_profiles: config.mcp_stdio_profiles.as_deref(),
             resolved_secrets: &runtime_secrets.resolved,
             callback_secrets: &callback_secrets,
+            custody: runtime_secrets.custody.clone(),
             extension_registry: &config.capability_extensions,
         };
         let (bootstrap, claim_error) = {
@@ -1286,6 +1300,7 @@ async fn execute_attempt(
             (
                 runtime,
                 authority_revision,
+                runtime_secrets.custody.clone(),
             )
         }),
         Arc::clone(&live_cancellation),
@@ -1773,6 +1788,7 @@ fn prepare_prompt(
     job: &WorkerRun,
     snapshot: &RunConfigSnapshot,
     native_revision: Option<&str>,
+    custody: &SecretCustody,
 ) -> Result<PreparedPrompt, ExecutorError> {
     let digest = ArtifactDigest::parse(job.run.input.as_str())
         .map_err(|error| ExecutorError::Artifact(error.to_string()))?;
@@ -1797,7 +1813,7 @@ fn prepare_prompt(
     let repository_instructions = native_revision
         .map(|revision| BTreeMap::from([("current_revision".to_owned(), revision.to_owned())]))
         .unwrap_or_default();
-    let compiled = compile(&PromptInput {
+    let mut prompt_input = PromptInput {
         experiment: Some(crate::agent::prompt::PromptExperiment {
             identity: crate::domain::config::GRAMMAR_EDIT_EXPERIMENT_ID.to_owned(),
             digest: snapshot.grammar_edit_experiment_digest(),
@@ -1810,7 +1826,13 @@ fn prepare_prompt(
         },
         repository_instructions,
         ..PromptInput::default()
-    })?;
+    };
+    prompt_input.task.goal = custody.project_text_references(
+        crate::telemetry::redact::CaptureBoundary::Prompt,
+        &prompt_input.task.goal,
+    );
+    let prompt_input = project_composition_input(custody, &prompt_input)?;
+    let compiled = compile(&prompt_input)?;
     let token_budget = usize::try_from(snapshot.effective().max_tokens).unwrap_or(usize::MAX);
     let context = project_canonical_prompt(
         job.run.input.as_str(),
@@ -1820,6 +1842,19 @@ fn prepare_prompt(
     )
     .map_err(|_| ExecutorError::Worker("canonical prompt exceeds model token budget".to_owned()))?;
     Ok(PreparedPrompt { compiled, context })
+}
+
+pub(crate) fn project_composition_input(
+    custody: &SecretCustody,
+    input: &PromptInput,
+) -> Result<PromptInput, ExecutorError> {
+    let composed = custody.project_json(
+        crate::telemetry::redact::CaptureBoundary::CompositionInput,
+        &serde_json::to_value(input).map_err(|error| ExecutorError::Worker(error.to_string()))?,
+    );
+    serde_json::from_value(composed).map_err(|error| {
+        ExecutorError::Worker(format!("composed prompt projection failed: {error}"))
+    })
 }
 
 fn seed_boundary(
@@ -2310,6 +2345,14 @@ fn detached_sampling_turn(
 struct RuntimeSecretLeases {
     resolved: Arc<BTreeMap<crate::domain::secret::SecretHandle, Arc<SecretLease>>>,
     scopes: BTreeMap<String, RuntimeSecretScope>,
+    custody: SecretCustody,
+    owner: String,
+}
+
+impl Drop for RuntimeSecretLeases {
+    fn drop(&mut self) {
+        self.custody.remove_owner(&self.owner);
+    }
 }
 
 struct RuntimeSecretScope {
@@ -2335,6 +2378,7 @@ fn runtime_secret_leases(
         config,
         job.principal_id,
         job.project_id,
+        job.attempt.id,
         snapshot.effective().provider,
         workspace_id,
     )
@@ -2344,6 +2388,7 @@ fn runtime_secret_leases_for_scope(
     config: &RunExecutorConfig,
     principal_id: crate::domain::ids::PrincipalId,
     project_id: crate::domain::ids::ProjectId,
+    attempt_id: crate::domain::ids::AttemptId,
     provider: ConfigProvider,
     workspace_id: WorkspaceId,
 ) -> Result<RuntimeSecretLeases, ExecutorError> {
@@ -2423,9 +2468,24 @@ fn runtime_secret_leases_for_scope(
             },
         );
     }
+    let owner = attempt_id.to_string();
+    config.secret_custody.replace_owner(
+        owner.clone(),
+        config
+            .model_adapter
+            .all_secret_leases_named()
+            .into_iter()
+            .chain(
+                resolved
+                    .iter()
+                    .map(|(handle, lease)| (handle.identifier().to_owned(), Arc::clone(lease))),
+            ),
+    );
     Ok(RuntimeSecretLeases {
         resolved: Arc::new(resolved),
         scopes,
+        custody: config.secret_custody.clone(),
+        owner,
     })
 }
 
@@ -2611,7 +2671,7 @@ fn model_adapter(
     let adapter = StreamPolicyAdapter::new(
         adapter,
         ModelStreamPolicy {
-            secrets: config.model_adapter.secret_leases(selected_provider),
+            secrets: config.secret_custody.leases(),
             retain_reasoning_summaries,
             ..ModelStreamPolicy::default()
         },
@@ -2789,6 +2849,7 @@ fn tool_adapter(
     mcp: Option<(
         &Arc<crate::protocols::mcp::transport::McpCapabilityRuntime>,
         &str,
+        SecretCustody,
     )>,
     live_cancellation: Arc<AtomicBool>,
     budget: Arc<BudgetLedger>,
@@ -2805,8 +2866,10 @@ fn tool_adapter(
         &mut append_store(config)?,
     )
     .map_err(|error| ExecutorError::Worker(error.to_string()))?;
-    let (mcp_runtime, mcp_revision) = mcp.unzip();
-    let descriptors = crate::capabilities::native::NativeCatalog::enabled(snapshot);
+    let (mcp_runtime, mcp_revision, mcp_custody) = mcp.map_or((None, None, None), |value| {
+        (Some(value.0), Some(value.1), Some(value.2))
+    });
+    let descriptors = crate::capabilities::native::NativeCatalog::all().to_vec();
     let configured = descriptors
         .iter()
         .map(|descriptor| {
@@ -2857,6 +2920,12 @@ fn tool_adapter(
         snapshot,
         configured
             .iter()
+            .filter(|(descriptor, _)| {
+                descriptor
+                    .required_grants()
+                    .iter()
+                    .all(|grant| snapshot.effective_authority().contains(grant))
+            })
             .map(|(descriptor, constraints)| {
                 CapabilityGrant::new(
                     job.principal_id,
@@ -2898,6 +2967,12 @@ fn tool_adapter(
     ));
     let bindings = configured
         .iter()
+        .filter(|(descriptor, _)| {
+            descriptor
+                .required_grants()
+                .iter()
+                .all(|grant| snapshot.effective_authority().contains(grant))
+        })
         .map(|(descriptor, constraints)| {
             let binding = ToolBinding::new(
                 descriptor.spec().clone(),
@@ -3002,6 +3077,7 @@ fn tool_adapter(
                 principal_id: job.principal_id,
             },
         )
+        .with_custody(config.secret_custody.clone())
     });
     let check_runner = acquisition
         .as_ref()
@@ -3078,6 +3154,13 @@ fn tool_adapter(
             ),
         ];
     }
+    let cursor_key = if let Some(key) = config.tool_learning_key {
+        key
+    } else {
+        let mut key = [0; 32];
+        getrandom::fill(&mut key).map_err(|error| ExecutorError::Worker(error.to_string()))?;
+        key
+    };
     let mut dispatcher = crate::capabilities::native::dispatch::NativeDispatcher::open(
         native_root,
         &scratch,
@@ -3094,9 +3177,10 @@ fn tool_adapter(
             container_image: config.native_container_image.clone(),
             verification_registry: config.verification_registry.clone(),
             check_runner,
+            custody: config.secret_custody.clone(),
             secrets: config
-                .model_adapter
-                .secret_leases(snapshot.effective().provider)
+                .secret_custody
+                .leases()
                 .iter()
                 .map(|secret| SecretLease::new(secret.expose().to_vec()))
                 .collect(),
@@ -3112,6 +3196,7 @@ fn tool_adapter(
             ),
             semantic_evidence: config.native_semantic_evidence.clone(),
             edit_validation_time: config.native_edit_validation_time,
+            cursor_key,
             #[cfg(test)]
             run_runner: None,
         },
@@ -3140,6 +3225,7 @@ fn tool_adapter(
             cancellation: live_cancellation,
             cancellation_coordinator: Arc::clone(&config.cancellation_coordinator),
             budget,
+            custody: config.secret_custody.clone(),
         },
         append_store(config)?,
         move |invocation| dispatcher.dispatch(invocation),
@@ -3149,7 +3235,8 @@ fn tool_adapter(
         Some(runtime) => adapter.with_mcp_runtime(
             Arc::clone(runtime),
             Arc::clone(&config.artifacts),
-            crate::protocols::mcp::transport::McpResultPolicy::default(),
+            crate::protocols::mcp::transport::McpResultPolicy::default()
+                .with_custody(mcp_custody.expect("MCP runtime carries secret custody")),
         ),
         None => adapter,
     };
@@ -3420,6 +3507,11 @@ fn complete_attempt(
         .retain(|part| !matches!(part, CanonicalPart::Reasoning { .. }));
     item.metadata.clear();
     item.usage = None;
+    item = serde_json::from_value(config.secret_custody.project_json(
+        crate::telemetry::redact::CaptureBoundary::Artifact,
+        &serde_json::to_value(&item).map_err(|error| ExecutorError::Worker(error.to_string()))?,
+    ))
+    .map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let item_bytes =
         serde_json::to_vec(&item).map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let snapshot = RunConfigSnapshot::from_canonical_bytes(&job.effective_config)
@@ -3449,6 +3541,8 @@ fn complete_attempt(
     let preview = output_preview(&item);
     let usage = run_accounting(config, &job, prepared)?;
     let provider = snapshot.effective().provider;
+    let envelope_redactor = config.secret_custody.redactor();
+    let envelope_capture = envelope_redactor.capture();
     let envelope = RunEnvelope::capture(
         RunCapture {
             prompt: &prepared.compiled,
@@ -3477,7 +3571,7 @@ fn complete_attempt(
             provider_summary: None,
             summary_retention: SummaryRetentionPolicy::Discard,
         },
-        &CaptureRedactor::new(&[]),
+        &envelope_capture,
     )
     .map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let telemetry_digest = envelope
@@ -3948,6 +4042,28 @@ impl SelectedModelAdapter {
         self.configured(provider).secrets.clone()
     }
 
+    fn all_secret_leases_named(&self) -> Vec<(String, Arc<SecretLease>)> {
+        self.providers
+            .iter()
+            .flat_map(|(provider, adapter)| {
+                adapter
+                    .secrets
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, lease)| {
+                        (
+                            format!("provider:{}:{index}", self.provider_name(*provider)),
+                            Arc::clone(lease),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn secret_custody(&self) -> SecretCustody {
+        SecretCustody::new_named("model-adapters", self.all_secret_leases_named())
+    }
+
     fn retain_reasoning_summaries(&self, _provider: ConfigProvider) -> bool {
         false
     }
@@ -4241,6 +4357,7 @@ pub enum FakeScenario {
     Tool,
     ToolInvalid,
     ToolInvalidCheck,
+    ReactiveInjection,
     DeferredMcp,
     NativeCoding,
     #[cfg(debug_assertions)]
@@ -4575,6 +4692,15 @@ impl ModelSession for FakeSession {
                 .iter()
                 .filter(|item| item.kind == ItemKind::Tool)
                 .count();
+            let injected = scenario == FakeScenario::ReactiveInjection
+                && serde_json::to_string(transcript).is_ok_and(|transcript| {
+                    transcript.contains("REQUEST_UNAUTHORIZED")
+                        || transcript.contains("request-unauthorized")
+                })
+                && request
+                    .available_tools
+                    .iter()
+                    .any(|spec| spec.name.0 == "kit_run");
             let turn = match scenario {
                 #[cfg(debug_assertions)]
                 FakeScenario::ToolBarrier(_)
@@ -4605,6 +4731,20 @@ impl ModelSession for FakeSession {
                         correlation.as_ref(),
                         "kit_check",
                         serde_json::json!({}),
+                    )?
+                }
+                FakeScenario::ReactiveInjection if injected && completed_tools == 0 => {
+                    FakeTurn::tool_request(
+                        response,
+                        correlation.as_ref(),
+                        "kit_run",
+                        serde_json::json!({
+                            "argv":["false"],
+                            "working_directory":".",
+                            "mounts":{"source":"read_only","build":"read_write","temp":"read_write"},
+                            "environment":{},"network":"deny","host_compatibility":false,"background":"foreground",
+                            "limits":{"cpu_millis":1,"memory_bytes":1,"pids":1,"file_bytes":1,"disk_bytes":1,"io_bytes":1,"output_bytes":1,"wall_time_millis":1}
+                        }),
                     )?
                 }
                 FakeScenario::DeferredMcp if completed_tools < 5 => FakeTurn::deferred_mcp_tool(
@@ -5409,6 +5549,7 @@ mod selector_tests {
             &config,
             principal,
             project,
+            attempt,
             Provider::OpenAi,
             workspace,
         )

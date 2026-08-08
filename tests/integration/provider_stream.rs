@@ -397,6 +397,7 @@ async fn request_is_forwarded_once_and_commits_before_exposure() {
     assert_eq!(log.0.lock().unwrap().last().unwrap(), "outcome");
     let mut visible = vec![first];
     visible.extend(drain(&mut turn).await.unwrap());
+    assert_eq!(log.0.lock().unwrap().last().unwrap(), "outcome");
     let encoded = serde_json::to_string(&visible).unwrap();
     assert!(!encoded.contains("CANARY"));
     assert!(visible.iter().all(|event| !matches!(
@@ -693,6 +694,393 @@ fn binary_secret_patterns_cannot_split_utf8_text() {
 }
 
 #[tokio::test]
+async fn redaction_stream_spans_part_ids_and_text_byte_deltas() {
+    let first = PartId::new("first");
+    let second = PartId::new("second");
+    let turn = FakeTurn {
+        steps: VecDeque::from([
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: first.clone(),
+                kind: PartKind::Text,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: first,
+                chunk: "CAN".into(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(TextPart::new("CAN")),
+            })),
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: second.clone(),
+                kind: PartKind::Text,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendBytes {
+                part_id: second,
+                chunk: b"ARY".to_vec(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(TextPart::new("ARY")),
+            })),
+            event(ModelTurnEvent::Finished(result("safe"))),
+        ]),
+    };
+    let mut turn = BoundedTurn::new(
+        turn,
+        TestCommitLog::default(),
+        StreamLimits::default(),
+        CanaryRedactor::new(["CANARY".into()]),
+    );
+    let events = drain(&mut turn).await.unwrap();
+    let bytes = serde_json::to_vec(&events).unwrap();
+    assert!(!bytes.windows(6).any(|value| value == b"CANARY"));
+    assert!(String::from_utf8_lossy(&bytes).contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn aggregate_stream_makes_each_metadata_event_boundary_safe() {
+    let part_id = PartId::new("structured");
+    let mut first = MetadataMap::new();
+    first.insert("first".to_owned(), serde_json::json!("META-"));
+    let mut second = MetadataMap::new();
+    second.insert("second".to_owned(), serde_json::json!("SECRET"));
+    let turn = FakeTurn {
+        steps: VecDeque::from([
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: part_id.clone(),
+                kind: PartKind::Structured,
+            })),
+            event(ModelTurnEvent::Delta(Delta::SetMetadata {
+                part_id: part_id.clone(),
+                metadata: first,
+            })),
+            event(ModelTurnEvent::Delta(Delta::SetMetadata {
+                part_id,
+                metadata: second,
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::structured(serde_json::json!({"safe": true})),
+            })),
+            event(ModelTurnEvent::Finished(result("safe"))),
+        ]),
+    };
+    let mut turn = BoundedTurn::new(
+        turn,
+        TestCommitLog::default(),
+        StreamLimits::default(),
+        CanaryRedactor::new(["META-SECRET".into()]),
+    );
+    let persisted = serde_json::to_string(&drain(&mut turn).await.unwrap()).unwrap();
+    assert!(persisted.contains("META-"));
+    assert!(!persisted.contains("SECRET"));
+    assert!(persisted.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn finished_outcome_rejects_every_secret_split_after_an_earlier_delta() {
+    const SECRET: &str = "123456789";
+
+    for split in 1..SECRET.len() {
+        for metadata in [false, true] {
+            let part_id = PartId::new("text");
+            let prefix = &SECRET[..split];
+            let suffix = &SECRET[split..];
+            let mut outcome = result(if metadata { "safe" } else { suffix });
+            if metadata {
+                outcome
+                    .metadata
+                    .insert("note".into(), serde_json::json!(suffix));
+            }
+            let commit = TestCommitLog::default();
+            let mut turn = BoundedTurn::new(
+                FakeTurn {
+                    steps: VecDeque::from([
+                        event(ModelTurnEvent::Delta(Delta::BeginPart {
+                            part_id,
+                            kind: PartKind::Text,
+                        })),
+                        event(ModelTurnEvent::Delta(Delta::CommitPart {
+                            part: Part::Text(TextPart::new(prefix)),
+                        })),
+                        event(ModelTurnEvent::Finished(outcome)),
+                    ]),
+                },
+                commit.clone(),
+                StreamLimits::default(),
+                CanaryRedactor::new([SECRET.into()]),
+            );
+
+            let error = match turn.next_event(None).await {
+                Err(error) => error.to_string(),
+                Ok(event) => {
+                    panic!("split {split} (metadata={metadata}) was accepted with {event:?}")
+                }
+            };
+            assert!(
+                error.contains("reconstructed active secret"),
+                "split {split} (metadata={metadata}) was not rejected: {error}"
+            );
+            assert!(
+                !commit
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry == "outcome"),
+                "split {split} (metadata={metadata}) reached the durable outcome boundary"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_preserves_internal_interactivity_without_exposing_before_finish() {
+    let first = PartId::new("first");
+    let second = PartId::new("second");
+    let safe = "safe-".repeat(80);
+    let turn = FakeTurn {
+        steps: VecDeque::from([
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: first.clone(),
+                kind: PartKind::Text,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: first.clone(),
+                chunk: format!("{safe}Q0FO"),
+            })),
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: second.clone(),
+                kind: PartKind::Text,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: second,
+                chunk: "ordinary interleaving".into(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: first,
+                chunk: "QVJZ".into(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(TextPart::new("safe")),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(TextPart::new("ordinary interleaving")),
+            })),
+            event(ModelTurnEvent::Finished(result("safe"))),
+        ]),
+    };
+    let log = TestCommitLog::default();
+    let mut turn = BoundedTurn::new(
+        turn,
+        log.clone(),
+        StreamLimits {
+            max_delta_bytes: 32,
+            ..StreamLimits::default()
+        },
+        CanaryRedactor::new(["CANARY".into()]),
+    );
+    assert!(matches!(
+        turn.next_event(None).await.unwrap(),
+        Some(ModelTurnEvent::Delta(Delta::BeginPart { .. }))
+    ));
+    let prefix = turn.next_event(None).await.unwrap().unwrap();
+    assert!(matches!(
+        prefix,
+        ModelTurnEvent::Delta(Delta::AppendText { .. })
+    ));
+    assert_eq!(log.0.lock().unwrap().last().unwrap(), "outcome");
+
+    let visible = drain(&mut turn).await.unwrap();
+    let encoded = serde_json::to_string(&visible).unwrap();
+    assert!(!encoded.contains("Q0FOQVJZ"));
+    let text = visible
+        .iter()
+        .filter_map(|event| match event {
+            ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) => Some(chunk.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(text.contains("[REDACTED]"), "{encoded}");
+}
+
+#[tokio::test]
+async fn commit_part_contains_the_complete_redacted_multi_delta_text() {
+    let part_id = PartId::new("text");
+    let turn = FakeTurn {
+        steps: VecDeque::from([
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: part_id.clone(),
+                kind: PartKind::Text,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: part_id.clone(),
+                chunk: "prefix SEC".into(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: part_id.clone(),
+                chunk: "RET suffix".into(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(TextPart::new("prefix SECRET suffix")),
+            })),
+            event(ModelTurnEvent::Finished(result("safe"))),
+        ]),
+    };
+    let mut turn = BoundedTurn::new(
+        turn,
+        TestCommitLog::default(),
+        StreamLimits::default(),
+        CanaryRedactor::new(["SECRET".into()]),
+    );
+    let events = drain(&mut turn).await.unwrap();
+    let committed = events
+        .iter()
+        .find_map(|event| match event {
+            ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(text),
+            }) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(committed, "prefix [REDACTED] suffix");
+}
+
+#[tokio::test]
+async fn byte_deltas_and_commit_preserve_non_utf8_and_redact_exactly() {
+    let part_id = PartId::new("binary");
+    let input = [b"\xff\0SEC".as_slice(), b"RET\xfe".as_slice()].concat();
+    let expected = [b"\xff\0".as_slice(), b"[REDACTED]", b"\xfe".as_slice()].concat();
+    let turn = FakeTurn {
+        steps: VecDeque::from([
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: part_id.clone(),
+                kind: PartKind::File,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendBytes {
+                part_id: part_id.clone(),
+                chunk: input[..5].to_vec(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendBytes {
+                part_id: part_id.clone(),
+                chunk: input[5..].to_vec(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::file(DataRef::inline_bytes(input)),
+            })),
+            event(ModelTurnEvent::Finished(result("safe"))),
+        ]),
+    };
+    let mut turn = BoundedTurn::new(
+        turn,
+        TestCommitLog::default(),
+        StreamLimits::default(),
+        CanaryRedactor::new(["SECRET".into()]),
+    );
+    let events = drain(&mut turn).await.unwrap();
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelTurnEvent::Delta(Delta::AppendBytes { chunk, .. }) => Some(chunk.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, expected);
+    let committed = events
+        .iter()
+        .find_map(|event| match event {
+            ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::File(file),
+            }) => Some(&file.data),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(committed, &DataRef::inline_bytes(expected));
+}
+
+#[tokio::test]
+async fn final_visible_item_limit_cannot_be_bypassed_by_redaction_splitting() {
+    let part_id = PartId::new("text");
+    let turn = FakeTurn {
+        steps: VecDeque::from([
+            event(ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: part_id.clone(),
+                kind: PartKind::Text,
+            })),
+            event(ModelTurnEvent::Delta(Delta::AppendText {
+                part_id,
+                chunk: "SECRET".into(),
+            })),
+            event(ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Text(TextPart::new("SECRET")),
+            })),
+            event(ModelTurnEvent::Finished(result("safe"))),
+        ]),
+    };
+    let mut turn = BoundedTurn::new(
+        turn,
+        TestCommitLog::default(),
+        StreamLimits {
+            max_items: 4,
+            max_delta_bytes: 1,
+            ..StreamLimits::default()
+        },
+        CanaryRedactor::new(["SECRET".into()]),
+    );
+    assert!(
+        turn.next_event(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded buffer limits")
+    );
+}
+
+#[tokio::test]
+async fn final_visible_byte_limit_cannot_be_bypassed_by_redaction_splitting() {
+    let part_id = PartId::new("text");
+    let events = vec![
+        ModelTurnEvent::Delta(Delta::BeginPart {
+            part_id: part_id.clone(),
+            kind: PartKind::Text,
+        }),
+        ModelTurnEvent::Delta(Delta::AppendText {
+            part_id,
+            chunk: "SECRET".into(),
+        }),
+        ModelTurnEvent::Delta(Delta::CommitPart {
+            part: Part::Text(TextPart::new("SECRET")),
+        }),
+        ModelTurnEvent::Finished(result("safe")),
+    ];
+    let provider_bytes = events
+        .iter()
+        .map(|event| serde_json::to_vec(event).unwrap().len())
+        .sum();
+    let turn = FakeTurn {
+        steps: events.into_iter().map(event).collect(),
+    };
+    let mut turn = BoundedTurn::new(
+        turn,
+        TestCommitLog::default(),
+        StreamLimits {
+            max_bytes: provider_bytes,
+            max_items: 128,
+            max_delta_bytes: 1,
+            ..StreamLimits::default()
+        },
+        CanaryRedactor::new(["SECRET".into()]),
+    );
+    assert!(
+        turn.next_event(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded buffer limits")
+    );
+}
+
+#[tokio::test]
 async fn malformed_out_of_order_oversize_and_midstream_failure_are_rejected() {
     let part_id = PartId::new("missing");
     let malformed = FakeTurn {
@@ -735,7 +1123,13 @@ async fn malformed_out_of_order_oversize_and_midstream_failure_are_rejected() {
         StreamLimits::default(),
         CanaryRedactor::new(["CANARY".into()]),
     );
-    let error = failed.next_event(None).await.unwrap_err().to_string();
+    let error = loop {
+        match failed.next_event(None).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("failed stream ended without an error"),
+            Err(error) => break error.to_string(),
+        }
+    };
     assert!(!error.contains("CANARY"));
 }
 
@@ -971,6 +1365,21 @@ impl StreamCommit for FailingCommit {
     }
 }
 
+#[derive(Clone, Default)]
+struct OutcomeFailingCommit(Arc<Mutex<Vec<String>>>);
+
+impl StreamCommit for OutcomeFailingCommit {
+    fn commit_chunk(&mut self, sequence: u64, _event: &ModelTurnEvent) -> Result<(), LoopError> {
+        self.0.lock().unwrap().push(format!("chunk-{sequence}"));
+        Ok(())
+    }
+
+    fn commit_outcome(&mut self, _result: &ModelTurnResult) -> Result<(), LoopError> {
+        self.0.lock().unwrap().push("outcome-failed".into());
+        Err(LoopError::Provider("outcome disk failed".into()))
+    }
+}
+
 #[tokio::test]
 async fn commit_failure_is_terminal_unknown_and_never_visible() {
     let mut turn = BoundedTurn::new(
@@ -984,4 +1393,22 @@ async fn commit_failure_is_terminal_unknown_and_never_visible() {
     let error = turn.next_event(None).await.unwrap_err().to_string();
     assert!(error.contains("outcome_unknown"));
     assert!(turn.next_event(None).await.is_err());
+}
+
+#[tokio::test]
+async fn outcome_commit_failure_leaves_internal_chunks_unexposed() {
+    let commit = OutcomeFailingCommit::default();
+    let mut turn = BoundedTurn::new(
+        FakeTurn {
+            steps: valid_stream("hidden-until-outcome"),
+        },
+        commit.clone(),
+        StreamLimits::default(),
+        CanaryRedactor::default(),
+    );
+    let error = turn.next_event(None).await.unwrap_err().to_string();
+    assert!(error.contains("outcome_unknown"));
+    let log = commit.0.lock().unwrap();
+    assert!(log.iter().any(|entry| entry.starts_with("chunk-")));
+    assert_eq!(log.last().map(String::as_str), Some("outcome-failed"));
 }

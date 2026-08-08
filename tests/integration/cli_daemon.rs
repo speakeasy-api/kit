@@ -523,6 +523,7 @@ fn prompt_runs_to_completion_through_daemon_and_cli() {
             run_id: RunId::parse(&run_id).unwrap(),
             after: EventCursor::START,
             limit: 100,
+            opaque_cursor: None,
         })
         .unwrap()
     else {
@@ -697,6 +698,7 @@ fn explicit_follow_inactivity_timeout_is_enforced() {
                 thread_id: THREAD.parse::<ThreadId>().unwrap(),
                 after: EventCursor::START,
                 limit: 100,
+                opaque_cursor: None,
             },
             None,
             |_| Ok(()),

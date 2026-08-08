@@ -51,10 +51,10 @@ use crate::store::sqlite::projection::{ProjectionStore, StoreTime};
 
 use super::{
     AttemptDriverClaim, Command, CommandReceipt, CursorStatusProjection, EventCursor, EventPage,
-    EventProjection, Query, QueryProjection, Resource, RetentionPolicy, RunCompletionRecord,
-    RunFailureCode, RunFailureProjection, RunProgressRecord, RunPromptProjection,
-    RunSemanticEnvelope, RunTranscriptProjection, ServiceError, ServiceStore, StatusProjection,
-    WorkerRun, WorkerStore, WriteRequest,
+    EventProjection, MAX_EVENT_PAGE_BYTES, ProjectedEventPage, Query, QueryProjection, Resource,
+    RetentionPolicy, RunCompletionRecord, RunFailureCode, RunFailureProjection, RunProgressRecord,
+    RunPromptProjection, RunSemanticEnvelope, RunTranscriptProjection, ServiceError, ServiceStore,
+    StatusProjection, WorkerRun, WorkerStore, WriteRequest,
 };
 
 pub struct SqliteServiceStore {
@@ -97,6 +97,254 @@ struct ClaimedDeletion {
 enum EventScope {
     Thread(ThreadId),
     Run(RunId),
+}
+
+pub(crate) struct ProjectedEventEnvelope {
+    pub payload: Vec<u8>,
+    pub envelope: Vec<u8>,
+    pub authority_digest: String,
+    pub digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct CanonicalEventEnvelope<'a> {
+    operation: &'a str,
+    stream: &'a str,
+    payload: &'a serde_json::value::RawValue,
+    trace_id: &'a str,
+    id: &'a str,
+    sequence: i64,
+    commit_position: i64,
+    schema_version: u16,
+    occurred_at: &'a str,
+    causation_id: &'a str,
+    correlation_id: &'a str,
+    attempt_id: Option<&'a str>,
+    artifacts: &'a serde_json::value::RawValue,
+}
+
+struct OrderedEventEnvelope(Vec<(String, serde_json::Value)>);
+
+#[derive(serde::Serialize)]
+struct RedactedEventPayload {
+    marker: &'static str,
+    projection: RedactedEventProjection,
+}
+
+#[derive(serde::Serialize)]
+struct RedactedEventProjection {
+    schema_version: u16,
+    status: &'static str,
+}
+
+const MAX_PROJECTED_PAGE_ITEMS: usize = 16;
+
+fn redacted_event_payload() -> serde_json::Value {
+    serde_json::to_value(RedactedEventPayload {
+        marker: crate::domain::secret::REDACTED,
+        projection: RedactedEventProjection {
+            schema_version: 1,
+            status: "fail_closed",
+        },
+    })
+    .expect("static redacted event payload is serializable")
+}
+
+impl<'de> serde::Deserialize<'de> for OrderedEventEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OrderedEventEnvelope;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an event envelope object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut fields = Vec::new();
+                while let Some(field) = map.next_entry()? {
+                    fields.push(field);
+                }
+                Ok(OrderedEventEnvelope(fields))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+pub(crate) fn project_event_envelopes(
+    custody: &crate::domain::secret::SecretCustody,
+    envelopes: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<ProjectedEventEnvelope>, String> {
+    project_event_envelopes_with_state(
+        custody,
+        envelopes,
+        &mut crate::domain::secret::JsonProjectionState::default(),
+    )
+}
+
+pub(crate) fn project_event_envelopes_with_state(
+    custody: &crate::domain::secret::SecretCustody,
+    envelopes: Vec<(Vec<u8>, Vec<u8>)>,
+    state: &mut crate::domain::secret::JsonProjectionState,
+) -> Result<Vec<ProjectedEventEnvelope>, String> {
+    envelopes
+        .into_iter()
+        .map(|(canonical, payload)| {
+            let authority_digest = Digest::of(DigestAlgorithm::Sha256, &canonical).to_string();
+            let OrderedEventEnvelope(mut fields) =
+                serde_json::from_slice(&canonical).map_err(|error| error.to_string())?;
+            let mut changed = false;
+            for (name, value) in &mut fields {
+                let identifier = matches!(
+                    name.as_str(),
+                    "operation"
+                        | "type"
+                        | "stream"
+                        | "id"
+                        | "causation_id"
+                        | "correlation_id"
+                        | "attempt_id"
+                        | "trace_id"
+                );
+                if identifier
+                    && value
+                        .as_str()
+                        .is_some_and(|value| custody.contains(value.as_bytes()))
+                {
+                    return Err(
+                        "active secret is forbidden in an event authority identifier".to_owned(),
+                    );
+                }
+                let field = serde_json::Value::Object(serde_json::Map::from_iter([(
+                    name.clone(),
+                    value.clone(),
+                )]));
+                let field = serde_json::to_vec(&field).map_err(|error| error.to_string())?;
+                let projected = custody
+                    .project_json_bytes_preserving_names(
+                        crate::telemetry::redact::CaptureBoundary::Event,
+                        &field,
+                    )
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+                    .map_err(|error| error.to_string())?;
+                let Some(projected) = projected.as_object() else {
+                    return Err("event envelope projection changed its shape".to_owned());
+                };
+                if projected.len() != 1 {
+                    return Err("event envelope projection changed its shape".to_owned());
+                }
+                let (projected_name, projected_value) =
+                    projected.iter().next().expect("one projected field");
+                if identifier && projected_name != name {
+                    return Err(
+                        "active secret is forbidden in an event authority field name".to_owned(),
+                    );
+                };
+                let next = if name == "payload" && value.is_object() && !projected_value.is_object()
+                {
+                    redacted_event_payload()
+                } else {
+                    projected_value.clone()
+                };
+                if identifier && &next != value {
+                    return Err(
+                        "active secret is forbidden in an event authority identifier".to_owned(),
+                    );
+                }
+                changed |= &next != value;
+                *value = next;
+            }
+            let payload_value = serde_json::from_slice::<serde_json::Value>(&payload)
+                .map_err(|error| error.to_string())?;
+            let mut projected = if !changed {
+                canonical
+            } else {
+                serialize_ordered_event_envelope(&fields)?
+            };
+            let mut candidate_state = state.clone();
+            if custody.try_advance_ordered_json_object(&fields, &projected, &mut candidate_state) {
+                *state = candidate_state;
+            } else {
+                let original_fields = fields.clone();
+                let mut safe = None;
+                for redacted in 1_u8..=3 {
+                    fields.clone_from(&original_fields);
+                    for (name, value) in &mut fields {
+                        if name == "payload" && redacted & 1 != 0
+                            || name == "artifacts" && redacted & 2 != 0
+                        {
+                            *value = if name == "payload" {
+                                redacted_event_payload()
+                            } else {
+                                serde_json::Value::String(
+                                    crate::domain::secret::REDACTED.to_owned(),
+                                )
+                            };
+                        }
+                    }
+                    let candidate = serialize_ordered_event_envelope(&fields)?;
+                    let mut candidate_state = state.clone();
+                    if custody.try_advance_ordered_json_object(
+                        &fields,
+                        &candidate,
+                        &mut candidate_state,
+                    ) {
+                        safe = Some((candidate, candidate_state));
+                        break;
+                    }
+                }
+                let Some((candidate, candidate_state)) = safe else {
+                    return Err(
+                        "active secret is forbidden in an event authority envelope".to_owned()
+                    );
+                };
+                projected = candidate;
+                *state = candidate_state;
+            }
+            let projected_payload = fields
+                .iter()
+                .find(|(name, _)| name == "payload")
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| "event envelope is missing its payload".to_owned())?;
+            let digest = Digest::of(DigestAlgorithm::Sha256, &projected).to_string();
+            let projected_payload = if projected_payload == payload_value {
+                payload
+            } else {
+                serde_json::to_vec(&projected_payload).map_err(|error| error.to_string())?
+            };
+            Ok(ProjectedEventEnvelope {
+                payload: projected_payload,
+                envelope: projected,
+                authority_digest,
+                digest,
+            })
+        })
+        .collect()
+}
+
+fn serialize_ordered_event_envelope(
+    fields: &[(String, serde_json::Value)],
+) -> Result<Vec<u8>, String> {
+    let mut output = vec![b'{'];
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index != 0 {
+            output.push(b',');
+        }
+        output.extend(serde_json::to_vec(name).map_err(|error| error.to_string())?);
+        output.push(b':');
+        output.extend(serde_json::to_vec(value).map_err(|error| error.to_string())?);
+    }
+    output.push(b'}');
+    Ok(output)
 }
 
 impl SqliteServiceStore {
@@ -2047,6 +2295,67 @@ impl ServiceStore for SqliteServiceStore {
     }
 
     fn query(&mut self, query: &Query) -> Result<QueryProjection, ServiceError> {
+        match query {
+            Query::ThreadEvents {
+                thread_id,
+                after,
+                limit,
+                opaque_cursor,
+            } => {
+                if opaque_cursor.is_some() {
+                    return Err(ServiceError::Invalid(
+                        "opaque event cursors require the HTTP adapter".to_owned(),
+                    ));
+                }
+                return Ok(QueryProjection::Events(
+                    self.event_page(EventScope::Thread(*thread_id), *after, *limit, None)?
+                        .page,
+                ));
+            }
+            Query::ThreadEventsProjected {
+                thread_id,
+                after,
+                limit,
+                projection_state,
+            } => {
+                return Ok(QueryProjection::ProjectedEvents(self.event_page(
+                    EventScope::Thread(*thread_id),
+                    *after,
+                    *limit,
+                    Some(projection_state.clone()),
+                )?));
+            }
+            Query::RunTimeline {
+                run_id,
+                after,
+                limit,
+                opaque_cursor,
+            } => {
+                if opaque_cursor.is_some() {
+                    return Err(ServiceError::Invalid(
+                        "opaque event cursors require the HTTP adapter".to_owned(),
+                    ));
+                }
+                return Ok(QueryProjection::Events(
+                    self.event_page(EventScope::Run(*run_id), *after, *limit, None)?
+                        .page,
+                ));
+            }
+            Query::RunTimelineProjected {
+                run_id,
+                after,
+                limit,
+                projection_state,
+            } => {
+                return Ok(QueryProjection::ProjectedEvents(self.event_page(
+                    EventScope::Run(*run_id),
+                    *after,
+                    *limit,
+                    Some(projection_state.clone()),
+                )?));
+            }
+            _ => {}
+        }
         let state = self.state()?;
         match query {
             Query::GetProject { project_id } => state
@@ -2077,15 +2386,9 @@ impl ServiceStore for SqliteServiceStore {
             Query::GetDeletionJob { .. } => Err(ServiceError::Invalid(
                 "deletion job queries are served by the deletion service".to_owned(),
             )),
-            Query::ThreadEvents {
-                thread_id,
-                after,
-                limit,
-            } => Ok(QueryProjection::Events(self.event_page(
-                EventScope::Thread(*thread_id),
-                *after,
-                *limit,
-            )?)),
+            Query::ThreadEvents { .. } | Query::ThreadEventsProjected { .. } => {
+                unreachable!("event queries return before state load")
+            }
             Query::ListRuns { project_id } => Ok(QueryProjection::Runs(
                 state
                     .runs
@@ -2135,15 +2438,9 @@ impl ServiceStore for SqliteServiceStore {
                 .cloned()
                 .map(QueryProjection::Attempt)
                 .ok_or(ServiceError::NotFound),
-            Query::RunTimeline {
-                run_id,
-                after,
-                limit,
-            } => Ok(QueryProjection::Events(self.event_page(
-                EventScope::Run(*run_id),
-                *after,
-                *limit,
-            )?)),
+            Query::RunTimeline { .. } | Query::RunTimelineProjected { .. } => {
+                unreachable!("event queries return before state load")
+            }
             Query::PendingApprovals { project_id } => Ok(QueryProjection::Approvals(
                 state
                     .approvals
@@ -2282,14 +2579,25 @@ impl SqliteServiceStore {
         scope: EventScope,
         after: EventCursor,
         limit: usize,
-    ) -> Result<EventPage, ServiceError> {
+        projection_state: Option<crate::domain::secret::JsonProjectionState>,
+    ) -> Result<ProjectedEventPage, ServiceError> {
+        const MAX_EVENT_BYTES: usize = 1024 * 1024;
+        let limit = limit.min(1_000).min(MAX_PROJECTED_PAGE_ITEMS);
+        let custody = self.authority.secret_custody();
+        if projection_state.is_none() && after != EventCursor::START && !custody.is_empty() {
+            return Err(ServiceError::Conflict(
+                "event cursor upgrade required; restart without a cursor".to_owned(),
+            ));
+        }
         let (column, value) = match scope {
             EventScope::Thread(id) => ("thread_id", id.to_string()),
             EventScope::Run(id) => ("run_id", id.to_string()),
         };
         let sql = format!(
-            "SELECT event.commit_position, index_row.project_id, event.event_type,
-                    event.stream, event.payload
+            "SELECT event.commit_position, index_row.project_id, event.event_id, event.stream,
+                    event.sequence, event.event_type, event.schema_version, event.occurred_at,
+                    event.causation_id, event.correlation_id, event.attempt_id, event.trace_id,
+                    length(event.payload), length(event.artifacts), event.payload, event.artifacts
              FROM event_projection_index AS index_row
              JOIN events AS event ON event.commit_position = index_row.commit_position
              WHERE index_row.{column} = ?1 AND index_row.erased = 0
@@ -2297,47 +2605,168 @@ impl SqliteServiceStore {
                AND event.commit_position <= (SELECT position FROM commit_watermark WHERE singleton = 1)
              ORDER BY event.commit_position LIMIT ?3"
         );
-        let events = self
+        let (mut rows, truncated) = self
             .projections
             .with_store_time(|transaction, _| {
                 let mut statement = transaction.prepare(&sql)?;
-                let rows = statement.query_map(
-                    params![value, after.position(), limit.min(1_000)],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Vec<u8>>(4)?,
-                        ))
-                    },
-                )?;
-                rows.map(|row| {
-                    let (position, project, operation, stream, payload) = row?;
-                    Ok(EventProjection {
-                        cursor: EventCursor::new(u64::try_from(position).map_err(|error| {
-                            crate::store::sqlite::projection::ProjectionError::Reducer(
-                                error.to_string(),
+                let mut query =
+                    statement.query(params![value, after.position(), limit.saturating_add(1)])?;
+                let mut work_bytes = 0_usize;
+                let mut rows = Vec::with_capacity(limit);
+                let mut truncated = false;
+                while let Some(row) = query.next()? {
+                    if rows.len() == limit {
+                        truncated = true;
+                        break;
+                    }
+                    let payload_bytes =
+                        usize::try_from(row.get::<_, i64>(12)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                12,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
                             )
-                        })?),
-                        project_id: ProjectId::parse(&project).map_err(|error| {
-                            crate::store::sqlite::projection::ProjectionError::Reducer(
-                                error.to_string(),
+                        })?;
+                    let artifact_bytes =
+                        usize::try_from(row.get::<_, i64>(13)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                13,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
                             )
-                        })?,
-                        operation,
-                        stream,
-                        payload,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
+                        })?;
+                    let Some(next) = work_bytes
+                        .checked_add(payload_bytes)
+                        .and_then(|bytes| bytes.checked_add(artifact_bytes))
+                        .filter(|bytes| {
+                            payload_bytes <= MAX_EVENT_BYTES
+                                && artifact_bytes <= MAX_EVENT_BYTES
+                                && *bytes <= MAX_EVENT_PAGE_BYTES
+                        })
+                    else {
+                        if rows.is_empty() {
+                            return Err(
+                                crate::store::sqlite::projection::ProjectionError::Reducer(
+                                    "single event exceeds event page byte bound".to_owned(),
+                                ),
+                            );
+                        }
+                        truncated = true;
+                        break;
+                    };
+                    work_bytes = next;
+                    rows.push((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u16>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, Vec<u8>>(14)?,
+                        row.get::<_, Vec<u8>>(15)?,
+                    ));
+                }
+                Ok((rows, truncated))
             })
             .map_err(|error| ServiceError::Store(error.to_string()))?;
+        let mut envelopes = Vec::with_capacity(rows.len());
+        for row in &mut rows {
+            let envelope = {
+                let (
+                    _,
+                    _,
+                    id,
+                    stream,
+                    _,
+                    operation,
+                    _,
+                    occurred_at,
+                    causation,
+                    correlation,
+                    attempt,
+                    trace,
+                    payload,
+                    artifacts,
+                ) = &*row;
+                for identifier in [id, stream, operation, causation, correlation, trace]
+                    .into_iter()
+                    .map(String::as_str)
+                    .chain(attempt.as_deref())
+                {
+                    if custody.contains(identifier.as_bytes()) {
+                        return Err(ServiceError::Store(
+                            "active secret is forbidden in an event authority identifier"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                let payload_value = serde_json::from_slice::<&serde_json::value::RawValue>(payload)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?;
+                let artifacts_value =
+                    serde_json::from_slice::<&serde_json::value::RawValue>(artifacts)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?;
+                serde_json::to_vec(&CanonicalEventEnvelope {
+                    operation,
+                    stream,
+                    payload: payload_value,
+                    trace_id: trace,
+                    id,
+                    sequence: row.4,
+                    commit_position: row.0,
+                    schema_version: row.6,
+                    occurred_at,
+                    causation_id: causation,
+                    correlation_id: correlation,
+                    attempt_id: attempt.as_deref(),
+                    artifacts: artifacts_value,
+                })
+                .map_err(|error| ServiceError::Store(error.to_string()))?
+            };
+            envelopes.push((envelope, std::mem::take(&mut row.12)));
+            row.13.clear();
+        }
+        let mut projection_state = projection_state.unwrap_or_else(|| custody.projection_state());
+        let mut events = Vec::with_capacity(envelopes.len());
+        let mut item_projection_states = Vec::with_capacity(envelopes.len());
+        for (row, envelope) in rows.into_iter().zip(envelopes) {
+            let projected =
+                project_event_envelopes_with_state(&custody, vec![envelope], &mut projection_state)
+                    .map_err(ServiceError::Store)?
+                    .remove(0);
+            let (position, project, _, stream, _, operation, _, _, _, _, _, _, _, _) = row;
+            events.push(EventProjection {
+                cursor: EventCursor::new(
+                    u64::try_from(position)
+                        .map_err(|error| ServiceError::Store(error.to_string()))?,
+                ),
+                opaque_cursor: None,
+                project_id: ProjectId::parse(&project)
+                    .map_err(|error| ServiceError::Store(error.to_string()))?,
+                operation,
+                stream,
+                payload: projected.payload,
+                envelope: projected.envelope,
+                authority_digest: projected.authority_digest,
+                projection_digest: projected.digest,
+            });
+            item_projection_states.push(projection_state.clone());
+        }
         let next_cursor = events.last().map(|event| event.cursor).unwrap_or(after);
-        Ok(EventPage {
-            events,
-            next_cursor,
+        Ok(ProjectedEventPage {
+            page: EventPage {
+                events,
+                next_cursor,
+                opaque_next_cursor: None,
+                truncated,
+            },
+            projection_state,
+            item_projection_states,
         })
     }
 
@@ -3300,9 +3729,9 @@ impl Query {
             | Self::ListCapabilities { project_id }
             | Self::EventCursorStatus { project_id, .. }
             | Self::Status { project_id } => Resource::Project(*project_id),
-            Self::GetThread { thread_id } | Self::ThreadEvents { thread_id, .. } => {
-                Resource::Thread(*thread_id)
-            }
+            Self::GetThread { thread_id }
+            | Self::ThreadEvents { thread_id, .. }
+            | Self::ThreadEventsProjected { thread_id, .. } => Resource::Thread(*thread_id),
             Self::GetDeletionJob { .. } => {
                 unreachable!("deletion job scope is resolved by the deletion service")
             }
@@ -3310,7 +3739,8 @@ impl Query {
             | Self::GetRunCost { run_id }
             | Self::GetRunPrompts { run_id }
             | Self::RunTranscript { run_id }
-            | Self::RunTimeline { run_id, .. } => Resource::Run(*run_id),
+            | Self::RunTimeline { run_id, .. }
+            | Self::RunTimelineProjected { run_id, .. } => Resource::Run(*run_id),
             Self::GetAttempt { attempt_id } => Resource::Attempt(*attempt_id),
             Self::GetArtifactMetadata { artifact_id } => Resource::Artifact(*artifact_id),
             Self::GetMcpCallback { callback_id } => Resource::McpCallback(*callback_id),
@@ -3997,6 +4427,19 @@ mod executor_recovery_tests {
         sync::{Arc, Barrier},
         time::Duration,
     };
+
+    #[test]
+    fn event_page_maximum_projection_states_are_bounded_before_cloning() {
+        let state_bytes = MAX_PROJECTED_PAGE_ITEMS
+            * crate::domain::secret::JsonProjectionState::MAX_SERIALIZED_BYTES;
+        let cursor_bytes = MAX_PROJECTED_PAGE_ITEMS
+            * ("kitc2_".len()
+                + (crate::domain::secret::JsonProjectionState::MAX_SERIALIZED_BYTES + 52)
+                    .div_ceil(3)
+                    * 4);
+        assert!(state_bytes <= MAX_EVENT_PAGE_BYTES);
+        assert!(cursor_bytes <= MAX_EVENT_PAGE_BYTES);
+    }
 
     #[test]
     fn stale_registration_racing_successor_takeover_cannot_leave_a_live_old_boundary() {
