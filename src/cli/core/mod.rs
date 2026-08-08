@@ -12,7 +12,7 @@ pub use client::{
 pub use command_tree::command as command_tree;
 pub use daemon::{
     AutoStart, DISCOVERY_FILE, DaemonConnection, DaemonDiscovery, DiscoveryError, connect_daemon,
-    read_discovery,
+    default_state_root, read_discovery,
 };
 pub use http::{HttpClient, operation_route};
 pub use output::{

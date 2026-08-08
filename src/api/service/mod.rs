@@ -41,7 +41,9 @@ use crate::store::sqlite::idempotency::IdempotencyKey;
 
 pub use crate::domain::retention::{RetentionPeriod, RetentionPolicy};
 pub(crate) use sqlite::project_event_envelopes_with_state;
-pub use sqlite::{DeletionEffect, DeletionWorkerReport, SqliteServiceStore};
+pub use sqlite::{
+    DeletionEffect, DeletionWorkerReport, SqliteServiceStore, renew_driver_claim_standalone,
+};
 pub(crate) use sqlite::{ProjectedEventEnvelope, project_event_envelopes};
 
 pub const MAX_PROMPT_MESSAGE_BYTES: usize = 8 * 1024;

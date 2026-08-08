@@ -101,7 +101,7 @@ fn global_args(scope: &'static str) -> [Arg; 6] {
         Arg::new(ids[3])
             .long("state-root")
             .value_name("PATH")
-            .help("Kit state directory [default: .kit]")
+            .help("Kit state directory [default: a per-project directory under the user state home]")
             .value_hint(ValueHint::DirPath)
             .action(ArgAction::Append)
             .allow_hyphen_values(true),

@@ -35,7 +35,9 @@ fn main() -> ExitCode {
             clap_output(error.into_clap(), format)
         }
         Ok(cli) => {
-            let state_root = cli.state_root.unwrap_or_else(|| PathBuf::from(".kit"));
+            let state_root = cli
+                .state_root
+                .unwrap_or_else(kit::cli::core::default_state_root);
             match cli.invocation {
                 Invocation::Daemon(command) => {
                     daemon(state_root, command.daemonize, cli.timeout, cli.format)

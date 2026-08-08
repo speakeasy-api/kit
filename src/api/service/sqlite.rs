@@ -885,45 +885,7 @@ impl WorkerStore for SqliteServiceStore {
         claim: AttemptDriverClaim,
         lease_duration: std::time::Duration,
     ) -> Result<AttemptDriverClaim, ServiceError> {
-        let duration = lease_micros(lease_duration)?;
-        let mut connection = self.driver_connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_service_error)?;
-        let now = driver_now(&transaction)?;
-        let expires = now
-            .checked_add(duration)
-            .ok_or_else(|| ServiceError::Invalid("driver lease duration is invalid".to_owned()))?;
-        let changed = transaction
-            .execute(
-                "UPDATE attempt_driver_claims SET expires_at_unix_micros = ?6
-                 WHERE run_id = ?1 AND attempt_id = ?2 AND principal_id = ?3
-                   AND fence = ?4 AND lease_version = ?5
-                   AND expires_at_unix_micros > ?7 AND quiescent = 0",
-                params![
-                    claim.run_id.to_string(),
-                    claim.attempt_id.to_string(),
-                    claim.principal_id.to_string(),
-                    i64::try_from(claim.fence.get())
-                        .map_err(|_| ServiceError::Conflict("driver fence is stale".to_owned()))?,
-                    i64::try_from(claim.lease_version).map_err(|_| ServiceError::Conflict(
-                        "driver lease version is stale".to_owned()
-                    ))?,
-                    expires,
-                    now,
-                ],
-            )
-            .map_err(sqlite_service_error)?;
-        if changed != 1 {
-            return Err(ServiceError::Conflict(
-                "attempt driver claim is stale".to_owned(),
-            ));
-        }
-        transaction.commit().map_err(sqlite_service_error)?;
-        Ok(AttemptDriverClaim {
-            expires_at_unix_micros: expires,
-            ..claim
-        })
+        renew_driver_claim_standalone(&self.database, claim, lease_duration)
     }
 
     fn ensure_worker_wait(
@@ -4562,5 +4524,60 @@ mod executor_recovery_tests {
         drop(connection);
         drop(store);
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// Extends a live driver claim's lease against the store directly, without the
+/// shared service lock: the claim heartbeat must keep renewing while long tool
+/// operations hold that lock, or a healthy driver expires mid-run and is fenced.
+pub fn renew_driver_claim_standalone(
+    database: &std::path::Path,
+    claim: AttemptDriverClaim,
+    lease_duration: std::time::Duration,
+) -> Result<AttemptDriverClaim, ServiceError> {
+    let duration = lease_micros(lease_duration)?;
+    let mut connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(sqlite_service_error)?;
+    {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_service_error)?;
+        let now = driver_now(&transaction)?;
+        let expires = now
+            .checked_add(duration)
+            .ok_or_else(|| ServiceError::Invalid("driver lease duration is invalid".to_owned()))?;
+        let changed = transaction
+            .execute(
+                "UPDATE attempt_driver_claims SET expires_at_unix_micros = ?6
+                 WHERE run_id = ?1 AND attempt_id = ?2 AND principal_id = ?3
+                   AND fence = ?4 AND lease_version = ?5
+                   AND expires_at_unix_micros > ?7 AND quiescent = 0",
+                params![
+                    claim.run_id.to_string(),
+                    claim.attempt_id.to_string(),
+                    claim.principal_id.to_string(),
+                    i64::try_from(claim.fence.get())
+                        .map_err(|_| ServiceError::Conflict("driver fence is stale".to_owned()))?,
+                    i64::try_from(claim.lease_version).map_err(|_| ServiceError::Conflict(
+                        "driver lease version is stale".to_owned()
+                    ))?,
+                    expires,
+                    now,
+                ],
+            )
+            .map_err(sqlite_service_error)?;
+        if changed != 1 {
+            return Err(ServiceError::Conflict(
+                "attempt driver claim is stale".to_owned(),
+            ));
+        }
+        transaction.commit().map_err(sqlite_service_error)?;
+        Ok(AttemptDriverClaim {
+            expires_at_unix_micros: expires,
+            ..claim
+        })
     }
 }

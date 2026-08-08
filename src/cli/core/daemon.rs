@@ -14,6 +14,47 @@ use super::{ClientError, ClientErrorKind};
 pub const DISCOVERY_FILE: &str = "daemon.json";
 const MAX_DISCOVERY_BYTES: u64 = 16 * 1024;
 
+/// Default state root for the project rooted at the current directory: a
+/// per-project directory under the user's state home, never inside the project
+/// itself. A state root inside the served repository makes every run fail with
+/// "source and managed root must not overlap", so `./.kit` is only the fallback
+/// when neither the working directory nor a state home can be resolved.
+pub fn default_state_root() -> PathBuf {
+    let Ok(project_root) = std::env::current_dir().and_then(fs::canonicalize) else {
+        return PathBuf::from(".kit");
+    };
+    let Some(state_home) = state_home() else {
+        return PathBuf::from(".kit");
+    };
+    let digest = crate::domain::crypto::sha256(project_root.as_os_str().as_encoded_bytes());
+    let short = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let name = project_root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".to_owned());
+    state_home.join("kit/projects").join(format!("{name}-{short}"))
+}
+
+#[cfg(windows)]
+fn state_home() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn state_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/state"))
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonDiscovery {

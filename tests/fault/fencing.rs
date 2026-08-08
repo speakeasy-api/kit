@@ -143,7 +143,7 @@ fn ten_thousand_stale_journal_appends_commit_zero_events() {
                 artifacts: Vec::new(),
                 record: record.clone(),
             }),
-            Err(StoreError::StaleDriverClaim)
+            Err(StoreError::StaleDriverClaim | StoreError::StaleDriverClaimDetail(_))
         ));
     }
     assert_eq!(store.events().unwrap().len(), before);

@@ -982,6 +982,22 @@ impl Daemon {
         if let Some(error) = &config.mcp_config_error {
             return Err(DaemonError::Setup(error.clone()));
         }
+        // A state root inside the served project makes every run fail later with
+        // "source and managed root must not overlap"; refuse at boot instead. The
+        // debug native-project mode intentionally nests the project inside the
+        // state root, so only that direction of overlap stays allowed.
+        if let (Ok(state_root), Ok(project_root)) = (
+            std::fs::canonicalize(&config.state_root)
+                .or_else(|_| std::path::absolute(&config.state_root)),
+            std::fs::canonicalize(&config.project_root),
+        ) && state_root.starts_with(&project_root)
+        {
+            return Err(DaemonError::Setup(format!(
+                "state root {} is inside the project root {}; pass --state-root outside the repository",
+                state_root.display(),
+                project_root.display(),
+            )));
+        }
         let secret_custody = config
             .model_adapter
             .as_ref()
@@ -1608,10 +1624,7 @@ impl Daemon {
             evaluation_unavailable,
             shutdown,
             task: Some(task),
-            _workspace_anchor: crate::workspace::revision::ManagedWorkspace::open(
-                &config.project_root,
-            )
-            .ok(),
+            _workspace_anchor: None,
         })
     }
 

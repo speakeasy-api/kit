@@ -166,6 +166,12 @@ pub struct RunExecutorConfig {
     native_edit_validation_time: Duration,
     pub(crate) native_semantic_evidence:
         crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
+    // Workspace handles for non-terminal runs. A run parked on a durable wait
+    // must keep its workspace owner (and revision epoch) alive: if the last
+    // handle drops, the resume mints a new epoch and every revision token the
+    // model captured before the wait becomes stale.
+    run_workspaces:
+        Arc<Mutex<BTreeMap<RunId, crate::workspace::revision::ManagedWorkspace>>>,
     #[cfg(debug_assertions)]
     native_check_completions: Vec<crate::executor::check::ConformanceCheck>,
 }
@@ -198,11 +204,7 @@ impl RunExecutorConfig {
             concurrency: 4,
             queue_capacity: 64,
             poll_interval: Duration::from_millis(250),
-            // The heartbeat renews under the shared service lock, so the lease must
-            // outlast the longest lock-holding tool operation (multi-file edits with
-            // verification have been observed >30s); expiry mid-run fences out the
-            // driver and fails the run with a stale claim.
-            lease_duration: Duration::from_secs(120),
+            lease_duration: Duration::from_secs(5),
             claim_renewal_interval: Duration::from_secs(1),
             model_reservation: Spend::new(0, 1, 1, 0, 0),
             telemetry: None,
@@ -227,6 +229,7 @@ impl RunExecutorConfig {
                 .max_validation_time,
             native_semantic_evidence:
                 crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default(),
+            run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(debug_assertions)]
             native_check_completions: Vec::new(),
         }
@@ -588,6 +591,15 @@ fn dispatch_available(
             let claim = job.claim;
             let result = execute_attempt(&config, job, progress.clone()).await;
             health.active.fetch_sub(1, Ordering::Relaxed);
+            // A waiting exit keeps the run's workspace handle so its revision
+            // epoch survives until resolution; every other exit releases it.
+            if !matches!(result, Ok(AttemptExit::Waiting)) {
+                config
+                    .run_workspaces
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&run_id);
+            }
             match result {
                 Ok(AttemptExit::Completed) => {
                     health.completed.fetch_add(1, Ordering::Relaxed);
@@ -779,7 +791,7 @@ impl ClaimHeartbeat {
         current_fence: Arc<AtomicU64>,
         current_claim_generation: Arc<AtomicU64>,
     ) -> Self {
-        let store = Arc::clone(&config.store);
+        let database = config.database.clone();
         let lease_duration = config.lease_duration;
         let interval = config.claim_renewal_interval;
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
@@ -820,10 +832,14 @@ impl ClaimHeartbeat {
                         std::thread::sleep(Duration::from_millis(2));
                     }
                 }
-                let renewed = store
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .renew_worker_claim(claim, lease_duration);
+                // Renew on a dedicated connection, never under the shared service
+                // lock: a long tool operation holding that lock must not starve
+                // the heartbeat into lease expiry and a mid-run fence-out.
+                let renewed = crate::api::service::renew_driver_claim_standalone(
+                    &database,
+                    claim,
+                    lease_duration,
+                );
                 match renewed {
                     Ok(renewed) => {
                         current_fence.store(renewed.fence.get(), Ordering::Release);
@@ -970,6 +986,11 @@ async fn execute_attempt(
     .await
     .map_err(|_| ExecutorError::Worker("trusted project root scan timed out".to_owned()))?
     .map_err(|error| ExecutorError::Worker(format!("trusted project root scan: {error}")))??;
+    config
+        .run_workspaces
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(job.run.id, authority_snapshot.2.clone());
     let workspace = workspace_id(job.attempt.id)?;
     let runtime_secrets = runtime_secret_leases(config, &job, &snapshot, workspace)?;
     let prompt_revision = authority_snapshot.1.as_str();
