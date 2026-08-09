@@ -241,8 +241,11 @@ pub fn stage<'workspace>(
         &allocation.view,
         &mut budget,
         workspace_ignore.as_ref(),
-    )?;
-    plan.revalidate_before(deadline).map_err(map_validation)?;
+    )
+    ?;
+    plan.revalidate_before(deadline)
+        .map_err(map_validation)
+        ?;
 
     watch_stage_tree(
         &allocation.root_path,
@@ -253,11 +256,13 @@ pub fn stage<'workspace>(
     stage_fence
         .reset_after_verified_read()
         .map_err(|_| StageError::StageChanged)?;
-    let initial = snapshot_tree(&allocation.view, &mut budget)?;
+    let initial = snapshot_tree(&allocation.view, &mut budget)
+        ?;
     stage_fence
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
-    apply_plan(&allocation.view, &plan, limits, deadline, &mut budget)?;
+    apply_plan(&allocation.view, &plan, limits, deadline, &mut budget)
+        ?;
     watch_stage_tree(
         &allocation.root_path,
         &allocation.root,
@@ -267,8 +272,10 @@ pub fn stage<'workspace>(
     stage_fence
         .reset_after_verified_read()
         .map_err(|_| StageError::StageChanged)?;
-    let mut current = snapshot_tree(&allocation.view, &mut budget)?;
-    require_exact_changed_set(&initial, &current, &plan.changed_files)?;
+    let mut current = snapshot_tree(&allocation.view, &mut budget)
+        ?;
+    require_exact_changed_set(&initial, &current, &plan.changed_files)
+        ?;
     verify_expected_paths(
         &allocation.view,
         &plan.expected_paths,
@@ -291,24 +298,30 @@ pub fn stage<'workspace>(
         .map_err(|_| StageError::StageChanged)?;
 
     let final_source = &allocation.view;
-    let expected_final = snapshot_tree(final_source, &mut budget)?;
+    let expected_final = snapshot_tree(final_source, &mut budget)
+        ?;
     stage_fence
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
-    copy_tree(final_source, &allocation.final_view, &mut budget, None)?;
-    apply_snapshot_modes(&allocation.final_view, &expected_final)?;
-    freeze_tree(&allocation.final_view)?;
+    copy_tree(final_source, &allocation.final_view, &mut budget, None)
+        ?;
+    apply_snapshot_modes(&allocation.final_view, &expected_final)
+        ?;
+    freeze_tree(&allocation.final_view)
+        ?;
     watch_stage_tree(
         &allocation.root_path,
         &allocation.root,
         &mut stage_fence,
         true,
     )?;
-    verify_frozen_tree(&allocation.final_view, &expected_final, &mut budget)?;
+    verify_frozen_tree(&allocation.final_view, &expected_final, &mut budget)
+        ?;
     stage_fence
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
-    let final_baseline = snapshot_tree(&allocation.final_view, &mut budget)?;
+    let final_baseline = snapshot_tree(&allocation.final_view, &mut budget)
+        ?;
     stage_fence
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
@@ -1150,6 +1163,10 @@ fn watch_stage_tree(
                     return Err(StageError::StageChanged);
                 }
                 pending.push((child_path, child));
+            } else if before.kind() == libc::S_IFLNK as u32 {
+                // Inert symlink copies carry no kernel watch: nothing in the
+                // stage opens through them, and the quiescence snapshots
+                // bind their literal targets by digest.
             } else if before.kind() == libc::S_IFREG as u32 && before.links == 1 {
                 let child = open_component(&directory, &name, libc::O_RDONLY)
                     .map_err(|_| StageError::StageChanged)?;
@@ -1985,6 +2002,9 @@ fn make_tree_removable(directory: &File) -> io::Result<()> {
             if unsafe { libc::fchmod(child.as_raw_fd(), 0o700) } != 0 {
                 return Err(io::Error::last_os_error());
             }
+        } else if stat.kind() == libc::S_IFLNK as u32 {
+            // Stage symlinks are inert copies; their modes are irrelevant to
+            // removal and a chmod here would follow the link.
         } else if stat.kind() == libc::S_IFREG as u32 && stat.links == 1 {
             let child = open_component(directory, &name, libc::O_RDONLY)?;
             if !stat.same_bound(stat_file(&child)?) {
@@ -2018,6 +2038,10 @@ fn remove_tree_contents(directory: &File) -> io::Result<()> {
             }
             remove_tree_contents(&child)?;
             libc::AT_REMOVEDIR
+        } else if stat.kind() == libc::S_IFLNK as u32 {
+            // Stages copy workspace symlinks as inert links; unlinking one
+            // never follows it, so no identity re-check is needed.
+            0
         } else if stat.kind() == libc::S_IFREG as u32 && stat.links == 1 {
             let child = open_component(directory, &name, libc::O_RDONLY)?;
             if !stat.same_bound(stat_file(&child)?) {
