@@ -20,6 +20,8 @@ use crate::workspace::edit::ir::RootRelativePath;
 const MARKER_NAME: &str = ".kit-workspace";
 const MARKER_VERSION: &str = "kit-workspace-v1";
 const MAX_COMMAND_OUTPUT: usize = 64 * 1024 * 1024;
+/// Base-commit marker for acquisitions of sources with no Git history.
+pub const UNTRACKED_BASE_COMMIT: &str = "untracked";
 const MAX_ERROR_OUTPUT: usize = 16 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES: usize = 1_000_000;
@@ -554,7 +556,7 @@ fn acquire_untrusted(
     source: PathBuf,
     managed_root: PathBuf,
 ) -> Result<AcquisitionResult, AcquisitionError> {
-    ensure_plain_repository_root(&source)?;
+    let tracked = classify_plain_source_root(&source)?;
     let reserved = reserve_directory(
         &managed_root,
         &request.workspace_id,
@@ -565,17 +567,46 @@ fn acquire_untrusted(
 
     let materialized = (|| {
         snapshot_repository(&source, &workspace_path)?;
-        sanitize_snapshot_git_metadata(&workspace_path)?;
-        reject_split_index(&workspace_path)?;
-        let base_commit = git_text(
-            &workspace_path,
-            "resolve HEAD",
-            ["rev-parse", "--verify", "HEAD^{commit}"],
-        )
-        .map_err(|error| match error {
-            AcquisitionError::Git { .. } => AcquisitionError::MissingHead,
-            other => other,
-        })?;
+        let resolved_base = if tracked {
+            sanitize_snapshot_git_metadata(&workspace_path)?;
+            reject_split_index(&workspace_path)?;
+            match git_text(
+                &workspace_path,
+                "resolve HEAD",
+                ["rev-parse", "--verify", "HEAD^{commit}"],
+            ) {
+                Ok(commit) => Some(commit),
+                Err(AcquisitionError::Git { .. }) => None,
+                Err(other) => return Err(other),
+            }
+        } else {
+            None
+        };
+        let Some(base_commit) = resolved_base else {
+            // No Git history to work from: a source without .git, or a
+            // repository whose HEAD is unborn. Materialize a Git-free
+            // snapshot whose revision derives from an owned content hash so
+            // acquisition never requires the git binary or a base commit.
+            if request.mode == AcquisitionMode::LocalClone {
+                return Err(AcquisitionError::MissingHead);
+            }
+            remove_snapshot_entry(&workspace_path.join(".git"))?;
+            let state = untracked_state_hash(&workspace_path)?;
+            let workspace_revision = WorkspaceRevision {
+                number: 0,
+                hash: revision_hash(UNTRACKED_BASE_COMMIT, &state),
+            };
+            return Ok((
+                UNTRACKED_BASE_COMMIT.to_owned(),
+                GitState {
+                    hash: state,
+                    dirty: true,
+                },
+                SnapshotMaterialization::FullCopyFallback,
+                DirtyContent::Included,
+                workspace_revision,
+            ));
+        };
         let source_state = git_status(&workspace_path)?;
         validate_snapshot_entries(&workspace_path)?;
 
@@ -862,10 +893,15 @@ fn ensure_repository_root(source: &Path) -> Result<(), AcquisitionError> {
     Ok(())
 }
 
-fn ensure_plain_repository_root(source: &Path) -> Result<(), AcquisitionError> {
+/// A source without any `.git` entry acquires as an untracked snapshot;
+/// a plain repository must still look safe (no symlinked or file `.git`).
+fn classify_plain_source_root(source: &Path) -> Result<bool, AcquisitionError> {
     let git_dir = source.join(".git");
-    let metadata = fs::symlink_metadata(&git_dir)
-        .map_err(|_| AcquisitionError::NotRepositoryRoot(source.to_path_buf()))?;
+    let metadata = match fs::symlink_metadata(&git_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("inspect source Git directory", error)),
+    };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(AcquisitionError::NotRepositoryRoot(source.to_path_buf()));
     }
@@ -875,7 +911,7 @@ fn ensure_plain_repository_root(source: &Path) -> Result<(), AcquisitionError> {
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4096 {
         return Err(AcquisitionError::NotRepositoryRoot(source.to_path_buf()));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(unix))]
@@ -883,6 +919,26 @@ fn snapshot_repository(_source: &Path, _target: &Path) -> Result<(), Acquisition
     Err(AcquisitionError::Unavailable {
         capability: "physical no-follow workspace snapshots",
     })
+}
+
+#[cfg(not(unix))]
+fn untracked_state_hash(_repository: &Path) -> Result<StateHash, AcquisitionError> {
+    Err(AcquisitionError::Unavailable {
+        capability: "physical no-follow workspace snapshots",
+    })
+}
+
+#[cfg(unix)]
+fn untracked_state_hash(repository: &Path) -> Result<StateHash, AcquisitionError> {
+    let directory = open_absolute_directory(repository, "untracked snapshot")?;
+    let root = unix_metadata(&directory)
+        .map_err(|error| snapshot_error("inspect untracked snapshot root", error))?;
+    let filesystem = SnapshotFilesystem {
+        device: root.dev,
+        mount: snapshot_mount_identity(&directory)?,
+    };
+    let hash = hash_directory_at(&directory, repository, &filesystem)?;
+    Ok(StateHash(format!("blake3:{}", hash.to_hex())))
 }
 
 #[cfg(unix)]

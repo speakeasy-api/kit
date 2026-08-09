@@ -693,6 +693,7 @@ impl NativeRepoService {
                 container_image: options.container_image,
                 verification_registry: options.verification_registry,
                 check_runner,
+                acquisition_failure: None,
                 custody: authority.secret_custody(),
                 secrets: Vec::new(),
                 syntax_executors,

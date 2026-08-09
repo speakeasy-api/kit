@@ -193,6 +193,7 @@ pub(crate) struct NativeRuntime {
     pub container_image: Option<String>,
     pub verification_registry: VerificationRegistry,
     pub check_runner: Option<CheckRunner>,
+    pub acquisition_failure: Option<String>,
     pub custody: crate::domain::secret::SecretCustody,
     pub secrets: Vec<crate::domain::secret::SecretLease>,
     pub syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
@@ -390,6 +391,7 @@ pub(crate) struct NativeDispatcher {
     grants: GrantSnapshot,
     config: RunConfigSnapshot,
     acquisition: Option<AcquisitionResult>,
+    acquisition_failure: Option<String>,
     workspace_id: crate::domain::ids::WorkspaceId,
     process_registration: Option<ProcessRegistryRegistration>,
     cancellation: SqliteCancellationCoordinator,
@@ -464,6 +466,7 @@ impl NativeDispatcher {
             container_image: runtime.container_image,
             verification_registry: runtime.verification_registry,
             check_runner: runtime.check_runner,
+            acquisition_failure: runtime.acquisition_failure,
             custody: runtime.custody,
             secrets: runtime.secrets,
             syntax_executors: runtime.syntax_executors,
@@ -509,6 +512,15 @@ impl NativeDispatcher {
         }
         if let Some(formatter) = &mut self.formatter {
             formatter.executor.bind_attempt(attempt);
+        }
+    }
+
+    /// Failure code for capabilities that need the workspace snapshot; carries
+    /// the acquisition failure so the model can see why and pivot.
+    fn snapshot_unavailable(&self, code: &str) -> String {
+        match &self.acquisition_failure {
+            Some(reason) => format!("{code}: workspace snapshot unavailable: {reason}"),
+            None => code.to_owned(),
         }
     }
 
@@ -1150,7 +1162,7 @@ impl NativeDispatcher {
             return Err("trusted_edit_syntax_unavailable".to_owned());
         }
         if self.formatter_required && self.formatter.is_none() {
-            return Err("trusted_edit_formatter_unavailable".to_owned());
+            return Err(self.snapshot_unavailable("trusted_edit_formatter_unavailable"));
         }
         if self
             .feedback
@@ -1200,10 +1212,8 @@ impl NativeDispatcher {
             return Err("stale_revision".to_owned());
         }
         let mut trace = EditPathTrace::default();
-        let runner = self
-            .check_runner
-            .as_mut()
-            .ok_or_else(|| "trusted_edit_runner_unavailable".to_owned())?;
+        let runner_unavailable = self.snapshot_unavailable("trusted_edit_runner_unavailable");
+        let runner = self.check_runner.as_mut().ok_or(runner_unavailable)?;
         let mut syntax_executors = self.syntax_executors.iter_mut().collect::<Vec<_>>();
         let feedback = self
             .feedback
@@ -1473,7 +1483,7 @@ impl NativeDispatcher {
             let acquisition = self
                 .acquisition
                 .as_ref()
-                .ok_or_else(|| "workspace_acquisition_unavailable".to_owned())?;
+                .ok_or_else(|| self.snapshot_unavailable("workspace_acquisition_unavailable"))?;
             let registration = self
                 .process_registration
                 .as_ref()
@@ -1651,7 +1661,7 @@ impl NativeDispatcher {
             return Err("trusted_check_registry_unavailable".to_owned());
         }
         if self.check_runner.is_none() {
-            return Err("trusted_check_runner_unavailable".to_owned());
+            return Err(self.snapshot_unavailable("trusted_check_runner_unavailable"));
         }
         let feedback = self
             .feedback
@@ -3459,6 +3469,7 @@ mod tests {
                 container_image: None,
                 verification_registry: registry,
                 check_runner: runner,
+                acquisition_failure: None,
                 custody: crate::domain::secret::SecretCustody::default(),
                 secrets: Vec::new(),
                 syntax_executors: vec![

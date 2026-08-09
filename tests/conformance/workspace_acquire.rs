@@ -7,8 +7,8 @@ use std::{
 
 use kit::workspace::acquire::{
     AcquisitionError, AcquisitionMode, AcquisitionRequest, CleanupOutcome, DirtyContent,
-    GitMetadata, OwnerId, ReservationRequest, SnapshotMaterialization, WorkspaceId, WriterPolicy,
-    acquire, cleanup, release_reserved_target, reserve_target,
+    GitMetadata, OwnerId, ReservationRequest, SnapshotMaterialization, UNTRACKED_BASE_COMMIT,
+    WorkspaceId, WriterPolicy, acquire, cleanup, release_reserved_target, reserve_target,
 };
 
 struct Fixture {
@@ -974,6 +974,93 @@ fn unsafe_ids_paths_and_symlink_roots_are_rejected() {
             Err(AcquisitionError::SymlinkPath { .. })
         ));
     }
+}
+
+fn plain_fixture(initialize_git: bool) -> Fixture {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).unwrap();
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("kit-workspace-test-{}", hex(&random)));
+    let source = root.join("source");
+    let managed = root.join("managed");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&managed).unwrap();
+    if initialize_git {
+        git(&source, &["init", "--quiet"]);
+    }
+    fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
+    Fixture {
+        root,
+        source,
+        managed,
+    }
+}
+
+#[test]
+fn unborn_head_acquires_untracked_snapshot() {
+    let fixture = plain_fixture(true);
+    let workspace = acquire(fixture.request(
+        AcquisitionMode::CopyOnWriteSnapshot,
+        WriterPolicy::Restricted,
+    ))
+    .unwrap();
+    assert_eq!(workspace.base_commit, UNTRACKED_BASE_COMMIT);
+    assert_eq!(workspace.dirty_content, DirtyContent::Included);
+    assert_eq!(workspace.git_metadata, GitMetadata::Independent);
+    assert_eq!(
+        fs::read(workspace.path.join("main.rs")).unwrap(),
+        b"fn main() {}\n"
+    );
+    assert!(!workspace.path.join(".git").exists());
+    cleanup(&workspace).unwrap();
+}
+
+#[test]
+fn no_git_source_acquires_untracked_snapshot_with_content_bound_revision() {
+    let fixture = plain_fixture(false);
+    let first = acquire(fixture.request(
+        AcquisitionMode::CopyOnWriteSnapshot,
+        WriterPolicy::Restricted,
+    ))
+    .unwrap();
+    let second = acquire(fixture.request(
+        AcquisitionMode::CopyOnWriteSnapshot,
+        WriterPolicy::Restricted,
+    ))
+    .unwrap();
+    assert_eq!(first.base_commit, UNTRACKED_BASE_COMMIT);
+    assert!(!first.path.join(".git").exists());
+    assert_eq!(
+        first.workspace_revision.hash.as_str(),
+        second.workspace_revision.hash.as_str()
+    );
+
+    fs::write(fixture.source.join("main.rs"), "fn main() { work(); }\n").unwrap();
+    let third = acquire(fixture.request(
+        AcquisitionMode::CopyOnWriteSnapshot,
+        WriterPolicy::Restricted,
+    ))
+    .unwrap();
+    assert_ne!(
+        first.workspace_revision.hash.as_str(),
+        third.workspace_revision.hash.as_str()
+    );
+    for workspace in [&first, &second, &third] {
+        cleanup(workspace).unwrap();
+    }
+}
+
+#[test]
+fn local_clone_still_requires_a_base_commit() {
+    let fixture = plain_fixture(true);
+    assert!(matches!(
+        acquire(fixture.request(AcquisitionMode::LocalClone, WriterPolicy::Restricted)),
+        Err(AcquisitionError::MissingHead)
+    ));
+    assert!(fs::read_dir(&fixture.managed).unwrap().next().is_none());
 }
 
 fn git(directory: &Path, arguments: &[&str]) -> Vec<u8> {

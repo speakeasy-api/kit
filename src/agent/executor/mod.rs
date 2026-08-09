@@ -3083,8 +3083,12 @@ fn tool_adapter(
         std::fs::canonicalize(scratch).map_err(|error| ExecutorError::Worker(error.to_string()))?;
     let acquired_root = std::fs::canonicalize(config.workspace_scratch.join("acquired"))
         .map_err(|error| ExecutorError::Worker(error.to_string()))?;
-    let acquisition = Some(
-        crate::workspace::acquire::acquire(crate::workspace::acquire::AcquisitionRequest::new(
+    // Snapshot acquisition is best-effort: a source that cannot be snapshotted
+    // (unsupported entries, size limits, ...) must not kill the run. The
+    // capabilities that need the snapshot fail at dispatch time with the
+    // recorded reason so the model can pivot.
+    let (acquisition, acquisition_failure) = match crate::workspace::acquire::acquire(
+        crate::workspace::acquire::AcquisitionRequest::new(
             project_root.clone(),
             acquired_root,
             crate::workspace::acquire::WorkspaceId::new(workspace.to_string())
@@ -3093,9 +3097,11 @@ fn tool_adapter(
                 .map_err(|error| ExecutorError::Worker(error.to_string()))?,
             crate::workspace::acquire::AcquisitionMode::CopyOnWriteSnapshot,
             crate::workspace::acquire::WriterPolicy::Restricted,
-        ))
-        .map_err(|error| ExecutorError::Worker(error.to_string()))?,
-    );
+        ),
+    ) {
+        Ok(result) => (Some(result), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let native_root = project_root;
     let process_registration = config.process_registry.as_ref().map(|registry| {
         ProcessRegistryRegistration::new(
@@ -3205,6 +3211,7 @@ fn tool_adapter(
             container_image: config.native_container_image.clone(),
             verification_registry: config.verification_registry.clone(),
             check_runner,
+            acquisition_failure,
             custody: config.secret_custody.clone(),
             secrets: config
                 .secret_custody
