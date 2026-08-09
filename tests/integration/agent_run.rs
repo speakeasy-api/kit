@@ -1912,6 +1912,45 @@ mod agent_run_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_edit_result_carries_staged_lsp_diagnostics_when_configured() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join("project/src")).unwrap();
+        let source = fixture.root.join("project/src/lib.rs");
+        fs::write(&source, "pub mod existing;\n").unwrap();
+        let provider = Arc::new(FakeProvider::with_scenario(
+            FakeResponse::completed("native coding complete"),
+            FakeScenario::NativeCoding,
+        ));
+        let lsp = kit::verify::lsp::launcher::NativeLspServerConfig::new(
+            env!("CARGO_BIN_EXE_kit").to_owned(),
+            vec![
+                "--kit-lsp-conformance-worker".to_owned(),
+                "diagnose".to_owned(),
+            ],
+            vec!["rust".to_owned()],
+            5_000,
+            100,
+        )
+        .unwrap();
+        let config = fixture
+            .config(Arc::clone(&provider))
+            .with_native_approval_policy(NativeApprovalPolicy::Auto)
+            .with_native_lsp(Some(lsp));
+        let executor = RunExecutor::start(config).unwrap();
+        fixture.wait_for(RunState::Completed).await;
+        executor.shutdown().await.unwrap();
+
+        let persisted = fixture.event_json();
+        assert!(persisted.contains("kit_edit"));
+        assert!(persisted.contains("diff_artifact"), "edit must commit");
+        assert!(
+            persisted.contains("kit fake lsp diagnostic"),
+            "staged LSP diagnostics must land in the kit_edit result: {persisted}"
+        );
+        assert!(!persisted.contains("diagnostics_unavailable"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn input_wait_resolves_durably_and_survives_executor_restart() {
         let fixture = Fixture::new();
         let provider = Arc::new(FakeProvider::with_scenario(

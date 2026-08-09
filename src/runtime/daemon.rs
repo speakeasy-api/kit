@@ -371,6 +371,7 @@ pub struct DaemonConfig {
     pub native_container_image: Option<String>,
     pub native_edit_validation_time: Duration,
     pub native_approval_policy: crate::agent::executor::NativeApprovalPolicy,
+    pub native_lsp: Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
     native_config_error: Option<String>,
     model_config_error: Option<String>,
     mcp_config_error: Option<String>,
@@ -460,19 +461,21 @@ impl DaemonConfig {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| state_root.join("unconfigured-project"));
         let native_config = load_native_config(&project_root);
-        let (native_edit_validation_time, native_approval_policy, native_config_error) =
+        let (native_edit_validation_time, native_approval_policy, native_lsp, native_config_error) =
             match native_config {
-                Ok(Some((validation_time, approval_policy))) => {
-                    (validation_time, approval_policy, None)
+                Ok(Some((validation_time, approval_policy, lsp))) => {
+                    (validation_time, approval_policy, lsp, None)
                 }
                 Ok(None) => (
                     crate::workspace::edit::ir::EditLimits::default().max_validation_time,
                     crate::agent::executor::NativeApprovalPolicy::default(),
                     None,
+                    None,
                 ),
                 Err(error) => (
                     crate::workspace::edit::ir::EditLimits::default().max_validation_time,
                     crate::agent::executor::NativeApprovalPolicy::default(),
+                    None,
                     Some(error),
                 ),
             };
@@ -496,6 +499,7 @@ impl DaemonConfig {
             native_container_image: std::env::var("KIT_NATIVE_CONTAINER_IMAGE").ok(),
             native_edit_validation_time,
             native_approval_policy,
+            native_lsp,
             native_config_error,
             model_config_error,
             mcp_config_error,
@@ -699,9 +703,37 @@ struct TrustedNativeConfig {
     edit_validation_wall_time_millis: u64,
     #[serde(default)]
     approval_policy: crate::agent::executor::NativeApprovalPolicy,
+    #[serde(default)]
+    lsp: Option<TrustedNativeLspConfig>,
 }
 
-type TrustedNativeServices = (Duration, crate::agent::executor::NativeApprovalPolicy);
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedNativeLspConfig {
+    command: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+    languages: Vec<String>,
+    #[serde(default = "default_native_lsp_wall_time_millis")]
+    wall_time_millis: u64,
+    #[serde(default = "default_native_lsp_max_diagnostics")]
+    max_diagnostics: u64,
+}
+
+fn default_native_lsp_wall_time_millis() -> u64 {
+    u64::try_from(crate::verify::lsp::launcher::DEFAULT_NATIVE_LSP_WALL_TIME.as_millis())
+        .expect("default LSP wall time fits u64")
+}
+
+fn default_native_lsp_max_diagnostics() -> u64 {
+    crate::verify::lsp::launcher::DEFAULT_NATIVE_LSP_DIAGNOSTICS
+}
+
+type TrustedNativeServices = (
+    Duration,
+    crate::agent::executor::NativeApprovalPolicy,
+    Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
+);
 
 /// `.kit/native.json` is optional: without it, native edits run with default
 /// validation limits and the default approval policy (syntax-only pipeline).
@@ -731,7 +763,20 @@ fn load_native_config(project_root: &Path) -> Result<Option<TrustedNativeService
                 .to_owned(),
         );
     }
-    Ok(Some((validation_time, config.approval_policy)))
+    let lsp = config
+        .lsp
+        .map(|lsp| {
+            crate::verify::lsp::launcher::NativeLspServerConfig::new(
+                lsp.command,
+                lsp.arguments,
+                lsp.languages,
+                lsp.wall_time_millis,
+                lsp.max_diagnostics,
+            )
+        })
+        .transpose()
+        .map_err(|error| format!("trusted native config lsp: {error}"))?;
+    Ok(Some((validation_time, config.approval_policy, lsp)))
 }
 
 #[cfg(debug_assertions)]
@@ -1111,6 +1156,7 @@ impl Daemon {
         .with_native_semantic_evidence(native_semantic_evidence.clone())
         .with_native_edit_validation_time(config.native_edit_validation_time)
         .with_native_approval_policy(config.native_approval_policy)
+        .with_native_lsp(config.native_lsp.clone())
         .with_capability_extensions(Arc::clone(&capability_extensions))
         .with_mcp_servers(config.mcp_servers);
         if let Some(profiles) = mcp_stdio_profiles {
@@ -1242,6 +1288,7 @@ impl Daemon {
                     cancellation: cancellation_coordinator.clone(),
                     container_image: config.native_container_image.clone(),
                     edit_validation_time: config.native_edit_validation_time,
+                    lsp: config.native_lsp.clone(),
                     cursor_key: identity.cursor_key,
                     capability_extensions: Arc::clone(&capability_extensions),
                 },
@@ -1896,6 +1943,13 @@ mod native_config_tests {
     use super::*;
 
     fn write_native_config(approval_policy: Option<&str>) -> PathBuf {
+        write_native_config_with_lsp(approval_policy, None)
+    }
+
+    fn write_native_config_with_lsp(
+        approval_policy: Option<&str>,
+        lsp: Option<serde_json::Value>,
+    ) -> PathBuf {
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random).unwrap();
         let root = std::env::temp_dir().join(format!(
@@ -1910,6 +1964,9 @@ mod native_config_tests {
         if let Some(policy) = approval_policy {
             config["approval_policy"] = serde_json::json!(policy);
         }
+        if let Some(lsp) = lsp {
+            config["lsp"] = lsp;
+        }
         fs::write(
             root.join(".kit/native.json"),
             serde_json::to_vec_pretty(&config).unwrap(),
@@ -1921,7 +1978,7 @@ mod native_config_tests {
     #[test]
     fn native_approval_policy_defaults_to_required() {
         let root = write_native_config(None);
-        let (_, policy) = load_native_config(&root).unwrap().unwrap();
+        let (_, policy, _) = load_native_config(&root).unwrap().unwrap();
         assert_eq!(
             policy,
             crate::agent::executor::NativeApprovalPolicy::Required
@@ -1932,7 +1989,7 @@ mod native_config_tests {
     #[test]
     fn native_approval_policy_parses_auto() {
         let root = write_native_config(Some("auto"));
-        let (_, policy) = load_native_config(&root).unwrap().unwrap();
+        let (_, policy, _) = load_native_config(&root).unwrap().unwrap();
         assert_eq!(policy, crate::agent::executor::NativeApprovalPolicy::Auto);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1940,6 +1997,102 @@ mod native_config_tests {
     #[test]
     fn native_approval_policy_rejects_unknown_values() {
         let root = write_native_config(Some("ask-somebody"));
+        let error = load_native_config(&root).unwrap_err();
+        assert!(error.contains("trusted native config parse"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_lsp_is_absent_by_default() {
+        let root = write_native_config(None);
+        let (_, _, lsp) = load_native_config(&root).unwrap().unwrap();
+        assert_eq!(lsp, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_lsp_parses_with_bounded_defaults() {
+        let root = write_native_config_with_lsp(
+            None,
+            Some(serde_json::json!({
+                "command": "/usr/local/bin/rust-analyzer",
+                "languages": ["rust"],
+            })),
+        );
+        let (_, _, lsp) = load_native_config(&root).unwrap().unwrap();
+        let lsp = lsp.unwrap();
+        assert_eq!(lsp.command(), "/usr/local/bin/rust-analyzer");
+        assert!(lsp.arguments().is_empty());
+        assert_eq!(lsp.languages(), ["rust".to_owned()]);
+        assert_eq!(
+            lsp.wall_time(),
+            crate::verify::lsp::launcher::DEFAULT_NATIVE_LSP_WALL_TIME
+        );
+        assert_eq!(
+            lsp.max_diagnostics(),
+            crate::verify::lsp::launcher::DEFAULT_NATIVE_LSP_DIAGNOSTICS
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_lsp_parses_explicit_fields() {
+        let root = write_native_config_with_lsp(
+            Some("auto"),
+            Some(serde_json::json!({
+                "command": "kit-lsp",
+                "arguments": ["--stdio"],
+                "languages": ["rust", "toml"],
+                "wall_time_millis": 1_500,
+                "max_diagnostics": 25,
+            })),
+        );
+        let (_, policy, lsp) = load_native_config(&root).unwrap().unwrap();
+        assert_eq!(policy, crate::agent::executor::NativeApprovalPolicy::Auto);
+        let lsp = lsp.unwrap();
+        assert_eq!(lsp.arguments(), ["--stdio".to_owned()]);
+        assert_eq!(lsp.wall_time(), Duration::from_millis(1_500));
+        assert_eq!(lsp.max_diagnostics(), 25);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_lsp_rejects_out_of_bounds_wall_time() {
+        let root = write_native_config_with_lsp(
+            None,
+            Some(serde_json::json!({
+                "command": "kit-lsp",
+                "languages": ["rust"],
+                "wall_time_millis": 0,
+            })),
+        );
+        let error = load_native_config(&root).unwrap_err();
+        assert!(error.contains("trusted native config lsp"), "{error}");
+        assert!(error.contains("wall_time_millis"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_lsp_rejects_missing_languages_and_unknown_fields() {
+        let root = write_native_config_with_lsp(
+            None,
+            Some(serde_json::json!({
+                "command": "kit-lsp",
+                "languages": [],
+            })),
+        );
+        let error = load_native_config(&root).unwrap_err();
+        assert!(error.contains("trusted native config lsp"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+
+        let root = write_native_config_with_lsp(
+            None,
+            Some(serde_json::json!({
+                "command": "kit-lsp",
+                "languages": ["rust"],
+                "blocking": true,
+            })),
+        );
         let error = load_native_config(&root).unwrap_err();
         assert!(error.contains("trusted native config parse"), "{error}");
         fs::remove_dir_all(root).unwrap();

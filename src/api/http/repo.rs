@@ -271,6 +271,7 @@ pub struct NativeRepoOptions {
     pub cancellation: SqliteCancellationCoordinator,
     pub container_image: Option<String>,
     pub edit_validation_time: Duration,
+    pub lsp: Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
     pub cursor_key: [u8; 32],
     pub capability_extensions: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
 }
@@ -647,6 +648,7 @@ impl NativeRepoService {
                 syntax_executors,
                 semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: options.edit_validation_time,
+                lsp: options.lsp,
                 cursor_key: options.cursor_key,
                 #[cfg(test)]
                 run_runner: None,
@@ -3707,6 +3709,7 @@ mod tests {
                 container_image: None,
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
+                lsp: None,
                 cursor_key: [7; 32],
                 capability_extensions: Arc::new(std::sync::RwLock::new(Default::default())),
             },

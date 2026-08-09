@@ -644,6 +644,13 @@ pub(crate) fn normalize_accepted(
     normalize_with_trace(format, &output.bytes, context, trace).map_err(Into::into)
 }
 
+/// A committed native edit plus the outcome of the optional staged-view LSP
+/// diagnostics pass that ran between staging and materialization.
+pub(crate) struct NativeMaterializedEdit {
+    pub(crate) edit: crate::workspace::edit::recovery::MaterializedEdit,
+    pub(crate) diagnostics: crate::capabilities::native::lsp::NativeEditLspOutcome,
+}
+
 pub(crate) struct EditOrchestrator;
 
 impl EditOrchestrator {
@@ -684,8 +691,9 @@ impl EditOrchestrator {
         artifacts: &crate::store::artifacts::ArtifactStore,
         cancellation: &Arc<AtomicBool>,
         syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
+        lsp: Option<&crate::capabilities::native::lsp::NativeEditLspGate>,
         trace: &mut impl EditTrace,
-    ) -> Result<crate::workspace::edit::recovery::MaterializedEdit, EditOrchestrationError> {
+    ) -> Result<NativeMaterializedEdit, EditOrchestrationError> {
         let ir = normalize_with_trace(
             ModelEditFormat::StructuredJson,
             input,
@@ -702,6 +710,7 @@ impl EditOrchestrator {
             artifacts,
             cancellation,
             syntax_executors,
+            lsp,
             trace,
         )
     }
@@ -716,8 +725,9 @@ impl EditOrchestrator {
         artifacts: &crate::store::artifacts::ArtifactStore,
         cancellation: &Arc<AtomicBool>,
         syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
+        lsp: Option<&crate::capabilities::native::lsp::NativeEditLspGate>,
         trace: &mut impl EditTrace,
-    ) -> Result<crate::workspace::edit::recovery::MaterializedEdit, EditOrchestrationError> {
+    ) -> Result<NativeMaterializedEdit, EditOrchestrationError> {
         ensure_not_cancelled(Some(cancellation))?;
         let authority =
             crate::workspace::edit::validate::AuthenticatedEditAuthority::from_authenticated(
@@ -758,7 +768,15 @@ impl EditOrchestrator {
             trace,
         )?;
         ensure_not_cancelled(Some(cancellation))?;
-        staged
+        // The staged-view verifier seam (RFC 18.3): bounded shadow LSP
+        // diagnostics against the staged buffers. Diagnostics never block the
+        // edit; the outcome rides along with the materialized result.
+        let diagnostics = lsp.map_or(
+            crate::capabilities::native::lsp::NativeEditLspOutcome::Skipped,
+            |gate| gate.run(&staged),
+        );
+        ensure_not_cancelled(Some(cancellation))?;
+        let edit = staged
             .materialize_traced(
                 artifacts,
                 crate::workspace::edit::recovery::MaterializeOptions::new(
@@ -767,7 +785,8 @@ impl EditOrchestrator {
                 .with_cancellation(Arc::clone(cancellation)),
                 trace,
             )
-            .map_err(Into::into)
+            .map_err(EditOrchestrationError::from)?;
+        Ok(NativeMaterializedEdit { edit, diagnostics })
     }
 
     #[allow(clippy::too_many_arguments)]

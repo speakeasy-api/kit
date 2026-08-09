@@ -184,6 +184,7 @@ pub(crate) struct NativeRuntime {
     pub syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
     pub semantic_evidence: NativeSemanticEvidenceStore,
     pub edit_validation_time: std::time::Duration,
+    pub lsp: Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
     pub cursor_key: [u8; 32],
     #[cfg(test)]
     pub run_runner: Option<RunConformanceRunner>,
@@ -386,6 +387,7 @@ pub(crate) struct NativeDispatcher {
     syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
     semantic_evidence: NativeSemanticEvidenceStore,
     edit_validation_time: std::time::Duration,
+    lsp_gate: Option<crate::capabilities::native::lsp::NativeEditLspGate>,
     cursor_key: [u8; 32],
     projection_state: crate::domain::secret::JsonProjectionState,
     read_replay: Option<ReadReplay>,
@@ -418,6 +420,15 @@ impl NativeDispatcher {
         std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
         let grants = authenticated.grant_snapshot().clone();
         let projection_state = runtime.custody.projection_state();
+        let lsp_gate = runtime.lsp.map(|lsp| {
+            crate::capabilities::native::lsp::NativeEditLspGate::new(
+                lsp,
+                root.clone(),
+                grants.principal_id(),
+                grants.project_id(),
+                runtime.workspace_id,
+            )
+        });
         Ok(Self {
             extension_guard: runtime.extension_guard,
             root,
@@ -449,6 +460,7 @@ impl NativeDispatcher {
             syntax_executors: runtime.syntax_executors,
             semantic_evidence: runtime.semantic_evidence,
             edit_validation_time: runtime.edit_validation_time,
+            lsp_gate,
             cursor_key: runtime.cursor_key,
             projection_state,
             read_replay: None,
@@ -1160,6 +1172,7 @@ impl NativeDispatcher {
         }
         let mut trace = EditPathTrace::default();
         let mut syntax_executors = self.syntax_executors.iter_mut().collect::<Vec<_>>();
+        let lsp_gate = self.lsp_gate.as_ref();
         let edit = if let Some(ir) = ir {
             EditOrchestrator::execute_native_ir(
                 ir,
@@ -1170,6 +1183,7 @@ impl NativeDispatcher {
                 &self.artifacts,
                 &self.live_cancellation,
                 &mut syntax_executors,
+                lsp_gate,
                 &mut trace,
             )
         } else {
@@ -1182,10 +1196,13 @@ impl NativeDispatcher {
                 &self.artifacts,
                 &self.live_cancellation,
                 &mut syntax_executors,
+                lsp_gate,
                 &mut trace,
             )
         }
         .map_err(native_edit_error)?;
+        let diagnostics = edit.diagnostics;
+        let edit = edit.edit;
         self.index = None;
         self.structure_graph_key = None;
         self.history_graph_key = None;
@@ -1206,27 +1223,34 @@ impl NativeDispatcher {
             },
         });
         let artifacts = vec![edit.diff_artifact_reference().to_string()];
-        Ok((
-            json!({
-                "outcome": if edit.committed_with_cancel_race() {
-                    "committed_with_cancel_race"
-                } else {
-                    "committed"
-                },
-                "diff_artifact": diff_artifact,
-                "diff_preview": edit.diff_preview(),
-                "change_diff": change_diff,
-                "change_diff_complete": edit.change_diff_complete(),
-                "revision": {
-                    "digest": edit.revision().digest().to_string(),
-                    "epoch": edit.revision().epoch().to_string(),
-                    "id": edit.revision().id().to_string(),
-                },
-                "trace": trace.ids(),
-                "transaction_id": edit.transaction_id(),
-            }),
-            artifacts,
-        ))
+        let mut data = json!({
+            "outcome": if edit.committed_with_cancel_race() {
+                "committed_with_cancel_race"
+            } else {
+                "committed"
+            },
+            "diff_artifact": diff_artifact,
+            "diff_preview": edit.diff_preview(),
+            "change_diff": change_diff,
+            "change_diff_complete": edit.change_diff_complete(),
+            "revision": {
+                "digest": edit.revision().digest().to_string(),
+                "epoch": edit.revision().epoch().to_string(),
+                "id": edit.revision().id().to_string(),
+            },
+            "trace": trace.ids(),
+            "transaction_id": edit.transaction_id(),
+        });
+        match diagnostics {
+            crate::capabilities::native::lsp::NativeEditLspOutcome::Skipped => {}
+            crate::capabilities::native::lsp::NativeEditLspOutcome::Diagnostics(diagnostics) => {
+                data["diagnostics"] = Value::Array(diagnostics);
+            }
+            crate::capabilities::native::lsp::NativeEditLspOutcome::Unavailable(reason) => {
+                data["diagnostics_unavailable"] = Value::String(reason);
+            }
+        }
+        Ok((data, artifacts))
     }
 
     fn resolve_structural_preview(
@@ -3156,6 +3180,7 @@ mod tests {
                 semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
+                lsp: None,
                 cursor_key: [7; 32],
                 run_runner: None,
             },
@@ -4843,6 +4868,136 @@ mod tests {
         assert_eq!(result["outcome"], "committed");
         assert!(result["change_diff"].is_string());
         assert_eq!(artifacts.len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn install_lsp_gate(dispatcher: &mut NativeDispatcher, command: &str, languages: &[&str]) {
+        let config = crate::verify::lsp::launcher::NativeLspServerConfig::new(
+            command.to_owned(),
+            if command == "/bin/sh" {
+                vec!["-c".to_owned(), "sleep 60".to_owned()]
+            } else {
+                Vec::new()
+            },
+            languages.iter().map(|language| (*language).to_owned()).collect(),
+            500,
+            50,
+        )
+        .unwrap();
+        dispatcher.lsp_gate = Some(crate::capabilities::native::lsp::NativeEditLspGate::new(
+            config,
+            dispatcher.root.clone(),
+            dispatcher.grants.principal_id(),
+            dispatcher.grants.project_id(),
+            dispatcher.workspace_id,
+        ));
+    }
+
+    fn text_edit_input(revision: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "expected_revision": revision,
+            "operations": [{
+                "op": "add_file",
+                "path": "created.txt",
+                "content": {
+                    "encoding": "utf8",
+                    "newline": "lf",
+                    "text": "verified",
+                    "final_newline": true
+                },
+                "executable": false
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn native_edit_skips_lsp_when_no_changed_file_matches_the_languages() {
+        let (directory, mut dispatcher) = dispatcher();
+        install_lsp_gate(&mut dispatcher, "/bin/sh", &["python"]);
+        let revision = dispatcher.revision().unwrap();
+        let input = text_edit_input(&revision);
+        let owner = attempt(&dispatcher);
+        let (result, _) = dispatcher.edit(&input, owner).unwrap();
+        assert_eq!(result["outcome"], "committed");
+        assert!(result.get("diagnostics").is_none());
+        assert!(result.get("diagnostics_unavailable").is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_edit_commits_with_diagnostics_unavailable_when_lsp_cannot_launch() {
+        let (directory, mut dispatcher) = dispatcher();
+        install_lsp_gate(
+            &mut dispatcher,
+            "/nonexistent/kit-lsp-conformance-server",
+            &["text"],
+        );
+        let revision = dispatcher.revision().unwrap();
+        let input = text_edit_input(&revision);
+        let owner = attempt(&dispatcher);
+        let (result, _) = dispatcher.edit(&input, owner).unwrap();
+        assert_eq!(result["outcome"], "committed");
+        assert_eq!(
+            std::fs::read_to_string(dispatcher.root.join("created.txt")).unwrap(),
+            "verified\n"
+        );
+        assert!(result.get("diagnostics").is_none());
+        let reason = result["diagnostics_unavailable"].as_str().unwrap();
+        assert!(reason.contains("LaunchFailed"), "{reason}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_edit_commits_with_diagnostics_unavailable_when_lsp_times_out() {
+        let (directory, mut dispatcher) = dispatcher();
+        // `/bin/sh -c "sleep 60"` accepts the handshake pipes but never
+        // publishes diagnostics: the bounded shadow run must expire.
+        install_lsp_gate(&mut dispatcher, "/bin/sh", &["text"]);
+        let revision = dispatcher.revision().unwrap();
+        let input = text_edit_input(&revision);
+        let owner = attempt(&dispatcher);
+        let (result, _) = dispatcher.edit(&input, owner).unwrap();
+        assert_eq!(result["outcome"], "committed");
+        assert_eq!(
+            std::fs::read_to_string(dispatcher.root.join("created.txt")).unwrap(),
+            "verified\n"
+        );
+        let reason = result["diagnostics_unavailable"].as_str().unwrap();
+        assert!(reason.contains("DeadlineExceeded"), "{reason}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_edit_commits_with_diagnostics_unavailable_when_lsp_crashes() {
+        let (directory, mut dispatcher) = dispatcher();
+        let config = crate::verify::lsp::launcher::NativeLspServerConfig::new(
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "exit 0".to_owned()],
+            vec!["text".to_owned()],
+            500,
+            50,
+        )
+        .unwrap();
+        dispatcher.lsp_gate = Some(crate::capabilities::native::lsp::NativeEditLspGate::new(
+            config,
+            dispatcher.root.clone(),
+            dispatcher.grants.principal_id(),
+            dispatcher.grants.project_id(),
+            dispatcher.workspace_id,
+        ));
+        let revision = dispatcher.revision().unwrap();
+        let input = text_edit_input(&revision);
+        let owner = attempt(&dispatcher);
+        let (result, _) = dispatcher.edit(&input, owner).unwrap();
+        assert_eq!(result["outcome"], "committed");
+        assert_eq!(
+            std::fs::read_to_string(dispatcher.root.join("created.txt")).unwrap(),
+            "verified\n"
+        );
+        assert!(result.get("diagnostics").is_none());
+        assert!(result["diagnostics_unavailable"].is_string());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

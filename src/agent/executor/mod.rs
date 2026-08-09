@@ -171,6 +171,7 @@ pub struct RunExecutorConfig {
     native_container_image: Option<String>,
     native_edit_validation_time: Duration,
     native_approval_policy: NativeApprovalPolicy,
+    native_lsp: Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
     pub(crate) native_semantic_evidence:
         crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
     // Workspace handles for non-terminal runs. A run parked on a durable wait
@@ -227,6 +228,7 @@ impl RunExecutorConfig {
             native_edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                 .max_validation_time,
             native_approval_policy: NativeApprovalPolicy::default(),
+            native_lsp: None,
             native_semantic_evidence:
                 crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default(),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -301,6 +303,16 @@ impl RunExecutorConfig {
 
     pub fn with_native_approval_policy(mut self, policy: NativeApprovalPolicy) -> Self {
         self.native_approval_policy = policy;
+        self
+    }
+
+    /// Optional `.kit/native.json` `lsp` declaration: staged-view shadow LSP
+    /// diagnostics for kit_edit. `None` leaves the feature off.
+    pub fn with_native_lsp(
+        mut self,
+        lsp: Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
+    ) -> Self {
+        self.native_lsp = lsp;
         self
     }
 
@@ -3186,6 +3198,7 @@ fn tool_adapter(
             syntax_executors,
             semantic_evidence: config.native_semantic_evidence.clone(),
             edit_validation_time: config.native_edit_validation_time,
+            lsp: config.native_lsp.clone(),
             cursor_key,
             #[cfg(test)]
             run_runner: None,
@@ -4994,8 +5007,13 @@ impl FakeTurn {
                     .collect::<Result<Vec<_>, _>>()?;
                 let original = String::from_utf8(bytes.clone())
                     .map_err(|_| LoopError::Provider("native read source is not UTF-8".into()))?;
+                // `text` carries the content without its final newline; the
+                // `final_newline` flag renders it, exactly as the dogfood
+                // harness constructs the same edit.
+                let final_newline = original.ends_with('\n');
+                let text = original.strip_suffix('\n').unwrap_or(&original).to_owned();
                 let replacement = format!(
-                    "{original}\npub const DOGFOOD_NATIVE_PATH: &str = \"provider-kernel-native\";\n"
+                    "{text}\n\npub const DOGFOOD_NATIVE_PATH: &str = \"provider-kernel-native\";"
                 );
                 (
                     "kit_edit",
@@ -5010,8 +5028,8 @@ impl FakeTurn {
                             "expected": {
                                 "encoding": "utf8",
                                 "newline": "lf",
-                                "text": original,
-                                "final_newline": data.get("final_newline").and_then(serde_json::Value::as_bool).unwrap_or(true)
+                                "text": text,
+                                "final_newline": final_newline
                             },
                             "replacement": {
                                 "encoding": "utf8",

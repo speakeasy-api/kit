@@ -15,8 +15,12 @@ Read tools require `WorkspaceRead` and an expected revision. Search cursors are 
 revision, index, query, and options. Edit requires `WorkspaceWrite` and enters the same production
 `EditOrchestrator` as grammar output: normalization, authorization, validation, private staging
 with syntax passes, materialization, and recovery. Edits work with no `.kit/native.json` present;
-the trusted config only tunes the edit validation wall time and approval policy. Its result
-identifies the committed revision, diff artifact, and edit trace.
+the trusted config only tunes the edit validation wall time, approval policy, and the optional
+staged LSP diagnostics pass. When the config declares an `lsp` server and a changed file matches
+its languages, a bounded shadow LSP session runs against the staged view between staging and
+materialization; error and warning diagnostics ride along in the result under `diagnostics`
+(or `diagnostics_unavailable` with a reason), and never block the edit. Its result identifies
+the committed revision, diff artifact, and edit trace.
 
 Run accepts argv, never a shell string. Working directory, mounts, scrubbed environment, network
 policy, and finite resource limits are explicit. It uses only the executor selected by trusted

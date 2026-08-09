@@ -252,6 +252,24 @@ impl ShadowAdapterRegistry {
         }
     }
 
+    /// Builds a registry whose single pin is the operator-declared server from
+    /// the trusted native config (`.kit/native.json`). The config file is the
+    /// project trust boundary, so the declared server is pinned shadow-safe;
+    /// every other capability/revision mismatch still falls back as usual.
+    pub fn from_trusted_request(
+        request: &ShadowAdapterRequest,
+    ) -> Result<Self, ShadowRegistryError> {
+        Self::from_pins(vec![VerifiedShadowAdapterPin::new(
+            request.server.clone(),
+            request.server_version.clone(),
+            request.position_encoding,
+            request.capabilities,
+            true,
+            request.isolation_identity.clone(),
+            request.execution_profile.clone(),
+        )?])
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn verified_fixture(
         request: &ShadowAdapterRequest,

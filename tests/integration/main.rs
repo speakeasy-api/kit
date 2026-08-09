@@ -8,6 +8,7 @@ mod cli_daemon;
 mod daemon_lifecycle;
 mod daemon_telemetry;
 mod local_executor;
+mod lsp_edit;
 mod provider_stream;
 
 fn run(root: &Path, program: &str, args: &[&str]) -> std::process::Output {

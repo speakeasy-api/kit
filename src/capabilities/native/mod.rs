@@ -5,6 +5,7 @@
 
 mod catalog;
 pub(crate) mod dispatch;
+pub(crate) mod lsp;
 pub(crate) mod orchestrate;
 
 pub use catalog::{

@@ -637,3 +637,97 @@ pub fn mcp_stdio_worker_main(arguments: &[std::ffi::OsString]) -> Option<std::pr
     }
     Some(std::process::ExitCode::SUCCESS)
 }
+
+/// Fake stdio LSP server for launcher conformance tests. Speaks Content-Length
+/// framing on stdin/stdout. Modes (argv\[2\], default `diagnose`):
+/// `diagnose` answers `initialize`, emits noisy traffic (a log notification and
+/// a server-to-client request) and then versioned `publishDiagnostics` for each
+/// `didOpen`; `crash` exits after answering `initialize`; `hang` reads frames
+/// but never writes.
+pub fn lsp_stdio_worker_main(arguments: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    if arguments.get(1).and_then(|value| value.to_str()) != Some("--kit-lsp-conformance-worker") {
+        return None;
+    }
+    use std::io::Write as _;
+
+    use crate::verify::lsp::session::{CodecLimits, LspCodec};
+
+    let mode = arguments
+        .get(2)
+        .and_then(|value| value.to_str())
+        .unwrap_or("diagnose")
+        .to_owned();
+    let limits = CodecLimits::default();
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    let mut write_frame = |value: &serde_json::Value| -> bool {
+        LspCodec::encode(value, limits).is_ok_and(|frame| {
+            writer.write_all(&frame).is_ok() && writer.flush().is_ok()
+        })
+    };
+    loop {
+        let Ok(frame) = LspCodec::decode_from(&mut reader, limits) else {
+            // EOF or closed pipe: the client reaped the session.
+            return Some(std::process::ExitCode::SUCCESS);
+        };
+        if mode == "hang" {
+            continue;
+        }
+        let value = frame.value();
+        match value.get("method").and_then(serde_json::Value::as_str) {
+            Some("initialize") => {
+                let id = value.get("id").cloned().unwrap_or(serde_json::json!(0));
+                if !write_frame(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "capabilities": { "textDocumentSync": 1 } }
+                })) {
+                    return Some(std::process::ExitCode::FAILURE);
+                }
+                if mode == "crash" {
+                    return Some(std::process::ExitCode::FAILURE);
+                }
+            }
+            Some("textDocument/didOpen") => {
+                let document = &value["params"]["textDocument"];
+                let uri = document["uri"].as_str().unwrap_or_default().to_owned();
+                let version = document["version"].clone();
+                // Noise the production transport must filter out.
+                let _ = write_frame(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "window/logMessage",
+                    "params": { "type": 3, "message": "kit fake lsp opened a document" }
+                }));
+                let _ = write_frame(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 9001,
+                    "method": "workspace/configuration",
+                    "params": { "items": [] }
+                }));
+                if !write_frame(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": uri,
+                        "version": version,
+                        "diagnostics": [{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 }
+                            },
+                            "severity": 1,
+                            "code": "KITFAKE1",
+                            "source": "kit-fake-lsp",
+                            "message": "kit fake lsp diagnostic"
+                        }]
+                    }
+                })) {
+                    return Some(std::process::ExitCode::FAILURE);
+                }
+            }
+            _ => {}
+        }
+    }
+}

@@ -2,9 +2,15 @@
 
 The daemon opens one `ManagedWorkspace` from the trusted `KIT_PROJECT_ROOT` (the current directory
 when unset). The regular file `.kit/native.json` is optional; when present, at most 256 KiB is
-read and version 1 sets `edit_validation_wall_time_millis` and the native approval policy. The
-wall time must be in `1..=300000`, while the default for projects without native configuration
-remains 10 seconds. A model request cannot raise this project policy. Native workspace
+read and version 1 sets `edit_validation_wall_time_millis`, the native approval policy, and an
+optional `lsp` object. The wall time must be in `1..=300000`, while the default for projects
+without native configuration remains 10 seconds. The `lsp` object
+(`{"command", "arguments", "languages", "wall_time_millis", "max_diagnostics"}`) declares a
+trusted stdio LSP server for staged edit diagnostics: `languages` lists syntax language keys
+("rust", "json", "text", ...) or bare file extensions, `wall_time_millis` is bounded by
+`1..=60000` (default 5000), and `max_diagnostics` by `1..=10000` (default 200). Diagnostics never
+block an edit; the kit_edit result carries a `diagnostics` array for changed files or a
+`diagnostics_unavailable` reason when the server is absent, crashes, or times out. A model request cannot raise this project policy. Native workspace
 reconciliation uses at least its 10-second default and at most 20 seconds of this trusted
 allowance; longer edit-validation policies do not widen repository reads.
 It is never replaced by a daemon-host command fallback.
