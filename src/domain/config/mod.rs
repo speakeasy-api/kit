@@ -200,7 +200,12 @@ impl ConfigLayer {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             budgets: BudgetLayer {
-                max_tokens: Some(1_000_000),
+                // Cumulative across the run, and every turn re-counts the
+                // full transcript it sends: a real coding-agent run over a
+                // large repository spends 100k+ tokens per turn across tens
+                // of turns. 1M proved too small the first time kit ran a
+                // real task against its own repository.
+                max_tokens: Some(20_000_000),
                 max_cost_microusd: Some(100_000_000),
                 max_turns: Some(1_000),
             },

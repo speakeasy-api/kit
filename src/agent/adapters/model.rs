@@ -102,6 +102,12 @@ pub struct ModelPolicy {
     pub max_buffered_bytes: usize,
     pub max_delta_bytes: usize,
     pub detached: bool,
+    /// Output tokens reserved for a request that carries no
+    /// `max_output_tokens`. Some providers reject that parameter entirely
+    /// yet still spend output and reasoning tokens; reserving nothing for
+    /// them hard-fails the turn as a billing overage the moment a reasoning
+    /// model thinks. Reconciliation settles to actual usage afterwards.
+    pub unbounded_output_allowance: u64,
 }
 
 impl Default for ModelPolicy {
@@ -112,6 +118,7 @@ impl Default for ModelPolicy {
             max_buffered_bytes: 8 * 1024 * 1024,
             max_delta_bytes: 16 * 1024,
             detached: false,
+            unbounded_output_allowance: DEFAULT_OUTPUT_TOKEN_ALLOWANCE,
         }
     }
 }
@@ -927,7 +934,7 @@ impl ModelKernel {
                 self.policy.reservation.processes(),
             )
         };
-        request_reservation(base, request)
+        request_reservation(base, request, self.policy.unbounded_output_allowance)
     }
 
     fn intent(
@@ -1598,15 +1605,21 @@ fn operation_identity_digest(
     sha256(&bytes)
 }
 
-fn request_reservation(base: Spend, request: &TurnRequest) -> Result<Spend, LoopError> {
+const DEFAULT_OUTPUT_TOKEN_ALLOWANCE: u64 = 65_536;
+
+fn request_reservation(
+    base: Spend,
+    request: &TurnRequest,
+    unbounded_output_allowance: u64,
+) -> Result<Spend, LoopError> {
     let projected_bytes = serde_json::to_vec(request).map_err(model_error)?.len();
+    let output_allowance = request
+        .generation
+        .max_output_tokens
+        .map_or(unbounded_output_allowance, u64::from);
     let tokens = u64::try_from(projected_bytes.div_ceil(3))
         .ok()
-        .and_then(|input| {
-            input.checked_add(u64::from(
-                request.generation.max_output_tokens.unwrap_or_default(),
-            ))
-        })
+        .and_then(|input| input.checked_add(output_allowance))
         .ok_or_else(|| LoopError::Provider("model prompt token estimate overflowed".to_owned()))?;
     Ok(Spend::new(
         base.cost_microusd(),
@@ -1919,7 +1932,7 @@ mod tests {
             generation: Default::default(),
             metadata: MetadataMap::new(),
         };
-        let ordinary = request_reservation(Spend::new(0, 1, 1, 0, 0), &request).unwrap();
+        let ordinary = request_reservation(Spend::new(0, 1, 1, 0, 0), &request, 0).unwrap();
         request.structured_output = Some(
             StructuredOutputRequest::new(
                 "edit",
@@ -1932,7 +1945,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let constrained = request_reservation(Spend::new(0, 1, 1, 0, 0), &request).unwrap();
+        let constrained = request_reservation(Spend::new(0, 1, 1, 0, 0), &request, 0).unwrap();
         assert!(constrained.tokens() > ordinary.tokens());
         assert_eq!(
             constrained.tokens(),

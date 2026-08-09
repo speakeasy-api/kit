@@ -370,6 +370,7 @@ impl Fixture {
                 max_buffered_bytes: 1024 * 1024,
                 max_delta_bytes: 4,
                 detached: false,
+                unbounded_output_allowance: 0,
             },
             fake: FakeAdapter::with_events(events),
         }
