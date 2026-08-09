@@ -1050,9 +1050,11 @@ On Linux, dedicated cgroup v2 trees and `cgroup.kill` SHOULD own process cleanup
 
 ### 25.3 Workspaces
 
-Each writing run receives a Git worktree, clone, or copy-on-write snapshot. Parallel subagents receive separate snapshots. Restricted or hostile execution uses per-run clones/COW repositories or mediated Git operations; it never mounts a shared writable Git common directory into the sandbox.
+Each writing run receives an isolated snapshot of the source. Version control is not a runtime correctness dependency: a source without Git metadata, or a repository without any commit, acquires as an untracked snapshot whose workspace revision derives from a Kit-owned content hash. When Git history is present, trusted acquisition MAY use a Git worktree, clone, or copy-on-write snapshot as a materialization optimization. Parallel subagents receive separate snapshots. Restricted or hostile execution uses per-run physical or COW snapshots; it never mounts a shared writable Git common directory into the sandbox.
 
-Kit records base commit, initial dirty-state hash, workspace revision, final diff, and resulting revision. It preserves unrelated user changes and never invokes destructive Git operations without explicit authority.
+Snapshot acquisition at run start is best-effort. An acquisition failure does not abort the run: snapshot-dependent capabilities fail closed at invocation with the recorded reason so the model can pivot, and Git-specific capabilities fail the same way when Git state or the Git binary is absent.
+
+Kit records the base commit where one exists and an explicit untracked marker otherwise, plus initial dirty-state hash, workspace revision, final diff, and resulting revision. It preserves unrelated user changes and never invokes destructive Git operations without explicit authority.
 
 Hooks and submodules are treated as executable code and disabled or sandboxed by default.
 
