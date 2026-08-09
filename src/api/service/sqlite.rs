@@ -1617,9 +1617,7 @@ impl SqliteServiceStore {
                 .attempts
                 .get(attempt_id)
                 .map(|attempt| attempt.run_id)
-                .ok_or_else(|| {
-                    ServiceError::Conflict("attempt has no driver claim".to_owned())
-                })?,
+                .ok_or_else(|| ServiceError::Conflict("attempt has no driver claim".to_owned()))?,
             _ => {
                 return Err(ServiceError::Invalid(
                     "worker command is not driver-owned".to_owned(),
@@ -2358,9 +2356,7 @@ impl ServiceStore for SqliteServiceStore {
                 // BTreeMap iteration is id order, which is random relative to run
                 // creation; present runs chronologically by first committed event.
                 let order = self.creation_order("run_id")?;
-                runs.sort_by_key(|run| {
-                    order.get(&run.id.to_string()).copied().unwrap_or(i64::MAX)
-                });
+                runs.sort_by_key(|run| order.get(&run.id.to_string()).copied().unwrap_or(i64::MAX));
                 Ok(QueryProjection::Runs(runs))
             }
             Query::GetRun { run_id } => state

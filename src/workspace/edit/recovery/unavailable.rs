@@ -1,11 +1,11 @@
 use std::fs::File;
 
-use crate::{store::artifacts::ArtifactStore, workspace::edit::stage::VerifiedStagedEdit};
+use crate::{store::artifacts::ArtifactStore, workspace::edit::stage::StagedEdit};
 
 use super::{MaterializeOptions, MaterializedEdit, RecoveryError, RecoveryHook};
 
 pub fn materialize(
-    _stage: VerifiedStagedEdit<'_>,
+    _stage: StagedEdit<'_>,
     _artifacts: &ArtifactStore,
     _options: MaterializeOptions,
 ) -> Result<MaterializedEdit, RecoveryError> {
@@ -13,7 +13,7 @@ pub fn materialize(
 }
 
 pub fn materialize_with_hook(
-    _stage: VerifiedStagedEdit<'_>,
+    _stage: StagedEdit<'_>,
     _artifacts: &ArtifactStore,
     _options: MaterializeOptions,
     _hook: RecoveryHook<'_>,

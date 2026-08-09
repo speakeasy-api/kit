@@ -222,13 +222,6 @@ mod agent_run_tests {
             Self::new_for_provider_with_grants(provider, &[])
         }
 
-        fn new_with_verification() -> Self {
-            Self::new_for_provider_with_grants(
-                ConfigProvider::OpenAi,
-                &[Grant::VerificationTargeted],
-            )
-        }
-
         fn new_for_provider_with_grants(provider: ConfigProvider, extra_grants: &[Grant]) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "kit-agent-run-{}-{}",
@@ -1844,88 +1837,6 @@ mod agent_run_tests {
                 ..
             } if Some(found) == call.as_ref()
         )));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn malformed_check_reservation_commits_learning_triple_without_effect_dispatch() {
-        let fixture = Fixture::new_with_verification();
-        let provider = Arc::new(FakeProvider::with_scenario(
-            FakeResponse::completed("invalid check handled"),
-            FakeScenario::ToolInvalidCheck,
-        ));
-        let executor = RunExecutor::start(
-            fixture
-                .config(Arc::clone(&provider))
-                .with_tool_learning_key([45; 32]),
-        )
-        .unwrap();
-        fixture.wait_for(RunState::Completed).await;
-        executor.shutdown().await.unwrap();
-
-        let store = test_support::open_sqlite_store(&fixture.database).unwrap();
-        let records = kit::telemetry::tool_learning::records(
-            &store,
-            fixture.run_id,
-            &kit::telemetry::tool_learning::ProjectPointerHasher::new(
-                fixture.project_id,
-                &[45; 32],
-            ),
-        )
-        .unwrap();
-        let call = records.iter().find_map(|event| match event {
-            kit::telemetry::tool_learning::ToolLearningEvent::Call { common, call, .. }
-                if common.capability.is_some() && common.schema.is_some() =>
-            {
-                Some(call)
-            }
-            _ => None,
-        });
-        assert!(call.is_some());
-        assert_eq!(
-            records
-                .iter()
-                .filter(|event| match event {
-                    kit::telemetry::tool_learning::ToolLearningEvent::Call {
-                        call: found, ..
-                    }
-                    | kit::telemetry::tool_learning::ToolLearningEvent::Error {
-                        call: found, ..
-                    }
-                    | kit::telemetry::tool_learning::ToolLearningEvent::Outcome {
-                        call: found,
-                        ..
-                    } => Some(found) == call,
-                    _ => false,
-                })
-                .count(),
-            3
-        );
-        assert!(records.iter().any(|event| matches!(
-            event,
-            kit::telemetry::tool_learning::ToolLearningEvent::Error {
-                call: found,
-                stage: kit::telemetry::tool_learning::ErrorStage::SchemaValidation,
-                code: kit::telemetry::tool_learning::ErrorCode::InvalidSchema,
-                dispatched: false,
-                known: true,
-                ..
-            } if Some(found) == call
-        )));
-        assert!(records.iter().any(|event| matches!(
-            event,
-            kit::telemetry::tool_learning::ToolLearningEvent::Outcome {
-                call: found,
-                status: kit::telemetry::tool_learning::LearningStatus::Failed,
-                dispatched: false,
-                known: true,
-                ..
-            } if Some(found) == call
-        )));
-        assert!(
-            !fixture
-                .event_json()
-                .contains("capability.invocation_dispatched")
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

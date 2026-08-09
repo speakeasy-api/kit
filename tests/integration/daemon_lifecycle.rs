@@ -417,15 +417,9 @@ async fn daemon_start_only_validates_configured_mcp_servers() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_repository_http_structural_preview_applies_the_exact_diff_once() {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use kit::{
-        executor::{check::ConformanceCheck, profile::ResourceLimits},
-        verify::{
-            feedback::{DiagnosticAdapter, FeedbackLimits},
-            profiles::{CheckClass, CheckRequirement, DeclaredCheck, VerificationRegistry},
-        },
-    };
+    // The checkless edit pipeline still runs staged syntax passes; swap in the
+    // always-passing debug executors so this test needs no syntax workers.
+    unsafe { std::env::set_var("KIT_FAKE_SYNTAX", "pass") };
 
     let root = TestRoot::new();
     let project_root = root.0.join("project");
@@ -441,41 +435,7 @@ async fn public_repository_http_structural_preview_applies_the_exact_diff_once()
     )
     .unwrap();
     init_git(&project_root);
-    let check = kit::executor::check::CheckCommand::new(
-        "diagnostics",
-        "cargo",
-        vec!["check".to_owned()],
-        format!("example.invalid/check@sha256:{}", "a".repeat(64)),
-        format!("sha256:{}", "b".repeat(64)),
-        format!("sha256:{}", "c".repeat(64)),
-        ResourceLimits::new(1_000, 1024 * 1024, 8, 1024, 1024, 1024, 1024, 1_000),
-    )
-    .unwrap();
-    let registry = VerificationRegistry::new(vec![
-        DeclaredCheck::new(
-            CheckClass::Diagnostics,
-            check,
-            CheckRequirement::Required,
-            BTreeSet::new(),
-            false,
-        )
-        .unwrap(),
-    ])
-    .unwrap();
-    let config = development_config(&root.0)
-        .with_project_root(&project_root)
-        .with_verification_registry(registry)
-        .with_native_feedback(
-            BTreeMap::from([(
-                "diagnostics".to_owned(),
-                DiagnosticAdapter::NormalizedJsonLinesV1,
-            )]),
-            FeedbackLimits::default(),
-        )
-        .with_native_check_completions([
-            ConformanceCheck::pass(b"", b""),
-            ConformanceCheck::pass(b"", b""),
-        ]);
+    let config = development_config(&root.0).with_project_root(&project_root);
     let daemon = start_daemon(config).await.unwrap();
     wait_ready(daemon.endpoint()).await;
     let discovery = read_discovery(&root.0).unwrap();
@@ -1859,7 +1819,11 @@ fn tamper_native_extension_digest(database: &std::path::Path) -> (String, String
             .execute(
                 "UPDATE capability_extension_registry SET snapshot=?1
                  WHERE principal_id=?2 AND project_id=?3",
-                rusqlite::params![text.replace(&genuine, &stale).into_bytes(), principal, project],
+                rusqlite::params![
+                    text.replace(&genuine, &stale).into_bytes(),
+                    principal,
+                    project
+                ],
             )
             .unwrap();
     }
@@ -1969,7 +1933,10 @@ async fn parked_run_resumes_after_built_in_extension_digest_change() {
         "digest-change-input-resolution",
     );
     headers.push(("Content-Type", "application/json".to_owned()));
-    headers.push(("Idempotency-Key", "digest-change-input-resolution".to_owned()));
+    headers.push((
+        "Idempotency-Key",
+        "digest-change-input-resolution".to_owned(),
+    ));
     let (status, body) = request(
         daemon.endpoint(),
         "POST",

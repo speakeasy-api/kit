@@ -7,7 +7,6 @@ use std::{
     process::Command,
 };
 
-mod affected_floor;
 mod auth_local;
 mod auth_remote;
 mod cap_bypass;

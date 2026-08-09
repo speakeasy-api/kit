@@ -169,11 +169,6 @@ pub struct RunExecutorConfig {
     edit_workspace: Option<PathBuf>,
     process_registry: Option<Arc<dyn ProcessRegistry>>,
     native_container_image: Option<String>,
-    verification_registry: crate::verify::profiles::VerificationRegistry,
-    native_formatter_descriptor: Option<crate::workspace::edit::format::FormatterDescriptor>,
-    native_formatter_required: bool,
-    native_diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-    native_feedback_limits: crate::verify::feedback::FeedbackLimits,
     native_edit_validation_time: Duration,
     native_approval_policy: NativeApprovalPolicy,
     pub(crate) native_semantic_evidence:
@@ -182,10 +177,7 @@ pub struct RunExecutorConfig {
     // must keep its workspace owner (and revision epoch) alive: if the last
     // handle drops, the resume mints a new epoch and every revision token the
     // model captured before the wait becomes stale.
-    run_workspaces:
-        Arc<Mutex<BTreeMap<RunId, crate::workspace::revision::ManagedWorkspace>>>,
-    #[cfg(debug_assertions)]
-    native_check_completions: Vec<crate::executor::check::ConformanceCheck>,
+    run_workspaces: Arc<Mutex<BTreeMap<RunId, crate::workspace::revision::ManagedWorkspace>>>,
 }
 
 impl RunExecutorConfig {
@@ -232,19 +224,12 @@ impl RunExecutorConfig {
             edit_workspace: None,
             process_registry: None,
             native_container_image: None,
-            verification_registry: crate::verify::profiles::VerificationRegistry::empty(),
-            native_formatter_descriptor: None,
-            native_formatter_required: false,
-            native_diagnostic_adapters: BTreeMap::new(),
-            native_feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
             native_edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                 .max_validation_time,
             native_approval_policy: NativeApprovalPolicy::default(),
             native_semantic_evidence:
                 crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default(),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
-            #[cfg(debug_assertions)]
-            native_check_completions: Vec::new(),
         }
     }
 
@@ -309,34 +294,6 @@ impl RunExecutorConfig {
         self
     }
 
-    pub fn with_verification_registry(
-        mut self,
-        registry: crate::verify::profiles::VerificationRegistry,
-    ) -> Self {
-        self.verification_registry = registry;
-        self
-    }
-
-    pub fn with_native_formatter(
-        mut self,
-        descriptor: crate::workspace::edit::format::FormatterDescriptor,
-        required: bool,
-    ) -> Self {
-        self.native_formatter_descriptor = Some(descriptor);
-        self.native_formatter_required = required;
-        self
-    }
-
-    pub fn with_native_feedback(
-        mut self,
-        adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-        limits: crate::verify::feedback::FeedbackLimits,
-    ) -> Self {
-        self.native_diagnostic_adapters = adapters;
-        self.native_feedback_limits = limits;
-        self
-    }
-
     pub fn with_native_edit_validation_time(mut self, timeout: Duration) -> Self {
         self.native_edit_validation_time = timeout;
         self
@@ -352,15 +309,6 @@ impl RunExecutorConfig {
         evidence: crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
     ) -> Self {
         self.native_semantic_evidence = evidence;
-        self
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn with_native_check_completions(
-        mut self,
-        completions: impl IntoIterator<Item = crate::executor::check::ConformanceCheck>,
-    ) -> Self {
-        self.native_check_completions = completions.into_iter().collect();
         self
     }
 
@@ -3069,7 +3017,7 @@ fn tool_adapter(
                 .all(|grant| snapshot.effective_authority().contains(grant))
         })
         .map(|(descriptor, constraints)| {
-            let binding = ToolBinding::new(
+            ToolBinding::new(
                 descriptor.spec().clone(),
                 descriptor.identity().clone(),
                 descriptor.normalized_schema().clone(),
@@ -3098,18 +3046,7 @@ fn tool_adapter(
                         _ => descriptor.approval(),
                     }
                 },
-            );
-            if descriptor.tool() == crate::capabilities::native::NativeTool::Check {
-                let registry = config.verification_registry.clone();
-                let grants = authenticated.grant_snapshot().clone();
-                let snapshot = snapshot.clone();
-                let descriptor = descriptor.clone();
-                binding.with_cost_estimator(move |input| {
-                    descriptor.estimate_reservation(input, &registry, &grants, &snapshot)
-                })
-            } else {
-                binding
-            }
+            )
         })
         .collect::<Vec<_>>();
     let discovery = config
@@ -3181,47 +3118,6 @@ fn tool_adapter(
         )
         .with_custody(config.secret_custody.clone())
     });
-    let check_runner = acquisition
-        .as_ref()
-        .zip(process_registration.as_ref())
-        .filter(|_| !config.verification_registry.is_empty())
-        .map(|(acquisition, registration)| {
-            #[cfg(debug_assertions)]
-            if !config.native_check_completions.is_empty() {
-                return crate::executor::check::CheckRunner::conformance(
-                    config.native_check_completions.clone(),
-                );
-            }
-            crate::executor::check::CheckRunner::registered_attempt_container(
-                job.attempt.owner,
-                SqliteCancellationCoordinator::new(&config.database),
-                crate::executor::cancel::WorkspaceIdentity::from_acquisition(
-                    workspace,
-                    acquisition,
-                ),
-                registration.clone(),
-            )
-        });
-    let formatter = config
-        .native_formatter_descriptor
-        .clone()
-        .zip(acquisition.as_ref())
-        .zip(process_registration.as_ref())
-        .map(|((descriptor, acquisition), registration)| {
-            crate::capabilities::native::dispatch::NativeFormatterRuntime {
-                descriptor,
-                executor:
-                    crate::executor::formatter::FormatterExecutor::registered_attempt_container(
-                        job.attempt.owner,
-                        SqliteCancellationCoordinator::new(&config.database),
-                        crate::executor::cancel::WorkspaceIdentity::from_acquisition(
-                            workspace,
-                            acquisition,
-                        ),
-                        registration.clone(),
-                    ),
-            }
-        });
     let mut syntax_executors = vec![
         crate::executor::syntax::SyntaxExecutor::production(
             "text",
@@ -3236,8 +3132,10 @@ fn tool_adapter(
             crate::workspace::edit::format::RUST_GRAMMAR_VERSION,
         ),
     ];
+    // Debug-only escape hatch for dogfood/daemon-lifecycle tests: KIT_FAKE_SYNTAX=pass
+    // swaps the production syntax executors for always-passing debug executors.
     #[cfg(debug_assertions)]
-    if !config.native_check_completions.is_empty() {
+    if std::env::var("KIT_FAKE_SYNTAX").as_deref() == Ok("pass") {
         syntax_executors = vec![
             crate::executor::syntax::SyntaxExecutor::debug(
                 "text",
@@ -3277,8 +3175,6 @@ fn tool_adapter(
             cancellation: SqliteCancellationCoordinator::new(&config.database),
             live_cancellation: Arc::clone(&live_cancellation),
             container_image: config.native_container_image.clone(),
-            verification_registry: config.verification_registry.clone(),
-            check_runner,
             acquisition_failure,
             custody: config.secret_custody.clone(),
             secrets: config
@@ -3288,15 +3184,6 @@ fn tool_adapter(
                 .map(|secret| SecretLease::new(secret.expose().to_vec()))
                 .collect(),
             syntax_executors,
-            formatter_required: config.native_formatter_required,
-            formatter,
-            feedback: Some(
-                crate::capabilities::native::dispatch::NativeFeedbackRuntime {
-                    database: config.database.clone(),
-                    adapters: config.native_diagnostic_adapters.clone(),
-                    limits: config.native_feedback_limits.clone(),
-                },
-            ),
             semantic_evidence: config.native_semantic_evidence.clone(),
             edit_validation_time: config.native_edit_validation_time,
             cursor_key,
@@ -4482,7 +4369,6 @@ pub enum FakeScenario {
     Complete,
     Tool,
     ToolInvalid,
-    ToolInvalidCheck,
     ReactiveInjection,
     DeferredMcp,
     NativeCoding,
@@ -4849,16 +4735,6 @@ impl ModelSession for FakeSession {
                         serde_json::json!({}),
                     )?
                 }
-                FakeScenario::ToolInvalidCheck
-                    if !transcript.iter().any(|item| item.kind == ItemKind::Tool) =>
-                {
-                    FakeTurn::tool_request(
-                        response,
-                        correlation.as_ref(),
-                        "kit_check",
-                        serde_json::json!({}),
-                    )?
-                }
                 FakeScenario::ReactiveInjection if injected && completed_tools == 0 => {
                     FakeTurn::tool_request(
                         response,
@@ -4879,7 +4755,7 @@ impl ModelSession for FakeSession {
                     completed_tools,
                     transcript,
                 )?,
-                FakeScenario::NativeCoding if completed_tools < 6 => FakeTurn::native_coding_tool(
+                FakeScenario::NativeCoding if completed_tools < 5 => FakeTurn::native_coding_tool(
                     response,
                     correlation.as_ref(),
                     native_revision.as_deref(),
@@ -5149,10 +5025,6 @@ impl FakeTurn {
                 )
             }
             4 => (
-                "kit_check",
-                serde_json::json!({"profile":"fast","targets":[]}),
-            ),
-            5 => (
                 "kit_run",
                 serde_json::json!({
                     "argv":["cargo","metadata","--no-deps","--format-version","1"],

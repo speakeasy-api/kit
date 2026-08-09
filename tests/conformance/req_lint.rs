@@ -388,7 +388,10 @@ fn req_lint_rejects_mutated_source_revision() {
     let start = original
         .find("source_revision: ")
         .expect("inventory records a source_revision");
-    let end = start + original[start..].find('\n').expect("source_revision line ends");
+    let end = start
+        + original[start..]
+            .find('\n')
+            .expect("source_revision line ends");
     fs::write(
         &inventory,
         format!(

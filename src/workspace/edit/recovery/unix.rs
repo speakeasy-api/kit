@@ -18,7 +18,7 @@ use crate::{
         edit::{
             diff::{DiffSide, FileSide, write_file_diff},
             ir::RootRelativePath,
-            stage::{StageChange, StagedOperation, VerifiedStagedEdit},
+            stage::{StageChange, StagedEdit, StagedOperation},
         },
         revision::{RevisionError, RevisionId},
     },
@@ -70,7 +70,6 @@ struct Manifest {
     expected_final_digest: String,
     principal: String,
     project: String,
-    verification: crate::verify::profiles::VerificationReceipt,
     diff_reference: String,
     diff_artifact: String,
     diff_bytes: u64,
@@ -82,7 +81,6 @@ struct Manifest {
     artifact_store_path: String,
     artifact_store: ObjectIdentity,
     diff_lease: String,
-    verification_leases: Vec<RecoveryArtifactLease>,
     diff_owner_referenced: bool,
     state: ManifestState,
     workspace: ObjectIdentity,
@@ -117,15 +115,7 @@ struct Ledger {
     diff_reference: Option<String>,
     diff_artifact: Option<String>,
     diff_lease: Option<String>,
-    verification_leases: Vec<RecoveryArtifactLease>,
     cleanup_intents: Vec<CleanupIntent>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryArtifactLease {
-    digest: String,
-    lease: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -241,7 +231,7 @@ fn pause_test_race(window: TestRaceWindow) {
 }
 
 pub fn materialize(
-    staged: VerifiedStagedEdit<'_>,
+    staged: StagedEdit<'_>,
     artifacts: &ArtifactStore,
     options: MaterializeOptions,
 ) -> Result<MaterializedEdit, RecoveryError> {
@@ -250,12 +240,11 @@ pub fn materialize(
 }
 
 pub fn materialize_with_hook(
-    staged: VerifiedStagedEdit<'_>,
+    mut staged: StagedEdit<'_>,
     artifacts: &ArtifactStore,
     options: MaterializeOptions,
     hook: RecoveryHook<'_>,
 ) -> Result<MaterializedEdit, RecoveryError> {
-    let (mut staged, verification) = staged.into_parts();
     if staged.changes().is_empty() {
         return Err(RecoveryError::InvalidOptions);
     }
@@ -280,10 +269,6 @@ pub fn materialize_with_hook(
     let authority = staged.authority().ok_or(RecoveryError::InvalidOptions)?;
     let principal = authority.principal().to_string();
     let project = authority.project().to_string();
-    verification
-        .validate_artifacts(artifacts, &principal, &project)
-        .map_err(|_| RecoveryError::CorruptManifest)?;
-    let verification_digests = verification_artifact_digests(artifacts, &verification)?;
     let stored_at = artifacts::now_unix_micros()?;
     let retention = minimum_retention(options.retention, stored_at)?;
     let artifact_metadata = ArtifactMetadata::new(
@@ -346,7 +331,6 @@ pub fn materialize_with_hook(
         diff_reference: None,
         diff_artifact: None,
         diff_lease: None,
-        verification_leases: Vec::new(),
         cleanup_intents: ["transaction", "manifest", "ledger"]
             .into_iter()
             .map(|key| cleanup_intent(&nonce, key, &object_identity_digest(&workspace_identity)))
@@ -358,22 +342,6 @@ pub fn materialize_with_hook(
     replace_ledger(&state_root, &ledger)?;
     system_crash(RecoveryPoint::TransactionBind, 0);
     let transaction_root = open_named_directory(&state_root, &transaction_directory.name)?;
-    ledger.verification_leases = verification_digests
-        .iter()
-        .map(|digest| RecoveryArtifactLease {
-            digest: digest.to_string(),
-            lease: verification_lease_id(&ledger.nonce, &ledger.workspace, *digest),
-        })
-        .collect();
-    replace_ledger(&state_root, &ledger)?;
-    for lease in &ledger.verification_leases {
-        artifacts.acquire_lease_with_id_before(
-            artifacts::ArtifactDigest::parse(&lease.digest)?,
-            &lease.lease,
-            &transaction,
-            deadline,
-        )?;
-    }
     let prepared_data = (|| {
         let move_peers = move_peers(&operations);
         let actions = build_actions(
@@ -427,12 +395,6 @@ pub fn materialize_with_hook(
         Ok(prepared) => prepared,
         Err(error) => {
             remove_private_transaction(&state_root, &transaction_directory, deadline)?;
-            release_verification_leases(
-                artifacts,
-                &ledger.verification_leases,
-                &ledger.transaction,
-                deadline,
-            )?;
             remove_ledger(&state_root, deadline)?;
             return Err(error);
         }
@@ -486,7 +448,6 @@ pub fn materialize_with_hook(
         expected_final_digest: final_digest,
         principal,
         project,
-        verification: verification.clone(),
         diff_reference: diff_reference.to_string(),
         diff_artifact: diff_digest.to_string(),
         diff_bytes: diff.bytes,
@@ -501,7 +462,6 @@ pub fn materialize_with_hook(
         artifact_store_path,
         artifact_store: artifact_store_identity,
         diff_lease: lease.id().to_owned(),
-        verification_leases: ledger.verification_leases.clone(),
         diff_owner_referenced: false,
         state: ManifestState::Staged,
         workspace: ledger.workspace.clone(),
@@ -658,7 +618,6 @@ pub fn materialize_with_hook(
         preview,
         change_diff,
         change_diff_complete,
-        verification,
     );
     if cancelled(&options) {
         result.mark_cancel_race();
@@ -756,7 +715,6 @@ pub(crate) fn recover_pending(
         || ledger.diff_reference.as_deref() != Some(manifest.diff_reference.as_str())
         || ledger.diff_artifact.as_deref() != Some(manifest.diff_artifact.as_str())
         || ledger.diff_lease.as_deref() != Some(manifest.diff_lease.as_str())
-        || ledger.verification_leases != manifest.verification_leases
     {
         return Err(RecoveryError::CorruptManifest);
     }
@@ -774,11 +732,6 @@ pub(crate) fn recover_pending(
         &manifest.artifact_store,
         &mut resolve_artifacts,
     )?;
-    manifest
-        .verification
-        .validate_artifacts(&artifacts, &manifest.principal, &manifest.project)
-        .map_err(|_| RecoveryError::CorruptManifest)?;
-    validate_verification_leases(&artifacts, &manifest)?;
     let digest = artifacts::ArtifactDigest::parse(&manifest.diff_artifact)?;
     let owner = diff_reference_owner(&manifest)?;
     if manifest.diff_owner_referenced {
@@ -1667,12 +1620,6 @@ fn cleanup(
     if !committed {
         release_manifest_lease(artifacts, manifest, deadline)?;
     }
-    release_verification_leases(
-        artifacts,
-        &manifest.verification_leases,
-        &manifest.transaction,
-        deadline,
-    )?;
     let mut ledger = read_ledger(state_root)?.ok_or(RecoveryError::CorruptManifest)?;
     ledger.final_state = true;
     replace_ledger(state_root, &ledger)?;
@@ -2220,17 +2167,11 @@ fn release_ledger_lease(
     resolve: &mut impl FnMut(&std::path::Path) -> Result<ArtifactStore, artifacts::ArtifactError>,
     deadline: Instant,
 ) -> Result<(), RecoveryError> {
-    if ledger.diff_artifact.is_none() && ledger.verification_leases.is_empty() {
+    if ledger.diff_artifact.is_none() {
         return Ok(());
     }
     let store =
         resolve_recovery_artifacts(&ledger.artifact_store_path, &ledger.artifact_store, resolve)?;
-    release_verification_leases(
-        &store,
-        &ledger.verification_leases,
-        &ledger.transaction,
-        deadline,
-    )?;
     if let (Some(digest), Some(lease)) = (&ledger.diff_artifact, &ledger.diff_lease) {
         let digest = artifacts::ArtifactDigest::parse(digest)?;
         store.release_lease_with_id_before(digest, lease, &ledger.transaction, deadline)?;
@@ -2246,87 +2187,6 @@ fn transaction_lease_id(ledger: &Ledger) -> String {
     hasher.update(&ledger.workspace.inode.to_le_bytes());
     hasher.update(ledger.workspace.mount.as_bytes());
     hasher.finalize().to_hex()[..32].to_owned()
-}
-
-fn verification_lease_id(
-    nonce: &str,
-    workspace: &ObjectIdentity,
-    digest: artifacts::ArtifactDigest,
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kit-edit-verification-artifact-lease-v1\0");
-    hasher.update(nonce.as_bytes());
-    hasher.update(&workspace.device.to_le_bytes());
-    hasher.update(&workspace.inode.to_le_bytes());
-    hasher.update(workspace.mount.as_bytes());
-    hasher.update(&digest.as_bytes());
-    hasher.finalize().to_hex()[..32].to_owned()
-}
-
-fn verification_artifact_digests(
-    artifacts: &ArtifactStore,
-    receipt: &crate::verify::profiles::VerificationReceipt,
-) -> Result<Vec<artifacts::ArtifactDigest>, RecoveryError> {
-    let mut references = vec![receipt.result_artifact.reference.as_str()];
-    references.extend(
-        receipt
-            .stdout_artifacts
-            .iter()
-            .chain(&receipt.stderr_artifacts)
-            .map(|artifact| artifact.reference.as_str()),
-    );
-    references.extend(receipt.process_artifacts.iter().filter_map(|artifact| {
-        if let crate::verify::profiles::VerificationProcessReference::Report { reference, .. } =
-            artifact
-        {
-            Some(reference.as_str())
-        } else {
-            None
-        }
-    }));
-    let mut digests = BTreeSet::new();
-    for reference in references {
-        let reference = artifacts::ArtifactReference::parse(reference)?;
-        digests.insert(artifacts.open_reference(reference)?.digest());
-    }
-    Ok(digests.into_iter().collect())
-}
-
-fn release_verification_leases(
-    artifacts: &ArtifactStore,
-    leases: &[RecoveryArtifactLease],
-    transaction: &str,
-    deadline: Instant,
-) -> Result<(), RecoveryError> {
-    for lease in leases {
-        artifacts.release_lease_with_id_before(
-            artifacts::ArtifactDigest::parse(&lease.digest)?,
-            &lease.lease,
-            transaction,
-            deadline,
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_verification_leases(
-    artifacts: &ArtifactStore,
-    manifest: &Manifest,
-) -> Result<(), RecoveryError> {
-    let expected = verification_artifact_digests(artifacts, &manifest.verification)?;
-    if manifest.verification_leases.len() != expected.len() {
-        return Err(RecoveryError::CorruptManifest);
-    }
-    for (lease, expected_digest) in manifest.verification_leases.iter().zip(expected) {
-        let digest = artifacts::ArtifactDigest::parse(&lease.digest)?;
-        if digest != expected_digest
-            || lease.lease != verification_lease_id(&manifest.nonce, &manifest.workspace, digest)
-        {
-            return Err(RecoveryError::CorruptManifest);
-        }
-        artifacts.open_lease(digest, &lease.lease, &manifest.transaction)?;
-    }
-    Ok(())
 }
 
 fn manifest_lease(
@@ -2732,11 +2592,6 @@ fn validate_manifest(
         || !valid_digest(&manifest.expected_final_digest)
         || !valid_digest(&manifest.diff_artifact)
         || artifacts::ArtifactReference::parse(&manifest.diff_reference).is_err()
-        || !valid_verification_leases(
-            &manifest.verification_leases,
-            &manifest.nonce,
-            &manifest.workspace,
-        )
     {
         return Err(RecoveryError::CorruptManifest);
     }
@@ -2878,11 +2733,6 @@ fn validate_ledger(
             .diff_lease
             .as_deref()
             .is_some_and(|lease| lease != transaction_lease_id(ledger))
-        || !valid_verification_leases(
-            &ledger.verification_leases,
-            &ledger.nonce,
-            &ledger.workspace,
-        )
         || !valid_cleanup_intents(
             &ledger.cleanup_intents,
             &ledger.nonce,
@@ -3021,26 +2871,6 @@ fn valid_hex_string(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn valid_verification_leases(
-    leases: &[RecoveryArtifactLease],
-    nonce: &str,
-    workspace: &ObjectIdentity,
-) -> bool {
-    let mut previous = None;
-    for lease in leases {
-        let Ok(digest) = artifacts::ArtifactDigest::parse(&lease.digest) else {
-            return false;
-        };
-        if previous.is_some_and(|previous| previous >= digest)
-            || lease.lease != verification_lease_id(nonce, workspace, digest)
-        {
-            return false;
-        }
-        previous = Some(digest);
-    }
-    true
 }
 
 fn valid_cleanup_intents(

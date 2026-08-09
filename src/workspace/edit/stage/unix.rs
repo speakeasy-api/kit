@@ -11,32 +11,19 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use sha2::{Digest as _, Sha256};
 
-use super::{
-    StageError, StageLimit, StageLimits, StagedOperation, SyntaxRequirements, capture, change,
-};
+use super::{StageError, StageLimit, StageLimits, StagedOperation, SyntaxRequirements, change};
 use crate::{
-    executor::{
-        formatter::{
-            FormatterBudget, FormatterBudgetCharge, FormatterCompletion, FormatterExecutor,
-            FormatterExecutorError, FormatterStatus, FormatterWriteRule, FormatterWriteScope,
-        },
-        overlay::ChangeKind,
-        profile::{
-            Architecture, ExecutorProfile, MountAccess, MountRole, Platform, ProfileSpec,
-            ResourceLimits, SourceWriteMode, TrustTier,
-        },
-        syntax::{SyntaxExecutor, SyntaxExecutorError},
-    },
+    executor::syntax::{SyntaxExecutor, SyntaxExecutorError},
     workspace::{
         edit::{
             format::{
-                FormatterDescriptor, NATIVE_JSON_VERSION, NATIVE_TEXT_VERSION,
-                RUST_GRAMMAR_VERSION, SyntaxRequest, SyntaxRequirement, SyntaxStatus, safe_text,
+                NATIVE_JSON_VERSION, NATIVE_TEXT_VERSION, RUST_GRAMMAR_VERSION, SyntaxRequest,
+                SyntaxRequirement, SyntaxStatus,
             },
             ir::RootRelativePath,
             validate::{
@@ -67,8 +54,6 @@ pub struct StagedEdit<'workspace> {
     changes: Vec<super::StageChange>,
     operations: Vec<StagedOperation>,
     expected_change_diff_digest: Option<String>,
-    feedback_mapping: crate::verify::feedback::EditMapping,
-    formatter: Option<super::FormatterCapture>,
     final_snapshot: Snapshot,
     limits: StageLimits,
     authority: Option<AuthenticatedEditAuthority>,
@@ -76,81 +61,6 @@ pub struct StagedEdit<'workspace> {
 }
 
 impl<'workspace> StagedEdit<'workspace> {
-    pub fn verify(
-        mut self,
-        request: crate::verify::profiles::VerificationRequest<'_>,
-    ) -> Result<super::VerificationOutcome<'workspace>, crate::verify::profiles::VerificationError>
-    {
-        let deadline = Instant::now()
-            .checked_add(self.limits.max_time)
-            .ok_or(crate::verify::profiles::VerificationError::StaleBinding)?;
-        self._guard
-            .validate_held_revision_until(self.revision, deadline)
-            .map_err(|_| crate::verify::profiles::VerificationError::StaleBinding)?;
-        let root = stat_file(&self.allocation.final_view)
-            .map_err(|_| crate::verify::profiles::VerificationError::StaleBinding)?;
-        let root_identity = format!("{}:{}", root.device, root.inode);
-        let changes_digest = changes_digest(&self.changes, &self.feedback_mapping);
-        let syntax_evidence_digest =
-            syntax_evidence_digest(&self.state_digest, &self.evidence_digest);
-        let revision = self._guard.revision();
-        let revision_id = revision.id().to_string();
-        let epoch = revision.epoch().to_string();
-        let revision_digest = revision.digest().to_string();
-        let authority = self.authority;
-        let principal = authority
-            .map(|value| value.principal().to_string())
-            .unwrap_or_default();
-        let project = authority
-            .map(|value| value.project().to_string())
-            .unwrap_or_default();
-        let result = crate::verify::profiles::verify_precommit(
-            crate::verify::profiles::StagedVerificationInput {
-                revision: &revision_id,
-                epoch: &epoch,
-                revision_digest: &revision_digest,
-                guard_binding: &self._binding,
-                root_identity: &root_identity,
-                plan_digest: &self.plan_digest,
-                state_digest: &self.state_digest,
-                evidence_digest: &self.evidence_digest,
-                changes_digest: &changes_digest,
-                syntax_evidence_digest: &syntax_evidence_digest,
-                changed_paths: self
-                    .changes
-                    .iter()
-                    .map(|change| change.path().as_str().to_owned())
-                    .collect(),
-                immutable_source: &self.allocation.final_path,
-                build: &self.allocation.build_path,
-                temp: &self.allocation.temp_path,
-                authority_principal: &principal,
-                authority_project: &project,
-                more_boundaries_after: false,
-            },
-            request,
-        )?;
-        let receipt = result.receipt();
-        if result.decision() != crate::verify::profiles::CommitDecision::Commit
-            || !result.quiescent()
-        {
-            return Ok(super::VerificationOutcome::Abort(
-                super::AbortedStagedEdit {
-                    staged: self,
-                    verification: result,
-                    receipt,
-                },
-            ));
-        }
-        Ok(super::VerificationOutcome::Commit(
-            super::VerifiedStagedEdit {
-                staged: self,
-                verification: result,
-                receipt,
-            },
-        ))
-    }
-
     pub fn revision(&self) -> RevisionId {
         self.revision
     }
@@ -187,10 +97,6 @@ impl<'workspace> StagedEdit<'workspace> {
         self.expected_change_diff_digest.as_deref()
     }
 
-    pub(crate) fn feedback_mapping(&self) -> &crate::verify::feedback::EditMapping {
-        &self.feedback_mapping
-    }
-
     pub(crate) fn final_root(&self) -> &File {
         &self.allocation.final_view
     }
@@ -221,10 +127,6 @@ impl<'workspace> StagedEdit<'workspace> {
 
     pub fn changes(&self) -> &[super::StageChange] {
         &self.changes
-    }
-
-    pub fn formatter(&self) -> Option<&super::FormatterCapture> {
-        self.formatter.as_ref()
     }
 
     pub fn read_file(
@@ -289,7 +191,6 @@ pub fn stage<'workspace>(
     limits: StageLimits,
     syntax: SyntaxRequirements<'_>,
     syntax_executors: &mut [&mut SyntaxExecutor],
-    formatter: Option<(&FormatterDescriptor, &mut FormatterExecutor)>,
 ) -> Result<StagedEdit<'workspace>, StageError> {
     validate_limits(limits)?;
     let deadline = Instant::now()
@@ -316,7 +217,6 @@ pub fn stage<'workspace>(
         &allocation.root,
         &mut stage_fence,
         false,
-        false,
     )?;
     stage_fence
         .reset_after_verified_read()
@@ -328,7 +228,6 @@ pub fn stage<'workspace>(
         &allocation.root_path,
         &allocation.root,
         &mut stage_fence,
-        false,
         false,
     )?;
     stage_fence
@@ -343,7 +242,6 @@ pub fn stage<'workspace>(
         &allocation.root_path,
         &allocation.root,
         &mut stage_fence,
-        false,
         false,
     )?;
     stage_fence
@@ -372,148 +270,8 @@ pub fn stage<'workspace>(
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
 
-    let mut logical_formatted = None;
-    let formatter_capture = if let Some((descriptor, runner)) = formatter {
-        validate_formatter_files(descriptor, &plan.changed_files, &current)?;
-        copy_tree(&allocation.view, &allocation.formatter_source, &mut budget)?;
-        copy_tree(&allocation.view, &allocation.overlay, &mut budget)?;
-        set_mode(&allocation.formatter_source, 0o500)?;
-        let text_styles =
-            formatter_text_styles(&allocation.overlay, descriptor, limits, &mut budget)?;
-        let profile = formatter_profile(limits, deadline)?;
-        let scope = formatter_write_scope(&current, descriptor)?;
-        let completion = runner
-            .execute(
-                descriptor,
-                &profile,
-                &scope,
-                &allocation.formatter_source,
-                &allocation.overlay,
-                &allocation.build,
-                &allocation.temp,
-                &allocation.formatter_source_path,
-                &allocation.overlay_path,
-                &allocation.build_path,
-                &allocation.temp_path,
-                limits.max_entries,
-                limits.max_file_bytes,
-                limits.max_total_bytes,
-                limits.max_formatter_output_bytes,
-                deadline,
-                &mut stage_fence,
-                &mut budget,
-            )
-            .map_err(|error| match error {
-                FormatterExecutorError::Unavailable => StageError::FormatterUnavailable,
-                FormatterExecutorError::Rejected => StageError::FormatterRejected,
-                FormatterExecutorError::Timeout => {
-                    StageError::FormatterTimeout(Box::new(capture_empty(descriptor)))
-                }
-                FormatterExecutorError::OutputLimit => {
-                    StageError::LimitExceeded(StageLimit::FormatterOutput)
-                }
-                FormatterExecutorError::Budget(charge) => StageError::LimitExceeded(match charge {
-                    FormatterBudgetCharge::Entries => StageLimit::Entries,
-                    FormatterBudgetCharge::Bytes => StageLimit::TotalBytes,
-                    FormatterBudgetCharge::NameBytes => StageLimit::NameBytes,
-                    FormatterBudgetCharge::PathBytes => StageLimit::PathBytes,
-                    FormatterBudgetCharge::MetadataMemory => StageLimit::MetadataMemory,
-                }),
-                FormatterExecutorError::NotQuiescent => StageError::FormatterNotQuiescent,
-                FormatterExecutorError::Undeclared(path) => {
-                    StageError::FormatterUndeclaredChange(path)
-                }
-                FormatterExecutorError::UnsafeOverlay => StageError::FormatterUnsafeChange,
-            })?;
-        let output_bytes = completion
-            .stdout_length()
-            .checked_add(completion.stderr_length())
-            .ok_or(StageError::LimitExceeded(StageLimit::FormatterOutput))?;
-        if output_bytes > limits.max_formatter_output_bytes as u64 {
-            return Err(StageError::LimitExceeded(StageLimit::FormatterOutput));
-        }
-        budget.metadata(
-            completion
-                .stdout()
-                .len()
-                .checked_add(completion.stderr().len())
-                .ok_or(StageError::LimitExceeded(StageLimit::FormatterOutput))?,
-        )?;
-        let recorded = capture(
-            descriptor.id(),
-            descriptor.version(),
-            completion.status(),
-            completion.stdout().to_vec(),
-            completion.stderr().to_vec(),
-            completion.stdout_length(),
-            completion.stdout_digest().to_owned(),
-            completion.stderr_length(),
-            completion.stderr_digest().to_owned(),
-            completion.output_attestation().to_owned(),
-            completion.elapsed(),
-            completion.overlay_digest().to_owned(),
-            completion.process().clone(),
-            completion.process().formatter_binary_digest().to_owned(),
-            completion.process().formatter_config_digest().to_owned(),
-            profile.digest().to_string(),
-            scope.digest().to_owned(),
-        );
-        if !completion.process().quiescent() {
-            return Err(StageError::FormatterNotQuiescent);
-        }
-        if completion.elapsed() > limits.max_time {
-            return Err(StageError::FormatterTimeout(Box::new(recorded)));
-        }
-        match completion.status() {
-            FormatterStatus::Success => {}
-            FormatterStatus::Timeout => {
-                return Err(StageError::FormatterTimeout(Box::new(recorded)));
-            }
-            FormatterStatus::Exit(_) => {
-                return Err(StageError::FormatterFailed(Box::new(recorded)));
-            }
-        }
-        check_deadline(deadline)?;
-        watch_stage_tree(
-            &allocation.root_path,
-            &allocation.root,
-            &mut stage_fence,
-            true,
-            false,
-        )?;
-        let mut formatted =
-            snapshot_tree(&allocation.overlay, &mut budget).map_err(|error| match error {
-                StageError::UnsafeSource => StageError::FormatterUnsafeChange,
-                other => other,
-            })?;
-        restore_logical_modes(&mut formatted, &current)?;
-        validate_executor_attestation(&current, &formatted, &scope, &completion)?;
-        validate_formatter_diff(&current, &formatted, descriptor)?;
-        validate_formatter_outputs(
-            &allocation.overlay,
-            descriptor,
-            &text_styles,
-            limits,
-            &mut budget,
-        )?;
-        stage_fence
-            .ensure_clean()
-            .map_err(|_| StageError::StageChanged)?;
-        logical_formatted = Some(formatted);
-        Some(recorded)
-    } else {
-        None
-    };
-
-    let final_source = if formatter_capture.is_some() {
-        &allocation.overlay
-    } else {
-        &allocation.view
-    };
-    let expected_final = match logical_formatted {
-        Some(snapshot) => snapshot,
-        None => snapshot_tree(final_source, &mut budget)?,
-    };
+    let final_source = &allocation.view;
+    let expected_final = snapshot_tree(final_source, &mut budget)?;
     stage_fence
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
@@ -524,7 +282,6 @@ pub fn stage<'workspace>(
         &allocation.root_path,
         &allocation.root,
         &mut stage_fence,
-        true,
         true,
     )?;
     verify_frozen_tree(&allocation.final_view, &expected_final, &mut budget)?;
@@ -557,40 +314,12 @@ pub fn stage<'workspace>(
         &plan,
         &current,
         &changes,
-        formatter_capture.as_ref(),
         &syntax_digest_requirements,
         limits,
     );
-    let evidence_digest = stage_evidence_digest(&state_digest, formatter_capture.as_ref());
+    let evidence_digest = stage_evidence_digest(&state_digest);
     let workspace_digest = workspace_content_digest(&allocation.final_view, &current, deadline)?;
     let operations = staged_operations(&plan.effects);
-    let feedback_mapping =
-        crate::verify::feedback::EditMapping::from_effects(&plan.effects, |path| {
-            let Some(expected) = current.entries.get(Path::new(path.as_str())) else {
-                return Ok(None);
-            };
-            let file = open_relative_file(&allocation.final_view, path, libc::O_RDONLY)
-                .map_err(|_| crate::verify::feedback::FeedbackError::InvalidMapping)?;
-            let before = stat_file(&file)
-                .map_err(|_| crate::verify::feedback::FeedbackError::InvalidMapping)?;
-            if expected.kind != Kind::File
-                || before.kind() != libc::S_IFREG as u32
-                || before.links != 1
-                || !supported_metadata(&file, before)
-                || before.mode & 0o777 != 0o400
-                || before.size != expected.size
-                || before.size > limits.max_file_bytes as u64
-            {
-                return Err(crate::verify::feedback::FeedbackError::InvalidMapping);
-            }
-            let bytes = read_file_checked(file, before, limits.max_file_bytes, deadline)
-                .map_err(|_| crate::verify::feedback::FeedbackError::InvalidMapping)?;
-            if expected.digest != *blake3::hash(&bytes).as_bytes() {
-                return Err(crate::verify::feedback::FeedbackError::InvalidMapping);
-            }
-            Ok(Some(bytes))
-        })
-        .map_err(|_| StageError::PlanMismatch)?;
     verify_quiescent_tree(
         &allocation.final_view,
         &final_baseline,
@@ -611,8 +340,6 @@ pub fn stage<'workspace>(
         changes,
         operations,
         expected_change_diff_digest: plan.expected_change_diff_digest,
-        feedback_mapping,
-        formatter: formatter_capture,
         final_snapshot: current,
         limits,
         authority: plan.authority,
@@ -677,8 +404,8 @@ fn validate_limits(limits: StageLimits) -> Result<(), StageError> {
     if limits.max_file_bytes == 0 {
         return Err(StageError::LimitExceeded(StageLimit::FileBytes));
     }
-    if limits.max_formatter_output_bytes == 0 {
-        return Err(StageError::LimitExceeded(StageLimit::FormatterOutput));
+    if limits.max_syntax_output_bytes == 0 {
+        return Err(StageError::LimitExceeded(StageLimit::SyntaxOutput));
     }
     if limits.max_name_bytes == 0 {
         return Err(StageError::LimitExceeded(StageLimit::NameBytes));
@@ -857,7 +584,7 @@ fn run_syntax(
             match executor.execute(
                 SyntaxRequest::new(requirement.path(), &source),
                 limits.max_metadata_bytes,
-                limits.max_formatter_output_bytes,
+                limits.max_syntax_output_bytes,
                 deadline,
             ) {
                 Ok(completion)
@@ -962,21 +689,6 @@ fn derive_syntax_requirements(
     Ok(derived)
 }
 
-fn validate_formatter_files(
-    descriptor: &FormatterDescriptor,
-    changed_files: &[RootRelativePath],
-    snapshot: &Snapshot,
-) -> Result<(), StageError> {
-    for path in descriptor.files() {
-        if changed_files.binary_search(path).is_err()
-            || !matches!(snapshot.entries.get(Path::new(path.as_str())), Some(state) if state.kind == Kind::File)
-        {
-            return Err(StageError::PlanMismatch);
-        }
-    }
-    Ok(())
-}
-
 fn verify_expected_paths(
     root: &File,
     expected: &[ExpectedPath],
@@ -1017,104 +729,6 @@ fn verify_expected_paths(
     Ok(())
 }
 
-fn formatter_write_scope(
-    snapshot: &Snapshot,
-    descriptor: &FormatterDescriptor,
-) -> Result<FormatterWriteScope, StageError> {
-    let mut rules = Vec::new();
-    rules
-        .try_reserve(descriptor.files().len())
-        .map_err(|_| StageError::LimitExceeded(StageLimit::Entries))?;
-    for path in descriptor.files() {
-        let state = snapshot
-            .entries
-            .get(Path::new(path.as_str()))
-            .ok_or(StageError::PlanMismatch)?;
-        rules.push(
-            FormatterWriteRule::new(
-                path.clone(),
-                state.digest_string(),
-                state.mode,
-                BTreeSet::from([ChangeKind::Modify]),
-            )
-            .map_err(|_| StageError::FormatterRejected)?,
-        );
-    }
-    FormatterWriteScope::new(rules).map_err(|_| StageError::FormatterRejected)
-}
-
-fn validate_executor_attestation(
-    before: &Snapshot,
-    after: &Snapshot,
-    scope: &FormatterWriteScope,
-    completion: &FormatterCompletion,
-) -> Result<(), StageError> {
-    let attestation = completion.attested_diff();
-    if attestation.scope_digest() != scope.digest()
-        || attestation.base_tree_digest() != artifact_snapshot_digest(before)
-        || attestation.result_tree_digest() != artifact_snapshot_digest(after)
-    {
-        return Err(StageError::FormatterUnsafeChange);
-    }
-    let actual = differing_paths(before, after);
-    if actual.len() != attestation.changes().len() {
-        return Err(StageError::FormatterUnsafeChange);
-    }
-    for (path, artifact) in actual.iter().zip(attestation.changes()) {
-        if Path::new(artifact.path().as_str()) != path {
-            return Err(StageError::FormatterUnsafeChange);
-        }
-        let old = before.entries.get(path);
-        let new = after.entries.get(path);
-        let kind = match (old, new) {
-            (None, Some(_)) => ChangeKind::Add,
-            (Some(_), None) => ChangeKind::Delete,
-            (Some(_), Some(_)) => ChangeKind::Modify,
-            (None, None) => unreachable!(),
-        };
-        if artifact.kind() != kind
-            || artifact.base_digest() != old.map(FileState::digest_string).as_deref()
-            || artifact.base_mode() != old.map(|state| state.mode)
-            || artifact.result_digest() != new.map(FileState::digest_string).as_deref()
-            || artifact.result_mode() != new.map(|state| state.mode)
-        {
-            return Err(StageError::FormatterUnsafeChange);
-        }
-    }
-    Ok(())
-}
-
-fn artifact_snapshot_digest(snapshot: &Snapshot) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kit-formatter-artifact-tree-v1");
-    for (path, state) in &snapshot.entries {
-        if state.kind != Kind::File {
-            continue;
-        }
-        frame(&mut hasher, path.as_os_str().as_encoded_bytes());
-        frame(&mut hasher, state.digest_string().as_bytes());
-        hasher.update(&state.mode.to_le_bytes());
-    }
-    format!("blake3:{}", hasher.finalize().to_hex())
-}
-
-fn restore_logical_modes(sealed: &mut Snapshot, base: &Snapshot) -> Result<(), StageError> {
-    if sealed.entries.len() != base.entries.len() {
-        return Err(StageError::FormatterUnsafeChange);
-    }
-    for (path, state) in &mut sealed.entries {
-        let expected = base
-            .entries
-            .get(path)
-            .ok_or(StageError::FormatterUnsafeChange)?;
-        if state.kind != expected.kind {
-            return Err(StageError::FormatterUnsafeChange);
-        }
-        state.mode = expected.mode;
-    }
-    Ok(())
-}
-
 fn snapshot_digest(snapshot: &Snapshot) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kit-stage-tree-v2");
@@ -1130,130 +744,6 @@ fn snapshot_digest(snapshot: &Snapshot) -> String {
         hasher.update(&state.digest);
     }
     format!("blake3:{}", hasher.finalize().to_hex())
-}
-
-fn capture_empty(descriptor: &FormatterDescriptor) -> super::FormatterCapture {
-    capture(
-        descriptor.id(),
-        descriptor.version(),
-        FormatterStatus::Timeout,
-        Vec::new(),
-        Vec::new(),
-        0,
-        digest_bytes(b""),
-        0,
-        digest_bytes(b""),
-        digest_bytes(b"unavailable-output-attestation"),
-        Duration::ZERO,
-        digest_bytes(b"unavailable-overlay"),
-        crate::executor::formatter::FormatterProcessEvidence::unavailable(),
-        "unavailable".to_owned(),
-        "unavailable".to_owned(),
-        "unavailable".to_owned(),
-        "unavailable".to_owned(),
-    )
-}
-
-fn digest_bytes(bytes: &[u8]) -> String {
-    format!("blake3:{}", blake3::hash(bytes).to_hex())
-}
-
-fn validate_formatter_diff(
-    before: &Snapshot,
-    after: &Snapshot,
-    descriptor: &FormatterDescriptor,
-) -> Result<(), StageError> {
-    let declared: BTreeSet<&Path> = descriptor
-        .files()
-        .iter()
-        .map(|path| Path::new(path.as_str()))
-        .collect();
-    for path in differing_paths(before, after) {
-        let Some(value) = path.to_str() else {
-            return Err(StageError::FormatterUnsafeChange);
-        };
-        if !declared.contains(path.as_path()) {
-            let path = RootRelativePath::parse(value, usize::MAX)
-                .map_err(|_| StageError::FormatterUnsafeChange)?;
-            return Err(StageError::FormatterUndeclaredChange(path));
-        }
-        let (Some(old), Some(new)) = (before.entries.get(&path), after.entries.get(&path)) else {
-            return Err(StageError::FormatterUnsafeChange);
-        };
-        if old.kind != Kind::File || new.kind != Kind::File || old.mode != new.mode {
-            return Err(StageError::FormatterUnsafeChange);
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum NewlineStyle {
-    None,
-    Lf,
-    Crlf,
-}
-
-fn formatter_text_styles(
-    root: &File,
-    descriptor: &FormatterDescriptor,
-    limits: StageLimits,
-    budget: &mut Budget,
-) -> Result<BTreeMap<RootRelativePath, NewlineStyle>, StageError> {
-    descriptor
-        .files()
-        .iter()
-        .map(|path| {
-            let file = open_relative_file(root, path, libc::O_RDONLY)?;
-            let state = stat_file(&file).map_err(|_| StageError::StageChanged)?;
-            budget.file(state.size)?;
-            budget.metadata(
-                usize::try_from(state.size)
-                    .map_err(|_| StageError::LimitExceeded(StageLimit::MetadataMemory))?,
-            )?;
-            let source = read_relative(root, path, limits.max_file_bytes, budget.deadline)
-                .map_err(|_| StageError::FormatterUnsafeChange)?;
-            let style = newline_style(&source).ok_or(StageError::FormatterUnsafeChange)?;
-            Ok((path.clone(), style))
-        })
-        .collect()
-}
-
-fn validate_formatter_outputs(
-    root: &File,
-    descriptor: &FormatterDescriptor,
-    before: &BTreeMap<RootRelativePath, NewlineStyle>,
-    limits: StageLimits,
-    budget: &mut Budget,
-) -> Result<(), StageError> {
-    for path in descriptor.files() {
-        let file = open_relative_file(root, path, libc::O_RDONLY)?;
-        let state = stat_file(&file).map_err(|_| StageError::StageChanged)?;
-        budget.file(state.size)?;
-        budget.metadata(
-            usize::try_from(state.size)
-                .map_err(|_| StageError::LimitExceeded(StageLimit::MetadataMemory))?,
-        )?;
-        let source = read_relative(root, path, limits.max_file_bytes, budget.deadline)
-            .map_err(|_| StageError::FormatterUnsafeChange)?;
-        if newline_style(&source) != before.get(path).copied() {
-            return Err(StageError::FormatterUnsafeChange);
-        }
-    }
-    Ok(())
-}
-
-fn newline_style(source: &[u8]) -> Option<NewlineStyle> {
-    if !safe_text(source) {
-        return None;
-    }
-    Some(if source.windows(2).any(|window| window == b"\r\n") {
-        NewlineStyle::Crlf
-    } else if source.contains(&b'\n') {
-        NewlineStyle::Lf
-    } else {
-        NewlineStyle::None
-    })
 }
 
 fn require_exact_changed_set(
@@ -1303,12 +793,11 @@ fn stage_state_digest(
     plan: &PlanConsumption<'_>,
     final_tree: &Snapshot,
     changes: &[super::StageChange],
-    formatter: Option<&super::FormatterCapture>,
     syntax: &[SyntaxRequirement],
     limits: StageLimits,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    frame(&mut hasher, b"kit-staged-edit-state-v1");
+    frame(&mut hasher, b"kit-staged-edit-state-v2");
     frame(&mut hasher, plan.digest.as_bytes());
     frame(&mut hasher, plan.revision.to_string().as_bytes());
     frame(&mut hasher, plan.epoch.to_string().as_bytes());
@@ -1317,7 +806,7 @@ fn stage_state_digest(
     hasher.update(&(limits.max_entries as u64).to_le_bytes());
     hasher.update(&limits.max_total_bytes.to_le_bytes());
     hasher.update(&(limits.max_file_bytes as u64).to_le_bytes());
-    hasher.update(&(limits.max_formatter_output_bytes as u64).to_le_bytes());
+    hasher.update(&(limits.max_syntax_output_bytes as u64).to_le_bytes());
     hasher.update(&(limits.max_name_bytes as u64).to_le_bytes());
     hasher.update(&(limits.max_path_bytes as u64).to_le_bytes());
     hasher.update(&(limits.max_metadata_bytes as u64).to_le_bytes());
@@ -1329,49 +818,6 @@ fn stage_state_digest(
         hasher.update(&change.before_mode().unwrap_or(0).to_le_bytes());
         hasher.update(&change.after_mode().unwrap_or(0).to_le_bytes());
     }
-    if let Some(formatter) = formatter {
-        hasher.update(&[1]);
-        frame(&mut hasher, formatter.id().as_bytes());
-        frame(&mut hasher, formatter.version().as_bytes());
-        hasher.update(&[match formatter.status() {
-            FormatterStatus::Success => 0,
-            FormatterStatus::Exit(_) => 1,
-            FormatterStatus::Timeout => 2,
-        }]);
-        if let FormatterStatus::Exit(code) = formatter.status() {
-            hasher.update(&code.to_le_bytes());
-        }
-        frame(&mut hasher, formatter.overlay_digest().as_bytes());
-        frame(&mut hasher, formatter.verified_binary_digest().as_bytes());
-        frame(&mut hasher, formatter.verified_config_digest().as_bytes());
-        frame(&mut hasher, formatter.write_scope_digest().as_bytes());
-        frame(
-            &mut hasher,
-            formatter.process().runtime_identity().as_bytes(),
-        );
-        frame(
-            &mut hasher,
-            formatter.process().helper_identity().as_bytes(),
-        );
-        frame(
-            &mut hasher,
-            formatter.process().resolved_image_digest().as_bytes(),
-        );
-        frame(
-            &mut hasher,
-            formatter.process().formatter_binary_digest().as_bytes(),
-        );
-        frame(
-            &mut hasher,
-            formatter.process().formatter_artifact_digest().as_bytes(),
-        );
-        frame(
-            &mut hasher,
-            formatter.process().formatter_config_digest().as_bytes(),
-        );
-    } else {
-        hasher.update(&[0]);
-    }
     for requirement in syntax {
         frame(&mut hasher, requirement.path().as_str().as_bytes());
         frame(&mut hasher, requirement.language().as_bytes());
@@ -1381,115 +827,16 @@ fn stage_state_digest(
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
-fn stage_evidence_digest(
-    state_digest: &str,
-    formatter: Option<&super::FormatterCapture>,
-) -> String {
+fn stage_evidence_digest(state_digest: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    frame(&mut hasher, b"kit-staged-edit-evidence-v1");
+    frame(&mut hasher, b"kit-staged-edit-evidence-v2");
     frame(&mut hasher, state_digest.as_bytes());
-    if let Some(formatter) = formatter {
-        hasher.update(&[1]);
-        frame(&mut hasher, formatter.process().boundary_id().as_bytes());
-        frame(
-            &mut hasher,
-            formatter.process().invocation_digest().as_bytes(),
-        );
-        frame(
-            &mut hasher,
-            formatter.process().container_plan_digest().as_bytes(),
-        );
-        frame(&mut hasher, formatter.profile_digest().as_bytes());
-        frame(
-            &mut hasher,
-            formatter.process().bounded_capture_digest().as_bytes(),
-        );
-        hasher.update(&formatter.process().survivors().to_le_bytes());
-        hasher.update(&[u8::from(formatter.process().boundary_absent())]);
-        hasher.update(
-            &(formatter.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64).to_le_bytes(),
-        );
-        hasher.update(&formatter.stdout_length().to_le_bytes());
-        frame(&mut hasher, formatter.stdout_digest().as_bytes());
-        hasher.update(&formatter.stderr_length().to_le_bytes());
-        frame(&mut hasher, formatter.stderr_digest().as_bytes());
-        frame(&mut hasher, formatter.output_attestation().as_bytes());
-    } else {
-        hasher.update(&[0]);
-    }
-    format!("blake3:{}", hasher.finalize().to_hex())
-}
-
-fn changes_digest(
-    changes: &[super::StageChange],
-    feedback_mapping: &crate::verify::feedback::EditMapping,
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    frame(&mut hasher, b"kit-staged-edit-changes-v1");
-    for change in changes {
-        frame(&mut hasher, change.path().as_str().as_bytes());
-        frame(&mut hasher, change.before_hash().unwrap_or("").as_bytes());
-        frame(&mut hasher, change.after_hash().unwrap_or("").as_bytes());
-        hasher.update(&change.before_mode().unwrap_or(0).to_le_bytes());
-        hasher.update(&change.after_mode().unwrap_or(0).to_le_bytes());
-    }
-    frame(&mut hasher, feedback_mapping.digest().as_bytes());
-    format!("blake3:{}", hasher.finalize().to_hex())
-}
-
-fn syntax_evidence_digest(state: &str, evidence: &str) -> String {
-    let mut hasher = blake3::Hasher::new();
-    frame(&mut hasher, b"kit-staged-syntax-evidence-v1");
-    frame(&mut hasher, state.as_bytes());
-    frame(&mut hasher, evidence.as_bytes());
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 fn frame(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
-}
-
-fn formatter_profile(
-    limits: StageLimits,
-    deadline: Instant,
-) -> Result<ExecutorProfile, StageError> {
-    let platform = if cfg!(target_os = "macos") {
-        Platform::MacOs
-    } else {
-        Platform::Linux
-    };
-    let architecture = if cfg!(target_arch = "aarch64") {
-        Architecture::Aarch64
-    } else if cfg!(target_arch = "x86_64") {
-        Architecture::X86_64
-    } else {
-        return Err(StageError::Unavailable);
-    };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let millis = u64::try_from(remaining.as_millis())
-        .map_err(|_| StageError::LimitExceeded(StageLimit::Time))?;
-    if millis == 0 {
-        return Err(StageError::LimitExceeded(StageLimit::Time));
-    }
-    let resources = ResourceLimits::new(
-        millis,
-        limits.max_total_bytes.max(1),
-        64,
-        limits.max_file_bytes as u64,
-        limits.max_total_bytes,
-        limits.max_total_bytes,
-        limits.max_formatter_output_bytes as u64,
-        millis,
-    );
-    let mut spec = ProfileSpec::isolated(TrustTier::Restricted, platform, architecture, resources);
-    spec.source_write = SourceWriteMode::MutationOverlay;
-    for mount in &mut spec.mounts {
-        if mount.role == MountRole::Source {
-            mount.access = MountAccess::CopyOnWrite;
-        }
-    }
-    ExecutorProfile::new(spec).map_err(|_| StageError::Unavailable)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1654,32 +1001,6 @@ impl Budget {
     }
 }
 
-impl FormatterBudget for Budget {
-    fn charge_entry(
-        &mut self,
-        name_bytes: usize,
-        path_bytes: usize,
-        metadata_bytes: usize,
-    ) -> Result<(), FormatterBudgetCharge> {
-        self.entry().map_err(|_| FormatterBudgetCharge::Entries)?;
-        self.name(name_bytes)
-            .map_err(|_| FormatterBudgetCharge::NameBytes)?;
-        self.path(path_bytes)
-            .map_err(|_| FormatterBudgetCharge::PathBytes)?;
-        self.metadata(metadata_bytes)
-            .map_err(|_| FormatterBudgetCharge::MetadataMemory)
-    }
-
-    fn charge_bytes(&mut self, bytes: u64) -> Result<(), FormatterBudgetCharge> {
-        self.file(bytes).map_err(|_| FormatterBudgetCharge::Bytes)
-    }
-
-    fn charge_metadata(&mut self, bytes: usize) -> Result<(), FormatterBudgetCharge> {
-        self.metadata(bytes)
-            .map_err(|_| FormatterBudgetCharge::MetadataMemory)
-    }
-}
-
 fn copy_tree(source: &File, target: &File, budget: &mut Budget) -> Result<(), StageError> {
     let root_mount = mount_identity(source).map_err(|_| StageError::Unavailable)?;
     copy_directory(source, target, Path::new(""), root_mount, budget)
@@ -1757,7 +1078,6 @@ fn watch_stage_tree(
     root_path: &Path,
     root: &File,
     fence: &mut crate::workspace::revision::WorkspaceKernelMutationFence,
-    include_formatter_writable: bool,
     include_final: bool,
 ) -> Result<(), StageError> {
     let mut pending = vec![(
@@ -1777,11 +1097,7 @@ fn watch_stage_tree(
         }
         drop(stream);
         for name in names {
-            if path == root_path
-                && ((!include_final && name.to_bytes() == b"final")
-                    || (!include_formatter_writable
-                        && matches!(name.to_bytes(), b"formatter-overlay" | b"build" | b"temp")))
-            {
+            if path == root_path && !include_final && name.to_bytes() == b"final" {
                 continue;
             }
             let before = stat_at(&directory, &name).map_err(|_| StageError::StageChanged)?;
@@ -2271,18 +1587,9 @@ struct Allocation {
     quarantine: CString,
     cleanup_state: Mutex<CleanupState>,
     root_path: PathBuf,
-    formatter_source_path: PathBuf,
-    overlay_path: PathBuf,
-    final_path: PathBuf,
-    build_path: PathBuf,
-    temp_path: PathBuf,
     root: File,
     view: File,
-    formatter_source: File,
-    overlay: File,
     final_view: File,
-    build: File,
-    temp: File,
     device: u64,
     inode: u64,
     nonce: [u8; 16],
@@ -2380,19 +1687,7 @@ impl Allocation {
             &marker,
         )?;
         let path = parent_path.join(name.to_string_lossy().as_ref());
-        let formatter_source_path = path.join("formatter-source");
-        let overlay_path = path.join("formatter-overlay");
-        let final_path = path.join("final");
-        let build_path = path.join("build");
-        let temp_path = path.join("temp");
-        for directory in [
-            "view",
-            "formatter-source",
-            "formatter-overlay",
-            "final",
-            "build",
-            "temp",
-        ] {
+        for directory in ["view", "final"] {
             let directory = CString::new(directory).expect("static stage name has no NUL");
             mkdir_at(&root, &directory, 0o700)?;
         }
@@ -2401,11 +1696,7 @@ impl Allocation {
                 .map_err(|_| StageError::Unavailable)
         };
         let view = open_directory(c"view")?;
-        let formatter_source = open_directory(c"formatter-source")?;
-        let overlay = open_directory(c"formatter-overlay")?;
         let final_view = open_directory(c"final")?;
-        let build = open_directory(c"build")?;
-        let temp = open_directory(c"temp")?;
         bootstrap.armed = false;
         drop(bootstrap);
         Ok(Self {
@@ -2414,18 +1705,9 @@ impl Allocation {
             quarantine,
             cleanup_state: Mutex::new(CleanupState::Original),
             root_path: path,
-            formatter_source_path,
-            overlay_path,
-            final_path,
-            build_path,
-            temp_path,
             root,
             view,
-            formatter_source,
-            overlay,
             final_view,
-            build,
-            temp,
             device: metadata.dev(),
             inode: metadata.ino(),
             nonce: random,
@@ -3077,674 +2359,6 @@ fn hex(bytes: &[u8]) -> String {
     value
 }
 
-#[cfg(test)]
-mod verification_tests {
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        fs,
-        path::PathBuf,
-        process::Command,
-    };
-
-    use crate::{
-        domain::{
-            events::ContentDigest,
-            ids::{PrincipalId, ProjectId},
-        },
-        executor::{
-            check::{CheckCommand, CheckRunner, ConformanceCheck},
-            profile::ResourceLimits,
-            syntax::{DebugSyntaxAction, SyntaxExecutor},
-        },
-        store::artifacts::{ArtifactRetention, ArtifactStore},
-        verify::feedback::{
-            DiagnosticAdapter, FeedbackAuthority, FeedbackEventStore, FeedbackItem, FeedbackLimits,
-            FeedbackPipeline, FeedbackVerificationObserver,
-        },
-        verify::profiles::{
-            CheckClass, CheckFailureBehavior, CheckRequirement, DeclaredCheck, ProfileSelection,
-            VerificationRegistry, VerificationRequest,
-        },
-        workspace::{
-            edit::{
-                format::NATIVE_TEXT_VERSION,
-                ir::{
-                    ByteRange, EditIr, EditLimits, EditOperation, ExecutableMode, RevisionToken,
-                    RootRelativePath, TextContent,
-                },
-                recovery::MaterializeOptions,
-                stage::{StageLimits, VerificationOutcome, stage},
-                validate::validate_authorized,
-            },
-            revision::ManagedWorkspace,
-        },
-    };
-
-    struct Fixture {
-        root: PathBuf,
-        workspace_path: PathBuf,
-        workspace: ManagedWorkspace,
-        artifacts: ArtifactStore,
-        authenticated: crate::api::auth::contract::AuthenticatedPrincipal,
-        grants: crate::api::auth::contract::GrantSnapshot,
-        config: crate::domain::config::RunConfigSnapshot,
-        principal: PrincipalId,
-        project: ProjectId,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            let mut nonce = [0_u8; 8];
-            getrandom::fill(&mut nonce).unwrap();
-            let root = std::env::temp_dir()
-                .canonicalize()
-                .unwrap()
-                .join(format!("kit-stage-verify-{}", u64::from_le_bytes(nonce)));
-            let workspace_path = root.join("workspace");
-            fs::create_dir_all(&workspace_path).unwrap();
-            fs::write(workspace_path.join("changed.txt"), b"old\n").unwrap();
-            let workspace = ManagedWorkspace::open(&workspace_path).unwrap();
-            let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
-            let principal = PrincipalId::generate().unwrap();
-            let project = ProjectId::generate().unwrap();
-            let (authenticated, grants, config) =
-                crate::test_support::trusted_verification_context(principal, project);
-            Self {
-                root,
-                workspace_path,
-                workspace,
-                artifacts,
-                authenticated,
-                grants,
-                config,
-                principal,
-                project,
-            }
-        }
-
-        fn staged(&self) -> super::StagedEdit<'_> {
-            let revision = self.workspace.current_revision().unwrap().id();
-            let path = RootRelativePath::parse("changed.txt", EditLimits::default().max_path_bytes)
-                .unwrap();
-            let ir = EditIr::new(
-                RevisionToken::parse(revision.to_string()).unwrap(),
-                vec![EditOperation::ReplaceRange {
-                    path,
-                    base_digest: ContentDigest::parse(&format!(
-                        "blake3:{}",
-                        blake3::hash(b"old\n").to_hex()
-                    ))
-                    .unwrap(),
-                    range: ByteRange::new(0, 4).unwrap(),
-                    expected: TextContent::from_bytes(b"old\n").unwrap(),
-                    replacement: TextContent::from_bytes(b"new\n").unwrap(),
-                    executable: ExecutableMode::Preserve,
-                }],
-                EditLimits::default(),
-            )
-            .unwrap();
-            let plan = validate_authorized(
-                &self.workspace,
-                &ir,
-                EditLimits::default(),
-                crate::test_support::trusted_edit_authority(self.principal, self.project),
-            )
-            .unwrap();
-            let mut syntax =
-                SyntaxExecutor::debug("text", NATIVE_TEXT_VERSION, DebugSyntaxAction::Pass(None));
-            stage(plan, StageLimits::default(), &[], &mut [&mut syntax], None).unwrap()
-        }
-
-        fn registry() -> VerificationRegistry {
-            let command = CheckCommand::new(
-                "diagnostics",
-                "/usr/bin/cargo",
-                vec!["check".to_owned()],
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                ResourceLimits::new(
-                    1_000,
-                    64 << 20,
-                    16,
-                    8 << 20,
-                    64 << 20,
-                    64 << 20,
-                    1 << 20,
-                    10_000,
-                ),
-            )
-            .unwrap();
-            VerificationRegistry::new(vec![
-                DeclaredCheck::new(
-                    CheckClass::Diagnostics,
-                    command,
-                    CheckRequirement::Required,
-                    BTreeSet::new(),
-                    false,
-                )
-                .unwrap(),
-            ])
-            .unwrap()
-        }
-
-        fn request<'a>(
-            &'a self,
-            registry: &'a VerificationRegistry,
-            runner: &'a mut CheckRunner,
-        ) -> VerificationRequest<'a> {
-            VerificationRequest {
-                selection: ProfileSelection::Fast,
-                registry,
-                authenticated: &self.authenticated,
-                grants: &self.grants,
-                config: &self.config,
-                runner: Some(runner),
-                observer: None,
-                artifacts: &self.artifacts,
-                secrets: &[],
-                on_check_failure: CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: None,
-            }
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    #[test]
-    fn only_verified_stage_materializes_and_abort_leaves_content_and_revision_unchanged() {
-        let aborted = Fixture::new();
-        let revision = aborted.workspace.current_revision().unwrap().id();
-        let registry = Fixture::registry();
-        let mut runner = CheckRunner::conformance([ConformanceCheck::exit(1, b"", b"failed")]);
-        assert!(matches!(
-            aborted
-                .staged()
-                .verify(aborted.request(&registry, &mut runner)),
-            Ok(VerificationOutcome::Abort(_))
-        ));
-        assert_eq!(
-            fs::read(aborted.workspace_path.join("changed.txt")).unwrap(),
-            b"old\n"
-        );
-        assert_eq!(aborted.workspace.current_revision().unwrap().id(), revision);
-
-        let committed = Fixture::new();
-        let registry = Fixture::registry();
-        let mut runner = CheckRunner::conformance([ConformanceCheck::pass(b"ok", b"")]);
-        let verified = match committed
-            .staged()
-            .verify(committed.request(&registry, &mut runner))
-            .unwrap()
-        {
-            VerificationOutcome::Commit(verified) => verified,
-            VerificationOutcome::Abort(_) => panic!("passing verification aborted"),
-        };
-        verified
-            .materialize(
-                &committed.artifacts,
-                MaterializeOptions::new(ArtifactRetention::Forever),
-            )
-            .unwrap();
-        assert_eq!(
-            fs::read(committed.workspace_path.join("changed.txt")).unwrap(),
-            b"new\n"
-        );
-    }
-
-    #[test]
-    fn aborted_verification_feedback_restarts_idempotently_without_materializing() {
-        let fixture = Fixture::new();
-        let revision = fixture.workspace.current_revision().unwrap().id();
-        let staged = fixture.staged();
-        let authority = FeedbackAuthority::issue(
-            &fixture.authenticated,
-            "workspace-feedback",
-            "run-feedback",
-            staged.state_digest(),
-            1,
-        )
-        .unwrap();
-        let events_path = fixture.root.join("feedback.sqlite3");
-        let mut events = FeedbackEventStore::open(&events_path).unwrap();
-        let registry = Fixture::registry();
-        let mut runner = CheckRunner::conformance([ConformanceCheck::exit(1, b"", b"failed")]);
-        let mut observer = FeedbackVerificationObserver::new(&mut events, &authority, &staged);
-        let outcome = staged
-            .verify(VerificationRequest {
-                selection: ProfileSelection::Fast,
-                registry: &registry,
-                authenticated: &fixture.authenticated,
-                grants: &fixture.grants,
-                config: &fixture.config,
-                runner: Some(&mut runner),
-                observer: Some(&mut observer),
-                artifacts: &fixture.artifacts,
-                secrets: &[],
-                on_check_failure: CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: None,
-            })
-            .unwrap();
-        assert!(matches!(outcome, VerificationOutcome::Abort(_)));
-        let adapters = BTreeMap::from([(
-            "diagnostics".to_owned(),
-            DiagnosticAdapter::NormalizedJsonLinesV1,
-        )]);
-        let first = {
-            let mut pipeline = FeedbackPipeline::new(
-                &fixture.artifacts,
-                &mut events,
-                &fixture.authenticated,
-                "workspace-feedback",
-                ArtifactRetention::Forever,
-                1,
-                &[],
-                FeedbackLimits::default(),
-            )
-            .unwrap();
-            pipeline
-                .process(&authority, None, &outcome, &adapters)
-                .unwrap()
-        };
-        drop(events);
-        match outcome {
-            VerificationOutcome::Abort(aborted) => aborted.close().unwrap(),
-            VerificationOutcome::Commit(_) => unreachable!(),
-        }
-        let recovery_db = rusqlite::Connection::open(&events_path).unwrap();
-        recovery_db
-            .execute_batch(
-                "UPDATE pending_feedback SET state = 'pending';
-                 DELETE FROM check_events;
-                 UPDATE feedback_feeds SET next_cursor = 1;
-                 UPDATE feedback_operations
-                 SET report_reference = NULL, report_length = NULL,
-                     payload_reference = NULL, payload_length = NULL;",
-            )
-            .unwrap();
-        drop(recovery_db);
-
-        let mut restarted_events = FeedbackEventStore::open(&events_path).unwrap();
-        let second = {
-            let mut pipeline = FeedbackPipeline::new(
-                &fixture.artifacts,
-                &mut restarted_events,
-                &fixture.authenticated,
-                "workspace-feedback",
-                ArtifactRetention::Forever,
-                1,
-                &[],
-                FeedbackLimits::default(),
-            )
-            .unwrap();
-            pipeline.recover_pending().unwrap().pop().unwrap()
-        };
-        assert_eq!(first.feedback_operation_id, second.feedback_operation_id);
-        assert_eq!(first.report_artifact, second.report_artifact);
-        assert_eq!(first.payload_artifact, second.payload_artifact);
-        assert_eq!(first.payload, second.payload);
-        assert_eq!(first.events, second.events);
-        assert!(matches!(
-            first.payload.items.first(),
-            Some(FeedbackItem::RequiredFailure(_))
-        ));
-        assert_eq!(first.events.len(), 3);
-        assert_eq!(
-            first
-                .events
-                .iter()
-                .map(|event| event.cursor)
-                .collect::<Vec<_>>(),
-            [1, 2, 3]
-        );
-        assert_eq!(
-            first
-                .events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            ["check.started", "check.progress", "check.failure"]
-        );
-        assert!(
-            first
-                .events
-                .iter()
-                .all(|event| event.successor_revision.is_none())
-        );
-        assert_eq!(fixture.workspace.current_revision().unwrap().id(), revision);
-        assert_eq!(
-            fs::read(fixture.workspace_path.join("changed.txt")).unwrap(),
-            b"old\n"
-        );
-    }
-
-    #[test]
-    fn feedback_crash_subprocess_worker() {
-        let Ok(manifest_path) = std::env::var("KIT_FEEDBACK_CRASH_MANIFEST") else {
-            return;
-        };
-        let fixture = Fixture::new();
-        let staged = fixture.staged();
-        let staged_state_digest = staged.state_digest().to_owned();
-        fs::write(
-            manifest_path,
-            serde_json::to_vec(&serde_json::json!({
-                "root": fixture.root,
-                "principal": fixture.principal.to_string(),
-                "project": fixture.project.to_string(),
-                "staged_state_digest": staged_state_digest,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let authority = FeedbackAuthority::issue(
-            &fixture.authenticated,
-            "workspace-feedback-crash",
-            "run-feedback-crash",
-            &staged_state_digest,
-            1,
-        )
-        .unwrap();
-        let mut events = FeedbackEventStore::open(fixture.root.join("feedback.sqlite3")).unwrap();
-        let registry = Fixture::registry();
-        let mut runner = CheckRunner::conformance([ConformanceCheck::exit(1, b"", b"failed")]);
-        let mut observer = FeedbackVerificationObserver::new(&mut events, &authority, &staged);
-        let outcome = staged
-            .verify(VerificationRequest {
-                selection: ProfileSelection::Fast,
-                registry: &registry,
-                authenticated: &fixture.authenticated,
-                grants: &fixture.grants,
-                config: &fixture.config,
-                runner: Some(&mut runner),
-                observer: Some(&mut observer),
-                artifacts: &fixture.artifacts,
-                secrets: &[],
-                on_check_failure: CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: None,
-            })
-            .unwrap();
-        let adapters = BTreeMap::from([(
-            "diagnostics".to_owned(),
-            DiagnosticAdapter::NormalizedJsonLinesV1,
-        )]);
-        FeedbackPipeline::new(
-            &fixture.artifacts,
-            &mut events,
-            &fixture.authenticated,
-            "workspace-feedback-crash",
-            ArtifactRetention::Forever,
-            1,
-            &[],
-            FeedbackLimits::default(),
-        )
-        .unwrap()
-        .process(&authority, None, &outcome, &adapters)
-        .unwrap();
-        panic!("feedback crash point was not reached");
-    }
-
-    #[test]
-    fn real_process_death_recovers_feedback_without_outcome_or_cursor_holes() {
-        let crash_points = [
-            "pending_record",
-            "result_artifact",
-            "report_artifact",
-            "report_reference",
-            "payload_artifact",
-            "payload_reference",
-            "lifecycle.started",
-            "lifecycle.progress",
-            "lifecycle.failure",
-            "event.started",
-            "event.progress",
-            "event.failure",
-            "pending_complete",
-        ];
-        for point in crash_points {
-            let mut nonce = [0_u8; 8];
-            getrandom::fill(&mut nonce).unwrap();
-            let manifest_path = std::env::temp_dir().join(format!(
-                "kit-feedback-crash-{}-{}.json",
-                std::process::id(),
-                u64::from_le_bytes(nonce)
-            ));
-            let status = Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("workspace::edit::stage::unix::verification_tests::feedback_crash_subprocess_worker")
-                .arg("--test-threads=1")
-                .env("KIT_FEEDBACK_CRASH_MANIFEST", &manifest_path)
-                .env("KIT_FEEDBACK_CRASH_POINT", point)
-                .status()
-                .unwrap();
-            assert_eq!(status.code(), Some(86), "crash point {point}");
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-            fs::remove_file(&manifest_path).unwrap();
-            let root = PathBuf::from(manifest["root"].as_str().unwrap());
-            let principal = PrincipalId::parse(manifest["principal"].as_str().unwrap()).unwrap();
-            let project = ProjectId::parse(manifest["project"].as_str().unwrap()).unwrap();
-            let staged_state_digest = manifest["staged_state_digest"].as_str().unwrap();
-            let (authenticated, _, _) =
-                crate::test_support::trusted_verification_context(principal, project);
-            let authority = FeedbackAuthority::issue(
-                &authenticated,
-                "workspace-feedback-crash",
-                "run-feedback-crash",
-                staged_state_digest,
-                1,
-            )
-            .unwrap();
-            let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
-            let events_path = root.join("feedback.sqlite3");
-            let mut events = FeedbackEventStore::open(&events_path).unwrap();
-            let recovered = FeedbackPipeline::new(
-                &artifacts,
-                &mut events,
-                &authenticated,
-                "workspace-feedback-crash",
-                ArtifactRetention::UntilUnixMicros(0),
-                i64::MAX,
-                &[],
-                FeedbackLimits::default(),
-            )
-            .unwrap()
-            .recover_pending()
-            .unwrap();
-            if point == "pending_complete" {
-                assert!(recovered.is_empty());
-            } else {
-                assert_eq!(recovered.len(), 1, "crash point {point}");
-            }
-            let before = events
-                .events(&authenticated, &authority, &artifacts, 0)
-                .unwrap();
-            assert_eq!(before.len(), 3, "crash point {point}");
-            assert_eq!(
-                before.iter().map(|event| event.cursor).collect::<Vec<_>>(),
-                [1, 2, 3],
-                "crash point {point}"
-            );
-            assert_eq!(
-                before
-                    .iter()
-                    .map(|event| event.event_type.as_str())
-                    .collect::<Vec<_>>(),
-                ["check.started", "check.progress", "check.failure"]
-            );
-            let before_bytes = before
-                .iter()
-                .map(|event| serde_json::to_vec(event).unwrap())
-                .collect::<Vec<_>>();
-            let operation_id = &before[0].feedback_operation_id;
-            let connection = rusqlite::Connection::open(&events_path).unwrap();
-            let refs: (String, u64, String, u64, String) = connection
-                .query_row(
-                    "SELECT report_reference, report_length, payload_reference, payload_length,
-                            state
-                     FROM feedback_operations JOIN pending_feedback USING (operation_id)
-                     WHERE operation_id = ?1",
-                    [operation_id],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .unwrap();
-            assert_eq!(refs.4, "complete");
-            assert!(before.iter().all(|event| {
-                event.artifacts
-                    == [
-                        crate::verify::feedback::OpaqueArtifactRef {
-                            reference: refs.0.clone(),
-                            length: refs.1,
-                        },
-                        crate::verify::feedback::OpaqueArtifactRef {
-                            reference: refs.2.clone(),
-                            length: refs.3,
-                        },
-                    ]
-            }));
-            drop(connection);
-            let after = events
-                .events(&authenticated, &authority, &artifacts, 0)
-                .unwrap();
-            assert_eq!(
-                after
-                    .iter()
-                    .map(|event| serde_json::to_vec(event).unwrap())
-                    .collect::<Vec<_>>(),
-                before_bytes
-            );
-            drop(events);
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn materialization_attaches_successor_to_the_existing_feedback_operation() {
-        let fixture = Fixture::new();
-        let staged = fixture.staged();
-        let authority = FeedbackAuthority::issue(
-            &fixture.authenticated,
-            "workspace-feedback",
-            "run-feedback",
-            staged.state_digest(),
-            1,
-        )
-        .unwrap();
-        let mut events = FeedbackEventStore::open(fixture.root.join("feedback.sqlite3")).unwrap();
-        let registry = Fixture::registry();
-        let mut runner = CheckRunner::conformance([ConformanceCheck::pass(b"", b"")]);
-        let mut observer = FeedbackVerificationObserver::new(&mut events, &authority, &staged);
-        let outcome = staged
-            .verify(VerificationRequest {
-                selection: ProfileSelection::Fast,
-                registry: &registry,
-                authenticated: &fixture.authenticated,
-                grants: &fixture.grants,
-                config: &fixture.config,
-                runner: Some(&mut runner),
-                observer: Some(&mut observer),
-                artifacts: &fixture.artifacts,
-                secrets: &[],
-                on_check_failure: CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: None,
-            })
-            .unwrap();
-        let adapters = BTreeMap::from([(
-            "diagnostics".to_owned(),
-            DiagnosticAdapter::NormalizedJsonLinesV1,
-        )]);
-        let output = {
-            let mut pipeline = FeedbackPipeline::new(
-                &fixture.artifacts,
-                &mut events,
-                &fixture.authenticated,
-                "workspace-feedback",
-                ArtifactRetention::Forever,
-                1,
-                &[],
-                FeedbackLimits::default(),
-            )
-            .unwrap();
-            pipeline
-                .process(&authority, None, &outcome, &adapters)
-                .unwrap()
-        };
-        let before_materialization = events
-            .events(&fixture.authenticated, &authority, &fixture.artifacts, 0)
-            .unwrap();
-        let before_bytes = before_materialization
-            .iter()
-            .map(|event| serde_json::to_vec(event).unwrap())
-            .collect::<Vec<_>>();
-        let verified = match outcome {
-            VerificationOutcome::Commit(verified) => verified,
-            VerificationOutcome::Abort(_) => panic!("passing verification aborted"),
-        };
-        let materialized = verified
-            .materialize(
-                &fixture.artifacts,
-                MaterializeOptions::new(ArtifactRetention::Forever),
-            )
-            .unwrap();
-        {
-            let mut pipeline = FeedbackPipeline::new(
-                &fixture.artifacts,
-                &mut events,
-                &fixture.authenticated,
-                "workspace-feedback",
-                ArtifactRetention::Forever,
-                1,
-                &[],
-                FeedbackLimits::default(),
-            )
-            .unwrap();
-            pipeline
-                .attach_materialization(&authority, &output, &materialized)
-                .unwrap();
-        }
-        let persisted = events
-            .events(&fixture.authenticated, &authority, &fixture.artifacts, 0)
-            .unwrap();
-        assert_eq!(persisted.len(), 4);
-        assert_eq!(
-            persisted[..3]
-                .iter()
-                .map(|event| serde_json::to_vec(event).unwrap())
-                .collect::<Vec<_>>(),
-            before_bytes
-        );
-        assert!(
-            persisted[..3]
-                .iter()
-                .all(|event| event.successor_revision.is_none())
-        );
-        let attached = persisted.last().unwrap();
-        assert_eq!(attached.cursor, 4);
-        assert_eq!(attached.event_type, "feedback.successor_attached");
-        assert_eq!(attached.feedback_operation_id, output.feedback_operation_id);
-        assert_eq!(
-            attached.successor_revision.as_deref(),
-            Some(materialized.revision().id().to_string().as_str())
-        );
-    }
-}
-
 fn set_mode(file: &File, mode: u32) -> Result<(), StageError> {
     if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
         Err(StageError::Unavailable)
@@ -4121,7 +2735,7 @@ fn check_deadline(deadline: Instant) -> Result<(), StageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{mem::ManuallyDrop, os::unix::fs::PermissionsExt as _};
+    use std::{mem::ManuallyDrop, os::unix::fs::PermissionsExt as _, time::Duration};
 
     #[test]
     fn canonical_tree_digest_vector() {
@@ -4170,13 +2784,12 @@ mod tests {
     }
 
     #[test]
-    fn evidence_digest_vector_without_formatter() {
+    fn evidence_digest_vector() {
         assert_eq!(
             stage_evidence_digest(
                 "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                None,
             ),
-            "blake3:bda0a8b87f622a683ec610c35064acecab151b72f2eb2d122c5a985196f34460"
+            "blake3:383ef44611deca83e24e20a824957d54c8bc18716387568ca979dab080e32aec"
         );
     }
 

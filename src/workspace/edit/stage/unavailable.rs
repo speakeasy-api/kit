@@ -1,22 +1,11 @@
-use super::{
-    FormatterCapture, StageChange, StageError, StageLimits, StagedOperation, SyntaxRequirements,
-};
-use crate::workspace::edit::{
-    format::FormatterDescriptor, ir::RootRelativePath, validate::ValidatedPlan,
-};
+use super::{StageChange, StageError, StageLimits, StagedOperation, SyntaxRequirements};
+use crate::workspace::edit::{ir::RootRelativePath, validate::ValidatedPlan};
 use crate::workspace::revision::RevisionId;
 use std::time::Instant;
 
 pub struct StagedEdit<'workspace>(std::marker::PhantomData<&'workspace ()>);
 
 impl StagedEdit<'_> {
-    pub fn verify(
-        self,
-        _request: crate::verify::profiles::VerificationRequest<'_>,
-    ) -> Result<super::VerificationOutcome<'_>, crate::verify::profiles::VerificationError> {
-        Err(crate::verify::profiles::VerificationError::StaleBinding)
-    }
-
     pub fn revision(&self) -> RevisionId {
         unreachable!()
     }
@@ -57,14 +46,6 @@ impl StagedEdit<'_> {
         unreachable!()
     }
 
-    pub(crate) fn feedback_mapping(&self) -> &crate::verify::feedback::EditMapping {
-        unreachable!()
-    }
-
-    pub fn formatter(&self) -> Option<&FormatterCapture> {
-        unreachable!()
-    }
-
     pub fn read_file(
         &self,
         _path: &RootRelativePath,
@@ -88,10 +69,6 @@ pub fn stage<'workspace>(
     _limits: StageLimits,
     _syntax: SyntaxRequirements<'_>,
     _syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
-    _formatter: Option<(
-        &FormatterDescriptor,
-        &mut crate::executor::formatter::FormatterExecutor,
-    )>,
 ) -> Result<StagedEdit<'workspace>, StageError> {
     Err(StageError::Unavailable)
 }

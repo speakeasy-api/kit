@@ -502,10 +502,18 @@ fn auto_start_replaces_daemon_from_a_previous_build() {
     let project = daemon_identity["project_id"].as_str().expect("project id");
     // The CLI's exit probe (kill 0) must observe the SIGTERMed daemon
     // disappearing, so reap the child promptly instead of leaving a zombie.
-    let reaper = thread::spawn(move || wait_for_exit(&mut daemon, Duration::from_secs(30), "stale daemon"));
+    let reaper =
+        thread::spawn(move || wait_for_exit(&mut daemon, Duration::from_secs(30), "stale daemon"));
     let replaced = cli(
         &root.0,
-        &["--auto-start", "--json", "project", "create", "--id", project],
+        &[
+            "--auto-start",
+            "--json",
+            "project",
+            "create",
+            "--id",
+            project,
+        ],
     );
     assert_success(&replaced);
 

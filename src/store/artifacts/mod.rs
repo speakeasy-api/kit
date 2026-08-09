@@ -1447,17 +1447,6 @@ impl ArtifactStore {
         self.stage_chunks_until(chunks, size, metadata, Some(deadline), None)
     }
 
-    pub(crate) fn stage_chunks_with_reference_before<'a>(
-        &self,
-        chunks: impl IntoIterator<Item = &'a [u8]>,
-        size: usize,
-        metadata: ArtifactMetadata,
-        reference: ArtifactReference,
-        deadline: Instant,
-    ) -> Result<StagedArtifact<'_>, ArtifactError> {
-        self.stage_chunks_until(chunks, size, metadata, Some(deadline), Some(reference))
-    }
-
     pub fn stage_reader_before(
         &self,
         reader: &mut impl Read,

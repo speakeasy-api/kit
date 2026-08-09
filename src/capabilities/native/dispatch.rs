@@ -10,16 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    agent::adapters::grammar_edit::{
-        EditOrchestrator, EditPathTrace, GrammarEditContext, NativeEditOutcome, NativeEditServices,
-    },
+    agent::adapters::grammar_edit::{EditOrchestrator, EditPathTrace, GrammarEditContext},
     api::auth::contract::{AuthenticatedPrincipal, GrantSnapshot},
     capabilities::kernel::invoke::{AuthorizedInvocation, CanonicalOutput, DispatchOutcome},
     domain::config::{Executor as ConfigExecutor, Grant, RunConfigSnapshot},
     executor::{
         backends::local_os::{LocalCommand, LocalOsBackend, SandboxPaths},
         cancel::{SqliteCancellationCoordinator, WorkspaceIdentity},
-        check::CheckRunner,
         process::own::ProcessRegistryRegistration,
         profile::{
             Architecture, CompatibilityOptIn, ExecutorProfile, Platform, ProfileSpec,
@@ -29,7 +26,6 @@ use crate::{
     store::artifacts::{ArtifactRetention, ArtifactStore},
     telemetry::redact::CaptureBoundary,
     verify::lsp::facts::SemanticFact,
-    verify::profiles::{ProfileSelection, VerificationRegistry},
     workspace::{
         acquire::AcquisitionResult,
         edit::ir::RootRelativePath,
@@ -63,17 +59,8 @@ use crate::{
     },
 };
 
-pub(crate) struct NativeFormatterRuntime {
-    pub descriptor: crate::workspace::edit::format::FormatterDescriptor,
-    pub executor: crate::executor::formatter::FormatterExecutor,
-}
-
-#[derive(Clone)]
-pub(crate) struct NativeFeedbackRuntime {
-    pub database: PathBuf,
-    pub adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-    pub limits: crate::verify::feedback::FeedbackLimits,
-}
+#[cfg(test)]
+use crate::executor::run_conformance::RunConformanceRunner;
 
 use super::catalog::{
     NATIVE_MAP_MAX_DEGREE, NATIVE_MAP_MAX_ESTIMATED_TOKENS, NATIVE_MAP_MAX_EXPANSION_SELECTORS,
@@ -191,20 +178,15 @@ pub(crate) struct NativeRuntime {
     pub cancellation: SqliteCancellationCoordinator,
     pub live_cancellation: Arc<AtomicBool>,
     pub container_image: Option<String>,
-    pub verification_registry: VerificationRegistry,
-    pub check_runner: Option<CheckRunner>,
     pub acquisition_failure: Option<String>,
     pub custody: crate::domain::secret::SecretCustody,
     pub secrets: Vec<crate::domain::secret::SecretLease>,
     pub syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
-    pub formatter_required: bool,
-    pub formatter: Option<NativeFormatterRuntime>,
-    pub feedback: Option<NativeFeedbackRuntime>,
     pub semantic_evidence: NativeSemanticEvidenceStore,
     pub edit_validation_time: std::time::Duration,
     pub cursor_key: [u8; 32],
     #[cfg(test)]
-    pub run_runner: Option<CheckRunner>,
+    pub run_runner: Option<RunConformanceRunner>,
 }
 
 #[derive(Clone, Debug)]
@@ -397,21 +379,18 @@ pub(crate) struct NativeDispatcher {
     cancellation: SqliteCancellationCoordinator,
     live_cancellation: Arc<AtomicBool>,
     container_image: Option<String>,
-    verification_registry: VerificationRegistry,
-    check_runner: Option<CheckRunner>,
     custody: crate::domain::secret::SecretCustody,
+    // Used by the test-only run-conformance path (`run_conformance`).
+    #[cfg_attr(not(test), allow(dead_code))]
     secrets: Vec<crate::domain::secret::SecretLease>,
     syntax_executors: Vec<crate::executor::syntax::SyntaxExecutor>,
-    formatter_required: bool,
-    formatter: Option<NativeFormatterRuntime>,
-    feedback: Option<NativeFeedbackRuntime>,
     semantic_evidence: NativeSemanticEvidenceStore,
     edit_validation_time: std::time::Duration,
     cursor_key: [u8; 32],
     projection_state: crate::domain::secret::JsonProjectionState,
     read_replay: Option<ReadReplay>,
     #[cfg(test)]
-    run_runner: Option<CheckRunner>,
+    run_runner: Option<RunConformanceRunner>,
 }
 
 impl NativeDispatcher {
@@ -464,15 +443,10 @@ impl NativeDispatcher {
             cancellation: runtime.cancellation,
             live_cancellation: runtime.live_cancellation,
             container_image: runtime.container_image,
-            verification_registry: runtime.verification_registry,
-            check_runner: runtime.check_runner,
             acquisition_failure: runtime.acquisition_failure,
             custody: runtime.custody,
             secrets: runtime.secrets,
             syntax_executors: runtime.syntax_executors,
-            formatter_required: runtime.formatter_required,
-            formatter: runtime.formatter,
-            feedback: runtime.feedback,
             semantic_evidence: runtime.semantic_evidence,
             edit_validation_time: runtime.edit_validation_time,
             cursor_key: runtime.cursor_key,
@@ -500,19 +474,13 @@ impl NativeDispatcher {
         &mut self,
         authenticated: AuthenticatedPrincipal,
         config: RunConfigSnapshot,
-        attempt: crate::domain::lifecycle::AttemptOwnership,
+        _attempt: crate::domain::lifecycle::AttemptOwnership,
         cancellation: Arc<AtomicBool>,
     ) {
         self.grants = authenticated.grant_snapshot().clone();
         self.authenticated = authenticated;
         self.config = config;
         self.live_cancellation = cancellation;
-        if let Some(runner) = &mut self.check_runner {
-            runner.bind_attempt(attempt);
-        }
-        if let Some(formatter) = &mut self.formatter {
-            formatter.executor.bind_attempt(attempt);
-        }
     }
 
     /// Failure code for capabilities that need the workspace snapshot; carries
@@ -544,14 +512,7 @@ impl NativeDispatcher {
         }
         if descriptor.tool() == NativeTool::Edit {
             return match self.edit(invocation.arguments(), invocation.attempt()) {
-                Ok((data, artifacts, true)) => committed_output(
-                    data,
-                    artifacts,
-                    &self.artifacts,
-                    &self.custody,
-                    &mut self.projection_state,
-                ),
-                Ok((data, artifacts, false)) => streaming_output(
+                Ok((data, artifacts)) => committed_output(
                     data,
                     artifacts,
                     &self.artifacts,
@@ -567,7 +528,6 @@ impl NativeDispatcher {
             NativeTool::Read => self.read(invocation.arguments()),
             NativeTool::Edit => unreachable!(),
             NativeTool::Run => self.run(invocation.arguments(), invocation.attempt()),
-            NativeTool::Check => self.check(invocation.arguments(), invocation.attempt()),
         };
         match result {
             Ok((_data, _artifacts)) if self.cancelled() => failed("cancelled_after_dispatch"),
@@ -1152,24 +1112,11 @@ impl NativeDispatcher {
     fn edit(
         &mut self,
         bytes: &[u8],
-        attempt: crate::domain::lifecycle::AttemptOwnership,
-    ) -> Result<(Value, Vec<String>, bool), String> {
+        _attempt: crate::domain::lifecycle::AttemptOwnership,
+    ) -> Result<(Value, Vec<String>), String> {
         self.ensure_not_cancelled()?;
-        if self.verification_registry.is_empty() {
-            return Err("trusted_edit_registry_unavailable".to_owned());
-        }
         if self.syntax_executors.is_empty() {
             return Err("trusted_edit_syntax_unavailable".to_owned());
-        }
-        if self.formatter_required && self.formatter.is_none() {
-            return Err(self.snapshot_unavailable("trusted_edit_formatter_unavailable"));
-        }
-        if self
-            .feedback
-            .as_ref()
-            .is_none_or(|feedback| feedback.adapters.is_empty())
-        {
-            return Err("trusted_edit_feedback_unavailable".to_owned());
         }
         let limits = crate::workspace::edit::ir::EditLimits {
             max_authorization_time: std::time::Duration::from_secs(30),
@@ -1206,34 +1153,14 @@ impl NativeDispatcher {
             |ir| Ok(ir.expected_revision().to_string()),
         )?;
         let workspace = self.ensure_workspace()?.clone();
-        let context = GrammarEditContext::from_workspace(workspace, self.root.clone(), limits)
+        let context = GrammarEditContext::from_workspace(workspace, limits)
             .map_err(code("edit_context_failed"))?;
         if context.expected_revision().as_str() != expected {
             return Err("stale_revision".to_owned());
         }
         let mut trace = EditPathTrace::default();
-        let runner_unavailable = self.snapshot_unavailable("trusted_edit_runner_unavailable");
-        let runner = self.check_runner.as_mut().ok_or(runner_unavailable)?;
         let mut syntax_executors = self.syntax_executors.iter_mut().collect::<Vec<_>>();
-        let feedback = self
-            .feedback
-            .as_ref()
-            .expect("trusted feedback was checked above");
-        let formatter = self
-            .formatter
-            .as_mut()
-            .map(|formatter| (&formatter.descriptor, &mut formatter.executor));
-        let services = NativeEditServices {
-            workspace_id: self.workspace_id.to_string(),
-            attempt,
-            feedback_database: &feedback.database,
-            build: &self.build,
-            temp: &self.temp,
-            diagnostic_adapters: &feedback.adapters,
-            feedback_limits: feedback.limits.clone(),
-            formatter,
-        };
-        let outcome = if let Some(ir) = ir {
+        let edit = if let Some(ir) = ir {
             EditOrchestrator::execute_native_ir(
                 ir,
                 &context,
@@ -1242,11 +1169,7 @@ impl NativeDispatcher {
                 &self.config,
                 &self.artifacts,
                 &self.live_cancellation,
-                &self.verification_registry,
-                runner,
-                &self.secrets,
                 &mut syntax_executors,
-                services,
                 &mut trace,
             )
         } else {
@@ -1258,96 +1181,52 @@ impl NativeDispatcher {
                 &self.config,
                 &self.artifacts,
                 &self.live_cancellation,
-                &self.verification_registry,
-                runner,
-                &self.secrets,
                 &mut syntax_executors,
-                services,
                 &mut trace,
             )
         }
         .map_err(native_edit_error)?;
-        match outcome {
-            NativeEditOutcome::Aborted { receipt, feedback } => {
-                let artifacts = vec![
-                    receipt.result_artifact.reference.clone(),
-                    feedback.payload_artifact.reference.clone(),
-                    feedback.report_artifact.reference.clone(),
-                ];
-                Ok((
-                    json!({
-                        "outcome": "aborted",
-                        "feedback": feedback.payload,
-                        "feedback_artifacts": {
-                            "payload_artifact": feedback.payload_artifact.reference,
-                            "report_artifact": feedback.report_artifact.reference,
-                        },
-                        "events": feedback.events,
-                        "trace": trace.ids(),
-                        "verification": receipt,
-                    }),
-                    artifacts,
-                    false,
-                ))
-            }
-            NativeEditOutcome::Committed { edit, feedback } => {
-                self.index = None;
-                self.structure_graph_key = None;
-                self.history_graph_key = None;
-                self.unified_graph = None;
-                self.structural_previews.clear();
-                let receipt = edit.verification_receipt();
-                let change_diff = std::str::from_utf8(edit.change_diff())
-                    .expect("materialized textual change diff is UTF-8");
-                let diff_artifact = json!({
-                    "reference": edit.diff_artifact_reference().to_string(),
-                    "digest": edit.diff_artifact_digest().to_string(),
-                    "media_type": "text/x-diff; charset=utf-8",
-                    "class": "diff",
-                    "provenance": {
-                        "principal_id": self.grants.principal_id(),
-                        "project_id": self.grants.project_id(),
-                        "transaction_id": edit.transaction_id(),
-                        "revision_id": edit.revision().id(),
-                    },
-                });
-                let artifacts = vec![
-                    edit.diff_artifact_reference().to_string(),
-                    receipt.result_artifact.reference.clone(),
-                    feedback.payload_artifact.reference.clone(),
-                    feedback.report_artifact.reference.clone(),
-                ];
-                Ok((
-                    json!({
-                        "outcome": if edit.committed_with_cancel_race() {
-                            "committed_with_cancel_race"
-                        } else {
-                            "committed"
-                        },
-                        "diff_artifact": diff_artifact,
-                        "diff_preview": edit.diff_preview(),
-                        "change_diff": change_diff,
-                        "change_diff_complete": edit.change_diff_complete(),
-                        "feedback": feedback.payload,
-                        "feedback_artifacts": {
-                            "payload_artifact": feedback.payload_artifact.reference,
-                            "report_artifact": feedback.report_artifact.reference,
-                        },
-                        "events": feedback.events,
-                        "revision": {
-                            "digest": edit.revision().digest().to_string(),
-                            "epoch": edit.revision().epoch().to_string(),
-                            "id": edit.revision().id().to_string(),
-                        },
-                        "trace": trace.ids(),
-                        "transaction_id": edit.transaction_id(),
-                        "verification": receipt,
-                    }),
-                    artifacts,
-                    true,
-                ))
-            }
-        }
+        self.index = None;
+        self.structure_graph_key = None;
+        self.history_graph_key = None;
+        self.unified_graph = None;
+        self.structural_previews.clear();
+        let change_diff = std::str::from_utf8(edit.change_diff())
+            .expect("materialized textual change diff is UTF-8");
+        let diff_artifact = json!({
+            "reference": edit.diff_artifact_reference().to_string(),
+            "digest": edit.diff_artifact_digest().to_string(),
+            "media_type": "text/x-diff; charset=utf-8",
+            "class": "diff",
+            "provenance": {
+                "principal_id": self.grants.principal_id(),
+                "project_id": self.grants.project_id(),
+                "transaction_id": edit.transaction_id(),
+                "revision_id": edit.revision().id(),
+            },
+        });
+        let artifacts = vec![edit.diff_artifact_reference().to_string()];
+        Ok((
+            json!({
+                "outcome": if edit.committed_with_cancel_race() {
+                    "committed_with_cancel_race"
+                } else {
+                    "committed"
+                },
+                "diff_artifact": diff_artifact,
+                "diff_preview": edit.diff_preview(),
+                "change_diff": change_diff,
+                "change_diff_complete": edit.change_diff_complete(),
+                "revision": {
+                    "digest": edit.revision().digest().to_string(),
+                    "epoch": edit.revision().epoch().to_string(),
+                    "id": edit.revision().id().to_string(),
+                },
+                "trace": trace.ids(),
+                "transaction_id": edit.transaction_id(),
+            }),
+            artifacts,
+        ))
     }
 
     fn resolve_structural_preview(
@@ -1582,7 +1461,7 @@ impl NativeDispatcher {
         input: RunInput,
         _attempt: crate::domain::lifecycle::AttemptOwnership,
     ) -> Result<(Value, Vec<String>), String> {
-        let command = crate::executor::check::CheckCommand::new(
+        let command = crate::executor::run_conformance::RunCommand::new(
             "native-run",
             input.argv[0].clone(),
             input.argv[1..].to_vec(),
@@ -1592,19 +1471,16 @@ impl NativeDispatcher {
             input.limits,
         )
         .map_err(code("run_request_rejected"))?;
-        let source_digest = crate::executor::check::immutable_tree_digest(&self.root)
+        let source_digest = crate::executor::run_conformance::immutable_tree_digest(&self.root)
             .map_err(code("run_tree_failed"))?;
         let completion = self
             .run_runner
             .as_mut()
             .expect("test run runner was checked")
-            .execute(crate::executor::check::CheckExecutionRequest {
+            .execute(crate::executor::run_conformance::RunExecutionRequest {
                 command: &command,
                 immutable_source: &self.root,
                 source_digest: &source_digest,
-                build: &self.build,
-                temp: &self.temp,
-                max_preview_bytes: 16 * 1024,
                 artifacts: &self.artifacts,
                 principal: &self.authenticated.principal_id().to_string(),
                 project: &self.config.project_id().to_string(),
@@ -1612,7 +1488,6 @@ impl NativeDispatcher {
                 stored_at_unix_micros: crate::store::artifacts::now_unix_micros()
                     .map_err(code("artifact_clock_unavailable"))?,
                 secrets: &self.secrets,
-                more_boundaries: false,
             })
             .map_err(|_| {
                 if self.cancelled() {
@@ -1627,8 +1502,8 @@ impl NativeDispatcher {
         Ok((
             json!({
                 "outcome": match completion.status {
-                    crate::executor::check::CheckStatus::Pass => json!({"status": "success", "exit_code": 0}),
-                    crate::executor::check::CheckStatus::Exit(code) => json!({"status": "exit", "exit_code": code}),
+                    crate::executor::run_conformance::RunStatus::Pass => json!({"status": "success", "exit_code": 0}),
+                    crate::executor::run_conformance::RunStatus::Exit(code) => json!({"status": "exit", "exit_code": code}),
                 },
                 "process": completion.process,
                 "process_artifact": process,
@@ -1636,152 +1511,6 @@ impl NativeDispatcher {
                 "stdout_artifact": stdout,
             }),
             vec![stdout, stderr, process],
-        ))
-    }
-
-    fn check(
-        &mut self,
-        bytes: &[u8],
-        attempt: crate::domain::lifecycle::AttemptOwnership,
-    ) -> Result<(Value, Vec<String>), String> {
-        self.ensure_not_cancelled()?;
-        let input: CheckInput = decode(bytes)?;
-        if input.profile == CheckProfile::Targeted && input.targets.is_empty() {
-            return Err("check_targets_required".to_owned());
-        }
-        if input.profile == CheckProfile::Full
-            && !self
-                .config
-                .effective_authority()
-                .contains(&Grant::VerificationFull)
-        {
-            return Err("verification_full_grant_required".to_owned());
-        }
-        if self.verification_registry.is_empty() {
-            return Err("trusted_check_registry_unavailable".to_owned());
-        }
-        if self.check_runner.is_none() {
-            return Err(self.snapshot_unavailable("trusted_check_runner_unavailable"));
-        }
-        let feedback = self
-            .feedback
-            .as_ref()
-            .ok_or_else(|| "trusted_check_feedback_unavailable".to_owned())?
-            .clone();
-        if feedback.adapters.is_empty() {
-            return Err("trusted_check_feedback_unavailable".to_owned());
-        }
-        let selection = match input.profile {
-            CheckProfile::Syntax => ProfileSelection::Syntax,
-            CheckProfile::Fast => ProfileSelection::Fast,
-            CheckProfile::Targeted => ProfileSelection::Targeted {
-                exact_targets: input.targets.into_iter().collect(),
-            },
-            CheckProfile::Full => ProfileSelection::Full,
-        };
-        if self
-            .verification_registry
-            .select_native(&selection, &self.grants, &self.config)
-            .map_err(code("check_profile_rejected"))?
-            .is_empty()
-        {
-            return Err("check_profile_empty".to_owned());
-        }
-        let revision = self
-            .ensure_workspace()?
-            .current_revision()
-            .map_err(code("check_tree_failed"))?;
-        let plan_digest = format!("blake3:{}", blake3::hash(bytes).to_hex());
-        let context = crate::workspace::edit::validate::EditOperationContext::current(
-            revision.id().to_string(),
-            revision.epoch().to_string(),
-            revision.digest().to_string(),
-            plan_digest,
-        );
-        let authority = crate::verify::feedback::FeedbackAuthority::issue(
-            &self.authenticated,
-            self.workspace_id.to_string(),
-            self.config.run_id().to_string(),
-            context.selected_plan_digest(),
-            attempt.fencing_token.get(),
-        )
-        .map_err(code("check_feedback_authority_unavailable"))?;
-        let mut events = crate::verify::feedback::FeedbackEventStore::open(&feedback.database)
-            .map_err(code("check_feedback_store_unavailable"))?;
-        let mut observer = crate::verify::feedback::FeedbackVerificationObserver::from_context(
-            &mut events,
-            &authority,
-            &context,
-            context.base_workspace_digest(),
-        );
-        let runner = self
-            .check_runner
-            .as_mut()
-            .ok_or_else(|| "trusted_check_runner_unavailable".to_owned())?;
-        let result = crate::verify::profiles::verify_current(
-            &context,
-            &self.root,
-            &self.build,
-            &self.temp,
-            BTreeSet::new(),
-            crate::verify::profiles::VerificationRequest {
-                selection,
-                registry: &self.verification_registry,
-                authenticated: &self.authenticated,
-                grants: &self.grants,
-                config: &self.config,
-                runner: Some(runner),
-                observer: Some(&mut observer),
-                artifacts: &self.artifacts,
-                secrets: &self.secrets,
-                on_check_failure: crate::verify::profiles::CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: Some(&self.live_cancellation),
-            },
-            false,
-        )
-        .map_err(code("check_execution_failed"))?;
-        drop(observer);
-        let feedback_output = {
-            let mut pipeline = crate::verify::feedback::FeedbackPipeline::new(
-                &self.artifacts,
-                &mut events,
-                &self.authenticated,
-                self.workspace_id.to_string(),
-                ArtifactRetention::Forever,
-                crate::store::artifacts::now_unix_micros()
-                    .map_err(code("artifact_clock_unavailable"))?,
-                &self.secrets,
-                feedback.limits.clone(),
-            )
-            .map_err(code("check_feedback_unavailable"))?;
-            let baseline = pipeline
-                .capture_baseline(&authority, &context, &result, &feedback.adapters)
-                .map_err(code("check_feedback_unavailable"))?;
-            pipeline
-                .process_result(
-                    &authority,
-                    Some(&baseline),
-                    &context,
-                    context.base_workspace_digest(),
-                    &result,
-                    &crate::verify::feedback::EditMapping::default(),
-                    &feedback.adapters,
-                )
-                .map_err(code("check_feedback_unavailable"))?
-        };
-        let artifacts = vec![
-            result.receipt().result_artifact.reference.clone(),
-            feedback_output.payload_artifact.reference.clone(),
-            feedback_output.report_artifact.reference.clone(),
-        ];
-        Ok((
-            json!({
-                "feedback": feedback_output.payload,
-                "events": feedback_output.events,
-                "verification": result,
-            }),
-            artifacts,
         ))
     }
 
@@ -1852,12 +1581,8 @@ fn native_edit_error(
             let _ = error;
             "edit_stage_failed"
         }
-        EditOrchestrationError::Verification(_) | EditOrchestrationError::VerificationRejected => {
-            "edit_verification_failed"
-        }
         EditOrchestrationError::Cancelled => "cancelled",
         EditOrchestrationError::Recovery(_) => "edit_recovery_failed",
-        EditOrchestrationError::Feedback(_) => "edit_feedback_failed",
     }
     .to_owned()
 }
@@ -2273,22 +1998,6 @@ enum MountPolicy {
 enum NetworkPolicy {
     Deny,
     ProfileGrants,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CheckInput {
-    profile: CheckProfile,
-    targets: Vec<String>,
-}
-
-#[derive(Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum CheckProfile {
-    Syntax,
-    Fast,
-    Targeted,
-    Full,
 }
 
 fn bounded_discover_options() -> DiscoverOptions {
@@ -3169,38 +2878,35 @@ mod tests {
             lifecycle::{AttemptOwnership, FencingToken, ProcessClaim, ProcessOwnership},
         },
         executor::{
-            check::{CheckCommand, ConformanceCheck},
             profile::{ExecutorProfile, ProfileSpec, ResourceLimits, TrustTier},
+            run_conformance::{ConformanceRun, RunConformanceRunner},
         },
         runtime::scheduler::{budget::RunBudget, reserve::BudgetLedger},
         test_support,
-        verify::{
-            lsp::{
-                facts::{
-                    FactLimits, LspWorkspaceSnapshot, OpenDocument, SnapshotFile,
-                    normalize_semantic_locations,
-                },
-                session::{
-                    CodecLimits, DocumentVersion, ExecutionProfileIdentity, LaunchRequest,
-                    LspCodec, LspSessionManager, OwnedLspLauncher, OwnedLspTransport,
-                    PositionEncoding, ResponseDisposition, RevisionPolicy, SendContext,
-                    ServerIdentity, SessionLimits, SessionPurpose, SessionScope, TransportError,
-                },
+        verify::lsp::{
+            facts::{
+                FactLimits, LspWorkspaceSnapshot, OpenDocument, SnapshotFile,
+                normalize_semantic_locations,
             },
-            profiles::{CheckClass, CheckRequirement, DeclaredCheck, VerificationRegistry},
+            session::{
+                CodecLimits, DocumentVersion, ExecutionProfileIdentity, LaunchRequest, LspCodec,
+                LspSessionManager, OwnedLspLauncher, OwnedLspTransport, PositionEncoding,
+                ResponseDisposition, RevisionPolicy, SendContext, ServerIdentity, SessionLimits,
+                SessionPurpose, SessionScope, TransportError,
+            },
         },
         workspace::{edit::ir::EditLimits, index::meta::IndexOptions},
     };
 
     use super::*;
 
-    fn dispatcher(runner: Option<CheckRunner>) -> (PathBuf, NativeDispatcher) {
-        dispatcher_with_semantic(runner, |_, _| (Vec::new(), None))
+    fn dispatcher() -> (PathBuf, NativeDispatcher) {
+        dispatcher_with_semantic(|_, _| (Vec::new(), None))
     }
 
     #[test]
     fn native_pages_cannot_reconstruct_any_secret_representation_split() {
-        let (directory, dispatcher) = dispatcher(None);
+        let (directory, dispatcher) = dispatcher();
         let custody = crate::domain::secret::SecretCustody::new([Arc::new(
             crate::domain::secret::SecretLease::new("cross-frame"),
         )]);
@@ -3241,7 +2947,7 @@ mod tests {
 
     #[test]
     fn native_reads_share_projection_state_across_content_and_later_paths() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         std::fs::write(dispatcher.root.join("first"), "cross-").unwrap();
         std::fs::write(dispatcher.root.join("read"), "").unwrap();
         dispatcher.custody.register(
@@ -3273,7 +2979,7 @@ mod tests {
 
     #[test]
     fn native_read_cursor_replays_exactly_and_rejects_a_different_range() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         std::fs::write(dispatcher.root.join("fragment"), "cross-").unwrap();
         dispatcher.custody.register(
             "read-cursor-test",
@@ -3369,7 +3075,6 @@ mod tests {
     }
 
     fn dispatcher_with_semantic(
-        runner: Option<CheckRunner>,
         evidence: impl FnOnce(
             &Path,
             &Path,
@@ -3410,45 +3115,6 @@ mod tests {
             .unwrap();
         let authenticated =
             AuthenticatedPrincipal::from_grants(GrantSnapshot::new(principal, project, grants));
-        let command = CheckCommand::new(
-            "diagnostics",
-            "cargo",
-            vec!["check".to_owned()],
-            "example.invalid/check@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            ResourceLimits::new(1_000, 1024 * 1024, 8, 1024, 1024, 1024, 1024, 1_000),
-        )
-        .unwrap();
-        let typecheck = CheckCommand::new(
-            "typecheck",
-            "cargo",
-            vec!["check".to_owned()],
-            "example.invalid/check@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            ResourceLimits::new(1_000, 1024 * 1024, 8, 1024, 1024, 1024, 1024, 1_000),
-        )
-        .unwrap();
-        let registry = VerificationRegistry::new(vec![
-            DeclaredCheck::new(
-                CheckClass::Diagnostics,
-                command,
-                CheckRequirement::Required,
-                BTreeSet::new(),
-                false,
-            )
-            .unwrap(),
-            DeclaredCheck::new(
-                CheckClass::Typecheck,
-                typecheck,
-                CheckRequirement::Required,
-                BTreeSet::new(),
-                false,
-            )
-            .unwrap(),
-        ])
-        .unwrap();
         let mut dispatcher = NativeDispatcher::open(
             root,
             &scratch,
@@ -3467,8 +3133,6 @@ mod tests {
                 cancellation: SqliteCancellationCoordinator::new(directory.join("state.sqlite3")),
                 live_cancellation: Arc::new(AtomicBool::new(false)),
                 container_image: None,
-                verification_registry: registry,
-                check_runner: runner,
                 acquisition_failure: None,
                 custody: crate::domain::secret::SecretCustody::default(),
                 secrets: Vec::new(),
@@ -3489,22 +3153,6 @@ mod tests {
                         crate::executor::syntax::DebugSyntaxAction::Pass(None),
                     ),
                 ],
-                formatter_required: false,
-                formatter: None,
-                feedback: Some(NativeFeedbackRuntime {
-                    database: directory.join("feedback.sqlite3"),
-                    adapters: BTreeMap::from([
-                        (
-                            "diagnostics".to_owned(),
-                            crate::verify::feedback::DiagnosticAdapter::NormalizedJsonLinesV1,
-                        ),
-                        (
-                            "typecheck".to_owned(),
-                            crate::verify::feedback::DiagnosticAdapter::NormalizedJsonLinesV1,
-                        ),
-                    ]),
-                    limits: crate::verify::feedback::FeedbackLimits::default(),
-                }),
                 semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
@@ -3785,7 +3433,7 @@ mod tests {
 
     #[test]
     fn native_history_uses_real_git_and_reuses_provider_without_hooks() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         let root = directory.join("source");
         let git = |arguments: &[&str]| {
             let output = Command::new("/usr/bin/git")
@@ -3880,7 +3528,7 @@ mod tests {
 
     #[test]
     fn native_discover_map_ranks_syntax_and_returns_real_containment_without_semantic_claims() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         std::fs::write(
             directory.join("source/lib.rs"),
             "fn parent() { fn child() {} }\nfn unrelated() {}\n",
@@ -4041,7 +3689,7 @@ mod tests {
 
     #[test]
     fn native_discover_builds_and_reuses_real_cargo_structure_graphs() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         let source = directory.join("source");
         std::fs::create_dir_all(source.join("src")).unwrap();
         std::fs::create_dir_all(source.join("helper/src")).unwrap();
@@ -4154,7 +3802,7 @@ mod tests {
     #[test]
     fn native_discover_map_uses_normalized_runtime_semantic_evidence() {
         let (directory, mut dispatcher) =
-            dispatcher_with_semantic(None, normalized_native_semantic_relationship);
+            dispatcher_with_semantic(normalized_native_semantic_relationship);
         let publisher = dispatcher.semantic_evidence.clone();
         let agent_native_runtime = dispatcher.semantic_evidence.clone();
         let http_native_service = dispatcher.semantic_evidence.clone();
@@ -4270,7 +3918,7 @@ mod tests {
 
     #[test]
     fn native_map_budget_relationship_and_cursor_failures_are_typed() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         std::fs::write(
             directory.join("source/lib.rs"),
             "fn one() {}\nfn two() {}\nfn three() {}\n",
@@ -4439,7 +4087,7 @@ mod tests {
 
     #[test]
     fn native_search_structural_rewrite_returns_bound_apply_without_writing() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         let source = directory.join("source/lib.rs");
         std::fs::write(&source, "fn main() { let value = Some(1); }\n").unwrap();
         let revision = dispatcher.revision().unwrap();
@@ -4503,13 +4151,7 @@ mod tests {
 
     #[test]
     fn structural_preview_token_is_scoped_single_use_and_returns_the_same_change_diff_string() {
-        let runner = CheckRunner::conformance([
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-        ]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
+        let (directory, mut dispatcher) = dispatcher();
         std::fs::write(
             directory.join("source/lib.rs"),
             "fn main() { let value = Some(1); }\n",
@@ -4541,8 +4183,8 @@ mod tests {
         dispatcher.authenticated = owner;
         let input = serde_json::to_vec(&json!({"preview_token": token})).unwrap();
         let owner_attempt = attempt(&dispatcher);
-        let (result, _, committed) = dispatcher.edit(&input, owner_attempt).unwrap();
-        assert!(committed);
+        let (result, _) = dispatcher.edit(&input, owner_attempt).unwrap();
+        assert_eq!(result["outcome"], "committed");
         assert!(result["change_diff"].is_string());
         assert_eq!(result["change_diff"], change_diff);
         assert_eq!(
@@ -4557,14 +4199,8 @@ mod tests {
     }
 
     #[test]
-    fn identity_preview_has_no_token_and_expired_or_formatter_divergent_tokens_are_consumed() {
-        let runner = CheckRunner::conformance([
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-        ]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
+    fn identity_preview_has_no_token_and_expired_tokens_are_consumed() {
+        let (directory, mut dispatcher) = dispatcher();
         let source = directory.join("source/lib.rs");
         std::fs::write(&source, "fn main() { let value = Some(1); }\n").unwrap();
         let revision = dispatcher.revision().unwrap();
@@ -4603,37 +4239,9 @@ mod tests {
             Err("structural_preview_invalid".to_owned())
         );
 
-        let preview = changed_structural_preview(&mut dispatcher);
-        let token = preview["rewrite"]["apply"]["preview_token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let path = crate::workspace::edit::ir::RootRelativePath::parse("lib.rs", 4096).unwrap();
-        dispatcher.formatter_required = true;
-        dispatcher.formatter = Some(NativeFormatterRuntime {
-            descriptor: crate::workspace::edit::format::FormatterDescriptor::new(
-                "rustfmt",
-                "test",
-                vec![path],
-            )
-            .unwrap(),
-            executor: test_support::formatter_executor(test_support::FormatterTestAction::Rewrite(
-                "lib.rs".to_owned(),
-                b"fn main() { let value = Ok( 1 ); }\n".to_vec(),
-            )),
-        });
-        let input = serde_json::to_vec(&json!({"preview_token": token})).unwrap();
-        assert_eq!(
-            dispatcher.edit(&input, attempt(&dispatcher)),
-            Err("edit_recovery_failed".to_owned())
-        );
         assert_eq!(
             std::fs::read_to_string(&source).unwrap(),
             "fn main() { let value = Some(1); }\n"
-        );
-        assert_eq!(
-            dispatcher.edit(&input, attempt(&dispatcher)),
-            Err("structural_preview_invalid".to_owned())
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -4731,16 +4339,12 @@ mod tests {
                     "limits":{"cpu_millis":1000,"memory_bytes":1048576,"pids":8,"file_bytes":1048576,"disk_bytes":1048576,"io_bytes":1048576,"output_bytes":65536,"wall_time_millis":1000}
                 }),
             ),
-            (
-                "kit_check".to_owned(),
-                json!({"profile":"fast","targets":[]}),
-            ),
         ]
     }
 
     #[test]
     fn native_workspace_index_retains_tree_for_incremental_revision() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         let first_revision = dispatcher.revision().unwrap();
         let (workspace, first_index) = dispatcher.workspace_index(&first_revision).unwrap();
         assert_eq!(dispatcher.syntax_index.metrics().full_parses, 1);
@@ -4903,35 +4507,16 @@ mod tests {
         )
     }
 
-    fn configure_formatter(dispatcher: &mut NativeDispatcher) {
-        let path =
-            crate::workspace::edit::ir::RootRelativePath::parse("format.json", 4096).unwrap();
-        dispatcher.formatter_required = true;
-        dispatcher.formatter = Some(NativeFormatterRuntime {
-            descriptor: crate::workspace::edit::format::FormatterDescriptor::new(
-                "route-formatter",
-                "v1",
-                vec![path],
-            )
-            .unwrap(),
-            executor: test_support::formatter_executor(test_support::FormatterTestAction::Rewrite(
-                "format.json".to_owned(),
-                b"{\n  \"x\": 1\n}\n".to_vec(),
-            )),
-        });
-    }
-
     async fn exercise_provider_route<M: ModelAdapter>(
         model: M,
         captured: thread::JoinHandle<Vec<Value>>,
         directory: PathBuf,
         mut dispatcher: NativeDispatcher,
     ) {
-        dispatcher.run_runner = Some(CheckRunner::conformance([ConformanceCheck::pass(
+        dispatcher.run_runner = Some(RunConformanceRunner::conformance([ConformanceRun::pass(
             b"run-output",
             b"",
         )]));
-        configure_formatter(&mut dispatcher);
         let revision = dispatcher.revision().unwrap();
         let inputs = native_inputs(&revision);
         let principal = dispatcher.authenticated.principal_id();
@@ -4973,7 +4558,7 @@ mod tests {
         let bindings = configured
             .iter()
             .map(|(descriptor, constraints)| {
-                let binding = ToolBinding::new(
+                ToolBinding::new(
                     descriptor.spec().clone(),
                     descriptor.identity().clone(),
                     descriptor.normalized_schema().clone(),
@@ -4984,14 +4569,7 @@ mod tests {
                     descriptor.reservation(),
                     descriptor.retry_safety(),
                     descriptor.approval(),
-                );
-                if descriptor.tool() == NativeTool::Check {
-                    binding.with_cost_estimator(|_| {
-                        Ok(crate::runtime::scheduler::limits::Spend::new(0, 0, 0, 1, 2))
-                    })
-                } else {
-                    binding
-                }
+                )
             })
             .collect::<Vec<_>>();
         let database = directory.join("route.sqlite3");
@@ -5107,21 +4685,21 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(outputs.len(), 6);
+        assert_eq!(outputs.len(), 5);
         assert!(outputs.iter().all(|output| {
             output["version"] == 1 && output["truncated"] == false && output["artifacts"].is_array()
         }));
-        assert_eq!(budget.totals().committed.tools(), 6);
-        assert_eq!(budget.totals().committed.processes(), 3);
+        assert_eq!(budget.totals().committed.tools(), 5);
+        assert_eq!(budget.totals().committed.processes(), 1);
         let restarted =
             crate::agent::executor::tool_budget_from_events(&events, &snapshot).unwrap();
-        assert_eq!(restarted.remaining().tools(), 250);
-        assert_eq!(restarted.remaining().processes(), 253);
+        assert_eq!(restarted.remaining().tools(), 251);
+        assert_eq!(restarted.remaining().processes(), 255);
         assert!(
             restarted
                 .reserve(
                     crate::runtime::scheduler::reserve::ReservationId::new(1),
-                    crate::runtime::scheduler::limits::Spend::new(0, 0, 0, 251, 0),
+                    crate::runtime::scheduler::limits::Spend::new(0, 0, 0, 252, 0),
                 )
                 .is_err()
         );
@@ -5129,22 +4707,17 @@ mod tests {
             restarted
                 .reserve(
                     crate::runtime::scheduler::reserve::ReservationId::new(2),
-                    crate::runtime::scheduler::limits::Spend::new(0, 0, 0, 0, 254),
+                    crate::runtime::scheduler::limits::Spend::new(0, 0, 0, 0, 256),
                 )
                 .is_err()
         );
         let durable = serde_json::to_string(&outputs).unwrap();
         assert_eq!(
             std::fs::read_to_string(directory.join("source/format.json")).unwrap(),
-            "{\n  \"x\": 1\n}\n",
+            "{\"x\":1}\n",
             "{durable}"
         );
-        for evidence in [
-            "diff_artifact",
-            "feedback",
-            "process_artifact",
-            "verification",
-        ] {
+        for evidence in ["diff_artifact", "process_artifact"] {
             assert!(
                 durable.contains(evidence),
                 "missing route evidence: {evidence}"
@@ -5155,8 +4728,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_streamed_aliases_reach_native_dispatch_through_the_agent_loop() {
-        let checks = (0..6).map(|_| ConformanceCheck::pass(b"", b""));
-        let (directory, mut dispatcher) = dispatcher(Some(CheckRunner::conformance(checks)));
+        let (directory, mut dispatcher) = dispatcher();
         let revision = dispatcher.revision().unwrap();
         let inputs = native_inputs(&revision);
         let (url, captured) = protocol_server(vec![
@@ -5179,8 +4751,7 @@ mod tests {
 
     #[tokio::test]
     async fn completions_streamed_aliases_reach_native_dispatch_through_the_agent_loop() {
-        let checks = (0..6).map(|_| ConformanceCheck::pass(b"", b""));
-        let (directory, mut dispatcher) = dispatcher(Some(CheckRunner::conformance(checks)));
+        let (directory, mut dispatcher) = dispatcher();
         let revision = dispatcher.revision().unwrap();
         let inputs = native_inputs(&revision);
         let (url, captured) = protocol_server(vec![
@@ -5199,33 +4770,6 @@ mod tests {
         .await;
     }
 
-    #[test]
-    fn trusted_check_runner_returns_bounded_artifacts() {
-        let runner = CheckRunner::conformance([
-            ConformanceCheck::pass(b"ok", b""),
-            ConformanceCheck::pass(b"ok", b""),
-        ]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
-        let owner = attempt(&dispatcher);
-        let (value, artifacts) = dispatcher
-            .check(br#"{"profile":"fast","targets":[]}"#, owner)
-            .unwrap();
-        assert_eq!(value["verification"]["checks"][0]["status"], "pass");
-        assert_eq!(artifacts.len(), 3);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn absent_trusted_check_runner_is_typed_unavailable() {
-        let (directory, mut dispatcher) = dispatcher(None);
-        let owner = attempt(&dispatcher);
-        assert_eq!(
-            dispatcher.check(br#"{"profile":"fast","targets":[]}"#, owner),
-            Err("trusted_check_runner_unavailable".to_owned())
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
     fn all_bytes(path: &Path) -> Vec<u8> {
         let mut bytes = Vec::new();
         if path.is_dir() {
@@ -5240,11 +4784,11 @@ mod tests {
 
     #[test]
     fn cancellation_during_native_run_reaps_the_protocol_service() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         let cancellation = Arc::clone(&dispatcher.live_cancellation);
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        dispatcher.run_runner = Some(CheckRunner::conformance([
-            ConformanceCheck::CancelWhenSignalled {
+        dispatcher.run_runner = Some(RunConformanceRunner::conformance([
+            ConformanceRun::CancelWhenSignalled {
                 entered: entered_tx,
                 cancellation: Arc::clone(&cancellation),
             },
@@ -5271,88 +4815,8 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_during_each_native_check_child_reaps_with_zero_survivors() {
-        for child in 0..2 {
-            let (directory, mut dispatcher) = dispatcher(None);
-            let cancellation = Arc::clone(&dispatcher.live_cancellation);
-            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-            let mut checks = Vec::new();
-            if child == 1 {
-                checks.push(ConformanceCheck::pass(b"first", b""));
-            }
-            checks.push(ConformanceCheck::CancelWhenSignalled {
-                entered: entered_tx,
-                cancellation: Arc::clone(&cancellation),
-            });
-            dispatcher.check_runner = Some(CheckRunner::conformance(checks));
-            let owner = attempt(&dispatcher);
-            let result = thread::scope(|scope| {
-                let worker = scope
-                    .spawn(move || dispatcher.check(br#"{"profile":"fast","targets":[]}"#, owner));
-                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                cancellation.store(true, Ordering::Release);
-                worker.join().unwrap()
-            });
-            let (result, artifacts) = result.unwrap();
-            assert_eq!(result["verification"]["decision"], "abort");
-            assert_eq!(
-                result["verification"]["checks"][child]["status"],
-                "cancelled"
-            );
-            assert!(result["verification"]["checks"][child]["process_artifact"].is_string());
-            assert_eq!(artifacts.len(), 3);
-            let evidence = String::from_utf8_lossy(&all_bytes(&directory)).into_owned();
-            assert!(
-                evidence.contains("\"kill_attempted\":true"),
-                "child {child}"
-            );
-            assert!(evidence.contains("\"reaped\":true"), "child {child}");
-            assert!(evidence.contains("\"survivors\":0"), "child {child}");
-            assert!(
-                evidence.contains("\"phase\":\"quiescent\""),
-                "child {child}"
-            );
-            std::fs::remove_dir_all(directory).unwrap();
-        }
-    }
-
-    #[test]
-    fn native_edit_aborts_without_required_verification_services() {
-        let (directory, mut dispatcher) = dispatcher(None);
-        let revision = dispatcher.revision().unwrap();
-        let input = serde_json::to_vec(&json!({
-            "version": 1,
-            "expected_revision": revision,
-            "operations": [{
-                "op": "add_file",
-                "path": "created.txt",
-                "content": {
-                    "encoding": "utf8",
-                    "newline": "lf",
-                    "text": "never materialized",
-                    "final_newline": true
-                },
-                "executable": false
-            }]
-        }))
-        .unwrap();
-        assert_eq!(
-            dispatcher.edit(&input, attempt(&dispatcher)),
-            Err("trusted_edit_runner_unavailable".to_owned())
-        );
-        assert!(!dispatcher.root.join("created.txt").exists());
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn native_edit_uses_configured_check_runner_before_materialization() {
-        let runner = CheckRunner::conformance([
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-        ]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
+    fn native_edit_commits_through_the_checkless_pipeline() {
+        let (directory, mut dispatcher) = dispatcher();
         let revision = dispatcher.revision().unwrap();
         let input = serde_json::to_vec(&json!({
             "version": 1,
@@ -5371,27 +4835,20 @@ mod tests {
         }))
         .unwrap();
         let owner = attempt(&dispatcher);
-        let (result, artifacts, committed) = dispatcher.edit(&input, owner).unwrap();
+        let (result, artifacts) = dispatcher.edit(&input, owner).unwrap();
         assert_eq!(
             std::fs::read_to_string(dispatcher.root.join("created.txt")).unwrap(),
             "verified\n"
         );
-        assert!(!result["verification"].is_null());
+        assert_eq!(result["outcome"], "committed");
         assert!(result["change_diff"].is_string());
-        assert!(artifacts.len() >= 2);
-        assert!(committed);
+        assert_eq!(artifacts.len(), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn native_empty_edit_creates_no_recovery_state_or_workspace_revision() {
-        let runner = CheckRunner::conformance([
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-            ConformanceCheck::pass(b"diagnostics", b""),
-            ConformanceCheck::pass(b"typecheck", b""),
-        ]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
+        let (directory, mut dispatcher) = dispatcher();
         let revision = dispatcher.revision().unwrap();
         let input = serde_json::to_vec(&json!({
             "version": 1,
@@ -5410,57 +4867,8 @@ mod tests {
     }
 
     #[test]
-    fn native_edit_returns_feedback_and_preserves_revision_on_new_required_diagnostic() {
-        let diagnostic = serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "path": "created.txt",
-            "range": {"start_line": 1, "start_column": 1, "end_line": 1, "end_column": 2},
-            "code": "E1",
-            "message": "new diagnostic",
-            "severity": "error",
-            "tool": "test"
-        }))
-        .unwrap();
-        let runner = CheckRunner::conformance([
-            ConformanceCheck::pass(b"", b""),
-            ConformanceCheck::pass(b"", b""),
-            ConformanceCheck::exit(1, diagnostic, b"failed"),
-            ConformanceCheck::pass(b"", b""),
-        ]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
-        let revision = dispatcher.revision().unwrap();
-        let input = serde_json::to_vec(&json!({
-            "version": 1,
-            "expected_revision": revision,
-            "operations": [{
-                "op": "add_file",
-                "path": "created.txt",
-                "content": {
-                    "encoding": "utf8",
-                    "newline": "lf",
-                    "text": "rejected",
-                    "final_newline": true
-                },
-                "executable": false
-            }]
-        }))
-        .unwrap();
-        let owner = attempt(&dispatcher);
-        let (result, artifacts, committed) = dispatcher.edit(&input, owner).unwrap();
-        assert_eq!(result["outcome"], "aborted");
-        assert!(!result["feedback"]["items"].as_array().unwrap().is_empty());
-        assert_eq!(result["events"].as_array().unwrap().len(), 6);
-        assert_eq!(artifacts.len(), 3);
-        assert!(!committed);
-        assert!(!dispatcher.root.join("created.txt").exists());
-        assert_eq!(dispatcher.revision().unwrap(), revision);
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn native_edit_rejects_missing_required_trusted_services_before_staging() {
-        let runner = CheckRunner::conformance([]);
-        let (directory, mut dispatcher) = dispatcher(Some(runner));
+    fn native_edit_rejects_missing_syntax_executors_before_staging() {
+        let (directory, mut dispatcher) = dispatcher();
         let revision = dispatcher.revision().unwrap();
         let input = serde_json::to_vec(&json!({
             "version": 1,
@@ -5474,10 +4882,10 @@ mod tests {
         }))
         .unwrap();
         let owner = attempt(&dispatcher);
-        dispatcher.feedback = None;
+        dispatcher.syntax_executors = Vec::new();
         assert_eq!(
             dispatcher.edit(&input, owner),
-            Err("trusted_edit_feedback_unavailable".to_owned())
+            Err("trusted_edit_syntax_unavailable".to_owned())
         );
         assert!(!dispatcher.root.join("created.txt").exists());
         std::fs::remove_dir_all(directory).unwrap();
@@ -5485,7 +4893,7 @@ mod tests {
 
     #[test]
     fn cancellation_and_hard_run_limits_stop_before_effects() {
-        let (directory, mut dispatcher) = dispatcher(None);
+        let (directory, mut dispatcher) = dispatcher();
         dispatcher.live_cancellation.store(true, Ordering::Release);
         assert_eq!(
             dispatcher.run(

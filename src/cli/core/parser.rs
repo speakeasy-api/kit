@@ -1031,14 +1031,13 @@ fn repo(
                 "read" => NativeTool::Read,
                 "edit" => NativeTool::Edit,
                 "run" => NativeTool::Run,
-                "check" => NativeTool::Check,
                 _ => unreachable!(),
             };
             RepoRequest::invoke(
                 required_id(matches, "project", "project-id", "--project")?,
                 tool,
                 repo_input_source(string(matches, "input-file")),
-                matches!(tool, NativeTool::Edit | NativeTool::Run | NativeTool::Check)
+                matches!(tool, NativeTool::Edit | NativeTool::Run)
                     .then(|| required_key(idempotency_key)),
             )
         }

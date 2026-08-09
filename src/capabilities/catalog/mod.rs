@@ -1363,10 +1363,6 @@ fn native_search(descriptor: &NativeToolDescriptor) -> Result<CatalogSearch, Cat
             "Run an explicit bounded process.",
             &["run", "process", "command", "argv"],
         ),
-        crate::capabilities::native::NativeTool::Check => (
-            "Run trusted verification profiles.",
-            &["check", "test", "lint", "verification"],
-        ),
     };
     CatalogSearch::new(summary, terms.iter().copied())
 }

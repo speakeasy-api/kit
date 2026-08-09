@@ -47,11 +47,7 @@ use crate::{
         },
         lifecycle::{AttemptOwnership, FencingToken},
     },
-    executor::{
-        cancel::{SqliteCancellationCoordinator, WorkspaceIdentity},
-        check::CheckRunner,
-        process::own::ProcessRegistryRegistration,
-    },
+    executor::{cancel::SqliteCancellationCoordinator, process::own::ProcessRegistryRegistration},
     runtime::daemon::ControlPlaneAuthority,
     store::{
         artifacts::{
@@ -131,13 +127,6 @@ pub const REPO_ROUTES: &[RouteDescriptor] = &[
         "POST",
         "/v1/projects/{project_id}/repository/run",
         "repo.run",
-        true,
-        true,
-    ),
-    route(
-        "POST",
-        "/v1/projects/{project_id}/repository/check",
-        "repo.check",
         true,
         true,
     ),
@@ -281,16 +270,9 @@ pub struct NativeRepoOptions {
     pub process_registration: ProcessRegistryRegistration,
     pub cancellation: SqliteCancellationCoordinator,
     pub container_image: Option<String>,
-    pub verification_registry: crate::verify::profiles::VerificationRegistry,
-    pub formatter: Option<crate::workspace::edit::format::FormatterDescriptor>,
-    pub formatter_required: bool,
-    pub diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-    pub feedback_limits: crate::verify::feedback::FeedbackLimits,
     pub edit_validation_time: Duration,
     pub cursor_key: [u8; 32],
     pub capability_extensions: crate::capabilities::extensions::SharedCapabilityExtensionRegistry,
-    #[cfg(debug_assertions)]
-    pub check_completions: Vec<crate::executor::check::ConformanceCheck>,
 }
 
 struct NativeRepoState {
@@ -303,7 +285,6 @@ struct NativeRepoWorker {
     authority: ControlPlaneAuthority,
     provider: Provider,
     workspace_id: WorkspaceId,
-    verification_registry: crate::verify::profiles::VerificationRegistry,
     state: Arc<Mutex<NativeRepoState>>,
     cancellations: Arc<Mutex<BTreeMap<String, Arc<AtomicBool>>>>,
     scheduled: Arc<Mutex<BTreeSet<String>>>,
@@ -319,7 +300,6 @@ impl Clone for NativeRepoWorker {
             authority: self.authority.clone(),
             provider: self.provider,
             workspace_id: self.workspace_id,
-            verification_registry: self.verification_registry.clone(),
             state: Arc::clone(&self.state),
             cancellations: Arc::clone(&self.cancellations),
             scheduled: Arc::clone(&self.scheduled),
@@ -338,10 +318,6 @@ pub struct NativeRepoService {
 struct AvailabilityProbe {
     root: PathBuf,
     image: Option<String>,
-    registry: crate::verify::profiles::VerificationRegistry,
-    feedback_configured: bool,
-    formatter: Option<crate::workspace::edit::format::FormatterDescriptor>,
-    formatter_required: bool,
     syntax_available: bool,
     mechanical_executor: bool,
     cached: Option<AvailabilitySnapshot>,
@@ -601,37 +577,14 @@ impl NativeRepoService {
             WriterPolicy::Restricted,
         ))
         .map_err(|error| error.to_string())?;
-        let registry_missing = options.verification_registry.is_empty();
-        let feedback_missing = options.diagnostic_adapters.is_empty();
+        // Debug-only escape hatch mirroring the executor path: KIT_FAKE_SYNTAX=pass
+        // swaps in always-passing syntax executors and marks the executor as
+        // mechanical so readiness does not require a container runtime.
         #[cfg(debug_assertions)]
-        let mechanical_executor = !options.check_completions.is_empty();
+        let mechanical_executor = std::env::var("KIT_FAKE_SYNTAX").as_deref() == Ok("pass");
         #[cfg(not(debug_assertions))]
         let mechanical_executor = false;
-        let check_runner = (!registry_missing).then(|| {
-            #[cfg(debug_assertions)]
-            if !options.check_completions.is_empty() {
-                return CheckRunner::conformance(options.check_completions.clone());
-            }
-            CheckRunner::registered_attempt_container(
-                attempt,
-                options.cancellation.clone(),
-                WorkspaceIdentity::from_acquisition(workspace_id, &acquisition),
-                options.process_registration.clone(),
-            )
-        });
-        let formatter_descriptor = options.formatter.clone();
-        let formatter = options.formatter.map(|descriptor| {
-            crate::capabilities::native::dispatch::NativeFormatterRuntime {
-                descriptor,
-                executor:
-                    crate::executor::formatter::FormatterExecutor::registered_attempt_container(
-                        attempt,
-                        options.cancellation.clone(),
-                        WorkspaceIdentity::from_acquisition(workspace_id, &acquisition),
-                        options.process_registration.clone(),
-                    ),
-            }
-        });
+        let _ = &attempt;
         let mut syntax_executors = vec![
             crate::executor::syntax::SyntaxExecutor::production(
                 "text",
@@ -647,7 +600,7 @@ impl NativeRepoService {
             ),
         ];
         #[cfg(debug_assertions)]
-        if !options.check_completions.is_empty() {
+        if mechanical_executor {
             syntax_executors = vec![
                 crate::executor::syntax::SyntaxExecutor::debug(
                     "text",
@@ -670,15 +623,10 @@ impl NativeRepoService {
         let availability = AvailabilityProbe {
             root: root.clone(),
             image: options.container_image.clone(),
-            registry: options.verification_registry.clone(),
-            feedback_configured: !feedback_missing,
-            formatter: formatter_descriptor,
-            formatter_required: options.formatter_required,
             syntax_available,
             mechanical_executor,
             cached: None,
         };
-        let verification_registry = options.verification_registry.clone();
         let mut dispatcher = crate::capabilities::native::dispatch::NativeDispatcher::open(
             root,
             &scratch,
@@ -693,21 +641,10 @@ impl NativeRepoService {
                 cancellation: options.cancellation,
                 live_cancellation: Arc::new(AtomicBool::new(false)),
                 container_image: options.container_image,
-                verification_registry: options.verification_registry,
-                check_runner,
                 acquisition_failure: None,
                 custody: authority.secret_custody(),
                 secrets: Vec::new(),
                 syntax_executors,
-                formatter_required: options.formatter_required,
-                formatter,
-                feedback: Some(
-                    crate::capabilities::native::dispatch::NativeFeedbackRuntime {
-                        database: options.database.clone(),
-                        adapters: options.diagnostic_adapters,
-                        limits: options.feedback_limits,
-                    },
-                ),
                 semantic_evidence: semantic_evidence.clone(),
                 edit_validation_time: options.edit_validation_time,
                 cursor_key: options.cursor_key,
@@ -726,7 +663,6 @@ impl NativeRepoService {
             authority: authority.clone(),
             provider: options.provider,
             workspace_id,
-            verification_registry,
             state,
             cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             scheduled: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1045,14 +981,7 @@ impl NativeRepoWorker {
                 &grants,
             )
             .map_err(|_| RepoError::Internal)?;
-        let reservation = descriptor
-            .estimate_reservation(
-                &input,
-                &self.verification_registry,
-                principal.grant_snapshot(),
-                &config,
-            )
-            .map_err(|_| RepoError::Invalid("body"))?;
+        let reservation = descriptor.reservation();
         let input = serde_json::to_vec(&input).map_err(|_| RepoError::Invalid("body"))?;
         let request_digest = canonical_request_digest(
             "repository.invoke",
@@ -1882,14 +1811,8 @@ fn map_invoke_error(error: crate::capabilities::kernel::invoke::InvokeError) -> 
 impl AvailabilityProbe {
     fn configured(&self, tool: NativeTool) -> bool {
         match tool {
-            NativeTool::Discover | NativeTool::Search | NativeTool::Read => true,
-            NativeTool::Edit => {
-                !self.registry.is_empty()
-                    && self.feedback_configured
-                    && (!self.formatter_required || self.formatter.is_some())
-            }
+            NativeTool::Discover | NativeTool::Search | NativeTool::Read | NativeTool::Edit => true,
             NativeTool::Run => self.image.is_some(),
-            NativeTool::Check => !self.registry.is_empty() && self.feedback_configured,
         }
     }
 
@@ -1913,28 +1836,8 @@ impl AvailabilityProbe {
                 mark(tool, "trusted_workspace_unavailable");
             }
         }
-        if self.registry.is_empty() {
-            mark(NativeTool::Edit, "trusted_edit_registry_unavailable");
-            mark(NativeTool::Check, "trusted_check_registry_unavailable");
-        }
-        if !self.feedback_configured {
-            mark(NativeTool::Edit, "trusted_edit_feedback_unavailable");
-            mark(NativeTool::Check, "trusted_check_feedback_unavailable");
-        }
-        if self.formatter_required && self.formatter.is_none() {
-            mark(NativeTool::Edit, "trusted_edit_formatter_unavailable");
-        }
         if !self.syntax_available {
             mark(NativeTool::Edit, "trusted_edit_syntax_unavailable");
-        }
-        if self.formatter.is_some()
-            && !self.mechanical_executor
-            && !crate::executor::formatter::FormatterExecutor::production_available()
-        {
-            mark(
-                NativeTool::Edit,
-                "trusted_edit_formatter_platform_unavailable",
-            );
         }
         let image_digest = self.image.as_deref().and_then(pinned_image_digest);
         if self.image.is_none() {
@@ -1953,31 +1856,9 @@ impl AvailabilityProbe {
                     {
                         mark(NativeTool::Run, "trusted_run_image_unavailable");
                     }
-                    for check in self.registry.checks() {
-                        if image_availability.get(check.command().image()) != Some(&true) {
-                            mark(NativeTool::Edit, "trusted_edit_check_image_unavailable");
-                            mark(NativeTool::Check, "trusted_check_image_unavailable");
-                        }
-                    }
-                    if let Some(formatter) = &self.formatter {
-                        match formatter.command() {
-                            Some(command)
-                                if image_availability.get(command.image()) != Some(&true) =>
-                            {
-                                mark(NativeTool::Edit, "trusted_edit_formatter_image_unavailable");
-                            }
-                            None => mark(
-                                NativeTool::Edit,
-                                "trusted_edit_formatter_command_unavailable",
-                            ),
-                            Some(_) => {}
-                        }
-                    }
                 }
                 Err(_) => {
-                    for tool in [NativeTool::Edit, NativeTool::Run, NativeTool::Check] {
-                        mark(tool, "trusted_executor_helper_unavailable");
-                    }
+                    mark(NativeTool::Run, "trusted_executor_helper_unavailable");
                 }
             }
         }
@@ -2035,51 +1916,12 @@ impl AvailabilityProbe {
                 bytes.push(available as u8);
             }
         }
-        for check in self.registry.checks() {
-            bytes.extend_from_slice(check.command().id().as_bytes());
-            bytes.extend_from_slice(check.command().image().as_bytes());
-            bytes.extend_from_slice(check.command().program().as_bytes());
-            bytes.extend_from_slice(check.command().tool_digest().as_bytes());
-            bytes.extend_from_slice(check.command().config_digest().as_bytes());
-        }
-        if let Some(formatter) = &self.formatter {
-            bytes.extend_from_slice(formatter.id().as_bytes());
-            bytes.extend_from_slice(formatter.version().as_bytes());
-            if let Some(command) = formatter.command() {
-                bytes.extend_from_slice(command.image().as_bytes());
-                bytes.extend_from_slice(command.program().as_bytes());
-                bytes.extend_from_slice(command.requested_binary_digest().as_bytes());
-                bytes.extend_from_slice(command.requested_config_digest().as_bytes());
-            }
-        }
-        bytes.extend_from_slice(&[
-            (!self.registry.is_empty()) as u8,
-            self.feedback_configured as u8,
-            self.formatter.is_some() as u8,
-            self.formatter_required as u8,
-            self.syntax_available as u8,
-            self.mechanical_executor as u8,
-        ]);
+        bytes.extend_from_slice(&[self.syntax_available as u8, self.mechanical_executor as u8]);
         blake3::hash(&bytes).to_hex().to_string()
     }
 
     fn dependency_images(&self) -> BTreeSet<String> {
-        self.image
-            .iter()
-            .cloned()
-            .chain(
-                self.registry
-                    .checks()
-                    .iter()
-                    .map(|check| check.command().image().to_owned()),
-            )
-            .chain(
-                self.formatter
-                    .iter()
-                    .filter_map(|formatter| formatter.command())
-                    .map(|command| command.image().to_owned()),
-            )
-            .collect()
+        self.image.iter().cloned().collect()
     }
 }
 
@@ -2716,28 +2558,6 @@ fn put_report(
     }))
 }
 
-fn referenced_artifact(
-    artifacts: &ArtifactStore,
-    operation: &RepositoryOperation,
-    reference: Option<&str>,
-    kind: &str,
-) -> Result<Value, RepoError> {
-    let Some(reference) = reference else {
-        return Ok(Value::Null);
-    };
-    let artifact = ArtifactReference::parse(reference)
-        .ok()
-        .and_then(|reference| artifacts.open_reference(reference).ok())
-        .filter(|artifact| {
-            artifact.manifest().principal == operation.principal.principal_id().to_string()
-                && artifact.manifest().project == operation.project.to_string()
-        });
-    Ok(artifact.map_or(Value::Null, |artifact| json!({
-        "reference":reference,"digest":artifact.digest().to_string(),"media_type":artifact.manifest().media_type,"size":artifact.manifest().size,
-        "provenance":{"kind":kind,"operation_id":operation.id,"native_result_id":operation.id,"principal_id":operation.principal.principal_id(),"project_id":operation.project},
-    })))
-}
-
 fn referenced_diff_artifact(
     artifacts: &ArtifactStore,
     operation: &RepositoryOperation,
@@ -2844,31 +2664,13 @@ fn explicit_artifacts(
     events: Value,
 ) -> Result<Value, RepoError> {
     let output = output.unwrap_or(&Value::Null);
-    let verification = output
-        .get("data")
-        .and_then(|value| value.get("verification"))
-        .or_else(|| output.get("verification"));
-    let feedback = output
-        .get("data")
-        .and_then(|value| value.get("feedback_artifacts"))
-        .or_else(|| output.get("feedback_artifacts"));
     let diff = output
         .get("data")
         .and_then(|value| value.get("diff_artifact"))
         .or_else(|| output.get("diff_artifact"));
-    let receipt = verification
-        .and_then(|value| value.pointer("/result_artifact/reference"))
-        .and_then(Value::as_str);
-    let logs = verification
-        .and_then(|value| value.pointer("/stdout_artifacts/0/reference"))
-        .and_then(Value::as_str);
     Ok(json!({
         "repository_result":Value::Null,
         "actual_diff":referenced_diff_artifact(artifacts,operation,diff)?,
-        "verification_receipt":referenced_artifact(artifacts,operation,receipt,"verification_receipt")?,
-        "verification_logs":referenced_artifact(artifacts,operation,logs,"verification_logs")?,
-        "feedback_payload":referenced_artifact(artifacts,operation,feedback.and_then(|value| value.get("payload_artifact")).and_then(Value::as_str),"feedback_payload")?,
-        "feedback_report":referenced_artifact(artifacts,operation,feedback.and_then(|value| value.get("report_artifact")).and_then(Value::as_str),"feedback_report")?,
         "edit_events":events,
         "cost":cost,
     }))
@@ -3050,7 +2852,7 @@ fn reconcile_operation_metadata_row(
     connection
         .execute(
             "UPDATE repository_operations SET reservation_processes=1
-             WHERE result_id=?1 AND tool IN ('run','check') AND reservation_processes=0",
+             WHERE result_id=?1 AND tool='run' AND reservation_processes=0",
             [id],
         )
         .map_err(map_sql_error)?;
@@ -3506,7 +3308,6 @@ pub fn routes(service: Arc<dyn RepoService>) -> Router {
         .route("/v1/projects/{project_id}/repository/read", post(read))
         .route("/v1/projects/{project_id}/repository/edit", post(edit))
         .route("/v1/projects/{project_id}/repository/run", post(run))
-        .route("/v1/projects/{project_id}/repository/check", post(check))
         .route("/v1/repository-results/{result_id}", get(result))
         .route("/v1/repository-results/{result_id}/events", get(events))
         .route(
@@ -3583,7 +3384,6 @@ invoke_handler!(search, NativeTool::Search, false);
 invoke_handler!(read, NativeTool::Read, false);
 invoke_handler!(edit, NativeTool::Edit, true);
 invoke_handler!(run, NativeTool::Run, true);
-invoke_handler!(check, NativeTool::Check, true);
 
 async fn result(
     Extension(service): Extension<Arc<dyn RepoService>>,
@@ -3905,17 +3705,10 @@ mod tests {
                 ),
                 cancellation: SqliteCancellationCoordinator::new(&database),
                 container_image: None,
-                verification_registry: crate::verify::profiles::VerificationRegistry::empty(),
-                formatter: None,
-                formatter_required: false,
-                diagnostic_adapters: BTreeMap::new(),
-                feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
                 edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                     .max_validation_time,
                 cursor_key: [7; 32],
                 capability_extensions: Arc::new(std::sync::RwLock::new(Default::default())),
-                #[cfg(debug_assertions)]
-                check_completions: Vec::new(),
             },
             ControlPlaneAuthority::for_test(),
             evidence.clone(),
@@ -5553,10 +5346,6 @@ mod tests {
         let mut probe = AvailabilityProbe {
             root: root.clone(),
             image: None,
-            registry: crate::verify::profiles::VerificationRegistry::empty(),
-            feedback_configured: true,
-            formatter: None,
-            formatter_required: false,
             syntax_available: true,
             mechanical_executor: true,
             cached: None,
@@ -5598,10 +5387,6 @@ mod tests {
         let probe = AvailabilityProbe {
             root: root.clone(),
             image: Some(references[0].clone()),
-            registry: crate::verify::profiles::VerificationRegistry::empty(),
-            feedback_configured: true,
-            formatter: None,
-            formatter_required: false,
             syntax_available: true,
             mechanical_executor: true,
             cached: None,

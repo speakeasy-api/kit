@@ -26,7 +26,10 @@ pub(crate) use unavailable::recover_pending;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use unavailable::{materialize, materialize_with_hook};
 
-pub const RECOVERY_MANIFEST_VERSION: u16 = 1;
+// Version 2 removed the embedded container-check verification receipt and its
+// artifact leases from the durable manifest/ledger; version-1 manifests are
+// rejected rather than misparsed.
+pub const RECOVERY_MANIFEST_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryPosition {
@@ -80,7 +83,6 @@ pub struct MaterializedEdit {
     diff_preview: Vec<u8>,
     change_diff: Vec<u8>,
     change_diff_complete: bool,
-    verification: crate::verify::profiles::VerificationReceipt,
     committed_with_cancel_race: bool,
 }
 
@@ -111,10 +113,6 @@ impl MaterializedEdit {
 
     pub const fn change_diff_complete(&self) -> bool {
         self.change_diff_complete
-    }
-
-    pub fn verification_receipt(&self) -> &crate::verify::profiles::VerificationReceipt {
-        &self.verification
     }
 
     pub const fn committed_with_cancel_race(&self) -> bool {
@@ -427,7 +425,6 @@ pub(crate) fn result(
     diff_preview: Vec<u8>,
     change_diff: Vec<u8>,
     change_diff_complete: bool,
-    verification: crate::verify::profiles::VerificationReceipt,
 ) -> MaterializedEdit {
     MaterializedEdit {
         transaction_id,
@@ -437,7 +434,6 @@ pub(crate) fn result(
         diff_preview,
         change_diff,
         change_diff_complete,
-        verification,
         committed_with_cancel_race: false,
     }
 }

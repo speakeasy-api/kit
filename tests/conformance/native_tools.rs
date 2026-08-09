@@ -35,7 +35,7 @@ use kit::{
     },
 };
 
-fn catalog() -> &'static [kit::capabilities::native::NativeToolDescriptor; 6] {
+fn catalog() -> &'static [kit::capabilities::native::NativeToolDescriptor; 5] {
     NativeCatalog::all()
 }
 
@@ -96,9 +96,9 @@ fn protocol_fake(response: serde_json::Value) -> (String, thread::JoinHandle<ser
     (format!("http://{address}"), handle)
 }
 
-fn assert_six_specs(body: serde_json::Value, anthropic: bool) {
+fn assert_native_specs(body: serde_json::Value, anthropic: bool) {
     let tools = body["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 5);
     let names = tools
         .iter()
         .map(|tool| {
@@ -119,7 +119,7 @@ fn assert_six_specs(body: serde_json::Value, anthropic: bool) {
 }
 
 #[tokio::test]
-async fn actual_provider_request_builders_receive_all_six_native_specs() {
+async fn actual_provider_request_builders_receive_all_native_specs() {
     let anthropic_response = serde_json::json!({
         "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
         "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
@@ -144,7 +144,7 @@ async fn actual_provider_request_builders_receive_all_six_native_specs() {
         .unwrap();
     let mut turn = session.begin_turn(request(), None).await.unwrap();
     assert!(turn.next_event(None).await.unwrap().is_some());
-    assert_six_specs(captured.join().unwrap(), true);
+    assert_native_specs(captured.join().unwrap(), true);
 
     let (url, captured) = protocol_fake(completion_response.clone());
     let adapter = OpenAIAdapter::new(
@@ -159,7 +159,7 @@ async fn actual_provider_request_builders_receive_all_six_native_specs() {
         .unwrap();
     let mut turn = session.begin_turn(request(), None).await.unwrap();
     assert!(turn.next_event(None).await.unwrap().is_some());
-    assert_six_specs(captured.join().unwrap(), false);
+    assert_native_specs(captured.join().unwrap(), false);
 
     let (url, captured) = protocol_fake(completion_response.clone());
     let adapter = OpenRouterAdapter::new(
@@ -174,7 +174,7 @@ async fn actual_provider_request_builders_receive_all_six_native_specs() {
         .unwrap();
     let mut turn = session.begin_turn(request(), None).await.unwrap();
     assert!(turn.next_event(None).await.unwrap().is_some());
-    assert_six_specs(captured.join().unwrap(), false);
+    assert_native_specs(captured.join().unwrap(), false);
 
     let (url, captured) = protocol_fake(completion_response);
     let adapter = OllamaAdapter::new(
@@ -189,12 +189,12 @@ async fn actual_provider_request_builders_receive_all_six_native_specs() {
         .unwrap();
     let mut turn = session.begin_turn(request(), None).await.unwrap();
     assert!(turn.next_event(None).await.unwrap().is_some());
-    assert_six_specs(captured.join().unwrap(), false);
+    assert_native_specs(captured.join().unwrap(), false);
 }
 
 #[test]
 fn tool_surface_few() {
-    assert_eq!(catalog().len(), 6);
+    assert_eq!(catalog().len(), 5);
 }
 
 #[test]
@@ -288,10 +288,6 @@ fn every_native_boundary_rejects_schema_invalid_input() {
         ),
         (NativeTool::Edit, serde_json::json!({"unexpected":true})),
         (NativeTool::Run, serde_json::json!({"argv":[]})),
-        (
-            NativeTool::Check,
-            serde_json::json!({"profile":"arbitrary","targets":[]}),
-        ),
     ];
     for (tool, input) in invalid {
         let descriptor = catalog().iter().find(|entry| entry.tool() == tool).unwrap();
@@ -866,9 +862,4 @@ fn eager_tool_edit() {
 #[test]
 fn eager_tool_run() {
     eager(NativeTool::Run);
-}
-
-#[test]
-fn eager_tool_check() {
-    eager(NativeTool::Check);
 }

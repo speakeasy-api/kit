@@ -16,9 +16,8 @@ use std::{
 };
 
 use kit::{
-    api::auth::contract::{AuthenticatedPrincipal, GrantSnapshot},
+    api::auth::contract::AuthenticatedPrincipal,
     domain::{
-        config::RunConfigSnapshot,
         events::ContentDigest,
         ids::{PrincipalId, ProjectId},
     },
@@ -30,7 +29,7 @@ use kit::{
                 RootRelativePath, TextContent,
             },
             recovery::{MaterializeOptions, RecoveryError, RecoveryPoint, materialize_with_hook},
-            stage::{StageLimits, VerificationOutcome, stage},
+            stage::{StageLimits, stage},
             validate::{validate, validate_authorized},
         },
         revision::{ManagedWorkspace, RevisionOptions},
@@ -45,8 +44,6 @@ struct Fixture {
     principal: PrincipalId,
     project: ProjectId,
     authenticated: AuthenticatedPrincipal,
-    grants: GrantSnapshot,
-    config: RunConfigSnapshot,
 }
 
 impl Fixture {
@@ -70,7 +67,7 @@ impl Fixture {
         let workspace = ManagedWorkspace::open(&workspace_path).unwrap();
         let principal = PrincipalId::generate().unwrap();
         let project = ProjectId::generate().unwrap();
-        let (authenticated, grants, config) =
+        let (authenticated, _grants, _config) =
             kit::test_support::trusted_verification_context(principal, project);
         Self {
             root,
@@ -80,8 +77,6 @@ impl Fixture {
             principal,
             project,
             authenticated,
-            grants,
-            config,
         }
     }
 
@@ -109,7 +104,7 @@ impl Fixture {
         assert_after(&self.workspace_path);
     }
 
-    fn raw_stage(&self) -> kit::workspace::edit::stage::StagedEdit<'_> {
+    fn stage(&self) -> kit::workspace::edit::stage::StagedEdit<'_> {
         let revision = self.workspace.current_revision().unwrap().id();
         let ir = edit_ir(revision);
         let plan = validate_authorized(
@@ -119,38 +114,7 @@ impl Fixture {
             kit::test_support::trusted_edit_authority(self.principal, self.project),
         )
         .unwrap();
-        stage(plan, StageLimits::default(), &[], &mut [], None).unwrap()
-    }
-
-    fn stage(&self) -> kit::workspace::edit::stage::VerifiedStagedEdit<'_> {
-        self.verify(self.raw_stage())
-    }
-
-    fn verify<'a>(
-        &'a self,
-        staged: kit::workspace::edit::stage::StagedEdit<'a>,
-    ) -> kit::workspace::edit::stage::VerifiedStagedEdit<'a> {
-        let registry = kit::verify::profiles::VerificationRegistry::empty();
-        match staged
-            .verify(kit::verify::profiles::VerificationRequest {
-                selection: kit::verify::profiles::ProfileSelection::None,
-                registry: &registry,
-                authenticated: &self.authenticated,
-                grants: &self.grants,
-                config: &self.config,
-                runner: None,
-                observer: None,
-                artifacts: &self.artifacts,
-                secrets: &[],
-                on_check_failure: kit::verify::profiles::CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: None,
-            })
-            .unwrap()
-        {
-            VerificationOutcome::Commit(verified) => verified,
-            VerificationOutcome::Abort(_) => panic!("empty verification profile aborted"),
-        }
+        stage(plan, StageLimits::default(), &[], &mut []).unwrap()
     }
 }
 
@@ -346,7 +310,6 @@ fn digest(value: &[u8]) -> ContentDigest {
 fn materialization_commits_exact_tree_and_authenticated_actual_diff() {
     let fixture = Fixture::new();
     let staged = fixture.stage();
-    let receipt = staged.verification_receipt().clone();
     let result = staged
         .materialize(&fixture.artifacts, fixture.options())
         .unwrap();
@@ -355,7 +318,6 @@ fn materialization_commits_exact_tree_and_authenticated_actual_diff() {
         fixture.workspace.current_revision().unwrap().id(),
         result.revision().id()
     );
-    assert_eq!(result.verification_receipt(), &receipt);
     let diff = fixture
         .artifacts
         .open_bytes(result.diff_artifact_digest())
@@ -376,14 +338,15 @@ fn materialization_commits_exact_tree_and_authenticated_actual_diff() {
 }
 
 #[test]
-fn rollback_and_rollforward_preserve_the_exact_verification_receipt() {
+fn rollback_and_rollforward_preserve_the_exact_stage_binding() {
     for (point, committed) in [
         (RecoveryPoint::AfterPreparedManifestSync, false),
         (RecoveryPoint::AfterRevisionCommit, true),
     ] {
         let fixture = Fixture::new();
         let staged = fixture.stage();
-        let expected = staged.verification_receipt().clone();
+        let expected_stage_digest = staged.state_digest().to_owned();
+        let expected_plan_digest = staged.plan_digest().to_owned();
         let result = materialize_with_hook(
             staged,
             &fixture.artifacts,
@@ -396,9 +359,13 @@ fn rollback_and_rollforward_preserve_the_exact_verification_receipt() {
                 .unwrap(),
         )
         .unwrap();
-        let actual: kit::verify::profiles::VerificationReceipt =
-            serde_json::from_value(manifest["verification"].clone()).unwrap();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            manifest["version"],
+            serde_json::json!(kit::workspace::edit::recovery::RECOVERY_MANIFEST_VERSION)
+        );
+        assert_eq!(manifest["stage_digest"], expected_stage_digest.as_str());
+        assert_eq!(manifest["plan_digest"], expected_plan_digest.as_str());
+        assert!(manifest.get("verification").is_none());
         fixture.workspace.current_revision().unwrap();
         if committed {
             fixture.assert_after();
@@ -409,7 +376,7 @@ fn rollback_and_rollforward_preserve_the_exact_verification_receipt() {
 }
 
 #[test]
-fn startup_recovery_rejects_a_substituted_verification_result() {
+fn startup_recovery_rejects_a_substituted_stage_digest() {
     let fixture = Fixture::new();
     let result = materialize_with_hook(
         fixture.stage(),
@@ -422,8 +389,7 @@ fn startup_recovery_rejects_a_substituted_verification_result() {
     let manifest_path = recovery_state_root(&fixture.root).join(".kit-edit-recovery.manifest");
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["verification"]["result_digest"] =
-        serde_json::Value::String(format!("blake3:{}", "a".repeat(64)));
+    manifest["stage_digest"] = serde_json::Value::String("tampered".to_owned());
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
     assert!(fixture.workspace.current_revision().is_err());
@@ -522,24 +488,10 @@ fn authority_budget_preview_and_minimum_retention_are_enforced() {
     let unauthenticated = Fixture::new();
     let ir = edit_ir(unauthenticated.workspace.current_revision().unwrap().id());
     let plan = validate(&unauthenticated.workspace, &ir, EditLimits::default()).unwrap();
-    let staged = stage(plan, StageLimits::default(), &[], &mut [], None).unwrap();
-    let registry = kit::verify::profiles::VerificationRegistry::empty();
+    let staged = stage(plan, StageLimits::default(), &[], &mut []).unwrap();
     assert!(
         staged
-            .verify(kit::verify::profiles::VerificationRequest {
-                selection: kit::verify::profiles::ProfileSelection::None,
-                registry: &registry,
-                authenticated: &unauthenticated.authenticated,
-                grants: &unauthenticated.grants,
-                config: &unauthenticated.config,
-                runner: None,
-                observer: None,
-                artifacts: &unauthenticated.artifacts,
-                secrets: &[],
-                on_check_failure: kit::verify::profiles::CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: None,
-            })
+            .materialize(&unauthenticated.artifacts, unauthenticated.options())
             .is_err()
     );
     unauthenticated.assert_before();
@@ -596,8 +548,6 @@ fn pending_recovery_lease_survives_retention_and_rollback_releases_it() {
     )
     .unwrap();
     let digest = ArtifactDigest::parse(manifest["diff_artifact"].as_str().unwrap()).unwrap();
-    let verification_digest =
-        ArtifactDigest::parse(manifest["verification"]["result_digest"].as_str().unwrap()).unwrap();
     let expired = Reachability {
         now_unix_micros: i64::MAX,
         orphan_grace_micros: 0,
@@ -605,17 +555,11 @@ fn pending_recovery_lease_survives_retention_and_rollback_releases_it() {
     };
     let pending_gc = fixture.artifacts.collect_garbage(&expired).unwrap();
     assert!(!pending_gc.deleted_artifacts.contains(&digest));
-    assert!(!pending_gc.deleted_artifacts.contains(&verification_digest));
 
     fixture.workspace.current_revision().unwrap();
     fixture.assert_before();
     let completed_gc = fixture.artifacts.collect_garbage(&expired).unwrap();
     assert!(completed_gc.deleted_artifacts.contains(&digest));
-    assert!(
-        completed_gc
-            .deleted_artifacts
-            .contains(&verification_digest)
-    );
 }
 
 #[test]
@@ -672,30 +616,7 @@ fn recovery_binds_a_custom_metadata_store_to_the_exact_workspace_root() {
         kit::test_support::trusted_edit_authority(principal, project),
     )
     .unwrap();
-    let staged = stage(plan, StageLimits::default(), &[], &mut [], None).unwrap();
-    let (authenticated, grants, config) =
-        kit::test_support::trusted_verification_context(principal, project);
-    let registry = kit::verify::profiles::VerificationRegistry::empty();
-    let staged = match staged
-        .verify(kit::verify::profiles::VerificationRequest {
-            selection: kit::verify::profiles::ProfileSelection::None,
-            registry: &registry,
-            authenticated: &authenticated,
-            grants: &grants,
-            config: &config,
-            runner: None,
-            observer: None,
-            artifacts: &artifacts,
-            secrets: &[],
-            on_check_failure: kit::verify::profiles::CheckFailureBehavior::Abort,
-            model_outcome: None,
-            cancellation: None,
-        })
-        .unwrap()
-    {
-        VerificationOutcome::Commit(verified) => verified,
-        VerificationOutcome::Abort(_) => panic!("empty verification profile aborted"),
-    };
+    let staged = stage(plan, StageLimits::default(), &[], &mut []).unwrap();
     let result = materialize_with_hook(
         staged,
         &artifacts,
@@ -747,11 +668,11 @@ fn recovery_binds_a_custom_metadata_store_to_the_exact_workspace_root() {
 #[test]
 fn concurrent_transactions_serialize_under_the_retained_guard() {
     let fixture = Fixture::new();
-    let first = fixture.raw_stage();
+    let first = fixture.stage();
     let finished = AtomicBool::new(false);
     thread::scope(|scope| {
         let second = scope.spawn(|| {
-            fixture.raw_stage().close().unwrap();
+            fixture.stage().close().unwrap();
             finished.store(true, Ordering::Release);
         });
         thread::sleep(Duration::from_millis(100));

@@ -1011,8 +1011,6 @@ paths:
     $ref: '#/components/pathItems/RepositoryEdit'
   /v1/projects/{project_id}/repository/run:
     $ref: '#/components/pathItems/RepositoryRun'
-  /v1/projects/{project_id}/repository/check:
-    $ref: '#/components/pathItems/RepositoryCheck'
   /v1/repository-results/{result_id}:
     get:
       operationId: getRepositoryResult
@@ -1271,22 +1269,6 @@ components:
           '409': {$ref: '#/components/responses/Problem'}
           '501': {$ref: '#/components/responses/Problem'}
           '503': {$ref: '#/components/responses/Problem'}
-    RepositoryCheck:
-      parameters:
-        - {$ref: '#/components/parameters/ProjectId'}
-        - {$ref: '#/components/parameters/IdempotencyKey'}
-      post:
-        operationId: checkRepository
-        tags: [Repository]
-        requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/RepositoryCheckInput'}}}}
-        responses:
-          '202': {$ref: '#/components/responses/RepositoryOperationAccepted'}
-          '400': {$ref: '#/components/responses/Problem'}
-          '401': {$ref: '#/components/responses/Unauthenticated'}
-          '404': {$ref: '#/components/responses/Problem'}
-          '409': {$ref: '#/components/responses/Problem'}
-          '501': {$ref: '#/components/responses/Problem'}
-          '503': {$ref: '#/components/responses/Problem'}
     ProjectEventStream:
       parameters:
         - $ref: '#/components/parameters/ProjectId'
@@ -1443,7 +1425,7 @@ components:
             type: object
             required: [name, provider_name, version, effect, input_schema, configured, available, unavailable_reasons, availability]
             properties:
-              name: {enum: [discover, search, read, edit, run, check]}
+              name: {enum: [discover, search, read, edit, run]}
               provider_name: {type: string}
               version: {type: string}
               effect: {enum: [workspace_read, workspace_write, process_spawn]}
@@ -1478,7 +1460,7 @@ components:
         id: {$ref: '#/components/schemas/RepositoryResultId'}
         native_operation_id: {$ref: '#/components/schemas/RepositoryResultId'}
         native_result_id: {$ref: '#/components/schemas/RepositoryResultId'}
-        operation: {type: string, pattern: '^repo\.(discover|search|read|edit|run|check)$'}
+        operation: {type: string, pattern: '^repo\.(discover|search|read|edit|run)$'}
         status: {enum: [queued, running, waiting_approval, completed, failed, cancelled, outcome_unknown, denied]}
         replayed: {type: boolean}
         approval: {$ref: '#/components/schemas/RepositoryApproval'}
@@ -2234,14 +2216,6 @@ components:
         io_bytes: {type: integer, minimum: 1}
         output_bytes: {type: integer, minimum: 1, maximum: 1048576}
         wall_time_millis: {type: integer, minimum: 1}
-      additionalProperties: false
-    RepositoryCheckInput:
-      $schema: https://json-schema.org/draft/2020-12/schema
-      type: object
-      required: [profile, targets]
-      properties:
-        profile: {enum: [syntax, fast, targeted, full]}
-        targets: {type: array, maxItems: 64, items: {type: string, minLength: 1, maxLength: 128}}
       additionalProperties: false
     ProcessId:
       $ref: './openapi.exec.yaml#/components/schemas/ProcessId'

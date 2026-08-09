@@ -32,7 +32,7 @@ use kit::{
 };
 
 #[test]
-fn forty_eight_native_bypass_attempts_have_zero_effects() {
+fn forty_native_bypass_attempts_have_zero_effects() {
     let principal = PrincipalId::generate().unwrap();
     let project = ProjectId::generate().unwrap();
     let workspace = WorkspaceId::generate().unwrap();
@@ -202,7 +202,7 @@ fn forty_eight_native_bypass_attempts_have_zero_effects() {
             );
         }
     }
-    assert_eq!(attempts, 48);
+    assert_eq!(attempts, 40);
     assert_eq!(effects.load(Ordering::SeqCst), 0);
     std::fs::remove_dir_all(directory).unwrap();
 }

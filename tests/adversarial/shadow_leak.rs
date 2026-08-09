@@ -127,7 +127,7 @@ impl Fixture {
             kit::test_support::trusted_edit_authority(self.principal, self.project),
         )
         .unwrap();
-        stage(plan, StageLimits::default(), &[], &mut [], None).unwrap()
+        stage(plan, StageLimits::default(), &[], &mut []).unwrap()
     }
 
     fn url(&self) -> Url {

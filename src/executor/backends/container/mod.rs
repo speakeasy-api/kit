@@ -1417,111 +1417,6 @@ where
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_mutation_overlay<I, S>(
-    profile: &ExecutorProfile,
-    source: &Path,
-    overlay: &Path,
-    build: &Path,
-    temp: &Path,
-    boundary_name: &str,
-    image: &str,
-    command: I,
-    formatter: FormatterExecutionRequest<'_>,
-) -> Result<ContainerPlan, ContainerError>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<OsString>,
-{
-    validate_supported_profile_mode(profile, true)?;
-    let evidence = probe_backend()?;
-    build_plan(
-        evidence,
-        PlanAuthority::TrustedProbe,
-        profile,
-        None,
-        Some((source, overlay)),
-        None,
-        build,
-        temp,
-        boundary_name,
-        image,
-        command,
-        None,
-        None,
-        Some(formatter),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_check<I, S>(
-    profile: &ExecutorProfile,
-    source: &Path,
-    build: &Path,
-    temp: &Path,
-    boundary_name: &str,
-    image: &str,
-    command: I,
-    check: CheckExecutionRequest<'_>,
-) -> Result<ContainerPlan, ContainerError>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<OsString>,
-{
-    validate_supported_profile(profile)?;
-    let evidence = probe_backend()?;
-    build_plan(
-        evidence,
-        PlanAuthority::TrustedProbe,
-        profile,
-        None,
-        None,
-        Some(source),
-        build,
-        temp,
-        boundary_name,
-        image,
-        command,
-        None,
-        None,
-        Some(check),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn preview_check<I, S>(
-    evidence: &ProbeRecord,
-    profile: &ExecutorProfile,
-    source: &Path,
-    build: &Path,
-    temp: &Path,
-    boundary_name: &str,
-    image: &str,
-    command: I,
-    check: CheckExecutionRequest<'_>,
-) -> Result<ContainerPlan, ContainerError>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<OsString>,
-{
-    build_plan(
-        record_for_preview(evidence),
-        PlanAuthority::Preview,
-        profile,
-        None,
-        None,
-        Some(source),
-        build,
-        temp,
-        boundary_name,
-        image,
-        command,
-        None,
-        None,
-        Some(check),
-    )
-}
-
 fn validate_trusted_input(
     path: &Path,
     mounts: &ValidatedMounts,
@@ -2130,6 +2025,7 @@ impl FormatterOutputRecord {
 }
 
 #[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 pub(crate) fn parse_check_output_for_test(
     stdout: &[u8],
     stderr: &[u8],

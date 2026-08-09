@@ -101,21 +101,6 @@ pub fn spawn_registered_test_process(
     crate::executor::process::own::spawn_owned(token, limits)
 }
 
-#[derive(Clone, Debug)]
-pub enum FormatterTestAction {
-    Pass,
-    Rewrite(String, Vec<u8>),
-    Delete(String),
-    Chmod(String, u32),
-    Symlink(String, String),
-    Exit(i32),
-    Timeout,
-    Output(usize),
-    SurvivingProcess,
-    ProvenanceMismatch,
-    MeasurementAbsent,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum SyntaxTestAction {
     Pass,
@@ -172,45 +157,6 @@ pub fn syntax_executor_with_capture(
         language,
         version,
         crate::executor::syntax::DebugSyntaxAction::Pass(Some(capture)),
-    )
-}
-
-pub fn formatter_executor(
-    action: FormatterTestAction,
-) -> crate::executor::formatter::FormatterExecutor {
-    use crate::executor::formatter::DebugFormatterAction as Action;
-
-    crate::executor::formatter::FormatterExecutor::debug(match action {
-        FormatterTestAction::Pass => Action::Pass,
-        FormatterTestAction::Rewrite(path, bytes) => Action::Rewrite(path, bytes),
-        FormatterTestAction::Delete(path) => Action::Delete(path),
-        FormatterTestAction::Chmod(path, mode) => Action::Chmod(path, mode),
-        FormatterTestAction::Symlink(path, target) => Action::Symlink(path, target),
-        FormatterTestAction::Exit(code) => Action::Exit(code),
-        FormatterTestAction::Timeout => Action::Timeout,
-        FormatterTestAction::Output(bytes) => Action::Output(bytes),
-        FormatterTestAction::SurvivingProcess => Action::SurvivingProcess,
-        FormatterTestAction::ProvenanceMismatch => Action::ProvenanceMismatch,
-        FormatterTestAction::MeasurementAbsent => Action::MeasurementAbsent,
-    })
-}
-
-pub fn formatter_executor_gate() -> (
-    crate::executor::formatter::FormatterExecutor,
-    std::sync::mpsc::Receiver<()>,
-    std::sync::mpsc::SyncSender<()>,
-) {
-    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-    (
-        crate::executor::formatter::FormatterExecutor::debug(
-            crate::executor::formatter::DebugFormatterAction::Gate {
-                entered: entered_tx,
-                release: release_rx,
-            },
-        ),
-        entered_rx,
-        release_tx,
     )
 }
 

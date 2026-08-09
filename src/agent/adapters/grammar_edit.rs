@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::{fmt, future::Future, path::Path, pin::Pin};
+use std::{fmt, future::Future, pin::Pin};
 
 use agentkit_core::{FinishReason, Item, ItemKind, MetadataMap, Part, TurnCancellation};
 use agentkit_loop::{
@@ -38,7 +37,6 @@ const GRAMMAR_EDIT_CONTRACT_METADATA: &str = "kit.grammar_edit.contract";
 #[derive(Clone)]
 pub struct GrammarEditContext {
     workspace: crate::workspace::revision::ManagedWorkspace,
-    root: std::path::PathBuf,
     normalization: NormalizationContext,
     workspace_digest: String,
 }
@@ -59,7 +57,6 @@ impl GrammarEditContext {
             .map_err(|error| GrammarEditError::Workspace(error.to_string()))?;
         Ok(Self {
             workspace,
-            root,
             normalization: NormalizationContext::new(expected_revision, limits),
             workspace_digest: revision.digest().to_string(),
         })
@@ -67,7 +64,6 @@ impl GrammarEditContext {
 
     pub(crate) fn from_workspace(
         workspace: crate::workspace::revision::ManagedWorkspace,
-        root: std::path::PathBuf,
         limits: EditLimits,
     ) -> Result<Self, GrammarEditError> {
         let revision = workspace
@@ -77,7 +73,6 @@ impl GrammarEditContext {
             .map_err(|error| GrammarEditError::Workspace(error.to_string()))?;
         Ok(Self {
             workspace,
-            root,
             normalization: NormalizationContext::new(expected_revision, limits),
             workspace_digest: revision.digest().to_string(),
         })
@@ -651,31 +646,6 @@ pub(crate) fn normalize_accepted(
 
 pub(crate) struct EditOrchestrator;
 
-pub(crate) struct NativeEditServices<'a> {
-    pub workspace_id: String,
-    pub attempt: crate::domain::lifecycle::AttemptOwnership,
-    pub feedback_database: &'a Path,
-    pub build: &'a Path,
-    pub temp: &'a Path,
-    pub diagnostic_adapters: &'a BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-    pub feedback_limits: crate::verify::feedback::FeedbackLimits,
-    pub formatter: Option<(
-        &'a crate::workspace::edit::format::FormatterDescriptor,
-        &'a mut crate::executor::formatter::FormatterExecutor,
-    )>,
-}
-
-pub(crate) enum NativeEditOutcome {
-    Committed {
-        edit: Box<crate::workspace::edit::recovery::MaterializedEdit>,
-        feedback: crate::verify::feedback::FeedbackOutput,
-    },
-    Aborted {
-        receipt: Box<crate::verify::profiles::VerificationReceipt>,
-        feedback: crate::verify::feedback::FeedbackOutput,
-    },
-}
-
 impl EditOrchestrator {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute(
@@ -698,13 +668,8 @@ impl EditOrchestrator {
             grants,
             config,
             artifacts,
+            None,
             syntax_executors,
-            Some(output.evidence()),
-            None,
-            &crate::verify::profiles::VerificationRegistry::empty(),
-            crate::verify::profiles::ProfileSelection::None,
-            None,
-            &[],
             trace,
         )
     }
@@ -718,13 +683,9 @@ impl EditOrchestrator {
         config: &RunConfigSnapshot,
         artifacts: &crate::store::artifacts::ArtifactStore,
         cancellation: &Arc<AtomicBool>,
-        registry: &crate::verify::profiles::VerificationRegistry,
-        runner: &mut crate::executor::check::CheckRunner,
-        secrets: &[crate::domain::secret::SecretLease],
         syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
-        services: NativeEditServices<'_>,
         trace: &mut impl EditTrace,
-    ) -> Result<NativeEditOutcome, EditOrchestrationError> {
+    ) -> Result<crate::workspace::edit::recovery::MaterializedEdit, EditOrchestrationError> {
         let ir = normalize_with_trace(
             ModelEditFormat::StructuredJson,
             input,
@@ -740,11 +701,7 @@ impl EditOrchestrator {
             config,
             artifacts,
             cancellation,
-            registry,
-            runner,
-            secrets,
             syntax_executors,
-            services,
             trace,
         )
     }
@@ -758,13 +715,9 @@ impl EditOrchestrator {
         config: &RunConfigSnapshot,
         artifacts: &crate::store::artifacts::ArtifactStore,
         cancellation: &Arc<AtomicBool>,
-        registry: &crate::verify::profiles::VerificationRegistry,
-        runner: &mut crate::executor::check::CheckRunner,
-        secrets: &[crate::domain::secret::SecretLease],
         syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
-        services: NativeEditServices<'_>,
         trace: &mut impl EditTrace,
-    ) -> Result<NativeEditOutcome, EditOrchestrationError> {
+    ) -> Result<crate::workspace::edit::recovery::MaterializedEdit, EditOrchestrationError> {
         ensure_not_cancelled(Some(cancellation))?;
         let authority =
             crate::workspace::edit::validate::AuthenticatedEditAuthority::from_authenticated(
@@ -780,7 +733,6 @@ impl EditOrchestrator {
             trace,
         )?;
         ensure_not_cancelled(Some(cancellation))?;
-        let operation_context = plan.operation_context();
         let syntax_requirements = plan
             .changed_files()
             .iter()
@@ -795,66 +747,6 @@ impl EditOrchestrator {
                 .expect("static Rust syntax requirement is valid")
             })
             .collect::<Vec<_>>();
-        let changed_paths = plan
-            .changed_files()
-            .iter()
-            .map(|path| path.as_str().to_owned())
-            .collect::<BTreeSet<_>>();
-        let feedback_authority = crate::verify::feedback::FeedbackAuthority::issue(
-            authenticated,
-            &services.workspace_id,
-            config.run_id().to_string(),
-            format!(
-                "blake3:{}",
-                blake3::hash(operation_context.selected_plan_digest().as_bytes()).to_hex()
-            ),
-            services.attempt.fencing_token.get(),
-        )?;
-        let mut events =
-            crate::verify::feedback::FeedbackEventStore::open(services.feedback_database)?;
-        let baseline_result = crate::verify::profiles::verify_current(
-            &operation_context,
-            &context.root,
-            services.build,
-            services.temp,
-            changed_paths,
-            crate::verify::profiles::VerificationRequest {
-                selection: crate::verify::profiles::ProfileSelection::Fast,
-                registry,
-                authenticated,
-                grants,
-                config,
-                runner: Some(runner),
-                observer: None,
-                artifacts,
-                secrets,
-                on_check_failure: crate::verify::profiles::CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: Some(cancellation),
-            },
-            true,
-        )?;
-        ensure_not_cancelled(Some(cancellation))?;
-        let baseline = {
-            let mut pipeline = crate::verify::feedback::FeedbackPipeline::new(
-                artifacts,
-                &mut events,
-                authenticated,
-                &services.workspace_id,
-                crate::store::artifacts::ArtifactRetention::Forever,
-                crate::store::artifacts::now_unix_micros()
-                    .map_err(|error| EditOrchestrationError::Feedback(error.to_string()))?,
-                secrets,
-                services.feedback_limits.clone(),
-            )?;
-            pipeline.capture_baseline(
-                &feedback_authority,
-                &operation_context,
-                &baseline_result,
-                services.diagnostic_adapters,
-            )?
-        };
-        ensure_not_cancelled(Some(cancellation))?;
         let staged = crate::workspace::edit::stage::stage_traced(
             plan,
             crate::workspace::edit::stage::StageLimits {
@@ -863,89 +755,19 @@ impl EditOrchestrator {
             },
             &syntax_requirements,
             syntax_executors,
-            services.formatter,
             trace,
         )?;
         ensure_not_cancelled(Some(cancellation))?;
-        let mut observer = crate::verify::feedback::FeedbackVerificationObserver::new(
-            &mut events,
-            &feedback_authority,
-            &staged,
-        );
-        let outcome = staged.verify_traced(
-            crate::verify::profiles::VerificationRequest {
-                selection: crate::verify::profiles::ProfileSelection::Fast,
-                registry,
-                authenticated,
-                grants,
-                config,
-                runner: Some(runner),
-                observer: Some(&mut observer),
+        staged
+            .materialize_traced(
                 artifacts,
-                secrets,
-                on_check_failure: crate::verify::profiles::CheckFailureBehavior::Abort,
-                model_outcome: None,
-                cancellation: Some(cancellation),
-            },
-            trace,
-        )?;
-        drop(observer);
-        let feedback = {
-            let mut pipeline = crate::verify::feedback::FeedbackPipeline::new(
-                artifacts,
-                &mut events,
-                authenticated,
-                &services.workspace_id,
-                crate::store::artifacts::ArtifactRetention::Forever,
-                crate::store::artifacts::now_unix_micros()
-                    .map_err(|error| EditOrchestrationError::Feedback(error.to_string()))?,
-                secrets,
-                services.feedback_limits.clone(),
-            )?;
-            pipeline.process(
-                &feedback_authority,
-                Some(&baseline),
-                &outcome,
-                services.diagnostic_adapters,
-            )?
-        };
-        match outcome {
-            crate::workspace::edit::stage::VerificationOutcome::Abort(aborted) => {
-                let receipt = aborted.verification_receipt().clone();
-                aborted.close()?;
-                Ok(NativeEditOutcome::Aborted {
-                    receipt: Box::new(receipt),
-                    feedback,
-                })
-            }
-            crate::workspace::edit::stage::VerificationOutcome::Commit(verified) => {
-                ensure_not_cancelled(Some(cancellation))?;
-                let edit = verified.materialize_traced(
-                    artifacts,
-                    crate::workspace::edit::recovery::MaterializeOptions::new(
-                        crate::store::artifacts::ArtifactRetention::Forever,
-                    )
-                    .with_cancellation(Arc::clone(cancellation)),
-                    trace,
-                )?;
-                let mut pipeline = crate::verify::feedback::FeedbackPipeline::new(
-                    artifacts,
-                    &mut events,
-                    authenticated,
-                    &services.workspace_id,
+                crate::workspace::edit::recovery::MaterializeOptions::new(
                     crate::store::artifacts::ArtifactRetention::Forever,
-                    crate::store::artifacts::now_unix_micros()
-                        .map_err(|error| EditOrchestrationError::Feedback(error.to_string()))?,
-                    secrets,
-                    services.feedback_limits,
-                )?;
-                pipeline.attach_materialization(&feedback_authority, &feedback, &edit)?;
-                Ok(NativeEditOutcome::Committed {
-                    edit: Box::new(edit),
-                    feedback,
-                })
-            }
-        }
+                )
+                .with_cancellation(Arc::clone(cancellation)),
+                trace,
+            )
+            .map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -956,13 +778,8 @@ impl EditOrchestrator {
         grants: &crate::api::auth::contract::GrantSnapshot,
         config: &RunConfigSnapshot,
         artifacts: &crate::store::artifacts::ArtifactStore,
-        syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
-        model_outcome: Option<&GrammarEditOutcomeEvidence>,
         cancellation: Option<&AtomicBool>,
-        registry: &crate::verify::profiles::VerificationRegistry,
-        selection: crate::verify::profiles::ProfileSelection,
-        runner: Option<&mut crate::executor::check::CheckRunner>,
-        secrets: &[crate::domain::secret::SecretLease],
+        syntax_executors: &mut [&mut crate::executor::syntax::SyntaxExecutor],
         trace: &mut impl EditTrace,
     ) -> Result<crate::workspace::edit::recovery::MaterializedEdit, EditOrchestrationError> {
         ensure_not_cancelled(cancellation)?;
@@ -986,33 +803,10 @@ impl EditOrchestrator {
             crate::workspace::edit::stage::StageLimits::default(),
             &[],
             syntax_executors,
-            None,
             trace,
         )?;
         ensure_not_cancelled(cancellation)?;
-        let verification = staged.verify_traced(
-            crate::verify::profiles::VerificationRequest {
-                selection,
-                registry,
-                authenticated,
-                grants,
-                config,
-                runner,
-                observer: None,
-                artifacts,
-                secrets,
-                on_check_failure: crate::verify::profiles::CheckFailureBehavior::Abort,
-                model_outcome,
-                cancellation,
-            },
-            trace,
-        )?;
-        let crate::workspace::edit::stage::VerificationOutcome::Commit(verified) = verification
-        else {
-            return Err(EditOrchestrationError::VerificationRejected);
-        };
-        ensure_not_cancelled(cancellation)?;
-        verified
+        staged
             .materialize_traced(
                 artifacts,
                 crate::workspace::edit::recovery::MaterializeOptions::new(
@@ -1037,11 +831,8 @@ pub(crate) enum EditOrchestrationError {
     Grammar(GrammarEditError),
     Validation(crate::workspace::edit::validate::ValidationError),
     Stage(crate::workspace::edit::stage::StageError),
-    Verification(crate::verify::profiles::VerificationError),
-    VerificationRejected,
     Cancelled,
     Recovery(crate::workspace::edit::recovery::RecoveryError),
-    Feedback(String),
 }
 
 impl fmt::Display for EditOrchestrationError {
@@ -1050,11 +841,8 @@ impl fmt::Display for EditOrchestrationError {
             Self::Grammar(error) => error.fmt(formatter),
             Self::Validation(error) => error.fmt(formatter),
             Self::Stage(error) => error.fmt(formatter),
-            Self::Verification(error) => error.fmt(formatter),
-            Self::VerificationRejected => formatter.write_str("edit verification rejected"),
             Self::Cancelled => formatter.write_str("edit cancelled before publication"),
             Self::Recovery(error) => error.fmt(formatter),
-            Self::Feedback(error) => formatter.write_str(error),
         }
     }
 }
@@ -1079,21 +867,9 @@ impl From<crate::workspace::edit::stage::StageError> for EditOrchestrationError 
     }
 }
 
-impl From<crate::verify::profiles::VerificationError> for EditOrchestrationError {
-    fn from(error: crate::verify::profiles::VerificationError) -> Self {
-        Self::Verification(error)
-    }
-}
-
 impl From<crate::workspace::edit::recovery::RecoveryError> for EditOrchestrationError {
     fn from(error: crate::workspace::edit::recovery::RecoveryError) -> Self {
         Self::Recovery(error)
-    }
-}
-
-impl From<crate::verify::feedback::FeedbackError> for EditOrchestrationError {
-    fn from(error: crate::verify::feedback::FeedbackError) -> Self {
-        Self::Feedback(error.to_string())
     }
 }
 
@@ -1315,7 +1091,6 @@ mod tests {
         let revision = RevisionToken::parse(current.id().to_string()).unwrap();
         let context = GrammarEditContext {
             workspace: workspace.clone(),
-            root: root.clone(),
             normalization: NormalizationContext::new(revision.clone(), EditLimits::default()),
             workspace_digest: current.digest().to_string(),
         };
@@ -1386,10 +1161,7 @@ mod tests {
             &mut trace,
         )
         .unwrap();
-        assert_eq!(
-            materialized.verification_receipt().model_outcome,
-            Some(evidence.clone())
-        );
+        assert!(!materialized.transaction_id().is_empty());
         drop(workspace);
         drop(artifacts);
         fs::remove_dir_all(root).unwrap();
@@ -1409,7 +1181,6 @@ mod tests {
                 EditTraceId::EditIrNew.as_str(),
                 EditTraceId::Validate.as_str(),
                 EditTraceId::Stage.as_str(),
-                EditTraceId::Verify.as_str(),
                 EditTraceId::Recovery.as_str(),
             ]
         );

@@ -794,10 +794,6 @@ fn clap_frontend_reaches_every_semantic_operation() {
             vec!["kit", "repo", "run", PROJECT, key, "repo-run-key"],
         ),
         (
-            "repo.check",
-            vec!["kit", "repo", "check", PROJECT, key, "repo-check-key"],
-        ),
-        (
             "repo.result",
             vec!["kit", "repo", "result", "--result", "result-1"],
         ),
@@ -947,7 +943,6 @@ fn typed_parse_preserves_exact_values_and_defaults() {
     for arguments in [
         vec!["kit", "repo", "edit", PROJECT],
         vec!["kit", "repo", "run", PROJECT],
-        vec!["kit", "repo", "check", PROJECT],
         vec!["kit", "terminal", "input", "--attachment", ATTACHMENT],
         vec![
             "kit",

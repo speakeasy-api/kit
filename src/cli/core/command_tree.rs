@@ -101,7 +101,9 @@ fn global_args(scope: &'static str) -> [Arg; 6] {
         Arg::new(ids[3])
             .long("state-root")
             .value_name("PATH")
-            .help("Kit state directory [default: a per-project directory under the user state home]")
+            .help(
+                "Kit state directory [default: a per-project directory under the user state home]",
+            )
             .value_hint(ValueHint::DirPath)
             .action(ArgAction::Append)
             .allow_hyphen_values(true),
@@ -726,7 +728,7 @@ fn repo() -> Command {
             "PROJECT_ID",
             "Project identifier",
         );
-        if matches!(name, "edit" | "run" | "check") {
+        if matches!(name, "edit" | "run") {
             recovery_leaf(command)
         } else {
             command
@@ -753,7 +755,6 @@ fn repo() -> Command {
         invoke("read", "Read repository content"),
         invoke("edit", "Apply a structured repository edit"),
         invoke("run", "Run an allowed repository command"),
-        invoke("check", "Run repository checks"),
         leaf("result", "Show a repository operation result").arg(required_value(
             "result",
             "result",
@@ -1099,7 +1100,6 @@ mod tests {
         assert_eq!(
             keyed_paths(&command, true),
             [
-                "repo check",
                 "repo edit",
                 "repo run",
                 "terminal input",

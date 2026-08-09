@@ -1,10 +1,10 @@
 pub mod backends;
 pub mod cancel;
-pub mod check;
-pub mod formatter;
 pub mod overlay;
 pub mod process;
 pub mod profile;
+#[cfg(test)]
+pub mod run_conformance;
 pub mod secrets;
 pub mod syntax;
 pub mod terminal;

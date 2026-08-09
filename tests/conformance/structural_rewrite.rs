@@ -8,15 +8,12 @@ use std::{
 use kit::{
     domain::ids::{PrincipalId, ProjectId},
     store::artifacts::{ArtifactRetention, ArtifactStore},
-    verify::profiles::{
-        CheckFailureBehavior, ProfileSelection, VerificationRegistry, VerificationRequest,
-    },
     workspace::{
         edit::{
-            format::{FormatterDescriptor, RUST_GRAMMAR_VERSION, SyntaxRequirement},
+            format::{RUST_GRAMMAR_VERSION, SyntaxRequirement},
             ir::{EditIr, EditLimits},
-            recovery::{MaterializeOptions, RecoveryError},
-            stage::{StageLimits, VerificationOutcome, stage},
+            recovery::MaterializeOptions,
+            stage::{StageLimits, stage},
             validate::{ValidationError, validate_authorized},
         },
         index::meta::{IndexOptions, MetadataIndex},
@@ -292,33 +289,9 @@ fn preview_change_diff_equals_materialized_change_diff() {
         StageLimits::default(),
         &[requirement],
         &mut [&mut syntax],
-        None,
     )
     .unwrap();
-    let (authenticated, grants, config) =
-        kit::test_support::trusted_verification_context(fixture.principal, fixture.project);
-    let registry = VerificationRegistry::empty();
-    let verified = match staged
-        .verify(VerificationRequest {
-            selection: ProfileSelection::None,
-            registry: &registry,
-            authenticated: &authenticated,
-            grants: &grants,
-            config: &config,
-            runner: None,
-            observer: None,
-            artifacts: &fixture.artifacts,
-            secrets: &[],
-            on_check_failure: CheckFailureBehavior::Abort,
-            model_outcome: None,
-            cancellation: None,
-        })
-        .unwrap()
-    {
-        VerificationOutcome::Commit(verified) => verified,
-        VerificationOutcome::Abort(_) => panic!("empty verification profile aborted"),
-    };
-    let materialized = verified
+    let materialized = staged
         .materialize(
             &fixture.artifacts,
             MaterializeOptions::new(ArtifactRetention::Forever),
@@ -330,81 +303,6 @@ fn preview_change_diff_equals_materialized_change_diff() {
     assert_eq!(
         fs::read_to_string(fixture.workspace_path.join("src/lib.rs")).unwrap(),
         "fn f() { let value = Ok(1); }\n"
-    );
-}
-
-#[test]
-fn formatter_change_rejects_bound_preview_before_workspace_write() {
-    let fixture = Fixture::new(&[("src/lib.rs", "fn f() { let value = Some(1); }\n")]);
-    let before = fs::read(fixture.workspace_path.join("src/lib.rs")).unwrap();
-    let rewrite = fixture.preview("Some($A)", Some("Ok($A)")).rewrite.unwrap();
-    let plan = validate_authorized(
-        &fixture.workspace,
-        &rewrite.ir,
-        EditLimits::default(),
-        kit::test_support::trusted_edit_authority(fixture.principal, fixture.project),
-    )
-    .unwrap();
-    let path = kit::workspace::edit::ir::RootRelativePath::parse(
-        "src/lib.rs",
-        EditLimits::default().max_path_bytes,
-    )
-    .unwrap();
-    let requirement =
-        SyntaxRequirement::new(path.clone(), "rust", RUST_GRAMMAR_VERSION, true).unwrap();
-    let descriptor = FormatterDescriptor::new("rustfmt", "1", vec![path]).unwrap();
-    let mut formatter =
-        kit::test_support::formatter_executor(kit::test_support::FormatterTestAction::Rewrite(
-            "src/lib.rs".to_owned(),
-            b"fn f() { let value = Ok( 1 ); }\n".to_vec(),
-        ));
-    let mut syntax = kit::test_support::syntax_executor(
-        "rust",
-        RUST_GRAMMAR_VERSION,
-        kit::test_support::SyntaxTestAction::Pass,
-    );
-    let staged = stage(
-        plan,
-        StageLimits::default(),
-        &[requirement],
-        &mut [&mut syntax],
-        Some((&descriptor, &mut formatter)),
-    )
-    .unwrap();
-    let (authenticated, grants, config) =
-        kit::test_support::trusted_verification_context(fixture.principal, fixture.project);
-    let registry = VerificationRegistry::empty();
-    let verified = match staged
-        .verify(VerificationRequest {
-            selection: ProfileSelection::None,
-            registry: &registry,
-            authenticated: &authenticated,
-            grants: &grants,
-            config: &config,
-            runner: None,
-            observer: None,
-            artifacts: &fixture.artifacts,
-            secrets: &[],
-            on_check_failure: CheckFailureBehavior::Abort,
-            model_outcome: None,
-            cancellation: None,
-        })
-        .unwrap()
-    {
-        VerificationOutcome::Commit(verified) => verified,
-        VerificationOutcome::Abort(_) => panic!("empty verification profile aborted"),
-    };
-    let error = verified
-        .materialize(
-            &fixture.artifacts,
-            MaterializeOptions::new(ArtifactRetention::Forever),
-        )
-        .unwrap_err();
-
-    assert!(matches!(error, RecoveryError::ChangeDiffMismatch { .. }));
-    assert_eq!(
-        fs::read(fixture.workspace_path.join("src/lib.rs")).unwrap(),
-        before
     );
 }
 

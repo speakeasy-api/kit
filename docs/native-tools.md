@@ -1,7 +1,7 @@
 # Native coding tools
 
-M004-W10 defines the complete native model-facing coding surface. It contains exactly six
-versioned tools: `kit.discover`, `kit.search`, `kit.read`, `kit.edit`, `kit.run`, and `kit.check`.
+M004-W10 defines the complete native model-facing coding surface. It contains exactly five
+versioned tools: `kit.discover`, `kit.search`, `kit.read`, `kit.edit`, and `kit.run`.
 Their canonical Draft 2020-12 JSON Schemas, digests, annotations, finite result bounds, capability
 identities, grants, reservations, and retry classifications are owned by `NativeCatalog`.
 
@@ -13,22 +13,19 @@ native dispatcher and persists a terminal outcome or `outcome_unknown` before re
 
 Read tools require `WorkspaceRead` and an expected revision. Search cursors are bound to the same
 revision, index, query, and options. Edit requires `WorkspaceWrite` and enters the same production
-`EditOrchestrator` as grammar output: baseline capture, normalization, authorization, validation,
-private staging, verification, materialization, and recovery. Its result identifies the committed
-revision, diff artifact, verification artifact, and edit trace.
+`EditOrchestrator` as grammar output: normalization, authorization, validation, private staging
+with syntax passes, materialization, and recovery. Edits work with no `.kit/native.json` present;
+the trusted config only tunes the edit validation wall time and approval policy. Its result
+identifies the committed revision, diff artifact, and edit trace.
 
 Run accepts argv, never a shell string. Working directory, mounts, scrubbed environment, network
 policy, and finite resource limits are explicit. It uses only the executor selected by trusted
 configuration. Isolation unavailability is a typed failure. Host compatibility is not a fallback
-and additionally requires `HostProcessCompatibility`. Check accepts only a trusted verification
-profile and registry target; an absent sealed runner or registry is a typed failure, never an
-arbitrary host command.
+and additionally requires `HostProcessCompatibility`.
 
 Restricted-container runs require a daemon-trusted pinned image configured with
 `KIT_NATIVE_CONTAINER_IMAGE` or `DaemonConfig::with_native_container_image`. Runs are foreground
-only and are durably registered with the attempt cancellation coordinator before release. Trusted
-checks are installed with `DaemonConfig::with_verification_registry`; model arguments can select a
-profile or declared target ID but cannot supply a command.
+only and are durably registered with the attempt cancellation coordinator before release.
 
 Every canonical result is at most 64 KiB and carries an explicit artifact-reference list. M001
 copies that list onto the durable outcome event. Larger content remains in authenticated artifacts.
@@ -37,10 +34,10 @@ construct native dispatch authority.
 
 Conformance evidence for KIT-TOOL-001 through KIT-TOOL-015 is in
 `tests/conformance/native_tools.rs`. The M004-W10 bypass matrix is in
-`tests/adversarial/native_tool_bypass.rs` and exercises 48 forged bindings with zero authorized
+`tests/adversarial/native_tool_bypass.rs` and exercises 40 forged bindings with zero authorized
 effects, in addition to the shared kernel bypass and fault suites.
 
-Route-level evidence uses loopback-only HTTP fixtures and the sealed executor/check protocol fake;
+Route-level evidence uses loopback-only HTTP fixtures and the deterministic run-conformance fake;
 it performs no external or billable model call. Run the focused evidence with:
 
 ```sh

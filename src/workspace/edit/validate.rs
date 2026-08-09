@@ -86,20 +86,6 @@ pub struct EditOperationContext {
 }
 
 impl EditOperationContext {
-    pub(crate) fn current(
-        base_revision: impl Into<String>,
-        base_epoch: impl Into<String>,
-        base_workspace_digest: impl Into<String>,
-        selected_plan_digest: impl Into<String>,
-    ) -> Self {
-        Self {
-            base_revision: base_revision.into(),
-            base_epoch: base_epoch.into(),
-            base_workspace_digest: base_workspace_digest.into(),
-            selected_plan_digest: selected_plan_digest.into(),
-        }
-    }
-
     pub fn base_revision(&self) -> &str {
         &self.base_revision
     }

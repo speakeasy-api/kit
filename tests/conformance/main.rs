@@ -64,8 +64,6 @@ mod terminal_lease;
 mod tool_telemetry;
 #[allow(clippy::duplicate_mod)]
 mod usage_reconcile;
-mod verify_feedback;
-mod verify_profiles;
 mod windows_job_limits;
 mod workspace_acquire;
 mod ws_revision;

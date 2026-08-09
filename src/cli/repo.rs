@@ -44,7 +44,6 @@ pub const REPO_CLI_OPERATIONS: &[RepoCliOperation] = &[
     operation("repo read", "repo.read", "readRepository", false),
     operation("repo edit", "repo.edit", "editRepository", true),
     operation("repo run", "repo.run", "runRepositoryCommand", true),
-    operation("repo check", "repo.check", "checkRepository", true),
     operation("repo result", "repo.result", "getRepositoryResult", false),
     operation(
         "repo events",
@@ -131,7 +130,6 @@ impl RepoRequest {
                 NativeTool::Read => "repo.read",
                 NativeTool::Edit => "repo.edit",
                 NativeTool::Run => "repo.run",
-                NativeTool::Check => "repo.check",
             },
             method: Method::POST,
             path: format!("/v1/projects/{project}/repository/{}", tool.short_name()),

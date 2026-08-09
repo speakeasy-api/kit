@@ -12,7 +12,6 @@ pub enum EditTraceId {
     EditIrNew,
     Validate,
     Stage,
-    Verify,
     Recovery,
 }
 
@@ -23,7 +22,6 @@ impl EditTraceId {
             Self::EditIrNew => "edit.ir.new.v1",
             Self::Validate => "edit.validate.v1",
             Self::Stage => "edit.stage.v1",
-            Self::Verify => "edit.verify.v1",
             Self::Recovery => "edit.recovery.v1",
         }
     }

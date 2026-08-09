@@ -35,7 +35,9 @@ pub fn default_state_root() -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "root".to_owned());
-    state_home.join("kit/projects").join(format!("{name}-{short}"))
+    state_home
+        .join("kit/projects")
+        .join(format!("{name}-{short}"))
 }
 
 #[cfg(windows)]

@@ -149,7 +149,7 @@ fn rebuild(
 #[test]
 fn native_catalog_entries_preserve_complete_metadata() {
     let snapshot = CatalogSnapshot::from_native(DigestAlgorithm::Sha256).unwrap();
-    assert_eq!(snapshot.entries().len(), 6);
+    assert_eq!(snapshot.entries().len(), 5);
     for descriptor in NativeCatalog::all() {
         let entry = snapshot.get_identity(descriptor.identity()).unwrap();
         assert_eq!(entry.identity(), descriptor.identity());

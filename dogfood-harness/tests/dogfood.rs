@@ -12,10 +12,9 @@ use std::{
 use serde_json::{Map, Value, json};
 
 const CI_JOB_TIMEOUT: Duration = Duration::from_secs(120 * 60);
-const CHECK_WALL_TIME: Duration = Duration::from_secs(10 * 60);
 const RUN_WALL_TIME: Duration = Duration::from_secs(10);
 const MODEL_CALL_BOUND: Duration = Duration::from_secs(5 * 60);
-const MODEL_CALLS: u32 = 8;
+const MODEL_CALLS: u32 = 7;
 const READ_TOOL_BOUND: Duration = Duration::from_secs(30);
 const INDEX_BUILD_BOUND: Duration = Duration::from_secs(60);
 const MEASURED_EDIT_VALIDATION_WORST_CASE: Duration = Duration::from_secs(5);
@@ -34,9 +33,7 @@ fn checked_duration_sum(parts: impl IntoIterator<Item = Duration>) -> Duration {
 
 fn scenario_timeout() -> Duration {
     let timeout = checked_duration_sum([
-        CHECK_WALL_TIME.checked_mul(2).unwrap(), // edit baseline and staged checks
-        CHECK_WALL_TIME,                         // explicit kit_check
-        RUN_WALL_TIME,                           // explicit kit_run
+        RUN_WALL_TIME, // explicit kit_run
         MODEL_CALL_BOUND.checked_mul(MODEL_CALLS).unwrap(),
         READ_TOOL_BOUND.checked_mul(3).unwrap(), // discover, search, and read
         INDEX_BUILD_BOUND,
@@ -310,10 +307,7 @@ fn materialize_unsupported_git_symlink(root: &Path, relative: &Path) {
 
 #[derive(Clone)]
 struct ProductionPins {
-    check_image: String,
     run_image: String,
-    tool_digest: String,
-    config_digest: String,
     helper_digest: String,
 }
 
@@ -330,14 +324,9 @@ fn pinned_digest(name: &str) -> String {
 }
 
 fn production_pins() -> ProductionPins {
-    let check_image = std::env::var("KIT_DOGFOOD_CHECK_IMAGE")
-        .expect("trusted dogfood requires KIT_DOGFOOD_CHECK_IMAGE");
     let run_image = std::env::var("KIT_NATIVE_CONTAINER_IMAGE")
         .expect("trusted dogfood requires KIT_NATIVE_CONTAINER_IMAGE");
-    for (name, image) in [
-        ("KIT_DOGFOOD_CHECK_IMAGE", &check_image),
-        ("KIT_NATIVE_CONTAINER_IMAGE", &run_image),
-    ] {
+    for (name, image) in [("KIT_NATIVE_CONTAINER_IMAGE", &run_image)] {
         assert!(
             !image.contains('<') && !image.contains('>') && !image.contains("example.invalid"),
             "{name} must not be a placeholder"
@@ -349,10 +338,7 @@ fn production_pins() -> ProductionPins {
         assert_eq!(digest, pinned_digest_value(name, digest));
     }
     ProductionPins {
-        check_image,
         run_image,
-        tool_digest: pinned_digest("KIT_DOGFOOD_TOOL_DIGEST"),
-        config_digest: pinned_digest("KIT_DOGFOOD_CONFIG_DIGEST"),
         helper_digest: pinned_digest("KIT_CONTAINER_HELPER_SHA256"),
     }
 }
@@ -385,48 +371,12 @@ fn fixture(pins: Option<&ProductionPins>) -> (PathBuf, PathBuf) {
         Path::new("vendor/agentkit/book/src/assets/logo.png"),
     );
     fs::create_dir_all(project.join(".kit")).unwrap();
-    let (image, tool_digest, config_digest) = pins.map_or_else(
-        || {
-            (
-                format!("example.invalid/kit-check@sha256:{}", "a".repeat(64)),
-                format!("sha256:{}", "b".repeat(64)),
-                format!("sha256:{}", "c".repeat(64)),
-            )
-        },
-        |pins| {
-            (
-                pins.check_image.clone(),
-                pins.tool_digest.clone(),
-                pins.config_digest.clone(),
-            )
-        },
-    );
+    let _ = pins;
     fs::write(
         project.join(".kit/native.json"),
         serde_json::to_vec_pretty(&json!({
             "version": 1,
             "edit_validation_wall_time_millis": EDIT_VALIDATION_TIME.as_millis(),
-            "checks": [{
-                "id": "dogfood",
-                "class": "diagnostics",
-                "requirement": "required",
-                "program": "cargo",
-                "arguments": ["check"],
-                "image": image,
-                "tool_digest": tool_digest,
-                "config_digest": config_digest,
-                "resources": {
-                    "cpu_millis": 1000,
-                    "memory_bytes": 268435456,
-                    "pids": 32,
-                    "file_bytes": 16777216,
-                    "disk_bytes": 268435456,
-                    "io_bytes": 67108864,
-                    "output_bytes": 65536,
-                    "wall_time_millis": 600000
-                },
-                "diagnostic_adapter": "normalized_json_lines_v1"
-            }]
         }))
         .unwrap(),
     )
@@ -481,7 +431,7 @@ fn start_daemon(
     state: &Path,
     project: &Path,
     provider_url: &str,
-    fake_checks: Option<&str>,
+    fake_syntax: bool,
     pins: Option<&ProductionPins>,
 ) -> Daemon {
     let mut command = Command::new(kit_binary());
@@ -503,10 +453,10 @@ fn start_daemon(
                 Stdio::piped()
             },
         );
-    if let Some(fake_checks) = fake_checks {
-        command.env("KIT_FAKE_CHECKS", fake_checks);
+    if fake_syntax {
+        command.env("KIT_FAKE_SYNTAX", "pass");
     } else {
-        command.env_remove("KIT_FAKE_CHECKS");
+        command.env_remove("KIT_FAKE_SYNTAX");
     }
     if let Some(pins) = pins {
         command.env("KIT_NATIVE_CONTAINER_IMAGE", &pins.run_image);
@@ -522,7 +472,7 @@ fn start_real_provider_daemon(state: &Path, project: &Path) -> Daemon {
             .arg("--state-root")
             .arg(state)
             .env("KIT_PROJECT_ROOT", project)
-            .env_remove("KIT_FAKE_CHECKS")
+            .env_remove("KIT_FAKE_SYNTAX")
             .env_remove("KIT_FAKE_NATIVE_AUTO_APPROVE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -601,7 +551,7 @@ fn start_provider_mock(project: &Path) -> (String, thread::JoinHandle<Vec<Value>
     let project = project.to_owned();
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
-        for step in 0..8 {
+        for step in 0..7 {
             let (mut stream, _) = listener.accept().unwrap();
             let mut bytes = Vec::new();
             let mut buffer = [0_u8; 8192];
@@ -630,7 +580,7 @@ fn start_provider_mock(project: &Path) -> (String, thread::JoinHandle<Vec<Value>
             let request: Value =
                 serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
             let tools = request["tools"].as_array().unwrap();
-            assert_eq!(tools.len(), 6);
+            assert_eq!(tools.len(), 5);
             let revision =
                 revision_in(&request).expect("public prompt must expose current revision");
             let (name, input) = match step {
@@ -672,8 +622,7 @@ fn start_provider_mock(project: &Path) -> (String, thread::JoinHandle<Vec<Value>
                         }]}),
                     )
                 }
-                5 => (Some("kit_check"), json!({"profile":"fast","targets":[]})),
-                6 => (
+                5 => (
                     Some("kit_run"),
                     json!({
                         "argv":["cargo","metadata","--no-deps","--format-version","1"],
@@ -731,8 +680,6 @@ fn wait_run_with_approvals(state: &Path, project_id: &str, run_id: &str) -> Valu
                     json_output(cli(
                         state,
                         &[
-                            "--idempotency-key",
-                            &key,
                             "approval",
                             "resolve",
                             "--approval",
@@ -741,6 +688,8 @@ fn wait_run_with_approvals(state: &Path, project_id: &str, run_id: &str) -> Valu
                             "approved",
                             "--version",
                             &version,
+                            "--idempotency-key",
+                            &key,
                         ],
                     ));
                 }
@@ -918,7 +867,7 @@ fn artifact_bytes(state: &Path, reference: &str) -> Vec<u8> {
 
 #[test]
 fn scenario_timeout_is_checked_and_fits_ci() {
-    assert_eq!(scenario_timeout(), Duration::from_secs(4_980));
+    assert_eq!(scenario_timeout(), Duration::from_secs(2_880));
     assert!(scenario_timeout() < CI_JOB_TIMEOUT);
 }
 
@@ -1269,10 +1218,7 @@ fn export_evidence_bundle(export: EvidenceExport<'_>) {
             "cargo test --locked --manifest-path dogfood-harness/Cargo.toml trusted_linux_production_dogfood_required_for_g04 -- --ignored --exact",
         ],
         "pins": {
-            "check_image": pins.check_image,
             "run_image": pins.run_image,
-            "tool_digest": pins.tool_digest,
-            "config_digest": pins.config_digest,
             "helper_digest": pins.helper_digest,
         },
         "artifacts": artifacts,
@@ -1330,7 +1276,7 @@ fn output_data(output: &Value) -> &Value {
 }
 
 fn assert_registered_tools(requests: Vec<Value>) {
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 7);
     for request in requests {
         let names = request["tools"]
             .as_array()
@@ -1346,7 +1292,6 @@ fn assert_registered_tools(requests: Vec<Value>) {
                 "kit_read",
                 "kit_edit",
                 "kit_run",
-                "kit_check",
             ])
         );
     }
@@ -1373,7 +1318,6 @@ fn assert_provider_edit_evidence(
     project: &Path,
     pristine: &Path,
     transcript: &Value,
-    production: Option<&ProductionPins>,
 ) -> (String, BTreeSet<String>) {
     let edit_call = tool_call(transcript, "kit_edit");
     assert_eq!(edit_call["id"], "dogfood-call-4");
@@ -1393,15 +1337,6 @@ fn assert_provider_edit_evidence(
             .as_str()
             .is_some_and(|id| id.starts_with("r:"))
     );
-    assert!(data["events"].as_array().is_some_and(|events| {
-        !events.is_empty()
-            && events.iter().all(|event| {
-                event["event_type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("check."))
-            })
-    }));
-    assert!(data["feedback"].is_object());
     assert_eq!(
         data["trace"],
         json!([
@@ -1409,172 +1344,8 @@ fn assert_provider_edit_evidence(
             "edit.ir.new.v1",
             "edit.validate.v1",
             "edit.stage.v1",
-            "edit.verify.v1",
             "edit.recovery.v1"
         ])
-    );
-
-    let receipt = &data["verification"];
-    assert_fields(
-        receipt,
-        &[
-            "version",
-            "schema_digest",
-            "plan_digest",
-            "binding_digest",
-            "provenance",
-            "result_digest",
-            "evidence_digest",
-            "experiment_identity",
-            "experiment_digest",
-            "model_outcome",
-            "result_artifact",
-            "stdout_artifacts",
-            "stderr_artifacts",
-            "process_artifacts",
-            "selected_check_count",
-            "process_artifact_count",
-        ],
-    );
-    assert_eq!(receipt["selected_check_count"], 1);
-    assert_eq!(receipt["process_artifact_count"], 1);
-    assert!(
-        !artifact_bytes(
-            state,
-            receipt["stdout_artifacts"][0]["reference"]
-                .as_str()
-                .unwrap()
-        )
-        .is_empty()
-    );
-    let result_reference = receipt["result_artifact"]["reference"].as_str().unwrap();
-    let verification: Value =
-        serde_json::from_slice(&artifact_bytes(state, result_reference)).unwrap();
-    assert_fields(
-        &verification,
-        &[
-            "version",
-            "profile",
-            "plan_digest",
-            "binding_digest",
-            "provenance",
-            "decision",
-            "skipped",
-            "accepted_failure",
-            "checks",
-            "quiescent",
-            "evidence_digest",
-            "experiment_identity",
-            "experiment_digest",
-            "model_outcome",
-        ],
-    );
-    assert_eq!(verification["profile"], "fast");
-    assert_eq!(verification["decision"], "commit");
-    assert_eq!(verification["quiescent"], true);
-    let check = &verification["checks"][0];
-    assert_eq!(check["check_id"], "dogfood");
-    assert_eq!(check["required"], true);
-    assert_eq!(check["status"], "pass");
-    assert_eq!(check["launch"], "launched");
-    assert_eq!(check["quiescent"], true);
-
-    let process_reference = receipt["process_artifacts"][0]["reference"]
-        .as_str()
-        .unwrap();
-    let process: Value = serde_json::from_slice(&artifact_bytes(state, process_reference)).unwrap();
-    assert_fields(
-        &process,
-        &[
-            "route",
-            "boundary_id",
-            "plan_digest",
-            "invocation_digest",
-            "runtime_identity",
-            "helper_identity",
-            "image_digest",
-            "tool_digest",
-            "config_digest",
-            "durable_record",
-            "cancellation_record",
-            "cancellation",
-            "kill_attempted",
-            "reaped",
-            "inspected",
-            "survivors",
-            "boundary_absent",
-            "quiescent",
-        ],
-    );
-    assert_eq!(process["survivors"], 0);
-    assert_eq!(process["reaped"], true);
-    assert_eq!(process["inspected"], true);
-    assert_eq!(process["boundary_absent"], true);
-    assert_eq!(process["quiescent"], true);
-    if let Some(pins) = production {
-        assert_eq!(process["route"], "SealedContainerHelper");
-        assert_eq!(process["helper_identity"], pins.helper_digest);
-        assert_eq!(
-            process["image_digest"],
-            pins.check_image.rsplit_once('@').unwrap().1
-        );
-        assert_eq!(process["tool_digest"], pins.tool_digest);
-        assert_eq!(process["config_digest"], pins.config_digest);
-    } else {
-        assert_eq!(process["route"], "ConformanceFake");
-    }
-
-    let payload_reference = data["feedback_artifacts"]["payload_artifact"]
-        .as_str()
-        .unwrap();
-    let feedback: Value =
-        serde_json::from_slice(&artifact_bytes(state, payload_reference)).unwrap();
-    assert_fields(
-        &feedback,
-        &[
-            "schema_version",
-            "baseline",
-            "counts",
-            "truncated",
-            "items",
-            "diagnostic_report",
-            "full_logs",
-        ],
-    );
-    assert_eq!(feedback["baseline"]["state"], "available");
-    assert!(
-        feedback["counts"]["input_bytes"]
-            .as_u64()
-            .is_some_and(|n| n > 0)
-    );
-    assert!(
-        feedback["full_logs"]
-            .as_array()
-            .is_some_and(|logs| !logs.is_empty())
-    );
-    let diagnostic_report: Value = serde_json::from_slice(&artifact_bytes(
-        state,
-        feedback["diagnostic_report"]["reference"].as_str().unwrap(),
-    ))
-    .unwrap();
-    assert_fields(
-        &diagnostic_report,
-        &[
-            "schema_version",
-            "baseline",
-            "baseline_set",
-            "current_set",
-            "deltas",
-        ],
-    );
-    assert_eq!(diagnostic_report["baseline"]["state"], "available");
-    assert_eq!(
-        diagnostic_report["baseline_set"]["checks"][0]["check_id"],
-        "dogfood"
-    );
-    assert_eq!(
-        diagnostic_report["current_set"]["checks"][0]["check_id"],
-        "dogfood"
     );
 
     let diff_reference = data["diff_artifact"]["reference"].as_str().unwrap();
@@ -1612,8 +1383,8 @@ fn assert_provider_edit_evidence(
 
     let references = open_artifact_closure(state, data);
     assert!(
-        references.len() >= 7,
-        "expected full artifact closure: {references:?}"
+        !references.is_empty(),
+        "expected the diff artifact in the closure: {references:?}"
     );
     (operation_id, references)
 }
@@ -1630,8 +1401,8 @@ fn provider_scenario(production: Option<&ProductionPins>) {
     assert_ne!(project, kit_checkout());
     assert!(project.join("Cargo.toml").is_file());
     let (provider_url, provider) = start_provider_mock(&project);
-    let fake_checks = production.is_none().then_some("pass,pass");
-    let daemon = start_daemon(&state, &project, &provider_url, fake_checks, production);
+    let fake_syntax = production.is_none();
+    let daemon = start_daemon(&state, &project, &provider_url, fake_syntax, production);
     let repository_status = wait_for_repository(&state);
     let project_id = repository_status["project_id"].as_str().unwrap();
     json_output(cli(&state, &["project", "create", "--id", project_id]));
@@ -1681,7 +1452,6 @@ fn provider_scenario(production: Option<&ProductionPins>) {
         ("kit_search", false),
         ("kit_read", false),
         ("kit_edit", false),
-        ("kit_check", false),
         ("kit_run", production.is_none()),
     ];
     for (name, local_error) in expected_transport_errors {
@@ -1692,38 +1462,10 @@ fn provider_scenario(production: Option<&ProductionPins>) {
             "terminal outcome for {name}: {result}"
         );
     }
-    let check = output_data(structured_output(tool_result(
-        &transcript,
-        "dogfood-call-5",
-    )));
-    let check_result_reference = check["verification"]["result_artifact"]["reference"]
-        .as_str()
-        .unwrap();
-    let check_result: Value =
-        serde_json::from_slice(&artifact_bytes(&state, check_result_reference)).unwrap();
     if let Some(pins) = production {
-        assert_eq!(check_result["decision"], "commit");
-        assert_eq!(check_result["checks"][0]["status"], "pass");
-        let check_process_reference = check["verification"]["process_artifacts"][0]["reference"]
-            .as_str()
-            .unwrap();
-        let check_process: Value =
-            serde_json::from_slice(&artifact_bytes(&state, check_process_reference)).unwrap();
-        assert_eq!(check_process["route"], "SealedContainerHelper");
-        assert_eq!(check_process["helper_identity"], pins.helper_digest);
-        assert_eq!(
-            check_process["image_digest"],
-            pins.check_image.rsplit_once('@').unwrap().1
-        );
-        assert_eq!(check_process["tool_digest"], pins.tool_digest);
-        assert_eq!(check_process["config_digest"], pins.config_digest);
-        assert_eq!(check_process["survivors"], 0);
-        assert_eq!(check_process["boundary_absent"], true);
-        assert_eq!(check_process["quiescent"], true);
-
         let run = output_data(structured_output(tool_result(
             &transcript,
-            "dogfood-call-6",
+            "dogfood-call-5",
         )));
         assert_eq!(run["outcome"]["status"], "success");
         let run_process: Value = serde_json::from_slice(&artifact_bytes(
@@ -1738,13 +1480,9 @@ fn provider_scenario(production: Option<&ProductionPins>) {
         );
         assert_eq!(run_process["survivors"], 0);
         assert_eq!(run_process["quiescent"], true);
-    } else {
-        assert_eq!(check_result["decision"], "abort");
-        assert_eq!(check_result["checks"][0]["status"], "unavailable");
-        assert_eq!(check_result["checks"][0]["launch"], "not_started");
     }
     let (provider_edit_id, mut references) =
-        assert_provider_edit_evidence(&state, &project, &pristine, &transcript, production);
+        assert_provider_edit_evidence(&state, &project, &pristine, &transcript);
     references.extend(open_artifact_closure(&state, &transcript));
     let revision = wait_json(
         &state,
@@ -1764,7 +1502,7 @@ fn provider_scenario(production: Option<&ProductionPins>) {
             .is_some_and(|value| value.starts_with("r:"))
     );
     drop(daemon);
-    let restarted = start_daemon(&state, &project, &provider_url, fake_checks, production);
+    let restarted = start_daemon(&state, &project, &provider_url, fake_syntax, production);
     wait_for_repository(&state);
     wait_json(&state, &["run", "show", &run_id], |run| {
         run["state"] == "completed"
@@ -1860,12 +1598,12 @@ fn submit_edit(state: &Path, project_id: &str, key: &str, input: &[u8]) -> Strin
     let pending = json_output(cli_input(
         state,
         &[
-            "--idempotency-key",
-            key,
             "repo",
             "edit",
             "--project",
             project_id,
+            "--idempotency-key",
+            key,
         ],
         input,
     ));
@@ -1877,14 +1615,14 @@ fn approve_edit(state: &Path, id: &str, key: &str) -> Value {
     json_output(cli(
         state,
         &[
-            "--idempotency-key",
-            key,
             "repo",
             "approval",
             "--result",
             id,
             "--decision",
             "approved",
+            "--idempotency-key",
+            key,
         ],
     ));
     wait_repository_result(state, id)
@@ -1894,13 +1632,7 @@ fn approve_edit(state: &Path, id: &str, key: &str) -> Value {
 fn direct_public_edit_failure_approval_and_artifact_contracts() {
     let (state, project) = fixture(None);
     let _cleanup = FixtureCleanup(state.parent().unwrap().to_owned());
-    let daemon = start_daemon(
-        &state,
-        &project,
-        "http://127.0.0.1:1",
-        Some("pass,pass,pass,fail"),
-        None,
-    );
+    let daemon = start_daemon(&state, &project, "http://127.0.0.1:1", true, None);
     let status = wait_for_repository(&state);
     let project_id = status["project_id"].as_str().unwrap();
     json_output(cli(&state, &["project", "create", "--id", project_id]));
@@ -1943,16 +1675,7 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
     assert_eq!(edit["native_result_id"], edit_id);
 
     let mut references = BTreeSet::new();
-    for key in [
-        "repository_result",
-        "actual_diff",
-        "verification_receipt",
-        "verification_logs",
-        "feedback_payload",
-        "feedback_report",
-        "edit_events",
-        "cost",
-    ] {
+    for key in ["actual_diff", "edit_events", "cost"] {
         let descriptor = &edit["artifacts"][key];
         assert_fields(
             descriptor,
@@ -1990,7 +1713,7 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
         assert_eq!(bytes.len() as u64, descriptor["size"].as_u64().unwrap());
         references.insert(reference.to_owned());
     }
-    assert_eq!(references.len(), 8);
+    assert_eq!(references.len(), 3);
     let events = json_output(cli(&state, &["repo", "events", "--result", &edit_id]));
     let event_types = events["items"]
         .as_array()
@@ -2010,42 +1733,19 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
         "DOGFOOD_ABORTED_PATH",
     );
     let before_failed = fs::read(project.join("src/lib.rs")).unwrap();
-    let failed_id = submit_edit(&state, project_id, "dogfood-failed-edit", &failed_input);
-    let failed = approve_edit(&state, &failed_id, "dogfood-failed-edit-approval");
-    assert_eq!(failed["status"], "completed", "{failed}");
-    assert_eq!(failed["output"]["data"]["outcome"], "aborted");
-    let failed_receipt: Value = serde_json::from_slice(&artifact_bytes(
-        &state,
-        failed["output"]["data"]["verification"]["result_artifact"]["reference"]
-            .as_str()
-            .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(failed_receipt["decision"], "abort");
-    assert_eq!(failed_receipt["checks"][0]["status"], "nonzero");
-    assert!(
-        failed["output"]["data"]["feedback"]["items"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty())
-    );
-    assert_eq!(fs::read(project.join("src/lib.rs")).unwrap(), before_failed);
-    assert_eq!(
-        json_output(cli(&state, &["repo", "revision", "--project", project_id]))["revision"],
-        current["revision"]
-    );
 
     let denied_id = submit_edit(&state, project_id, "dogfood-denied-edit", &failed_input);
     json_output(cli(
         &state,
         &[
-            "--idempotency-key",
-            "dogfood-denied-resolution",
             "repo",
             "approval",
             "--result",
             &denied_id,
             "--decision",
             "denied",
+            "--idempotency-key",
+            "dogfood-denied-resolution",
         ],
     ));
     let denied = wait_repository_result(&state, &denied_id);
@@ -2060,12 +1760,12 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
     json_output(cli(
         &state,
         &[
-            "--idempotency-key",
-            "dogfood-cancelled-resolution",
             "repo",
             "cancel",
             "--result",
             &cancelled_id,
+            "--idempotency-key",
+            "dogfood-cancelled-resolution",
         ],
     ));
     let cancelled = wait_repository_result(&state, &cancelled_id);
@@ -2077,7 +1777,7 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
     let revision_before_restart =
         json_output(cli(&state, &["repo", "revision", "--project", project_id]));
     let tree_before_restart = tree_digest(&project);
-    let before_restart = [&invalid_id, &edit_id, &failed_id, &denied_id, &cancelled_id]
+    let before_restart = [&invalid_id, &edit_id, &denied_id, &cancelled_id]
         .into_iter()
         .map(|id| {
             let result = json_output(cli(&state, &["repo", "result", "--result", id]));
@@ -2096,13 +1796,7 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
     }
 
     drop(daemon);
-    let restarted = start_daemon(
-        &state,
-        &project,
-        "http://127.0.0.1:1",
-        Some("pass,pass,pass,fail"),
-        None,
-    );
+    let restarted = start_daemon(&state, &project, "http://127.0.0.1:1", true, None);
     wait_for_repository(&state);
     let revision_after_restart =
         json_output(cli(&state, &["repo", "revision", "--project", project_id]));
@@ -2170,7 +1864,7 @@ fn real_provider_billing_smoke() {
             "prompt",
             "--thread",
             thread_id,
-            "Use repository tools to inspect Kit, make one minimal valid Rust source edit, run the fast check, and report evidence.",
+            "Use repository tools to inspect Kit, make one minimal valid Rust source edit, and report evidence.",
         ],
     ));
     let run_id = prompt["resource"]["id"].as_str().unwrap();
@@ -2178,7 +1872,6 @@ fn real_provider_billing_smoke() {
     assert_eq!(completed["state"], "completed", "{completed}");
     let transcript = json_output(cli(&state, &["run", "transcript", run_id]));
     assert!(transcript.to_string().contains("kit.native_operation_id"));
-    assert!(transcript.to_string().contains("verification"));
     let cost = json_output(cli(&state, &["run", "cost", run_id]));
     assert!(cost.to_string().contains("provider_reported"));
     let changed = Command::new("git")
@@ -2204,7 +1897,7 @@ fn trusted_linux_production_preflight() {
 }
 
 #[test]
-#[ignore = "trusted Linux production dogfood; requires isolation/helper/syntax/check images"]
+#[ignore = "trusted Linux production dogfood; requires isolation/helper/syntax images"]
 fn trusted_linux_production_dogfood_required_for_g04() {
     assert_eq!(std::env::consts::OS, "linux");
     assert_eq!(

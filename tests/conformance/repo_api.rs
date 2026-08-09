@@ -247,7 +247,7 @@ async fn repository_routes_authenticate_and_mutations_require_retained_keys() {
         "application/problem+json"
     );
 
-    for operation in ["edit", "run", "check"] {
+    for operation in ["edit", "run"] {
         let response = app(Arc::clone(&repo), true)
             .oneshot(request(
                 Method::POST,
@@ -288,7 +288,6 @@ async fn repository_routes_authenticate_and_mutations_require_retained_keys() {
         [
             Some("retained-key".to_owned()),
             Some("retained-key".to_owned()),
-            Some("retained-key".to_owned()),
             Some("action-key".to_owned()),
             Some("action-key".to_owned())
         ]
@@ -318,7 +317,7 @@ fn repository_api_cli_and_openapi_are_exactly_parallel() {
             .iter()
             .all(|operation| encoded.contains(operation))
     );
-    assert_eq!(REPO_ROUTES.len(), 14);
+    assert_eq!(REPO_ROUTES.len(), 13);
     assert!(
         REPO_ROUTES
             .iter()
@@ -326,7 +325,6 @@ fn repository_api_cli_and_openapi_are_exactly_parallel() {
             .all(|route| [
                 "repo.edit",
                 "repo.run",
-                "repo.check",
                 "repo.result.approval",
                 "repo.result.cancel"
             ]
@@ -368,8 +366,7 @@ fn route_descriptors_are_unique_and_long_operations_are_resources() {
                 "repo.search",
                 "repo.read",
                 "repo.edit",
-                "repo.run",
-                "repo.check"
+                "repo.run"
             ]
             .contains(&route.operation))
     );
@@ -397,13 +394,12 @@ fn repository_cli_contract_covers_method_path_header_schema_and_status() {
             "runRepositoryCommand",
             "RepositoryRunInput",
         ),
-        (NativeTool::Check, "checkRepository", "RepositoryCheckInput"),
     ] {
         let request = kit::cli::repo::RepoRequest::invoke(
             ProjectId::parse(PROJECT).unwrap(),
             tool,
             kit::cli::repo::InputSource::Stdin,
-            matches!(tool, NativeTool::Edit | NativeTool::Run | NativeTool::Check)
+            matches!(tool, NativeTool::Edit | NativeTool::Run)
                 .then(|| IdempotencyKey::parse("contract-key").unwrap()),
         );
         assert_eq!(request.method, Method::POST);
@@ -426,7 +422,7 @@ fn repository_cli_contract_covers_method_path_header_schema_and_status() {
         assert!(document["components"]["schemas"].get(schema).is_some());
         let parameters = contract["parameters"].as_array().unwrap();
         assert_eq!(parameters[0]["$ref"], "#/components/parameters/ProjectId");
-        if matches!(tool, NativeTool::Edit | NativeTool::Run | NativeTool::Check) {
+        if matches!(tool, NativeTool::Edit | NativeTool::Run) {
             assert!(
                 parameters
                     .iter()
@@ -483,7 +479,6 @@ fn openapi_embeds_the_exact_native_catalog_input_schemas() {
         (NativeTool::Read, "RepositoryReadInput"),
         (NativeTool::Edit, "RepositoryEditInput"),
         (NativeTool::Run, "RepositoryRunInput"),
-        (NativeTool::Check, "RepositoryCheckInput"),
     ] {
         let embedded = resolve_schema_refs(&document["components"]["schemas"][schema], &document);
         let catalog = kit::capabilities::native::NativeCatalog::all()

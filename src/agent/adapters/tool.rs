@@ -76,8 +76,6 @@ const MCP_AUTH_CHALLENGE_ID_METADATA: &str = "kit.mcp.auth_challenge_id";
 const LEARNING_SURFACE_METADATA: &str = "kit.learning_surface";
 const LEARNING_OPERATION_SEQUENCE_METADATA: &str = "kit.operation_sequence";
 const LEARNING_ROUTE_METADATA: &str = "kit.learning_route";
-type CostEstimator = Arc<dyn Fn(&Value) -> Result<Spend, String> + Send + Sync>;
-
 #[derive(Clone)]
 pub struct ToolBinding {
     spec: ToolSpec,
@@ -90,7 +88,6 @@ pub struct ToolBinding {
     reservation: Spend,
     retry_safety: RetrySafety,
     approval: ApprovalState,
-    cost_estimator: Option<CostEstimator>,
     external: Option<Arc<CapabilityBinding>>,
     extension: crate::capabilities::kernel::grant_ext::RequestExtension,
 }
@@ -120,7 +117,6 @@ impl ToolBinding {
             reservation,
             retry_safety,
             approval,
-            cost_estimator: None,
             external: None,
             extension: Default::default(),
         }
@@ -144,24 +140,13 @@ impl ToolBinding {
             reservation: Spend::new(0, 0, 0, 1, 0),
             retry_safety: entry.side_effects().retry_safety(),
             approval: ApprovalState::NotRequired,
-            cost_estimator: None,
             external: Some(binding),
             extension,
         }
     }
 
-    pub(crate) fn with_cost_estimator(
-        mut self,
-        estimator: impl Fn(&Value) -> Result<Spend, String> + Send + Sync + 'static,
-    ) -> Self {
-        self.cost_estimator = Some(Arc::new(estimator));
-        self
-    }
-
-    fn reservation(&self, input: &Value) -> Result<Spend, String> {
-        self.cost_estimator
-            .as_ref()
-            .map_or(Ok(self.reservation), |estimate| estimate(input))
+    fn reservation(&self, _input: &Value) -> Result<Spend, String> {
+        Ok(self.reservation)
     }
 }
 

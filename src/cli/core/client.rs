@@ -226,10 +226,8 @@ mod wait_tests {
             self.queries += 1;
             Ok(QueryProjection::Run(RunProjection {
                 id: run_id,
-                thread_id: crate::domain::ids::ThreadId::parse(
-                    "thread_00000000000000000000000001",
-                )
-                .unwrap(),
+                thread_id: crate::domain::ids::ThreadId::parse("thread_00000000000000000000000001")
+                    .unwrap(),
                 state,
                 input: ArtifactRef::parse(&format!("blake3:{}", "a".repeat(64))).unwrap(),
                 auth_granted: None,
@@ -304,7 +302,9 @@ pub fn wait_for_terminal_run(
             return Err(ClientError::internal("run query returned a mutation"));
         };
         let QueryProjection::Run(run) = *projection else {
-            return Err(ClientError::internal("run query returned a foreign projection"));
+            return Err(ClientError::internal(
+                "run query returned a foreign projection",
+            ));
         };
         if run.state.is_terminal() {
             return Ok(run);

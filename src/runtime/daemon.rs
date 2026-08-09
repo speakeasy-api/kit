@@ -369,18 +369,11 @@ pub struct DaemonConfig {
     pub mcp_servers: Vec<crate::protocols::mcp::config::McpServerConfig>,
     pub evaluation_anchor: Option<Arc<dyn crate::evaluation::reports::LedgerAnchor>>,
     pub native_container_image: Option<String>,
-    pub verification_registry: crate::verify::profiles::VerificationRegistry,
-    pub native_formatter_descriptor: Option<crate::workspace::edit::format::FormatterDescriptor>,
-    pub native_formatter_required: bool,
-    pub native_diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-    pub native_feedback_limits: crate::verify::feedback::FeedbackLimits,
     pub native_edit_validation_time: Duration,
     pub native_approval_policy: crate::agent::executor::NativeApprovalPolicy,
     native_config_error: Option<String>,
     model_config_error: Option<String>,
     mcp_config_error: Option<String>,
-    #[cfg(debug_assertions)]
-    pub native_check_completions: Vec<crate::executor::check::ConformanceCheck>,
 }
 
 #[derive(Clone)]
@@ -467,31 +460,22 @@ impl DaemonConfig {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| state_root.join("unconfigured-project"));
         let native_config = load_native_config(&project_root);
-        let (
-            verification_registry,
-            native_diagnostic_adapters,
-            native_edit_validation_time,
-            native_approval_policy,
-            native_config_error,
-        ) = match native_config {
-            Ok(Some((registry, adapters, validation_time, approval_policy))) => {
-                (registry, adapters, validation_time, approval_policy, None)
-            }
-            Ok(None) => (
-                crate::verify::profiles::VerificationRegistry::empty(),
-                BTreeMap::new(),
-                crate::workspace::edit::ir::EditLimits::default().max_validation_time,
-                crate::agent::executor::NativeApprovalPolicy::default(),
-                None,
-            ),
-            Err(error) => (
-                crate::verify::profiles::VerificationRegistry::empty(),
-                BTreeMap::new(),
-                crate::workspace::edit::ir::EditLimits::default().max_validation_time,
-                crate::agent::executor::NativeApprovalPolicy::default(),
-                Some(error),
-            ),
-        };
+        let (native_edit_validation_time, native_approval_policy, native_config_error) =
+            match native_config {
+                Ok(Some((validation_time, approval_policy))) => {
+                    (validation_time, approval_policy, None)
+                }
+                Ok(None) => (
+                    crate::workspace::edit::ir::EditLimits::default().max_validation_time,
+                    crate::agent::executor::NativeApprovalPolicy::default(),
+                    None,
+                ),
+                Err(error) => (
+                    crate::workspace::edit::ir::EditLimits::default().max_validation_time,
+                    crate::agent::executor::NativeApprovalPolicy::default(),
+                    Some(error),
+                ),
+            };
         Self {
             backup_destination: default_backup_destination(&state_root),
             state_root,
@@ -510,41 +494,11 @@ impl DaemonConfig {
             mcp_servers,
             evaluation_anchor: None,
             native_container_image: std::env::var("KIT_NATIVE_CONTAINER_IMAGE").ok(),
-            verification_registry,
-            native_formatter_descriptor: None,
-            native_formatter_required: false,
-            native_diagnostic_adapters,
-            native_feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
             native_edit_validation_time,
             native_approval_policy,
             native_config_error,
             model_config_error,
             mcp_config_error,
-            #[cfg(debug_assertions)]
-            native_check_completions: match std::env::var("KIT_FAKE_CHECKS").as_deref() {
-                Ok("pass") => (0..64)
-                    .map(|_| crate::executor::check::ConformanceCheck::pass("", ""))
-                    .collect(),
-                Ok(sequence) => sequence
-                    .split(',')
-                    .filter_map(|outcome| match outcome {
-                        "pass" => Some(crate::executor::check::ConformanceCheck::pass(
-                            "check passed",
-                            "",
-                        )),
-                        "fail" => Some(crate::executor::check::ConformanceCheck::exit(
-                            1,
-                            "",
-                            "check failed",
-                        )),
-                        "unavailable" => {
-                            Some(crate::executor::check::ConformanceCheck::Unavailable)
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            },
         }
     }
 
@@ -563,43 +517,6 @@ impl DaemonConfig {
         anchor: Arc<dyn crate::evaluation::reports::LedgerAnchor>,
     ) -> Self {
         self.evaluation_anchor = Some(anchor);
-        self
-    }
-
-    pub fn with_verification_registry(
-        mut self,
-        registry: crate::verify::profiles::VerificationRegistry,
-    ) -> Self {
-        self.verification_registry = registry;
-        self
-    }
-
-    pub fn with_native_formatter(
-        mut self,
-        descriptor: crate::workspace::edit::format::FormatterDescriptor,
-        required: bool,
-    ) -> Self {
-        self.native_formatter_descriptor = Some(descriptor);
-        self.native_formatter_required = required;
-        self
-    }
-
-    pub fn with_native_feedback(
-        mut self,
-        adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-        limits: crate::verify::feedback::FeedbackLimits,
-    ) -> Self {
-        self.native_diagnostic_adapters = adapters;
-        self.native_feedback_limits = limits;
-        self
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn with_native_check_completions(
-        mut self,
-        completions: impl IntoIterator<Item = crate::executor::check::ConformanceCheck>,
-    ) -> Self {
-        self.native_check_completions = completions.into_iter().collect();
         self
     }
 
@@ -782,36 +699,12 @@ struct TrustedNativeConfig {
     edit_validation_wall_time_millis: u64,
     #[serde(default)]
     approval_policy: crate::agent::executor::NativeApprovalPolicy,
-    checks: Vec<TrustedCheck>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TrustedCheck {
-    id: String,
-    class: crate::verify::profiles::CheckClass,
-    requirement: crate::verify::profiles::CheckRequirement,
-    program: String,
-    #[serde(default)]
-    arguments: Vec<String>,
-    image: String,
-    tool_digest: String,
-    config_digest: String,
-    resources: crate::executor::profile::ResourceLimits,
-    #[serde(default)]
-    changed_path_prefixes: std::collections::BTreeSet<String>,
-    #[serde(default)]
-    post_commit_safe: bool,
-    diagnostic_adapter: crate::verify::feedback::DiagnosticAdapter,
-}
+type TrustedNativeServices = (Duration, crate::agent::executor::NativeApprovalPolicy);
 
-type TrustedNativeServices = (
-    crate::verify::profiles::VerificationRegistry,
-    BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
-    Duration,
-    crate::agent::executor::NativeApprovalPolicy,
-);
-
+/// `.kit/native.json` is optional: without it, native edits run with default
+/// validation limits and the default approval policy (syntax-only pipeline).
 fn load_native_config(project_root: &Path) -> Result<Option<TrustedNativeServices>, String> {
     const MAX_CONFIG_BYTES: u64 = 256 * 1024;
     let path = project_root.join(".kit/native.json");
@@ -832,47 +725,13 @@ fn load_native_config(project_root: &Path) -> Result<Option<TrustedNativeService
     if config.version != 1
         || validation_time.is_zero()
         || validation_time > crate::capabilities::native::dispatch::MAX_EDIT_VALIDATION_TIME
-        || config.checks.is_empty()
-        || config.checks.len() > 64
     {
         return Err(
-            "trusted native config requires version 1, a 1..=300000 ms edit validation policy, and 1 to 64 checks"
+            "trusted native config requires version 1 and a 1..=300000 ms edit validation policy"
                 .to_owned(),
         );
     }
-    let mut adapters = BTreeMap::new();
-    let mut checks = Vec::with_capacity(config.checks.len());
-    for check in config.checks {
-        let command = crate::executor::check::CheckCommand::new(
-            &check.id,
-            check.program,
-            check.arguments,
-            check.image,
-            check.tool_digest,
-            check.config_digest,
-            check.resources,
-        )
-        .map_err(|error| format!("trusted native check {}: {error}", check.id))?;
-        adapters.insert(check.id.clone(), check.diagnostic_adapter);
-        checks.push(
-            crate::verify::profiles::DeclaredCheck::new(
-                check.class,
-                command,
-                check.requirement,
-                check.changed_path_prefixes,
-                check.post_commit_safe,
-            )
-            .map_err(|error| format!("trusted native check {}: {error}", check.id))?,
-        );
-    }
-    let registry = crate::verify::profiles::VerificationRegistry::new(checks)
-        .map_err(|error| format!("trusted native config registry: {error}"))?;
-    Ok(Some((
-        registry,
-        adapters,
-        validation_time,
-        config.approval_policy,
-    )))
+    Ok(Some((validation_time, config.approval_policy)))
 }
 
 #[cfg(debug_assertions)]
@@ -1249,11 +1108,6 @@ impl Daemon {
         .with_callback_secret_registry(callback_secrets.clone())
         .with_project_root(&config.project_root)
         .with_process_registry(exec_manager.clone())
-        .with_verification_registry(config.verification_registry.clone())
-        .with_native_feedback(
-            config.native_diagnostic_adapters.clone(),
-            config.native_feedback_limits.clone(),
-        )
         .with_native_semantic_evidence(native_semantic_evidence.clone())
         .with_native_edit_validation_time(config.native_edit_validation_time)
         .with_native_approval_policy(config.native_approval_policy)
@@ -1262,17 +1116,8 @@ impl Daemon {
         if let Some(profiles) = mcp_stdio_profiles {
             executor_config = executor_config.with_mcp_stdio_profiles(profiles);
         }
-        if let Some(descriptor) = &config.native_formatter_descriptor {
-            executor_config = executor_config
-                .with_native_formatter(descriptor.clone(), config.native_formatter_required);
-        }
         if let Some(image) = &config.native_container_image {
             executor_config = executor_config.with_native_container_image(image);
-        }
-        #[cfg(debug_assertions)]
-        {
-            executor_config = executor_config
-                .with_native_check_completions(config.native_check_completions.clone());
         }
         executor_config.poll_interval = Duration::from_secs(5);
         executor_config.telemetry = Some(Arc::clone(&telemetry));
@@ -1396,16 +1241,9 @@ impl Daemon {
                     .with_custody(secret_custody.clone()),
                     cancellation: cancellation_coordinator.clone(),
                     container_image: config.native_container_image.clone(),
-                    verification_registry: config.verification_registry.clone(),
-                    formatter: config.native_formatter_descriptor.clone(),
-                    formatter_required: config.native_formatter_required,
-                    diagnostic_adapters: config.native_diagnostic_adapters.clone(),
-                    feedback_limits: config.native_feedback_limits.clone(),
                     edit_validation_time: config.native_edit_validation_time,
                     cursor_key: identity.cursor_key,
                     capability_extensions: Arc::clone(&capability_extensions),
-                    #[cfg(debug_assertions)]
-                    check_completions: config.native_check_completions.clone(),
                 },
                 authority.clone(),
                 native_semantic_evidence,
@@ -2068,27 +1906,6 @@ mod native_config_tests {
         let mut config = serde_json::json!({
             "version": 1,
             "edit_validation_wall_time_millis": 20_000,
-            "checks": [{
-                "id": "diagnostics",
-                "class": "diagnostics",
-                "requirement": "required",
-                "program": "cargo",
-                "arguments": ["check"],
-                "image": format!("example.com/check@sha256:{}", "a".repeat(64)),
-                "tool_digest": format!("sha256:{}", "b".repeat(64)),
-                "config_digest": format!("sha256:{}", "c".repeat(64)),
-                "resources": {
-                    "cpu_millis": 1000,
-                    "memory_bytes": 268435456,
-                    "pids": 32,
-                    "file_bytes": 16777216,
-                    "disk_bytes": 268435456,
-                    "io_bytes": 67108864,
-                    "output_bytes": 65536,
-                    "wall_time_millis": 600000
-                },
-                "diagnostic_adapter": "normalized_json_lines_v1"
-            }]
         });
         if let Some(policy) = approval_policy {
             config["approval_policy"] = serde_json::json!(policy);
@@ -2104,15 +1921,18 @@ mod native_config_tests {
     #[test]
     fn native_approval_policy_defaults_to_required() {
         let root = write_native_config(None);
-        let (_, _, _, policy) = load_native_config(&root).unwrap().unwrap();
-        assert_eq!(policy, crate::agent::executor::NativeApprovalPolicy::Required);
+        let (_, policy) = load_native_config(&root).unwrap().unwrap();
+        assert_eq!(
+            policy,
+            crate::agent::executor::NativeApprovalPolicy::Required
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn native_approval_policy_parses_auto() {
         let root = write_native_config(Some("auto"));
-        let (_, _, _, policy) = load_native_config(&root).unwrap().unwrap();
+        let (_, policy) = load_native_config(&root).unwrap().unwrap();
         assert_eq!(policy, crate::agent::executor::NativeApprovalPolicy::Auto);
         fs::remove_dir_all(root).unwrap();
     }

@@ -225,10 +225,7 @@ jobs:
       - name: Preflight externally supplied production pins
         env:
           KIT_TRUSTED_PRODUCTION_DOGFOOD: '1'
-          KIT_DOGFOOD_CHECK_IMAGE: ${{ vars.KIT_DOGFOOD_CHECK_IMAGE }}
           KIT_NATIVE_CONTAINER_IMAGE: ${{ vars.KIT_NATIVE_CONTAINER_IMAGE }}
-          KIT_DOGFOOD_TOOL_DIGEST: ${{ vars.KIT_DOGFOOD_TOOL_DIGEST }}
-          KIT_DOGFOOD_CONFIG_DIGEST: ${{ vars.KIT_DOGFOOD_CONFIG_DIGEST }}
           KIT_CONTAINER_HELPER_SHA256: ${{ vars.KIT_CONTAINER_HELPER_SHA256 }}
         run: |
           cargo build --locked --bin kit
@@ -236,10 +233,7 @@ jobs:
       - name: Run trusted production dogfood
         env:
           KIT_TRUSTED_PRODUCTION_DOGFOOD: '1'
-          KIT_DOGFOOD_CHECK_IMAGE: ${{ vars.KIT_DOGFOOD_CHECK_IMAGE }}
           KIT_NATIVE_CONTAINER_IMAGE: ${{ vars.KIT_NATIVE_CONTAINER_IMAGE }}
-          KIT_DOGFOOD_TOOL_DIGEST: ${{ vars.KIT_DOGFOOD_TOOL_DIGEST }}
-          KIT_DOGFOOD_CONFIG_DIGEST: ${{ vars.KIT_DOGFOOD_CONFIG_DIGEST }}
           KIT_CONTAINER_HELPER_SHA256: ${{ vars.KIT_CONTAINER_HELPER_SHA256 }}
           KIT_DOGFOOD_EVIDENCE_BUNDLE: ${{ runner.temp }}/m004-dogfood-evidence
         run: cargo test --locked --manifest-path dogfood-harness/Cargo.toml trusted_linux_production_dogfood_required_for_g04 -- --ignored --exact
@@ -255,7 +249,6 @@ jobs:
             > "${RUNNER_TEMP}/m004-dogfood-sha256.txt"
       - name: Emit trusted dogfood release attestations
         env:
-          KIT_DOGFOOD_CHECK_IMAGE: ${{ vars.KIT_DOGFOOD_CHECK_IMAGE }}
           KIT_NATIVE_CONTAINER_IMAGE: ${{ vars.KIT_NATIVE_CONTAINER_IMAGE }}
           KIT_CONTAINER_HELPER_SHA256: ${{ vars.KIT_CONTAINER_HELPER_SHA256 }}
         run: |
@@ -263,7 +256,6 @@ jobs:
           printf '%s\n' \
             "runner_os=$RUNNER_OS" \
             "runner_arch=$RUNNER_ARCH" \
-            "check_image=$KIT_DOGFOOD_CHECK_IMAGE" \
             "run_image=$KIT_NATIVE_CONTAINER_IMAGE" \
             "helper=$KIT_CONTAINER_HELPER_SHA256" \
             > "$RUNNER_TEMP/m004-dogfood-environment.txt"

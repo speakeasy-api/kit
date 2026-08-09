@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    api::auth::contract::GrantSnapshot,
     capabilities::kernel::{
         grant::EffectClass,
         identity::{
@@ -46,17 +45,15 @@ pub enum NativeTool {
     Read,
     Edit,
     Run,
-    Check,
 }
 
 impl NativeTool {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Discover,
         Self::Search,
         Self::Read,
         Self::Edit,
         Self::Run,
-        Self::Check,
     ];
 
     pub const fn short_name(self) -> &'static str {
@@ -66,7 +63,6 @@ impl NativeTool {
             Self::Read => "read",
             Self::Edit => "edit",
             Self::Run => "run",
-            Self::Check => "check",
         }
     }
 
@@ -125,52 +121,6 @@ impl NativeToolDescriptor {
         self.reservation
     }
 
-    pub fn estimate_reservation(
-        &self,
-        input: &Value,
-        registry: &crate::verify::profiles::VerificationRegistry,
-        grants: &GrantSnapshot,
-        config: &RunConfigSnapshot,
-    ) -> Result<Spend, String> {
-        if self.tool != NativeTool::Check {
-            return Ok(self.reservation);
-        }
-        let profile = input
-            .get("profile")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "check profile is missing".to_owned())?;
-        let selection = match profile {
-            "syntax" => crate::verify::profiles::ProfileSelection::Syntax,
-            "fast" => crate::verify::profiles::ProfileSelection::Fast,
-            "full" => crate::verify::profiles::ProfileSelection::Full,
-            "targeted" => crate::verify::profiles::ProfileSelection::Targeted {
-                exact_targets: input
-                    .get("targets")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect(),
-            },
-            _ => return Err("check profile is invalid".to_owned()),
-        };
-        let count = registry
-            .select_native(&selection, grants, config)
-            .map_err(|error| error.to_string())?
-            .len();
-        if count == 0 {
-            return Err("check profile has no trusted commands".to_owned());
-        }
-        Ok(Spend::new(
-            0,
-            0,
-            0,
-            1,
-            u64::try_from(count).map_err(|_| "check process count overflowed")?,
-        ))
-    }
-
     pub const fn retry_safety(&self) -> RetrySafety {
         self.retry_safety
     }
@@ -187,8 +137,8 @@ impl NativeToolDescriptor {
 pub struct NativeCatalog;
 
 impl NativeCatalog {
-    pub fn all() -> &'static [NativeToolDescriptor; 6] {
-        static CATALOG: OnceLock<[NativeToolDescriptor; 6]> = OnceLock::new();
+    pub fn all() -> &'static [NativeToolDescriptor; 5] {
+        static CATALOG: OnceLock<[NativeToolDescriptor; 5]> = OnceLock::new();
         CATALOG.get_or_init(|| NativeTool::ALL.map(descriptor))
     }
 
@@ -263,14 +213,6 @@ fn descriptor(tool: NativeTool) -> NativeToolDescriptor {
             Spend::new(0, 0, 0, 1, 1),
             ApprovalState::Pending,
         ),
-        NativeTool::Check => (
-            EffectClass::ProcessSpawn,
-            &[Grant::ProcessSpawn, Grant::VerificationTargeted][..],
-            ToolAnnotations::read_only().with_idempotent(true),
-            RetrySafety::Idempotent,
-            Spend::new(0, 0, 0, 1, 1),
-            ApprovalState::NotRequired,
-        ),
     };
     let mut metadata = MetadataMap::new();
     metadata.insert("kit.native.version".to_owned(), json!(VERSION));
@@ -332,9 +274,6 @@ fn description(tool: NativeTool) -> &'static str {
         }
         NativeTool::Run => {
             "Select for an explicit argv process in the configured M003 executor profile; never select for trusted project checks or shell strings. Saves bounded sanitized stream and process-evidence artifacts and returns at most 64 KiB. Example: {\"argv\":[\"cargo\",\"metadata\"],\"working_directory\":\".\",\"mounts\":{\"source\":\"read_only\",\"build\":\"read_write\",\"temp\":\"read_write\"},\"environment\":{},\"network\":\"deny\",\"host_compatibility\":false,\"background\":\"foreground\",\"limits\":{\"cpu_millis\":1000,\"memory_bytes\":268435456,\"pids\":64,\"file_bytes\":16777216,\"disk_bytes\":268435456,\"io_bytes\":67108864,\"output_bytes\":65536,\"wall_time_millis\":10000}}."
-        }
-        NativeTool::Check => {
-            "Select for trusted diagnostics, build, test, lint, affected, or full verification profiles; never select for an arbitrary command. Runs only sealed registry entries, saves verification/process artifacts, and returns at most 64 KiB. Example: {\"profile\":\"fast\",\"targets\":[]}."
         }
     }
 }
@@ -588,13 +527,6 @@ fn input_schema(tool: NativeTool) -> Value {
                 "background",
             ],
         ),
-        NativeTool::Check => object(
-            json!({
-                "profile": {"enum": ["syntax", "fast", "targeted", "full"]},
-                "targets": {"items": {"maxLength": 128, "minLength": 1, "type": "string"}, "maxItems": 64, "type": "array"}
-            }),
-            &["profile", "targets"],
-        ),
     }
 }
 
@@ -663,93 +595,4 @@ fn output_schema(tool: NativeTool) -> Value {
             wrapper(json!({"$ref": "#/components/schemas/RepositoryDiscoverMapOutput"}))
         ]
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::*;
-    use crate::{
-        api::auth::contract::GrantSnapshot,
-        domain::{
-            config::{LayerStack, Provider, RunConfigContext},
-            ids::{PrincipalId, ProjectId, RunId},
-        },
-        executor::{check::CheckCommand, profile::ResourceLimits},
-        verify::profiles::{CheckClass, CheckRequirement, DeclaredCheck, VerificationRegistry},
-    };
-
-    #[test]
-    fn shared_estimator_charges_one_process_per_selected_check_and_one_for_run() {
-        let principal = PrincipalId::from_stable_bytes(b"native-estimator-principal");
-        let project = ProjectId::from_stable_bytes(b"native-estimator-project");
-        let grants = BTreeSet::from([
-            Grant::WorkspaceRead,
-            Grant::ProcessSpawn,
-            Grant::VerificationTargeted,
-        ]);
-        let config = LayerStack::safe_defaults_for(Provider::OpenAi)
-            .materialize(
-                RunConfigContext {
-                    principal_id: principal,
-                    project_id: project,
-                    run_id: RunId::from_stable_bytes(b"native-estimator-run"),
-                },
-                &grants,
-            )
-            .unwrap();
-        let grants = GrantSnapshot::new(principal, project, grants);
-        let limits = ResourceLimits::new(1_000, 1024, 8, 1024, 1024, 1024, 1024, 1_000);
-        let checks = [CheckClass::Diagnostics, CheckClass::Typecheck]
-            .into_iter()
-            .enumerate()
-            .map(|(index, class)| {
-                DeclaredCheck::new(
-                    class,
-                    CheckCommand::new(
-                        format!("check-{index}"),
-                        "cargo",
-                        vec!["check".to_owned()],
-                        format!("example.invalid/check@sha256:{}", "a".repeat(64)),
-                        format!("sha256:{}", "b".repeat(64)),
-                        format!("sha256:{}", "c".repeat(64)),
-                        limits,
-                    )
-                    .unwrap(),
-                    CheckRequirement::Required,
-                    BTreeSet::new(),
-                    false,
-                )
-                .unwrap()
-            })
-            .collect();
-        let registry = VerificationRegistry::new(checks).unwrap();
-        let check = NativeCatalog::all()
-            .iter()
-            .find(|descriptor| descriptor.tool() == NativeTool::Check)
-            .unwrap();
-        assert_eq!(
-            check
-                .estimate_reservation(
-                    &json!({"profile":"fast","targets":[]}),
-                    &registry,
-                    &grants,
-                    &config,
-                )
-                .unwrap()
-                .processes(),
-            2
-        );
-        let run = NativeCatalog::all()
-            .iter()
-            .find(|descriptor| descriptor.tool() == NativeTool::Run)
-            .unwrap();
-        assert_eq!(
-            run.estimate_reservation(&json!({}), &registry, &grants, &config)
-                .unwrap()
-                .processes(),
-            1
-        );
-    }
 }

@@ -15,16 +15,14 @@ use std::{
 
 use kit::{
     domain::events::ContentDigest,
-    executor::formatter::FormatterStatus,
     test_support::{
-        FormatterTestAction, SyntaxTestAction, formatter_executor, formatter_executor_gate,
-        syntax_executor, syntax_executor_gate_second, syntax_executor_with_capture,
+        SyntaxTestAction, syntax_executor, syntax_executor_gate_second,
+        syntax_executor_with_capture,
     },
     workspace::{
         edit::{
             format::{
-                FormatterCommandDescriptor, FormatterDescriptor, NATIVE_JSON_VERSION,
-                NATIVE_TEXT_VERSION, RUST_GRAMMAR_VERSION, SyntaxRequirement,
+                NATIVE_JSON_VERSION, NATIVE_TEXT_VERSION, RUST_GRAMMAR_VERSION, SyntaxRequirement,
             },
             ir::{
                 ByteRange, EditIr, EditLimits, EditOperation, ExecutableMode, RevisionToken,
@@ -151,7 +149,6 @@ fn stage_applies_all_operations_preserves_tree_modes_and_newlines_without_worksp
         StageLimits::default(),
         &[],
         &mut [],
-        None,
     )
     .unwrap();
 
@@ -200,7 +197,6 @@ fn stage_applies_all_operations_preserves_tree_modes_and_newlines_without_worksp
         StageLimits::default(),
         &[],
         &mut [],
-        None,
     )
     .unwrap();
     assert_eq!(second.digest(), first_digest);
@@ -214,7 +210,6 @@ fn same_process_manager_open_does_not_recover_a_live_stage() {
         StageLimits::default(),
         &[],
         &mut [],
-        None,
     )
     .unwrap();
     thread::scope(|scope| {
@@ -285,7 +280,6 @@ fn stage_recovery_subprocess_worker() {
         StageLimits::default(),
         &[],
         &mut [],
-        None,
     )
     .unwrap();
     std::mem::forget(staged);
@@ -318,7 +312,6 @@ fn syntax_is_versioned_sealed_stage_only_and_required_unavailable_is_typed() {
         StageLimits::default(),
         std::slice::from_ref(&json),
         &mut [],
-        None,
     )
     .unwrap();
     assert!(matches!(
@@ -327,7 +320,6 @@ fn syntax_is_versioned_sealed_stage_only_and_required_unavailable_is_typed() {
             StageLimits::default(),
             &[json],
             &mut [],
-            None,
         ),
         Err(StageError::SyntaxFailed(path)) if path.as_str() == "changed.json"
     ));
@@ -347,7 +339,6 @@ fn syntax_is_versioned_sealed_stage_only_and_required_unavailable_is_typed() {
         StageLimits::default(),
         std::slice::from_ref(&requirement),
         &mut [],
-        None,
     )
     .unwrap();
     assert!(matches!(
@@ -356,7 +347,6 @@ fn syntax_is_versioned_sealed_stage_only_and_required_unavailable_is_typed() {
             StageLimits::default(),
             std::slice::from_ref(&requirement),
             &mut [],
-            None,
         ),
         Err(StageError::SyntaxFailed(_))
     ));
@@ -369,7 +359,6 @@ fn syntax_is_versioned_sealed_stage_only_and_required_unavailable_is_typed() {
         StageLimits::default(),
         &[requirement],
         &mut executors,
-        None,
     )
     .unwrap();
     assert_eq!(&*seen.lock().unwrap(), b"fn staged() {}\n");
@@ -377,24 +366,6 @@ fn syntax_is_versioned_sealed_stage_only_and_required_unavailable_is_typed() {
         fs::read(fixture.workspace_path.join("changed.json")).unwrap(),
         b"{}\n"
     );
-
-    let mut runner = formatter_executor(FormatterTestAction::Rewrite(
-        "changed.json".to_owned(),
-        b"{formatter-broke-json}\n".to_vec(),
-    ));
-    let descriptor = FormatterDescriptor::new("jsonfmt", "1", vec![path("changed.json")]).unwrap();
-    let json =
-        SyntaxRequirement::new(path("changed.json"), "json", NATIVE_JSON_VERSION, true).unwrap();
-    assert!(matches!(
-        stage(
-            single_replace(&fixture, b"{\"valid_before_formatter\":true}\n"),
-            StageLimits::default(),
-            &[json],
-            &mut [],
-            Some((&descriptor, &mut runner)),
-        ),
-        Err(StageError::SyntaxFailed(path)) if path.as_str() == "changed.json"
-    ));
 }
 
 #[test]
@@ -415,7 +386,6 @@ fn stuck_syntax_executor_times_out() {
         },
         &[requirement],
         &mut [&mut executor],
-        None,
     );
     assert!(
         matches!(&result, Err(StageError::SyntaxTimeout(path)) if path.as_str() == "changed.rs"),
@@ -425,32 +395,15 @@ fn stuck_syntax_executor_times_out() {
 }
 
 #[test]
-fn formatter_free_stage_rejects_a_final_snapshot_mutation() {
+fn stage_rejects_a_final_snapshot_mutation() {
     for _ in 0..4 {
-        assert_final_snapshot_mutation_rejected(false);
-    }
-}
-
-#[test]
-fn formatter_stage_rejects_a_final_snapshot_mutation() {
-    for _ in 0..4 {
-        assert_final_snapshot_mutation_rejected(true);
+        assert_final_snapshot_mutation_rejected();
     }
 }
 
 #[test]
 #[ignore = "exact opt-in filesystem stress; run serially with --ignored --exact --test-threads=1"]
-fn formatter_free_final_mutation_is_rejected_500_iterations_parallel() {
-    stress_final_snapshot_mutation(false);
-}
-
-#[test]
-#[ignore = "exact opt-in filesystem stress; run serially with --ignored --exact --test-threads=1"]
-fn formatter_final_mutation_is_rejected_500_iterations_parallel() {
-    stress_final_snapshot_mutation(true);
-}
-
-fn stress_final_snapshot_mutation(formatter: bool) {
+fn final_mutation_is_rejected_500_iterations_parallel() {
     let next = Arc::new(AtomicUsize::new(0));
     thread::scope(|scope| {
         for _ in 0..8 {
@@ -461,14 +414,14 @@ fn stress_final_snapshot_mutation(formatter: bool) {
                     if iteration >= 500 {
                         break;
                     }
-                    assert_final_snapshot_mutation_rejected(formatter);
+                    assert_final_snapshot_mutation_rejected();
                 }
             });
         }
     });
 }
 
-fn assert_final_snapshot_mutation_rejected(formatter: bool) {
+fn assert_final_snapshot_mutation_rejected() {
     let fixture = Fixture::new(&[("changed.rs", b"fn old() {}\n", 0o644)]);
     let requirement =
         SyntaxRequirement::new(path("changed.rs"), "rust", RUST_GRAMMAR_VERSION, true).unwrap();
@@ -494,20 +447,7 @@ fn assert_final_snapshot_mutation_rejected(formatter: bool) {
             max_time: Duration::from_secs(2),
             ..StageLimits::default()
         };
-        let result = if formatter {
-            let descriptor =
-                FormatterDescriptor::new("rustfmt", "1", vec![path("changed.rs")]).unwrap();
-            let mut runner = formatter_executor(FormatterTestAction::Pass);
-            stage(
-                plan,
-                limits,
-                &[requirement],
-                &mut [&mut executor],
-                Some((&descriptor, &mut runner)),
-            )
-        } else {
-            stage(plan, limits, &[requirement], &mut [&mut executor], None)
-        };
+        let result = stage(plan, limits, &[requirement], &mut [&mut executor]);
         mutator.join().unwrap();
         assert!(matches!(result, Err(StageError::StageChanged)));
     });
@@ -528,67 +468,6 @@ fn frozen_stage_file(root: &Path, relative: &str) -> Option<PathBuf> {
             let file = allocation.path().join("final").join(relative);
             if fs::metadata(&file).ok()?.permissions().mode() & 0o777 == 0o400 {
                 return Some(file);
-            }
-        }
-    }
-    None
-}
-
-#[test]
-fn same_content_aba_during_formatter_window_is_rejected() {
-    let fixture = Fixture::new(&[("changed.json", b"{}\n", 0o644)]);
-    let descriptor =
-        FormatterDescriptor::new("jsonfmt", "1.0.0", vec![path("changed.json")]).unwrap();
-    let (mut runner, entered, release) = formatter_executor_gate();
-    thread::scope(|scope| {
-        let root = fixture.root.clone();
-        let mutator = scope.spawn(move || {
-            entered.recv().unwrap();
-            let file = stage_file(&root, "formatter-source", "changed.json").unwrap();
-            let detached = root.join("formatter-aba-detached");
-            let bytes = fs::read(&file).unwrap();
-            let permissions = fs::metadata(&file).unwrap().permissions();
-            fs::set_permissions(file.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
-            fs::rename(&file, &detached).unwrap();
-            fs::write(&file, &bytes).unwrap();
-            fs::set_permissions(&file, permissions).unwrap();
-            fs::remove_file(&file).unwrap();
-            fs::rename(detached, file).unwrap();
-            fs::set_permissions(
-                stage_file(&root, "formatter-source", "changed.json")
-                    .unwrap()
-                    .parent()
-                    .unwrap(),
-                fs::Permissions::from_mode(0o500),
-            )
-            .unwrap();
-            release.send(()).unwrap();
-        });
-        let result = stage(
-            single_replace(&fixture, b"{\"staged\":true}\n"),
-            StageLimits::default(),
-            &[],
-            &mut [],
-            Some((&descriptor, &mut runner)),
-        );
-        mutator.join().unwrap();
-        assert!(matches!(result, Err(StageError::FormatterUnsafeChange)));
-    });
-}
-
-fn stage_file(root: &Path, directory: &str, relative: &str) -> Option<PathBuf> {
-    for state in fs::read_dir(root).ok()? {
-        let state = state.ok()?;
-        if !state.file_name().to_string_lossy().ends_with(".staging") {
-            continue;
-        }
-        for allocation in fs::read_dir(state.path()).ok()? {
-            let allocation = allocation.ok()?;
-            if stage_allocation_name(&allocation.file_name().to_string_lossy()) {
-                let file = allocation.path().join(directory).join(relative);
-                if file.exists() {
-                    return Some(file);
-                }
             }
         }
     }
@@ -625,227 +504,36 @@ fn unknown_extensions_cannot_claim_native_text_or_an_unrelated_grammar() {
                 StageLimits::default(),
                 &[requirement],
                 &mut [],
-                None,
             ),
             Err(StageError::SyntaxUnavailable(path)) if path.as_str() == "changed.unknown"
         ));
     }
 }
 
-fn formatted<'a>(
-    fixture: &'a Fixture,
-    action: FormatterTestAction,
-) -> Result<kit::workspace::edit::stage::StagedEdit<'a>, StageError> {
-    let mut runner = formatter_executor(action);
-    let descriptor =
-        FormatterDescriptor::new("jsonfmt", "1.0.0", vec![path("changed.json")]).unwrap();
-    stage(
-        single_replace(fixture, b"{\"staged\":true}\n"),
-        StageLimits {
-            max_formatter_output_bytes: 1024,
-            ..StageLimits::default()
-        },
-        &[],
-        &mut [],
-        Some((&descriptor, &mut runner)),
-    )
-}
-
-#[test]
-fn formatter_uses_only_the_isolated_stage_profile_and_captures_pass_fail_timeout() {
-    let fixture = Fixture::new(&[
-        ("changed.json", b"{}\n", 0o644),
-        ("unrelated.txt", b"same\n", 0o640),
-    ]);
-    let passed = formatted(
-        &fixture,
-        FormatterTestAction::Rewrite(
-            "changed.json".to_owned(),
-            b"{\"formatted\":true}\n".to_vec(),
-        ),
-    )
-    .unwrap();
-    assert_eq!(
-        passed.read_file(&path("changed.json"), 1024).unwrap(),
-        b"{\"formatted\":true}\n"
-    );
-    assert_eq!(
-        passed.formatter().unwrap().status(),
-        FormatterStatus::Success
-    );
-    assert_eq!(passed.formatter().unwrap().stdout(), b"formatted");
-    assert!(
-        passed
-            .formatter()
-            .unwrap()
-            .process()
-            .resolved_image_digest()
-            .starts_with("sha256:")
-    );
-    assert_eq!(
-        fs::read(fixture.workspace_path.join("changed.json")).unwrap(),
-        b"{}\n"
-    );
-    passed.close().unwrap();
-
-    assert!(matches!(
-        formatted(&fixture, FormatterTestAction::Exit(2)),
-        Err(StageError::FormatterFailed(capture))
-            if capture.status() == FormatterStatus::Exit(2) && capture.stdout() == b"formatted"
-    ));
-    assert!(matches!(
-        formatted(&fixture, FormatterTestAction::Timeout),
-        Err(StageError::FormatterTimeout(capture)) if capture.status() == FormatterStatus::Timeout
-    ));
-    assert!(matches!(
-        formatted(&fixture, FormatterTestAction::Output(1025)),
-        Err(StageError::LimitExceeded(StageLimit::FormatterOutput))
-    ));
-}
-
 #[test]
 fn state_digest_is_deterministic_and_evidence_digest_is_separate() {
     let fixture = Fixture::new(&[("changed.json", b"{}\n", 0o644)]);
-    let first = formatted(
-        &fixture,
-        FormatterTestAction::Rewrite(
-            "changed.json".to_owned(),
-            b"{\"formatted\":true}\n".to_vec(),
-        ),
+    let first = stage(
+        single_replace(&fixture, b"{\"staged\":true}\n"),
+        StageLimits::default(),
+        &[],
+        &mut [],
     )
     .unwrap();
     let state = first.state_digest().to_owned();
     let evidence = first.evidence_digest().to_owned();
     assert_eq!(first.digest(), state);
+    assert_ne!(state, evidence);
     first.close().unwrap();
-    let second = formatted(
-        &fixture,
-        FormatterTestAction::Rewrite(
-            "changed.json".to_owned(),
-            b"{\"formatted\":true}\n".to_vec(),
-        ),
-    )
-    .unwrap();
-    assert_eq!(second.state_digest(), state);
-    assert_ne!(second.evidence_digest(), evidence);
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn macos_production_formatter_is_explicitly_unavailable() {
-    assert!(!kit::executor::formatter::FormatterExecutor::production_available());
-    let fixture = Fixture::new(&[("changed.json", b"{}\n", 0o644)]);
-    stage(
-        single_replace(&fixture, b"{\"changed\":true}\n"),
+    let second = stage(
+        single_replace(&fixture, b"{\"staged\":true}\n"),
         StageLimits::default(),
         &[],
         &mut [],
-        None,
     )
     .unwrap();
-}
-
-#[test]
-fn formatter_undeclared_create_delete_mode_and_symlink_are_rejected() {
-    for action in [
-        FormatterTestAction::Rewrite("escape.txt".to_owned(), b"escape".to_vec()),
-        FormatterTestAction::Delete("unrelated.txt".to_owned()),
-    ] {
-        let fixture = Fixture::new(&[
-            ("changed.json", b"{}\n", 0o644),
-            ("unrelated.txt", b"same\n", 0o640),
-        ]);
-        assert!(matches!(
-            formatted(&fixture, action),
-            Err(StageError::FormatterUndeclaredChange(_))
-        ));
-        assert_eq!(
-            fs::read(fixture.workspace_path.join("unrelated.txt")).unwrap(),
-            b"same\n"
-        );
-    }
-
-    for action in [
-        FormatterTestAction::Chmod("changed.json".to_owned(), 0o755),
-        FormatterTestAction::Symlink("changed.json".to_owned(), "/etc/passwd".to_owned()),
-    ] {
-        let fixture = Fixture::new(&[
-            ("changed.json", b"{}\n", 0o644),
-            ("unrelated.txt", b"same\n", 0o640),
-        ]);
-        assert!(matches!(
-            formatted(&fixture, action),
-            Err(StageError::FormatterUnsafeChange)
-        ));
-    }
-}
-
-#[test]
-fn formatter_requires_executor_proven_zero_survivors() {
-    let fixture = Fixture::new(&[
-        ("changed.json", b"{}\n", 0o644),
-        ("unrelated.txt", b"same\n", 0o640),
-    ]);
-    assert!(matches!(
-        formatted(&fixture, FormatterTestAction::SurvivingProcess),
-        Err(StageError::FormatterNotQuiescent)
-    ));
-}
-
-#[test]
-fn formatter_rejects_requested_provenance_that_differs_from_measured_bytes() {
-    use sha2::{Digest as _, Sha256};
-
-    let fixture = Fixture::new(&[("changed.json", b"{}\n", 0o644)]);
-    let image = format!("debug@sha256:{:x}", Sha256::digest(b"trusted-test-image"));
-    let binary = format!("blake3:{}", blake3::hash(b"trusted-test-binary").to_hex());
-    let config = format!("blake3:{}", blake3::hash(b"trusted-test-config").to_hex());
-    let descriptor = FormatterDescriptor::new("jsonfmt", "1", vec![path("changed.json")])
-        .unwrap()
-        .with_command(
-            FormatterCommandDescriptor::new(image, "/jsonfmt", vec![], binary, config).unwrap(),
-        );
-    let mut runner = formatter_executor(FormatterTestAction::ProvenanceMismatch);
-    assert!(matches!(
-        stage(
-            single_replace(&fixture, b"{\"staged\":true}\n"),
-            StageLimits::default(),
-            &[],
-            &mut [],
-            Some((&descriptor, &mut runner)),
-        ),
-        Err(StageError::FormatterRejected)
-    ));
-}
-
-#[test]
-fn formatter_rejects_absent_authoritative_measurements() {
-    use sha2::{Digest as _, Sha256};
-
-    let fixture = Fixture::new(&[("changed.json", b"{}\n", 0o644)]);
-    let descriptor = FormatterDescriptor::new("jsonfmt", "1", vec![path("changed.json")])
-        .unwrap()
-        .with_command(
-            FormatterCommandDescriptor::new(
-                format!("debug@sha256:{:x}", Sha256::digest(b"trusted-test-image")),
-                "/jsonfmt",
-                vec![],
-                format!("blake3:{}", blake3::hash(b"trusted-test-binary").to_hex()),
-                format!("blake3:{}", blake3::hash(b"trusted-test-config").to_hex()),
-            )
-            .unwrap(),
-        );
-    let mut runner = formatter_executor(FormatterTestAction::MeasurementAbsent);
-    assert!(matches!(
-        stage(
-            single_replace(&fixture, b"{\"staged\":true}\n"),
-            StageLimits::default(),
-            &[],
-            &mut [],
-            Some((&descriptor, &mut runner)),
-        ),
-        Err(StageError::FormatterRejected)
-    ));
+    assert_eq!(second.state_digest(), state);
+    assert_eq!(second.evidence_digest(), evidence);
 }
 
 #[test]
@@ -862,7 +550,6 @@ fn stage_rejects_setid_and_user_xattr_metadata() {
             StageLimits::default(),
             &[],
             &mut [],
-            None,
         ),
         Err(StageError::UnsafeSource)
     ));
@@ -878,7 +565,6 @@ fn stage_rejects_setid_and_user_xattr_metadata() {
         StageLimits::default(),
         &[],
         &mut [],
-        None,
     );
     assert!(
         matches!(&directory_result, Err(StageError::UnsafeSource)),
@@ -894,7 +580,6 @@ fn stage_rejects_setid_and_user_xattr_metadata() {
             StageLimits::default(),
             &[],
             &mut [],
-            None,
         ),
         Err(StageError::UnsafeSource)
     ));
@@ -924,7 +609,6 @@ fn stage_rejects_directory_acls() {
             StageLimits::default(),
             &[],
             &mut [],
-            None,
         ),
         Err(StageError::UnsafeSource)
     ));
@@ -1019,35 +703,13 @@ fn staging_bounds_fail_typed_and_failed_stages_leave_no_allocations() {
             StageLimit::MetadataMemory,
         ),
     ] {
-        let result = stage(single_replace(&fixture, b"x\n"), limits, &[], &mut [], None);
+        let result = stage(single_replace(&fixture, b"x\n"), limits, &[], &mut []);
         let actual = result.as_ref().err().map(ToString::to_string);
         assert!(
             matches!(result, Err(StageError::LimitExceeded(actual)) if actual == expected),
             "unexpected staging limit result for {expected:?}: {actual:?}"
         );
     }
-
-    assert!(formatted(&fixture, FormatterTestAction::Exit(2)).is_err());
-}
-
-#[test]
-fn formatter_descriptor_rejects_non_changed_files_before_runner() {
-    let fixture = Fixture::new(&[
-        ("changed.json", b"{}\n", 0o644),
-        ("unrelated.txt", b"same\n", 0o640),
-    ]);
-    let mut runner = formatter_executor(FormatterTestAction::Pass);
-    let descriptor = FormatterDescriptor::new("fmt", "1", vec![path("unrelated.txt")]).unwrap();
-    assert!(matches!(
-        stage(
-            single_replace(&fixture, b"{\"staged\":true}\n"),
-            StageLimits::default(),
-            &[],
-            &mut [],
-            Some((&descriptor, &mut runner)),
-        ),
-        Err(StageError::PlanMismatch)
-    ));
 }
 
 #[test]
@@ -1060,8 +722,6 @@ fn stage_contract_is_documented_as_opaque_and_non_host() {
         "cannot be serialized or forged",
         "daemon host",
         "mode `0700`",
-        "declared changed files",
-        "descriptor",
     ] {
         assert!(
             documentation.contains(text),

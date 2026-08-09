@@ -1578,7 +1578,13 @@ async fn failure_body_excerpt(response: reqwest::Response) -> String {
     }
     let excerpt = String::from_utf8_lossy(&body)
         .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .collect::<String>();
     let excerpt = excerpt.trim();
     if excerpt.is_empty() {

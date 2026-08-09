@@ -627,7 +627,10 @@ pub(crate) fn attest_native_extension_durable(
         }
     };
     drop(current);
-    Ok((NativeExtensionGuard::new(Arc::clone(registry), scope)?, upgrades))
+    Ok((
+        NativeExtensionGuard::new(Arc::clone(registry), scope)?,
+        upgrades,
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -1855,9 +1858,10 @@ mod tests {
         let mut store = service.worker_append_store().unwrap();
         let stale = rebuilt_native_contract(None, "11", "22");
         let mut seeded = CapabilityExtensionRegistry::default();
-        seeded
-            .entries
-            .insert((scope, stale.reference()), active_entry(scope, stale.clone()));
+        seeded.entries.insert(
+            (scope, stale.reference()),
+            active_entry(scope, stale.clone()),
+        );
         seeded.revision = 1;
         seeded.revisions.insert(scope, 1);
         let bytes = seeded.scope_bytes(scope).unwrap();
@@ -1878,7 +1882,8 @@ mod tests {
         );
 
         let shared = Arc::new(RwLock::new(CapabilityExtensionRegistry::default()));
-        let (guard, upgrades) = attest_native_extension_durable(&shared, scope, &mut store).unwrap();
+        let (guard, upgrades) =
+            attest_native_extension_durable(&shared, scope, &mut store).unwrap();
         guard.ensure_current().unwrap();
         let genuine = genuine_native_contract();
         assert_eq!(
