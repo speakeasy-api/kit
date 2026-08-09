@@ -264,7 +264,7 @@ fn description(tool: NativeTool) -> &'static str {
             "Select for ranked repository tree, symbol, relationship, or personalized declaration-map discovery at an expected revision; do not select for exact text lookup. Saves no workspace changes and returns at most 64 KiB with mode-specific revision-bound cursors. Example: {\"expected_revision\":\"r:<64 hex>\",\"map\":{\"taskTerms\":[\"Config\"]}}."
         }
         NativeTool::Search => {
-            "Select for exact lexical or Rust structural lookup and read-only rewrite previews at an expected revision; do not select to apply changes. Saves no workspace changes and returns at most 64 KiB; changed structural rewrites include an opaque single-use apply token and change diff. Example: {\"expected_revision\":\"r:<64 hex>\",\"text\":\"Some($A)\",\"mode\":\"structural\",\"rewrite\":\"Ok($A)\",\"path_prefixes\":[],\"languages\":[\"rust\"]}."
+            "Select for one or more exact lexical or Rust structural lookups and read-only rewrite previews at an expected revision; do not select to apply changes. Batched calls accept 2 to 8 independent search-only queries at one revision. Saves no workspace changes and returns at most 64 KiB; changed structural rewrites include an opaque single-use apply token and change diff. Example: {\"expected_revision\":\"r:<64 hex>\",\"text\":\"Some($A)\",\"mode\":\"structural\",\"rewrite\":\"Ok($A)\",\"path_prefixes\":[],\"languages\":[\"rust\"]}."
         }
         NativeTool::Read => {
             "Select for one bounded file or line/byte range at an expected revision; do not select for repository-wide search. Saves large/binary content as an authorized artifact and returns at most 64 KiB. Example: {\"expected_revision\":\"r:<64 hex>\",\"path\":\"src/lib.rs\",\"range\":{\"kind\":\"lines\",\"start\":1,\"end\":80}}."
@@ -466,11 +466,44 @@ fn input_schema(tool: NativeTool) -> Value {
                     "languages",
                 ],
             );
+            let mut batched_lexical = object(
+                json!({
+                    "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
+                    "mode": {"enum": ["path", "content", "path_and_content"]},
+                    "path_prefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                    "text": {"maxLength": 4096, "minLength": 1, "type": "string"}
+                }),
+                &["text", "mode", "path_prefixes", "languages"],
+            );
+            let mut batched_structural = object(
+                json!({
+                    "languages": {"items": {"type": "string"}, "maxItems": 32, "type": "array"},
+                    "mode": {"const": "structural"},
+                    "path_prefixes": {"items": relative_path(), "maxItems": 32, "type": "array"},
+                    "text": {"maxLength": 4096, "minLength": 1, "type": "string"}
+                }),
+                &["text", "mode", "path_prefixes", "languages"],
+            );
+            batched_lexical.as_object_mut().unwrap().remove("$schema");
+            batched_structural.as_object_mut().unwrap().remove("$schema");
+            let mut batched = object(
+                json!({
+                    "expected_revision": revision(),
+                    "queries": {
+                        "items": {"oneOf": [batched_lexical, batched_structural]},
+                        "minItems": 2,
+                        "maxItems": 8,
+                        "type": "array"
+                    }
+                }),
+                &["expected_revision", "queries"],
+            );
+            batched.as_object_mut().unwrap().remove("$schema");
             lexical.as_object_mut().unwrap().remove("$schema");
             structural.as_object_mut().unwrap().remove("$schema");
             json!({
                 "$schema": JSON_SCHEMA_DIALECT,
-                "oneOf": [lexical, structural]
+                "oneOf": [lexical, structural, batched]
             })
         }
         NativeTool::Read => object(

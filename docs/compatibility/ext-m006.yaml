@@ -53,7 +53,7 @@ built_ins:
       minimum: 1.0.0
       maximum_exclusive: 2.0.0
     schema_digest: sha256:192a510e776a5bea66a115469e772fff8280bce59d03e142ccebb151efa92e98
-    implementation_digest: sha256:09c0827403fb7bff77fc91a4607dc3042e2302d41cb10a89c57ba8425f0ef56a
+    implementation_digest: sha256:f8dcaa48da1fd44442a56f95231f3d264c502607dee9005407eccd575584ec4e
     schema_artifact: docs/compatibility/schemas/native-provider-v1.json
     implementation_sources:
       - src/capabilities/native/catalog.rs

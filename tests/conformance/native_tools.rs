@@ -622,6 +622,42 @@ fn native_search_and_edit_schemas_reject_cross_form_hybrids() {
         "languages": ["rust"]
     })));
 
+    let batch_query = serde_json::json!({
+        "text": "needle",
+        "mode": "content",
+        "path_prefixes": [],
+        "languages": []
+    });
+    let batch = |queries| serde_json::json!({
+        "expected_revision": revision,
+        "queries": queries
+    });
+    assert!(search.is_valid(&batch(vec![
+        batch_query.clone(),
+        serde_json::json!({
+            "text": "Some($A)",
+            "mode": "structural",
+            "path_prefixes": [],
+            "languages": ["rust"]
+        }),
+    ])));
+    assert!(!search.is_valid(&batch(vec![serde_json::json!({
+        "text": "needle",
+        "mode": "content",
+        "cursor": {},
+        "path_prefixes": [],
+        "languages": []
+    }), batch_query.clone()])));
+    assert!(!search.is_valid(&batch(vec![serde_json::json!({
+        "text": "Some($A)",
+        "mode": "structural",
+        "rewrite": "Ok($A)",
+        "path_prefixes": [],
+        "languages": ["rust"]
+    }), batch_query.clone()])));
+    assert!(!search.is_valid(&batch(vec![batch_query.clone()])));
+    assert!(!search.is_valid(&batch(vec![batch_query; 9])));
+
     let edit = jsonschema::validator_for(schema(NativeTool::Edit)).unwrap();
     let token = format!("kitsp1_{}", "b".repeat(64));
     assert!(edit.is_valid(&serde_json::json!({"preview_token": token})));

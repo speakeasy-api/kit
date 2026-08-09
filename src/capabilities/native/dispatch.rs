@@ -958,7 +958,85 @@ impl NativeDispatcher {
 
     fn search(&mut self, bytes: &[u8]) -> Result<(Value, Vec<String>), String> {
         self.ensure_not_cancelled()?;
-        let input: SearchInput = decode(bytes)?;
+        let value: Value = decode(bytes)?;
+        if value.get("queries").is_some() {
+            let input: BatchedSearchInput = serde_json::from_value(value)
+                .map_err(|_| "invalid_arguments".to_owned())?;
+            if !(2..=8).contains(&input.queries.len()) {
+                return Err("invalid_arguments".to_owned());
+            }
+            let (workspace, index) = self.workspace_index(&input.expected_revision)?;
+            let max_result_bytes = (MAX_NATIVE_OUTPUT_BYTES / 2) / input.queries.len();
+            let mut results = Vec::with_capacity(input.queries.len());
+            for (query_index, query) in input.queries.into_iter().enumerate() {
+                self.ensure_not_cancelled()?;
+                let structural = matches!(query.mode, SearchModeInput::Structural);
+                let result = if structural {
+                    structural_search(
+                        &workspace,
+                        &index,
+                        &mut self.syntax_index,
+                        &StructuralQuery { pattern: query.text, rewrite: None },
+                        &StructuralOptions {
+                            path_prefixes: query.path_prefixes.into_iter().map(PathBuf::from).collect(),
+                            languages: query.languages,
+                            max_change_diff_bytes: MAX_NATIVE_OUTPUT_BYTES / 4,
+                            max_output_bytes: max_result_bytes,
+                            max_time: std::time::Duration::from_secs(30),
+                            ..StructuralOptions::default()
+                        },
+                    )
+                    .map_err(code("structural_search_failed"))
+                    .and_then(|response| serde_json::to_value(response).map_err(code("serialization_failed")))
+                } else {
+                    search_projected_with_state(
+                        &workspace,
+                        &index,
+                        &SearchQuery { text: query.text, mode: query.mode.into() },
+                        &SearchOptions {
+                            path_prefixes: query.path_prefixes.into_iter().map(PathBuf::from).collect(),
+                            languages: query.languages,
+                            max_result_bytes,
+                            max_time: std::time::Duration::from_secs(30),
+                            ..SearchOptions::default()
+                        },
+                        None,
+                        &self.custody,
+                        &mut self.projection_state,
+                        &self.cursor_key,
+                        &self.authenticated.principal_id().to_string(),
+                        &self.config.project_id().to_string(),
+                    )
+                    .map_err(code("search_failed"))
+                };
+                match result {
+                    Ok(mut value) => {
+                        if structural {
+                            value = self.custody.project_json_stream(
+                                CaptureBoundary::WorkspaceMetadata,
+                                &value,
+                                &mut self.projection_state,
+                            );
+                        }
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("cursor");
+                            object.remove("rewrite");
+                        }
+                        value["query_index"] = json!(query_index);
+                        results.push(value);
+                    }
+                    Err(error) => results.push(json!({
+                        "query_index": query_index,
+                        "error": error,
+                    })),
+                }
+            }
+            let mut value = json!({"results": results});
+            settle_result_bytes(&mut value)?;
+            return Ok((value, Vec::new()));
+        }
+        let input: SearchInput = serde_json::from_value(value)
+            .map_err(|_| "invalid_arguments".to_owned())?;
         let (workspace, index) = self.workspace_index(&input.expected_revision)?;
         if matches!(input.mode, SearchModeInput::Structural) {
             if input.cursor.is_some() && input.rewrite.is_some() {
@@ -1770,6 +1848,22 @@ struct SearchInput {
     rewrite: Option<String>,
     #[serde(default)]
     cursor: Option<SearchCursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchedSearchInput {
+    expected_revision: String,
+    queries: Vec<BatchedSearchQuery>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchedSearchQuery {
+    text: String,
+    mode: SearchModeInput,
+    path_prefixes: Vec<String>,
+    languages: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -2932,6 +3026,56 @@ mod tests {
 
     fn dispatcher() -> (PathBuf, NativeDispatcher) {
         dispatcher_with_semantic(|_, _| (Vec::new(), None))
+    }
+
+    #[test]
+    fn batched_search_returns_ordered_independent_results_at_one_revision() {
+        let (directory, mut dispatcher) = dispatcher();
+        std::fs::write(
+            dispatcher.root.join("batch.rs"),
+            "fn needle() { let value = Some(1); }\n",
+        )
+        .unwrap();
+        let revision = dispatcher.revision().unwrap();
+        let request = |queries| {
+            serde_json::to_vec(&json!({
+                "expected_revision": revision,
+                "queries": queries,
+            }))
+            .unwrap()
+        };
+        let (value, _) = dispatcher.search(&request(vec![
+            json!({
+                "text": "needle", "mode": "content",
+                "path_prefixes": [], "languages": ["rust"],
+            }),
+            json!({
+                "text": "Some($A)", "mode": "structural",
+                "path_prefixes": [], "languages": ["rust"],
+            }),
+        ])).unwrap();
+        let results = value["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["query_index"], 0);
+        assert_eq!(results[1]["query_index"], 1);
+        assert!(results.iter().all(|result| result.get("error").is_none()));
+
+        let (value, _) = dispatcher.search(&request(vec![
+            json!({
+                "text": "\u{0}", "mode": "structural",
+                "path_prefixes": [], "languages": ["rust"],
+            }),
+            json!({
+                "text": "needle", "mode": "content",
+                "path_prefixes": [], "languages": ["rust"],
+            }),
+        ])).unwrap();
+        let results = value["results"].as_array().unwrap();
+        assert_eq!(results[0]["query_index"], 0);
+        assert_eq!(results[0]["error"], "structural_search_failed");
+        assert_eq!(results[1]["query_index"], 1);
+        assert!(results[1].get("error").is_none());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
