@@ -279,6 +279,11 @@ impl ManagedWorkspace {
         Err(unavailable())
     }
 
+    #[doc(hidden)]
+    pub fn scan_content_file_reads(&self) -> u64 {
+        0
+    }
+
     pub fn is_dirty(&self) -> bool {
         true
     }

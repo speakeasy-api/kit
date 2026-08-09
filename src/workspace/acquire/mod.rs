@@ -77,6 +77,7 @@ pub enum DirtyContent {
 pub enum SnapshotMaterialization {
     DetachedWorktree,
     IndependentClone,
+    CowClone,
     FullCopyFallback,
 }
 
@@ -568,7 +569,7 @@ fn acquire_untrusted(
     let workspace_path = reserved.path.join("repo");
 
     let materialized = (|| {
-        snapshot_repository(&source, &workspace_path)?;
+        let snapshot_materialization = snapshot_repository(&source, &workspace_path)?;
         let resolved_base = if tracked {
             sanitize_snapshot_git_metadata(&workspace_path)?;
             match request.mode {
@@ -617,7 +618,7 @@ fn acquire_untrusted(
                     hash: state,
                     dirty: true,
                 },
-                SnapshotMaterialization::FullCopyFallback,
+                snapshot_materialization,
                 DirtyContent::Included,
                 workspace_revision,
             ));
@@ -654,7 +655,7 @@ fn acquire_untrusted(
                         hash: state,
                         dirty: true,
                     },
-                    SnapshotMaterialization::FullCopyFallback,
+                    snapshot_materialization,
                     DirtyContent::Included,
                     workspace_revision,
                 ))
@@ -682,7 +683,7 @@ fn acquire_untrusted(
                 Ok((
                     base_commit,
                     source_state,
-                    SnapshotMaterialization::FullCopyFallback,
+                    snapshot_materialization,
                     dirty_content,
                     workspace_revision,
                 ))
@@ -953,7 +954,10 @@ fn classify_plain_source_root(source: &Path) -> Result<bool, AcquisitionError> {
 }
 
 #[cfg(not(unix))]
-fn snapshot_repository(_source: &Path, _target: &Path) -> Result<(), AcquisitionError> {
+fn snapshot_repository(
+    _source: &Path,
+    _target: &Path,
+) -> Result<SnapshotMaterialization, AcquisitionError> {
     Err(AcquisitionError::Unavailable {
         capability: "physical no-follow workspace snapshots",
     })
@@ -1006,8 +1010,33 @@ fn untracked_state_hash(repository: &Path) -> Result<StateHash, AcquisitionError
     Ok(StateHash(format!("blake3:{}", hash.to_hex())))
 }
 
+/// Materializes the snapshot copy of `source` at `target`.
+///
+/// Regular files are materialized with a copy-on-write kernel clone of the
+/// already-opened (and revalidated) source descriptor whenever the filesystem
+/// supports it — `fclonefileat` on APFS, `ioctl(FICLONE)` on Linux reflink
+/// filesystems — and fall back to a plain bounded `io::copy` otherwise. Every
+/// pre-existing safety fence is preserved on both paths: pre-open metadata
+/// capture, post-open `same_file` revalidation, symlink/hardlink/mount
+/// rejection, permission normalization, and the entry/byte limits.
+///
+/// Content fidelity of the copy no longer needs a source-vs-target
+/// whole-tree hash pass: clones are content-identical by construction at
+/// clone time, and fallback copies are fenced by the per-file
+/// before/opened/after metadata revalidation that already rejects
+/// stat-visible source mutation with a typed
+/// `SourceChangedDuringAcquisition`. The caller's owned state hash
+/// (`owned_state_hash`/`untracked_state_hash`) is the single remaining
+/// content walk, and it runs over the private target tree.
+///
+/// Returns `SnapshotMaterialization::CowClone` when every regular file was
+/// materialized by a kernel clone, `FullCopyFallback` when any file needed
+/// the byte-copy fallback.
 #[cfg(unix)]
-fn snapshot_repository(source: &Path, target: &Path) -> Result<(), AcquisitionError> {
+fn snapshot_repository(
+    source: &Path,
+    target: &Path,
+) -> Result<SnapshotMaterialization, AcquisitionError> {
     let source_dir = open_absolute_directory(source, "source")?;
     let source_root = unix_metadata(&source_dir)
         .map_err(|error| snapshot_error("inspect snapshot source root", error))?;
@@ -1040,6 +1069,7 @@ fn snapshot_repository(source: &Path, target: &Path) -> Result<(), AcquisitionEr
     };
 
     let mut limits = SnapshotLimits::default();
+    let mut all_cloned = true;
     copy_directory_at(
         &source_dir,
         &target_dir,
@@ -1048,19 +1078,110 @@ fn snapshot_repository(source: &Path, target: &Path) -> Result<(), AcquisitionEr
         &source_filesystem,
         &target_filesystem,
         &mut limits,
+        &mut all_cloned,
     )?;
 
-    let source_hash = hash_directory_at(&source_dir, source, &source_filesystem)?;
-    let target_hash = hash_directory_at(&target_dir, target, &target_filesystem)?;
-    if source_hash != target_hash {
-        return Err(AcquisitionError::SourceChangedDuringAcquisition);
-    }
     let source_after = unix_metadata(&source_dir)
         .map_err(|error| snapshot_error("reinspect snapshot source root", error))?;
     if !source_root.same_directory(&source_after) {
         return Err(AcquisitionError::SourceChangedDuringAcquisition);
     }
-    Ok(())
+    Ok(if all_cloned {
+        SnapshotMaterialization::CowClone
+    } else {
+        SnapshotMaterialization::FullCopyFallback
+    })
+}
+
+/// Debug-only test seam mirroring `KIT_TEST_GIT_UNAVAILABLE`: forces the
+/// per-file byte-copy fallback so tests can prove the fallback path stays
+/// correct on filesystems where clones would otherwise always succeed.
+#[cfg(unix)]
+fn force_copy_fallback() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var("KIT_TEST_FORCE_COPY").as_deref() == Ok("1") {
+        return true;
+    }
+    false
+}
+
+/// Attempts a copy-on-write clone of the opened source descriptor into
+/// `target_dir/name`. Returns the opened target file on success and `None`
+/// when the filesystem cannot clone (the caller falls back to a byte copy).
+/// The clone always operates on the already-revalidated source descriptor,
+/// never on a source path, so it introduces no path-based TOCTOU.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn try_clone_file(input: &File, target_dir: &File, name: &OsStr) -> io::Result<Option<File>> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+
+    let path = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: fclonefileat receives live descriptors and a valid C string.
+    if unsafe { libc::fclonefileat(input.as_raw_fd(), target_dir.as_raw_fd(), path.as_ptr(), 0) }
+        == 0
+    {
+        // Reopen the clone through the directory descriptor (O_NOFOLLOW) so
+        // permission normalization runs on the descriptor, not a path.
+        return open_file_at(target_dir, name, libc::O_RDONLY).map(Some);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EXDEV)
+        | Some(libc::ENOTSUP)
+        | Some(libc::EOPNOTSUPP)
+        | Some(libc::EINVAL)
+        | Some(libc::ENOSYS) => Ok(None),
+        _ => Err(error),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn try_clone_file(input: &File, target_dir: &File, name: &OsStr) -> io::Result<Option<File>> {
+    use std::os::fd::AsRawFd;
+
+    let output = create_file_at(target_dir, name, 0o600)?;
+    // SAFETY: FICLONE receives two live descriptors owned by this process.
+    if unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONE, input.as_raw_fd()) } == 0 {
+        return Ok(Some(output));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // EOPNOTSUPP == ENOTSUP on Linux, so a single arm covers both.
+        Some(libc::EXDEV) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) | Some(libc::ENOSYS)
+        | Some(libc::EBADF) => {
+            drop(output);
+            unlink_file_at(target_dir, name)?;
+            Ok(None)
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    ))
+))]
+fn try_clone_file(_input: &File, _target_dir: &File, _name: &OsStr) -> io::Result<Option<File>> {
+    Ok(None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unlink_file_at(directory: &File, name: &OsStr) -> io::Result<()> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: unlinkat receives a valid directory descriptor and C string.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[cfg(unix)]
@@ -1126,6 +1247,7 @@ struct SnapshotLimits {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn copy_directory_at(
     source_dir: &File,
     target_dir: &File,
@@ -1134,6 +1256,7 @@ fn copy_directory_at(
     source_filesystem: &SnapshotFilesystem,
     target_filesystem: &SnapshotFilesystem,
     limits: &mut SnapshotLimits,
+    all_cloned: &mut bool,
 ) -> Result<(), AcquisitionError> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1191,6 +1314,7 @@ fn copy_directory_at(
                     source_filesystem,
                     target_filesystem,
                     limits,
+                    all_cloned,
                 )?;
             }
             libc::S_IFREG => {
@@ -1211,17 +1335,39 @@ fn copy_directory_at(
                 if snapshot_mount_identity(&input)? != source_filesystem.mount {
                     return Err(AcquisitionError::SourceFilesystemBoundary(display_path));
                 }
-                let mut output = create_file_at(target_dir, &name, 0o600)
-                    .map_err(|error| snapshot_error("create repository snapshot file", error))?;
-                let copied = io::copy(
-                    &mut Read::by_ref(&mut input).take(remaining.saturating_add(1)),
-                    &mut output,
-                )
-                .map_err(|error| snapshot_error("copy repository snapshot file", error))?;
-                if copied > remaining {
-                    return Err(AcquisitionError::SnapshotLimitExceeded);
-                }
-                limits.bytes += copied;
+                let cloned = if force_copy_fallback() {
+                    None
+                } else {
+                    try_clone_file(&input, target_dir, &name)
+                        .map_err(|error| snapshot_error("clone repository snapshot file", error))?
+                };
+                let output = match cloned {
+                    Some(output) => {
+                        // The clone is content-identical to the opened source
+                        // descriptor by kernel guarantee; charge the verified
+                        // size against the byte limit without reading.
+                        limits.bytes += before.size;
+                        output
+                    }
+                    None => {
+                        *all_cloned = false;
+                        let mut output = create_file_at(target_dir, &name, 0o600).map_err(
+                            |error| snapshot_error("create repository snapshot file", error),
+                        )?;
+                        let copied = io::copy(
+                            &mut Read::by_ref(&mut input).take(remaining.saturating_add(1)),
+                            &mut output,
+                        )
+                        .map_err(|error| snapshot_error("copy repository snapshot file", error))?;
+                        if copied > remaining {
+                            return Err(AcquisitionError::SnapshotLimitExceeded);
+                        }
+                        limits.bytes += copied;
+                        output
+                    }
+                };
+                // Clones inherit the source mode; normalize both paths the
+                // way the copy path always has, via the open descriptor.
                 output
                     .set_permissions(fs::Permissions::from_mode(permission_mode(
                         before.mode & 0o777,
@@ -5229,6 +5375,64 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join(format!("{prefix}-{}", hex(&random)))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn snapshot_repository_clones_regular_files_on_apfs() {
+        let root = temporary_path("kit-cow-clone");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("plain.txt"), "plain contents\n").unwrap();
+        fs::write(source.join("nested").join("tool.sh"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            source.join("nested").join("tool.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let source_plain_mode = fs::metadata(source.join("plain.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let materialization = snapshot_repository(&source, &target).unwrap();
+
+        assert_eq!(materialization, SnapshotMaterialization::CowClone);
+        assert_eq!(
+            fs::read(target.join("plain.txt")).unwrap(),
+            b"plain contents\n"
+        );
+        assert_eq!(
+            fs::read(target.join("nested").join("tool.sh")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+        // Permissions are normalized exactly as the copy path always did.
+        assert_eq!(
+            fs::metadata(target.join("nested").join("tool.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(target.join("plain.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            source_plain_mode
+        );
+        // Clones are copy-on-write: mutating the snapshot never writes
+        // through to the source.
+        fs::write(target.join("plain.txt"), "mutated copy\n").unwrap();
+        assert_eq!(
+            fs::read(source.join("plain.txt")).unwrap(),
+            b"plain contents\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

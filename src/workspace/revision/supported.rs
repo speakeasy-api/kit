@@ -14,7 +14,13 @@ use std::{
 };
 
 const STATE_MAGIC: &str = "kit-workspace-revision-v3";
-const DIGEST_MAGIC: &[u8] = b"kit-workspace-content-v1\0";
+/// Workspace content digest domain. v2 binds each regular file through its
+/// 32-byte blake3 content hash (instead of streaming the raw bytes into the
+/// tree hasher) so reconciliation can reuse per-file hashes from the stat
+/// cache without re-reading unchanged files. The edit staging path
+/// (`workspace::edit::stage`) predicts this digest with the same preimage and
+/// must stay bit-for-bit consistent.
+const DIGEST_MAGIC: &[u8] = b"kit-workspace-content-v2\0";
 const REVISION_MAGIC: &[u8] = b"kit-workspace-revision-id-v1\0";
 
 // The memory limit is a logical allocation budget, not an allocator measurement. Every
@@ -447,6 +453,7 @@ struct Inner {
     watcher_lost: AtomicBool,
     watcher_control: Arc<WatcherControl>,
     watcher: Mutex<Option<JoinHandle<()>>>,
+    scan_cache: ScanCache,
 }
 
 struct WorkspaceOwner {
@@ -522,6 +529,7 @@ impl ManagedWorkspace {
             inode: root_metadata.inode,
         };
         let metadata = MetadataStore::open(&root_file, &root_path, root_identity, &options)?;
+        let scan_cache = ScanCache::new(options.max_entries);
         let revision = {
             let operation_deadline = deadline(options.max_scan_time);
             let _lock = metadata.lock(operation_deadline, None)?;
@@ -543,6 +551,7 @@ impl ManagedWorkspace {
                 operation_deadline,
                 None,
                 Capture::None,
+                Some(&scan_cache),
             )?;
             if let Some(path) = scanned.hardlink {
                 return Err(RevisionError::Hardlink(path));
@@ -584,6 +593,7 @@ impl ManagedWorkspace {
             watcher_lost: AtomicBool::new(false),
             watcher_control,
             watcher: Mutex::new(None),
+            scan_cache,
         });
         spawn_watcher(&inner);
         Ok(Self { inner })
@@ -602,6 +612,14 @@ impl ManagedWorkspace {
             .root
             .try_clone()
             .map_err(|source| io_error("duplicate workspace root handle", source))
+    }
+
+    /// Diagnostic/test seam: total number of file content reads performed by
+    /// reconciliation scans on this workspace. Stat-cache hits do not
+    /// increment it, which makes cache effectiveness observable.
+    #[doc(hidden)]
+    pub fn scan_content_file_reads(&self) -> u64 {
+        self.inner.scan_cache.content_reads.load(Ordering::Relaxed)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -994,6 +1012,7 @@ impl WorkspaceMutationGuard<'_> {
             operation_deadline,
             Some(&self.stable.inner.watcher_control.stopped),
             Capture::None,
+            Some(&self.stable.inner.scan_cache),
         )?;
         if let Some(path) = scanned.hardlink {
             return Err(RevisionError::Hardlink(path));
@@ -1289,6 +1308,7 @@ fn reconcile_locked(
         operation_deadline,
         Some(&inner.watcher_control.stopped),
         capture,
+        Some(&inner.scan_cache),
     )?;
     check_request_deadline(request_deadline)?;
     let stored = inner.metadata.load_consistent()?;
@@ -1550,6 +1570,193 @@ fn allocation_charge(payload: usize) -> Result<u64, RevisionError> {
         .ok_or(RevisionError::LimitExceeded(LimitKind::Memory))
 }
 
+/// Upper bound on stat-cache heap usage; entries beyond it are simply not
+/// cached (correctness is unaffected because misses fall back to reading).
+const STAT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Approximate fixed per-entry heap overhead charged against
+/// `STAT_CACHE_MAX_BYTES` on top of the key path bytes.
+const STAT_CACHE_ENTRY_OVERHEAD: u64 = 128;
+
+/// The full stat identity a cached content hash is keyed on. Every field must
+/// match for a hit; ctime (nanosecond-granular on APFS and modern Linux
+/// filesystems) catches mode/ownership changes and most same-mtime tricks.
+///
+/// Residual race, deliberately accepted (the classic stat-cache caveat git
+/// itself lives with): content replaced in-place with identical size AND
+/// identical mtime+ctime down to the nanosecond is indistinguishable by stat.
+/// Two mitigations shrink the window further: entries whose mtime or ctime is
+/// not strictly older than the scan's wall-clock start are treated as
+/// unverifiable and never cached (git's "racy timestamp" rule), and the
+/// double-scan mutation fence still requires two consecutive identical
+/// digests before a revision is published.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatKey {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+    mode: u32,
+}
+
+impl StatKey {
+    fn from_metadata(metadata: &UnixMetadata) -> Self {
+        Self {
+            device: metadata.device,
+            inode: metadata.inode,
+            size: metadata.size,
+            modified_seconds: metadata.modified_seconds,
+            modified_nanoseconds: metadata.modified_nanoseconds,
+            changed_seconds: metadata.changed_seconds,
+            changed_nanoseconds: metadata.changed_nanoseconds,
+            mode: u32::from(metadata.mode),
+        }
+    }
+
+    /// True when both timestamps are strictly older than the scan start, so
+    /// the file cannot mutate again without moving at least one timestamp.
+    fn settled_before(&self, scan_start: (i64, i64)) -> bool {
+        timestamp_settled(self.modified_seconds, self.modified_nanoseconds, scan_start)
+            && timestamp_settled(self.changed_seconds, self.changed_nanoseconds, scan_start)
+    }
+}
+
+fn timestamp_settled(seconds: i64, nanoseconds: i64, scan_start: (i64, i64)) -> bool {
+    if nanoseconds == 0 {
+        // A zero nanosecond field may mean a coarse-granularity filesystem
+        // (APFS and modern Linux filesystems store nanoseconds, but the rule
+        // must stay safe everywhere): require a strictly earlier second so a
+        // same-second rewrite that stat cannot distinguish is never cached.
+        seconds < scan_start.0
+    } else {
+        (seconds, nanoseconds) < scan_start
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CachedContent {
+    hash: [u8; 32],
+    has_nul: bool,
+    valid_utf8: bool,
+}
+
+struct StatCacheEntry {
+    key: StatKey,
+    content: CachedContent,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct StatCacheState {
+    map: HashMap<PathBuf, StatCacheEntry>,
+    bytes: u64,
+}
+
+/// In-memory (per-daemon, never persisted) stat cache for revision
+/// reconciliation: relative path -> full stat tuple -> content hash and
+/// content facts. A scan pass that finds an identical stat tuple reuses the
+/// cached hash without opening the file. Bounded by `max_entries` (the same
+/// bound the scan itself enforces on tree entries) and
+/// `STAT_CACHE_MAX_BYTES`; paths that vanish from the tree are evicted after
+/// every successful scan pass by generation pruning.
+struct ScanCache {
+    state: Mutex<StatCacheState>,
+    generation: AtomicU64,
+    content_reads: AtomicU64,
+    max_entries: usize,
+}
+
+impl ScanCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            state: Mutex::new(StatCacheState::default()),
+            generation: AtomicU64::new(0),
+            content_reads: AtomicU64::new(0),
+            max_entries,
+        }
+    }
+
+    fn begin_scan(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn lookup(&self, path: &Path, key: &StatKey, generation: u64) -> Option<CachedContent> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.map.get_mut(path)?;
+        if entry.key == *key {
+            entry.generation = generation;
+            Some(entry.content)
+        } else {
+            None
+        }
+    }
+
+    fn store(&self, path: &Path, key: StatKey, content: CachedContent, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.map.get_mut(path) {
+            entry.key = key;
+            entry.content = content;
+            entry.generation = generation;
+            return;
+        }
+        let charge = Self::charge(path);
+        if state.map.len() >= self.max_entries
+            || state.bytes.saturating_add(charge) > STAT_CACHE_MAX_BYTES
+        {
+            return;
+        }
+        state.bytes += charge;
+        state.map.insert(
+            path.to_path_buf(),
+            StatCacheEntry {
+                key,
+                content,
+                generation,
+            },
+        );
+    }
+
+    /// Evicts entries that were neither hit nor stored during the pass that
+    /// just completed successfully; their paths are no longer in the tree.
+    fn finish_scan(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        let mut freed = 0_u64;
+        state.map.retain(|path, entry| {
+            if entry.generation == generation {
+                true
+            } else {
+                freed = freed.saturating_add(Self::charge(path));
+                false
+            }
+        });
+        state.bytes = state.bytes.saturating_sub(freed);
+    }
+
+    fn charge(path: &Path) -> u64 {
+        path.as_os_str().len() as u64 + STAT_CACHE_ENTRY_OVERHEAD
+    }
+}
+
+struct ScanCacheContext<'a> {
+    cache: &'a ScanCache,
+    generation: u64,
+    scan_start: (i64, i64),
+}
+
+fn wall_clock() -> (i64, i64) {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => (
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
+            i64::from(elapsed.subsec_nanos()),
+        ),
+        // A pre-epoch clock makes every timestamp look racy, which fails
+        // safe: nothing is cached and every file is read.
+        Err(_) => (i64::MIN, 0),
+    }
+}
+
 fn scan_stable(
     root: &File,
     display_root: &Path,
@@ -1557,6 +1764,7 @@ fn scan_stable(
     deadline: Instant,
     stopped: Option<&AtomicBool>,
     capture: Capture<'_>,
+    cache: Option<&ScanCache>,
 ) -> Result<Scanned, RevisionError> {
     for attempt_number in 1..=options.max_scan_attempts {
         let mut memory = MemoryBudget::new(options.max_memory_bytes);
@@ -1574,6 +1782,7 @@ fn scan_stable(
                 &mut fence,
                 &mut memory,
                 &mut scanned_bytes,
+                cache,
             )?;
             profile_scan(attempt_number, 1, &first, first_started.elapsed());
             fence.ensure_clean()?;
@@ -1588,6 +1797,7 @@ fn scan_stable(
                 &mut fence,
                 &mut memory,
                 &mut scanned_bytes,
+                cache,
             )?;
             profile_scan(attempt_number, 2, &second, second_started.elapsed());
             fence.ensure_clean()?;
@@ -1621,7 +1831,13 @@ fn scan_once(
     fence: &mut MutationFence,
     memory: &mut MemoryBudget,
     scanned_bytes: &mut u64,
+    cache: Option<&ScanCache>,
 ) -> Result<Scanned, RevisionError> {
+    let cache_context = cache.map(|cache| ScanCacheContext {
+        cache,
+        generation: cache.begin_scan(),
+        scan_start: wall_clock(),
+    });
     let bytes_before = *scanned_bytes;
     let root_before =
         unix_metadata(root).map_err(|source| io_error("inspect workspace root", source))?;
@@ -1665,6 +1881,7 @@ fn scan_once(
         &mut hardlink,
         &mut captured_file,
         &mut captured_bytes,
+        cache_context.as_ref(),
     )?;
     *scanned_bytes = limits.bytes;
     let root_after =
@@ -1677,6 +1894,9 @@ fn scan_once(
         .map_err(|source| io_error("reinspect workspace root path", source))?;
     if !root_before.same_object(&path_after) {
         return Err(RevisionError::ScanRace { attempts: 1 });
+    }
+    if let Some(context) = &cache_context {
+        context.cache.finish_scan(context.generation);
     }
     Ok(Scanned {
         digest: ContentDigest::from_hash(hasher.finalize()),
@@ -1718,6 +1938,7 @@ fn scan_directory(
     hardlink: &mut Option<PathBuf>,
     captured_file: &mut Option<BoundedFileRead>,
     captured_bytes: &mut u64,
+    cache_context: Option<&ScanCacheContext<'_>>,
 ) -> Result<(), RevisionError> {
     check_time(limits)?;
     let directory_before = unix_metadata(directory)
@@ -1797,6 +2018,7 @@ fn scan_directory(
                     hardlink,
                     captured_file,
                     captured_bytes,
+                    cache_context,
                 )?;
             }
             libc::S_IFREG => {
@@ -1804,33 +2026,6 @@ fn scan_directory(
                     *hardlink = Some(clone_path(&display_path, memory)?);
                 }
                 let executable = before.mode & 0o111 != 0;
-                let mut file =
-                    match open_file_at(directory, &name, libc::O_RDONLY | libc::O_NONBLOCK) {
-                        Ok(file) => file,
-                        Err(source) => return Err(map_entry_error(display_path, source)),
-                    };
-                let opened = unix_metadata(&file)
-                    .map_err(|source| io_error("inspect opened workspace file", source))?;
-                if !before.same_file(&opened) {
-                    return Err(RevisionError::ScanRace { attempts: 1 });
-                }
-                if mount_identity(&file)? != filesystem.mount {
-                    return Err(RevisionError::MountBoundary(display_path));
-                }
-                fence.watch(&display_path, &file, false, memory)?;
-                let watched = metadata_at(directory, &name).map_err(|source| {
-                    if matches!(
-                        source.kind(),
-                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                    ) {
-                        RevisionError::ScanRace { attempts: 1 }
-                    } else {
-                        io_error("reinspect watched workspace file path", source)
-                    }
-                })?;
-                if !opened.same_object(&watched) {
-                    return Err(RevisionError::ScanRace { attempts: 1 });
-                }
                 let remaining = options.max_bytes.saturating_sub(limits.bytes);
                 if before.size > remaining || before.size > usize::MAX as u64 {
                     return Err(RevisionError::LimitExceeded(LimitKind::Bytes));
@@ -1862,6 +2057,74 @@ fn scan_directory(
                     }
                     _ => false,
                 };
+                // Stat-cache fast path: when no capture needs this file's
+                // bytes and the full stat tuple (device, inode, size,
+                // mtime, ctime, mode) matches a cached entry, reuse the
+                // cached content hash without opening the file. Byte-limit
+                // accounting still charges the file's size so limit
+                // semantics are identical to a cold scan. Mutations remain
+                // fenced: a stat-visible change misses the cache and is
+                // re-read, a deletion after the stat trips the directory
+                // mutation fences, and stat-invisible changes are the
+                // documented residual race bounded by the racy-timestamp
+                // rule and the double-scan digest comparison.
+                if selected.is_none()
+                    && !retain_snapshot
+                    && let Some(context) = cache_context
+                    && let Some(content) = context.cache.lookup(
+                        &child_relative,
+                        &StatKey::from_metadata(&before),
+                        context.generation,
+                    )
+                {
+                    hasher.update(&content.hash);
+                    limits.bytes += before.size;
+                    if matches!(capture, Capture::Snapshot { .. }) {
+                        push_entry(
+                            entries,
+                            SnapshotEntry {
+                                path: child_relative,
+                                kind: EntryKind::File,
+                                executable,
+                                size: before.size,
+                                has_nul: content.has_nul,
+                                valid_utf8: content.valid_utf8,
+                                content_complete: false,
+                                bytes: Vec::new(),
+                            },
+                            entries_capacity,
+                            memory,
+                        )?;
+                    }
+                    continue;
+                }
+                let mut file =
+                    match open_file_at(directory, &name, libc::O_RDONLY | libc::O_NONBLOCK) {
+                        Ok(file) => file,
+                        Err(source) => return Err(map_entry_error(display_path, source)),
+                    };
+                let opened = unix_metadata(&file)
+                    .map_err(|source| io_error("inspect opened workspace file", source))?;
+                if !before.same_file(&opened) {
+                    return Err(RevisionError::ScanRace { attempts: 1 });
+                }
+                if mount_identity(&file)? != filesystem.mount {
+                    return Err(RevisionError::MountBoundary(display_path));
+                }
+                fence.watch(&display_path, &file, false, memory)?;
+                let watched = metadata_at(directory, &name).map_err(|source| {
+                    if matches!(
+                        source.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) {
+                        RevisionError::ScanRace { attempts: 1 }
+                    } else {
+                        io_error("reinspect watched workspace file path", source)
+                    }
+                })?;
+                if !opened.same_object(&watched) {
+                    return Err(RevisionError::ScanRace { attempts: 1 });
+                }
                 let mut snapshot_bytes = if retain_snapshot {
                     *captured_bytes += before.size;
                     Some(precharged_bytes(before.size as usize, memory)?)
@@ -1874,6 +2137,7 @@ fn scan_directory(
                     })
                     .transpose()?;
                 let mut facts = FileFacts::default();
+                let mut file_hasher = blake3::Hasher::new();
                 let mut buffer = vec![0_u8; 64 * 1024];
                 let mut read_size = 0_u64;
                 loop {
@@ -1899,7 +2163,7 @@ fn scan_directory(
                         return Err(RevisionError::ScanRace { attempts: 1 });
                     }
                     read_size = next_read_size;
-                    hasher.update(&buffer[..count]);
+                    file_hasher.update(&buffer[..count]);
                     facts.update(&buffer[..count]);
                     if let Some(bytes) = &mut snapshot_bytes {
                         bytes.extend_from_slice(&buffer[..count]);
@@ -1918,6 +2182,28 @@ fn scan_directory(
                         .is_some_and(|bytes| bytes.len() as u64 != before.size)
                 {
                     return Err(RevisionError::ScanRace { attempts: 1 });
+                }
+                let content_hash = *file_hasher.finalize().as_bytes();
+                hasher.update(&content_hash);
+                if let Some(context) = cache_context {
+                    context.cache.content_reads.fetch_add(1, Ordering::Relaxed);
+                    let key = StatKey::from_metadata(&before);
+                    // Git's racy-timestamp rule: only cache entries whose
+                    // timestamps are strictly older than this scan's start,
+                    // so a same-timestamp rewrite can never be mistaken for
+                    // the cached content.
+                    if key.settled_before(context.scan_start) {
+                        context.cache.store(
+                            &child_relative,
+                            key,
+                            CachedContent {
+                                hash: content_hash,
+                                has_nul: facts.has_nul,
+                                valid_utf8: facts.utf8.valid,
+                            },
+                            context.generation,
+                        );
+                    }
                 }
                 if matches!(capture, Capture::Snapshot { .. }) {
                     push_entry(
@@ -3857,6 +4143,7 @@ mod tests {
             &mut fence,
             &mut memory,
             &mut scanned_bytes,
+            None,
         )
         .unwrap();
         fence.ensure_clean().unwrap();
@@ -3879,6 +4166,7 @@ mod tests {
             &mut fence,
             &mut memory,
             &mut scanned_bytes,
+            None,
         )
         .unwrap();
         assert_eq!(first.digest, second.digest);
@@ -3890,5 +4178,169 @@ mod tests {
         drop(fence);
         drop(root_file);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    struct CacheFixture {
+        root: PathBuf,
+        workspace: PathBuf,
+    }
+
+    impl CacheFixture {
+        fn new() -> Self {
+            let mut nonce = [0_u8; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("kit-revision-cache-{}", hex_nonce(nonce)));
+            let workspace = root.join("workspace");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&workspace).unwrap();
+            Self { root, workspace }
+        }
+
+        fn open(&self) -> ManagedWorkspace {
+            let options = RevisionOptions {
+                max_entries: 1024,
+                max_name_bytes: 1024 * 1024,
+                max_bytes: 64 * 1024 * 1024,
+                max_memory_bytes: 128 * 1024 * 1024,
+                max_depth: 16,
+                max_scan_time: Duration::from_secs(5),
+                max_scan_attempts: 3,
+                // Keep the background watcher from reconciling on its own so
+                // the content-read counter is driven only by this test.
+                watcher_interval: Duration::from_secs(3600),
+                reconciliation_interval: Duration::from_secs(3600),
+                metadata_path: Some(self.root.join("revision.state")),
+            };
+            ManagedWorkspace::open_with_options(&self.workspace, options).unwrap()
+        }
+
+        fn cached_paths(&self, workspace: &ManagedWorkspace) -> usize {
+            workspace.inner.scan_cache.state.lock().unwrap().map.len()
+        }
+    }
+
+    impl Drop for CacheFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn bump_mtime(path: &Path) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now()).unwrap();
+    }
+
+    #[test]
+    fn stat_cache_reuses_content_hashes_and_re_reads_on_stat_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = CacheFixture::new();
+        fs::write(fixture.workspace.join("alpha"), b"alpha contents").unwrap();
+        fs::write(fixture.workspace.join("beta"), b"beta contents").unwrap();
+        let workspace = fixture.open();
+        // The opening scan reads each file exactly once: the first pass is
+        // cold, the second pass of the double-scan fence already hits.
+        assert_eq!(workspace.scan_content_file_reads(), 2);
+        let initial = workspace.reconcile().unwrap();
+        // A fully warm reconciliation opens no file at all.
+        assert_eq!(workspace.scan_content_file_reads(), 2);
+
+        // mtime bump, same content: the stat tuple changed, so the file is
+        // re-read (once), and the digest proves the content did not change.
+        bump_mtime(&fixture.workspace.join("alpha"));
+        let touched = workspace.reconcile().unwrap();
+        assert_eq!(workspace.scan_content_file_reads(), 3);
+        assert_eq!(touched.digest(), initial.digest());
+
+        // Content change: re-read and a new digest.
+        fs::write(fixture.workspace.join("alpha"), b"gamma contents").unwrap();
+        let rewritten = workspace.reconcile().unwrap();
+        assert_eq!(workspace.scan_content_file_reads(), 4);
+        assert_ne!(rewritten.digest(), touched.digest());
+
+        // Mode change, same content and mtime: ctime moves, the cache row is
+        // invalidated, and the executable bit changes the digest.
+        fs::set_permissions(
+            fixture.workspace.join("beta"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let chmodded = workspace.reconcile().unwrap();
+        assert_eq!(workspace.scan_content_file_reads(), 5);
+        assert_ne!(chmodded.digest(), rewritten.digest());
+    }
+
+    #[test]
+    fn stat_cache_treats_racy_timestamps_as_unverifiable() {
+        let fixture = CacheFixture::new();
+        fs::write(fixture.workspace.join("racy"), b"racy contents").unwrap();
+        fs::write(fixture.workspace.join("calm"), b"calm contents").unwrap();
+        // A modification timestamp at or after every scan start is never
+        // cacheable, so the file is read by both passes of every scan.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.workspace.join("racy"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        drop(file);
+        let workspace = fixture.open();
+        let after_open = workspace.scan_content_file_reads();
+        // calm: one read; racy: read in both passes.
+        assert_eq!(after_open, 3);
+        let first = workspace.reconcile().unwrap();
+        assert_eq!(workspace.scan_content_file_reads(), after_open + 2);
+        let second = workspace.reconcile().unwrap();
+        assert_eq!(workspace.scan_content_file_reads(), after_open + 4);
+        assert_eq!(first.digest(), second.digest());
+    }
+
+    #[test]
+    fn stat_cache_evicts_paths_that_leave_the_tree_and_bounds_entries() {
+        let fixture = CacheFixture::new();
+        fs::write(fixture.workspace.join("one"), b"one").unwrap();
+        fs::write(fixture.workspace.join("two"), b"two").unwrap();
+        fs::write(fixture.workspace.join("three"), b"three").unwrap();
+        let workspace = fixture.open();
+        assert_eq!(fixture.cached_paths(&workspace), 3);
+        fs::remove_file(fixture.workspace.join("three")).unwrap();
+        workspace.reconcile().unwrap();
+        assert_eq!(fixture.cached_paths(&workspace), 2);
+
+        // The insert bound refuses new rows instead of growing without
+        // limit; correctness is unaffected because misses simply read.
+        let bounded = ScanCache::new(1);
+        let generation = bounded.begin_scan();
+        let key = StatKey {
+            device: 1,
+            inode: 1,
+            size: 1,
+            modified_seconds: 1,
+            modified_nanoseconds: 1,
+            changed_seconds: 1,
+            changed_nanoseconds: 1,
+            mode: 0o644,
+        };
+        let content = CachedContent {
+            hash: [0_u8; 32],
+            has_nul: false,
+            valid_utf8: true,
+        };
+        bounded.store(Path::new("first"), key, content, generation);
+        bounded.store(Path::new("second"), key, content, generation);
+        assert_eq!(bounded.state.lock().unwrap().map.len(), 1);
+        assert!(
+            bounded
+                .lookup(Path::new("first"), &key, generation)
+                .is_some()
+        );
+        assert!(
+            bounded
+                .lookup(Path::new("second"), &key, generation)
+                .is_none()
+        );
     }
 }

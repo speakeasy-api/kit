@@ -367,8 +367,14 @@ fn workspace_content_digest(
     snapshot: &Snapshot,
     deadline: Instant,
 ) -> Result<String, StageError> {
+    // Predicts the revision system's workspace content digest
+    // (`kit-workspace-content-v2`): regular files are bound through their
+    // 32-byte blake3 content hash. The re-read below stays as a quiescence
+    // fence — the staged tree must still hash to the snapshot's digests at
+    // prediction time — and the verified per-file digest is what enters the
+    // tree preimage, exactly as in the reconciliation scan.
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kit-workspace-content-v1\0");
+    hasher.update(b"kit-workspace-content-v2\0");
     for (path, state) in &snapshot.entries {
         hasher.update(&[if state.kind == Kind::Directory {
             b'd'
@@ -388,7 +394,7 @@ fn workspace_content_digest(
             if *blake3::hash(&bytes).as_bytes() != state.digest {
                 return Err(StageError::StageChanged);
             }
-            hasher.update(&bytes);
+            hasher.update(&state.digest);
         }
     }
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))

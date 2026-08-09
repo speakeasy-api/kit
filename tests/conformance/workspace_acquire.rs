@@ -81,6 +81,20 @@ impl Drop for Fixture {
     }
 }
 
+fn assert_untrusted_snapshot_marker(marker: SnapshotMaterialization) {
+    assert!(
+        matches!(
+            marker,
+            SnapshotMaterialization::CowClone | SnapshotMaterialization::FullCopyFallback
+        ),
+        "unexpected untrusted snapshot marker: {marker:?}"
+    );
+    // This project's development and CI Macs run APFS, where every regular
+    // file clones; a fallback there would mean the clone path regressed.
+    #[cfg(target_os = "macos")]
+    assert_eq!(marker, SnapshotMaterialization::CowClone);
+}
+
 #[test]
 fn all_modes_preserve_dirty_source_and_report_snapshot_truthfully() {
     for (mode, policy, expected_dirty, expected_metadata, materialization) in [
@@ -114,7 +128,14 @@ fn all_modes_preserve_dirty_source_and_report_snapshot_truthfully() {
         let workspace = acquire(fixture.request(mode, policy)).unwrap();
         assert_eq!(workspace.dirty_content, expected_dirty);
         assert_eq!(workspace.git_metadata, expected_metadata);
-        assert_eq!(workspace.materialization, materialization);
+        if mode == AcquisitionMode::DetachedWorktree {
+            assert_eq!(workspace.materialization, materialization);
+        } else {
+            // Untrusted snapshots report how they were materialized: a
+            // kernel copy-on-write clone when the filesystem supports it,
+            // the byte-copy fallback otherwise.
+            assert_untrusted_snapshot_marker(workspace.materialization);
+        }
         assert_eq!(
             workspace.canonical_source,
             fixture.source.canonicalize().unwrap()
@@ -1366,4 +1387,90 @@ fn make_executable(_path: &Path) {}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The clone materialization and the forced byte-copy fallback must be
+/// observationally identical: same snapshot content, same owned state hash,
+/// same revision hash. The fallback is forced in a child process through the
+/// debug-only `KIT_TEST_FORCE_COPY` seam (mirroring the
+/// `KIT_TEST_GIT_UNAVAILABLE` pattern) so the parent's clone-path
+/// acquisitions are never affected.
+#[test]
+fn cow_snapshot_clone_and_forced_copy_agree_on_state_hashes() {
+    if let (Some(source), Some(managed)) = (
+        std::env::var_os("KIT_FORCE_COPY_SOURCE"),
+        std::env::var_os("KIT_FORCE_COPY_MANAGED"),
+    ) {
+        let request = AcquisitionRequest::new(
+            PathBuf::from(source),
+            PathBuf::from(managed),
+            WorkspaceId::new("workspace-force-copy").unwrap(),
+            OwnerId::new("writer-1").unwrap(),
+            AcquisitionMode::CopyOnWriteSnapshot,
+            WriterPolicy::Hostile,
+        );
+        let workspace = acquire(request).unwrap();
+        assert_eq!(
+            workspace.materialization,
+            SnapshotMaterialization::FullCopyFallback
+        );
+        assert_eq!(
+            fs::read(workspace.path.join("untracked.txt")).unwrap(),
+            b"untracked content\n"
+        );
+        println!("kit-state={}", workspace.initial_dirty_state.as_str());
+        println!(
+            "kit-revision={}",
+            workspace.workspace_revision.hash.as_str()
+        );
+        assert_eq!(cleanup(&workspace).unwrap(), CleanupOutcome::Removed);
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.dirty();
+    let cloned = acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+        .unwrap();
+    assert_untrusted_snapshot_marker(cloned.materialization);
+    assert_eq!(
+        fs::read(cloned.path.join("untracked.txt")).unwrap(),
+        b"untracked content\n"
+    );
+    assert_eq!(
+        fs::read(cloned.path.join("tracked.txt")).unwrap(),
+        b"unstaged change\n"
+    );
+    let clone_state = cloned.initial_dirty_state.as_str().to_owned();
+    let clone_revision = cloned.workspace_revision.hash.as_str().to_owned();
+    assert_eq!(cleanup(&cloned).unwrap(), CleanupOutcome::Removed);
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workspace_acquire::cow_snapshot_clone_and_forced_copy_agree_on_state_hashes",
+            "--nocapture",
+        ])
+        .env("KIT_FORCE_COPY_SOURCE", &fixture.source)
+        .env("KIT_FORCE_COPY_MANAGED", &fixture.managed)
+        .env("KIT_TEST_FORCE_COPY", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let field = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("missing {key} in child output:\n{stdout}"))
+            .to_owned()
+    };
+    // Identical content must hash identically in both materializations: the
+    // state-hash domains are content-bound, not materialization-bound.
+    assert_eq!(field("kit-state="), clone_state);
+    assert_eq!(field("kit-revision="), clone_revision);
 }
