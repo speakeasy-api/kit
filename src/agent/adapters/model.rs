@@ -45,7 +45,9 @@ use crate::{
         reserve::{ReservationId, ReservationStatus},
     },
     store::sqlite::{
-        append::{AppendCommand, AppendOutcome, ExpectedStreamVersion, NewEvent, SqliteStore},
+        append::{
+            AppendCommand, AppendOutcome, ExpectedStreamVersion, NewEvent, SqliteStore, StoreError,
+        },
         idempotency::{
             CanonicalRequestDigest, IdempotencyKey, IdempotencyScope, IdempotencyStatus,
         },
@@ -288,6 +290,7 @@ where
                     &intent,
                     &outcome,
                     self.kernel.boundary(&request, outcome.result.as_ref()),
+                    true,
                 )?;
                 self.kernel.settle_outcome(&outcome)?;
                 return outcome.into_turn(Arc::clone(&self.kernel));
@@ -1151,7 +1154,7 @@ impl ModelKernel {
             intent.correlation.outcome_event_id,
             if dispatched { 2 } else { 1 },
         )?;
-        self.append_journal_outcome(key, intent, &appended.0, snapshot)?;
+        self.append_journal_outcome(key, intent, &appended.0, snapshot, appended.1)?;
         Ok(appended)
     }
 
@@ -1293,6 +1296,7 @@ impl ModelKernel {
         intent: &IntentReceipt,
         outcome: &PersistedOutcome,
         snapshot: Option<BoundarySnapshot>,
+        repair: bool,
     ) -> Result<(), LoopError> {
         if self.policy.detached {
             return Ok(());
@@ -1303,7 +1307,7 @@ impl ModelKernel {
             ModelOutcomeStatus::Cancelled => EffectStatus::Cancelled,
             ModelOutcomeStatus::OutcomeUnknown => EffectStatus::OutcomeUnknown,
         };
-        self.append_journal(
+        self.append_journal_inner(
             &format!("effect:{}:outcome", key.as_str()),
             intent.correlation.command_id,
             LoopRecord::EffectOutcome(EffectOutcome {
@@ -1312,6 +1316,7 @@ impl ModelKernel {
                 status,
                 snapshot,
             }),
+            repair,
         )
     }
 
@@ -1321,8 +1326,19 @@ impl ModelKernel {
         command_id: CommandId,
         record: LoopRecord,
     ) -> Result<(), LoopError> {
+        self.append_journal_inner(idempotency_key, command_id, record, false)
+    }
+
+    fn append_journal_inner(
+        &self,
+        idempotency_key: &str,
+        command_id: CommandId,
+        record: LoopRecord,
+        tolerate_existing: bool,
+    ) -> Result<(), LoopError> {
         let idempotency_key = IdempotencyKey::parse(idempotency_key).map_err(model_error)?;
-        self.store
+        let appended = self
+            .store
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .append_effect(EffectJournalAppend {
@@ -1335,9 +1351,18 @@ impl ModelKernel {
                 trace_id: self.trace_id.clone(),
                 artifacts: Vec::new(),
                 record,
-            })
-            .map(|_| ())
-            .map_err(model_error)
+            });
+        match appended {
+            Ok(_) => Ok(()),
+            // Crash-repair re-appends after a replayed outcome lawfully
+            // diverge from the stored record: the journal digest binds the
+            // driver claim (renewed leases change it) and the boundary
+            // snapshot (recomputed from live state). The identity key scopes
+            // to this attempt and fence, so an existing terminal record IS
+            // this effect's record — never a foreign request.
+            Err(StoreError::IdempotencyConflict(_)) if tolerate_existing => Ok(()),
+            Err(error) => Err(model_error(error)),
+        }
     }
 }
 

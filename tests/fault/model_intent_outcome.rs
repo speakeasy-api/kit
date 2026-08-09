@@ -508,6 +508,39 @@ async fn replay_rejects_a_changed_projected_request_digest() {
     assert_eq!(fixture.fake.dispatches(), 0);
 }
 
+/// A completed turn replayed after a driver-claim lease renewal must resume
+/// cleanly. The replay re-appends the outcome journal record as crash
+/// repair, and the journal digest binds the claim and a recomputed boundary
+/// snapshot — the existing terminal record under the identity key must be
+/// accepted, never reported as "a different request".
+#[tokio::test]
+async fn replay_after_lease_renewal_repairs_the_outcome_journal() {
+    let mut fixture = Fixture::new([ModelTurnEvent::Finished(result())]);
+    fixture.seed_boundary();
+    let mut first = begin(fixture.adapter(None)).await.unwrap();
+    drain(&mut first).await.unwrap();
+    assert_eq!(fixture.fake.dispatches(), 1);
+
+    let renewed = test_support::open_sqlite_store(fixture.database.path())
+        .unwrap()
+        .install_driver_claim_for_test(AttemptDriverClaim {
+            run_id: fixture.security.config.run_id(),
+            attempt_id: fixture.security.attempt.attempt_id,
+            principal_id: fixture.security.attempt.principal_id,
+            fence: fixture.security.attempt.fencing_token,
+            lease_version: 2,
+            expires_at_unix_micros: 0,
+        })
+        .unwrap();
+    fixture.security.claim = renewed;
+
+    let mut replayed = begin(fixture.adapter(None)).await.unwrap();
+    let events = drain(&mut replayed).await.unwrap();
+    assert!(!events.is_empty());
+    // Replay, not re-execution: the provider is never dispatched again.
+    assert_eq!(fixture.fake.dispatches(), 1);
+}
+
 #[tokio::test]
 async fn schema_bytes_can_exhaust_model_budget_before_intent_or_dispatch() {
     let fixture = Fixture::new([ModelTurnEvent::Finished(result())]);
