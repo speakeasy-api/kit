@@ -474,6 +474,61 @@ fn concurrent_auto_start_replaces_sigkill_stale_discovery_once() {
 }
 
 #[test]
+fn auto_start_replaces_daemon_from_a_previous_build() {
+    let root = TestRoot::new("stale-binary");
+    let mut daemon = start_daemon(&root.0);
+    wait_for_discovery(&root.0, &mut daemon);
+    let old_pid = daemon.id();
+    let recorded: Value =
+        serde_json::from_slice(&fs::read(root.0.join("daemon.json")).expect("read discovery"))
+            .expect("parse discovery");
+    assert_eq!(recorded["pid"].as_u64(), Some(u64::from(old_pid)));
+    let identity = recorded["executable"]
+        .as_object()
+        .expect("daemon must record its executable identity");
+    let mut stale = recorded.clone();
+    stale["executable"]["modified_unix_micros"] = json!(
+        identity["modified_unix_micros"]
+            .as_u64()
+            .expect("modified micros")
+            + 1
+    );
+    write_discovery(&root.0, &stale);
+
+    let daemon_identity: Value = serde_json::from_slice(
+        &fs::read(root.0.join("daemon-identity.json")).expect("read daemon identity"),
+    )
+    .expect("parse daemon identity");
+    let project = daemon_identity["project_id"].as_str().expect("project id");
+    // The CLI's exit probe (kill 0) must observe the SIGTERMed daemon
+    // disappearing, so reap the child promptly instead of leaving a zombie.
+    let reaper = thread::spawn(move || wait_for_exit(&mut daemon, Duration::from_secs(30), "stale daemon"));
+    let replaced = cli(
+        &root.0,
+        &["--auto-start", "--json", "project", "create", "--id", project],
+    );
+    assert_success(&replaced);
+
+    reaper.join().expect("reap stale daemon");
+    let processes = daemon_processes(&root.0);
+    assert_eq!(
+        processes.len(),
+        1,
+        "exactly one daemon survives stale replacement"
+    );
+    assert_ne!(processes[0].0, old_pid, "stale daemon must be replaced");
+    let refreshed: Value = serde_json::from_slice(
+        &fs::read(root.0.join("daemon.json")).expect("read refreshed discovery"),
+    )
+    .expect("parse refreshed discovery");
+    assert_eq!(
+        refreshed["executable"], recorded["executable"],
+        "replacement daemon records the live binary identity"
+    );
+    terminate_daemons(&root.0);
+}
+
+#[test]
 fn daemonized_process_starts_a_detached_unix_session() {
     let root = TestRoot::new("detached-session");
     assert_success(&cli(&root.0, &["daemon", "--daemonize"]));

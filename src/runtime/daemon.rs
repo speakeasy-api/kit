@@ -1508,6 +1508,8 @@ impl Daemon {
             endpoint: origin,
             credential: std::str::from_utf8(credential.expose())
                 .map_err(|error| DaemonError::Setup(error.to_string()))?,
+            pid: std::process::id(),
+            executable: crate::cli::core::ExecutableIdentity::current(),
         };
         write_json_atomic(&state_root, DISCOVERY_FILE, &discovery)?;
 
@@ -1840,6 +1842,8 @@ struct Identity {
 struct Discovery<'a> {
     endpoint: String,
     credential: &'a str,
+    pid: u32,
+    executable: Option<crate::cli::core::ExecutableIdentity>,
 }
 
 fn map_lease(error: LeaseError) -> DaemonError {

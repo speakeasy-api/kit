@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{ClientError, ClientErrorKind};
 
@@ -55,11 +55,46 @@ fn state_home() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".local/state"))
 }
 
+/// Identity of the daemon executable, recorded in the discovery file at boot
+/// so auto-start can detect a daemon left running from a previous build.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableIdentity {
+    pub path: String,
+    pub len: u64,
+    pub modified_unix_micros: u64,
+}
+
+impl ExecutableIdentity {
+    pub fn current() -> Option<Self> {
+        Self::of(&std::env::current_exe().ok()?)
+    }
+
+    pub fn of(path: &Path) -> Option<Self> {
+        let canonical = fs::canonicalize(path).ok()?;
+        let metadata = fs::metadata(&canonical).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(Self {
+            path: canonical.to_string_lossy().into_owned(),
+            len: metadata.len(),
+            modified_unix_micros: u64::try_from(modified.as_micros()).ok()?,
+        })
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonDiscovery {
     pub endpoint: String,
     pub credential: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub executable: Option<ExecutableIdentity>,
 }
 
 impl fmt::Debug for DaemonDiscovery {
@@ -137,12 +172,19 @@ where
 {
     let mut child = match read_discovery(state_root) {
         Ok(discovery) => match connect_and_check_ready(&discovery) {
-            Ok(connection) => {
-                return Ok(DaemonConnection {
-                    discovery,
-                    connection,
-                });
-            }
+            Ok(connection) => match stale_running_daemon(&discovery, auto_start) {
+                None => {
+                    return Ok(DaemonConnection {
+                        discovery,
+                        connection,
+                    });
+                }
+                Some(pid) => {
+                    drop(connection);
+                    terminate_stale_daemon(state_root, pid, auto_start.timeout)?;
+                    Some(spawn_daemon(state_root, auto_start)?)
+                }
+            },
             Err(_) if !auto_start.enabled => {
                 return Err(DiscoveryError::AutoStartDisabled);
             }
@@ -167,6 +209,7 @@ where
             child = None;
         }
         if let Ok(discovery) = read_discovery(state_root)
+            && stale_running_daemon(&discovery, auto_start).is_none()
             && let Ok(connection) = connect_and_check_ready(&discovery)
         {
             return Ok(DaemonConnection {
@@ -186,6 +229,77 @@ where
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// A running daemon is stale when the discovery-recorded executable identity
+/// points at the same binary path the CLI would spawn but with a different
+/// size or mtime: the daemon outlived a rebuild. Discovery files without an
+/// identity (older daemons) and daemons started from a different binary path
+/// are never treated as stale.
+fn stale_running_daemon(discovery: &DaemonDiscovery, auto_start: &AutoStart) -> Option<u32> {
+    if !auto_start.enabled || !cfg!(unix) {
+        return None;
+    }
+    let pid = discovery.pid.filter(|pid| *pid != std::process::id())?;
+    let recorded = discovery.executable.as_ref()?;
+    let current = ExecutableIdentity::of(&auto_start.executable)?;
+    (recorded.path == current.path && *recorded != current).then_some(pid)
+}
+
+#[cfg(unix)]
+fn terminate_stale_daemon(
+    state_root: &Path,
+    pid: u32,
+    timeout: Duration,
+) -> Result<(), DiscoveryError> {
+    let Ok(target) = i32::try_from(pid) else {
+        return Err(DiscoveryError::Invalid(format!(
+            "stale daemon pid {pid} is out of range"
+        )));
+    };
+    // SAFETY: kill(2) with SIGTERM/0 takes no pointers and cannot corrupt
+    // process state; the target pid was just confirmed live over its own
+    // authenticated discovery endpoint.
+    if unsafe { libc::kill(target, libc::SIGTERM) } == -1 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(DiscoveryError::Io(error))
+        };
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: see above; signal 0 only probes liveness.
+        if unsafe { libc::kill(target, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return Ok(());
+        }
+        // Process exit is the only signal that the state-root lock is
+        // released; discovery-file removal happens earlier in shutdown and
+        // must not trigger the respawn. A discovery file re-written by a
+        // different pid means another client already completed the
+        // replacement.
+        if let Ok(discovery) = read_discovery(state_root)
+            && discovery.pid.is_some_and(|current| current != pid)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(DiscoveryError::StaleDaemon(pid));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_stale_daemon(
+    _state_root: &Path,
+    _pid: u32,
+    _timeout: Duration,
+) -> Result<(), DiscoveryError> {
+    Ok(())
 }
 
 fn spawn_daemon(state_root: &Path, auto_start: &AutoStart) -> Result<Child, DiscoveryError> {
@@ -262,6 +376,7 @@ pub enum DiscoveryError {
     AutoStartDisabled,
     Timeout,
     Exited(Option<i32>),
+    StaleDaemon(u32),
     Client(ClientError),
 }
 
@@ -279,6 +394,10 @@ impl fmt::Display for DiscoveryError {
             }
             Self::Timeout => f.write_str("daemon did not become ready before the timeout"),
             Self::Exited(code) => write!(f, "auto-started daemon exited with status {code:?}"),
+            Self::StaleDaemon(pid) => write!(
+                f,
+                "daemon {pid} runs a previous build of this binary and did not exit after SIGTERM before the timeout; stop it manually and retry"
+            ),
             Self::Client(error) => error.fmt(f),
         }
     }
@@ -292,9 +411,9 @@ impl From<DiscoveryError> for ClientError {
         match error {
             DiscoveryError::Client(error) => error,
             DiscoveryError::Timeout => ClientError::timeout(message),
-            DiscoveryError::AutoStartDisabled | DiscoveryError::Exited(_) => {
-                ClientError::unavailable(message)
-            }
+            DiscoveryError::AutoStartDisabled
+            | DiscoveryError::Exited(_)
+            | DiscoveryError::StaleDaemon(_) => ClientError::unavailable(message),
             DiscoveryError::Invalid(_)
             | DiscoveryError::UnsafeFile
             | DiscoveryError::UnsafePermissions => {
