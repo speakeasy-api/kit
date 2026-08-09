@@ -873,8 +873,18 @@ struct IgnoreFileRules {
     rules: Vec<IgnoreRule>,
 }
 
+/// One ignore file handed to [`IgnoreRules::compile_sources`]: its rules apply
+/// beneath `base` (path components of the containing directory, empty for the
+/// root), while `path` is only used to attribute errors.
 #[derive(Clone, Debug)]
-struct IgnoreRules {
+pub(crate) struct IgnoreSource {
+    pub(crate) base: Vec<String>,
+    pub(crate) path: PathBuf,
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IgnoreRules {
     files: Vec<IgnoreFileRules>,
     max_matcher_work_bytes: usize,
 }
@@ -963,81 +973,15 @@ impl IgnoreRules {
                 .ok_or(IndexError::IgnoreLimit("compiled byte"))?;
             charge_compiled(&mut compiled_bytes, base_structure, options)?;
             let base = copy_parts(&base_parts)?;
-            let mut rules = Vec::new();
-            for (line_index, raw) in source.split('\n').enumerate() {
-                check_deadline(deadline)?;
-                let raw = raw.strip_suffix('\r').unwrap_or(raw);
-                if raw.len() > options.max_pattern_bytes {
-                    return Err(ignore_error(&file.path, line_index, "pattern is too long"));
-                }
-                let Some((parsed, negated)) = parse_ignore_line(raw, &file.path, line_index)?
-                else {
-                    continue;
-                };
-                let mut line = parsed.as_str();
-                if line.is_empty() {
-                    if negated {
-                        return Err(ignore_error(&file.path, line_index, "empty negation"));
-                    }
-                    continue;
-                }
-                if line.len() > options.max_pattern_bytes {
-                    return Err(ignore_error(&file.path, line_index, "pattern is too long"));
-                }
-                if line.contains('[') || line.contains(']') {
-                    return Err(ignore_error(&file.path, line_index, "character class"));
-                }
-                let directory_only = line.ends_with('/');
-                if directory_only {
-                    line = &line[..line.len() - 1];
-                }
-                let anchored = line.starts_with('/');
-                if anchored {
-                    line = &line[1..];
-                }
-                if line.is_empty() || line.contains("//") {
-                    return Err(ignore_error(&file.path, line_index, "empty path component"));
-                }
-                let pattern_count = line.split('/').count();
-                if pattern_count > options.max_pattern_components {
-                    return Err(IndexError::IgnoreLimit("pattern component count"));
-                }
-                if line.split('/').any(|part| {
-                    (part.contains("**") && part != "**") || part == "." || part == ".."
-                }) {
-                    return Err(ignore_error(
-                        &file.path,
-                        line_index,
-                        "ambiguous globstar or component",
-                    ));
-                }
-                if rule_count == options.max_ignore_rules {
-                    return Err(IndexError::IgnoreLimit("rule count"));
-                }
-                let pattern_bytes = line
-                    .len()
-                    .checked_sub(pattern_count.saturating_sub(1))
-                    .ok_or(IndexError::IgnoreLimit("compiled byte"))?;
-                let rule_bytes = pattern_count
-                    .checked_mul(size_of::<String>())
-                    .and_then(|value| value.checked_add(size_of::<IgnoreRule>()))
-                    .and_then(|value| value.checked_add(pattern_bytes))
-                    .ok_or(IndexError::IgnoreLimit("compiled byte"))?;
-                charge_compiled(&mut compiled_bytes, rule_bytes, options)?;
-                rules
-                    .try_reserve(1)
-                    .map_err(|_| IndexError::IgnoreLimit("allocation"))?;
-                let pattern = copy_pattern(line, pattern_count)?;
-                rule_count += 1;
-                rules.push(IgnoreRule {
-                    trailing_globstar: pattern.last().is_some_and(|part| part == "**"),
-                    has_slash: pattern.len() > 1,
-                    pattern,
-                    negated,
-                    directory_only,
-                    anchored,
-                });
-            }
+            let rules = compile_file_rules(
+                &file.path,
+                source,
+                options,
+                deadline,
+                false,
+                &mut rule_count,
+                &mut compiled_bytes,
+            )?;
             compiled_files
                 .try_reserve(1)
                 .map_err(|_| IndexError::IgnoreLimit("allocation"))?;
@@ -1049,7 +993,77 @@ impl IgnoreRules {
         })
     }
 
-    fn ignored(&self, path: &Path, kind: EntryKind, deadline: Instant) -> Result<bool, IndexError> {
+    /// Compiles ignore rules from explicit sources (for callers that walk a
+    /// filesystem instead of a revision snapshot). When `lenient` is set,
+    /// lines using syntax the matcher does not support are skipped instead of
+    /// failing compilation: the failure direction is safe for acquisition
+    /// (files git would have excluded stay included). Resource limits still
+    /// fail hard. Sources apply in the given order (later sources win ties),
+    /// so callers must pass lower-precedence files first.
+    pub(crate) fn compile_sources(
+        sources: Vec<IgnoreSource>,
+        options: &IndexOptions,
+        deadline: Instant,
+        lenient: bool,
+    ) -> Result<Self, IndexError> {
+        if sources.len() > options.max_ignore_files {
+            return Err(IndexError::IgnoreLimit("file count"));
+        }
+        let total = sources.iter().try_fold(0_usize, |total, source| {
+            total
+                .checked_add(source.text.len())
+                .ok_or(IndexError::IgnoreLimit("byte"))
+        })?;
+        if total > options.max_ignore_bytes {
+            return Err(IndexError::IgnoreLimit("byte"));
+        }
+        let mut compiled_bytes = 0_usize;
+        let mut rule_count = 0_usize;
+        let mut compiled_files = Vec::new();
+        for source in sources {
+            check_deadline(deadline)?;
+            let base_bytes = source.base.iter().try_fold(0_usize, |total, part| {
+                total
+                    .checked_add(part.len())
+                    .ok_or(IndexError::IgnoreLimit("compiled byte"))
+            })?;
+            let base_structure = source
+                .base
+                .len()
+                .checked_mul(size_of::<String>())
+                .and_then(|value| value.checked_add(size_of::<IgnoreFileRules>()))
+                .and_then(|value| value.checked_add(base_bytes))
+                .ok_or(IndexError::IgnoreLimit("compiled byte"))?;
+            charge_compiled(&mut compiled_bytes, base_structure, options)?;
+            let rules = compile_file_rules(
+                &source.path,
+                &source.text,
+                options,
+                deadline,
+                lenient,
+                &mut rule_count,
+                &mut compiled_bytes,
+            )?;
+            compiled_files
+                .try_reserve(1)
+                .map_err(|_| IndexError::IgnoreLimit("allocation"))?;
+            compiled_files.push(IgnoreFileRules {
+                base: source.base,
+                rules,
+            });
+        }
+        Ok(Self {
+            files: compiled_files,
+            max_matcher_work_bytes: options.max_matcher_work_bytes,
+        })
+    }
+
+    pub(crate) fn ignored(
+        &self,
+        path: &Path,
+        kind: EntryKind,
+        deadline: Instant,
+    ) -> Result<bool, IndexError> {
         let part_count = path.components().count();
         let work_bytes = part_count
             .checked_mul(size_of::<&str>())
@@ -1113,6 +1127,121 @@ impl IgnoreRule {
             })
         }
     }
+}
+
+/// Compiles the lines of one ignore file. Unsupported-syntax lines raise
+/// `InvalidIgnore` in strict mode and are skipped in lenient mode; resource
+/// limits (`IgnoreLimit`) and deadlines fail in both modes.
+#[allow(clippy::too_many_arguments)]
+fn compile_file_rules(
+    path: &Path,
+    source: &str,
+    options: &IndexOptions,
+    deadline: Instant,
+    lenient: bool,
+    rule_count: &mut usize,
+    compiled_bytes: &mut usize,
+) -> Result<Vec<IgnoreRule>, IndexError> {
+    let mut rules = Vec::new();
+    for (line_index, raw) in source.split('\n').enumerate() {
+        check_deadline(deadline)?;
+        let rule = match compile_ignore_line(
+            raw,
+            path,
+            line_index,
+            options,
+            rule_count,
+            compiled_bytes,
+        ) {
+            Ok(rule) => rule,
+            Err(IndexError::InvalidIgnore { .. }) if lenient => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(rule) = rule else { continue };
+        rules
+            .try_reserve(1)
+            .map_err(|_| IndexError::IgnoreLimit("allocation"))?;
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
+fn compile_ignore_line(
+    raw: &str,
+    path: &Path,
+    line_index: usize,
+    options: &IndexOptions,
+    rule_count: &mut usize,
+    compiled_bytes: &mut usize,
+) -> Result<Option<IgnoreRule>, IndexError> {
+    let raw = raw.strip_suffix('\r').unwrap_or(raw);
+    if raw.len() > options.max_pattern_bytes {
+        return Err(ignore_error(path, line_index, "pattern is too long"));
+    }
+    let Some((parsed, negated)) = parse_ignore_line(raw, path, line_index)? else {
+        return Ok(None);
+    };
+    let mut line = parsed.as_str();
+    if line.is_empty() {
+        if negated {
+            return Err(ignore_error(path, line_index, "empty negation"));
+        }
+        return Ok(None);
+    }
+    if line.len() > options.max_pattern_bytes {
+        return Err(ignore_error(path, line_index, "pattern is too long"));
+    }
+    if line.contains('[') || line.contains(']') {
+        return Err(ignore_error(path, line_index, "character class"));
+    }
+    let directory_only = line.ends_with('/');
+    if directory_only {
+        line = &line[..line.len() - 1];
+    }
+    let anchored = line.starts_with('/');
+    if anchored {
+        line = &line[1..];
+    }
+    if line.is_empty() || line.contains("//") {
+        return Err(ignore_error(path, line_index, "empty path component"));
+    }
+    let pattern_count = line.split('/').count();
+    if pattern_count > options.max_pattern_components {
+        return Err(IndexError::IgnoreLimit("pattern component count"));
+    }
+    if line
+        .split('/')
+        .any(|part| (part.contains("**") && part != "**") || part == "." || part == "..")
+    {
+        return Err(ignore_error(
+            path,
+            line_index,
+            "ambiguous globstar or component",
+        ));
+    }
+    if *rule_count == options.max_ignore_rules {
+        return Err(IndexError::IgnoreLimit("rule count"));
+    }
+    let pattern_bytes = line
+        .len()
+        .checked_sub(pattern_count.saturating_sub(1))
+        .ok_or(IndexError::IgnoreLimit("compiled byte"))?;
+    let rule_bytes = pattern_count
+        .checked_mul(size_of::<String>())
+        .and_then(|value| value.checked_add(size_of::<IgnoreRule>()))
+        .and_then(|value| value.checked_add(pattern_bytes))
+        .ok_or(IndexError::IgnoreLimit("compiled byte"))?;
+    charge_compiled(compiled_bytes, rule_bytes, options)?;
+    let pattern = copy_pattern(line, pattern_count)?;
+    *rule_count += 1;
+    Ok(Some(IgnoreRule {
+        trailing_globstar: pattern.last().is_some_and(|part| part == "**"),
+        has_slash: pattern.len() > 1,
+        pattern,
+        negated,
+        directory_only,
+        anchored,
+    }))
 }
 
 fn parse_ignore_line(

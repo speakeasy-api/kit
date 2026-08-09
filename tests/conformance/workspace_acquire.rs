@@ -9,6 +9,7 @@ use kit::workspace::acquire::{
     AcquisitionError, AcquisitionMode, AcquisitionRequest, CleanupOutcome, DirtyContent,
     GitMetadata, OwnerId, ReservationRequest, SnapshotMaterialization, UNTRACKED_BASE_COMMIT,
     WorkspaceId, WriterPolicy, acquire, cleanup, release_reserved_target, reserve_target,
+    trusted_git_executable,
 };
 
 struct Fixture {
@@ -1051,6 +1052,260 @@ fn no_git_source_acquires_untracked_snapshot_with_content_bound_revision() {
     for workspace in [&first, &second, &third] {
         cleanup(workspace).unwrap();
     }
+}
+
+/// KIT-EXEC-815: the production copy-on-write acquisition must record the
+/// real base commit without ever spawning the git binary. The child process
+/// runs with the debug-only seam that makes kit's trusted git executable
+/// unavailable; the fixture's own `git` helper is unaffected because it
+/// resolves git through PATH, outside kit.
+#[cfg(unix)]
+#[test]
+fn tracked_acquisition_succeeds_without_git_binary() {
+    if std::env::var_os("KIT_GIT_UNAVAILABLE_CHILD").is_some() {
+        assert!(trusted_git_executable().is_err());
+        let fixture = Fixture::new();
+        fixture.dirty();
+        let head = String::from_utf8(git(&fixture.source, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let workspace = acquire(fixture.request(
+            AcquisitionMode::CopyOnWriteSnapshot,
+            WriterPolicy::Restricted,
+        ))
+        .unwrap();
+        assert_eq!(workspace.base_commit, head);
+        assert!(
+            workspace
+                .workspace_revision
+                .hash
+                .as_str()
+                .starts_with("blake3:")
+        );
+        assert_eq!(workspace.dirty_content, DirtyContent::Included);
+        assert_eq!(
+            fs::read(workspace.path.join("untracked.txt")).unwrap(),
+            b"untracked content\n"
+        );
+        assert_eq!(cleanup(&workspace).unwrap(), CleanupOutcome::Removed);
+
+        // The clone-based untrusted mode still needs git, proving the seam
+        // is active for kit's own git plumbing.
+        assert!(matches!(
+            acquire(fixture.request(AcquisitionMode::LocalClone, WriterPolicy::Restricted)),
+            Err(AcquisitionError::Unavailable { .. })
+        ));
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workspace_acquire::tracked_acquisition_succeeds_without_git_binary",
+        ])
+        .env("KIT_GIT_UNAVAILABLE_CHILD", "1")
+        .env("KIT_TEST_GIT_UNAVAILABLE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn packed_refs_and_index_v4_acquire_with_owned_readers() {
+    let fixture = Fixture::new();
+    git(&fixture.source, &["pack-refs", "--all"]);
+    git(&fixture.source, &["update-index", "--index-version", "4"]);
+    fixture.dirty();
+    let head = String::from_utf8(git(&fixture.source, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    assert_eq!(workspace.base_commit, head);
+    assert_eq!(workspace.dirty_content, DirtyContent::Included);
+    assert_eq!(
+        fs::read(workspace.path.join("tracked.txt")).unwrap(),
+        b"unstaged change\n"
+    );
+    assert_eq!(
+        fs::read(workspace.path.join("untracked.txt")).unwrap(),
+        b"untracked content\n"
+    );
+    cleanup(&workspace).unwrap();
+}
+
+#[test]
+fn sha256_repository_acquires_with_owned_head_resolution() {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).unwrap();
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("kit-workspace-test-{}", hex(&random)));
+    let source = root.join("source");
+    let managed = root.join("managed");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&managed).unwrap();
+    let supported = Command::new("git")
+        .current_dir(&source)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["init", "--quiet", "--object-format=sha256"])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    if !supported {
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let fixture = Fixture {
+        root,
+        source,
+        managed,
+    };
+    fs::write(fixture.source.join("tracked.txt"), "tracked base\n").unwrap();
+    git(&fixture.source, &["add", "--", "tracked.txt"]);
+    git(
+        &fixture.source,
+        &[
+            "-c",
+            "user.name=Kit Test",
+            "-c",
+            "user.email=kit@example.invalid",
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "base",
+        ],
+    );
+    let head = String::from_utf8(git(&fixture.source, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(head.len(), 64);
+
+    let workspace = acquire(fixture.request(
+        AcquisitionMode::CopyOnWriteSnapshot,
+        WriterPolicy::Restricted,
+    ))
+    .unwrap();
+    assert_eq!(workspace.base_commit, head);
+    assert_eq!(
+        fs::read(workspace.path.join("tracked.txt")).unwrap(),
+        b"tracked base\n"
+    );
+    cleanup(&workspace).unwrap();
+}
+
+#[test]
+fn owned_ignore_removal_matches_git_semantics() {
+    let fixture = Fixture::new();
+    // Tracked files that match ignore patterns must survive, including
+    // inside an ignored directory.
+    fs::write(fixture.source.join("tracked.log"), "tracked log\n").unwrap();
+    fs::create_dir(fixture.source.join("vendor")).unwrap();
+    fs::write(fixture.source.join("vendor/pinned.txt"), "pinned\n").unwrap();
+    git(
+        &fixture.source,
+        &["add", "--", "tracked.log", "vendor/pinned.txt"],
+    );
+    git(
+        &fixture.source,
+        &[
+            "-c",
+            "user.name=Kit Test",
+            "-c",
+            "user.email=kit@example.invalid",
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "ignored-but-tracked",
+        ],
+    );
+    fs::write(
+        fixture.source.join(".gitignore"),
+        "*.log\n!keep.log\nbuild/\nvendor/\n",
+    )
+    .unwrap();
+    fs::create_dir(fixture.source.join("sub")).unwrap();
+    fs::write(fixture.source.join("sub/.gitignore"), "local.txt\n").unwrap();
+    fs::create_dir_all(fixture.source.join("build/inner")).unwrap();
+    fs::write(fixture.source.join("a.log"), "a\n").unwrap();
+    fs::write(fixture.source.join("keep.log"), "keep\n").unwrap();
+    fs::write(fixture.source.join("build/x.txt"), "x\n").unwrap();
+    fs::write(fixture.source.join("build/inner/y.txt"), "y\n").unwrap();
+    fs::write(fixture.source.join("vendor/junk.txt"), "junk\n").unwrap();
+    fs::write(fixture.source.join("sub/local.txt"), "local\n").unwrap();
+    fs::write(fixture.source.join("sub/other.txt"), "other\n").unwrap();
+    fs::write(fixture.source.join("secret.txt"), "secret\n").unwrap();
+    fs::create_dir_all(fixture.source.join(".git/info")).unwrap();
+    fs::write(fixture.source.join(".git/info/exclude"), "secret.txt\n").unwrap();
+
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    // Removed: ignored untracked files, fully ignored directories (pruned
+    // whole), files under an ignored directory, nested-gitignore matches,
+    // and .git/info/exclude matches.
+    assert!(!workspace.path.join("a.log").exists());
+    assert!(!workspace.path.join("build").exists());
+    assert!(!workspace.path.join("vendor/junk.txt").exists());
+    assert!(!workspace.path.join("sub/local.txt").exists());
+    assert!(!workspace.path.join("secret.txt").exists());
+    // Kept: negated patterns, tracked files (even when matching ignore
+    // patterns), and everything else.
+    assert_eq!(fs::read(workspace.path.join("keep.log")).unwrap(), b"keep\n");
+    assert_eq!(
+        fs::read(workspace.path.join("tracked.log")).unwrap(),
+        b"tracked log\n"
+    );
+    assert_eq!(
+        fs::read(workspace.path.join("vendor/pinned.txt")).unwrap(),
+        b"pinned\n"
+    );
+    assert_eq!(
+        fs::read(workspace.path.join("sub/other.txt")).unwrap(),
+        b"other\n"
+    );
+    assert!(workspace.path.join("sub/.gitignore").exists());
+    cleanup(&workspace).unwrap();
+}
+
+/// Ignore lines using syntax the owned matcher does not support (character
+/// classes, exotic escapes) are skipped rather than failing the acquisition.
+/// The divergence direction is safe: files git would have excluded stay in
+/// the snapshot.
+#[test]
+fn unsupported_ignore_lines_are_skipped_not_fatal() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.source.join(".gitignore"),
+        "ignored.txt\nweird-[cl]ass.txt\n",
+    )
+    .unwrap();
+    fs::write(fixture.source.join("ignored.txt"), "gone\n").unwrap();
+    fs::write(fixture.source.join("weird-class.txt"), "kept\n").unwrap();
+
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    assert!(!workspace.path.join("ignored.txt").exists());
+    assert_eq!(
+        fs::read(workspace.path.join("weird-class.txt")).unwrap(),
+        b"kept\n"
+    );
+    cleanup(&workspace).unwrap();
 }
 
 #[test]

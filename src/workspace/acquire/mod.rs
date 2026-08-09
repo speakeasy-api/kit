@@ -17,6 +17,8 @@ use std::{
 
 use crate::workspace::edit::ir::RootRelativePath;
 
+mod owned_git;
+
 const MARKER_NAME: &str = ".kit-workspace";
 const MARKER_VERSION: &str = "kit-workspace-v1";
 const MAX_COMMAND_OUTPUT: usize = 64 * 1024 * 1024;
@@ -569,15 +571,28 @@ fn acquire_untrusted(
         snapshot_repository(&source, &workspace_path)?;
         let resolved_base = if tracked {
             sanitize_snapshot_git_metadata(&workspace_path)?;
-            reject_split_index(&workspace_path)?;
-            match git_text(
-                &workspace_path,
-                "resolve HEAD",
-                ["rev-parse", "--verify", "HEAD^{commit}"],
-            ) {
-                Ok(commit) => Some(commit),
-                Err(AcquisitionError::Git { .. }) => None,
-                Err(other) => return Err(other),
+            match request.mode {
+                // The production untrusted mode resolves HEAD from the
+                // snapshot's own ref store; no git process is spawned
+                // anywhere on this path.
+                AcquisitionMode::CopyOnWriteSnapshot => {
+                    owned_git::resolve_head(&workspace_path)?
+                }
+                AcquisitionMode::LocalClone => {
+                    reject_split_index(&workspace_path)?;
+                    match git_text(
+                        &workspace_path,
+                        "resolve HEAD",
+                        ["rev-parse", "--verify", "HEAD^{commit}"],
+                    ) {
+                        Ok(commit) => Some(commit),
+                        Err(AcquisitionError::Git { .. }) => None,
+                        Err(other) => return Err(other),
+                    }
+                }
+                AcquisitionMode::DetachedWorktree => {
+                    unreachable!("shared worktree policy checked above")
+                }
             }
         } else {
             None
@@ -607,52 +622,75 @@ fn acquire_untrusted(
                 workspace_revision,
             ));
         };
-        let source_state = git_status(&workspace_path)?;
-        validate_snapshot_entries(&workspace_path)?;
-
-        let materialization = match request.mode {
+        match request.mode {
+            AcquisitionMode::CopyOnWriteSnapshot => {
+                // Fully owned materialization: the snapshot copy already
+                // guarantees integrity (source/target tree hashes matched and
+                // only regular files and directories were admitted), so the
+                // remaining work — index validation, ignored-entry removal,
+                // and the revision-identity hash — runs on owned readers.
+                let tracked_paths =
+                    owned_git::read_validated_index(&workspace_path, base_commit.len() / 2)?;
+                owned_git::validate_tracked_snapshot_entries(&workspace_path, &tracked_paths)?;
+                owned_git::remove_ignored_snapshot_entries(&workspace_path, &tracked_paths)?;
+                let git_dir = fs::canonicalize(workspace_path.join(".git"))
+                    .map_err(|source| io_error("canonicalize snapshot Git directory", source))?;
+                if !git_dir.starts_with(&workspace_path) {
+                    return Err(AcquisitionError::SnapshotMismatch);
+                }
+                // The state hash is the owned whole-tree content hash. Its
+                // only consumer is revision-identity equality, for which a
+                // content hash is a strictly valid identity; the copy always
+                // includes whatever content the source had, so the dirty
+                // content is honestly reported as included.
+                let state = owned_state_hash(&workspace_path)?;
+                let workspace_revision = WorkspaceRevision {
+                    number: 0,
+                    hash: revision_hash(&base_commit, &state),
+                };
+                Ok((
+                    base_commit,
+                    GitState {
+                        hash: state,
+                        dirty: true,
+                    },
+                    SnapshotMaterialization::FullCopyFallback,
+                    DirtyContent::Included,
+                    workspace_revision,
+                ))
+            }
             AcquisitionMode::LocalClone => {
+                let source_state = git_status(&workspace_path)?;
+                validate_snapshot_entries(&workspace_path)?;
                 clear_snapshot_worktree(&workspace_path)?;
                 reset_snapshot_to_base(&workspace_path, &base_commit)?;
-                SnapshotMaterialization::FullCopyFallback
-            }
-            AcquisitionMode::CopyOnWriteSnapshot => {
-                remove_ignored_snapshot_entries(&workspace_path)?;
-                SnapshotMaterialization::FullCopyFallback
+                let workspace_state = git_status(&workspace_path)?;
+                let git_dir = fs::canonicalize(workspace_path.join(".git"))
+                    .map_err(|source| io_error("canonicalize snapshot Git directory", source))?;
+                if !git_dir.starts_with(&workspace_path) {
+                    return Err(AcquisitionError::SnapshotMismatch);
+                }
+                let dirty_content = if !source_state.dirty {
+                    DirtyContent::SourceClean
+                } else {
+                    DirtyContent::NotIncluded
+                };
+                let workspace_revision = WorkspaceRevision {
+                    number: 0,
+                    hash: revision_hash(&base_commit, &workspace_state.hash),
+                };
+                Ok((
+                    base_commit,
+                    source_state,
+                    SnapshotMaterialization::FullCopyFallback,
+                    dirty_content,
+                    workspace_revision,
+                ))
             }
             AcquisitionMode::DetachedWorktree => {
                 unreachable!("shared worktree policy checked above")
             }
-        };
-        let workspace_state = git_status(&workspace_path)?;
-        if request.mode == AcquisitionMode::CopyOnWriteSnapshot
-            && workspace_state.hash != source_state.hash
-        {
-            return Err(AcquisitionError::SnapshotMismatch);
         }
-        let git_dir = fs::canonicalize(workspace_path.join(".git"))
-            .map_err(|source| io_error("canonicalize snapshot Git directory", source))?;
-        if !git_dir.starts_with(&workspace_path) {
-            return Err(AcquisitionError::SnapshotMismatch);
-        }
-        let dirty_content = if !source_state.dirty {
-            DirtyContent::SourceClean
-        } else if request.mode == AcquisitionMode::CopyOnWriteSnapshot {
-            DirtyContent::Included
-        } else {
-            DirtyContent::NotIncluded
-        };
-        let workspace_revision = WorkspaceRevision {
-            number: 0,
-            hash: revision_hash(&base_commit, &workspace_state.hash),
-        };
-        Ok((
-            base_commit,
-            source_state,
-            materialization,
-            dirty_content,
-            workspace_revision,
-        ))
     })();
 
     let (base_commit, source_state, materialization, dirty_content, workspace_revision) =
@@ -923,6 +961,33 @@ fn snapshot_repository(_source: &Path, _target: &Path) -> Result<(), Acquisition
 
 #[cfg(not(unix))]
 fn untracked_state_hash(_repository: &Path) -> Result<StateHash, AcquisitionError> {
+    Err(AcquisitionError::Unavailable {
+        capability: "physical no-follow workspace snapshots",
+    })
+}
+
+/// Owned state hash for tracked untrusted snapshots: the whole-tree content
+/// hash of the snapshot copy (including its sanitized `.git`), wrapped in a
+/// dedicated domain. The preimage differs from the retired git-status-derived
+/// `kit-git-dirty-state-v3` hash, so the domain string changes with it.
+#[cfg(unix)]
+fn owned_state_hash(repository: &Path) -> Result<StateHash, AcquisitionError> {
+    let directory = open_absolute_directory(repository, "owned snapshot")?;
+    let root = unix_metadata(&directory)
+        .map_err(|error| snapshot_error("inspect owned snapshot root", error))?;
+    let filesystem = SnapshotFilesystem {
+        device: root.dev,
+        mount: snapshot_mount_identity(&directory)?,
+    };
+    let tree = hash_directory_at(&directory, repository, &filesystem)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kit-owned-state-v1\0");
+    hasher.update(tree.as_bytes());
+    Ok(StateHash(format!("blake3:{}", hasher.finalize().to_hex())))
+}
+
+#[cfg(not(unix))]
+fn owned_state_hash(_repository: &Path) -> Result<StateHash, AcquisitionError> {
     Err(AcquisitionError::Unavailable {
         capability: "physical no-follow workspace snapshots",
     })
@@ -1862,26 +1927,6 @@ fn validate_snapshot_entries(repository: &Path) -> Result<(), AcquisitionError> 
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(io_error("inspect snapshot path", source)),
         }
-    }
-    Ok(())
-}
-
-fn remove_ignored_snapshot_entries(repository: &Path) -> Result<(), AcquisitionError> {
-    let ignored = git_output(
-        repository,
-        "list ignored snapshot paths",
-        [
-            OsStr::new("ls-files"),
-            OsStr::new("--others"),
-            OsStr::new("--ignored"),
-            OsStr::new("--exclude-standard"),
-            OsStr::new("--directory"),
-            OsStr::new("-z"),
-        ],
-    )?;
-    for raw_path in nul_paths(&ignored.stdout) {
-        let relative = validated_git_path(&raw_path, "remove ignored snapshot path")?;
-        remove_snapshot_entry(&repository.join(relative))?;
     }
     Ok(())
 }
@@ -4505,6 +4550,15 @@ fn configure_working_directory(_command: &mut Command, _root: Option<File>) {}
 
 #[cfg(unix)]
 pub fn trusted_git_executable() -> Result<PathBuf, AcquisitionError> {
+    // Debug-only test seam mirroring KIT_FAKE_SYNTAX: forces the trusted Git
+    // executable to be unavailable so tests can prove that the owned
+    // acquisition path never needs the git binary.
+    #[cfg(debug_assertions)]
+    if std::env::var("KIT_TEST_GIT_UNAVAILABLE").as_deref() == Ok("1") {
+        return Err(AcquisitionError::Unavailable {
+            capability: "an administrator-controlled non-user-writable system Git executable",
+        });
+    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     const CANDIDATES: &[&str] = &["/usr/bin/git", "/bin/git"];
     #[cfg(any(target_os = "macos", target_os = "ios"))]
