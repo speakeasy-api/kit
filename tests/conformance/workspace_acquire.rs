@@ -370,23 +370,52 @@ fn cow_snapshot_excludes_ignored_files() {
 
 #[cfg(unix)]
 #[test]
-fn untrusted_snapshot_rejects_symlinks_without_copying_their_targets() {
+fn untrusted_snapshot_copies_symlinks_as_inert_links_without_their_targets() {
+    use std::os::unix::fs::MetadataExt;
+
     let fixture = Fixture::new();
     let external = fixture.root.join("external-secret");
     fs::write(&external, "external bytes\n").unwrap();
     std::os::unix::fs::symlink(&external, fixture.source.join("external-link")).unwrap();
 
-    for (mode, policy) in [
-        (AcquisitionMode::LocalClone, WriterPolicy::Restricted),
-        (AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile),
-    ] {
-        assert!(matches!(
-            acquire(fixture.request(mode, policy)),
-            Err(AcquisitionError::SymlinkPath { .. })
-        ));
-    }
+    // Tracked repositories legitimately contain symlinks; the snapshot keeps
+    // the link itself — literal target bytes — and never copies or follows
+    // the target, even when it points outside the source.
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    let copied = workspace.path.join("external-link");
+    assert!(fs::symlink_metadata(&copied).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_link(&copied).unwrap(), external);
+    // The snapshot holds one link inode, not a second copy of the content.
+    assert_eq!(
+        fs::symlink_metadata(&copied).unwrap().size(),
+        external.as_os_str().len() as u64
+    );
     assert_eq!(fs::read(&external).unwrap(), b"external bytes\n");
-    assert!(fs::read_dir(&fixture.managed).unwrap().next().is_none());
+    cleanup(&workspace).unwrap();
+}
+
+/// Symlink target changes must change the acquisition state hash: the link's
+/// literal target bytes are bound content, exactly like file bytes.
+#[cfg(unix)]
+#[test]
+fn symlink_target_changes_the_state_hash() {
+    let fixture = Fixture::new();
+    std::os::unix::fs::symlink("tracked.txt", fixture.source.join("alias")).unwrap();
+    let first =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    let first_hash = first.initial_dirty_state.clone();
+    cleanup(&first).unwrap();
+
+    fs::remove_file(fixture.source.join("alias")).unwrap();
+    std::os::unix::fs::symlink("staged.txt", fixture.source.join("alias")).unwrap();
+    let second =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    assert_ne!(second.initial_dirty_state, first_hash);
+    cleanup(&second).unwrap();
 }
 
 #[cfg(unix)]
@@ -500,8 +529,14 @@ fn concurrent_source_replacement_never_copies_outside_bytes() {
             Ok(workspace) => {
                 let copied = workspace.path.join("racy-entry");
                 let metadata = fs::symlink_metadata(&copied).unwrap();
-                assert!(metadata.is_file());
-                assert_ne!(fs::read(&copied).unwrap(), fs::read(&external).unwrap());
+                if metadata.file_type().is_symlink() {
+                    // An inert link may be materialized; the outside bytes
+                    // themselves must never enter the snapshot.
+                    assert_eq!(fs::read_link(&copied).unwrap(), external);
+                } else {
+                    assert!(metadata.is_file());
+                    assert_ne!(fs::read(&copied).unwrap(), fs::read(&external).unwrap());
+                }
                 cleanup(&workspace).unwrap();
             }
             Err(AcquisitionError::SourceChangedDuringAcquisition)
@@ -1300,6 +1335,110 @@ fn owned_ignore_removal_matches_git_semantics() {
         b"other\n"
     );
     assert!(workspace.path.join("sub/.gitignore").exists());
+    cleanup(&workspace).unwrap();
+}
+
+/// Cargo hardlinks object files inside `target/`; a source repository being
+/// actively built must still acquire. Ignored content is pruned during the
+/// copy, before the hardlink fence would reject it.
+#[cfg(unix)]
+#[test]
+fn hardlinks_inside_ignored_directories_do_not_abort_acquisition() {
+    let fixture = Fixture::new();
+    fs::write(fixture.source.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir(fixture.source.join("build")).unwrap();
+    fs::write(fixture.source.join("build/object.o"), "object\n").unwrap();
+    fs::hard_link(
+        fixture.source.join("build/object.o"),
+        fixture.source.join("build/object-link.o"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("object.o", fixture.source.join("build/object-alias.o")).unwrap();
+
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    assert!(!workspace.path.join("build").exists());
+    assert_eq!(
+        fs::read(workspace.path.join("tracked.txt")).unwrap(),
+        b"tracked base\n"
+    );
+    cleanup(&workspace).unwrap();
+}
+
+/// An ignored untracked symlink outside any ignored directory is likewise
+/// pruned rather than rejected. A hardlink pair with an unignored side keeps
+/// failing closed: pruning the ignored link never lowers the survivor's link
+/// count, so the snapshot boundary still rejects it.
+#[cfg(unix)]
+#[test]
+fn ignored_non_regular_entries_are_pruned_not_rejected() {
+    let fixture = Fixture::new();
+    fs::write(fixture.source.join(".gitignore"), "*.tmp\n").unwrap();
+    std::os::unix::fs::symlink("tracked.txt", fixture.source.join("scratch.tmp")).unwrap();
+
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    assert!(!workspace.path.join("scratch.tmp").exists());
+    cleanup(&workspace).unwrap();
+
+    // The unignored twin of the same layout still fails closed.
+    let rejected = Fixture::new();
+    fs::write(rejected.source.join("payload.txt"), "payload\n").unwrap();
+    fs::hard_link(
+        rejected.source.join("payload.txt"),
+        rejected.source.join("payload-link.txt"),
+    )
+    .unwrap();
+    match acquire(rejected.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile)) {
+        Err(AcquisitionError::HardlinkedSourceEntry(path)) => {
+            assert!(path.ends_with("payload-link.txt") || path.ends_with("payload.txt"));
+        }
+        other => panic!("expected hardlink rejection, got {other:?}"),
+    }
+}
+
+/// A tracked file inside an ignored directory keeps the directory alive, and
+/// hardlinked untracked siblings are still pruned file-by-file around it.
+#[cfg(unix)]
+#[test]
+fn tracked_files_survive_pruning_beside_hardlinked_siblings() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.source.join("gen")).unwrap();
+    fs::write(fixture.source.join("gen/pinned.txt"), "pinned\n").unwrap();
+    git(&fixture.source, &["add", "--", "gen/pinned.txt"]);
+    git(
+        &fixture.source,
+        &[
+            "-c",
+            "user.name=Kit Test",
+            "-c",
+            "user.email=kit@example.invalid",
+            "commit",
+            "--quiet",
+            "--no-gpg-sign",
+            "-m",
+            "pin",
+        ],
+    );
+    fs::write(fixture.source.join(".gitignore"), "gen/\n").unwrap();
+    fs::write(fixture.source.join("gen/junk.o"), "junk\n").unwrap();
+    fs::hard_link(
+        fixture.source.join("gen/junk.o"),
+        fixture.source.join("gen/junk-link.o"),
+    )
+    .unwrap();
+
+    let workspace =
+        acquire(fixture.request(AcquisitionMode::CopyOnWriteSnapshot, WriterPolicy::Hostile))
+            .unwrap();
+    assert_eq!(
+        fs::read(workspace.path.join("gen/pinned.txt")).unwrap(),
+        b"pinned\n"
+    );
+    assert!(!workspace.path.join("gen/junk.o").exists());
+    assert!(!workspace.path.join("gen/junk-link.o").exists());
     cleanup(&workspace).unwrap();
 }
 

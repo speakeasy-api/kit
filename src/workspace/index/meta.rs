@@ -1568,6 +1568,114 @@ fn frame_before(
     check_deadline(deadline)
 }
 
+/// Compiles ignore rules from a LIVE tree: `.git/info/exclude` at the lowest
+/// precedence, then every `.gitignore` collected parent-first, skipping the
+/// top-level `.git` and nested repositories. Shared by the revision scan and
+/// the edit stage so both exclude byte-identical sets — their digests must
+/// stay in lockstep. Every collection failure short of the deadline degrades
+/// toward inclusion (unreadable or non-UTF-8 files contribute no rules, and
+/// files beyond the source limit are dropped), never toward exclusion.
+pub(crate) fn load_live_ignore_rules(
+    root: &Path,
+    options: &IndexOptions,
+    deadline: Instant,
+) -> Result<IgnoreRules, IndexError> {
+    let mut sources = Vec::new();
+    collect_live_ignore_file(
+        &mut sources,
+        Vec::new(),
+        PathBuf::from(".git/info/exclude"),
+        &root.join(".git").join("info").join("exclude"),
+        options,
+    );
+    collect_live_gitignore_sources(root, Path::new(""), &mut sources, options, deadline)?;
+    IgnoreRules::compile_sources(sources, options, deadline, true)
+}
+
+fn collect_live_ignore_file(
+    sources: &mut Vec<IgnoreSource>,
+    base: Vec<String>,
+    display_path: PathBuf,
+    path: &Path,
+    options: &IndexOptions,
+) {
+    if sources.len() >= options.max_ignore_files {
+        return;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > options.max_ignore_bytes as u64
+    {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return;
+    };
+    sources.push(IgnoreSource {
+        base,
+        path: display_path,
+        text,
+    });
+}
+
+fn collect_live_gitignore_sources(
+    root: &Path,
+    relative: &Path,
+    sources: &mut Vec<IgnoreSource>,
+    options: &IndexOptions,
+    deadline: Instant,
+) -> Result<(), IndexError> {
+    check_deadline(deadline)?;
+    let absolute = root.join(relative);
+    let mut base = Vec::new();
+    for component in relative.components() {
+        let Some(part) = component.as_os_str().to_str() else {
+            // The matcher cannot express non-UTF-8 bases; the subtree keeps
+            // all files (safe direction).
+            return Ok(());
+        };
+        base.push(part.to_owned());
+    }
+    collect_live_ignore_file(
+        sources,
+        base,
+        relative.join(".gitignore"),
+        &absolute.join(".gitignore"),
+        options,
+    );
+    let Ok(reader) = std::fs::read_dir(&absolute) else {
+        return Ok(());
+    };
+    let mut children = Vec::new();
+    for entry in reader.flatten() {
+        let name = entry.file_name();
+        if relative.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            children.push(name);
+        }
+    }
+    children.sort();
+    for name in children {
+        let child = relative.join(&name);
+        if root.join(&child).join(".git").symlink_metadata().is_ok() {
+            continue;
+        }
+        collect_live_gitignore_sources(root, &child, sources, options, deadline)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

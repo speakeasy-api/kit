@@ -428,14 +428,21 @@ fn metadata_aliases_are_rejected_and_parent_replacement_cannot_redirect_updates(
 
 #[test]
 fn symlinks_hardlinks_and_special_entries_fail_closed() {
+    // Symlinks are inert first-class entries: the scan binds their literal
+    // target bytes into the revision without following them, so a retarget
+    // changes the revision like any content change.
     let symlink = Fixture::new();
     let external = symlink.root.join("external");
     fs::write(&external, b"outside").unwrap();
     std::os::unix::fs::symlink(&external, symlink.workspace.join("link")).unwrap();
-    assert!(matches!(
-        ManagedWorkspace::open(&symlink.workspace),
-        Err(RevisionError::Symlink(_))
-    ));
+    let workspace = ManagedWorkspace::open(&symlink.workspace).unwrap();
+    let first = workspace.current_revision().unwrap().id().to_string();
+    fs::remove_file(symlink.workspace.join("link")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", symlink.workspace.join("link")).unwrap();
+    workspace.reconcile().unwrap();
+    let second = workspace.current_revision().unwrap().id().to_string();
+    assert_ne!(first, second);
+    drop(workspace);
 
     let hardlink = Fixture::new();
     fs::write(hardlink.workspace.join("first"), b"bytes").unwrap();

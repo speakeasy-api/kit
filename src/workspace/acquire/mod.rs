@@ -27,6 +27,7 @@ pub const UNTRACKED_BASE_COMMIT: &str = "untracked";
 const MAX_ERROR_OUTPUT: usize = 16 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES: usize = 1_000_000;
+const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 const MAX_SNAPSHOT_NAME_BYTES: usize = 256 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -569,7 +570,17 @@ fn acquire_untrusted(
     let workspace_path = reserved.path.join("repo");
 
     let materialized = (|| {
-        let snapshot_materialization = snapshot_repository(&source, &workspace_path)?;
+        // Ignored content is pruned during the copy rather than after it, so
+        // hardlinked or symlinked entries inside ignored directories (cargo
+        // target dirs above all) cannot abort acquisition and never count
+        // toward snapshot limits. Restricted to the owned-snapshot mode:
+        // the LocalClone trial path keeps its historical full-copy contents.
+        let prune = if tracked && request.mode == AcquisitionMode::CopyOnWriteSnapshot {
+            owned_git::compute_source_prune_set(&source)?
+        } else {
+            BTreeSet::new()
+        };
+        let snapshot_materialization = snapshot_repository(&source, &workspace_path, &prune)?;
         let resolved_base = if tracked {
             sanitize_snapshot_git_metadata(&workspace_path)?;
             match request.mode {
@@ -957,6 +968,7 @@ fn classify_plain_source_root(source: &Path) -> Result<bool, AcquisitionError> {
 fn snapshot_repository(
     _source: &Path,
     _target: &Path,
+    _prune: &BTreeSet<PathBuf>,
 ) -> Result<SnapshotMaterialization, AcquisitionError> {
     Err(AcquisitionError::Unavailable {
         capability: "physical no-follow workspace snapshots",
@@ -1036,6 +1048,7 @@ fn untracked_state_hash(repository: &Path) -> Result<StateHash, AcquisitionError
 fn snapshot_repository(
     source: &Path,
     target: &Path,
+    prune: &BTreeSet<PathBuf>,
 ) -> Result<SnapshotMaterialization, AcquisitionError> {
     let source_dir = open_absolute_directory(source, "source")?;
     let source_root = unix_metadata(&source_dir)
@@ -1079,6 +1092,7 @@ fn snapshot_repository(
         &target_filesystem,
         &mut limits,
         &mut all_cloned,
+        prune,
     )?;
 
     let source_after = unix_metadata(&source_dir)
@@ -1257,12 +1271,20 @@ fn copy_directory_at(
     target_filesystem: &SnapshotFilesystem,
     limits: &mut SnapshotLimits,
     all_cloned: &mut bool,
+    prune: &BTreeSet<PathBuf>,
 ) -> Result<(), AcquisitionError> {
     use std::os::unix::fs::PermissionsExt;
 
     let directory_before = unix_metadata(source_dir)
         .map_err(|error| snapshot_error("inspect snapshot directory", error))?;
     for name in directory_entries(source_dir)? {
+        let child_relative = relative.join(&name);
+        // Pruned entries are ignored content the post-copy pass would delete
+        // anyway; skipping them here means their hardlinks, symlinks, sizes
+        // and entry counts never participate in snapshot validation.
+        if prune.contains(&child_relative) {
+            continue;
+        }
         limits.entries = limits
             .entries
             .checked_add(1)
@@ -1270,7 +1292,6 @@ fn copy_directory_at(
         if limits.entries > MAX_SNAPSHOT_ENTRIES {
             return Err(AcquisitionError::SnapshotLimitExceeded);
         }
-        let child_relative = relative.join(&name);
         let display_path = source_root.join(&child_relative);
         let before = metadata_at(source_dir, &name)
             .map_err(|error| snapshot_error("inspect repository snapshot entry", error))?;
@@ -1315,6 +1336,7 @@ fn copy_directory_at(
                     target_filesystem,
                     limits,
                     all_cloned,
+                    prune,
                 )?;
             }
             libc::S_IFREG => {
@@ -1380,10 +1402,49 @@ fn copy_directory_at(
                 }
             }
             libc::S_IFLNK => {
-                return Err(AcquisitionError::SymlinkPath {
-                    kind: "snapshot source",
-                    path: display_path,
-                });
+                // Tracked repositories legitimately contain symlinks (mode
+                // 120000 entries). The link is materialized as inert data —
+                // its literal target bytes, never resolved or followed — so
+                // it cannot reach outside the snapshot; tools that would
+                // follow it keep failing closed on their own O_NOFOLLOW
+                // fences. Links under .git stay rejected: the owned ref
+                // readers open .git paths with plain follow semantics and
+                // must never traverse one.
+                if child_relative.starts_with(".git") {
+                    return Err(AcquisitionError::SymlinkPath {
+                        kind: "snapshot source",
+                        path: display_path,
+                    });
+                }
+                let target = readlink_at(source_dir, &name).map_err(|error| {
+                    // A concurrent swap can turn the entry into a non-link
+                    // between the lstat and the readlink; that is source
+                    // mutation, not an environment failure.
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINVAL) | Some(libc::ENOENT)
+                    ) {
+                        AcquisitionError::SourceChangedDuringAcquisition
+                    } else {
+                        snapshot_error("read snapshot symlink", error)
+                    }
+                })?;
+                let target_bytes = os_str_bytes(&target);
+                if target_bytes.len() > MAX_SYMLINK_TARGET_BYTES {
+                    return Err(AcquisitionError::UnsupportedSourceEntry(display_path));
+                }
+                let remaining = MAX_SNAPSHOT_BYTES.saturating_sub(limits.bytes);
+                if target_bytes.len() as u64 > remaining {
+                    return Err(AcquisitionError::SnapshotLimitExceeded);
+                }
+                limits.bytes += target_bytes.len() as u64;
+                let after = metadata_at(source_dir, &name)
+                    .map_err(|error| snapshot_error("reinspect snapshot symlink", error))?;
+                if !before.same_file(&after) {
+                    return Err(AcquisitionError::SourceChangedDuringAcquisition);
+                }
+                symlink_at(&target, target_dir, &name)
+                    .map_err(|error| snapshot_error("create snapshot symlink", error))?;
             }
             _ => return Err(AcquisitionError::UnsupportedSourceEntry(display_path)),
         }
@@ -1497,10 +1558,28 @@ fn hash_directory_contents(
                 }
             }
             libc::S_IFLNK => {
-                return Err(AcquisitionError::SymlinkPath {
-                    kind: "snapshot source",
-                    path: display_path,
-                });
+                // Symlinks hash as their literal target bytes under a
+                // dedicated kind tag; nothing is followed. Trees without
+                // symlinks keep byte-identical preimages.
+                if child_relative.starts_with(".git") {
+                    return Err(AcquisitionError::SymlinkPath {
+                        kind: "snapshot source",
+                        path: display_path,
+                    });
+                }
+                hasher.update(b"\0symlink\0");
+                let target = readlink_at(directory, &name)
+                    .map_err(|error| snapshot_error("read hashed snapshot symlink", error))?;
+                let target_bytes = os_str_bytes(&target);
+                if target_bytes.len() > MAX_SYMLINK_TARGET_BYTES {
+                    return Err(AcquisitionError::UnsupportedSourceEntry(display_path));
+                }
+                let after = metadata_at(directory, &name)
+                    .map_err(|error| snapshot_error("reinspect hashed snapshot symlink", error))?;
+                if !before.same_file(&after) {
+                    return Err(AcquisitionError::SourceChangedDuringAcquisition);
+                }
+                hasher.update(target_bytes.as_ref());
             }
             _ => return Err(AcquisitionError::UnsupportedSourceEntry(display_path)),
         }
@@ -1645,6 +1724,47 @@ fn create_file_at(directory: &File, name: &OsStr, mode: libc::mode_t) -> io::Res
     } else {
         // SAFETY: descriptor is newly opened and uniquely owned.
         Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(unix)]
+fn readlink_at(directory: &File, name: &OsStr) -> io::Result<std::ffi::OsString> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt, os::unix::ffi::OsStringExt};
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut buffer = vec![0_u8; MAX_SYMLINK_TARGET_BYTES + 1];
+    // SAFETY: readlinkat receives a valid directory descriptor, C string and
+    // an owned buffer of the stated capacity.
+    let written = unsafe {
+        libc::readlinkat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(written as usize);
+    Ok(std::ffi::OsString::from_vec(buffer))
+}
+
+#[cfg(unix)]
+fn symlink_at(target: &OsStr, directory: &File, name: &OsStr) -> io::Result<()> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+
+    let target = std::ffi::CString::new(target.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "target contains NUL"))?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: symlinkat receives valid C strings and a valid directory
+    // descriptor; it never follows the created path.
+    if unsafe { libc::symlinkat(target.as_ptr(), directory.as_raw_fd(), name.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -5397,7 +5517,7 @@ mod tests {
             .mode()
             & 0o777;
 
-        let materialization = snapshot_repository(&source, &target).unwrap();
+        let materialization = snapshot_repository(&source, &target, &BTreeSet::new()).unwrap();
 
         assert_eq!(materialization, SnapshotMaterialization::CowClone);
         assert_eq!(

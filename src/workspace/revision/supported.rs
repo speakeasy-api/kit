@@ -27,6 +27,7 @@ const REVISION_MAGIC: &[u8] = b"kit-workspace-revision-id-v1\0";
 // requested heap growth is charged a 64-byte header plus payload rounded to 64-byte slabs
 // below one page and 4 KiB pages above it. Vectors start with a fixed 4 KiB slab and double
 // their logical capacity; every replacement buffer is charged in full before growth.
+const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 const MEMORY_HEADER_BYTES: u64 = 64;
 const MEMORY_SLAB_BYTES: u64 = 64;
 const MEMORY_PAGE_BYTES: u64 = 4096;
@@ -1864,6 +1865,15 @@ fn scan_once(
     };
     let mut limits = ScanLimits::new(deadline, stopped);
     limits.bytes = *scanned_bytes;
+    // Failure to load ignore rules degrades to the unscoped scan (extra
+    // inclusion): correctness never depends on exclusion, only the budget
+    // does, and the time limit still fences the walk.
+    let ignore = crate::workspace::index::meta::load_live_ignore_rules(
+        display_root,
+        &crate::workspace::index::meta::IndexOptions::default(),
+        deadline,
+    )
+    .ok();
     scan_directory(
         root,
         display_root,
@@ -1882,6 +1892,7 @@ fn scan_once(
         &mut captured_file,
         &mut captured_bytes,
         cache_context.as_ref(),
+        ignore.as_ref(),
     )?;
     *scanned_bytes = limits.bytes;
     let root_after =
@@ -1939,6 +1950,7 @@ fn scan_directory(
     captured_file: &mut Option<BoundedFileRead>,
     captured_bytes: &mut u64,
     cache_context: Option<&ScanCacheContext<'_>>,
+    ignore: Option<&crate::workspace::index::meta::IgnoreRules>,
 ) -> Result<(), RevisionError> {
     check_time(limits)?;
     let directory_before = unix_metadata(directory)
@@ -1957,6 +1969,14 @@ fn scan_directory(
     for name in directory_entries(directory, options, limits, memory)? {
         check_time(limits)?;
         let child_relative = join_path(relative, Path::new(&name), memory)?;
+        // Workspace identity is scoped by ignore semantics: the top-level
+        // `.git` and every ignored entry stay out of the digest, the index,
+        // and the scan budget — a cargo `target/` must never dominate the
+        // scan or churn revisions. The edit-stage snapshot skips the
+        // identical set to keep digest prediction in lockstep.
+        if relative.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
         let display_path = join_path(display_root, &child_relative, memory)?;
         let before = match metadata_at(directory, &name) {
             Ok(metadata) => metadata,
@@ -1964,6 +1984,23 @@ fn scan_directory(
         };
         if before.device != filesystem.device {
             return Err(RevisionError::MountBoundary(display_path));
+        }
+        if let Some(rules) = ignore {
+            let kind = if before.kind() == libc::S_IFDIR {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            };
+            match rules.ignored(&child_relative, kind, limits.deadline) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                // Unexpressible paths keep their entries (safe direction).
+                Err(crate::workspace::index::meta::IndexError::NonUtf8Path(_)) => {}
+                Err(crate::workspace::index::meta::IndexError::DeadlineExceeded) => {
+                    return Err(RevisionError::LimitExceeded(LimitKind::Time));
+                }
+                Err(_) => {}
+            }
         }
         match before.kind() {
             libc::S_IFDIR => {
@@ -2019,6 +2056,7 @@ fn scan_directory(
                     captured_file,
                     captured_bytes,
                     cache_context,
+                    ignore,
                 )?;
             }
             libc::S_IFREG => {
@@ -2225,7 +2263,26 @@ fn scan_directory(
                     *captured_file = Some(bounded.finish(facts)?);
                 }
             }
-            libc::S_IFLNK => return Err(RevisionError::Symlink(display_path)),
+            libc::S_IFLNK => {
+                // Symlinks bind into the tree digest as their literal target
+                // bytes under a dedicated kind tag and never enter the index:
+                // nothing follows them, tools resolving the path fail closed,
+                // and symlink-free trees keep byte-identical preimages. The
+                // edit-stage digest predictor mirrors this encoding exactly.
+                let target = readlink_at(directory, &name)
+                    .map_err(|source| io_error("read workspace symlink", source))?;
+                let target_bytes = os_slice(&target);
+                if target_bytes.len() > MAX_SYMLINK_TARGET_BYTES {
+                    return Err(RevisionError::UnsupportedEntry(display_path));
+                }
+                let after = metadata_at(directory, &name)
+                    .map_err(|source| io_error("reinspect workspace symlink", source))?;
+                if !before.same_file(&after) {
+                    return Err(RevisionError::ScanRace { attempts: 1 });
+                }
+                hash_entry_header(hasher, b'l', &child_relative, false, target_bytes.len() as u64);
+                hasher.update(blake3::hash(target_bytes).as_bytes());
+            }
             _ => return Err(RevisionError::UnsupportedEntry(display_path)),
         }
     }
@@ -3899,6 +3956,29 @@ fn clear_errno() {
     unsafe {
         *libc::__errno_location() = 0;
     }
+}
+
+#[cfg(unix)]
+fn readlink_at(directory: &File, name: &OsStr) -> io::Result<OsString> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStringExt};
+
+    let name = CName::new(name)?;
+    let mut buffer = vec![0_u8; MAX_SYMLINK_TARGET_BYTES + 1];
+    // SAFETY: readlinkat receives a valid directory descriptor, C string and
+    // an owned buffer of the stated capacity.
+    let written = unsafe {
+        libc::readlinkat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(written as usize);
+    Ok(OsString::from_vec(buffer))
 }
 
 #[cfg(unix)]

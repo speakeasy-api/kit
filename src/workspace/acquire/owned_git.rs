@@ -380,14 +380,51 @@ fn read_varint(bytes: &[u8], mut at: usize, end: usize) -> Option<(usize, usize)
 }
 
 /// Equivalent of the git-based `validate_snapshot_entries`: a tracked path
-/// whose snapshot entry is a directory is unsupported. Symlinks and other
-/// non-regular entries cannot occur — `snapshot_repository` already rejected
-/// them while copying — so only the file/directory distinction remains.
+/// whose snapshot entry is a directory is unsupported. Symlinks are valid
+/// tracked entries (mode 120000) and were materialized as inert links by the
+/// snapshot copy; other non-regular kinds still cannot occur.
 pub(super) fn validate_tracked_snapshot_entries(
     repository: &Path,
     tracked: &BTreeSet<PathBuf>,
 ) -> Result<(), AcquisitionError> {
+    let mut verified_directories = BTreeSet::new();
     for relative in tracked {
+        // A tracked path must never resolve through a symlinked ancestor:
+        // the snapshot materializes symlinks as inert entries, and a
+        // follow here would reach outside the copied tree.
+        let mut ancestors_present = true;
+        if let Some(parent) = relative.parent() {
+            let mut ancestor = PathBuf::new();
+            for component in parent.components() {
+                ancestor.push(component);
+                if verified_directories.contains(&ancestor) {
+                    continue;
+                }
+                let path = repository.join(&ancestor);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata)
+                        if metadata.is_dir() && !metadata.file_type().is_symlink() =>
+                    {
+                        verified_directories.insert(ancestor.clone());
+                    }
+                    Ok(_) => {
+                        return Err(AcquisitionError::SymlinkPath {
+                            kind: "snapshot source",
+                            path,
+                        });
+                    }
+                    // A deleted subtree is legitimate dirty state.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        ancestors_present = false;
+                        break;
+                    }
+                    Err(source) => return Err(io_error("inspect snapshot path", source)),
+                }
+            }
+        }
+        if !ancestors_present {
+            continue;
+        }
         let path = repository.join(relative);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {}
@@ -437,6 +474,113 @@ pub(super) fn remove_ignored_snapshot_entries(
     let rules = IgnoreRules::compile_sources(sources, &options, deadline, true)
         .map_err(map_ignore_error)?;
     remove_ignored_walk(repository, Path::new(""), &rules, tracked, false, deadline)
+}
+
+/// Computes, from the SOURCE tree, the set of entries that
+/// `remove_ignored_snapshot_entries` would delete from the snapshot, so the
+/// copy can skip them entirely. Without this, ignored build directories abort
+/// acquisition before ignore rules ever apply: cargo hardlinks objects inside
+/// `target/`, and the copy walk rejects hardlinked (and symlinked) entries it
+/// was never going to keep.
+///
+/// The prune set is advisory: it is computed from the live source, so a
+/// concurrent mutation can make it stale. The post-copy passes
+/// (`validate_tracked_snapshot_entries`, `remove_ignored_snapshot_entries`)
+/// remain the authority on the snapshot's final content, and the walk below
+/// mirrors their semantics exactly — same ignore sources, same tracked-file
+/// protection, same nested-repository boundaries. When the source has no
+/// resolvable HEAD or a readable index cannot be established, nothing is
+/// pruned and the copy behaves as before.
+pub(super) fn compute_source_prune_set(
+    source: &Path,
+) -> Result<BTreeSet<PathBuf>, AcquisitionError> {
+    let Ok(Some(base_commit)) = resolve_head(source) else {
+        return Ok(BTreeSet::new());
+    };
+    let Ok(tracked) = read_validated_index(source, base_commit.len() / 2) else {
+        return Ok(BTreeSet::new());
+    };
+    let options = IndexOptions::default();
+    let deadline = Instant::now()
+        .checked_add(super::GIT_TIMEOUT)
+        .ok_or(AcquisitionError::CommandTimedOut("evaluate ignore rules"))?;
+    let mut sources = Vec::new();
+    collect_ignore_source(
+        &mut sources,
+        Vec::new(),
+        PathBuf::from(".git/info/exclude"),
+        &source.join(".git").join("info").join("exclude"),
+        &options,
+    )?;
+    collect_gitignore_sources(source, Path::new(""), &mut sources, &options)?;
+    let rules = IgnoreRules::compile_sources(sources, &options, deadline, true)
+        .map_err(map_ignore_error)?;
+    let mut prune = BTreeSet::new();
+    prune_walk(
+        source,
+        Path::new(""),
+        &rules,
+        &tracked,
+        false,
+        deadline,
+        &mut prune,
+    )?;
+    Ok(prune)
+}
+
+/// Source-side twin of `remove_ignored_walk`: collects prunable paths instead
+/// of deleting them. The one extra case is non-regular entries (symlinks,
+/// sockets): they cannot occur in a snapshot but do occur in sources, and an
+/// ignored untracked one must be pruned or the copy walk rejects it.
+fn prune_walk(
+    root: &Path,
+    relative: &Path,
+    rules: &IgnoreRules,
+    tracked: &BTreeSet<PathBuf>,
+    ancestor_ignored: bool,
+    deadline: Instant,
+    prune: &mut BTreeSet<PathBuf>,
+) -> Result<(), AcquisitionError> {
+    let absolute = root.join(relative);
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(&absolute).map_err(|source| io_error("read source directory", source))?
+    {
+        let entry = entry.map_err(|source| io_error("read source directory entry", source))?;
+        entries.push(entry.file_name());
+    }
+    entries.sort();
+    for name in entries {
+        if relative.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
+        let child = relative.join(&name);
+        let path = root.join(&child);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error("inspect source directory entry", source)),
+        };
+        if metadata.is_dir() {
+            let ignored =
+                ancestor_ignored || matches_ignored(rules, &child, EntryKind::Directory, deadline)?;
+            if ignored && !tracked_under(tracked, &child) {
+                prune.insert(child);
+            } else if path.join(".git").symlink_metadata().is_err() {
+                prune_walk(root, &child, rules, tracked, ignored, deadline, prune)?;
+            }
+        } else {
+            if tracked.contains(&child) {
+                continue;
+            }
+            let ignored =
+                ancestor_ignored || matches_ignored(rules, &child, EntryKind::File, deadline)?;
+            if ignored {
+                prune.insert(child);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn map_ignore_error(error: IndexError) -> AcquisitionError {
@@ -600,7 +744,9 @@ fn remove_ignored_walk(
             }
             // Nested repositories that are not fully ignored are opaque
             // boundaries, exactly as git treats them.
-        } else if metadata.is_file() {
+        } else {
+            // Files and symlinks share ignore semantics; symlinks are
+            // materialized as inert entries by the snapshot copy.
             if tracked.contains(&child) {
                 continue;
             }

@@ -31,11 +31,16 @@ use crate::{
                 ValidatedPlan, ValidationError, ValidationLimit,
             },
         },
+        index::meta::{IgnoreRules, IndexError},
         path_auth::AcceptedPathCapability,
-        revision::{LimitKind, RevisionError, RevisionId, WorkspaceMutationGuard},
+        revision::{
+            EntryKind as RevisionEntryKind, LimitKind, RevisionError, RevisionId,
+            WorkspaceMutationGuard,
+        },
     },
 };
 
+const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 const MARKER_NAME: &str = ".kit-stage-marker";
 const CLEANUP_QUEUE_NAME: &CStr = c".kit-stage-cleanup.queue";
 const CLEANUP_QUEUE_LIMIT: usize = 1024 * 1024;
@@ -198,10 +203,20 @@ pub fn stage<'workspace>(
         .ok_or(StageError::LimitExceeded(StageLimit::Time))?;
     let mut budget = Budget::new(limits, deadline);
     let mut plan = plan.consume_before(deadline).map_err(map_validation)?;
-    let (source, _workspace_path) = plan
+    let (source, workspace_path) = plan
         .guard
         .path_authorization_root()
         .map_err(|_| StageError::Unavailable)?;
+    // Same scope as the revision scan: `.git` and ignored entries stay out
+    // of the stage so digest prediction matches workspace identity. A rule
+    // load failure degrades to the unscoped copy; the scan side degrades the
+    // same way and any residual divergence fails typed as StageChanged.
+    let workspace_ignore = crate::workspace::index::meta::load_live_ignore_rules(
+        &workspace_path,
+        &crate::workspace::index::meta::IndexOptions::default(),
+        deadline,
+    )
+    .ok();
     let (stage_root, stage_root_path) = plan
         .guard
         .stage_allocation_root()
@@ -221,7 +236,12 @@ pub fn stage<'workspace>(
     stage_fence
         .reset_after_verified_read()
         .map_err(|_| StageError::StageChanged)?;
-    copy_tree(&source, &allocation.view, &mut budget)?;
+    copy_tree(
+        &source,
+        &allocation.view,
+        &mut budget,
+        workspace_ignore.as_ref(),
+    )?;
     plan.revalidate_before(deadline).map_err(map_validation)?;
 
     watch_stage_tree(
@@ -275,7 +295,7 @@ pub fn stage<'workspace>(
     stage_fence
         .ensure_clean()
         .map_err(|_| StageError::StageChanged)?;
-    copy_tree(final_source, &allocation.final_view, &mut budget)?;
+    copy_tree(final_source, &allocation.final_view, &mut budget, None)?;
     apply_snapshot_modes(&allocation.final_view, &expected_final)?;
     freeze_tree(&allocation.final_view)?;
     watch_stage_tree(
@@ -376,10 +396,10 @@ fn workspace_content_digest(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kit-workspace-content-v2\0");
     for (path, state) in &snapshot.entries {
-        hasher.update(&[if state.kind == Kind::Directory {
-            b'd'
-        } else {
-            b'f'
+        hasher.update(&[match state.kind {
+            Kind::Directory => b'd',
+            Kind::File => b'f',
+            Kind::Symlink => b'l',
         }]);
         frame(&mut hasher, path.as_os_str().as_encoded_bytes());
         hasher.update(&[u8::from(
@@ -394,6 +414,11 @@ fn workspace_content_digest(
             if *blake3::hash(&bytes).as_bytes() != state.digest {
                 return Err(StageError::StageChanged);
             }
+            hasher.update(&state.digest);
+        } else if state.kind == Kind::Symlink {
+            // The stored digest is blake3 of the literal target bytes; the
+            // snapshot's own physical fences already pin the link, and the
+            // reconciliation scan hashes the identical preimage.
             hasher.update(&state.digest);
         }
     }
@@ -744,6 +769,7 @@ fn snapshot_digest(snapshot: &Snapshot) -> String {
         hasher.update(&[match state.kind {
             Kind::Directory => 0,
             Kind::File => 1,
+            Kind::Symlink => 2,
         }]);
         hasher.update(&state.mode.to_le_bytes());
         hasher.update(&state.size.to_le_bytes());
@@ -849,6 +875,7 @@ fn frame(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 enum Kind {
     Directory,
     File,
+    Symlink,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1007,9 +1034,14 @@ impl Budget {
     }
 }
 
-fn copy_tree(source: &File, target: &File, budget: &mut Budget) -> Result<(), StageError> {
+fn copy_tree(
+    source: &File,
+    target: &File,
+    budget: &mut Budget,
+    ignore: Option<&IgnoreRules>,
+) -> Result<(), StageError> {
     let root_mount = mount_identity(source).map_err(|_| StageError::Unavailable)?;
-    copy_directory(source, target, Path::new(""), root_mount, budget)
+    copy_directory(source, target, Path::new(""), root_mount, budget, ignore)
 }
 
 fn freeze_tree(root: &File) -> Result<(), StageError> {
@@ -1039,6 +1071,9 @@ fn freeze_tree(root: &File) -> Result<(), StageError> {
                     return Err(StageError::StageChanged);
                 }
                 set_mode(&child, 0o400)?;
+            } else if before.kind() == libc::S_IFLNK as u32 {
+                // Symlinks stay as created: their modes are inert, and any
+                // chmod here would follow the link.
             } else {
                 return Err(StageError::StageChanged);
             }
@@ -1148,6 +1183,9 @@ fn verify_frozen_tree(
         let frozen_mode = match expected.kind {
             Kind::Directory => 0o500,
             Kind::File => 0o400,
+            // Symlink modes are inert and platform/umask-dependent; identity
+            // is carried by the target digest and size checks below.
+            Kind::Symlink => actual.mode,
         };
         if actual.kind != expected.kind
             || actual.digest != expected.digest
@@ -1187,6 +1225,7 @@ fn copy_directory(
     relative: &Path,
     root_mount: MountIdentity,
     budget: &mut Budget,
+    ignore: Option<&IgnoreRules>,
 ) -> Result<(), StageError> {
     let directory_before = stat_file(source).map_err(|_| StageError::StageChanged)?;
     if directory_before.kind() != libc::S_IFDIR as u32
@@ -1201,7 +1240,29 @@ fn copy_directory(
         let name = CString::new(bytes.clone()).map_err(|_| StageError::UnsafeSource)?;
         let path = relative.join(OsString::from_vec(bytes));
         budget.path(path.as_os_str().as_encoded_bytes().len())?;
+        // The workspace→stage copy skips exactly what the revision scan
+        // skips — the top-level `.git` and ignored entries — so the staged
+        // tree's digest prediction matches the scan's identity scope.
+        if relative.as_os_str().is_empty() && path.as_os_str() == ".git" {
+            continue;
+        }
         let before = stat_at(source, &name).map_err(|_| StageError::StageChanged)?;
+        if let Some(rules) = ignore {
+            let kind = if before.kind() == libc::S_IFDIR as u32 {
+                RevisionEntryKind::Directory
+            } else {
+                RevisionEntryKind::File
+            };
+            match rules.ignored(&path, kind, budget.deadline) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(IndexError::DeadlineExceeded) => {
+                    return Err(StageError::LimitExceeded(StageLimit::Time));
+                }
+                // Unexpressible paths keep their entries (safe direction).
+                Err(_) => {}
+            }
+        }
         match before.kind() {
             kind if kind == libc::S_IFDIR as u32 => {
                 mkdir_at(target, &name, 0o700)?;
@@ -1219,7 +1280,7 @@ fn copy_directory(
                 if !supported_directory_metadata(&source_child, before) {
                     return Err(StageError::UnsafeSource);
                 }
-                copy_directory(&source_child, &target_child, &path, root_mount, budget)?;
+                copy_directory(&source_child, &target_child, &path, root_mount, budget, ignore)?;
                 set_mode(&target_child, before.mode & 0o777)?;
             }
             kind if kind == libc::S_IFREG as u32 => {
@@ -1246,6 +1307,15 @@ fn copy_directory(
                 copy_file_bytes(&mut source_file, &mut target_file, before, budget.deadline)?;
                 strip_creation_metadata(&target_file)?;
                 set_mode(&target_file, before.mode & 0o777)?;
+            }
+            kind if kind == libc::S_IFLNK as u32 => {
+                let link_target = readlink_component(source, &name)?;
+                budget.file(link_target.len() as u64)?;
+                let after = stat_at(source, &name).map_err(|_| StageError::StageChanged)?;
+                if !before.same_bound(after) {
+                    return Err(StageError::StageChanged);
+                }
+                symlink_component(&link_target, target, &name)?;
             }
             _ => return Err(StageError::UnsafeSource),
         }
@@ -1348,6 +1418,34 @@ fn snapshot_directory(
                     },
                 );
             }
+            kind if kind == libc::S_IFLNK as u32 => {
+                // Symlinks snapshot as their literal target bytes; nothing
+                // follows the link and edits addressed at the path fail
+                // closed elsewhere.
+                let target = readlink_component(directory, &name)?;
+                budget.file(target.len() as u64)?;
+                let after = stat_at(directory, &name).map_err(|_| StageError::StageChanged)?;
+                if !before.same_bound(after) {
+                    return Err(StageError::StageChanged);
+                }
+                entries.insert(
+                    path,
+                    FileState {
+                        kind: Kind::Symlink,
+                        digest: *blake3::hash(&target).as_bytes(),
+                        mode: before.mode & 0o777,
+                        size: target.len() as u64,
+                        physical: PhysicalState {
+                            device: before.device,
+                            inode: before.inode,
+                            changed_seconds: before.changed_seconds,
+                            changed_nanoseconds: before.changed_nanoseconds,
+                            mode: before.mode & 0o777,
+                            size: before.size,
+                        },
+                    },
+                );
+            }
             _ => return Err(StageError::UnsafeSource),
         }
     }
@@ -1355,6 +1453,43 @@ fn snapshot_directory(
         return Err(StageError::StageChanged);
     }
     Ok(())
+}
+
+fn readlink_component(directory: &File, name: &CStr) -> Result<Vec<u8>, StageError> {
+    use std::os::fd::AsRawFd;
+
+    let mut buffer = vec![0_u8; MAX_SYMLINK_TARGET_BYTES + 1];
+    // SAFETY: readlinkat receives a valid directory descriptor, C string and
+    // an owned buffer of the stated capacity.
+    let written = unsafe {
+        libc::readlinkat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if written < 0 {
+        return Err(StageError::StageChanged);
+    }
+    buffer.truncate(written as usize);
+    if buffer.len() > MAX_SYMLINK_TARGET_BYTES {
+        return Err(StageError::UnsafeSource);
+    }
+    Ok(buffer)
+}
+
+fn symlink_component(target: &[u8], directory: &File, name: &CStr) -> Result<(), StageError> {
+    use std::os::fd::AsRawFd;
+
+    let target = CString::new(target).map_err(|_| StageError::UnsafeSource)?;
+    // SAFETY: symlinkat receives valid C strings and a valid directory
+    // descriptor; it never follows the created path.
+    if unsafe { libc::symlinkat(target.as_ptr(), directory.as_raw_fd(), name.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(StageError::Unavailable)
+    }
 }
 
 fn directory_names(directory: &File, budget: &mut Budget) -> Result<Vec<Vec<u8>>, StageError> {

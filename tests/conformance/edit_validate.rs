@@ -274,15 +274,20 @@ fn edit_rejects_fuzzy_duplicate() {
 
 #[test]
 fn symlink_special_and_hardlink_sources_fail_as_the_documented_unsafe_outcome() {
+    // A workspace merely CONTAINING a symlink is editable — the link is an
+    // inert entry — but an edit addressed AT the symlink path itself still
+    // fails closed through path authorization.
     let symlink = Fixture::new(&[("file", b"x")]);
+    std::os::unix::fs::symlink("file", symlink.workspace_path.join("link")).unwrap();
     let ir = symlink.ir(vec![EditOperation::AddFile {
         path: path("new"),
         content: text(b"x"),
         executable: false,
     }]);
-    std::os::unix::fs::symlink("file", symlink.workspace_path.join("link")).unwrap();
+    validate(&symlink.workspace, &ir, EditLimits::default()).unwrap();
+    let at_link = symlink.ir(vec![replace("link", b"x", b"y")]);
     assert!(matches!(
-        validate(&symlink.workspace, &ir, EditLimits::default()),
+        validate(&symlink.workspace, &at_link, EditLimits::default()),
         Err(ValidationError::UnsafePath(UnsafePathKind::Symlink))
     ));
 
