@@ -4,10 +4,10 @@
   title: Exclude secrets from prompts
   atomic_text: Secret values MUST NOT appear in prompts.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -57,10 +57,10 @@
   title: Exclude secrets from events
   atomic_text: Secret values MUST NOT appear in events.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -110,10 +110,10 @@
   title: Exclude secrets from traces
   atomic_text: Secret values MUST NOT appear in traces.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -163,10 +163,10 @@
   title: Exclude secrets from composition source
   atomic_text: Secret values MUST NOT appear in composition source.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -211,10 +211,10 @@
   title: Exclude secrets from retained terminal history
   atomic_text: Secret values MUST NOT appear in retained terminal history.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: active
   supersedes: null
   tombstone_reason: null
@@ -258,10 +258,10 @@
   title: Exclude secrets from workspace metadata
   atomic_text: Secret values MUST NOT appear in workspace metadata.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: active
   supersedes: null
   tombstone_reason: null
@@ -305,10 +305,10 @@
   title: Avoid secrets in process arguments
   atomic_text: Secret values SHOULD NOT appear in process arguments.
   source_section: §24 Capability Security
-  source_anchor: RFC.md:1020
+  source_anchor: RFC.md:940
   source_quote: Secrets are opaque handles resolved just in time by the broker. Secret values MUST NOT appear in prompts, events, traces, composition source, retained terminal history, or workspace metadata. They SHOULD NOT appear in process arguments because argv is commonly observable; file descriptors, memory-backed files, environment injection where unavoidable, short-lived credentials, and egress-proxy injection are preferred. If a target program only accepts argv credentials, policy requires explicit approval, redaction at capture boundaries, and the shortest feasible lifetime.
   source_fingerprint: 3fdc8f8d1a68a625c6728a1ee8696f10524679f247e941fa38d2de44f3480223
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: active
   supersedes: null
   tombstone_reason: null

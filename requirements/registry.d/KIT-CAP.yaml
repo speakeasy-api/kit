@@ -4,10 +4,10 @@
   title: Keep active bindings immutable
   atomic_text: A catalog change MUST NOT silently replace a schema already bound to an active run.
   source_section: §15.2 Progressive discovery
-  source_anchor: RFC.md:610
-  source_quote: 'Authorization filtering occurs before search so a principal cannot discover forbidden capabilities. A catalog change updates the index but MUST NOT silently replace a schema already bound to an active run.'
+  source_anchor: RFC.md:609
+  source_quote: Authorization filtering occurs before search so a principal cannot discover forbidden capabilities. A catalog change updates the index but MUST NOT silently replace a schema already bound to an active run.
   source_fingerprint: 755fff22d3abfed40bc750e89a4244dbed95ab543691f9742935003fb368dade
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -15,25 +15,31 @@
   applicability: mandatory
   interpretation: Active runs continue using their pinned schema digest after catalog refresh and require a new binding to change schemas.
   acceptance_criteria:
-    - 'cargo test --test conformance binding_schema_immutable -- --exact exits 0 with 1 passed and 0 failed'
+  - cargo test --test conformance binding_schema_immutable -- --exact exits 0 with 1 passed and 0 failed
   primary_milestone: M006
   contributing_milestones: []
   dependencies: []
   owner: Capability owner
   criticality: blocking
-  platforms: [all]
-  deployment_tiers: [local, restricted, clustered, hostile]
-  release_gates: [G06]
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G06
   implementation_links:
-    - src/capabilities/discovery/mod.rs
+  - src/capabilities/discovery/mod.rs
   public_contract_links: []
   telemetry_links:
-    - tests/conformance/binding_schema_immutable.rs
-    - tests/adversarial/catalog_visibility.rs
+  - tests/conformance/binding_schema_immutable.rs
+  - tests/adversarial/catalog_visibility.rs
   evidence_type: conformance
   evidence_id: EV-M006-W05-C-001
   evidence_job: integration
-  expected_result: 'cargo test --test conformance binding_schema_immutable -- --exact exits 0 with 1 passed and 0 failed'
+  expected_result: cargo test --test conformance binding_schema_immutable -- --exact exits 0 with 1 passed and 0 failed
   artifact_digest: null
   environment_digest: null
   versions: null

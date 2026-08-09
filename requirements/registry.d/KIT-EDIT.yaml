@@ -4,10 +4,10 @@
   title: Reject low-confidence fuzzy edits
   atomic_text: Kit MUST reject low-confidence fuzzy application rather than edit a possibly wrong duplicate.
   source_section: §18.3 Edit transaction
-  source_anchor: RFC.md:747
-  source_quote: Kit MUST reject low-confidence fuzzy application rather than silently editing the wrong duplicate. An enclosing symbol can disambiguate an otherwise exact repeated anchor.
-  source_fingerprint: 866783bb0bb495707bba1046ff9cf37346c3f0e7c9aed03f9005850ff44eecf4
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_anchor: RFC.md:744
+  source_quote: Kit MUST reject low-confidence fuzzy application rather than silently editing the wrong duplicate.
+  source_fingerprint: 1267b49641873a105a3d4f3a3a23be059ddbb57df00f91a548115c4670e25095
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -58,10 +58,10 @@
   title: Isolate staged LSP buffers
   atomic_text: Kit MUST NOT expose staged edit buffers to the live workspace LSP.
   source_section: §18.3 Edit transaction
-  source_anchor: RFC.md:749
-  source_quote: For staged diagnostics, Kit sends versioned staged buffers to an isolated LSP session or shadow workspace using `didOpen`/`didChange`, collects responses tied to those document versions, then closes or discards the shadow state. It MUST NOT expose staged buffers to the live workspace LSP. If a language server cannot diagnose shadow content safely, pre-commit LSP diagnostics are unavailable for that adapter; compiler checks run in the copy-on-write execution view and live diagnostics are collected only after commit.
-  source_fingerprint: 30596e2199dcbcc0c6f5c53ba3ab2a2a6bfe674e25fb465be727778ed43be401
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_anchor: RFC.md:746
+  source_quote: It MUST NOT expose staged buffers to the live workspace LSP.
+  source_fingerprint: dac6952133880273cdb476f9fa3dd111b20aaf55478161d01f56d74a7382f719
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

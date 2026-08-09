@@ -4,10 +4,10 @@
   title: Preserve ACP protocol boundaries
   atomic_text: ACP MUST NOT be flattened with A2A and MCP into one generic protocol merely because they share JSON-RPC-like concepts.
   source_section: §23.1 Protocol roles
-  source_anchor: RFC.md:958
+  source_anchor: RFC.md:878
   source_quote: They MUST NOT be flattened into one generic protocol merely because they share JSON-RPC-like concepts.
   source_fingerprint: 3ece858336efe6ef661e683c20565fbb13f949576ecc1a84bf04aa0eb527d675
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -50,10 +50,10 @@
   title: Optimize in-process ACP children
   atomic_text: An in-process agentkit child MAY be optimized internally when its durable behavior is normalized to the ACP child-run contract.
   source_section: §23.3 ACP subagents
-  source_anchor: RFC.md:977
+  source_anchor: RFC.md:897
   source_quote: Kit acts as ACP client to the subagent. This makes third-party coding agents replaceable and observable. An in-process agentkit child MAY be optimized internally, but its durable behavior is normalized to the same child-run contract.
   source_fingerprint: 77e1dc236adbf8cd190e2ee8ee3aabc73671c42b60fe8c499b511b6d7415dc03
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

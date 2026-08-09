@@ -8,9 +8,9 @@
   source_quote: The defect SHOULD be reproduced before editing when feasible. Existing red builds and diagnostics are baselined; decisions use deltas rather than assuming the repository starts clean.
   source_fingerprint: 060ef19d5f6be790f0c18e21695842477e9f4a2a765b13f3a15d48eb8a86cd85
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: implemented
-  supersedes: null
-  tombstone_reason: null
+  status: tombstoned
+  supersedes: KIT-VERIFY-815
+  tombstone_reason: Container-check verification (ladder, affected-check selection, feedback pipeline, loop control) was removed by the RFC amendment at 4e3b5d755034 accompanying DR-0007/DR-0008; built-in verification is the edit-time syntax gate plus optional staged shadow-LSP diagnostics, and further verification is performed by the model through kit_run.
   area: KIT-VERIFY
   applicability: mandatory
   interpretation: The verification event stream records a failing reproducer before the first edit, or records why reproduction is infeasible.
@@ -51,7 +51,7 @@
     rustc: 1.94.0
   latest_result: pass
   revalidation_rule: Re-run when edit orchestration or verification-event recording changes.
-  decision_record: null
+  decision_record: docs/decisions/DR-0008-hunk-anchored-edits.md
   deviation_record: null
 - id: KIT-VERIFY-002
   record_class: requirement
@@ -63,9 +63,9 @@
   source_quote: Repeated full logs MUST NOT accumulate in context.
   source_fingerprint: 94dfd908bdff520642c2468d9690b0f09025673cdafd9022ab866f015d1a63ab
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: implemented
-  supersedes: null
-  tombstone_reason: null
+  status: tombstoned
+  supersedes: KIT-VERIFY-815
+  tombstone_reason: Container-check verification (ladder, affected-check selection, feedback pipeline, loop control) was removed by the RFC amendment at 4e3b5d755034 accompanying DR-0007/DR-0008; built-in verification is the edit-time syntax gate plus optional staged shadow-LSP diagnostics, and further verification is performed by the model through kit_run.
   area: KIT-VERIFY
   applicability: mandatory
   interpretation: A repeated check replaces or references prior full logs and model context retains only bounded failure feedback.
@@ -106,7 +106,7 @@
     rustc: 1.94.0
   latest_result: pass
   revalidation_rule: Re-run when verification feedback, transcript projection, or log artifact handling changes.
-  decision_record: null
+  decision_record: docs/decisions/DR-0008-hunk-anchored-edits.md
   deviation_record: null
 - id: KIT-VERIFY-003
   record_class: requirement
@@ -118,9 +118,9 @@
   source_quote: Each run has budgets for model turns, reasoning, spend, wall time, test time, patch size, repeated failures, and destructive effects. After two materially identical failures, policy SHOULD trigger re-localization, model escalation, a fresh-context reviewer, or user input rather than another equivalent edit.
   source_fingerprint: 61e22b482796fe9c7b9375007bafe8a709d5a06c02a8f3605bd940d7a7faa25c
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: proposed
+  status: tombstoned
   supersedes: null
-  tombstone_reason: null
+  tombstone_reason: Container-check verification (ladder, affected-check selection, feedback pipeline, loop control) was removed by the RFC amendment at 4e3b5d755034 accompanying DR-0007/DR-0008; built-in verification is the edit-time syntax gate plus optional staged shadow-LSP diagnostics, and further verification is performed by the model through kit_run.
   area: KIT-VERIFY
   applicability: mandatory
   interpretation: A third materially identical failure signature cannot dispatch the same edit strategy without first selecting one of the four named interventions.
@@ -153,5 +153,5 @@
   versions: null
   latest_result: pending
   revalidation_rule: Re-run when failure signatures, intervention policy, or edit retry logic changes.
-  decision_record: null
+  decision_record: docs/decisions/DR-0008-hunk-anchored-edits.md
   deviation_record: null

@@ -667,12 +667,12 @@
   record_class: requirement
   modality: SHOULD
   title: Eagerly load edit
-  atomic_text: The default eager tool set SHOULD include edit for transactional multi-file patches with optional verification.
+  atomic_text: The default eager tool set SHOULD include edit for transactional multi-file hunk patches with syntax validation.
   source_section: §14.2 Core tools
   source_anchor: RFC.md:554
-  source_quote: edit          transactional multi-file patch with optional verification
-  source_fingerprint: bf8b7f1f8bb97ddc289d4ed99dcbbcc41b3a6d6fbe796e4c93eca4bc7d843b60
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_quote: edit          transactional multi-file hunk patch with syntax validation
+  source_fingerprint: 0159d4b0805ded3d9fd88b4cb4577ebb53d711082fe6a425c0f12b60f608ad10
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -785,9 +785,9 @@
   source_quote: check         diagnostics, build, tests, lint, and affected checks
   source_fingerprint: 947c06ca1f3af42c9bfa94b20e8c4d5ee605d5bf0061b927b8a865b865c9fc68
   introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
-  status: implemented
-  supersedes: null
-  tombstone_reason: null
+  status: tombstoned
+  supersedes: KIT-VERIFY-815
+  tombstone_reason: The kit_check tool was removed by the RFC amendment at 4e3b5d755034 accompanying DR-0007/DR-0008; verification beyond the edit-time gate runs through kit_run.
   area: KIT-TOOL
   applicability: mandatory
   interpretation: The default model tool registration contains check with each stated verification class.
@@ -830,7 +830,7 @@
     rustc: 1.94.0
   latest_result: pass
   revalidation_rule: Re-run when the eager model-facing tool set or a tool contract changes.
-  decision_record: null
+  decision_record: docs/decisions/DR-0008-hunk-anchored-edits.md
   deviation_record: null
 - id: KIT-TOOL-016
   record_class: requirement
@@ -838,10 +838,10 @@
   title: Eagerly load tools
   atomic_text: The default eager tool set SHOULD include tools for deferred capability search, inspection, binding, and invocation.
   source_section: §14.2 Core tools
-  source_anchor: RFC.md:557
+  source_anchor: RFC.md:556
   source_quote: tools         deferred capability search, inspection, binding, and invocation
   source_fingerprint: f33b3fa32a751ddad4a105eaa5eb76887aeab6c88515d4512512ceae1fcb752f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -886,10 +886,10 @@
   title: Eagerly load compose
   atomic_text: The default eager tool set SHOULD include compose for bounded programmatic capability composition.
   source_section: §14.2 Core tools
-  source_anchor: RFC.md:558
+  source_anchor: RFC.md:557
   source_quote: compose       bounded programmatic capability composition
   source_fingerprint: 4f605ef6f6e4c7f19ba007ad530cd5864dd9e78bd48e24ec86c81da81f23d746
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -932,10 +932,10 @@
   title: Eagerly load agent
   atomic_text: The default eager tool set SHOULD include agent for spawning, inspecting, messaging, and canceling ACP subagents or A2A tasks.
   source_section: §14.2 Core tools
-  source_anchor: RFC.md:559
+  source_anchor: RFC.md:558
   source_quote: agent         spawn/inspect/message/cancel ACP subagents or A2A tasks
   source_fingerprint: 60e5e8723e514d2c7281074cc14fada398725a94dafb4c4f49ef4cd1a5fe6f79
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -978,10 +978,10 @@
   title: Eagerly load yield
   atomic_text: The default eager tool set SHOULD include yield for semantic continuation submission and context compaction.
   source_section: §14.2 Core tools
-  source_anchor: RFC.md:560
+  source_anchor: RFC.md:559
   source_quote: yield         submit a semantic continuation and compact context
   source_fingerprint: bdab05b2b9f511e8dce75188df8f5c09b2527aa28938697f3d6c33c03a9cf64f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -1024,10 +1024,10 @@
   title: Select provider-native server tools
   atomic_text: Provider-native server tools MAY be included when they outperform equivalent local tools and preserve policy.
   source_section: §14.2 Core tools
-  source_anchor: RFC.md:563
+  source_anchor: RFC.md:562
   source_quote: Provider-native server tools MAY be included when they outperform equivalent local tools and preserve policy.
   source_fingerprint: 33f281204b7646e6e0e53e430d691810eef4df03e13d921b94ca738fbff55640
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -1072,10 +1072,10 @@
   title: Use JSON Schema 2020-12 for native schemas
   atomic_text: Native Kit tool schemas SHOULD use JSON Schema 2020-12.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:567
+  source_anchor: RFC.md:566
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -1120,10 +1120,10 @@
   title: Preserve source schemas
   atomic_text: Kit MUST preserve each capability source schema.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:567
+  source_anchor: RFC.md:566
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -1168,10 +1168,10 @@
   title: Preserve normalized schema views
   atomic_text: Kit MUST preserve each capability normalized internal schema view.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:567
+  source_anchor: RFC.md:566
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -1216,10 +1216,10 @@
   title: Preserve provider projections
   atomic_text: Kit MUST preserve every generated provider schema projection.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:567
+  source_anchor: RFC.md:566
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -1264,10 +1264,10 @@
   title: Preserve schema-form digests
   atomic_text: Kit MUST preserve digests for the source schema, normalized view, and projection.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:567
+  source_anchor: RFC.md:566
   source_quote: Kit preserves each capability’s source JSON Schema and declared dialect. Native Kit schemas SHOULD use JSON Schema 2020-12. Under MCP `2025-11-25`, a schema without `$schema` defaults to 2020-12 while an explicit alternate dialect is permitted. Provider adapters project schemas into each provider/model’s accepted subset and reject unsupported constraints rather than silently dropping them. Kit MUST preserve the source schema, normalized internal view, projection, and their digests.
   source_fingerprint: 570f63ac7165cacd9fce9208130151152fcd1e701f35bbbe99ee63bb43a0e3fd
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -1312,10 +1312,10 @@
   title: Retain author documentation
   atomic_text: Provider schema projections MUST NOT drop author documentation.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:580
+  source_anchor: RFC.md:579
   source_quote: Descriptions, defaults, enums, required fields, and important constraints remain present. Raw JSON Schema keywords that do not help the model are omitted from the projection. Author documentation MUST NOT be dropped.
   source_fingerprint: eb903415501b5392ecdb5c8bfc7bf6616febab37310c76eba9f6293a3f95b3fb
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null

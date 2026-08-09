@@ -4,13 +4,13 @@
   title: Route classification to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle classification.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:854-856
+  source_anchor: RFC.md:774-776
   source_quote: 'Classical code or fast inexpensive models SHOULD handle:
 
 
     - classification and query expansion,'
   source_fingerprint: 85f49a5bd1f56640596ed2deae6957f39f8ce24300fb257a2fddde9898e6c2f5
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -53,10 +53,10 @@
   title: Route tool ranking to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle tool search ranking.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:857
+  source_anchor: RFC.md:777
   source_quote: '- tool search ranking,'
   source_fingerprint: 7e249a9253c4814ce0797437870373a9c85c98c8e04ce80cc9b9d767b6ae81c6
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -99,10 +99,10 @@
   title: Route compression to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle log compression.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:858
+  source_anchor: RFC.md:778
   source_quote: '- log and result compression,'
   source_fingerprint: cfb60a7bb2056b9a897f13e52cbe74de84dadb96dae18167dad91d06a8f85b3b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -145,10 +145,10 @@
   title: Route simple projection to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle simple formatting.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:859
+  source_anchor: RFC.md:779
   source_quote: '- simple formatting and schema projection,'
   source_fingerprint: 444a1d22d2a0ad8cf5e0e598ffa8d6bb094a0ce75e1fe3a00a224bda20b22509
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -191,10 +191,10 @@
   title: Route low-risk edits to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle straightforward low-risk edits.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:860
+  source_anchor: RFC.md:780
   source_quote: '- straightforward low-risk edits,'
   source_fingerprint: 1e05cc306cebaa1d43e2b93498fa81508125d305e45091baf228ab484f69dbd2
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -237,10 +237,10 @@
   title: Route result classification to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle verification-result classification.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:861
+  source_anchor: RFC.md:781
   source_quote: '- verification-result classification.'
   source_fingerprint: bbf21da442980c329fb6119dbf88a49d9058de236dbb0651f487c5d2db65dac1
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -283,13 +283,13 @@
   title: Route ambiguous requirements to capable models
   atomic_text: More capable models SHOULD handle ambiguous requirements.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:863-865
+  source_anchor: RFC.md:783-785
   source_quote: 'More capable models SHOULD handle:
 
 
     - ambiguous requirements,'
   source_fingerprint: bd982a26ea1f68bd965475f5ce120cddfc7103ec20daa0c111e0c6ce3c1a5405
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -332,10 +332,10 @@
   title: Route multi-file localization to capable models
   atomic_text: More capable models SHOULD handle multi-file localization.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:866
+  source_anchor: RFC.md:786
   source_quote: '- multi-file localization,'
   source_fingerprint: 50554f11859b941f2172f8a51aaa273c63e8be4f822d31fb7e91bf5e91db2564
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -378,10 +378,10 @@
   title: Route architecture changes to capable models
   atomic_text: More capable models SHOULD handle architectural changes.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:867
+  source_anchor: RFC.md:787
   source_quote: '- architectural or public API changes,'
   source_fingerprint: 62765e10818ac5ace1b9c52a044a1128dfa54a3f82504c0a95e22e107cbe2995
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -424,10 +424,10 @@
   title: Route concurrency bugs to capable models
   atomic_text: More capable models SHOULD handle concurrency bugs.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:868
+  source_anchor: RFC.md:788
   source_quote: '- concurrency, security, migrations, and state bugs,'
   source_fingerprint: cea0b28e17f7761fbf97bf144658c8a8c89baff8b46dbfcc89d0f18a4e0e2e08
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -470,10 +470,10 @@
   title: Escalate lower-tier failures
   atomic_text: More capable models SHOULD handle lower-tier failures.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:869
+  source_anchor: RFC.md:789
   source_quote: '- lower-tier failures,'
   source_fingerprint: 29c5e69443b44e7ddee2ee61f3b8ba429fd3090bdb7c4f151a254407f3f26707
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -516,10 +516,10 @@
   title: Route irreversible effects to capable models
   atomic_text: More capable models SHOULD handle high-cost irreversible effects.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:870
+  source_anchor: RFC.md:790
   source_quote: '- high-cost irreversible effects.'
   source_fingerprint: 69e4c3cad10f22995d35fa4b2c770e7cdb3484bac5f65e6b09a76b49b02ae78d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -609,10 +609,10 @@
   title: Route query expansion to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle query expansion.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:854-856
+  source_anchor: RFC.md:774-776
   source_quote: '- classification and query expansion,'
   source_fingerprint: 85f49a5bd1f56640596ed2deae6957f39f8ce24300fb257a2fddde9898e6c2f5
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -655,10 +655,10 @@
   title: Route result compression to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle result compression.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:858
+  source_anchor: RFC.md:778
   source_quote: '- log and result compression,'
   source_fingerprint: cfb60a7bb2056b9a897f13e52cbe74de84dadb96dae18167dad91d06a8f85b3b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -701,10 +701,10 @@
   title: Route schema projection to inexpensive handlers
   atomic_text: Classical code or fast inexpensive models SHOULD handle schema projection.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:859
+  source_anchor: RFC.md:779
   source_quote: '- simple formatting and schema projection,'
   source_fingerprint: 444a1d22d2a0ad8cf5e0e598ffa8d6bb094a0ce75e1fe3a00a224bda20b22509
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -747,10 +747,10 @@
   title: Route public API changes to capable models
   atomic_text: More capable models SHOULD handle public API changes.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:867
+  source_anchor: RFC.md:787
   source_quote: '- architectural or public API changes,'
   source_fingerprint: 62765e10818ac5ace1b9c52a044a1128dfa54a3f82504c0a95e22e107cbe2995
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -793,10 +793,10 @@
   title: Route security bugs to capable models
   atomic_text: More capable models SHOULD handle security bugs.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:868
+  source_anchor: RFC.md:788
   source_quote: '- concurrency, security, migrations, and state bugs,'
   source_fingerprint: cea0b28e17f7761fbf97bf144658c8a8c89baff8b46dbfcc89d0f18a4e0e2e08
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -839,10 +839,10 @@
   title: Route migrations to capable models
   atomic_text: More capable models SHOULD handle migrations.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:868
+  source_anchor: RFC.md:788
   source_quote: '- concurrency, security, migrations, and state bugs,'
   source_fingerprint: cea0b28e17f7761fbf97bf144658c8a8c89baff8b46dbfcc89d0f18a4e0e2e08
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -885,10 +885,10 @@
   title: Route state bugs to capable models
   atomic_text: More capable models SHOULD handle state bugs.
   source_section: §20.2 Phase routing
-  source_anchor: RFC.md:868
+  source_anchor: RFC.md:788
   source_quote: '- concurrency, security, migrations, and state bugs,'
   source_fingerprint: cea0b28e17f7761fbf97bf144658c8a8c89baff8b46dbfcc89d0f18a4e0e2e08
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

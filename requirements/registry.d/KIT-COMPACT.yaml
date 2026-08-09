@@ -4,10 +4,10 @@
   title: Make yield the sole tool call
   atomic_text: The yield control action MUST be the sole tool call in its model round.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -50,10 +50,10 @@
   title: Reject yield during an in-flight tool
   atomic_text: Kit MUST NOT accept yield while another tool operation is in flight.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -96,10 +96,10 @@
   title: Reject yield during an approval
   atomic_text: Kit MUST NOT accept yield while an approval is in flight.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -142,10 +142,10 @@
   title: Reject yield during authentication
   atomic_text: Kit MUST NOT accept yield while an authentication flow is in flight.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -188,10 +188,10 @@
   title: Reject yield during an edit transaction
   atomic_text: Kit MUST NOT accept yield while an edit transaction is in flight.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -234,10 +234,10 @@
   title: Reject yield during a child merge
   atomic_text: Kit MUST NOT accept yield while a child merge is in flight.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -280,10 +280,10 @@
   title: Reject yield during other blockers
   atomic_text: Kit MUST NOT accept yield while any other blocking operation is in flight.
   source_section: §22.1 Semantic checkpoint
-  source_anchor: RFC.md:915
+  source_anchor: RFC.md:835
   source_quote: This is a control action, not user-facing prose. `yield` MUST be the sole tool call in its model round and is accepted only when no tool, approval, auth flow, edit transaction, child merge, or other blocking operation is in flight. A mixed or mid-flight call is rejected with a compact, retryable control error and does not alter context. A valid call ends the current model round; after validation, Kit compacts and returns a small acknowledgment before the next model call. The continuation packet has a model- and task-specific maximum token budget.
   source_fingerprint: b6d93b9c967a46ca65fda063882215d55bd028a4a2ef798c547b7e49c6318afc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

@@ -4,10 +4,10 @@
   title: Select compact type notation
   atomic_text: The model-facing schema projection MAY use compact type notation.
   source_section: §14.3 Compact tool schemas
-  source_anchor: RFC.md:569
+  source_anchor: RFC.md:568
   source_quote: 'The model-facing projection MAY use compact type notation:'
   source_fingerprint: 6484f8fb7c76db0b826b366bc4d92576731af3a9df675a207519fc625b174edc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

@@ -4,10 +4,10 @@
   title: Linux process cleanup uses dedicated cgroup v2 trees
   atomic_text: Dedicated cgroup v2 trees should own process cleanup on Linux.
   source_section: §25.2 Executor requirements
-  source_anchor: RFC.md:1049
+  source_anchor: RFC.md:969
   source_quote: On Linux, dedicated cgroup v2 trees and `cgroup.kill` SHOULD own process cleanup.
   source_fingerprint: fa0152ede5cae9b18f6a73ba82d94af99179123b5766ddb2a43fd709a3e00b1c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: active
   supersedes: null
   tombstone_reason: null
@@ -53,10 +53,10 @@
   title: Linux process cleanup uses cgroup.kill
   atomic_text: cgroup.kill should own process cleanup on Linux.
   source_section: §25.2 Executor requirements
-  source_anchor: RFC.md:1049
+  source_anchor: RFC.md:969
   source_quote: On Linux, dedicated cgroup v2 trees and `cgroup.kill` SHOULD own process cleanup.
   source_fingerprint: fa0152ede5cae9b18f6a73ba82d94af99179123b5766ddb2a43fd709a3e00b1c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: active
   supersedes: null
   tombstone_reason: null

@@ -848,12 +848,12 @@
   record_class: requirement
   modality: MUST
   title: Apply edits transactionally
-  atomic_text: Kit must apply edits transactionally against a known workspace revision.
+  atomic_text: Kit must apply edits transactionally with exact content anchors.
   source_section: §3 Goals
   source_anchor: RFC.md:58
-  source_quote: '- apply edits transactionally against a known workspace revision and optionally verify them in the same call;'
-  source_fingerprint: 78bb1c8edc1adcdd4c1dd521de4d5c07a888a6033a0756ab8cc30f3b11eb7fb8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_quote: apply edits transactionally with exact content anchors
+  source_fingerprint: 01b0fb575479a0885c3ee707bd9cb5f817b02aeffb9281016ef6acf2b05240e6
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -894,13 +894,13 @@
 - id: KIT-OUTCOME-020
   record_class: requirement
   modality: MUST
-  title: Offer same-call edit verification
-  atomic_text: Kit must offer optional verification in the same transactional edit call.
+  title: Optional staged diagnostics in edit
+  atomic_text: Kit must offer optional staged diagnostics in the same transactional edit call.
   source_section: §3 Goals
   source_anchor: RFC.md:58
-  source_quote: '- apply edits transactionally against a known workspace revision and optionally verify them in the same call;'
-  source_fingerprint: 78bb1c8edc1adcdd4c1dd521de4d5c07a888a6033a0756ab8cc30f3b11eb7fb8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_quote: optionally collect staged diagnostics in the same call
+  source_fingerprint: 01b0fb575479a0885c3ee707bd9cb5f817b02aeffb9281016ef6acf2b05240e6
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

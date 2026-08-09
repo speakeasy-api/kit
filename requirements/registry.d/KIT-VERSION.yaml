@@ -4,10 +4,10 @@
   title: Pin mutable protocol versions
   atomic_text: Mutable protocols MUST be pinned to the exact versions recorded by an experiment or build.
   source_section: §37 References
-  source_anchor: RFC.md:1507
+  source_anchor: RFC.md:1424
   source_quote: Local case studies are primary evidence about the reviewed implementation but are self-authored, not independent validation. Product/vendor documentation establishes current interfaces, not causal quality gains. Mutable protocols, datasets, models, and harnesses MUST be pinned to the exact versions recorded by an experiment or build.
   source_fingerprint: 6f2564346df2c156da21d754d488f8ca760d5d3d3d065c9e062b8cdfa2477a0a
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -59,10 +59,10 @@
   title: Pin mutable dataset versions
   atomic_text: Mutable datasets MUST be pinned to the exact versions recorded by an experiment or build.
   source_section: §37 References
-  source_anchor: RFC.md:1507
+  source_anchor: RFC.md:1424
   source_quote: Local case studies are primary evidence about the reviewed implementation but are self-authored, not independent validation. Product/vendor documentation establishes current interfaces, not causal quality gains. Mutable protocols, datasets, models, and harnesses MUST be pinned to the exact versions recorded by an experiment or build.
   source_fingerprint: 6f2564346df2c156da21d754d488f8ca760d5d3d3d065c9e062b8cdfa2477a0a
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -112,10 +112,10 @@
   title: Pin mutable model versions
   atomic_text: Mutable models MUST be pinned to the exact versions recorded by an experiment or build.
   source_section: §37 References
-  source_anchor: RFC.md:1507
+  source_anchor: RFC.md:1424
   source_quote: Local case studies are primary evidence about the reviewed implementation but are self-authored, not independent validation. Product/vendor documentation establishes current interfaces, not causal quality gains. Mutable protocols, datasets, models, and harnesses MUST be pinned to the exact versions recorded by an experiment or build.
   source_fingerprint: 6f2564346df2c156da21d754d488f8ca760d5d3d3d065c9e062b8cdfa2477a0a
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -170,10 +170,10 @@
   title: Pin mutable harness versions
   atomic_text: Mutable harnesses MUST be pinned to the exact versions recorded by an experiment or build.
   source_section: §37 References
-  source_anchor: RFC.md:1507
+  source_anchor: RFC.md:1424
   source_quote: Local case studies are primary evidence about the reviewed implementation but are self-authored, not independent validation. Product/vendor documentation establishes current interfaces, not causal quality gains. Mutable protocols, datasets, models, and harnesses MUST be pinned to the exact versions recorded by an experiment or build.
   source_fingerprint: 6f2564346df2c156da21d754d488f8ca760d5d3d3d065c9e062b8cdfa2477a0a
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null

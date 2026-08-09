@@ -4,10 +4,10 @@
   title: Avoid composition for exploratory investigation
   atomic_text: Composition SHOULD NOT be the default for exploratory investigation where each observation changes the next question.
   source_section: §16.1 Purpose
-  source_anchor: RFC.md:643
+  source_anchor: RFC.md:644
   source_quote: Composition SHOULD NOT be the default for exploratory investigation where each observation changes the next question, approval-sensitive effects, or a single cheap call.
   source_fingerprint: 641676c6f1f04c10e2720378973c2ab966e8005915b517dd2a89252d3372c220
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -51,10 +51,10 @@
   title: Avoid composition for approval-sensitive effects
   atomic_text: Composition SHOULD NOT be the default for approval-sensitive effects.
   source_section: §16.1 Purpose
-  source_anchor: RFC.md:643
+  source_anchor: RFC.md:644
   source_quote: Composition SHOULD NOT be the default for exploratory investigation where each observation changes the next question, approval-sensitive effects, or a single cheap call.
   source_fingerprint: 641676c6f1f04c10e2720378973c2ab966e8005915b517dd2a89252d3372c220
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -98,10 +98,10 @@
   title: Avoid composition for a single cheap call
   atomic_text: Composition SHOULD NOT be the default for a single cheap call.
   source_section: §16.1 Purpose
-  source_anchor: RFC.md:643
+  source_anchor: RFC.md:644
   source_quote: Composition SHOULD NOT be the default for exploratory investigation where each observation changes the next question, approval-sensitive effects, or a single cheap call.
   source_fingerprint: 641676c6f1f04c10e2720378973c2ab966e8005915b517dd2a89252d3372c220
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -145,10 +145,10 @@
   title: Aggregate composition output
   atomic_text: Composition programs SHOULD aggregate source records before returning evidence.
   source_section: §16.4 Output minimization
-  source_anchor: RFC.md:675
+  source_anchor: RFC.md:676
   source_quote: Only the final selected value and necessary diagnostics enter model context. The full execution graph and nested results remain available as artifacts and events. Programs SHOULD aggregate, assert, and return compact evidence rather than source records.
   source_fingerprint: 8a2fc0bce6e3ffc772eb7464a3ad2a23e23c8dfdbf3b26e3e174f9408fefe939
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -191,10 +191,10 @@
   title: Assert composition results
   atomic_text: Composition programs SHOULD assert expected result conditions before returning evidence.
   source_section: §16.4 Output minimization
-  source_anchor: RFC.md:675
+  source_anchor: RFC.md:676
   source_quote: Only the final selected value and necessary diagnostics enter model context. The full execution graph and nested results remain available as artifacts and events. Programs SHOULD aggregate, assert, and return compact evidence rather than source records.
   source_fingerprint: 8a2fc0bce6e3ffc772eb7464a3ad2a23e23c8dfdbf3b26e3e174f9408fefe939
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -237,10 +237,10 @@
   title: Return compact composition evidence
   atomic_text: Composition programs SHOULD return compact evidence rather than source records.
   source_section: §16.4 Output minimization
-  source_anchor: RFC.md:675
+  source_anchor: RFC.md:676
   source_quote: Only the final selected value and necessary diagnostics enter model context. The full execution graph and nested results remain available as artifacts and events. Programs SHOULD aggregate, assert, and return compact evidence rather than source records.
   source_fingerprint: 8a2fc0bce6e3ffc772eb7464a3ad2a23e23c8dfdbf3b26e3e174f9408fefe939
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -283,10 +283,10 @@
   title: Make composition errors concise
   atomic_text: Composition compiler and runtime errors MUST be concise.
   source_section: §16.5 Diagnostics as interface
-  source_anchor: RFC.md:679
+  source_anchor: RFC.md:680
   source_quote: Compiler and runtime errors MUST be concise, located, specific, and repairable. Known model confusions deserve targeted diagnostics and fix suggestions. Validated exemplar programs are compiled in CI so documentation cannot drift from the language.
   source_fingerprint: 5fd9603b9f409f66a3b6c65d51ddebd70d3ec7d00d0e82060bf2d3fbb7209d23
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -329,10 +329,10 @@
   title: Locate composition errors
   atomic_text: Composition compiler and runtime errors MUST identify their source location.
   source_section: §16.5 Diagnostics as interface
-  source_anchor: RFC.md:679
+  source_anchor: RFC.md:680
   source_quote: Compiler and runtime errors MUST be concise, located, specific, and repairable. Known model confusions deserve targeted diagnostics and fix suggestions. Validated exemplar programs are compiled in CI so documentation cannot drift from the language.
   source_fingerprint: 5fd9603b9f409f66a3b6c65d51ddebd70d3ec7d00d0e82060bf2d3fbb7209d23
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -375,10 +375,10 @@
   title: Make composition errors specific
   atomic_text: Composition compiler and runtime errors MUST identify the failed constraint or operation.
   source_section: §16.5 Diagnostics as interface
-  source_anchor: RFC.md:679
+  source_anchor: RFC.md:680
   source_quote: Compiler and runtime errors MUST be concise, located, specific, and repairable. Known model confusions deserve targeted diagnostics and fix suggestions. Validated exemplar programs are compiled in CI so documentation cannot drift from the language.
   source_fingerprint: 5fd9603b9f409f66a3b6c65d51ddebd70d3ec7d00d0e82060bf2d3fbb7209d23
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -421,10 +421,10 @@
   title: Make composition errors repairable
   atomic_text: Composition compiler and runtime errors MUST provide information that identifies a valid repair.
   source_section: §16.5 Diagnostics as interface
-  source_anchor: RFC.md:679
+  source_anchor: RFC.md:680
   source_quote: Compiler and runtime errors MUST be concise, located, specific, and repairable. Known model confusions deserve targeted diagnostics and fix suggestions. Validated exemplar programs are compiled in CI so documentation cannot drift from the language.
   source_fingerprint: 5fd9603b9f409f66a3b6c65d51ddebd70d3ec7d00d0e82060bf2d3fbb7209d23
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: proposed
   supersedes: null
   tombstone_reason: null

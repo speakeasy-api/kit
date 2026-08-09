@@ -4,10 +4,10 @@
   title: Non-idempotent mutations require an idempotency key
   atomic_text: Non-naturally-idempotent mutations must include Idempotency-Key.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1128
+  source_anchor: RFC.md:1048
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -65,10 +65,10 @@
   title: Clients ignore unknown additive fields
   atomic_text: Clients must ignore unknown additive fields.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1130
+  source_anchor: RFC.md:1050
   source_quote: Clients MUST ignore unknown additive fields and event types.
   source_fingerprint: 3106fdb870f84b84d8830c239279da84862d1f0a1be3b940a3d4e5b0a95e75c2
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -116,10 +116,10 @@
   title: Clients ignore unknown additive event types
   atomic_text: Clients must ignore unknown additive event types.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1130
+  source_anchor: RFC.md:1050
   source_quote: Clients MUST ignore unknown additive fields and event types.
   source_fingerprint: 3106fdb870f84b84d8830c239279da84862d1f0a1be3b940a3d4e5b0a95e75c2
-  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  introduced_revision: 4e3b5d755034800f6fd96ebeaf535e3eea40dc0d
   status: implemented
   supersedes: null
   tombstone_reason: null

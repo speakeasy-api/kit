@@ -14,12 +14,12 @@ shasum -a 256 RFC.md
 ## Exact output
 
 ```
-7e36e05d308653526c27b17ff736579d4fe2cd5944f5c5cad5372a0b00303ba9  RFC.md
+07ebf8f68cb84ac92f9f3d78c2290487ae6e6f5b7905aefae6c9c9e914943d87  RFC.md
 ```
 
 ## Expected digest
 
-`7e36e05d308653526c27b17ff736579d4fe2cd5944f5c5cad5372a0b00303ba9` (`IMPLEMENTATION_PLAN.md:5`)
+`07ebf8f68cb84ac92f9f3d78c2290487ae6e6f5b7905aefae6c9c9e914943d87` (`IMPLEMENTATION_PLAN.md:5`)
 
 ## Match status
 
@@ -27,4 +27,4 @@ MATCH
 
 ## Timestamp
 
-2026-08-09T08:28:23Z (UTC)
+2026-08-09T15:47:17Z (UTC)
