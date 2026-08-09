@@ -460,25 +460,8 @@ impl DaemonConfig {
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| state_root.join("unconfigured-project"));
-        let native_config = load_native_config(&project_root);
         let (native_edit_validation_time, native_approval_policy, native_lsp, native_config_error) =
-            match native_config {
-                Ok(Some((validation_time, approval_policy, lsp))) => {
-                    (validation_time, approval_policy, lsp, None)
-                }
-                Ok(None) => (
-                    crate::workspace::edit::ir::EditLimits::default().max_validation_time,
-                    crate::agent::executor::NativeApprovalPolicy::default(),
-                    None,
-                    None,
-                ),
-                Err(error) => (
-                    crate::workspace::edit::ir::EditLimits::default().max_validation_time,
-                    crate::agent::executor::NativeApprovalPolicy::default(),
-                    None,
-                    Some(error),
-                ),
-            };
+            resolve_native_config(&project_root);
         Self {
             backup_destination: default_backup_destination(&state_root),
             state_root,
@@ -508,7 +491,21 @@ impl DaemonConfig {
 
     pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.project_root = root.into();
+        self.reload_native_config();
         self
+    }
+
+    /// The trusted native config binds to the project root; every root change
+    /// must re-resolve it or a `.kit/native.json` from the construction-time
+    /// working directory (approval policy above all) leaks into whatever
+    /// project this daemon actually serves.
+    fn reload_native_config(&mut self) {
+        let (validation_time, approval_policy, lsp, error) =
+            resolve_native_config(&self.project_root);
+        self.native_edit_validation_time = validation_time;
+        self.native_approval_policy = approval_policy;
+        self.native_lsp = lsp;
+        self.native_config_error = error;
     }
 
     pub fn with_native_container_image(mut self, image: impl Into<String>) -> Self {
@@ -532,10 +529,38 @@ impl DaemonConfig {
         scenario: FakeScenario,
     ) -> Self {
         self.project_root = self.state_root.join("native-project");
+        self.reload_native_config();
         self.model_adapter = Some(DaemonModelAdapterConfig::development(
             provider, response, scenario,
         ));
         self
+    }
+}
+
+fn resolve_native_config(
+    project_root: &Path,
+) -> (
+    Duration,
+    crate::agent::executor::NativeApprovalPolicy,
+    Option<crate::verify::lsp::launcher::NativeLspServerConfig>,
+    Option<String>,
+) {
+    match load_native_config(project_root) {
+        Ok(Some((validation_time, approval_policy, lsp))) => {
+            (validation_time, approval_policy, lsp, None)
+        }
+        Ok(None) => (
+            crate::workspace::edit::ir::EditLimits::default().max_validation_time,
+            crate::agent::executor::NativeApprovalPolicy::default(),
+            None,
+            None,
+        ),
+        Err(error) => (
+            crate::workspace::edit::ir::EditLimits::default().max_validation_time,
+            crate::agent::executor::NativeApprovalPolicy::default(),
+            None,
+            Some(error),
+        ),
     }
 }
 
