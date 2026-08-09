@@ -55,7 +55,7 @@ Kit MUST:
 - make stable prompt prefixes and dynamic context intentional and observable;
 - discover relevant code with lexical, syntactic, semantic, graph, and historical evidence under explicit token budgets;
 - expose concise, model-legible tools that can batch work and return bounded output;
-- apply edits transactionally against a known workspace revision and optionally verify them in the same call;
+- apply edits transactionally with exact content anchors and optionally collect staged diagnostics in the same call;
 - discover large and changing tool catalogs without loading every schema into context;
 - compose tools, including MCP tools, while retaining normal permission, tracing, cancellation, and resource controls;
 - support ACP subagents and clients, A2A peer collaboration, and MCP capabilities without conflating their roles;
@@ -205,7 +205,7 @@ Kit SHOULD initially ship as one binary with modular internal boundaries. It MAY
 - `agent`: agentkit assembly, prompt compiler, model router, transcript projection.
 - `capabilities`: native tools, MCP broker, discovery, permissions, composition.
 - `workspace`: snapshots, filesystem index, code intelligence, edits, diffs.
-- `verify`: diagnostics, affected-test selection, builds, tests, evidence.
+- `verify`: syntax validation, staged shadow-LSP diagnostics, evidence.
 - `protocols`: ACP client/server, A2A gateway, MCP client/server adapters.
 - `executor`: local, restricted container, and isolated VM backends.
 - `telemetry`: events, traces, metrics, usage, cost, experiment attribution.
@@ -551,9 +551,8 @@ The default eagerly loaded set SHOULD be approximately:
 discover      ranked tree, symbols, and relationship expansion
 search        batched lexical, structural, symbol, and semantic search
 read          bounded files, ranges, symbols, artifacts, and diffs
-edit          transactional multi-file patch with optional verification
+edit          transactional multi-file hunk patch with syntax validation
 run           sandboxed process with timeout/background policy
-check         diagnostics, build, tests, lint, and affected checks
 tools         deferred capability search, inspection, binding, and invocation
 compose       bounded programmatic capability composition
 agent         spawn/inspect/message/cancel ACP subagents or A2A tasks
@@ -569,8 +568,8 @@ Kit preserves each capability’s source JSON Schema and declared dialect. Nativ
 The model-facing projection MAY use compact type notation:
 
 ```text
-edit(patch: Patch, verify?: none|syntax|fast|targeted|full = fast)
-  -> {revision, diff, checks[], diagnostics_delta, artifacts[]}
+edit(hunks: Hunk[])
+  -> {revision, diff, diagnostics?, diagnostics_unavailable?, artifacts[]}
 
 search(queries: {text: string, mode?: lexical|structural|symbol|semantic}[],
        paths?: string[], limit?: int = 50)
@@ -608,6 +607,8 @@ search summaries -> inspect exact definition -> bind schema digest -> invoke
 ```
 
 Authorization filtering occurs before search so a principal cannot discover forbidden capabilities. A catalog change updates the index but MUST NOT silently replace a schema already bound to an active run.
+
+A built-in extension contract registered again by the trusted daemon bootstrap with changed schema or implementation digests supersedes the stored entry in place as an ordinary new snapshot revision, and each supersede appends a durable `capability.extension.upgraded` audit record carrying the old and new digests. Contract conflicts remain fatal for external or untrusted registrations, for entries whose kind or trust classification changed, and for version downgrades of the same reference. A superseded contract revokes its old lifecycle so stale guards cancel, and a parked run whose tool bindings were minted from a superseded contract fails that invocation at resume with a typed `descriptor_superseded` error so the model re-plans against the refreshed catalog.
 
 `tools.bind` returns an immutable binding ID for `(source, capability, schema_digest, authorization_snapshot)`. If the provider supports dynamic deferred registration, Kit exposes that bound definition on the next model request. Otherwise the model calls `tools.invoke(binding_id, input)`, whose generic schema is eager and whose input is validated against the pinned bound schema before broker dispatch. Bindings expire on grant, catalog, or run-policy changes; schema changes require a new binding. This makes invocation and prompt-cache consequences explicit across providers.
 
@@ -708,13 +709,13 @@ MoveFile
 ReplaceRange
 ```
 
-Each request includes a workspace revision, base content hashes, and exact textual or semantic anchors. Durable edit addresses are not AST node identities because tree shape changes across edits and parser versions.
+Each mutating operation carries exact textual context anchors; the current file content, not a revision epoch or a per-operation content digest, is the concurrency token. Durable edit addresses are not AST node identities because tree shape changes across edits and parser versions.
 
 ### 18.2 Model-facing formats
 
 Kit supports:
 
-- simplified context patch as the general default,
+- context-anchored hunk patches as the general default,
 - exact search/replace for local edits,
 - whole-file output for new or very small files,
 - LSP `WorkspaceEdit` for semantic rename and code actions,
@@ -729,119 +730,38 @@ An `edit` call performs:
 
 1. acquire the managed workspace mutation lock;
 2. resolve and authorize paths from pre-opened workspace-root handles with no-follow component checks;
-3. verify workspace revision and base hashes;
-4. parse the entire request before mutation;
-5. reject absent or ambiguous anchors;
-6. stage all declared files in a complete copy-on-write execution view;
-7. apply requested operations exactly;
-8. parse changed files and detect new syntax errors;
-9. run configured formatters against staged content;
-10. reparse formatter output;
-11. collect bounded LSP diagnostic deltas through a shadow document/workspace when supported;
-12. run the requested verification profile against the staged view;
-13. write and sync a recovery manifest, complete undo images including file types/metadata, and staged artifacts before replacing any file;
-14. materialize and sync the complete declared change, excluding unrelated check outputs;
-15. append the workspace revision event and mark the manifest committed;
-16. update indexes/LSP buffers and return the actual diff, checks, diagnostics, and artifacts.
+3. parse the entire request before mutation;
+4. resolve each hunk against current file content and reject absent or ambiguous anchors;
+5. stage all declared files in a complete copy-on-write execution view;
+6. apply requested operations exactly;
+7. parse changed files and detect new syntax errors;
+8. collect bounded staged-view LSP diagnostics through a shadow session when trusted configuration provides one;
+9. write and sync a recovery manifest, complete undo images including file types/metadata, and staged artifacts before replacing any file;
+10. materialize and sync the complete declared change;
+11. append the workspace revision event and mark the manifest committed;
+12. update indexes/LSP buffers and return the actual diff, diagnostics, and artifacts.
 
-Kit MUST reject low-confidence fuzzy application rather than silently editing the wrong duplicate. An enclosing symbol can disambiguate an otherwise exact repeated anchor.
+Kit MUST reject low-confidence fuzzy application rather than silently editing the wrong duplicate. Hunk matching is exact on line content after newline normalization: a hunk whose context matches nowhere fails with the typed `edit_anchor_not_found` error so the model re-reads the file, and a hunk whose context matches more than once fails with the typed `edit_anchor_ambiguous` error so the model supplies more surrounding context.
 
-For staged diagnostics, Kit sends versioned staged buffers to an isolated LSP session or shadow workspace using `didOpen`/`didChange`, collects responses tied to those document versions, then closes or discards the shadow state. It MUST NOT expose staged buffers to the live workspace LSP. If a language server cannot diagnose shadow content safely, pre-commit LSP diagnostics are unavailable for that adapter; compiler checks run in the copy-on-write execution view and live diagnostics are collected only after commit.
+For staged diagnostics, Kit sends versioned staged buffers to an isolated LSP session or shadow workspace using `didOpen`/`didChange`, collects responses tied to those document versions, then closes or discards the shadow state. It MUST NOT expose staged buffers to the live workspace LSP. The pass runs only when the trusted configuration provides a language server matching a changed file, its output is bounded by the configured diagnostic and wall-time limits, and a language server that is missing, crashing, or out of time never blocks the edit: the result then carries `diagnostics_unavailable` with the recorded reason instead of diagnostics.
 
 Multi-file host filesystem writes and database events cannot share one physical transaction. The idempotent manifest states are `staged -> prepared -> materialized -> committed` or `rolled_back`. Any failure before the revision event restores and syncs the complete undo image; after the event, recovery rolls materialization forward. Recovery runs under the mutation lock before an in-process error returns and again at startup before the workspace is exposed. Kit calls the operation transactional only when staging, locking, journaling, and recovery prevent an agent from observing or continuing from a partial logical revision.
 
-### 18.4 Auto-verification flag
+### 18.4 Edit-time validation
 
-The edit tool’s extra `verify` flag removes a model round-trip when the next action is predictable:
-
-```text
-none      apply only
-syntax    parse and format
-fast      syntax, format, bounded diagnostics
-targeted  fast plus affected typecheck/tests
-full      configured full verification policy
-```
-
-`fast` is the default. Path, revision, anchor, syntax, formatter, sandbox, and materialization failures are hard gates and never commit. `targeted` and `full` test/typecheck failures use `on_check_failure: commit|abort`; the default is `commit` so the verified failing edit becomes the next repair revision. With `abort`, checks still run against the staged view but no source edit is materialized. Cancellation before prepare aborts; cancellation after prepare completes recovery before another writer proceeds. The result contains only diagnostic deltas and concise failures, with complete logs in artifacts.
-
-Example:
-
-```json
-{
-  "status": "applied_with_failed_checks",
-  "revision": 185,
-  "diff": "artifact:blake3:...",
-  "verification": {
-    "profile": "targeted",
-    "status": "failed",
-    "checks": [
-      {"name": "rustfmt", "status": "passed", "ms": 41},
-      {"name": "auth::refresh_rotation", "status": "failed", "ms": 813,
-       "summary": "expected old token rejection, got success"}
-    ],
-    "new_diagnostics": [],
-    "resolved_diagnostics": ["src/auth/token.rs:42 E0308"]
-  }
-}
-```
+An earlier draft attached a `verify` profile ladder (`none|syntax|fast|targeted|full`) with an `on_check_failure` policy to the edit call; that ladder is removed. Syntax validation always runs against the staged view, and path, anchor, syntax, and materialization failures are hard gates that never commit. Cancellation before prepare aborts; cancellation after prepare completes recovery before another writer proceeds. Optional staged LSP diagnostics are enabled only through the trusted native configuration: `.kit/native.json` carries a `version`, an `edit_validation_wall_time_millis` bound, an `approval_policy` of `required` or `auto` where `auto` lets policy-approved bindings proceed without a human approval round-trip, and an optional `lsp` object with `command`, `arguments`, `languages`, `wall_time_millis`, and `max_diagnostics`. Edits work with no trusted configuration present.
 
 ### 18.5 Concurrent changes
 
-Transactional guarantees apply to daemon-exclusive managed workspaces. External modifications advance or invalidate the workspace revision. Attached user checkouts are explicitly cooperative: Kit takes an advisory external-writer lock where supported and rechecks every base hash immediately before materialization, but cannot promise atomicity against an uncooperative editor. A stale edit returns a compact conflict containing changed paths and relevant hunks. Kit never overwrites concurrent user work through a whole-file rewrite without matching its base hash.
+Transactional guarantees apply to daemon-exclusive managed workspaces. External modifications advance or invalidate the workspace revision. Attached user checkouts are explicitly cooperative: Kit takes an advisory external-writer lock where supported and resolves every hunk anchor against current file content under the mutation lock, but cannot promise atomicity against an uncooperative editor. An edit built on an outdated view of a file cannot anchor and fails with a typed anchor error naming the affected paths. Kit never overwrites concurrent user work whose current content no longer matches the anchored context.
 
 Ordinary `run`, build, formatter, test, LSP, and MCP processes see source read-only and write only to designated build/temp paths. An explicitly source-writable process must acquire the same mutation lock, receives a dedicated overlay, and on exit either promotes a declared diff as one revision or discards it. Kit confirms the old sandbox is quiescent before reassigning a workspace; a lease token alone cannot fence an escaped OS process.
 
 ## 19. Verification
 
-### 19.1 Verification ladder
+An earlier draft specified a container-check verification ladder with affected-check selection, a structured feedback pipeline, and loop-control policy; that machinery is removed. Kit's built-in verification is deliberately small: the edit transaction parses changed files and rejects new syntax errors, and, when the trusted configuration provides a language server, it returns bounded staged-view LSP diagnostics for changed files. Both signals come from the staged view before materialization and neither requires a container toolchain.
 
-Kit uses the cheapest high-signal checks first:
-
-```text
-patch validity
--> syntax and formatter
--> changed-file diagnostics
--> typecheck or build slice
--> reproducing/targeted tests
--> nearby regression tests
--> affected package/service checks
--> full suite, security, performance, or integration checks
-```
-
-The defect SHOULD be reproduced before editing when feasible. Existing red builds and diagnostics are baselined; decisions use deltas rather than assuming the repository starts clean.
-
-### 19.2 Affected-check selection
-
-Test selection combines:
-
-- explicit user commands and repository policy,
-- changed paths and package ownership,
-- symbol-to-test graph edges,
-- build-system dependency graphs,
-- historical co-change and failure data,
-- coverage when available,
-- model proposals under deterministic validation.
-
-Critical checks are never omitted solely because a learned selector predicts low risk.
-
-### 19.3 Feedback shape
-
-Failures returned to the model contain:
-
-- command/check identity and exit status,
-- failing test or diagnostic identifiers,
-- the first relevant stack frame and source location,
-- expected versus actual values,
-- change from the previous run,
-- artifact handle for complete logs.
-
-Repeated full logs MUST NOT accumulate in context.
-
-### 19.4 Loop control
-
-Each run has budgets for model turns, reasoning, spend, wall time, test time, patch size, repeated failures, and destructive effects. After two materially identical failures, policy SHOULD trigger re-localization, model escalation, a fresh-context reviewer, or user input rather than another equivalent edit.
-
-Independent review can find omissions, but findings are not authoritative until executable checks or maintainers validate them.
+Verification beyond that gate belongs to the model, not to a built-in check ladder: the model runs the project's own build, test, lint, and typecheck commands through `run` and reads their bounded output as ordinary tool results. Kit does not select affected checks, maintain check profiles, or synthesize diagnostic deltas on the model's behalf. Failures stay compact because process output is bounded and complete logs remain addressable as artifacts.
 
 ## 20. Model and Strategy Routing
 
@@ -1175,7 +1095,6 @@ api.command
       nested.tool.call
       process.exec
     child.run
-    verification.check
     compaction.checkpoint
 ```
 
@@ -1185,7 +1104,7 @@ The built-in read-only web application provides simple observability, not a full
 - live event timeline,
 - model/tool/process spans,
 - token, cache, cost, and latency breakdowns,
-- workspace diff and verification evidence,
+- workspace diff evidence,
 - subagent/A2A tree,
 - pending approvals and auth,
 - active processes and terminals,
@@ -1238,7 +1157,7 @@ Kit pursues the following adjacent optimizations as independently measurable pol
 - phase- and risk-aware model routing;
 - confidence-calibrated abstention and escalation;
 - expected-value-of-information ranking for reads and tests;
-- learned affected-test selection with deterministic safety floors;
+- learned selection of project checks run through `run`, with deterministic safety floors;
 - diverse hypothesis fan-out only for high uncertainty;
 - fresh-context review only where its defect yield justifies cost.
 
@@ -1318,7 +1237,7 @@ Kit runs ablations for:
 - full JSON Schema versus compact projections;
 - JSON versus TOON by payload shape;
 - direct, parallel, Lua, and Runlet tool use;
-- each edit format and verification flag;
+- each edit format;
 - fixed versus routed model/reasoning effort;
 - cold versus warm prompt and infrastructure caches;
 - structural versus semantic/model-selected compaction;
@@ -1422,8 +1341,6 @@ Similar JSON-RPC envelopes do not imply equivalent lifecycle, cancellation, stre
 | Unfamiliar DSL increases reasoning cost | Lua default where cheaper, model/backend routing, measure hidden output |
 | Nested tools bypass permissions | one broker for direct and nested calls, bounded grants, full traces |
 | Transaction partially materializes | staged overlay, journal, revision fencing, recovery |
-| Formatter changes unrelated code | separate formatter diff, changed-range mode where supported |
-| Existing red repository causes loops | baseline and compare diagnostic/check deltas |
 | Parallel agents conflict | isolated snapshots and explicit merge artifacts |
 | Speculation lowers latency but explodes cost | learned value threshold, quotas, record canceled spend |
 | Model router misses hard-looking-simple tasks | verification-triggered escalation and risk floors |
@@ -1445,8 +1362,8 @@ Implementation may proceed in dependency-ordered slices while preserving this RF
 | `KIT-MILESTONE-001` | domain IDs/events, embedded store, daemon lifecycle, HTTP/SSE, CLI | restart/replay, idempotency, cursor ordering, backup/restore, auth, and CLI/API parity conformance pass |
 | `KIT-MILESTONE-002` | agentkit loop/provider integration, prompt compiler, usage accounting | one prompt streams to completion through a durable run; intent/outcome ordering, cancellation, prompt digest, and core cost envelope pass |
 | `KIT-MILESTONE-003` | sandboxed workspace/process ownership and cancellation | restricted process cannot escape filesystem/network/resource policy; whole-tree cancellation and outcome-unknown recovery pass |
-| `KIT-MILESTONE-004` | lexical discovery, targeted reads, revisioned transactional edits, fast verification | Kit can inspect and safely modify its own repository through CLI/API; conflict, rollback, syntax, formatter, diagnostic, and diff evidence suites pass |
-| `KIT-MILESTONE-005` | Tree-sitter, repository maps, LSP, optional graph/SCIP/semantic adapters, affected checks | core syntax/LSP localization beats lexical baseline within budget; each optional adapter ships only with incremental value and freshness evidence |
+| `KIT-MILESTONE-004` | lexical discovery, targeted reads, transactional hunk edits, syntax and diagnostic gates | Kit can inspect and safely modify its own repository through CLI/API; anchor-conflict, rollback, syntax, diagnostic, and diff evidence suites pass |
+| `KIT-MILESTONE-005` | Tree-sitter, repository maps, LSP, optional graph/SCIP/semantic adapters | core syntax/LSP localization beats lexical baseline within budget; each optional adapter ships only with incremental value and freshness evidence |
 | `KIT-MILESTONE-006` | capability catalog, MCP broker, dynamic discovery, compact projections | search/inspect/bind/invoke, schema-digest pinning, list-change refresh, auth, and provider projection conformance pass |
 | `KIT-MILESTONE-007` | compose Lua/Runlet, adaptive TOON, nested policy and tracing | direct/compose routing, nested authorization, cancellation, effect recording, and encoding ablations meet correctness gates |
 | `KIT-MILESTONE-008` | model routing, batching, parallelism, background tasks, speculation | budgeted policies beat fixed serial baseline on a preregistered frontier without safety or tail-latency regression |
@@ -1455,7 +1372,7 @@ Implementation may proceed in dependency-ordered slices while preserving this RF
 | `KIT-MILESTONE-011` | full benchmark, experiment, shadow, and canary infrastructure | reproducible harness, hidden/private corpus, statistical report, replay limits, and rollout guardrails pass |
 | `KIT-MILESTONE-012` | clustered storage/executors and hostile multi-tenant isolation | lease/fencing failover, tenant isolation, disaster recovery, quota/fairness, and adversarial sandbox suites pass |
 
-The product becomes **dogfoodable after `KIT-MILESTONE-004`**: a developer can use the daemon and CLI to run one agent against Kit itself, discover code lexically, apply conflict-safe edits, receive fast verification, inspect events/cost/diffs, cancel work, and recover after restart. Later slices improve intelligence, interoperability, optimization, and deployment strength without redefining that core loop.
+The product becomes **dogfoodable after `KIT-MILESTONE-004`**: a developer can use the daemon and CLI to run one agent against Kit itself, discover code lexically, apply conflict-safe edits gated on syntax and staged diagnostics, inspect events/cost/diffs, cancel work, and recover after restart. Later slices improve intelligence, interoperability, optimization, and deployment strength without redefining that core loop.
 
 This is an implementation ordering, not a reduction in product ambition. A slice is complete only when its registered `KIT-*` requirements have evidence; code presence or a demo is insufficient.
 
@@ -1493,7 +1410,7 @@ This RFC makes the following foundational decisions:
 4. Source JSON Schema and dialect remain canonical per capability; compact notation is a one-way model projection.
 5. Each protocol retains its native wire representation; TOON is adaptive model-context presentation only.
 6. Repository discovery is hybrid and progressive, with syntax and semantic provenance preserved.
-7. Editing is revisioned, staged, conflict-aware, and optionally verified in one call.
+7. Editing is hunk-anchored, staged, conflict-aware, and syntax-gated in one call.
 8. Dynamic tools use search, inspect, bind, and invoke rather than eager catalog stuffing.
 9. Composition is task- and model-routed, not universally preferred.
 10. ACP handles coding clients and subagents, A2A handles autonomous peers, and MCP handles capabilities.
