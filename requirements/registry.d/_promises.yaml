@@ -104,13 +104,13 @@
   title: Optional self-hosted inference profile
   atomic_text: The self-hosted inference profile is selected only when Kit operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1243-1245
+  source_anchor: RFC.md:1245-1247
   source_quote: '### 29.5 Self-hosted inference
 
 
     When Kit operates self-hosted models, it SHOULD evaluate:'
   source_fingerprint: 91dc7f8208543285935fc8770edf4992597df3063f90426950d70ce543251cee
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21146,18 +21146,18 @@
   record_class: promise
   modality: declarative
   title: Writing run workspace isolation
-  atomic_text: Each writing run and parallel subagent receives an isolated worktree, clone, or copy-on-write snapshot.
+  atomic_text: Each writing run and parallel subagent receives an isolated snapshot of the source.
   source_section: §25.3 Workspaces
   source_anchor: RFC.md:1053
-  source_quote: Each writing run receives a Git worktree, clone, or copy-on-write snapshot. Parallel subagents receive separate snapshots. Restricted or hostile execution uses per-run clones/COW repositories or mediated Git operations; it never mounts a shared writable Git common directory into the sandbox.
-  source_fingerprint: ef416ba77c6a9d6f82a9d2fff644a9d3d760797b28a48b8527c949e855edddca
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_quote: 'Each writing run receives an isolated snapshot of the source. Version control is not a runtime correctness dependency: a source without Git metadata, or a repository without any commit, acquires as an untracked snapshot whose workspace revision derives from a Kit-owned content hash. When Git history is present, trusted acquisition MAY use a Git worktree, clone, or copy-on-write snapshot as a materialization optimization. Parallel subagents receive separate snapshots. Restricted or hostile execution uses per-run physical or COW snapshots; it never mounts a shared writable Git common directory into the sandbox.'
+  source_fingerprint: 347b70fbd7c9795a9fdf9fa98f9bd12994ad354556240e199680c03a722e64c9
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-EXEC
   applicability: mandatory
-  interpretation: Each writing run and parallel subagent receives an isolated worktree, clone, or copy-on-write snapshot.
+  interpretation: Each writing run and parallel subagent receives an isolated snapshot of the source.
   acceptance_criteria:
   - cargo test --locked --test conformance workspace_acquire exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
   primary_milestone: M003
@@ -21195,9 +21195,9 @@
   atomic_text: Restricted and hostile sandboxes do not mount a shared writable Git common directory.
   source_section: §25.3 Workspaces
   source_anchor: RFC.md:1053
-  source_quote: Each writing run receives a Git worktree, clone, or copy-on-write snapshot. Parallel subagents receive separate snapshots. Restricted or hostile execution uses per-run clones/COW repositories or mediated Git operations; it never mounts a shared writable Git common directory into the sandbox.
-  source_fingerprint: ef416ba77c6a9d6f82a9d2fff644a9d3d760797b28a48b8527c949e855edddca
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_quote: 'Each writing run receives an isolated snapshot of the source. Version control is not a runtime correctness dependency: a source without Git metadata, or a repository without any commit, acquires as an untracked snapshot whose workspace revision derives from a Kit-owned content hash. When Git history is present, trusted acquisition MAY use a Git worktree, clone, or copy-on-write snapshot as a materialization optimization. Parallel subagents receive separate snapshots. Restricted or hostile execution uses per-run physical or COW snapshots; it never mounts a shared writable Git common directory into the sandbox.'
+  source_fingerprint: 347b70fbd7c9795a9fdf9fa98f9bd12994ad354556240e199680c03a722e64c9
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21238,18 +21238,18 @@
   record_class: promise
   modality: declarative
   title: Workspace provenance
-  atomic_text: Kit records base commit, initial dirty hash, workspace revision, final diff, and resulting revision.
+  atomic_text: Kit records the base commit or an explicit untracked marker, initial dirty hash, workspace revision, final diff, and resulting revision.
   source_section: §25.3 Workspaces
-  source_anchor: RFC.md:1055
-  source_quote: Kit records base commit, initial dirty-state hash, workspace revision, final diff, and resulting revision. It preserves unrelated user changes and never invokes destructive Git operations without explicit authority.
-  source_fingerprint: 959874f2ad78b1b582b5456f0df87d1a07d8579c53245e42aeee7a73e9bd24c3
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_anchor: RFC.md:1057
+  source_quote: Kit records the base commit where one exists and an explicit untracked marker otherwise, plus initial dirty-state hash, workspace revision, final diff, and resulting revision. It preserves unrelated user changes and never invokes destructive Git operations without explicit authority.
+  source_fingerprint: 008a4df3a3379bb3fb74a66153d2103ce2fb15f9a5d688f32c2b69c36dce273b
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
   area: KIT-EXEC
   applicability: mandatory
-  interpretation: Kit records base commit, initial dirty hash, workspace revision, final diff, and resulting revision.
+  interpretation: Kit records the base commit or an explicit untracked marker, initial dirty hash, workspace revision, final diff, and resulting revision.
   acceptance_criteria:
   - cargo test --locked --test conformance workspace_acquire exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
   primary_milestone: M003
@@ -21286,10 +21286,10 @@
   title: Preserve unrelated changes
   atomic_text: Kit preserves unrelated changes and requires explicit authority for destructive Git operations.
   source_section: §25.3 Workspaces
-  source_anchor: RFC.md:1055
-  source_quote: Kit records base commit, initial dirty-state hash, workspace revision, final diff, and resulting revision. It preserves unrelated user changes and never invokes destructive Git operations without explicit authority.
-  source_fingerprint: 959874f2ad78b1b582b5456f0df87d1a07d8579c53245e42aeee7a73e9bd24c3
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  source_anchor: RFC.md:1057
+  source_quote: Kit records the base commit where one exists and an explicit untracked marker otherwise, plus initial dirty-state hash, workspace revision, final diff, and resulting revision. It preserves unrelated user changes and never invokes destructive Git operations without explicit authority.
+  source_fingerprint: 008a4df3a3379bb3fb74a66153d2103ce2fb15f9a5d688f32c2b69c36dce273b
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21326,16 +21326,62 @@
   revalidation_rule: Re-run when the implementation of KIT-EXEC-816 or its source contract changes.
   decision_record: null
   deviation_record: null
+- id: KIT-EXEC-822
+  record_class: promise
+  modality: declarative
+  title: Best-effort workspace acquisition
+  atomic_text: Snapshot acquisition failure does not abort the run; snapshot-dependent capabilities fail closed at invocation with the recorded reason.
+  source_section: §25.3 Workspaces
+  source_anchor: RFC.md:1055
+  source_quote: 'Snapshot acquisition at run start is best-effort. An acquisition failure does not abort the run: snapshot-dependent capabilities fail closed at invocation with the recorded reason so the model can pivot, and Git-specific capabilities fail the same way when Git state or the Git binary is absent.'
+  source_fingerprint: 54dc3d5ec4f53007f0d0778aa3ab3060baf1c2e37669ccdc2932b96bf35e4a91
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
+  status: active
+  supersedes: null
+  tombstone_reason: null
+  area: KIT-EXEC
+  applicability: mandatory
+  interpretation: Snapshot acquisition failure does not abort the run; snapshot-dependent capabilities fail closed at invocation with the recorded reason.
+  acceptance_criteria:
+  - cargo test --locked --test conformance workspace_acquire exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  primary_milestone: M003
+  contributing_milestones: []
+  dependencies: []
+  owner: Executor owner
+  criticality: high
+  platforms:
+  - all
+  deployment_tiers:
+  - local
+  - restricted
+  - clustered
+  - hostile
+  release_gates:
+  - G03
+  implementation_links: []
+  public_contract_links: []
+  telemetry_links: []
+  evidence_type: conformance
+  evidence_id: EV-1.04-C-1348
+  evidence_job: integration
+  expected_result: cargo test --locked --test conformance workspace_acquire exits 0 with at least 1 relevant test per cargo invocation; this local-only result is not trusted release evidence
+  artifact_digest: null
+  environment_digest: null
+  versions: null
+  latest_result: pending
+  revalidation_rule: Re-run when the implementation of KIT-EXEC-822 or its source contract changes.
+  decision_record: null
+  deviation_record: null
 - id: KIT-EXEC-817
   record_class: promise
   modality: declarative
   title: Hooks and submodules sandboxed
   atomic_text: Hooks and submodules are disabled or sandboxed by default.
   source_section: §25.3 Workspaces
-  source_anchor: RFC.md:1057
+  source_anchor: RFC.md:1059
   source_quote: Hooks and submodules are treated as executable code and disabled or sandboxed by default.
   source_fingerprint: 1c7a8135f03e3c026bcdf6a4f8a1675485cebeb6b4b563a04172520a7b773722
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21378,10 +21424,10 @@
   title: Pipes default transport
   atomic_text: Process pipes are the default and PTYs are allocated only for terminal semantics.
   source_section: §25.4 Terminals
-  source_anchor: RFC.md:1061
+  source_anchor: RFC.md:1063
   source_quote: Pipes are the default. PTYs are allocated only for terminal semantics. A terminal has one input-writer lease, multiple read-only viewers, sequenced output chunks, resize events, retention policy, and an owning process.
   source_fingerprint: 5dc4872bfe61c24f1f7c45c582b2eb8954c4368cc934f0d413069d66e604c5d1
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21424,10 +21470,10 @@
   title: Terminal lease and stream model
   atomic_text: A terminal has one input writer, multiple read-only viewers, sequenced output, resize events, retention, and an owning process.
   source_section: §25.4 Terminals
-  source_anchor: RFC.md:1061
+  source_anchor: RFC.md:1063
   source_quote: Pipes are the default. PTYs are allocated only for terminal semantics. A terminal has one input-writer lease, multiple read-only viewers, sequenced output chunks, resize events, retention policy, and an owning process.
   source_fingerprint: 5dc4872bfe61c24f1f7c45c582b2eb8954c4368cc934f0d413069d66e604c5d1
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21470,10 +21516,10 @@
   title: Raw terminal input not retained
   atomic_text: Raw terminal input is not persisted by default.
   source_section: §25.4 Terminals
-  source_anchor: RFC.md:1063
+  source_anchor: RFC.md:1065
   source_quote: Raw terminal input is not persisted by default because it frequently contains secrets. If the daemon owning a local PTY dies, the attempt is interrupted; Kit does not claim resumability it cannot provide.
   source_fingerprint: 8ae99acf0912cc1aca90074afbb1f30f8db1bb83c11c5ddffea4023e633af1ae
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21516,10 +21562,10 @@
   title: PTY daemon loss interrupts
   atomic_text: Loss of the daemon owning a local PTY interrupts the attempt rather than claiming resumability.
   source_section: §25.4 Terminals
-  source_anchor: RFC.md:1063
+  source_anchor: RFC.md:1065
   source_quote: Raw terminal input is not persisted by default because it frequently contains secrets. If the daemon owning a local PTY dies, the attempt is interrupted; Kit does not claim resumability it cannot provide.
   source_fingerprint: 8ae99acf0912cc1aca90074afbb1f30f8db1bb83c11c5ddffea4023e633af1ae
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -21562,10 +21608,10 @@
   title: Cancellation intent first
   atomic_text: Cancellation first appends durable cancellation intent.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1069
+  source_anchor: RFC.md:1071
   source_quote: 1. append cancellation intent;
   source_fingerprint: 090b43206e66655817a6ca5360ffcbdf93de976fc082b6a0c2bcf5abb38b9102
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21608,10 +21654,10 @@
   title: Cancel controller token
   atomic_text: Cancellation cancels the agentkit or controller token.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1070
+  source_anchor: RFC.md:1072
   source_quote: 2. cancel the agentkit/controller token;
   source_fingerprint: 706cc75dc607859d563b11a2a22546620476b3f5d42b40c0be787ff53eea89c0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21654,10 +21700,10 @@
   title: Stop new work on cancellation
   atomic_text: Cancellation stops issuing new model and tool work.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1071
+  source_anchor: RFC.md:1073
   source_quote: 3. stop issuing new model and tool work;
   source_fingerprint: 397b5199b18087086e21a2bcd1209f9a44501bbcdc2ce9850bcade44c3ebfdec
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21700,10 +21746,10 @@
   title: Interrupt interactive processes
   atomic_text: Cancellation interrupts interactive processes.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1072
+  source_anchor: RFC.md:1074
   source_quote: 4. interrupt interactive processes;
   source_fingerprint: 5609e7f62282fbc8e738b1d19ef18592346321ad39b6e28d4a0717be9fb499b0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21746,10 +21792,10 @@
   title: Graceful termination period
   atomic_text: Cancellation allows a grace period before forced termination.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1073
+  source_anchor: RFC.md:1075
   source_quote: 5. terminate after a grace period;
   source_fingerprint: 04e1a044595c7f85bf8e9055bcdaf2ff87b7f91d838e0a03b7243e3ac040e9cc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21792,10 +21838,10 @@
   title: Kill complete process tree
   atomic_text: Cancellation kills the complete sandbox and process tree.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1074
+  source_anchor: RFC.md:1076
   source_quote: 6. kill the complete sandbox/process tree;
   source_fingerprint: 4e48712cc6ddb93f1ae534a2814f34b5756c0f1ec11f1b114f70575b28cb8111
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21838,10 +21884,10 @@
   title: Reap and record cancellation
   atomic_text: Cancellation reaps resources and records outcomes.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1075
+  source_anchor: RFC.md:1077
   source_quote: 7. reap resources and record outcomes;
   source_fingerprint: 2bed27d0ab562733b77c0a5b368862310ac57588e27919790fb1d856c9e880b4
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21884,10 +21930,10 @@
   title: Cancelled requires quiescence
   atomic_text: A run enters cancelled only after local effects are quiescent and remote cancellation is acknowledged.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1076
+  source_anchor: RFC.md:1078
   source_quote: 8. enter `cancelled` only when all locally owned effects are confirmed quiescent and remote cancellation is acknowledged.
   source_fingerprint: dcfb7ccb3ea18ba87b56acd984d3c33bce642f26c73e6de03b33d78e79d1871d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21930,10 +21976,10 @@
   title: Attempts hold leases and fencing
   atomic_text: Each active attempt holds a renewable lease and fencing token carried by effects and completion events.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1078
+  source_anchor: RFC.md:1080
   source_quote: Each active attempt holds a renewable lease and fencing token. Effects and completion events carry that token. A workspace or run is not reassigned until the executor confirms the old sandbox is quiescent; unconfirmable local or remote effects end as `interrupted` or `failed` with `outcome_unknown`, never `cancelled`. An outcome-unknown interruption blocks automatic resume until reconciliation or an explicit policy decision. On ambiguous crash recovery, Kit inspects the executor where possible and does not blindly repeat non-idempotent work.
   source_fingerprint: 2e51a8072d14acacecb2d080580c028ec2bdf97533a3ca2b92679af1295afb55
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -21976,10 +22022,10 @@
   title: No reassignment before quiescence
   atomic_text: A workspace or run is not reassigned until the old sandbox is confirmed quiescent.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1078
+  source_anchor: RFC.md:1080
   source_quote: Each active attempt holds a renewable lease and fencing token. Effects and completion events carry that token. A workspace or run is not reassigned until the executor confirms the old sandbox is quiescent; unconfirmable local or remote effects end as `interrupted` or `failed` with `outcome_unknown`, never `cancelled`. An outcome-unknown interruption blocks automatic resume until reconciliation or an explicit policy decision. On ambiguous crash recovery, Kit inspects the executor where possible and does not blindly repeat non-idempotent work.
   source_fingerprint: 2e51a8072d14acacecb2d080580c028ec2bdf97533a3ca2b92679af1295afb55
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -22022,10 +22068,10 @@
   title: Unknown outcome blocks resume
   atomic_text: An outcome_unknown interruption blocks automatic resume pending reconciliation or explicit policy.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1078
+  source_anchor: RFC.md:1080
   source_quote: Each active attempt holds a renewable lease and fencing token. Effects and completion events carry that token. A workspace or run is not reassigned until the executor confirms the old sandbox is quiescent; unconfirmable local or remote effects end as `interrupted` or `failed` with `outcome_unknown`, never `cancelled`. An outcome-unknown interruption blocks automatic resume until reconciliation or an explicit policy decision. On ambiguous crash recovery, Kit inspects the executor where possible and does not blindly repeat non-idempotent work.
   source_fingerprint: 2e51a8072d14acacecb2d080580c028ec2bdf97533a3ca2b92679af1295afb55
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -22068,10 +22114,10 @@
   title: Crash recovery avoids blind repeats
   atomic_text: Crash recovery inspects the executor where possible and does not blindly repeat non-idempotent work.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1078
+  source_anchor: RFC.md:1080
   source_quote: Each active attempt holds a renewable lease and fencing token. Effects and completion events carry that token. A workspace or run is not reassigned until the executor confirms the old sandbox is quiescent; unconfirmable local or remote effects end as `interrupted` or `failed` with `outcome_unknown`, never `cancelled`. An outcome-unknown interruption blocks automatic resume until reconciliation or an explicit policy decision. On ambiguous crash recovery, Kit inspects the executor where possible and does not blindly repeat non-idempotent work.
   source_fingerprint: 2e51a8072d14acacecb2d080580c028ec2bdf97533a3ca2b92679af1295afb55
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -22114,10 +22160,10 @@
   title: Bounded fair scheduling
   atomic_text: Scheduling uses bounded queues, principal and global concurrency, depth limits, reserved spend, and weighted fairness.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1080
+  source_anchor: RFC.md:1082
   source_quote: Scheduling uses bounded queues, per-principal and global concurrency, subagent-depth limits, reserved spend, and weighted fairness. Interactive runs take latency priority over offline indexing and benchmarks without starving background work.
   source_fingerprint: ce02cd16fef626d869a1ccbaac23c64d6f8f050dde4e0554cc3e34b95f29eb90
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -22160,10 +22206,10 @@
   title: Interactive scheduling priority
   atomic_text: Interactive work has latency priority without starving background work.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1080
+  source_anchor: RFC.md:1082
   source_quote: Scheduling uses bounded queues, per-principal and global concurrency, subagent-depth limits, reserved spend, and weighted fairness. Interactive runs take latency priority over offline indexing and benchmarks without starving background work.
   source_fingerprint: ce02cd16fef626d869a1ccbaac23c64d6f8f050dde4e0554cc3e34b95f29eb90
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -22206,10 +22252,10 @@
   title: Versioned OpenAPI HTTP API
   atomic_text: Kit exposes an authenticated versioned HTTP JSON API described by OpenAPI.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22258,10 +22304,10 @@
   title: Principal authorization
   atomic_text: Every API resource, event, terminal, and artifact is authorized to a principal and project.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22311,10 +22357,10 @@
   title: Local socket authentication
   atomic_text: Local Unix sockets use state-root permissions and peer credentials plus a session token where needed.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22362,10 +22408,10 @@
   title: Loopback HTTP authentication
   atomic_text: Loopback HTTP uses a random bearer credential and strict Origin and Host checks.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22413,10 +22459,10 @@
   title: Remote caller authentication
   atomic_text: Remote HTTP and ACP require mTLS identity or validated OAuth or OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -22459,10 +22505,10 @@
   title: SSE event transport
   atomic_text: Server-sent events provide resumable event streams.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22510,10 +22556,10 @@
   title: WebSocket terminal transport
   atomic_text: WebSocket is reserved for bidirectional terminal attachment.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1086
+  source_anchor: RFC.md:1088
   source_quote: Kit exposes a versioned HTTP JSON API described by OpenAPI. Every transport is authenticated and every resource, event, terminal, and artifact is authorized to a principal/project. Local Unix sockets use state-root permissions and peer credentials plus a session token where needed. Loopback HTTP uses a random bearer credential and strict Origin/Host checks. Remote HTTP and ACP entry points require caller authentication through mTLS identity or validated OAuth/OIDC bearer tokens with issuer, audience, expiry, revocation, and principal mapping; server-authenticated TLS alone is insufficient. Server-sent events provide resumable event streams. WebSocket is reserved for bidirectional terminal attachment.
   source_fingerprint: bcbb6299098c0ea464aad65a4784b24f2124f8711eb6a39e06ca054d38bd937d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22561,10 +22607,10 @@
   title: Atomic message and run creation
   atomic_text: POST thread runs atomically records one input message and creates or returns its run.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1124
+  source_anchor: RFC.md:1126
   source_quote: '`POST /threads/{id}/runs` atomically records one input message and creates or returns its run. HTTP, CLI, and ACP prompts route through this one command, preventing duplicate message/run semantics.'
   source_fingerprint: 4a8351bf76fa7dc230632d4acb26c2e7cbb233f066f28438831af4723eeed4af
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22612,10 +22658,10 @@
   title: Shared prompt command
   atomic_text: HTTP, CLI, and ACP prompts route through one domain command.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1124
+  source_anchor: RFC.md:1126
   source_quote: '`POST /threads/{id}/runs` atomically records one input message and creates or returns its run. HTTP, CLI, and ACP prompts route through this one command, preventing duplicate message/run semantics.'
   source_fingerprint: 4a8351bf76fa7dc230632d4acb26c2e7cbb233f066f28438831af4723eeed4af
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22664,10 +22710,10 @@
   title: First-party idempotency retention
   atomic_text: First-party clients retain idempotency keys through the retry window.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22715,10 +22761,10 @@
   title: Idempotency key scope
   atomic_text: Idempotency keys are scoped to principal, command, and target.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22766,10 +22812,10 @@
   title: Idempotency conflict and replay
   atomic_text: Idempotency storage binds canonical request digest and response, conflicts on changed input, and replays pending or terminal outcomes.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22817,10 +22863,10 @@
   title: Idempotency retention floor
   atomic_text: Idempotency keys are retained at least as long as the maximum retry window.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22868,10 +22914,10 @@
   title: Long-running accepted response
   atomic_text: Long-running work returns 202 Accepted with an existing domain resource.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22919,10 +22965,10 @@
   title: Problem details errors
   atomic_text: HTTP errors use RFC 9457 problem details.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -22970,10 +23016,10 @@
   title: Opaque IDs and cursors
   atomic_text: API IDs and cursors are opaque and timestamps use RFC 3339 UTC.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1126
+  source_anchor: RFC.md:1128
   source_quote: Non-naturally-idempotent mutations, especially run/message creation, MUST include `Idempotency-Key`; first-party clients generate and retain it through the retry window. The key is scoped to authenticated principal, command, and target. The command transaction stores a canonical request digest and response; reuse with different input returns conflict, while pending and terminal outcomes replay. Keys have a declared retention period no shorter than the maximum retry window. Long-running work returns `202 Accepted` with an existing domain resource. Errors use RFC 9457 problem details. IDs are opaque, timestamps are RFC 3339 UTC, and pagination/events use opaque cursors.
   source_fingerprint: 90bc29041f685cd85aef2f809e7df9d8c2d73d2b2427ed183df72b5b7f8c2f40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23021,10 +23067,10 @@
   title: Independent event schema versions
   atomic_text: Event payloads carry independent schema versions.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1128
+  source_anchor: RFC.md:1130
   source_quote: Clients MUST ignore unknown additive fields and event types. Event payloads carry independent schema versions.
   source_fingerprint: 3106fdb870f84b84d8830c239279da84862d1f0a1be3b940a3d4e5b0a95e75c2
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23072,10 +23118,10 @@
   title: Archive is reversible
   atomic_text: Archive is a reversible visibility state.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1130
+  source_anchor: RFC.md:1132
   source_quote: Archive is a reversible visibility state. Delete creates an auditable asynchronous deletion job governed by project retention, legal hold, shared-artifact reachability, and backup expiry; it never silently removes still-referenced content. Retention APIs expose effective event, transcript, terminal, artifact, experiment, and backup policies plus the earliest possible physical-deletion time.
   source_fingerprint: 78c38c9c4a24bbad00418f57047d767fd2824e17111434e335c1b638af50dbcc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23126,10 +23172,10 @@
   title: Delete is audited async job
   atomic_text: Delete creates an auditable asynchronous job governed by retention, legal hold, reachability, and backup expiry.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1130
+  source_anchor: RFC.md:1132
   source_quote: Archive is a reversible visibility state. Delete creates an auditable asynchronous deletion job governed by project retention, legal hold, shared-artifact reachability, and backup expiry; it never silently removes still-referenced content. Retention APIs expose effective event, transcript, terminal, artifact, experiment, and backup policies plus the earliest possible physical-deletion time.
   source_fingerprint: 78c38c9c4a24bbad00418f57047d767fd2824e17111434e335c1b638af50dbcc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23182,10 +23228,10 @@
   title: Retention policy API
   atomic_text: Retention APIs expose effective policy and earliest possible physical deletion time.
   source_section: §27.1 Transport
-  source_anchor: RFC.md:1130
+  source_anchor: RFC.md:1132
   source_quote: Archive is a reversible visibility state. Delete creates an auditable asynchronous deletion job governed by project retention, legal hold, shared-artifact reachability, and backup expiry; it never silently removes still-referenced content. Retention APIs expose effective event, transcript, terminal, artifact, experiment, and backup policies plus the earliest possible physical-deletion time.
   source_fingerprint: 78c38c9c4a24bbad00418f57047d767fd2824e17111434e335c1b638af50dbcc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23236,10 +23282,10 @@
   title: CLI shared handlers
   atomic_text: The CLI uses the same authorization, validation, event, and lifecycle handlers as external clients.
   source_section: §27.2 CLI parity
-  source_anchor: RFC.md:1134
+  source_anchor: RFC.md:1136
   source_quote: The CLI calls the same command/query service as external clients. It has no hidden agent capability. When embedded/local direct calls avoid HTTP serialization, they still pass through identical authorization, validation, event, and lifecycle handlers.
   source_fingerprint: 0a6d8f1ae1af0d627d30961de42e925e8fd513eac4608b3aee4bd107c24dfbad
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23290,10 +23336,10 @@
   title: Daemon state-root lock
   atomic_text: The local daemon acquires the configured state-root lock before migrations or serving.
   source_section: §27.2 CLI parity
-  source_anchor: RFC.md:1136
+  source_anchor: RFC.md:1138
   source_quote: The local daemon owns one configured state root and acquires its exclusive lock before migrations or serving. Endpoint and credential discovery use a permission-restricted file in that root. `kit daemon` runs foreground unless explicitly daemonized; CLI auto-start is opt-in and waits for readiness. Graceful shutdown stops admission, checkpoints safe runs, cancels or hands off owned work according to policy, reconciles prepared edits, flushes events, and releases the lock.
   source_fingerprint: 4213f660292bdf1daf2632d4b3a5411705356ff4768068da66ae052c6024201a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23341,10 +23387,10 @@
   title: Daemon discovery file permissions
   atomic_text: Endpoint and credential discovery use a permission-restricted state-root file.
   source_section: §27.2 CLI parity
-  source_anchor: RFC.md:1136
+  source_anchor: RFC.md:1138
   source_quote: The local daemon owns one configured state root and acquires its exclusive lock before migrations or serving. Endpoint and credential discovery use a permission-restricted file in that root. `kit daemon` runs foreground unless explicitly daemonized; CLI auto-start is opt-in and waits for readiness. Graceful shutdown stops admission, checkpoints safe runs, cancels or hands off owned work according to policy, reconciles prepared edits, flushes events, and releases the lock.
   source_fingerprint: 4213f660292bdf1daf2632d4b3a5411705356ff4768068da66ae052c6024201a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23392,10 +23438,10 @@
   title: Daemon startup policy
   atomic_text: kit daemon runs foreground unless daemonized and CLI auto-start is opt-in and waits for readiness.
   source_section: §27.2 CLI parity
-  source_anchor: RFC.md:1136
+  source_anchor: RFC.md:1138
   source_quote: The local daemon owns one configured state root and acquires its exclusive lock before migrations or serving. Endpoint and credential discovery use a permission-restricted file in that root. `kit daemon` runs foreground unless explicitly daemonized; CLI auto-start is opt-in and waits for readiness. Graceful shutdown stops admission, checkpoints safe runs, cancels or hands off owned work according to policy, reconciles prepared edits, flushes events, and releases the lock.
   source_fingerprint: 4213f660292bdf1daf2632d4b3a5411705356ff4768068da66ae052c6024201a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23443,10 +23489,10 @@
   title: Graceful daemon shutdown
   atomic_text: Graceful shutdown stops admission, handles safe runs, reconciles edits, flushes events, and releases the lock.
   source_section: §27.2 CLI parity
-  source_anchor: RFC.md:1136
+  source_anchor: RFC.md:1138
   source_quote: The local daemon owns one configured state root and acquires its exclusive lock before migrations or serving. Endpoint and credential discovery use a permission-restricted file in that root. `kit daemon` runs foreground unless explicitly daemonized; CLI auto-start is opt-in and waits for readiness. Graceful shutdown stops admission, checkpoints safe runs, cancels or hands off owned work according to policy, reconciles prepared edits, flushes events, and releases the lock.
   source_fingerprint: 4213f660292bdf1daf2632d4b3a5411705356ff4768068da66ae052c6024201a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23494,10 +23540,10 @@
   title: CLI structured output
   atomic_text: All query commands support human and JSON output and streams support JSON Lines.
   source_section: §27.2 CLI parity
-  source_anchor: RFC.md:1156
+  source_anchor: RFC.md:1158
   source_quote: All query commands support human output and `--json`; streams support `--jsonl`.
   source_fingerprint: 5313874f71086f39901ac91d2c25019ac212277f51702a7e3d1d5a9a0456cce3
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23545,10 +23591,10 @@
   title: Third-party client boundary
   atomic_text: Third-party clients use OpenAPI, event envelopes, ACP, HTTP, and SSE without embedding Rust, agentkit, or the storage schema.
   source_section: §27.3 Third-party clients
-  source_anchor: RFC.md:1160
+  source_anchor: RFC.md:1162
   source_quote: OpenAPI, stable event envelopes, ACP support, and ordinary HTTP/SSE make third-party clients trivial. No client must embed Rust, agentkit, or Kit’s storage schema.
   source_fingerprint: ea47b190deac364bbac8574a25682c37baa2430a12f4e4174c0218ea6545aac6
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -23596,10 +23642,10 @@
   title: OpenTelemetry adapter
   atomic_text: Kit emits OpenTelemetry-compatible traces, metrics, and structured logs through a versioned telemetry adapter.
   source_section: §28 Observability
-  source_anchor: RFC.md:1164
+  source_anchor: RFC.md:1166
   source_quote: Kit emits OpenTelemetry-compatible traces, metrics, and structured logs behind a versioned internal telemetry adapter.
   source_fingerprint: 7acd533bb12dc8b96c99da947d06958c1956cfc7e2cfa89de310cae75598db7d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23642,10 +23688,10 @@
   title: Public-API-only observability UI
   atomic_text: The built-in read-only observability application derives every view from public API projections and endpoints.
   source_section: §28 Observability
-  source_anchor: RFC.md:1180
+  source_anchor: RFC.md:1182
   source_quote: 'The built-in read-only web application provides simple observability, not a full IDE. It derives every view from public run/thread projections, timeline, agent-tree, checkpoint, approval, process, cost, artifact, and event endpoints:'
   source_fingerprint: 1a61f0ea709417842ffc48b060546fbbf2c01b63c889555a9bd00528174e692a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23688,10 +23734,10 @@
   title: Run-state observability view
   atomic_text: The web application exposes threads and run state.
   source_section: §28 Observability
-  source_anchor: RFC.md:1182
+  source_anchor: RFC.md:1184
   source_quote: '- threads and run state,'
   source_fingerprint: de6afddfef3d44717da7d4cd2b3955d378dc1523ea374066e78f25ea69f76169
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23734,10 +23780,10 @@
   title: Timeline observability view
   atomic_text: The web application exposes a live event timeline.
   source_section: §28 Observability
-  source_anchor: RFC.md:1183
+  source_anchor: RFC.md:1185
   source_quote: '- live event timeline,'
   source_fingerprint: 3d440ca87534a56ec93f8761947d798e1dcf1f293d7e496818f82185c5167aae
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23780,10 +23826,10 @@
   title: Span observability view
   atomic_text: The web application exposes model, tool, and process spans.
   source_section: §28 Observability
-  source_anchor: RFC.md:1184
+  source_anchor: RFC.md:1186
   source_quote: '- model/tool/process spans,'
   source_fingerprint: de87ae03cb1b130593bbf4e70a3972ffa4894f8d4ef54d65bb9d6f8557474158
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23826,10 +23872,10 @@
   title: Cost observability view
   atomic_text: The web application exposes token, cache, cost, and latency breakdowns.
   source_section: §28 Observability
-  source_anchor: RFC.md:1185
+  source_anchor: RFC.md:1187
   source_quote: '- token, cache, cost, and latency breakdowns,'
   source_fingerprint: d167dd3b3fbb9f4dc936d6fa7a1d70c3632fba093dc0d2cabdd351b849bea1f6
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23872,10 +23918,10 @@
   title: Verification observability view
   atomic_text: The web application exposes workspace diff and verification evidence.
   source_section: §28 Observability
-  source_anchor: RFC.md:1186
+  source_anchor: RFC.md:1188
   source_quote: '- workspace diff and verification evidence,'
   source_fingerprint: bc08725099adc11e0ff57f54cc8426acfecc53da3dc31d49216a89d61899c5df
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23918,10 +23964,10 @@
   title: Agent-tree observability view
   atomic_text: The web application exposes subagent and A2A trees.
   source_section: §28 Observability
-  source_anchor: RFC.md:1187
+  source_anchor: RFC.md:1189
   source_quote: '- subagent/A2A tree,'
   source_fingerprint: d31e987ebee60172dc4a9e7d7c809ece262898e11bca5ed17d32100d1c971c40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -23964,10 +24010,10 @@
   title: Approval observability view
   atomic_text: The web application exposes pending approvals and authentication requests.
   source_section: §28 Observability
-  source_anchor: RFC.md:1188
+  source_anchor: RFC.md:1190
   source_quote: '- pending approvals and auth,'
   source_fingerprint: 72eccda25bee44ea54c4b64dc1e5c996c5cc0f0b38502066a2b8d85d58ca1291
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24010,10 +24056,10 @@
   title: Process observability view
   atomic_text: The web application exposes active processes and terminals.
   source_section: §28 Observability
-  source_anchor: RFC.md:1189
+  source_anchor: RFC.md:1191
   source_quote: '- active processes and terminals,'
   source_fingerprint: 503c00cf4be62c98acd8df0f484822d4ffdeaf2983efdab196f4823705da6931
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24056,10 +24102,10 @@
   title: Redacted prompt observability view
   atomic_text: The web application exposes prompt and checkpoint versions with sensitive content redacted.
   source_section: §28 Observability
-  source_anchor: RFC.md:1190
+  source_anchor: RFC.md:1192
   source_quote: '- prompt/checkpoint versions with sensitive content redacted,'
   source_fingerprint: 9e1c3e2471d0e47aca5f052b2df7e040c02bad6e6418c9d3cdf92c9b487a0b8e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24102,10 +24148,10 @@
   title: Experiment observability view
   atomic_text: The web application exposes experiment assignment and outcome.
   source_section: §28 Observability
-  source_anchor: RFC.md:1191
+  source_anchor: RFC.md:1193
   source_quote: '- experiment assignment and outcome.'
   source_fingerprint: 5d8bba6b096ac99a0a5709d22c5ea6b90622d34b40d3c8792fd2082da14db614
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24148,10 +24194,10 @@
   title: Low-cardinality metrics
   atomic_text: Metrics exclude run IDs, paths, prompts, and commands from labels.
   source_section: §28 Observability
-  source_anchor: RFC.md:1193
+  source_anchor: RFC.md:1195
   source_quote: Metrics avoid high-cardinality labels such as run IDs, paths, prompts, or commands. Those belong in access-controlled traces and logs.
   source_fingerprint: a163cbe01bbcde7fa39d97065e0195336dfc09a8e3f834c74be420ec925ee82a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24194,10 +24240,10 @@
   title: Liveness and readiness separation
   atomic_text: Health endpoints distinguish liveness from readiness.
   source_section: §28 Observability
-  source_anchor: RFC.md:1195
+  source_anchor: RFC.md:1197
   source_quote: Health endpoints distinguish liveness from readiness. Slow event clients are disconnected after bounded buffering and resume from durable cursors.
   source_fingerprint: 1420f65e7704d6b6574f973f83fcdf9cf08c61b8340e1f354fe6d053e1a8aaeb
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24240,10 +24286,10 @@
   title: Slow event client recovery
   atomic_text: Slow event clients are disconnected after bounded buffering and resume from durable cursors.
   source_section: §28 Observability
-  source_anchor: RFC.md:1195
+  source_anchor: RFC.md:1197
   source_quote: Health endpoints distinguish liveness from readiness. Slow event clients are disconnected after bounded buffering and resume from durable cursors.
   source_fingerprint: 1420f65e7704d6b6574f973f83fcdf9cf08c61b8340e1f354fe6d053e1a8aaeb
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24286,7 +24332,7 @@
   title: Full-policy evaluated unit
   atomic_text: Evaluation treats model, prompt, context, tools, router, sandbox, retry, verifier, cache, and infrastructure as one system under test.
   source_section: §30.1 System under test
-  source_anchor: RFC.md:1262-1267
+  source_anchor: RFC.md:1264-1269
   source_quote: 'The evaluated unit is:
 
 
@@ -24298,7 +24344,7 @@
 
     ```'
   source_fingerprint: c8c79fdf882ec393450fb70ed6aa9a699182ce8dfd3a907918a7aef72cf3ecb6
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24341,10 +24387,10 @@
   title: No model-only comparison
   atomic_text: Model-only comparisons are not accepted as system evaluation.
   source_section: §30.1 System under test
-  source_anchor: RFC.md:1269
+  source_anchor: RFC.md:1271
   source_quote: Model-only comparisons are insufficient.
   source_fingerprint: ec1aabae51c4532f39fdde695fef34bf381a3738eecde146e11a8c4a3497fad0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24387,7 +24433,7 @@
   title: Evaluation portfolio
   atomic_text: Kit maintains public, private, adversarial, regression, shadow, and canary evaluation portfolios.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1273-1278
+  source_anchor: RFC.md:1275-1280
   source_quote: 'Kit maintains:
 
 
@@ -24399,7 +24445,7 @@
 
     - production shadow and canary experiments.'
   source_fingerprint: 85d1fb5c4496517918826a6aa72bae7a38eaeab9ba2805ef103e596a14c342bc
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24442,10 +24488,10 @@
   title: Private task stratification
   atomic_text: Private tasks are stratified by language, repository size, class, duration, touched files, ambiguity, test quality, and risk.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1282
+  source_anchor: RFC.md:1284
   source_quote: Private tasks include bugs, features, migrations, dependency updates, refactors, tests, CI repair, incident diagnosis, review feedback, documentation, security-sensitive changes, and tasks that should ask or abstain. They are stratified by language, repository size, task class, human duration, files touched, ambiguity, test quality, and risk.
   source_fingerprint: a3ba924bf5851e2166fe254415cb91546305b3a9f6cf2552cbe8f32867fdf1ba
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24488,7 +24534,7 @@
   title: Pinned trial manifest
   atomic_text: Every trial pins repository, environment, budgets, model, policy digests, cache, grader, randomization, and provider request IDs.
   source_section: §30.3 Harness requirements
-  source_anchor: RFC.md:1286-1295
+  source_anchor: RFC.md:1288-1297
   source_quote: 'Every trial pins:
 
 
@@ -24508,7 +24554,7 @@
 
     - randomization identifiers and provider request IDs.'
   source_fingerprint: 135a3a5da294e961f47ec6bf1e86be61dcdefb806b226a7e21522a36ffc22289
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -24556,10 +24602,10 @@
   title: Fresh isolated trial
   atomic_text: Each trial runs in a fresh isolated environment with gold patches and hidden tests outside the agent sandbox.
   source_section: §30.3 Harness requirements
-  source_anchor: RFC.md:1297
+  source_anchor: RFC.md:1299
   source_quote: The harness uses a fresh isolated environment per trial. Gold patches and hidden tests remain outside the agent sandbox. It stores the final tree, patch, events, model/tool usage, checks, and grader result.
   source_fingerprint: 7b287fc8a49297c0d66a01a5886939ecf96350f90a66306dbbb5602165e7b998
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -24608,10 +24654,10 @@
   title: Persist trial artifacts
   atomic_text: The harness stores final tree, patch, events, usage, checks, and grader result.
   source_section: §30.3 Harness requirements
-  source_anchor: RFC.md:1297
+  source_anchor: RFC.md:1299
   source_quote: The harness uses a fresh isolated environment per trial. Gold patches and hidden tests remain outside the agent sandbox. It stores the final tree, patch, events, model/tool usage, checks, and grader result.
   source_fingerprint: 7b287fc8a49297c0d66a01a5886939ecf96350f90a66306dbbb5602165e7b998
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -24659,10 +24705,10 @@
   title: Harness validation cases
   atomic_text: Harness validation requires original failure, reference success, and empty, malformed, and adversarial patch failure.
   source_section: §30.3 Harness requirements
-  source_anchor: RFC.md:1299
+  source_anchor: RFC.md:1301
   source_quote: Harness validation checks that the original state fails intended assertions, the reference solution passes, and empty, malformed, and adversarial patches fail. Repeated regrades under the pinned environment estimate residual nondeterminism; observed disagreement and flake rates are reported rather than retried away.
   source_fingerprint: 782824c5fa74ab5819ed2413b3d9a1d68c3f8345d00152e0dab8f8cc580d4cbb
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -24710,10 +24756,10 @@
   title: Report nondeterminism
   atomic_text: Repeated pinned regrades report disagreement and flake rates rather than retrying them away.
   source_section: §30.3 Harness requirements
-  source_anchor: RFC.md:1299
+  source_anchor: RFC.md:1301
   source_quote: Harness validation checks that the original state fails intended assertions, the reference solution passes, and empty, malformed, and adversarial patches fail. Repeated regrades under the pinned environment estimate residual nondeterminism; observed disagreement and flake rates are reported rather than retried away.
   source_fingerprint: 782824c5fa74ab5819ed2413b3d9a1d68c3f8345d00152e0dab8f8cc580d4cbb
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24756,10 +24802,10 @@
   title: Randomized paired comparisons
   atomic_text: Comparisons are time-block randomized, paired where feasible, repeated for stochastic systems, and repository and task stratified.
   source_section: §30.4 Statistical method
-  source_anchor: RFC.md:1303
+  source_anchor: RFC.md:1305
   source_quote: Comparisons are randomized in time blocks, paired at the task/block level where feasible, repeated for stochastic systems, and stratified by repository and task class. Reports include effect sizes and confidence intervals. Sample size, estimand, correctness non-inferiority margin, stopping rule, and multiplicity family are predeclared.
   source_fingerprint: 28c66388ab08f499700754c7aa144c1bd3834c853bbe6cf0434ce6067d66b973
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24802,10 +24848,10 @@
   title: Predeclare statistical design
   atomic_text: Sample size, estimand, non-inferiority margin, stopping rule, and multiplicity family are predeclared.
   source_section: §30.4 Statistical method
-  source_anchor: RFC.md:1303
+  source_anchor: RFC.md:1305
   source_quote: Comparisons are randomized in time blocks, paired at the task/block level where feasible, repeated for stochastic systems, and stratified by repository and task class. Reports include effect sizes and confidence intervals. Sample size, estimand, correctness non-inferiority margin, stopping rule, and multiplicity family are predeclared.
   source_fingerprint: 28c66388ab08f499700754c7aa144c1bd3834c853bbe6cf0434ce6067d66b973
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -24858,10 +24904,10 @@
   title: Cluster-aware statistical analysis
   atomic_text: Repeated and clustered trials use task summaries or cluster-aware models, bootstrap, or randomization.
   source_section: §30.4 Statistical method
-  source_anchor: RFC.md:1305
+  source_anchor: RFC.md:1307
   source_quote: With one binary pair per task, exact McNemar is appropriate. With repeated trials or tasks clustered by repository, Kit analyzes task-level paired summaries or uses a hierarchical model, GEE, or repository-then-task cluster bootstrap/randomization that retains all trials. Cost and latency use paired bootstrap or randomization tests; tail quantiles receive bootstrap intervals. Multiple confirmatory comparisons are corrected. Non-inferiority is claimed only when the appropriate one-sided confidence bound excludes the margin.
   source_fingerprint: e4103cde2e8544e3d73ee66ffba88259ea9c0fa3aa165bf52071ff7aecf92b46
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24904,10 +24950,10 @@
   title: Correct multiplicity and non-inferiority
   atomic_text: Confirmatory comparisons correct multiplicity and claim non-inferiority only when the one-sided bound excludes the margin.
   source_section: §30.4 Statistical method
-  source_anchor: RFC.md:1305
+  source_anchor: RFC.md:1307
   source_quote: With one binary pair per task, exact McNemar is appropriate. With repeated trials or tasks clustered by repository, Kit analyzes task-level paired summaries or uses a hierarchical model, GEE, or repository-then-task cluster bootstrap/randomization that retains all trials. Cost and latency use paired bootstrap or randomization tests; tail quantiles receive bootstrap intervals. Multiple confirmatory comparisons are corrected. Non-inferiority is claimed only when the appropriate one-sided confidence bound excludes the margin.
   source_fingerprint: e4103cde2e8544e3d73ee66ffba88259ea9c0fa3aa165bf52071ff7aecf92b46
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24950,10 +24996,10 @@
   title: End-to-end adaptive policy evaluation
   atomic_text: Adaptive retries and verifier selection are evaluated end to end as resolution at budget including selection errors and all costs.
   source_section: §30.4 Statistical method
-  source_anchor: RFC.md:1307
+  source_anchor: RFC.md:1309
   source_quote: HumanEval `pass@k` is used only for a fixed candidate-sampling policy, with estimator and sample count reported; it assumes an oracle can recognize a passing candidate. Adaptive retries, repair turns, and verifier-selected candidates are evaluated end to end as `resolution@budget`, including selection errors and all costs. `pass^k` is used only for the predeclared probability that all `k` fresh runs of one fixed policy succeed and is estimated empirically rather than replaced with `(pass@1)^k` without an independence argument.
   source_fingerprint: add017141ccf071f346980791eb42ea4116109a6fde4c748344f62d41978ce99
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -24996,7 +25042,7 @@
   title: Required ablation portfolio
   atomic_text: Kit runs the complete prompt, retrieval, map, schema, encoding, composition, edit, routing, cache, compaction, execution, retry, review, and escalation ablation portfolio.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1311-1324
+  source_anchor: RFC.md:1313-1326
   source_quote: 'Kit runs ablations for:
 
 
@@ -25067,10 +25113,10 @@
   title: Factorial interaction design
   atomic_text: Evaluation uses factorial designs when policy interactions are likely.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1326
+  source_anchor: RFC.md:1328
   source_quote: Factorial designs are used when interactions are likely, such as caching with compaction or model tier with composition backend.
   source_fingerprint: 168331cca8d712dc866da0af6e9d57ac015256e5f2372453008aa2b13b919cb0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25113,10 +25159,10 @@
   title: Independent retrieval evaluation
   atomic_text: Retrieval is evaluated independently with recall, rank, provenance, token, latency, freshness, and downstream metrics.
   source_section: §30.6 Retrieval evaluation
-  source_anchor: RFC.md:1330
+  source_anchor: RFC.md:1332
   source_quote: Discovery is evaluated independently from generation using file/symbol recall@k, reciprocal rank, provenance correctness, evidence tokens, time to first relevant symbol, index latency/freshness, and downstream task resolution. Oracle localization estimates the maximum value retrieval improvements can provide.
   source_fingerprint: 36f06453841db0e81bdebd006d4e2cc46fbbbc010258e7bad0ce7f0551095622
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25159,10 +25205,10 @@
   title: Editing evaluation matrix
   atomic_text: Editing evaluation covers success, location, checks, unintended changes, size, tokens, latency, conflict, recovery, and edge-case fixtures.
   source_section: §30.7 Editing evaluation
-  source_anchor: RFC.md:1334
+  source_anchor: RFC.md:1336
   source_quote: Edit benchmarks measure apply success, correct-location rate, parse/typecheck/test success, unintended changed lines, diff size, output tokens, latency, conflict detection, and recovery turns. Cases include Unicode, CRLF, missing newlines, duplicate anchors, renames, symlinks, concurrent modifications, and binary files.
   source_fingerprint: c682fc46e2c0c1bd148acaba874de5d5e39ed186670c94ae2e080a6f6695f816
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25205,10 +25251,10 @@
   title: Shadow runs do not apply output
   atomic_text: Production shadow runs do not apply output and measure routing, cost, permissions, and delayed ground truth.
   source_section: §30.8 Production experiments
-  source_anchor: RFC.md:1338
+  source_anchor: RFC.md:1340
   source_quote: Shadow runs do not apply output. They measure routing, costs, permissions, and delayed ground truth under real workload. Canary rollout uses sticky assignment and watches acceptance, developer active time, review/rework, rollback, defects, unauthorized actions, p95/p99 latency, and cost per accepted task.
   source_fingerprint: 64ec8184dc9826fbe4ba3b1c1df7df19445b30836e4380eccceee8be8962cbd0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25251,10 +25297,10 @@
   title: Sticky canary monitoring
   atomic_text: Canaries use sticky assignment and monitor acceptance, activity, review, rollback, defects, unauthorized actions, tail latency, and cost.
   source_section: §30.8 Production experiments
-  source_anchor: RFC.md:1338
+  source_anchor: RFC.md:1340
   source_quote: Shadow runs do not apply output. They measure routing, costs, permissions, and delayed ground truth under real workload. Canary rollout uses sticky assignment and watches acceptance, developer active time, review/rework, rollback, defects, unauthorized actions, p95/p99 latency, and cost per accepted task.
   source_fingerprint: 64ec8184dc9826fbe4ba3b1c1df7df19445b30836e4380eccceee8be8962cbd0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25297,10 +25343,10 @@
   title: Security failure rollback
   atomic_text: Security failures automatically roll back canaries.
   source_section: §30.8 Production experiments
-  source_anchor: RFC.md:1340
+  source_anchor: RFC.md:1342
   source_quote: Security failures trigger automatic rollback. Canaries run long enough to observe review and post-merge outcomes.
   source_fingerprint: d39248a47bdc61d39052e826cc251e2466e9ca72cb12f233178d4661cfa4dcaa
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25343,10 +25389,10 @@
   title: Observe delayed canary outcomes
   atomic_text: Canaries run long enough to observe review and post-merge outcomes.
   source_section: §30.8 Production experiments
-  source_anchor: RFC.md:1340
+  source_anchor: RFC.md:1342
   source_quote: Security failures trigger automatic rollback. Canaries run long enough to observe review and post-merge outcomes.
   source_fingerprint: d39248a47bdc61d39052e826cc251e2466e9ca72cb12f233178d4661cfa4dcaa
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25389,10 +25435,10 @@
   title: No causal replay after action divergence
   atomic_text: Recorded future observations are not used as causal estimates after a policy selects a different action.
   source_section: §30.9 Replay limits
-  source_anchor: RFC.md:1352
+  source_anchor: RFC.md:1354
   source_quote: Once a policy chooses a different action, recorded future observations are not a valid causal estimate. Fresh rollouts are required for agent quality claims.
   source_fingerprint: 4ef2ae3917df9374963f4d6f5d6a0da6fbaa35a65ab0fea849eb51a45c4cd17c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25435,10 +25481,10 @@
   title: Fresh rollouts for quality claims
   atomic_text: Agent quality claims require fresh rollouts.
   source_section: §30.9 Replay limits
-  source_anchor: RFC.md:1352
+  source_anchor: RFC.md:1354
   source_quote: Once a policy chooses a different action, recorded future observations are not a valid causal estimate. Fresh rollouts are required for agent quality claims.
   source_fingerprint: 4ef2ae3917df9374963f4d6f5d6a0da6fbaa35a65ab0fea849eb51a45c4cd17c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25481,10 +25527,10 @@
   title: External immutable graders
   atomic_text: Graders are immutable and external and are defended with hidden tests, adversarial patches, side-effect checks, least privilege, paired tasks, and trace audits.
   source_section: §30.10 Reward-hacking defenses
-  source_anchor: RFC.md:1356
+  source_anchor: RFC.md:1358
   source_quote: Graders are immutable and external. Hidden mutation/metamorphic tests, adversarial patches, side-effect checks, least privilege, paired act/do-not-act tasks, and manual trace audits defend against test deletion, grader probing, premature completion, and proxy optimization.
   source_fingerprint: ccbf5e76c58971563c5910e49b45ae147f5d5fc8b83d601d800d4ccda5ecbab5
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25527,10 +25573,10 @@
   title: Public API version pin
   atomic_text: Kit independently pins and negotiates the public API major version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1393
+  source_anchor: RFC.md:1395
   source_quote: '- public API major version,'
   source_fingerprint: b9b483a72a72ad7d648140bd45a6b0027a5ea10d8cae53697c8136a0c87b12b5
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25573,10 +25619,10 @@
   title: Event schema version pin
   atomic_text: Kit independently pins and negotiates event payload schema versions.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1394
+  source_anchor: RFC.md:1396
   source_quote: '- event payload schema version,'
   source_fingerprint: c60463ad237c0e42ee4d03d849dc4bc1d8ebbf02bfea9224b79ac2ffd9402d33
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25619,10 +25665,10 @@
   title: Persistence schema version pin
   atomic_text: Kit independently pins and negotiates the persistence schema version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1395
+  source_anchor: RFC.md:1397
   source_quote: '- persistence schema version,'
   source_fingerprint: f1e097a07a49dbbc520c3eb931aa09fd5485fe29c190f69b7b901209bf7ac320
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25665,10 +25711,10 @@
   title: Agentkit version pin
   atomic_text: Kit independently pins the agentkit crate version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1396
+  source_anchor: RFC.md:1398
   source_quote: '- agentkit crate version,'
   source_fingerprint: 36bf1beb236b47d13ccec62361fd5c842375c13e2ffcf7a2a652eafdb9cb3a58
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25711,10 +25757,10 @@
   title: ACP version negotiation
   atomic_text: Kit independently pins and negotiates the ACP wire version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1397
+  source_anchor: RFC.md:1399
   source_quote: '- ACP wire version,'
   source_fingerprint: e0f697dfac34151f85acdc0bee80b5154283feefd16a4cd35d1afa91fc2fa7c1
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25757,10 +25803,10 @@
   title: A2A version negotiation
   atomic_text: Kit independently pins and negotiates the A2A interface and protocol version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1398
+  source_anchor: RFC.md:1400
   source_quote: '- A2A interface/protocol version,'
   source_fingerprint: 3624b1bcd4360c0c0a4c2df9fb95ae7681cea559409f2c14daa88ae2b6775256
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25803,10 +25849,10 @@
   title: MCP revision negotiation
   atomic_text: Kit independently pins and negotiates the MCP revision date.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1399
+  source_anchor: RFC.md:1401
   source_quote: '- MCP revision date,'
   source_fingerprint: ca824c70d63f10653b041b1a212bb4ffc39037b3a89bfe0369b5715cc3adc805
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25849,10 +25895,10 @@
   title: JSON Schema dialect negotiation
   atomic_text: Kit independently pins and negotiates the JSON Schema dialect.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1400
+  source_anchor: RFC.md:1402
   source_quote: '- JSON Schema dialect,'
   source_fingerprint: 95116a71d90a12237dbd337eb9bbb6da10f50471924fef4a9753b35e2f30a23d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25895,10 +25941,10 @@
   title: TOON version pin
   atomic_text: Kit independently pins the TOON version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1401
+  source_anchor: RFC.md:1403
   source_quote: '- TOON version,'
   source_fingerprint: 472e92c41efe20ee2420a8fbd1531704c5366538e013808d2d6215c695739f9e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25941,10 +25987,10 @@
   title: Tree-sitter version pin
   atomic_text: Kit independently pins Tree-sitter grammar and query versions.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1402
+  source_anchor: RFC.md:1404
   source_quote: '- Tree-sitter grammar/query versions,'
   source_fingerprint: 30d745b6ffb261353833a9669ef1490417df99e775649f8ad0bbb80e4e914624
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -25987,10 +26033,10 @@
   title: LSP version negotiation
   atomic_text: Kit independently pins and negotiates LSP position encoding and server version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1403
+  source_anchor: RFC.md:1405
   source_quote: '- LSP position encoding and server version,'
   source_fingerprint: 623a92e24b352dc08989ebcf5ead4a7e0f814a7771d2fe618aeaa69df47508ee
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -26033,10 +26079,10 @@
   title: SCIP version pin
   atomic_text: Kit independently pins the SCIP schema and index version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1404
+  source_anchor: RFC.md:1406
   source_quote: '- SCIP schema/index version,'
   source_fingerprint: 2cbc12afe55912388879b34bcd31e540f0d76e540afa01881207a9eda2523020
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -26079,10 +26125,10 @@
   title: Provider version pin
   atomic_text: Kit independently pins provider model snapshot and feature version.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1405
+  source_anchor: RFC.md:1407
   source_quote: '- provider model snapshot and feature version.'
   source_fingerprint: 650592c210e18e8045a3e4d7ff24e73db5772c51e247c7a27b014f751cb511b4
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -26125,10 +26171,10 @@
   title: Adapter conformance tests
   atomic_text: Every protocol adapter has conformance and round-trip tests.
   source_section: §32 Compatibility and Versioning
-  source_anchor: RFC.md:1407
+  source_anchor: RFC.md:1409
   source_quote: Similar JSON-RPC envelopes do not imply equivalent lifecycle, cancellation, streaming, error, or auth behavior. Every adapter has conformance and round-trip tests.
   source_fingerprint: 5ea26cd7657353511ee42d218c5a4adcab8e3450007506f6ba73da08d4b75db5
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27634,10 +27680,10 @@
   title: Durable cancellation request
   atomic_text: Cancellation is represented as a durable request.
   source_section: §26 Cancellation, Scheduling, and Recovery
-  source_anchor: RFC.md:1067
+  source_anchor: RFC.md:1069
   source_quote: 'Cancellation is a durable request:'
   source_fingerprint: 01ec36b74f7b5c2fcc3e75c04fe42d11917390ffffc253f8401f4eb72e71b1d4
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27680,10 +27726,10 @@
   title: Independently measurable optimization policies
   atomic_text: Adjacent cost and latency optimizations are treated as independently measurable policies.
   source_section: §29 Cost and Latency Optimizations
-  source_anchor: RFC.md:1199
+  source_anchor: RFC.md:1201
   source_quote: Kit pursues the following adjacent optimizations as independently measurable policies.
   source_fingerprint: 68533c4d07c7fa8f650e935a271ec637021db2675f9bbc7b691550a585c32b6e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27726,10 +27772,10 @@
   title: Coding evaluation parity for inference optimizations
   atomic_text: Every quantization or decoding optimization passes the same coding evaluations.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1256
+  source_anchor: RFC.md:1258
   source_quote: Every quantization or decoding optimization must pass the same coding and tool-call evaluations. Throughput gains do not excuse changed outputs or higher tail latency.
   source_fingerprint: 82a0a7d28594c5dd6df819e7f0697fd7c5224c1ce8da5dba83efe56a3cb71f60
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27772,10 +27818,10 @@
   title: Tool-call evaluation parity for inference optimizations
   atomic_text: Every quantization or decoding optimization passes the same tool-call evaluations.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1256
+  source_anchor: RFC.md:1258
   source_quote: Every quantization or decoding optimization must pass the same coding and tool-call evaluations. Throughput gains do not excuse changed outputs or higher tail latency.
   source_fingerprint: 82a0a7d28594c5dd6df819e7f0697fd7c5224c1ce8da5dba83efe56a3cb71f60
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27818,10 +27864,10 @@
   title: No output regression for throughput gains
   atomic_text: Throughput gains do not permit changed outputs from quantization or decoding optimizations.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1256
+  source_anchor: RFC.md:1258
   source_quote: Every quantization or decoding optimization must pass the same coding and tool-call evaluations. Throughput gains do not excuse changed outputs or higher tail latency.
   source_fingerprint: 82a0a7d28594c5dd6df819e7f0697fd7c5224c1ce8da5dba83efe56a3cb71f60
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27864,10 +27910,10 @@
   title: No tail-latency regression for throughput gains
   atomic_text: Throughput gains do not permit higher tail latency from quantization or decoding optimizations.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1256
+  source_anchor: RFC.md:1258
   source_quote: Every quantization or decoding optimization must pass the same coding and tool-call evaluations. Throughput gains do not excuse changed outputs or higher tail latency.
   source_fingerprint: 82a0a7d28594c5dd6df819e7f0697fd7c5224c1ce8da5dba83efe56a3cb71f60
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27910,10 +27956,10 @@
   title: Constrain human-facing verbosity
   atomic_text: Kit constrains human-facing verbosity to reduce sequential model work.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1203
+  source_anchor: RFC.md:1205
   source_quote: '- constrain human-facing verbosity;'
   source_fingerprint: 01afc0c69c87c33f3cb6ff8d981adb6988a8566d0fe0ce13fdf8b7f42d1c2c79
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -27956,10 +28002,10 @@
   title: Emit minimal patches
   atomic_text: Kit emits minimal patches instead of unchanged file content.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1204
+  source_anchor: RFC.md:1206
   source_quote: '- emit minimal patches instead of unchanged file content;'
   source_fingerprint: afe2d79437f1bc915a3290de9b8bf06380b03ccbbe1ef914a05de8bb0acd6aa0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28002,10 +28048,10 @@
   title: Use structured control calls
   atomic_text: Kit uses structured control calls instead of prose.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1205
+  source_anchor: RFC.md:1207
   source_quote: '- use structured control calls instead of prose;'
   source_fingerprint: 15e7dcdacdb6725f44141d913da9945780e6ba1eeda654b4c6017e6fe46548ba
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28048,10 +28094,10 @@
   title: Gate grammar-constrained output on measured quality
   atomic_text: Kit uses grammar-constrained structured output only where provider support improves syntax without semantic regressions.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1206
+  source_anchor: RFC.md:1208
   source_quote: '- use grammar-constrained structured output where provider support improves syntax without semantic regressions;'
   source_fingerprint: b3cec91583296b0d2ad4538945831e65bca849e98dc76ba2dec782eb7c18c1fa
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28098,10 +28144,10 @@
   title: Batch independent tools
   atomic_text: Kit batches independent tool calls.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1207
+  source_anchor: RFC.md:1209
   source_quote: '- batch independent tools;'
   source_fingerprint: 30265ee5c0a7193633c08e1cdd22b21749a40d6a5562065b11adde30ece0b6fa
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28144,10 +28190,10 @@
   title: Compose dependent mechanical calls
   atomic_text: Kit composes dependent mechanical calls.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1208
+  source_anchor: RFC.md:1210
   source_quote: '- compose dependent mechanical calls;'
   source_fingerprint: 3153eb65b04b26bdd7a1fbb3993a301727211ac1b98919084cd14da442e9161f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28190,10 +28236,10 @@
   title: Execute mechanical operations outside the model
   atomic_text: Kit executes loops, joins, and reductions outside the model.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1209
+  source_anchor: RFC.md:1211
   source_quote: '- execute loops, joins, and reductions outside the model;'
   source_fingerprint: 5c0eece74dc8cf106e63da696e368b67c6f822749667797dea8fedc58a10cc89
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28236,10 +28282,10 @@
   title: Restrict read memoization
   atomic_text: Kit memoizes only deterministic reads keyed by revision and authorization.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1210
+  source_anchor: RFC.md:1212
   source_quote: '- memoize only deterministic, revision- and authorization-keyed reads;'
   source_fingerprint: 235b9676d2466cc15855933d4c699c14c1549a1c6001bfe7744455ebccfec7bd
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28282,10 +28328,10 @@
   title: Gate predicted output on net savings
   atomic_text: Kit uses provider predicted output for mostly unchanged whole-file generation only when measured savings exceed rejected-token cost.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1211
+  source_anchor: RFC.md:1213
   source_quote: '- use provider predicted-output features for mostly unchanged whole-file generation only when measured savings exceed rejected-token cost;'
   source_fingerprint: 869f15b843e15e396605e949666c5f649195d26c380e2bb54368c72ad3a9fd1b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28328,10 +28374,10 @@
   title: Stop negative-value retries
   atomic_text: Kit stops retries when expected marginal value falls below cost.
   source_section: §29.1 Reduce sequential model work
-  source_anchor: RFC.md:1212
+  source_anchor: RFC.md:1214
   source_quote: '- stop retries when expected marginal value falls below cost.'
   source_fingerprint: 20263e28138586732bcaa6484b0610d083a493d94aa1a81b0013f3af108e5729
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28374,10 +28420,10 @@
   title: Use stable exact prefixes
   atomic_text: Kit uses stable exact prefixes to reduce prefill and context work.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1216
+  source_anchor: RFC.md:1218
   source_quote: '- stable exact prefixes and canonical serialization;'
   source_fingerprint: 5243b9146650a195d18c51ac5a999c259feb86c927acff43ece2460394c42746
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28420,10 +28466,10 @@
   title: Use canonical serialization
   atomic_text: Kit uses canonical serialization to reduce prefill and context work.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1216
+  source_anchor: RFC.md:1218
   source_quote: '- stable exact prefixes and canonical serialization;'
   source_fingerprint: 5243b9146650a195d18c51ac5a999c259feb86c927acff43ece2460394c42746
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28466,10 +28512,10 @@
   title: Defer tool schemas
   atomic_text: Kit defers tool schemas until they are needed.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1217
+  source_anchor: RFC.md:1219
   source_quote: '- deferred tool schemas;'
   source_fingerprint: 2db4daf0236837c2bc06a1703f396110c03a55f50fcf478d4a4d7c68ddc14a3b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28512,10 +28558,10 @@
   title: Use targeted code slices
   atomic_text: Kit uses targeted code slices to reduce context.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1218
+  source_anchor: RFC.md:1220
   source_quote: '- targeted code slices and personalized maps;'
   source_fingerprint: 2846a75ecf1db23ad0dcb1a11ff9a184662390f2a578da94be38cb67bfb7fdf0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28558,10 +28604,10 @@
   title: Use personalized repository maps
   atomic_text: Kit uses personalized repository maps to reduce context.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1218
+  source_anchor: RFC.md:1220
   source_quote: '- targeted code slices and personalized maps;'
   source_fingerprint: 2846a75ecf1db23ad0dcb1a11ff9a184662390f2a578da94be38cb67bfb7fdf0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28604,10 +28650,10 @@
   title: Use artifact handles for repeated logs
   atomic_text: Kit uses artifact handles instead of repeating logs in context.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1219
+  source_anchor: RFC.md:1221
   source_quote: '- artifact handles instead of repeated logs;'
   source_fingerprint: 50314ee7ef9f5f0fe6d8df9dd3fc5ecac6be62bcd5a69d4f866a69f13b1597ab
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28650,10 +28696,10 @@
   title: Combine model-selected checkpoints with deterministic eviction
   atomic_text: Kit uses model-selected checkpoints and deterministic eviction to reduce context.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1220
+  source_anchor: RFC.md:1222
   source_quote: '- model-selected checkpoints and deterministic eviction;'
   source_fingerprint: 4ec77d4656d48c99fa067ad5e7636a2cc17929ba6ec7c0364c85415443b49cac
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28696,10 +28742,10 @@
   title: Use compact schema notation
   atomic_text: Kit uses compact schema notation to reduce context.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1221
+  source_anchor: RFC.md:1223
   source_quote: '- compact schema notation and adaptive result encoding;'
   source_fingerprint: f67b89ed54d78a5bed3c82225b28dc310c957d4c0eefed6b803f6ee3f104ad5c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28742,10 +28788,10 @@
   title: Use adaptive result encoding
   atomic_text: Kit uses adaptive result encoding to reduce context.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1221
+  source_anchor: RFC.md:1223
   source_quote: '- compact schema notation and adaptive result encoding;'
   source_fingerprint: f67b89ed54d78a5bed3c82225b28dc310c957d4c0eefed6b803f6ee3f104ad5c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28788,10 +28834,10 @@
   title: Gate session affinity on cache and balance
   atomic_text: Kit uses session affinity only when it improves cache hits without harmful load imbalance.
   source_section: §29.2 Reduce prefill and context
-  source_anchor: RFC.md:1222
+  source_anchor: RFC.md:1224
   source_quote: '- session affinity when it improves cache hits without harmful load imbalance.'
   source_fingerprint: 1eaa51f07d7405afeea16dcf8b213731ce57c879385ab02c7b29042a887bcb41
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28834,10 +28880,10 @@
   title: Warm repository mirrors and copy-on-write images
   atomic_text: Kit uses warm repository mirrors and copy-on-write images to reduce environment latency.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1226
+  source_anchor: RFC.md:1228
   source_quote: '- warm repository mirrors and copy-on-write images;'
   source_fingerprint: a51889bc276f82c3b01f81c583567a6660a173ffb5648a1647e0517266bb15c7
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28880,10 +28926,10 @@
   title: Persist safely bounded language servers
   atomic_text: Kit persists language servers keyed by safe workspace boundaries.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1227
+  source_anchor: RFC.md:1229
   source_quote: '- persistent language servers keyed by safe workspace boundaries;'
   source_fingerprint: 504980a159ebb2ca697f85eb621e5b02d5a5c9523910c7dd6cc78556a7fe454f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28926,10 +28972,10 @@
   title: Cache environment preparation work
   atomic_text: Kit uses dependency, compiler, build, and test-discovery caches.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1228
+  source_anchor: RFC.md:1230
   source_quote: '- dependency, compiler, build, and test-discovery caches;'
   source_fingerprint: 4bf2a6dfe934e3f1f7bd8ae893badfbb3abf6581b1caea883fbfd94e63f70d7d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -28972,10 +29018,10 @@
   title: Use prebuilt sandbox images
   atomic_text: Kit uses prebuilt sandbox images to reduce environment latency.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1229
+  source_anchor: RFC.md:1231
   source_quote: '- prebuilt sandbox images;'
   source_fingerprint: 467399d82cc23346df8042fd811f5cb4414d91a320784d8164fe50ce4b0ff740
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29018,10 +29064,10 @@
   title: Persist provider and MCP connections
   atomic_text: Kit persists provider and MCP connections to reduce environment latency.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1230
+  source_anchor: RFC.md:1232
   source_quote: '- persistent provider and MCP connections;'
   source_fingerprint: 89d25c5057a592ab822e1cae21e8d9c0dfeac26be5b7e87a3b63d97aab0b226d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29064,10 +29110,10 @@
   title: Incrementally maintain parsing and indexes
   atomic_text: Kit uses incremental parsing and indexes to reduce environment latency.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1231
+  source_anchor: RFC.md:1233
   source_quote: '- incremental parsing and indexes;'
   source_fingerprint: b172c4ba98dddddfc3309268678001ca7fa50bb16d8d5a0184615afd303eaa0d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29110,10 +29156,10 @@
   title: Use offline batch APIs for non-interactive work
   atomic_text: Kit uses offline batch APIs for non-interactive summarization, indexing, and evaluation.
   source_section: §29.3 Reduce environment latency
-  source_anchor: RFC.md:1232
+  source_anchor: RFC.md:1234
   source_quote: '- offline batch APIs for non-interactive summarization, indexing, and evaluation.'
   source_fingerprint: d9edae38e872d1cd87b9cd15d699afcfb5c01d386f48ea8279e4d01660e8f829
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29156,10 +29202,10 @@
   title: Route models by phase and risk
   atomic_text: Kit routes models according to task phase and risk.
   source_section: §29.4 Improve decision efficiency
-  source_anchor: RFC.md:1236
+  source_anchor: RFC.md:1238
   source_quote: '- phase- and risk-aware model routing;'
   source_fingerprint: 80b7978374b19d3dc1929f839cb22a77a68e06a36a816f043be40e1248e9009e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29202,10 +29248,10 @@
   title: Calibrate abstention and escalation
   atomic_text: Kit calibrates abstention and escalation decisions by confidence.
   source_section: §29.4 Improve decision efficiency
-  source_anchor: RFC.md:1237
+  source_anchor: RFC.md:1239
   source_quote: '- confidence-calibrated abstention and escalation;'
   source_fingerprint: cfb10ef8fd8ba5cb111da0d6aeea3df9661e6ddf59fbc1b970c3ae9f82ad7d3d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29248,10 +29294,10 @@
   title: Rank reads and tests by information value
   atomic_text: Kit ranks reads and tests by expected value of information.
   source_section: §29.4 Improve decision efficiency
-  source_anchor: RFC.md:1238
+  source_anchor: RFC.md:1240
   source_quote: '- expected-value-of-information ranking for reads and tests;'
   source_fingerprint: be9e6252a67c44578ea06c505b0adc8d81508a0774245f35ee858ac412ba86c9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29294,10 +29340,10 @@
   title: Apply safety floors to learned test selection
   atomic_text: Kit uses learned affected-test selection with deterministic safety floors.
   source_section: §29.4 Improve decision efficiency
-  source_anchor: RFC.md:1239
+  source_anchor: RFC.md:1241
   source_quote: '- learned affected-test selection with deterministic safety floors;'
   source_fingerprint: 294c338c6bee565e70812a532c0eedf5f2396ddee1dffb9af6bb4262f7d9f28c
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29340,10 +29386,10 @@
   title: Reserve diverse fan-out for high uncertainty
   atomic_text: Kit uses diverse hypothesis fan-out only for high uncertainty.
   source_section: §29.4 Improve decision efficiency
-  source_anchor: RFC.md:1240
+  source_anchor: RFC.md:1242
   source_quote: '- diverse hypothesis fan-out only for high uncertainty;'
   source_fingerprint: 5aa4d0fa99adde361bafc411ee8f0c805ca24421df3b8df715a3e905d7b43a41
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29386,10 +29432,10 @@
   title: Gate fresh-context review on defect yield
   atomic_text: Kit uses fresh-context review only where defect yield justifies cost.
   source_section: §29.4 Improve decision efficiency
-  source_anchor: RFC.md:1241
+  source_anchor: RFC.md:1243
   source_quote: '- fresh-context review only where its defect yield justifies cost.'
   source_fingerprint: 076da859364e8cfd40e0eb3b8efee3cbbbbf9de4f460c84f0681b47a2eca9dff
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29432,10 +29478,10 @@
   title: Ablate each standing prompt module
   atomic_text: Kit runs an ablation for each standing prompt module.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1313
+  source_anchor: RFC.md:1315
   source_quote: '- each standing prompt module;'
   source_fingerprint: 483f41a2728d87b4f8d9df1685b9320713c28bde95f3bf3396a8b3b7e0499ff7
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29478,10 +29524,10 @@
   title: Ablate retrieval families
   atomic_text: Kit runs ablations for lexical, syntax, semantic, graph, history, and embedding retrieval.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1314
+  source_anchor: RFC.md:1316
   source_quote: '- lexical, syntax, semantic, graph, history, and embedding retrieval;'
   source_fingerprint: c75527daf53e05e8e7fdd200518c8a27e6151efdf5ad7882beb10d75f92f6cf3
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29524,10 +29570,10 @@
   title: Ablate repository-map personalization
   atomic_text: Kit runs static-versus-personalized repository-map ablations.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1315
+  source_anchor: RFC.md:1317
   source_quote: '- static versus personalized repo maps;'
   source_fingerprint: 0060d54b153d84e41096941ce1e672a3efaa861d7193e0b7e72c56c58757ab80
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29570,10 +29616,10 @@
   title: Ablate schema projections
   atomic_text: Kit runs full-JSON-Schema-versus-compact-projection ablations.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1316
+  source_anchor: RFC.md:1318
   source_quote: '- full JSON Schema versus compact projections;'
   source_fingerprint: 596da79dc772e5c8cfa21289f6f734d4409f5b41d696cd773766e197891bc16b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29616,10 +29662,10 @@
   title: Ablate JSON and TOON by payload shape
   atomic_text: Kit runs JSON-versus-TOON ablations by payload shape.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1317
+  source_anchor: RFC.md:1319
   source_quote: '- JSON versus TOON by payload shape;'
   source_fingerprint: e6e4037770197490e0e31d8b86e10741c2f632eae3004d69e66723a5f7c55ff8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29662,10 +29708,10 @@
   title: Ablate tool-use backends
   atomic_text: Kit runs ablations for direct, parallel, Lua, and Runlet tool use.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1318
+  source_anchor: RFC.md:1320
   source_quote: '- direct, parallel, Lua, and Runlet tool use;'
   source_fingerprint: 6240e656e4689e12c6aab3af535f7e0d0816b0d04ccd15535b04b5b5510de0a6
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29708,10 +29754,10 @@
   title: Ablate edit formats and verification flags
   atomic_text: Kit runs ablations for each edit format and verification flag.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1319
+  source_anchor: RFC.md:1321
   source_quote: '- each edit format and verification flag;'
   source_fingerprint: ab25bb92f6ad51e0a3fd5db44e9f82c0b3eda1ad77b9e7e6df5112f7a3e1060e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29754,10 +29800,10 @@
   title: Ablate model and reasoning routing
   atomic_text: Kit runs fixed-versus-routed model-and-reasoning-effort ablations.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1320
+  source_anchor: RFC.md:1322
   source_quote: '- fixed versus routed model/reasoning effort;'
   source_fingerprint: 4fa126fc431b0b8a6abd6f8e3c9b551485134ea60830ab2628a34af3a6941f3e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29800,10 +29846,10 @@
   title: Ablate prompt and infrastructure caches
   atomic_text: Kit runs cold-versus-warm prompt-and-infrastructure-cache ablations.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1321
+  source_anchor: RFC.md:1323
   source_quote: '- cold versus warm prompt and infrastructure caches;'
   source_fingerprint: 91641885780b8c7106f869587cf5745e99c2a99623bfbdb29e285b8e0c48094e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29846,10 +29892,10 @@
   title: Ablate compaction selection
   atomic_text: Kit runs structural-versus-semantic-or-model-selected compaction ablations.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1322
+  source_anchor: RFC.md:1324
   source_quote: '- structural versus semantic/model-selected compaction;'
   source_fingerprint: 1d4712b4692ba7725c6d54b0859245f386d839271705bc6bf3131233cdcd71f1
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29892,10 +29938,10 @@
   title: Ablate execution strategies
   atomic_text: Kit runs ablations for serial, batched, parallel, and speculative execution.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1323
+  source_anchor: RFC.md:1325
   source_quote: '- serial, batched, parallel, and speculative execution;'
   source_fingerprint: 68587d01f24784e1e89e27b22f63e0f18e7d7275f796af2cc417ba0caa2c4843
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -29938,10 +29984,10 @@
   title: Ablate retry, review, and escalation policies
   atomic_text: Kit runs ablations for retry, review, and escalation policies.
   source_section: §30.5 Required ablations
-  source_anchor: RFC.md:1324
+  source_anchor: RFC.md:1326
   source_quote: '- retry, review, and escalation policies.'
   source_fingerprint: 3616890e68216d57f11b2945ca01f82aba4d709ca0f781bdb2d516231489262e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null

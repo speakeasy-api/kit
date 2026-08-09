@@ -4,10 +4,10 @@
   title: Daemon public runtime
   atomic_text: Kit is a daemon and public runtime rather than a client-centric application.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1488
+  source_anchor: RFC.md:1490
   source_quote: 1. Kit is a daemon and public runtime, not a client-centric application.
   source_fingerprint: e2e762a80dd1606bc82e90345376c94acd3cc9584b0d1e0f2abf1917d8b9fd06
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -58,10 +58,10 @@
   title: Agentkit and Kit authority split
   atomic_text: Agentkit supplies active loop primitives and Kit supplies durable product semantics.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1489
+  source_anchor: RFC.md:1491
   source_quote: 2. Agentkit supplies active loop primitives; Kit supplies durable product semantics.
   source_fingerprint: 076e841d58bd0ef40277a2aca38d5f4acb214d42905b4c27ec2d72add5c2cc5f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -113,10 +113,10 @@
   title: Gated Pareto optimization
   atomic_text: Correctness and safety are gates while cost, tokens, and latency are Pareto objectives.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1490
+  source_anchor: RFC.md:1492
   source_quote: 3. Correctness and safety are gates; cost, tokens, and latency are Pareto objectives.
   source_fingerprint: 1034a28f10d9bbe432f1499801a313bf27fb173cc422c8e6835cd876100a79ad
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -167,10 +167,10 @@
   title: Canonical source schemas
   atomic_text: Each capability's source JSON Schema and dialect remain canonical and compact notation is a one-way model projection.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1491
+  source_anchor: RFC.md:1493
   source_quote: 4. Source JSON Schema and dialect remain canonical per capability; compact notation is a one-way model projection.
   source_fingerprint: 96b70261f879bb2190a13074d4bfd28ded22fede9c80798277f0defb1f41f144
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -217,10 +217,10 @@
   title: Native wire formats and adaptive TOON
   atomic_text: Protocols retain native wire representations and TOON is only an adaptive model-context presentation.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1492
+  source_anchor: RFC.md:1494
   source_quote: 5. Each protocol retains its native wire representation; TOON is adaptive model-context presentation only.
   source_fingerprint: ff7271b472f43e475bcb1713af2fdba9cfbf09143006af17405843c2037648cb
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -267,10 +267,10 @@
   title: Hybrid progressive discovery
   atomic_text: Repository discovery is hybrid and progressive and preserves syntax and semantic provenance.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1493
+  source_anchor: RFC.md:1495
   source_quote: 6. Repository discovery is hybrid and progressive, with syntax and semantic provenance preserved.
   source_fingerprint: f779f881d6715010a3b40e6cc9f4c580f371310d035e7b8dba20497b4b17bd75
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -317,10 +317,10 @@
   title: Revisioned staged editing
   atomic_text: Editing is revisioned, staged, conflict-aware, and can include verification in one call.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1494
+  source_anchor: RFC.md:1496
   source_quote: 7. Editing is revisioned, staged, conflict-aware, and optionally verified in one call.
   source_fingerprint: 396c22481725447c40ee00ee71b413d4cfe5530c935a501075eaa63490deb56b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -371,10 +371,10 @@
   title: Deferred dynamic tools
   atomic_text: Dynamic tools use search, inspect, bind, and invoke instead of eager catalog stuffing.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1495
+  source_anchor: RFC.md:1497
   source_quote: 8. Dynamic tools use search, inspect, bind, and invoke rather than eager catalog stuffing.
   source_fingerprint: a841d261ab70db37456ca6c3f1ce01b166ed1f043dbef9a889b1457f0100a515
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -421,10 +421,10 @@
   title: Routed composition
   atomic_text: Composition is routed by task and model rather than universally preferred.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1496
+  source_anchor: RFC.md:1498
   source_quote: 9. Composition is task- and model-routed, not universally preferred.
   source_fingerprint: 1081b54769b532baa8f8e21ece74f25e7a6cd25d632b754943071ccb8310fe40
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -471,10 +471,10 @@
   title: Distinct protocol roles
   atomic_text: ACP handles coding clients and subagents, A2A handles autonomous peers, and MCP handles capabilities.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1497
+  source_anchor: RFC.md:1499
   source_quote: 10. ACP handles coding clients and subagents, A2A handles autonomous peers, and MCP handles capabilities.
   source_fingerprint: 181aaaad398767e7133f058a81bb48006e548b4c451f158af95a17214771d8a0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -521,10 +521,10 @@
   title: Model-selected validated checkpoints
   atomic_text: The model may select semantic checkpoint boundaries while Kit validates summaries against authoritative state.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1498
+  source_anchor: RFC.md:1500
   source_quote: 11. The model may choose semantic checkpoint boundaries, but Kit validates summaries against authoritative state.
   source_fingerprint: 73829269cf316e928237d55e455152628a8b7ae29fd159480f8e7f403f2c951a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -570,10 +570,10 @@
   title: Daemon-owned effect supervision
   atomic_text: Every local process and agent and every remote task relationship is supervised, bounded, observable, and daemon-owned.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1499
+  source_anchor: RFC.md:1501
   source_quote: 12. Every local process/agent and every remote task relationship is supervised, bounded, observable, and owned by the daemon.
   source_fingerprint: 3284993d671ab5873800afc9067b51664e88b75085715d652d0a23dfdbde2789
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -622,10 +622,10 @@
   title: Shared public command/query semantics
   atomic_text: The CLI and every client use the same public command/query semantics.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1500
+  source_anchor: RFC.md:1502
   source_quote: 13. The CLI and all clients use the same public command/query semantics.
   source_fingerprint: 372d132a2bb3c0fbfeddf5e305ba8bd2e675c2bc47695de273d7724c5949fd8d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -679,10 +679,10 @@
   title: Task-level optimization evidence
   atomic_text: Every optimization must survive task-level ablation and production-relevant evaluation.
   source_section: §36 Decisions
-  source_anchor: RFC.md:1501
+  source_anchor: RFC.md:1503
   source_quote: 14. Every optimization must survive task-level ablation and production-relevant evaluation.
   source_fingerprint: a395ea9a1e08225d17bf508d22e12c69186b5c1188f735ed9393f052b9550416
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null

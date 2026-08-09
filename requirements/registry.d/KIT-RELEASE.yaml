@@ -4,10 +4,10 @@
   title: Milestone 001 deliverable
   atomic_text: Milestone 001 delivers domain IDs/events, embedded store, daemon lifecycle, HTTP/SSE, CLI.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1443
+  source_anchor: RFC.md:1445
   source_quote: '| `KIT-MILESTONE-001` | domain IDs/events, embedded store, daemon lifecycle, HTTP/SSE, CLI | restart/replay, idempotency, cursor ordering, backup/restore, auth, and CLI/API parity conformance pass |'
   source_fingerprint: 2a8ebec9fb64338bbade4077e6fd36b403075a04285c184595271cdcfb55a721
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -50,10 +50,10 @@
   title: Milestone 002 deliverable
   atomic_text: Milestone 002 delivers agentkit loop/provider integration, prompt compiler, usage accounting.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1444
+  source_anchor: RFC.md:1446
   source_quote: '| `KIT-MILESTONE-002` | agentkit loop/provider integration, prompt compiler, usage accounting | one prompt streams to completion through a durable run; intent/outcome ordering, cancellation, prompt digest, and core cost envelope pass |'
   source_fingerprint: d0dee040dadff5f8a5f2b7bff907f7ebcf19c8be4fef66d4539ff39127e256b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -96,10 +96,10 @@
   title: Milestone 003 deliverable
   atomic_text: Milestone 003 delivers sandboxed workspace/process ownership and cancellation.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1445
+  source_anchor: RFC.md:1447
   source_quote: '| `KIT-MILESTONE-003` | sandboxed workspace/process ownership and cancellation | restricted process cannot escape filesystem/network/resource policy; whole-tree cancellation and outcome-unknown recovery pass |'
   source_fingerprint: 2aba2247565049640095ebe288398ea2323b889499d97db7f5393347e5cd0898
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -142,10 +142,10 @@
   title: Milestone 004 deliverable
   atomic_text: Milestone 004 delivers lexical discovery, targeted reads, revisioned transactional edits, fast verification.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1446
+  source_anchor: RFC.md:1448
   source_quote: '| `KIT-MILESTONE-004` | lexical discovery, targeted reads, revisioned transactional edits, fast verification | Kit can inspect and safely modify its own repository through CLI/API; conflict, rollback, syntax, formatter, diagnostic, and diff evidence suites pass |'
   source_fingerprint: 4c49ee8ee80f3c14b3e9be7f3879e2ee5819dd5dc18acca07d0eaff66e9e80f8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -188,10 +188,10 @@
   title: Milestone 005 deliverable
   atomic_text: Milestone 005 delivers Tree-sitter, repository maps, LSP, optional graph/SCIP/semantic adapters, affected checks.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1447
+  source_anchor: RFC.md:1449
   source_quote: '| `KIT-MILESTONE-005` | Tree-sitter, repository maps, LSP, optional graph/SCIP/semantic adapters, affected checks | core syntax/LSP localization beats lexical baseline within budget; each optional adapter ships only with incremental value and freshness evidence |'
   source_fingerprint: 4b8afffd00d593900abc05ac33f40a2a05a21b4e5d6b20cd4cd7b44b3504ce0b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -234,10 +234,10 @@
   title: Milestone 006 deliverable
   atomic_text: Milestone 006 delivers capability catalog, MCP broker, dynamic discovery, compact projections.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1448
+  source_anchor: RFC.md:1450
   source_quote: '| `KIT-MILESTONE-006` | capability catalog, MCP broker, dynamic discovery, compact projections | search/inspect/bind/invoke, schema-digest pinning, list-change refresh, auth, and provider projection conformance pass |'
   source_fingerprint: 801dbb089004123ea52af3e3893a785598321621204ab04220ebecca39c3fbc9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -280,10 +280,10 @@
   title: Milestone 007 deliverable
   atomic_text: Milestone 007 delivers compose Lua/Runlet, adaptive TOON, nested policy and tracing.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1449
+  source_anchor: RFC.md:1451
   source_quote: '| `KIT-MILESTONE-007` | compose Lua/Runlet, adaptive TOON, nested policy and tracing | direct/compose routing, nested authorization, cancellation, effect recording, and encoding ablations meet correctness gates |'
   source_fingerprint: 9fb7193036379032dc68c7e2902b37beb5a5805f2e3584f9c10f54529d42f593
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -326,10 +326,10 @@
   title: Milestone 008 deliverable
   atomic_text: Milestone 008 delivers model routing, batching, parallelism, background tasks, speculation.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1450
+  source_anchor: RFC.md:1452
   source_quote: '| `KIT-MILESTONE-008` | model routing, batching, parallelism, background tasks, speculation | budgeted policies beat fixed serial baseline on a preregistered frontier without safety or tail-latency regression |'
   source_fingerprint: afe575417468db824514d14ee484e7ddfcf5c67ab7f32e6a5b5d3819bc17534d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -372,10 +372,10 @@
   title: Milestone 009 deliverable
   atomic_text: Milestone 009 delivers smart `yield` compaction and durable resume.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1451
+  source_anchor: RFC.md:1453
   source_quote: '| `KIT-MILESTONE-009` | smart `yield` compaction and durable resume | checkpoint validation, post-mutation durability, state-transfer, context-pressure fallback, and resume suites pass |'
   source_fingerprint: bbbc6a81d2feb1e98d6ead536f2a8b84d10b1e32b3b6122bd2f44c23852ca216
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -418,10 +418,10 @@
   title: Milestone 010 deliverable
   atomic_text: Milestone 010 delivers ACP clients/subagents, A2A peers, simple observability web app.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1452
+  source_anchor: RFC.md:1454
   source_quote: '| `KIT-MILESTONE-010` | ACP clients/subagents, A2A peers, simple observability web app | protocol conformance, remote lifecycle/cancellation, child workspace isolation, and public-API-only UI pass |'
   source_fingerprint: 7307f7661ce847cd24364e98c4949dfc2c53866695c2ad1651b171097a1ece9f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -464,10 +464,10 @@
   title: Milestone 011 deliverable
   atomic_text: Milestone 011 delivers full benchmark, experiment, shadow, and canary infrastructure.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1453
+  source_anchor: RFC.md:1455
   source_quote: '| `KIT-MILESTONE-011` | full benchmark, experiment, shadow, and canary infrastructure | reproducible harness, hidden/private corpus, statistical report, replay limits, and rollout guardrails pass |'
   source_fingerprint: 66a09f76736be3316da8e3c65579d527f3c73882d654087777e4f97f60f3a96a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -510,10 +510,10 @@
   title: Milestone 012 deliverable
   atomic_text: Milestone 012 delivers clustered storage/executors and hostile multi-tenant isolation.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1454
+  source_anchor: RFC.md:1456
   source_quote: '| `KIT-MILESTONE-012` | clustered storage/executors and hostile multi-tenant isolation | lease/fencing failover, tenant isolation, disaster recovery, quota/fairness, and adversarial sandbox suites pass |'
   source_fingerprint: dd4ef73ecbbe25d0c78d6537490b4ac5a833246cdee38b0ce4f3ac65b6b5a915
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -556,10 +556,10 @@
   title: Dogfoodable milestone contract
   atomic_text: After Milestone 004 a developer can use the daemon and CLI for one end-to-end self-hosted coding run with discovery, safe edits, verification, observability, cancellation, and restart recovery.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1456
+  source_anchor: RFC.md:1458
   source_quote: 'The product becomes **dogfoodable after `KIT-MILESTONE-004`**: a developer can use the daemon and CLI to run one agent against Kit itself, discover code lexically, apply conflict-safe edits, receive fast verification, inspect events/cost/diffs, cancel work, and recover after restart. Later slices improve intelligence, interoperability, optimization, and deployment strength without redefining that core loop.'
   source_fingerprint: b3c88f923aeaf87b1c68b865fcc0c092b1627d54c863cfc2709d1c94f5734a22
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -602,10 +602,10 @@
   title: Evidence defines slice completion
   atomic_text: A delivery slice is complete only when its registered requirements have evidence; code presence or a demo does not establish completion.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1458
+  source_anchor: RFC.md:1460
   source_quote: This is an implementation ordering, not a reduction in product ambition. A slice is complete only when its registered `KIT-*` requirements have evidence; code presence or a demo is insufficient.
   source_fingerprint: 8e09c01eb1a1c1a37321da088466bdd59f219c1b989696712612a1a13eef1eff
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -648,10 +648,10 @@
   title: Milestone 001 acceptance evidence
   atomic_text: Milestone 001 is accepted only when restart/replay, idempotency, cursor ordering, backup/restore, auth, and CLI/API parity conformance pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1443
+  source_anchor: RFC.md:1445
   source_quote: '| `KIT-MILESTONE-001` | domain IDs/events, embedded store, daemon lifecycle, HTTP/SSE, CLI | restart/replay, idempotency, cursor ordering, backup/restore, auth, and CLI/API parity conformance pass |'
   source_fingerprint: 2a8ebec9fb64338bbade4077e6fd36b403075a04285c184595271cdcfb55a721
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -694,10 +694,10 @@
   title: Milestone 002 acceptance evidence
   atomic_text: Milestone 002 is accepted only when one prompt streams to completion through a durable run; intent/outcome ordering, cancellation, prompt digest, and core cost envelope pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1444
+  source_anchor: RFC.md:1446
   source_quote: '| `KIT-MILESTONE-002` | agentkit loop/provider integration, prompt compiler, usage accounting | one prompt streams to completion through a durable run; intent/outcome ordering, cancellation, prompt digest, and core cost envelope pass |'
   source_fingerprint: d0dee040dadff5f8a5f2b7bff907f7ebcf19c8be4fef66d4539ff39127e256b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -740,10 +740,10 @@
   title: Milestone 003 acceptance evidence
   atomic_text: Milestone 003 is accepted only when restricted process cannot escape filesystem/network/resource policy; whole-tree cancellation and outcome-unknown recovery pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1445
+  source_anchor: RFC.md:1447
   source_quote: '| `KIT-MILESTONE-003` | sandboxed workspace/process ownership and cancellation | restricted process cannot escape filesystem/network/resource policy; whole-tree cancellation and outcome-unknown recovery pass |'
   source_fingerprint: 2aba2247565049640095ebe288398ea2323b889499d97db7f5393347e5cd0898
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -786,10 +786,10 @@
   title: Milestone 004 acceptance evidence
   atomic_text: Milestone 004 is accepted only when Kit can inspect and safely modify its own repository through CLI/API; conflict, rollback, syntax, formatter, diagnostic, and diff evidence suites pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1446
+  source_anchor: RFC.md:1448
   source_quote: '| `KIT-MILESTONE-004` | lexical discovery, targeted reads, revisioned transactional edits, fast verification | Kit can inspect and safely modify its own repository through CLI/API; conflict, rollback, syntax, formatter, diagnostic, and diff evidence suites pass |'
   source_fingerprint: 4c49ee8ee80f3c14b3e9be7f3879e2ee5819dd5dc18acca07d0eaff66e9e80f8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -832,10 +832,10 @@
   title: Milestone 005 acceptance evidence
   atomic_text: Milestone 005 is accepted only when core syntax/LSP localization beats lexical baseline within budget; each optional adapter ships only with incremental value and freshness evidence.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1447
+  source_anchor: RFC.md:1449
   source_quote: '| `KIT-MILESTONE-005` | Tree-sitter, repository maps, LSP, optional graph/SCIP/semantic adapters, affected checks | core syntax/LSP localization beats lexical baseline within budget; each optional adapter ships only with incremental value and freshness evidence |'
   source_fingerprint: 4b8afffd00d593900abc05ac33f40a2a05a21b4e5d6b20cd4cd7b44b3504ce0b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -878,10 +878,10 @@
   title: Milestone 006 acceptance evidence
   atomic_text: Milestone 006 is accepted only when search/inspect/bind/invoke, schema-digest pinning, list-change refresh, auth, and provider projection conformance pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1448
+  source_anchor: RFC.md:1450
   source_quote: '| `KIT-MILESTONE-006` | capability catalog, MCP broker, dynamic discovery, compact projections | search/inspect/bind/invoke, schema-digest pinning, list-change refresh, auth, and provider projection conformance pass |'
   source_fingerprint: 801dbb089004123ea52af3e3893a785598321621204ab04220ebecca39c3fbc9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -924,10 +924,10 @@
   title: Milestone 007 acceptance evidence
   atomic_text: Milestone 007 is accepted only when direct/compose routing, nested authorization, cancellation, effect recording, and encoding ablations meet correctness gates.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1449
+  source_anchor: RFC.md:1451
   source_quote: '| `KIT-MILESTONE-007` | compose Lua/Runlet, adaptive TOON, nested policy and tracing | direct/compose routing, nested authorization, cancellation, effect recording, and encoding ablations meet correctness gates |'
   source_fingerprint: 9fb7193036379032dc68c7e2902b37beb5a5805f2e3584f9c10f54529d42f593
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -970,10 +970,10 @@
   title: Milestone 008 acceptance evidence
   atomic_text: Milestone 008 is accepted only when budgeted policies beat fixed serial baseline on a preregistered frontier without safety or tail-latency regression.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1450
+  source_anchor: RFC.md:1452
   source_quote: '| `KIT-MILESTONE-008` | model routing, batching, parallelism, background tasks, speculation | budgeted policies beat fixed serial baseline on a preregistered frontier without safety or tail-latency regression |'
   source_fingerprint: afe575417468db824514d14ee484e7ddfcf5c67ab7f32e6a5b5d3819bc17534d
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -1016,10 +1016,10 @@
   title: Milestone 009 acceptance evidence
   atomic_text: Milestone 009 is accepted only when checkpoint validation, post-mutation durability, state-transfer, context-pressure fallback, and resume suites pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1451
+  source_anchor: RFC.md:1453
   source_quote: '| `KIT-MILESTONE-009` | smart `yield` compaction and durable resume | checkpoint validation, post-mutation durability, state-transfer, context-pressure fallback, and resume suites pass |'
   source_fingerprint: bbbc6a81d2feb1e98d6ead536f2a8b84d10b1e32b3b6122bd2f44c23852ca216
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -1062,10 +1062,10 @@
   title: Milestone 010 acceptance evidence
   atomic_text: Milestone 010 is accepted only when protocol conformance, remote lifecycle/cancellation, child workspace isolation, and public-API-only UI pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1452
+  source_anchor: RFC.md:1454
   source_quote: '| `KIT-MILESTONE-010` | ACP clients/subagents, A2A peers, simple observability web app | protocol conformance, remote lifecycle/cancellation, child workspace isolation, and public-API-only UI pass |'
   source_fingerprint: 7307f7661ce847cd24364e98c4949dfc2c53866695c2ad1651b171097a1ece9f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -1108,10 +1108,10 @@
   title: Milestone 011 acceptance evidence
   atomic_text: Milestone 011 is accepted only when reproducible harness, hidden/private corpus, statistical report, replay limits, and rollout guardrails pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1453
+  source_anchor: RFC.md:1455
   source_quote: '| `KIT-MILESTONE-011` | full benchmark, experiment, shadow, and canary infrastructure | reproducible harness, hidden/private corpus, statistical report, replay limits, and rollout guardrails pass |'
   source_fingerprint: 66a09f76736be3316da8e3c65579d527f3c73882d654087777e4f97f60f3a96a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -1154,10 +1154,10 @@
   title: Milestone 012 acceptance evidence
   atomic_text: Milestone 012 is accepted only when lease/fencing failover, tenant isolation, disaster recovery, quota/fairness, and adversarial sandbox suites pass.
   source_section: §34 Delivery Architecture
-  source_anchor: RFC.md:1454
+  source_anchor: RFC.md:1456
   source_quote: '| `KIT-MILESTONE-012` | clustered storage/executors and hostile multi-tenant isolation | lease/fencing failover, tenant isolation, disaster recovery, quota/fairness, and adversarial sandbox suites pass |'
   source_fingerprint: dd4ef73ecbbe25d0c78d6537490b4ac5a833246cdee38b0ce4f3ac65b6b5a915
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null

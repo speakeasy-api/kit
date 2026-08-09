@@ -4,13 +4,13 @@
   title: Evaluate continuous batching for self-hosted models
   atomic_text: Kit should evaluate continuous batching when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1245-1247
+  source_anchor: RFC.md:1247-1249
   source_quote: 'When Kit operates self-hosted models, it SHOULD evaluate:
 
 
     - continuous batching,'
   source_fingerprint: 9e6f14dd0dfd08da5c11a7ce8d3f5dde3a08989fb55963d66b457d5bf7db91da
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -53,10 +53,10 @@
   title: Evaluate paged KV-cache allocation
   atomic_text: Kit should evaluate paged KV-cache allocation when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1248
+  source_anchor: RFC.md:1250
   source_quote: '- paged KV-cache allocation,'
   source_fingerprint: 42d47cd6eb70a367b5b52c780972fa175276acb12173c8ce279c7054323f1afe
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -99,10 +99,10 @@
   title: Evaluate automatic prefix caching
   atomic_text: Kit should evaluate automatic prefix caching when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1249
+  source_anchor: RFC.md:1251
   source_quote: '- automatic prefix caching,'
   source_fingerprint: 3c6144802e45e7d92ec080c3a96511d50b63a3254c9100dd60f634c351c92e9b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -145,10 +145,10 @@
   title: Evaluate grouped-query attention
   atomic_text: Kit should evaluate grouped-query attention when it operates a compatible self-hosted model.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1250
+  source_anchor: RFC.md:1252
   source_quote: '- grouped-query and quantized KV where model-compatible,'
   source_fingerprint: fb8f7deaf3f86fbfc2f1c23a1c76e2bde67f9ecbc6ab81f5d7a1fb5cd5c155da
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -191,10 +191,10 @@
   title: Evaluate quantized KV cache
   atomic_text: Kit should evaluate quantized KV cache when it operates a compatible self-hosted model.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1250
+  source_anchor: RFC.md:1252
   source_quote: '- grouped-query and quantized KV where model-compatible,'
   source_fingerprint: fb8f7deaf3f86fbfc2f1c23a1c76e2bde67f9ecbc6ab81f5d7a1fb5cd5c155da
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -237,10 +237,10 @@
   title: Evaluate speculative decoding
   atomic_text: Kit should evaluate speculative decoding when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1251
+  source_anchor: RFC.md:1253
   source_quote: '- speculative decoding,'
   source_fingerprint: 2aebd18713ce582ce8deb9e6646fb66469a4a904bc7064bbf49742d58db2dcd0
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -283,10 +283,10 @@
   title: Evaluate prompt-prefix sharing
   atomic_text: Kit should evaluate prompt-prefix sharing across workers when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1252
+  source_anchor: RFC.md:1254
   source_quote: '- prompt-prefix sharing across workers,'
   source_fingerprint: f7e802885e6280fc72d3b07b3c53d0216378f8172671a4eaf811168f9e535476
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -329,10 +329,10 @@
   title: Evaluate prefill and decode disaggregation
   atomic_text: Kit should evaluate prefill/decode disaggregation when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1253
+  source_anchor: RFC.md:1255
   source_quote: '- prefill/decode disaggregation,'
   source_fingerprint: ce5a3eb9e985b363c22ce909162024ac692ef1c3efb2f1688159318a132211d3
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -375,10 +375,10 @@
   title: Evaluate sequence-length admission control
   atomic_text: Kit should evaluate admission control by predicted sequence length when it operates self-hosted models.
   source_section: §29.5 Self-hosted inference
-  source_anchor: RFC.md:1254
+  source_anchor: RFC.md:1256
   source_quote: '- admission control by predicted sequence length.'
   source_fingerprint: a8475d312fd68625867d9f1006aa5d5ffd82524028990d23dbcb6b573d54f71b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -421,10 +421,10 @@
   title: Pin SWE-bench Verified dataset releases
   atomic_text: Public coverage should include pinned SWE-bench Verified dataset releases.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: Public coverage SHOULD include pinned dataset and harness releases of SWE-bench Verified and Multilingual
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -467,10 +467,10 @@
   title: Pin SWE-bench Verified harness releases
   atomic_text: Public coverage should include pinned SWE-bench Verified harness releases.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: Public coverage SHOULD include pinned dataset and harness releases of SWE-bench Verified and Multilingual
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -513,10 +513,10 @@
   title: Pin SWE-bench Multilingual dataset releases
   atomic_text: Public coverage should include pinned SWE-bench Multilingual dataset releases.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: Public coverage SHOULD include pinned dataset and harness releases of SWE-bench Verified and Multilingual
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -559,10 +559,10 @@
   title: Pin SWE-bench Multilingual harness releases
   atomic_text: Public coverage should include pinned SWE-bench Multilingual harness releases.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: Public coverage SHOULD include pinned dataset and harness releases of SWE-bench Verified and Multilingual
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -605,10 +605,10 @@
   title: Include SWE-bench-Live coverage
   atomic_text: Public coverage should include separately maintained SWE-bench-Live for recent tasks.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: separately maintained SWE-bench-Live for recent tasks
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -651,10 +651,10 @@
   title: Include SWE-bench Multimodal for image-capable configurations
   atomic_text: Public coverage should include SWE-bench Multimodal for image-capable configurations.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: SWE-bench Multimodal for image-capable configurations
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -697,10 +697,10 @@
   title: Include Terminal-Bench 2.1
   atomic_text: Public coverage should include Terminal-Bench 2.1 for terminal competence.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: Terminal-Bench 2.1 for terminal competence
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -743,10 +743,10 @@
   title: Include task-specific public benchmarks when applicable
   atomic_text: Public coverage should include task-specific benchmarks where appropriate.
   source_section: §30.2 Evaluation portfolio
-  source_anchor: RFC.md:1280
+  source_anchor: RFC.md:1282
   source_quote: and task-specific benchmarks where appropriate.
   source_fingerprint: 69601e6390ae2e2a118a819c6ab4f9c5d6fc57d6a9f6726cc8e90c610d1e07b8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -789,10 +789,10 @@
   title: Tool count is not a correctness proxy
   atomic_text: Kit must not optimize tool count as if it were correctness.
   source_section: §30.10 Reward-hacking defenses
-  source_anchor: RFC.md:1358
+  source_anchor: RFC.md:1360
   source_quote: Kit MUST NOT optimize tool count, changed lines, tests run, speed, or token count as if any were correctness.
   source_fingerprint: 8e792ab798695f42c70acf4af640dce3cecce704889c76a7fa35c18b2067b5a9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -835,10 +835,10 @@
   title: Changed-line count is not a correctness proxy
   atomic_text: Kit must not optimize changed-line count as if it were correctness.
   source_section: §30.10 Reward-hacking defenses
-  source_anchor: RFC.md:1358
+  source_anchor: RFC.md:1360
   source_quote: Kit MUST NOT optimize tool count, changed lines, tests run, speed, or token count as if any were correctness.
   source_fingerprint: 8e792ab798695f42c70acf4af640dce3cecce704889c76a7fa35c18b2067b5a9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -881,10 +881,10 @@
   title: Test-run count is not a correctness proxy
   atomic_text: Kit must not optimize tests-run count as if it were correctness.
   source_section: §30.10 Reward-hacking defenses
-  source_anchor: RFC.md:1358
+  source_anchor: RFC.md:1360
   source_quote: Kit MUST NOT optimize tool count, changed lines, tests run, speed, or token count as if any were correctness.
   source_fingerprint: 8e792ab798695f42c70acf4af640dce3cecce704889c76a7fa35c18b2067b5a9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -927,10 +927,10 @@
   title: Speed is not a correctness proxy
   atomic_text: Kit must not optimize speed as if it were correctness.
   source_section: §30.10 Reward-hacking defenses
-  source_anchor: RFC.md:1358
+  source_anchor: RFC.md:1360
   source_quote: Kit MUST NOT optimize tool count, changed lines, tests run, speed, or token count as if any were correctness.
   source_fingerprint: 8e792ab798695f42c70acf4af640dce3cecce704889c76a7fa35c18b2067b5a9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -973,10 +973,10 @@
   title: Token count is not a correctness proxy
   atomic_text: Kit must not optimize token count as if it were correctness.
   source_section: §30.10 Reward-hacking defenses
-  source_anchor: RFC.md:1358
+  source_anchor: RFC.md:1360
   source_quote: Kit MUST NOT optimize tool count, changed lines, tests run, speed, or token count as if any were correctness.
   source_fingerprint: 8e792ab798695f42c70acf4af640dce3cecce704889c76a7fa35c18b2067b5a9
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null

@@ -385,12 +385,16 @@ fn req_lint_rejects_mutated_source_revision() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let inventory = temp_path("source-revision.yaml");
     let original = fs::read_to_string(root.join("requirements/source-inventory.yaml")).unwrap();
+    let start = original
+        .find("source_revision: ")
+        .expect("inventory records a source_revision");
+    let end = start + original[start..].find('\n').expect("source_revision line ends");
     fs::write(
         &inventory,
-        original.replacen(
-            "source_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a",
-            "source_revision: 0000000000000000000000000000000000000000",
-            1,
+        format!(
+            "{}source_revision: 0000000000000000000000000000000000000000{}",
+            &original[..start],
+            &original[end..]
         ),
     )
     .unwrap();

@@ -4,23 +4,23 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 
 ## Coverage
 
-- Registry records: 1038
-- Inventory mappings: 1037
+- Registry records: 1039
+- Inventory mappings: 1038
 - RFC sections: 37/37
-- Historical IDs: 1038
+- Historical IDs: 1039
 - Unmapped registry records: 0
-- Architectural promises resolved: 256/655
+- Architectural promises resolved: 256/656
 
 ## Record Classes
 
 - decision: 14
-- promise: 655
+- promise: 656
 - requirement: 346
 - risk: 23
 
 ## Lifecycle
 
-- active: 83
+- active: 84
 - implemented: 393
 - mitigated: 6
 - proposed: 555
@@ -28,13 +28,13 @@ Generated deterministically from `requirements/registry.d/` and `requirements/so
 
 ## Applicability
 
-- mandatory: 1003
+- mandatory: 1004
 - pending_voi: 35
 
 ## Evidence
 
 - pass: 343
-- pending: 695
+- pending: 696
 
 ## Release Gate
 

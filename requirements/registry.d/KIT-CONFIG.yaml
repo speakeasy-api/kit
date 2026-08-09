@@ -4,10 +4,10 @@
   title: Built-in configuration layer
   atomic_text: Built-in safe defaults are the first configuration layer.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1365
+  source_anchor: RFC.md:1367
   source_quote: built-in safe defaults
   source_fingerprint: 737b25615404c885ec530cf9d646400e46c532a8f3247bb32e756cc93b37ab82
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -55,10 +55,10 @@
   title: User configuration layer
   atomic_text: User configuration overlays built-in defaults.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1366
+  source_anchor: RFC.md:1368
   source_quote: user configuration
   source_fingerprint: 259b7cb96e7ff079b0d9500bc5860fc7dc015078f3eb91ca7174cd6ef2794a78
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -106,10 +106,10 @@
   title: Project configuration layer
   atomic_text: Project configuration overlays user configuration.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1367
+  source_anchor: RFC.md:1369
   source_quote: project configuration
   source_fingerprint: ac973a1794bafe1e9b26e1ed31571664c0b5004a96d81ab685014359366ad597
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -157,10 +157,10 @@
   title: Run override configuration layer
   atomic_text: Thread and run overrides overlay project configuration.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1368
+  source_anchor: RFC.md:1370
   source_quote: thread/run overrides
   source_fingerprint: 0083f89a091194d192017a7ce83f3b6e54cdcd524ffb01510996b18fa6d9ff7b
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -208,10 +208,10 @@
   title: Experiment configuration layer
   atomic_text: Experiment assignment is the final configuration layer.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1369
+  source_anchor: RFC.md:1371
   source_quote: experiment assignment
   source_fingerprint: 8ccf85ea5a7927181565884ef79197a78984d4ac0ae6915d27de306736496f91
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -259,10 +259,10 @@
   title: Configuration cannot expand authority
   atomic_text: Later configuration layers cannot expand authority beyond authenticated principal grants.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1372
+  source_anchor: RFC.md:1374
   source_quote: Later layers cannot expand security authority beyond the authenticated principal’s grants. Every effective configuration is materialized with a digest on the run.
   source_fingerprint: 5292679d76cb9f7dcead998e1479c0e2c240e841c4dfb6c16406063f1cc07c7f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -310,10 +310,10 @@
   title: Effective configuration digest
   atomic_text: Every run materializes its effective configuration with a digest.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1372
+  source_anchor: RFC.md:1374
   source_quote: Later layers cannot expand security authority beyond the authenticated principal’s grants. Every effective configuration is materialized with a digest on the run.
   source_fingerprint: 5292679d76cb9f7dcead998e1479c0e2c240e841c4dfb6c16406063f1cc07c7f
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -361,10 +361,10 @@
   title: Model adapter extension
   atomic_text: Extensions can provide model adapters through agentkit.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1376
+  source_anchor: RFC.md:1378
   source_quote: '- model adapters through agentkit,'
   source_fingerprint: bc3ac60930f393fcb5045430ceda5584574fdac8384fc0551b08aad37d578669
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -413,10 +413,10 @@
   title: Capability provider extension
   atomic_text: Extensions can provide native capability providers.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1377
+  source_anchor: RFC.md:1379
   source_quote: '- native capability providers,'
   source_fingerprint: b05e99443c6d7437a4a77e610d3ec06575723093e246b0882e914c6b50a4ac5e
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -463,10 +463,10 @@
   title: MCP extension
   atomic_text: Extensions can provide MCP servers.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1378
+  source_anchor: RFC.md:1380
   source_quote: '- MCP servers,'
   source_fingerprint: 10c7baac37a11b1b264ff5bbd63553cc9ec45845423547c2e58f527ca23b9048
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -514,10 +514,10 @@
   title: ACP extension
   atomic_text: Extensions can provide ACP subagents and clients.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1379
+  source_anchor: RFC.md:1381
   source_quote: '- ACP subagents and clients,'
   source_fingerprint: 3f69b6e1e86162ae1db79f473135075e1d83f6e3d85d2821aa453bd452aa362a
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -561,10 +561,10 @@
   title: A2A extension
   atomic_text: Extensions can provide A2A peers and skills.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1380
+  source_anchor: RFC.md:1382
   source_quote: '- A2A peers and skills,'
   source_fingerprint: 9aecef9a6a181af9b20a9cc34a34211fabc0a2591f6a26ffd76c7b879f139980
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -608,10 +608,10 @@
   title: Repository adapter extension
   atomic_text: Extensions can provide repository language and index adapters.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1381
+  source_anchor: RFC.md:1383
   source_quote: '- repository language/index adapters,'
   source_fingerprint: 610660c88fba84f6c9c355dcd4bd953c61b756dd03a899e9db033b9d0cd83dba
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -655,10 +655,10 @@
   title: Edit verifier extension
   atomic_text: Extensions can provide edit and verification adapters.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1382
+  source_anchor: RFC.md:1384
   source_quote: '- edit and verification adapters,'
   source_fingerprint: 732a33b79f6e6bce219265a6e5fb93bf099edd012f8fe85e716416ec219b5c17
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -702,10 +702,10 @@
   title: Prompt policy extension
   atomic_text: Extensions can provide prompt modules and policies.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1383
+  source_anchor: RFC.md:1385
   source_quote: '- prompt modules and policies,'
   source_fingerprint: f332411619c17209586b373916477920e7f81866e802a58620ae495ca81e0121
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: implemented
   supersedes: null
   tombstone_reason: null
@@ -754,10 +754,10 @@
   title: Executor extension
   atomic_text: Extensions can provide executor backends.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1384
+  source_anchor: RFC.md:1386
   source_quote: '- executor backends,'
   source_fingerprint: e8a63f389b9f1f930d7253e5a18d273021a3459f05850c3925dddd5be783eb45
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -801,10 +801,10 @@
   title: Cost experiment extension
   atomic_text: Extensions can provide cost tables and experiment policies.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1385
+  source_anchor: RFC.md:1387
   source_quote: '- cost tables and experiment policies.'
   source_fingerprint: 73242732413365ee671169ae57a560c0ef26650039211d34fce7677cbfb7e4e8
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: proposed
   supersedes: null
   tombstone_reason: null
@@ -848,10 +848,10 @@
   title: In-process plugins trusted
   atomic_text: In-process plugins are treated as trusted code.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1387
+  source_anchor: RFC.md:1389
   source_quote: In-process plugins are trusted code. Untrusted extensions run out of process through MCP, ACP, A2A, or a narrow Kit plugin protocol under sandbox policy.
   source_fingerprint: 63a239d7364dce0a7f6757651bd7604e709376daa35821e0146f0ae810957778
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null
@@ -901,10 +901,10 @@
   title: Untrusted extensions out of process
   atomic_text: Untrusted extensions run out of process through MCP, ACP, A2A, or a narrow sandboxed plugin protocol.
   source_section: §31 Configuration and Extensibility
-  source_anchor: RFC.md:1387
+  source_anchor: RFC.md:1389
   source_quote: In-process plugins are trusted code. Untrusted extensions run out of process through MCP, ACP, A2A, or a narrow Kit plugin protocol under sandbox policy.
   source_fingerprint: 63a239d7364dce0a7f6757651bd7604e709376daa35821e0146f0ae810957778
-  introduced_revision: f1893b56e9fba01fcf49c64c3cdf65dfdc7c253a
+  introduced_revision: 2f06944a95085395e5d5ec0db1dd1543ef784f3b
   status: active
   supersedes: null
   tombstone_reason: null

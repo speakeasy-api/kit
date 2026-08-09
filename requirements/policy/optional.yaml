@@ -77,7 +77,7 @@ mechanisms:
   requirement_id: KIT-ENCODE-803
 - id: self-hosted-inference-profile
   name: Self-hosted inference profile
-  source: RFC.md:1243-1245
+  source: RFC.md:1245-1247
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-SELF-HOSTED-PROFILE
@@ -87,7 +87,7 @@ mechanisms:
   requirement_id: KIT-EVAL-825
 - id: self-hosted-continuous-batching
   name: Continuous batching
-  source: RFC.md:1245-1247
+  source: RFC.md:1247-1249
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-CONTINUOUS-BATCHING
@@ -97,7 +97,7 @@ mechanisms:
   requirement_id: KIT-EVAL-001
 - id: self-hosted-paged-kv
   name: Paged KV-cache allocation
-  source: RFC.md:1248
+  source: RFC.md:1250
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-PAGED-KV
@@ -107,7 +107,7 @@ mechanisms:
   requirement_id: KIT-EVAL-002
 - id: self-hosted-automatic-prefix-cache
   name: Automatic prefix caching
-  source: RFC.md:1249
+  source: RFC.md:1251
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-AUTOMATIC-PREFIX-CACHE
@@ -117,7 +117,7 @@ mechanisms:
   requirement_id: KIT-EVAL-003
 - id: self-hosted-grouped-query-kv
   name: Grouped-query KV optimization
-  source: RFC.md:1250
+  source: RFC.md:1252
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-GROUPED-QUERY-KV
@@ -127,7 +127,7 @@ mechanisms:
   requirement_id: KIT-EVAL-004
 - id: self-hosted-quantized-kv
   name: Quantized KV cache
-  source: RFC.md:1250
+  source: RFC.md:1252
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-QUANTIZED-KV
@@ -137,7 +137,7 @@ mechanisms:
   requirement_id: KIT-EVAL-005
 - id: self-hosted-speculative-decoding
   name: Speculative decoding
-  source: RFC.md:1251
+  source: RFC.md:1253
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-SPECULATIVE-DECODING
@@ -147,7 +147,7 @@ mechanisms:
   requirement_id: KIT-EVAL-006
 - id: self-hosted-prefix-sharing
   name: Prompt-prefix sharing across workers
-  source: RFC.md:1252
+  source: RFC.md:1254
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-PREFIX-SHARING
@@ -157,7 +157,7 @@ mechanisms:
   requirement_id: KIT-EVAL-007
 - id: self-hosted-prefill-decode-disaggregation
   name: Prefill and decode disaggregation
-  source: RFC.md:1253
+  source: RFC.md:1255
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-PREFILL-DECODE-DISAGGREGATION
@@ -167,7 +167,7 @@ mechanisms:
   requirement_id: KIT-EVAL-008
 - id: self-hosted-sequence-admission
   name: Admission control by predicted sequence length
-  source: RFC.md:1254
+  source: RFC.md:1256
   gate: G12
   disposition: pending_voi
   experiment_id: EXP-M012-W12-SEQUENCE-ADMISSION

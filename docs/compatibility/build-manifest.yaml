@@ -1,5 +1,5 @@
 schema_version: 1
-source_rfc_sha256: "ed988c75a8c3798c6f8967f51ced0f374ab15b81b800349d54a4894766daa6d4"
+source_rfc_sha256: "7e36e05d308653526c27b17ff736579d4fe2cd5944f5c5cad5372a0b00303ba9"
 recorded_at_utc: "2026-08-02"
 
 # A blocked record is an honest observation, not a usable build pin. Its
