@@ -375,6 +375,7 @@ pub struct DaemonConfig {
     pub native_diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
     pub native_feedback_limits: crate::verify::feedback::FeedbackLimits,
     pub native_edit_validation_time: Duration,
+    pub native_approval_policy: crate::agent::executor::NativeApprovalPolicy,
     native_config_error: Option<String>,
     model_config_error: Option<String>,
     mcp_config_error: Option<String>,
@@ -470,21 +471,24 @@ impl DaemonConfig {
             verification_registry,
             native_diagnostic_adapters,
             native_edit_validation_time,
+            native_approval_policy,
             native_config_error,
         ) = match native_config {
-            Ok(Some((registry, adapters, validation_time))) => {
-                (registry, adapters, validation_time, None)
+            Ok(Some((registry, adapters, validation_time, approval_policy))) => {
+                (registry, adapters, validation_time, approval_policy, None)
             }
             Ok(None) => (
                 crate::verify::profiles::VerificationRegistry::empty(),
                 BTreeMap::new(),
                 crate::workspace::edit::ir::EditLimits::default().max_validation_time,
+                crate::agent::executor::NativeApprovalPolicy::default(),
                 None,
             ),
             Err(error) => (
                 crate::verify::profiles::VerificationRegistry::empty(),
                 BTreeMap::new(),
                 crate::workspace::edit::ir::EditLimits::default().max_validation_time,
+                crate::agent::executor::NativeApprovalPolicy::default(),
                 Some(error),
             ),
         };
@@ -512,6 +516,7 @@ impl DaemonConfig {
             native_diagnostic_adapters,
             native_feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
             native_edit_validation_time,
+            native_approval_policy,
             native_config_error,
             model_config_error,
             mcp_config_error,
@@ -775,6 +780,8 @@ fn parse_provider(value: &str) -> Option<ConfigProvider> {
 struct TrustedNativeConfig {
     version: u16,
     edit_validation_wall_time_millis: u64,
+    #[serde(default)]
+    approval_policy: crate::agent::executor::NativeApprovalPolicy,
     checks: Vec<TrustedCheck>,
 }
 
@@ -802,6 +809,7 @@ type TrustedNativeServices = (
     crate::verify::profiles::VerificationRegistry,
     BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
     Duration,
+    crate::agent::executor::NativeApprovalPolicy,
 );
 
 fn load_native_config(project_root: &Path) -> Result<Option<TrustedNativeServices>, String> {
@@ -859,7 +867,12 @@ fn load_native_config(project_root: &Path) -> Result<Option<TrustedNativeService
     }
     let registry = crate::verify::profiles::VerificationRegistry::new(checks)
         .map_err(|error| format!("trusted native config registry: {error}"))?;
-    Ok(Some((registry, adapters, validation_time)))
+    Ok(Some((
+        registry,
+        adapters,
+        validation_time,
+        config.approval_policy,
+    )))
 }
 
 #[cfg(debug_assertions)]
@@ -1242,6 +1255,7 @@ impl Daemon {
         )
         .with_native_semantic_evidence(native_semantic_evidence.clone())
         .with_native_edit_validation_time(config.native_edit_validation_time)
+        .with_native_approval_policy(config.native_approval_policy)
         .with_capability_extensions(Arc::clone(&capability_extensions))
         .with_mcp_servers(config.mcp_servers);
         if let Some(profiles) = mcp_stdio_profiles {
@@ -1994,6 +2008,79 @@ fn remove_discovery(root: &Path) -> Result<(), DaemonError> {
             .map_err(DaemonError::Io),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(DaemonError::Io(error)),
+    }
+}
+
+#[cfg(test)]
+mod native_config_tests {
+    use super::*;
+
+    fn write_native_config(approval_policy: Option<&str>) -> PathBuf {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "kit-native-config-{}",
+            random.map(|byte| format!("{byte:02x}")).join("")
+        ));
+        fs::create_dir_all(root.join(".kit")).unwrap();
+        let mut config = serde_json::json!({
+            "version": 1,
+            "edit_validation_wall_time_millis": 20_000,
+            "checks": [{
+                "id": "diagnostics",
+                "class": "diagnostics",
+                "requirement": "required",
+                "program": "cargo",
+                "arguments": ["check"],
+                "image": format!("example.com/check@sha256:{}", "a".repeat(64)),
+                "tool_digest": format!("sha256:{}", "b".repeat(64)),
+                "config_digest": format!("sha256:{}", "c".repeat(64)),
+                "resources": {
+                    "cpu_millis": 1000,
+                    "memory_bytes": 268435456,
+                    "pids": 32,
+                    "file_bytes": 16777216,
+                    "disk_bytes": 268435456,
+                    "io_bytes": 67108864,
+                    "output_bytes": 65536,
+                    "wall_time_millis": 600000
+                },
+                "diagnostic_adapter": "normalized_json_lines_v1"
+            }]
+        });
+        if let Some(policy) = approval_policy {
+            config["approval_policy"] = serde_json::json!(policy);
+        }
+        fs::write(
+            root.join(".kit/native.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn native_approval_policy_defaults_to_required() {
+        let root = write_native_config(None);
+        let (_, _, _, policy) = load_native_config(&root).unwrap().unwrap();
+        assert_eq!(policy, crate::agent::executor::NativeApprovalPolicy::Required);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_approval_policy_parses_auto() {
+        let root = write_native_config(Some("auto"));
+        let (_, _, _, policy) = load_native_config(&root).unwrap().unwrap();
+        assert_eq!(policy, crate::agent::executor::NativeApprovalPolicy::Auto);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_approval_policy_rejects_unknown_values() {
+        let root = write_native_config(Some("ask-somebody"));
+        let error = load_native_config(&root).unwrap_err();
+        assert!(error.contains("trusted native config parse"), "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

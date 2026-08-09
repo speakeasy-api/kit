@@ -17,7 +17,7 @@ mod agent_run_tests {
     use kit::{
         agent::executor::{
             FakeBarrierCheckpoint, FakeProvider, FakeProviderBarrier, FakeResponse, FakeScenario,
-            RunExecutor, RunExecutorConfig, SelectedModelAdapter,
+            NativeApprovalPolicy, RunExecutor, RunExecutorConfig, SelectedModelAdapter,
         },
         api::{
             auth::{
@@ -1975,6 +1975,29 @@ mod agent_run_tests {
         assert!(persisted.contains("tool_approval_requested"));
         assert!(!persisted.contains("diff_artifact"));
         assert_eq!(provider.dispatch_count(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_approval_policy_dispatches_native_writes_without_parking() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.root.join("project/src")).unwrap();
+        let source = fixture.root.join("project/src/lib.rs");
+        fs::write(&source, "pub mod existing;\n").unwrap();
+        let provider = Arc::new(FakeProvider::with_scenario(
+            FakeResponse::completed("native coding complete"),
+            FakeScenario::NativeCoding,
+        ));
+        let config = fixture
+            .config(Arc::clone(&provider))
+            .with_native_approval_policy(NativeApprovalPolicy::Auto);
+        let executor = RunExecutor::start(config).unwrap();
+        fixture.wait_for(RunState::Completed).await;
+        executor.shutdown().await.unwrap();
+
+        let persisted = fixture.event_json();
+        assert!(persisted.contains("kit_edit"));
+        assert!(!persisted.contains("tool_approval_requested"));
+        assert!(!persisted.contains("waiting_for_approval"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

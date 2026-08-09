@@ -130,6 +130,17 @@ use crate::agent::extensions::{ExtensionConfigStack, ExtensionRegistry, built_in
 
 pub type SharedWorkerStore = Arc<Mutex<SqliteServiceStore>>;
 
+/// How native workspace-write and process-spawn invocations obtain approval.
+/// `Auto` records the decision as policy-approved instead of parking the run;
+/// it is a project trust setting sourced from the trusted native config.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeApprovalPolicy {
+    #[default]
+    Required,
+    Auto,
+}
+
 pub struct RunExecutorConfig {
     pub database: PathBuf,
     pub artifacts: Arc<ArtifactStore>,
@@ -164,6 +175,7 @@ pub struct RunExecutorConfig {
     native_diagnostic_adapters: BTreeMap<String, crate::verify::feedback::DiagnosticAdapter>,
     native_feedback_limits: crate::verify::feedback::FeedbackLimits,
     native_edit_validation_time: Duration,
+    native_approval_policy: NativeApprovalPolicy,
     pub(crate) native_semantic_evidence:
         crate::capabilities::native::dispatch::NativeSemanticEvidenceStore,
     // Workspace handles for non-terminal runs. A run parked on a durable wait
@@ -227,6 +239,7 @@ impl RunExecutorConfig {
             native_feedback_limits: crate::verify::feedback::FeedbackLimits::default(),
             native_edit_validation_time: crate::workspace::edit::ir::EditLimits::default()
                 .max_validation_time,
+            native_approval_policy: NativeApprovalPolicy::default(),
             native_semantic_evidence:
                 crate::capabilities::native::dispatch::NativeSemanticEvidenceStore::default(),
             run_workspaces: Arc::new(Mutex::new(BTreeMap::new())),
@@ -326,6 +339,11 @@ impl RunExecutorConfig {
 
     pub fn with_native_edit_validation_time(mut self, timeout: Duration) -> Self {
         self.native_edit_validation_time = timeout;
+        self
+    }
+
+    pub fn with_native_approval_policy(mut self, policy: NativeApprovalPolicy) -> Self {
+        self.native_approval_policy = policy;
         self
     }
 
@@ -3012,9 +3030,10 @@ fn tool_adapter(
                 constraints.clone(),
                 descriptor.reservation(),
                 descriptor.retry_safety(),
-                if config
-                    .model_adapter
-                    .deterministic_native_approval(snapshot.effective().provider)
+                if config.native_approval_policy == NativeApprovalPolicy::Auto
+                    || config
+                        .model_adapter
+                        .deterministic_native_approval(snapshot.effective().provider)
                 {
                     ApprovalState::Approved
                 } else {
