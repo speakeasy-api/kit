@@ -437,6 +437,23 @@ impl RegistryEntry {
 pub enum RegistrationOutcome {
     Inserted,
     Existing,
+    /// A trusted daemon-bootstrap registration replaced a stored entry whose
+    /// contract digests no longer match the current build (in-place upgrade of
+    /// a built-in extension). Everything else keeps `ContractConflict`.
+    Superseded,
+}
+
+/// Durable audit record for one in-place upgrade of a built-in extension
+/// contract (`capability.extension.upgraded`). The registry revision bump
+/// persists the new contract; this record carries the digest transition for
+/// the structured audit log emitted by the caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionUpgradeAudit {
+    pub reference: ExtensionReference,
+    pub old_schema_digest: ContentDigest,
+    pub new_schema_digest: ContentDigest,
+    pub old_implementation_digest: ContentDigest,
+    pub new_implementation_digest: ContentDigest,
 }
 
 type RegistryKey = (ExtensionScope, ExtensionReference);
@@ -565,27 +582,52 @@ pub(crate) fn attest_native_extension_durable(
     registry: &SharedCapabilityExtensionRegistry,
     scope: ExtensionScope,
     store: &mut crate::store::sqlite::append::SqliteStore,
-) -> Result<NativeExtensionGuard, RegistryError> {
+) -> Result<(NativeExtensionGuard, Vec<ExtensionUpgradeAudit>), RegistryError> {
     let token = TrustedExtensionToken::daemon_bootstrap();
     let mut current = registry.write().map_err(|_| RegistryError::Unavailable)?;
-    loop {
+    let upgrades = loop {
         current.reconcile(store)?;
         let mut candidate = current.clone();
-        let mut inserted = false;
+        let mut mutated = false;
+        let mut upgrades = Vec::new();
         for contract in built_in_contracts() {
-            inserted |= candidate.register_trusted(&token, scope, contract)?
-                == RegistrationOutcome::Inserted;
+            let key = (scope, contract.reference());
+            let previous = candidate
+                .entries
+                .get(&key)
+                .map(|entry| entry.contract.clone());
+            match candidate.register_trusted(&token, scope, contract)? {
+                RegistrationOutcome::Inserted => mutated = true,
+                RegistrationOutcome::Superseded => {
+                    mutated = true;
+                    let old = previous.expect("superseded entry existed");
+                    let new = candidate
+                        .entries
+                        .get(&key)
+                        .expect("superseding entry is stored")
+                        .contract
+                        .clone();
+                    upgrades.push(ExtensionUpgradeAudit {
+                        reference: key.1,
+                        old_schema_digest: old.schema_digest().clone(),
+                        new_schema_digest: new.schema_digest().clone(),
+                        old_implementation_digest: old.implementation_digest().clone(),
+                        new_implementation_digest: new.implementation_digest().clone(),
+                    });
+                }
+                RegistrationOutcome::Existing => {}
+            }
         }
-        if !inserted {
+        if !mutated {
             current.commit_candidate(candidate);
-            break;
+            break Vec::new();
         }
         if CapabilityExtensionRegistry::persist_candidate(&mut current, candidate, scope, store)? {
-            break;
+            break upgrades;
         }
-    }
+    };
     drop(current);
-    NativeExtensionGuard::new(Arc::clone(registry), scope)
+    Ok((NativeExtensionGuard::new(Arc::clone(registry), scope)?, upgrades))
 }
 
 #[derive(Debug, Default)]
@@ -1282,12 +1324,46 @@ impl CapabilityExtensionRegistry {
         let key = (entry.scope, entry.contract.reference());
         if let Some(existing) = self.entries.get(&key) {
             if existing != &entry {
+                // A rebuild of a built-in extension changes its schema or
+                // implementation digest without changing its reference. Only
+                // the trusted daemon-bootstrap path (`activate_trusted` is set
+                // exclusively by token-gated, build-allowlisted
+                // `register_trusted`) may supersede the stored entry, and only
+                // when the contract stays the same kind and trust
+                // classification and does not downgrade. Everything else keeps
+                // the hard conflict.
+                if activate_trusted && built_in_upgrade_allowed(existing, &entry) {
+                    let mut candidate = self.clone();
+                    candidate.entries.insert(key.clone(), entry);
+                    candidate.trusted_active.insert(key);
+                    candidate.validate_all()?;
+                    // `commit_candidate` revokes the superseded entry's
+                    // lifecycle, so in-flight guards minted under the old
+                    // contract are cancelled, never mixed with the new one.
+                    self.commit_candidate(candidate);
+                    return Ok(RegistrationOutcome::Superseded);
+                }
                 return Err(RegistryError::ContractConflict(entry.contract.reference()));
             }
             if activate_trusted {
                 self.trusted_active.insert(key);
             }
             return Ok(RegistrationOutcome::Existing);
+        }
+        // A trusted registration must not register below an already stored
+        // newer version of the same built-in (an old binary against a state
+        // root touched by a newer kit refuses to boot instead of downgrading).
+        if activate_trusted
+            && self.entries.iter().any(|((scope, reference), existing)| {
+                *scope == entry.scope
+                    && reference.identity == key.1.identity
+                    && reference.version > key.1.version
+                    && existing.contract.kind == entry.contract.kind
+                    && existing.contract.trust == entry.contract.trust
+                    && matches!(existing.state, ExtensionState::Active)
+            })
+        {
+            return Err(RegistryError::ContractConflict(entry.contract.reference()));
         }
         let mut candidate = self.clone();
         candidate.entries.insert(key.clone(), entry);
@@ -1301,14 +1377,14 @@ impl CapabilityExtensionRegistry {
 
     fn commit_candidate(&mut self, mut candidate: Self) {
         for (key, lifecycle) in &self.lifecycle {
+            // Revoke when an active entry stops being active or changes in any
+            // way (an in-place contract upgrade must cancel guards minted
+            // under the previous contract).
             if self
                 .entries
                 .get(key)
                 .is_some_and(|entry| matches!(entry.state, ExtensionState::Active))
-                && candidate
-                    .entries
-                    .get(key)
-                    .is_none_or(|entry| !matches!(entry.state, ExtensionState::Active))
+                && candidate.entries.get(key) != self.entries.get(key)
             {
                 lifecycle.revoke();
             }
@@ -1469,6 +1545,13 @@ pub fn built_in_contracts() -> [ExtensionContract; 2] {
         )
         .expect("static schema projection contract"),
     ]
+}
+
+fn built_in_upgrade_allowed(existing: &RegistryEntry, incoming: &RegistryEntry) -> bool {
+    matches!(existing.state, ExtensionState::Active)
+        && existing.contract.kind == incoming.contract.kind
+        && existing.contract.trust == incoming.contract.trust
+        && incoming.contract.version >= existing.contract.version
 }
 
 fn trusted_build_allowlist(token: &TrustedExtensionToken) -> BTreeSet<ContentDigest> {
@@ -1723,6 +1806,274 @@ mod tests {
         )]))
         .authenticate(&LocalPeerObservation::from_transport(1, 1, 1))
         .unwrap()
+    }
+
+    fn genuine_native_contract() -> ExtensionContract {
+        built_in_contracts()
+            .into_iter()
+            .find(|contract| contract.kind() == ExtensionKind::NativeProvider)
+            .expect("native provider contract exists")
+    }
+
+    /// Simulates the contract a differently built kit binary would have
+    /// registered: same reference, different digests (and optionally a
+    /// different version).
+    fn rebuilt_native_contract(
+        version: Option<&str>,
+        schema_hex: &str,
+        implementation_hex: &str,
+    ) -> ExtensionContract {
+        let mut value = serde_json::to_value(genuine_native_contract()).unwrap();
+        if let Some(version) = version {
+            value["version"] = serde_json::Value::String(version.to_owned());
+        }
+        value["schema_digest"] =
+            serde_json::Value::String(format!("sha256:{}", schema_hex.repeat(32)));
+        value["implementation_digest"] =
+            serde_json::Value::String(format!("sha256:{}", implementation_hex.repeat(32)));
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn active_entry(scope: ExtensionScope, contract: ExtensionContract) -> RegistryEntry {
+        RegistryEntry {
+            scope,
+            contract,
+            state: ExtensionState::Active,
+        }
+    }
+
+    #[test]
+    fn trusted_bootstrap_reregistration_with_changed_digests_supersedes_durably() {
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let scope = ExtensionScope::new(principal, project);
+        let database = std::env::temp_dir().join(format!(
+            "kit-extension-supersede-{}-{project}",
+            std::process::id()
+        ));
+        let service = crate::test_support::open_service_store(&database).unwrap();
+        let mut store = service.worker_append_store().unwrap();
+        let stale = rebuilt_native_contract(None, "11", "22");
+        let mut seeded = CapabilityExtensionRegistry::default();
+        seeded
+            .entries
+            .insert((scope, stale.reference()), active_entry(scope, stale.clone()));
+        seeded.revision = 1;
+        seeded.revisions.insert(scope, 1);
+        let bytes = seeded.scope_bytes(scope).unwrap();
+        assert_eq!(
+            store
+                .persist_extension_registry_snapshot(
+                    principal,
+                    project,
+                    0,
+                    1,
+                    &bytes,
+                    1,
+                    MAX_EXTENSION_ENTRIES,
+                    MAX_EXTENSION_SNAPSHOT_BYTES,
+                )
+                .unwrap(),
+            crate::store::sqlite::append::ExtensionRegistryCommit::Committed
+        );
+
+        let shared = Arc::new(RwLock::new(CapabilityExtensionRegistry::default()));
+        let (guard, upgrades) = attest_native_extension_durable(&shared, scope, &mut store).unwrap();
+        guard.ensure_current().unwrap();
+        let genuine = genuine_native_contract();
+        assert_eq!(
+            upgrades,
+            vec![ExtensionUpgradeAudit {
+                reference: genuine.reference(),
+                old_schema_digest: stale.schema_digest().clone(),
+                new_schema_digest: genuine.schema_digest().clone(),
+                old_implementation_digest: stale.implementation_digest().clone(),
+                new_implementation_digest: genuine.implementation_digest().clone(),
+            }]
+        );
+        {
+            let registry = shared.read().unwrap();
+            let entry = registry
+                .entries
+                .get(&(scope, genuine.reference()))
+                .expect("superseding entry is stored");
+            assert_eq!(entry.contract, genuine);
+            assert!(matches!(entry.state, ExtensionState::Active));
+        }
+        let (revision, snapshots) = store.extension_registry_state().unwrap();
+        assert_eq!(revision, 2);
+        let payload = String::from_utf8(snapshots[0].1.clone()).unwrap();
+        assert!(payload.contains(genuine.implementation_digest().as_str()));
+        assert!(!payload.contains(stale.implementation_digest().as_str()));
+        assert!(!payload.contains(stale.schema_digest().as_str()));
+
+        // Re-attestation after the upgrade is a pure no-op.
+        let (_, upgrades) = attest_native_extension_durable(&shared, scope, &mut store).unwrap();
+        assert!(upgrades.is_empty());
+        assert_eq!(store.extension_registry_state().unwrap().0, 2);
+
+        drop(store);
+        drop(service);
+        let _ = std::fs::remove_file(database);
+    }
+
+    #[tokio::test]
+    async fn trusted_supersede_revokes_the_old_contract_lifecycle() {
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let scope = ExtensionScope::new(principal, project);
+        let stale = rebuilt_native_contract(None, "33", "44");
+        let reference = stale.reference();
+        let shared = Arc::new(RwLock::new(CapabilityExtensionRegistry::default()));
+        {
+            let mut registry = shared.write().unwrap();
+            registry
+                .entries
+                .insert((scope, reference.clone()), active_entry(scope, stale));
+            registry.trusted_active.insert((scope, reference.clone()));
+        }
+        let guard = CapabilityExtensionRegistry::lifecycle_guard(
+            &shared,
+            scope,
+            &reference,
+            ExtensionKind::NativeProvider,
+            TrustClassification::Trusted,
+        )
+        .unwrap();
+        let mut cancelled = guard.cancellation();
+        let token = TrustedExtensionToken::daemon_bootstrap();
+        assert_eq!(
+            shared
+                .write()
+                .unwrap()
+                .register_trusted(&token, scope, genuine_native_contract())
+                .unwrap(),
+            RegistrationOutcome::Superseded
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*cancelled.borrow());
+        assert!(matches!(
+            guard.ensure_current(),
+            Err(RegistryError::Revoked(_))
+        ));
+    }
+
+    #[test]
+    fn trusted_downgrade_below_stored_version_keeps_contract_conflict() {
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let scope = ExtensionScope::new(principal, project);
+        let newer = rebuilt_native_contract(Some("9.9.9"), "55", "66");
+        let mut registry = CapabilityExtensionRegistry::default();
+        registry
+            .entries
+            .insert((scope, newer.reference()), active_entry(scope, newer));
+        let token = TrustedExtensionToken::daemon_bootstrap();
+        assert!(matches!(
+            registry.register_trusted(&token, scope, genuine_native_contract()),
+            Err(RegistryError::ContractConflict(_))
+        ));
+    }
+
+    #[test]
+    fn trusted_supersede_requires_unchanged_kind_trust_and_active_state() {
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let scope = ExtensionScope::new(principal, project);
+        let token = TrustedExtensionToken::daemon_bootstrap();
+        let genuine = genuine_native_contract();
+
+        // Kind change under the same reference keeps the conflict.
+        let mut kind_changed = serde_json::to_value(&genuine).unwrap();
+        kind_changed["kind"] = serde_json::Value::String("schema_projection_adapter".to_owned());
+        kind_changed["implementation_digest"] =
+            serde_json::Value::String(format!("sha256:{}", "77".repeat(32)));
+        let kind_changed: ExtensionContract = serde_json::from_value(kind_changed).unwrap();
+        let mut registry = CapabilityExtensionRegistry::default();
+        registry.entries.insert(
+            (scope, kind_changed.reference()),
+            active_entry(scope, kind_changed),
+        );
+        assert!(matches!(
+            registry.register_trusted(&token, scope, genuine.clone()),
+            Err(RegistryError::ContractConflict(_))
+        ));
+
+        // Trust classification change under the same reference keeps the
+        // conflict.
+        let untrusted_same_reference = ExtensionContract::untrusted(
+            ExtensionKind::NativeProvider,
+            genuine.identity().clone(),
+            genuine.version().clone(),
+            ContentDigest::sha256(b"schema"),
+            ContentDigest::sha256(b"implementation"),
+            genuine.compatibility(),
+            ExtensionProtocol::Mcp,
+            "route-native",
+            ContentDigest::sha256(b"profile").to_string(),
+            ExtensionMetadata::default(),
+        )
+        .unwrap();
+        let mut registry = CapabilityExtensionRegistry::default();
+        registry.entries.insert(
+            (scope, untrusted_same_reference.reference()),
+            active_entry(scope, untrusted_same_reference),
+        );
+        assert!(matches!(
+            registry.register_trusted(&token, scope, genuine.clone()),
+            Err(RegistryError::ContractConflict(_))
+        ));
+
+        // A revoked entry is never resurrected by re-registration.
+        let mut registry = CapabilityExtensionRegistry::default();
+        registry.entries.insert(
+            (scope, genuine.reference()),
+            RegistryEntry {
+                scope,
+                contract: rebuilt_native_contract(None, "88", "99"),
+                state: ExtensionState::Revoked,
+            },
+        );
+        assert!(matches!(
+            registry.register_trusted(&token, scope, genuine),
+            Err(RegistryError::ContractConflict(_))
+        ));
+    }
+
+    #[test]
+    fn untrusted_reregistration_with_changed_contract_keeps_contract_conflict() {
+        let principal = PrincipalId::generate().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let authenticated = authenticated(principal, project);
+        let make = |implementation: &[u8]| {
+            ExtensionContract::untrusted(
+                ExtensionKind::McpServer,
+                ExtensionIdentity::parse("third-party.rebuilt").unwrap(),
+                ExtensionVersion::parse("1.0.0").unwrap(),
+                ContentDigest::sha256(b"schema"),
+                ContentDigest::sha256(implementation),
+                CompatibilityRange::new(
+                    CAPABILITY_EXTENSION_HOST_VERSION,
+                    ContractVersion::new(2, 0, 0),
+                ),
+                ExtensionProtocol::Mcp,
+                "route",
+                ContentDigest::sha256(b"profile").to_string(),
+                ExtensionMetadata::default(),
+            )
+            .unwrap()
+        };
+        let mut registry = CapabilityExtensionRegistry::default();
+        registry
+            .register_untrusted(&authenticated, project, make(b"implementation-a"))
+            .unwrap();
+        assert!(matches!(
+            registry.register_untrusted(&authenticated, project, make(b"implementation-b")),
+            Err(RegistryError::ContractConflict(_))
+        ));
     }
 
     #[test]

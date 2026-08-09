@@ -564,7 +564,9 @@ impl NativeRepoService {
         ));
         let mut extension_store =
             SqliteStore::open(&options.database, authority).map_err(|error| error.to_string())?;
-        let native_extension_guard =
+        // The upgrade audit is emitted where telemetry is available (daemon
+        // boot, run construction); here the durable revision bump suffices.
+        let (native_extension_guard, _extension_upgrades) =
             crate::capabilities::extensions::attest_native_extension_durable(
                 &options.capability_extensions,
                 crate::capabilities::extensions::ExtensionScope::new(

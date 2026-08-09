@@ -1816,6 +1816,187 @@ async fn production_daemon_reaches_tool_input_approval_and_auth_boundaries() {
     daemon.shutdown().await.unwrap();
 }
 
+/// Rewrites every persisted capability-extension registry snapshot so the
+/// built-in native provider carries a stale implementation digest, simulating
+/// a state root produced by a differently built kit binary. Returns the
+/// (genuine, stale) digest pair.
+fn tamper_native_extension_digest(database: &std::path::Path) -> (String, String) {
+    let genuine = kit::capabilities::extensions::built_in_contracts()
+        .into_iter()
+        .find(|contract| {
+            contract.kind() == kit::capabilities::extensions::ExtensionKind::NativeProvider
+        })
+        .unwrap()
+        .implementation_digest()
+        .to_string();
+    let stale = format!("sha256:{}", "ab".repeat(32));
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection.busy_timeout(Duration::from_secs(1)).unwrap();
+    let snapshots = {
+        let mut statement = connection
+            .prepare("SELECT principal_id, project_id, snapshot FROM capability_extension_registry")
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let mut tampered_any = false;
+    for (principal, project, snapshot) in snapshots {
+        let text = String::from_utf8(snapshot).unwrap();
+        if !text.contains(&genuine) {
+            continue;
+        }
+        tampered_any = true;
+        connection
+            .execute(
+                "UPDATE capability_extension_registry SET snapshot=?1
+                 WHERE principal_id=?2 AND project_id=?3",
+                rusqlite::params![text.replace(&genuine, &stale).into_bytes(), principal, project],
+            )
+            .unwrap();
+    }
+    assert!(tampered_any, "boot registered the built-in native contract");
+    (genuine, stale)
+}
+
+fn stored_extension_snapshots(database: &std::path::Path) -> String {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection.busy_timeout(Duration::from_secs(1)).unwrap();
+    let mut statement = connection
+        .prepare("SELECT snapshot FROM capability_extension_registry")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows.into_iter()
+        .map(|snapshot| String::from_utf8(snapshot).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_boots_cleanly_after_built_in_extension_digest_change() {
+    let root = TestRoot::new();
+    let daemon = start_daemon(development_config(&root.0)).await.unwrap();
+    wait_ready(daemon.endpoint()).await;
+    daemon.shutdown().await.unwrap();
+
+    let database = root.0.join("state.sqlite3");
+    let (genuine, stale) = tamper_native_extension_digest(&database);
+    assert!(stored_extension_snapshots(&database).contains(&stale));
+
+    // A binary whose built-in digests differ from the stored contract must
+    // supersede the entry and boot cleanly instead of exiting with
+    // "extension contract conflicts with ...".
+    let restarted = start_daemon(development_config(&root.0)).await.unwrap();
+    wait_ready(restarted.endpoint()).await;
+    restarted.shutdown().await.unwrap();
+
+    let snapshots = stored_extension_snapshots(&database);
+    assert!(snapshots.contains(&genuine));
+    assert!(!snapshots.contains(&stale));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parked_run_resumes_after_built_in_extension_digest_change() {
+    let root = TestRoot::new();
+    let (daemon, discovery, _, run) = start_scenario_run(&root, FakeScenario::Input).await;
+    wait_run_state(
+        daemon.endpoint(),
+        &discovery.credential,
+        &discovery.endpoint,
+        run,
+        "waiting_for_input",
+    )
+    .await;
+    daemon.shutdown().await.unwrap();
+
+    // The run is parked on a durable input wait; simulate a kit upgrade that
+    // changes the built-in native provider digest before the daemon restarts.
+    let database = root.0.join("state.sqlite3");
+    let (_, stale) = tamper_native_extension_digest(&database);
+
+    let project = root.0.join("project");
+    let daemon = start_daemon(
+        DaemonConfig::new(&root.0)
+            .with_development_provider(
+                kit::domain::config::Provider::OpenAi,
+                FakeResponse::completed("daemon scenario complete"),
+                FakeScenario::Input,
+            )
+            .with_project_root(project),
+    )
+    .await
+    .unwrap();
+    wait_ready(daemon.endpoint()).await;
+    let discovery = read_discovery(&root.0).unwrap();
+    let waiting = wait_run_state(
+        daemon.endpoint(),
+        &discovery.credential,
+        &discovery.endpoint,
+        run,
+        "waiting_for_input",
+    )
+    .await;
+    let artifact = ArtifactStore::open(root.0.join("artifacts"))
+        .unwrap()
+        .put(
+            b"resumed after digest change",
+            ArtifactMetadata::new(
+                "text/plain; charset=utf-8",
+                ArtifactClass::File,
+                daemon.principal_id().to_string(),
+                daemon.project_id().to_string(),
+                ArtifactRetention::Forever,
+                now_unix_micros().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut headers = authenticated_headers(
+        &discovery.credential,
+        &discovery.endpoint,
+        "digest-change-input-resolution",
+    );
+    headers.push(("Content-Type", "application/json".to_owned()));
+    headers.push(("Idempotency-Key", "digest-change-input-resolution".to_owned()));
+    let (status, body) = request(
+        daemon.endpoint(),
+        "POST",
+        &format!("/v1/runs/{run}/input"),
+        &headers,
+        &format!(
+            r#"{{"input":"{}","expected_version":{}}}"#,
+            artifact.digest(),
+            waiting["version"]
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // The resumed attempt re-mints its tool bindings from the live catalog
+    // against the superseded (current-build) contract and completes.
+    wait_run_state(
+        daemon.endpoint(),
+        &discovery.credential,
+        &discovery.endpoint,
+        run,
+        "completed",
+    )
+    .await;
+    daemon.shutdown().await.unwrap();
+    assert!(!stored_extension_snapshots(&database).contains(&stale));
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigkill_model_provider_commit_windows_recover_exactly_once() {

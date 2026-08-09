@@ -2906,12 +2906,61 @@ fn tool_adapter(
     })?;
     let native_scope =
         crate::capabilities::extensions::ExtensionScope::new(job.principal_id, job.project_id);
-    let native_extension_guard = crate::capabilities::extensions::attest_native_extension_durable(
-        &config.capability_extensions,
-        native_scope,
-        &mut append_store(config)?,
-    )
-    .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    // Tool bindings are re-minted from the live compiled-in catalog
+    // (`NativeCatalog::all()` below) on every attempt construction, including
+    // the attempt that resumes a run parked on a durable wait: persisted
+    // `binding` payloads in the effect journal are audit snapshots and are
+    // never rehydrated into a `ToolBinding`. A run parked before a built-in
+    // digest change therefore resumes against the refreshed catalog after the
+    // attestation below supersedes the stored contract; no stale descriptor
+    // can be replayed.
+    let (native_extension_guard, extension_upgrades) =
+        crate::capabilities::extensions::attest_native_extension_durable(
+            &config.capability_extensions,
+            native_scope,
+            &mut append_store(config)?,
+        )
+        .map_err(|error| ExecutorError::Worker(error.to_string()))?;
+    if let Some(telemetry) = &config.telemetry {
+        for upgrade in &extension_upgrades {
+            // Best-effort structured audit; the registry revision bump already
+            // recorded the upgrade durably.
+            let _ = telemetry.emit(crate::telemetry::otel::TelemetryItem::Log(
+                crate::telemetry::otel::LogRecord {
+                    timestamp_unix_nanos: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_nanos().min(u128::from(u64::MAX)) as u64)
+                        .unwrap_or_default(),
+                    severity: crate::telemetry::otel::LogSeverity::Info,
+                    body: crate::telemetry::otel::AttributeValue::String(
+                        "capability.extension.upgraded".to_owned(),
+                    ),
+                    attributes: std::collections::BTreeMap::from([
+                        (
+                            "kit.extension.reference".to_owned(),
+                            crate::telemetry::otel::AttributeValue::String(
+                                upgrade.reference.to_string(),
+                            ),
+                        ),
+                        (
+                            "kit.extension.implementation_digest.old".to_owned(),
+                            crate::telemetry::otel::AttributeValue::String(
+                                upgrade.old_implementation_digest.to_string(),
+                            ),
+                        ),
+                        (
+                            "kit.extension.implementation_digest.new".to_owned(),
+                            crate::telemetry::otel::AttributeValue::String(
+                                upgrade.new_implementation_digest.to_string(),
+                            ),
+                        ),
+                    ]),
+                    trace_id: None,
+                    span_id: None,
+                },
+            ));
+        }
+    }
     let (mcp_runtime, mcp_revision, mcp_custody) = mcp.map_or((None, None, None), |value| {
         (Some(value.0), Some(value.1), Some(value.2))
     });

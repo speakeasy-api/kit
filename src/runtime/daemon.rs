@@ -1076,12 +1076,13 @@ impl Daemon {
         .map_err(|error| DaemonError::Setup(error.to_string()))?;
         let capability_extensions: SharedCapabilityExtensionRegistry =
             Arc::new(std::sync::RwLock::new(capability_extensions));
-        crate::capabilities::extensions::attest_native_extension_durable(
-            &capability_extensions,
-            capability_scope,
-            &mut capability_store,
-        )
-        .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        let (_, extension_upgrades) =
+            crate::capabilities::extensions::attest_native_extension_durable(
+                &capability_extensions,
+                capability_scope,
+                &mut capability_store,
+            )
+            .map_err(|error| DaemonError::Setup(error.to_string()))?;
         for contract in built_in_contracts() {
             capability_extensions
                 .read()
@@ -1303,6 +1304,43 @@ impl Daemon {
             .map_err(|error| DaemonError::Setup(error.to_string()))?,
         )));
         let startup_nanos = now_unix_nanos()?;
+        // Built-in extension upgrades happen before the telemetry runtime
+        // exists, so their audit records are emitted here: one structured
+        // `capability.extension.upgraded` log per supersede, alongside the
+        // durable registry revision bump that already persisted the contract.
+        for upgrade in &extension_upgrades {
+            telemetry
+                .emit(TelemetryItem::Log(LogRecord {
+                    timestamp_unix_nanos: startup_nanos,
+                    severity: LogSeverity::Info,
+                    body: AttributeValue::String("capability.extension.upgraded".to_owned()),
+                    attributes: BTreeMap::from([
+                        (
+                            "kit.extension.reference".to_owned(),
+                            AttributeValue::String(upgrade.reference.to_string()),
+                        ),
+                        (
+                            "kit.extension.schema_digest.old".to_owned(),
+                            AttributeValue::String(upgrade.old_schema_digest.to_string()),
+                        ),
+                        (
+                            "kit.extension.schema_digest.new".to_owned(),
+                            AttributeValue::String(upgrade.new_schema_digest.to_string()),
+                        ),
+                        (
+                            "kit.extension.implementation_digest.old".to_owned(),
+                            AttributeValue::String(upgrade.old_implementation_digest.to_string()),
+                        ),
+                        (
+                            "kit.extension.implementation_digest.new".to_owned(),
+                            AttributeValue::String(upgrade.new_implementation_digest.to_string()),
+                        ),
+                    ]),
+                    trace_id: None,
+                    span_id: None,
+                }))
+                .map_err(|error| DaemonError::Setup(error.to_string()))?;
+        }
         telemetry
             .emit(TelemetryItem::Log(LogRecord {
                 timestamp_unix_nanos: startup_nanos,
