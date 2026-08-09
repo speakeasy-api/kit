@@ -7,7 +7,7 @@ mod parser;
 
 pub use client::{
     Client, ClientError, ClientErrorKind, ClientRequest, ClientResponse, EmbeddedClient,
-    MutationRequest, PromptRequest, execute_with_retry,
+    MutationRequest, PromptRequest, execute_with_retry, wait_for_terminal_run,
 };
 pub use command_tree::command as command_tree;
 pub use daemon::{
@@ -16,8 +16,8 @@ pub use daemon::{
 };
 pub use http::{HttpClient, operation_route};
 pub use output::{
-    EXIT_CONFLICT, EXIT_INTERNAL, EXIT_NOT_FOUND, EXIT_OK, EXIT_TRANSPORT, EXIT_USAGE, Output,
-    render_error, render_exec_response, render_response,
+    EXIT_CONFLICT, EXIT_INTERNAL, EXIT_NOT_FOUND, EXIT_OK, EXIT_RUN_FAILED, EXIT_TRANSPORT,
+    EXIT_USAGE, Output, render_error, render_exec_response, render_response,
 };
 pub use parser::{
     CLI_OPERATIONS, Cli, DaemonCommand, Invocation, OperationDescriptor, OutputFormat, ParseError,

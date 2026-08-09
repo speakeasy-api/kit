@@ -1139,7 +1139,8 @@ fn prompt(
                 experiment_config: None,
             },
             request_key(idempotency_key)?,
-        ),
+        )
+        .with_wait(matches.get_flag("wait")),
     ))))
 }
 

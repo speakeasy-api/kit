@@ -8,6 +8,7 @@ use crate::api::{
 use super::{ClientError, ClientErrorKind, ClientResponse, OutputFormat};
 
 pub const EXIT_OK: u8 = 0;
+pub const EXIT_RUN_FAILED: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_NOT_FOUND: u8 = 4;
 pub const EXIT_CONFLICT: u8 = 5;

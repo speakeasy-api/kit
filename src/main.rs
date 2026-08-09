@@ -271,9 +271,48 @@ fn dispatch(
             Err(error) => render_error(&error, format),
         };
     }
-    match execute_with_retry(&mut client, &request, 3)
-        .and_then(|response| render_response(response, format))
-    {
+    let wait_for_run = matches!(&request, ClientRequest::Prompt(prompt) if prompt.wait);
+    let response = match execute_with_retry(&mut client, &request, 3) {
+        Ok(response) => response,
+        Err(error) => return render_error(&error, format),
+    };
+    if wait_for_run {
+        let kit::cli::core::ClientResponse::Mutation { resource_id, .. } = &response else {
+            return render_error(
+                &ClientError::internal("prompt returned a foreign response"),
+                format,
+            );
+        };
+        let run_id = match kit::domain::ids::RunId::parse(resource_id) {
+            Ok(run_id) => run_id,
+            Err(error) => return render_error(&ClientError::internal(error.to_string()), format),
+        };
+        return match kit::cli::core::wait_for_terminal_run(
+            &mut client,
+            run_id,
+            std::time::Duration::from_millis(300),
+        ) {
+            Ok(run) => {
+                let completed = run.state == kit::domain::events::RunState::Completed;
+                match render_response(
+                    kit::cli::core::ClientResponse::Query(Box::new(
+                        kit::api::service::QueryProjection::Run(run),
+                    )),
+                    format,
+                ) {
+                    Ok(mut output) => {
+                        if !completed {
+                            output.exit_code = kit::cli::core::EXIT_RUN_FAILED;
+                        }
+                        output
+                    }
+                    Err(error) => render_error(&error, format),
+                }
+            }
+            Err(error) => render_error(&error, format),
+        };
+    }
+    match render_response(response, format) {
         Ok(output) => output,
         Err(error) => render_error(&error, format),
     }

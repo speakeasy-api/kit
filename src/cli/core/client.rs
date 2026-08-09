@@ -6,11 +6,11 @@ use crate::{
         http::core::ServiceHandler,
         service::{
             Command, CommandReceipt, PromptCommand, PromptReceipt, Query, QueryProjection,
-            RequestContext, ServiceError,
+            RequestContext, RunProjection, ServiceError,
         },
         stream::OpaqueStreamCursor,
     },
-    domain::events::TraceId,
+    domain::{events::TraceId, ids::RunId},
     store::sqlite::idempotency::IdempotencyKey,
 };
 
@@ -25,6 +25,7 @@ pub struct MutationRequest {
 #[derive(Clone, Debug)]
 pub struct PromptRequest {
     pub command: PromptCommand,
+    pub wait: bool,
     idempotency_key: IdempotencyKey,
 }
 
@@ -32,8 +33,14 @@ impl PromptRequest {
     pub fn new(command: PromptCommand, idempotency_key: IdempotencyKey) -> Self {
         Self {
             command,
+            wait: false,
             idempotency_key,
         }
+    }
+
+    pub fn with_wait(mut self, wait: bool) -> Self {
+        self.wait = wait;
+        self
     }
 
     pub fn idempotency_key(&self) -> &IdempotencyKey {
@@ -191,6 +198,119 @@ pub fn execute_with_retry(
         }
     }
     unreachable!("attempt count is at least one")
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+    use crate::{
+        domain::config::EffectiveConfigReference,
+        domain::events::{ArtifactRef, RunState},
+    };
+
+    struct SequencedClient {
+        states: Vec<RunState>,
+        queries: usize,
+    }
+
+    impl Client for SequencedClient {
+        fn execute(&mut self, _request: &MutationRequest) -> Result<CommandReceipt, ClientError> {
+            Err(ClientError::internal("mutation is unused"))
+        }
+
+        fn query(&mut self, query: Query) -> Result<QueryProjection, ClientError> {
+            let Query::GetRun { run_id } = query else {
+                return Err(ClientError::internal("unexpected query"));
+            };
+            let state = self.states[self.queries.min(self.states.len() - 1)];
+            self.queries += 1;
+            Ok(QueryProjection::Run(RunProjection {
+                id: run_id,
+                thread_id: crate::domain::ids::ThreadId::parse(
+                    "thread_00000000000000000000000001",
+                )
+                .unwrap(),
+                state,
+                input: ArtifactRef::parse(&format!("blake3:{}", "a".repeat(64))).unwrap(),
+                auth_granted: None,
+                effective_config: EffectiveConfigReference {
+                    digest: "digest".to_owned(),
+                    experiment_identity: "identity".to_owned(),
+                    experiment_digest: "digest".to_owned(),
+                    provenance: Default::default(),
+                },
+                owner: None,
+                output: None,
+                failure: None,
+                version: self.queries as u64,
+            }))
+        }
+    }
+
+    #[test]
+    fn wait_polls_through_non_terminal_and_waiting_states() {
+        let mut client = SequencedClient {
+            states: vec![
+                RunState::Queued,
+                RunState::Running,
+                RunState::WaitingForApproval,
+                RunState::Completed,
+            ],
+            queries: 0,
+        };
+        let run = wait_for_terminal_run(
+            &mut client,
+            RunId::parse("run_00000000000000000000000001").unwrap(),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(client.queries, 4);
+    }
+
+    #[test]
+    fn wait_returns_failed_runs_as_success_with_failed_state() {
+        let mut client = SequencedClient {
+            states: vec![RunState::Running, RunState::Failed],
+            queries: 0,
+        };
+        let run = wait_for_terminal_run(
+            &mut client,
+            RunId::parse("run_00000000000000000000000001").unwrap(),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
+}
+
+/// Poll a run until it reaches a terminal state and return the final
+/// projection. Waiting states are not terminal: a parked run keeps the wait
+/// alive until an approval/auth/input resolution moves it on.
+pub fn wait_for_terminal_run(
+    client: &mut dyn Client,
+    run_id: RunId,
+    poll_interval: Duration,
+) -> Result<RunProjection, ClientError> {
+    loop {
+        let query = Query::GetRun { run_id };
+        let request = ClientRequest::Query {
+            operation: query.operation(),
+            query,
+            stream: false,
+            stream_cursor: None,
+        };
+        let ClientResponse::Query(projection) = execute_with_retry(client, &request, 3)? else {
+            return Err(ClientError::internal("run query returned a mutation"));
+        };
+        let QueryProjection::Run(run) = *projection else {
+            return Err(ClientError::internal("run query returned a foreign projection"));
+        };
+        if run.state.is_terminal() {
+            return Ok(run);
+        }
+        thread::sleep(poll_interval);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

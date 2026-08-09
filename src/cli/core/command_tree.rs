@@ -238,6 +238,11 @@ fn prompt(name: &'static str) -> Command {
                 .args(["input", "message"])
                 .multiple(false),
         )
+        .arg(flag(
+            "wait",
+            "wait",
+            "Block until the run reaches a terminal state, then print the final run",
+        ))
         .arg(idempotency_key(false))
 }
 

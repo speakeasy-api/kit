@@ -405,6 +405,20 @@ fn prompt_forms_convert_directly_and_invalid_combinations_fail() {
             request.command.input,
             PromptInput::Message("message".to_owned())
         );
+        assert!(!request.wait);
+    }
+
+    for arguments in [
+        vec!["kit", "prompt", "--wait", THREAD, "message"],
+        vec!["kit", "run", "start", THREAD, "message", "--wait"],
+    ] {
+        let Invocation::Client(request) = parse(arguments).unwrap().invocation else {
+            panic!("expected prompt request")
+        };
+        let ClientRequest::Prompt(request) = *request else {
+            panic!("expected prompt request")
+        };
+        assert!(request.wait);
     }
 
     for arguments in [
