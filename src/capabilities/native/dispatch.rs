@@ -1154,20 +1154,15 @@ impl NativeDispatcher {
             .as_deref()
             .map(|token| self.resolve_structural_preview(token, limits))
             .transpose()?;
-        let expected = ir.as_ref().map_or_else(
-            || {
-                input
-                    .get("expected_revision")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| "invalid_arguments".to_owned())
-            },
-            |ir| Ok(ir.expected_revision().to_string()),
-        )?;
         let workspace = self.ensure_workspace()?.clone();
         let context = GrammarEditContext::from_workspace(workspace, limits)
             .map_err(code("edit_context_failed"))?;
-        if context.expected_revision().as_str() != expected {
+        // DR-0008: hunk inputs carry no expected_revision; the current file
+        // content is the concurrency token. Preview tokens still bind the
+        // revision the preview was computed against.
+        if let Some(ir) = &ir
+            && context.expected_revision() != ir.expected_revision()
+        {
             return Err("stale_revision".to_owned());
         }
         let mut trace = EditPathTrace::default();
@@ -1593,8 +1588,19 @@ impl NativeDispatcher {
 fn native_edit_error(
     error: crate::agent::adapters::grammar_edit::EditOrchestrationError,
 ) -> String {
-    use crate::agent::adapters::grammar_edit::EditOrchestrationError;
+    use crate::agent::adapters::grammar_edit::{EditOrchestrationError, GrammarEditError};
+    use crate::workspace::edit::normalize::NormalizeError;
     match error {
+        EditOrchestrationError::Grammar(GrammarEditError::Normalize(
+            error @ (NormalizeError::AnchorNotFound { .. } | NormalizeError::BaseFileMissing(_)),
+        )) => {
+            return format!("edit_anchor_not_found:{error}");
+        }
+        EditOrchestrationError::Grammar(GrammarEditError::Normalize(
+            error @ NormalizeError::AnchorAmbiguous { .. },
+        )) => {
+            return format!("edit_anchor_ambiguous:{error}");
+        }
         EditOrchestrationError::Grammar(_) => "edit_input_rejected",
         EditOrchestrationError::Validation(error) => {
             return format!("edit_validation_failed:{}", validation_error_detail(&error));
@@ -4321,7 +4327,6 @@ mod tests {
     }
 
     fn native_inputs(revision: &str) -> Vec<(String, Value)> {
-        let original = b"{}\n";
         vec![
             (
                 "kit_discover".to_owned(),
@@ -4338,16 +4343,16 @@ mod tests {
             (
                 "kit_edit".to_owned(),
                 json!({
-                    "version":1,
-                    "expected_revision":revision,
+                    "version":2,
                     "operations":[{
-                        "op":"replace_range",
+                        "op":"edit",
                         "path":"format.json",
-                        "base_digest":format!("blake3:{}", blake3::hash(original).to_hex()),
-                        "range":{"start":0,"end":original.len()},
-                        "expected":{"encoding":"utf8","newline":"lf","text":"{}","final_newline":true},
-                        "replacement":{"encoding":"utf8","newline":"lf","text":"{\"x\":1}","final_newline":true},
-                        "executable":"preserve"
+                        "hunks":[{
+                            "context_before":[],
+                            "old":["{}"],
+                            "new":["{\"x\":1}"],
+                            "context_after":[]
+                        }]
                     }]
                 }),
             ),
@@ -4842,19 +4847,12 @@ mod tests {
     #[test]
     fn native_edit_commits_through_the_checkless_pipeline() {
         let (directory, mut dispatcher) = dispatcher();
-        let revision = dispatcher.revision().unwrap();
         let input = serde_json::to_vec(&json!({
-            "version": 1,
-            "expected_revision": revision,
+            "version": 2,
             "operations": [{
                 "op": "add_file",
                 "path": "created.txt",
-                "content": {
-                    "encoding": "utf8",
-                    "newline": "lf",
-                    "text": "verified",
-                    "final_newline": true
-                },
+                "content": "verified\n",
                 "executable": false
             }]
         }))
@@ -4868,6 +4866,65 @@ mod tests {
         assert_eq!(result["outcome"], "committed");
         assert!(result["change_diff"].is_string());
         assert_eq!(artifacts.len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_edit_from_outdated_view_fails_typed_and_leaves_the_file_untouched() {
+        let (directory, mut dispatcher) = dispatcher();
+        // Hunk built from the original view of format.json ("{}\n").
+        let outdated = serde_json::to_vec(&json!({
+            "version": 2,
+            "operations": [{
+                "op": "edit",
+                "path": "format.json",
+                "hunks": [{
+                    "context_before": [],
+                    "old": ["{}"],
+                    "new": ["{\"x\":1}"],
+                    "context_after": []
+                }]
+            }]
+        }))
+        .unwrap();
+        // A parallel writer changes the file before the edit lands.
+        std::fs::write(dispatcher.root.join("format.json"), "{\"y\":2}\n").unwrap();
+        let owner = attempt(&dispatcher);
+        let error = dispatcher.edit(&outdated, owner).unwrap_err();
+        assert!(error.starts_with("edit_anchor_not_found:"), "{error}");
+        assert!(error.contains("outdated"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dispatcher.root.join("format.json")).unwrap(),
+            "{\"y\":2}\n"
+        );
+
+        // An anchor matching several regions is the other typed failure.
+        std::fs::write(dispatcher.root.join("format.json"), "x\ny\nx\ny\n").unwrap();
+        if let Some(workspace) = &dispatcher.workspace {
+            workspace.mark_dirty();
+        }
+        let ambiguous = serde_json::to_vec(&json!({
+            "version": 2,
+            "operations": [{
+                "op": "edit",
+                "path": "format.json",
+                "hunks": [{
+                    "context_before": [],
+                    "old": ["x"],
+                    "new": ["z"],
+                    "context_after": []
+                }]
+            }]
+        }))
+        .unwrap();
+        let owner = attempt(&dispatcher);
+        let error = dispatcher.edit(&ambiguous, owner).unwrap_err();
+        assert!(error.starts_with("edit_anchor_ambiguous:"), "{error}");
+        assert!(error.contains("add more context"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dispatcher.root.join("format.json")).unwrap(),
+            "x\ny\nx\ny\n"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4893,19 +4950,13 @@ mod tests {
         ));
     }
 
-    fn text_edit_input(revision: &str) -> Vec<u8> {
+    fn text_edit_input() -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "version": 1,
-            "expected_revision": revision,
+            "version": 2,
             "operations": [{
                 "op": "add_file",
                 "path": "created.txt",
-                "content": {
-                    "encoding": "utf8",
-                    "newline": "lf",
-                    "text": "verified",
-                    "final_newline": true
-                },
+                "content": "verified\n",
                 "executable": false
             }]
         }))
@@ -4916,8 +4967,7 @@ mod tests {
     fn native_edit_skips_lsp_when_no_changed_file_matches_the_languages() {
         let (directory, mut dispatcher) = dispatcher();
         install_lsp_gate(&mut dispatcher, "/bin/sh", &["python"]);
-        let revision = dispatcher.revision().unwrap();
-        let input = text_edit_input(&revision);
+        let input = text_edit_input();
         let owner = attempt(&dispatcher);
         let (result, _) = dispatcher.edit(&input, owner).unwrap();
         assert_eq!(result["outcome"], "committed");
@@ -4934,8 +4984,7 @@ mod tests {
             "/nonexistent/kit-lsp-conformance-server",
             &["text"],
         );
-        let revision = dispatcher.revision().unwrap();
-        let input = text_edit_input(&revision);
+        let input = text_edit_input();
         let owner = attempt(&dispatcher);
         let (result, _) = dispatcher.edit(&input, owner).unwrap();
         assert_eq!(result["outcome"], "committed");
@@ -4955,8 +5004,7 @@ mod tests {
         // `/bin/sh -c "sleep 60"` accepts the handshake pipes but never
         // publishes diagnostics: the bounded shadow run must expire.
         install_lsp_gate(&mut dispatcher, "/bin/sh", &["text"]);
-        let revision = dispatcher.revision().unwrap();
-        let input = text_edit_input(&revision);
+        let input = text_edit_input();
         let owner = attempt(&dispatcher);
         let (result, _) = dispatcher.edit(&input, owner).unwrap();
         assert_eq!(result["outcome"], "committed");
@@ -4987,8 +5035,7 @@ mod tests {
             dispatcher.grants.project_id(),
             dispatcher.workspace_id,
         ));
-        let revision = dispatcher.revision().unwrap();
-        let input = text_edit_input(&revision);
+        let input = text_edit_input();
         let owner = attempt(&dispatcher);
         let (result, _) = dispatcher.edit(&input, owner).unwrap();
         assert_eq!(result["outcome"], "committed");
@@ -5006,8 +5053,7 @@ mod tests {
         let (directory, mut dispatcher) = dispatcher();
         let revision = dispatcher.revision().unwrap();
         let input = serde_json::to_vec(&json!({
-            "version": 1,
-            "expected_revision": revision,
+            "version": 2,
             "operations": []
         }))
         .unwrap();
@@ -5024,14 +5070,12 @@ mod tests {
     #[test]
     fn native_edit_rejects_missing_syntax_executors_before_staging() {
         let (directory, mut dispatcher) = dispatcher();
-        let revision = dispatcher.revision().unwrap();
         let input = serde_json::to_vec(&json!({
-            "version": 1,
-            "expected_revision": revision,
+            "version": 2,
             "operations": [{
                 "op": "add_file",
                 "path": "created.txt",
-                "content": {"encoding": "utf8", "newline": "lf", "text": "x", "final_newline": true},
+                "content": "x\n",
                 "executable": false
             }]
         }))

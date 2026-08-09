@@ -86,6 +86,29 @@ impl GrammarEditContext {
         &self.workspace_digest
     }
 
+    /// Revision-pinned read of one workspace file for hunk resolution;
+    /// `Ok(None)` when the path does not exist at the context revision.
+    fn read_base_file(
+        &self,
+        path: &crate::workspace::edit::ir::RootRelativePath,
+    ) -> Result<Option<Vec<u8>>, GrammarEditError> {
+        let revision = crate::workspace::revision::RevisionId::parse(
+            self.expected_revision().as_str(),
+        )
+        .ok_or(GrammarEditError::RevisionChanged)?;
+        match self
+            .workspace
+            .read_file(revision, std::path::Path::new(path.as_str()))
+        {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(crate::workspace::revision::RevisionError::NotFound(_)) => Ok(None),
+            Err(crate::workspace::revision::RevisionError::StaleRevision { .. }) => {
+                Err(GrammarEditError::RevisionChanged)
+            }
+            Err(error) => Err(GrammarEditError::Workspace(error.to_string())),
+        }
+    }
+
     fn require_current_revision(&self) -> Result<(), GrammarEditError> {
         let current = self
             .workspace
@@ -694,13 +717,31 @@ impl EditOrchestrator {
         lsp: Option<&crate::capabilities::native::lsp::NativeEditLspGate>,
         trace: &mut impl EditTrace,
     ) -> Result<NativeMaterializedEdit, EditOrchestrationError> {
-        let ir = normalize_with_trace(
-            ModelEditFormat::StructuredJson,
-            input,
-            &context.normalization,
-            trace,
-        )
-        .map_err(GrammarEditError::Normalize)?;
+        // DR-0008: the native input is the hunk-anchored v2 format. Resolve
+        // hunks against the current file content in the run's workspace
+        // snapshot and lower them to the existing edit IR; the pipeline
+        // downstream of this point is unchanged.
+        let limits = context.normalization.limits();
+        trace.emit(EditTraceId::Normalize);
+        let envelope = crate::workspace::edit::normalize::hunks::parse(input, limits)
+            .map_err(GrammarEditError::Normalize)?;
+        let mut normalization = crate::workspace::edit::normalize::NormalizationContext::new(
+            context.expected_revision().clone(),
+            limits,
+        );
+        for path in envelope
+            .base_paths(limits)
+            .map_err(GrammarEditError::Normalize)?
+        {
+            if let Some(bytes) = context.read_base_file(&path)? {
+                normalization
+                    .insert_file(path.as_str(), &bytes, false)
+                    .map_err(GrammarEditError::Normalize)?;
+            }
+        }
+        let ir = crate::workspace::edit::normalize::hunks::lower(&envelope, &normalization)
+            .map_err(GrammarEditError::Normalize)?;
+        trace.emit(EditTraceId::EditIrNew);
         Self::execute_native_ir(
             ir,
             context,

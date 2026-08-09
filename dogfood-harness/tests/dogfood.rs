@@ -606,19 +606,19 @@ fn start_provider_mock(project: &Path) -> (String, thread::JoinHandle<Vec<Value>
                     });
                     assert_eq!(original, fs::read(project.join("src/lib.rs")).unwrap());
                     let text = String::from_utf8(original.clone()).unwrap();
-                    let text = text.strip_suffix('\n').unwrap_or(&text).to_owned();
-                    let replacement = format!(
-                        "{text}\n\npub const DOGFOOD_NATIVE_PATH: &str = \"provider-kernel-native\";"
-                    );
+                    // DR-0008 hunk edit built from the read result: the whole
+                    // current file is the (trivially unique) anchor and the
+                    // marker constant rides at the end of the new lines.
+                    let old: Vec<&str> =
+                        text.strip_suffix('\n').unwrap_or(&text).split('\n').collect();
+                    let mut new = old.clone();
+                    new.push("");
+                    new.push("pub const DOGFOOD_NATIVE_PATH: &str = \"provider-kernel-native\";");
                     (
                         Some("kit_edit"),
-                        json!({"version":1,"expected_revision":revision,"operations":[{
-                            "op":"replace_range","path":"src/lib.rs",
-                            "base_digest":format!("blake3:{}",blake3::hash(&original).to_hex()),
-                            "range":{"start":0,"end":original.len()},
-                            "expected":{"encoding":"utf8","newline":"lf","text":text,"final_newline":true},
-                            "replacement":{"encoding":"utf8","newline":"lf","text":replacement,"final_newline":true},
-                            "executable":"preserve"
+                        json!({"version":2,"operations":[{
+                            "op":"edit","path":"src/lib.rs",
+                            "hunks":[{"context_before":[],"old":old,"new":new,"context_after":[]}]
                         }]}),
                     )
                 }
@@ -1579,16 +1579,18 @@ fn read_edit_input(state: &Path, project_id: &str, revision: &Value, marker: &st
         .iter()
         .map(|byte| u8::try_from(byte.as_u64().unwrap()).unwrap())
         .collect::<Vec<_>>();
-    let source_text = String::from_utf8(source.clone()).unwrap();
+    let source_text = String::from_utf8(source).unwrap();
     let source_text = source_text.strip_suffix('\n').unwrap_or(&source_text);
+    // DR-0008 hunk edit: the whole current file anchors the append.
+    let old: Vec<&str> = source_text.split('\n').collect();
+    let mut new = old.clone();
+    let marker_line = format!("pub const {marker}: &str = \"public-api\";");
+    new.push("");
+    new.push(&marker_line);
     serde_json::to_vec(&json!({
-        "version":1,"expected_revision":revision,"operations":[{
-            "op":"replace_range","path":"src/lib.rs",
-            "base_digest":format!("blake3:{}",blake3::hash(&source).to_hex()),
-            "range":{"start":0,"end":source.len()},
-            "expected":{"encoding":"utf8","newline":"lf","text":source_text,"final_newline":true},
-            "replacement":{"encoding":"utf8","newline":"lf","text":format!("{source_text}\n\npub const {marker}: &str = \"public-api\";"),"final_newline":true},
-            "executable":"preserve"
+        "version":2,"operations":[{
+            "op":"edit","path":"src/lib.rs",
+            "hunks":[{"context_before":[],"old":old,"new":new,"context_after":[]}]
         }]
     }))
     .unwrap()
@@ -1644,8 +1646,9 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
         "DOGFOOD_PUBLIC_PATH",
     );
     let mut invalid_input: Value = serde_json::from_slice(&input).unwrap();
-    invalid_input["operations"][0]["base_digest"] =
-        Value::String(format!("blake3:{}", "0".repeat(64)));
+    // DR-0008: a hunk built from an outdated view of the file cannot anchor.
+    invalid_input["operations"][0]["hunks"][0]["old"][0] =
+        Value::String("this line no longer exists in src/lib.rs".to_owned());
     let invalid_id = submit_edit(
         &state,
         project_id,
@@ -1654,8 +1657,14 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
     );
     let invalid = approve_edit(&state, &invalid_id, "dogfood-invalid-edit-approval");
     assert_eq!(invalid["status"], "failed", "{invalid}");
-    assert_eq!(invalid["error"]["code"], "edit_validation_failed");
-    assert_eq!(invalid["error"]["detail"], "base_digest_mismatch");
+    assert_eq!(invalid["error"]["code"], "edit_anchor_not_found");
+    assert!(
+        invalid["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("outdated"),
+        "{invalid}"
+    );
     let invalid_events = json_output(cli(&state, &["repo", "events", "--result", &invalid_id]));
     assert!(
         invalid_events["items"]
@@ -1664,8 +1673,7 @@ fn direct_public_edit_failure_approval_and_artifact_contracts() {
             .iter()
             .any(|event| {
                 event["type"] == "repository.operation_terminal"
-                    && event["payload"]["result"]["error"]["code"] == "edit_validation_failed"
-                    && event["payload"]["result"]["error"]["detail"] == "base_digest_mismatch"
+                    && event["payload"]["result"]["error"]["code"] == "edit_anchor_not_found"
             })
     );
     let edit_id = submit_edit(&state, project_id, "dogfood-public-edit", &input);

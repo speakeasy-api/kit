@@ -626,16 +626,60 @@ fn native_search_and_edit_schemas_reject_cross_form_hybrids() {
     let token = format!("kitsp1_{}", "b".repeat(64));
     assert!(edit.is_valid(&serde_json::json!({"preview_token": token})));
     assert!(edit.is_valid(&serde_json::json!({
+        "version": 2,
+        "operations": []
+    })));
+    assert!(edit.is_valid(&serde_json::json!({
+        "version": 2,
+        "operations": [{
+            "op": "edit",
+            "path": "src/lib.rs",
+            "hunks": [{
+                "context_before": ["fn main() {"],
+                "old": ["    old();"],
+                "new": ["    new();"],
+                "context_after": ["}"]
+            }]
+        }, {
+            "op": "add_file",
+            "path": "new.txt",
+            "content": "text\n",
+            "executable": false
+        }, {
+            "op": "delete_file",
+            "path": "gone.txt"
+        }]
+    })));
+    // DR-0008: the v1 revision/digest/byte-range form is gone.
+    assert!(!edit.is_valid(&serde_json::json!({
         "version": 1,
         "expected_revision": revision,
         "operations": []
+    })));
+    assert!(!edit.is_valid(&serde_json::json!({
+        "version": 2,
+        "expected_revision": revision,
+        "operations": []
+    })));
+    // Hunk lines are single lines.
+    assert!(!edit.is_valid(&serde_json::json!({
+        "version": 2,
+        "operations": [{
+            "op": "edit",
+            "path": "src/lib.rs",
+            "hunks": [{
+                "context_before": [],
+                "old": ["a\nb"],
+                "new": ["c"],
+                "context_after": []
+            }]
+        }]
     })));
     assert!(!edit.is_valid(&serde_json::json!({"preview_token": "kitsp1_bad"})));
     assert!(!edit.is_valid(&serde_json::json!({})));
     assert!(!edit.is_valid(&serde_json::json!({
         "preview_token": token,
-        "version": 1,
-        "expected_revision": revision,
+        "version": 2,
         "operations": []
     })));
 }

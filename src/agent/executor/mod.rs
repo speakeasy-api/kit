@@ -5005,39 +5005,36 @@ impl FakeTurn {
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let original = String::from_utf8(bytes.clone())
+                let original = String::from_utf8(bytes)
                     .map_err(|_| LoopError::Provider("native read source is not UTF-8".into()))?;
-                // `text` carries the content without its final newline; the
-                // `final_newline` flag renders it, exactly as the dogfood
-                // harness constructs the same edit.
-                let final_newline = original.ends_with('\n');
-                let text = original.strip_suffix('\n').unwrap_or(&original).to_owned();
-                let replacement = format!(
-                    "{text}\n\npub const DOGFOOD_NATIVE_PATH: &str = \"provider-kernel-native\";"
-                );
+                // DR-0008 hunk edit built from the read result: anchor on the
+                // file's last line and append the marker constant after it.
+                let lines: Vec<&str> = original
+                    .strip_suffix('\n')
+                    .unwrap_or(&original)
+                    .split('\n')
+                    .collect();
+                let anchor = if original.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![*lines.last().expect("non-empty source has a last line")]
+                };
                 (
                     "kit_edit",
                     serde_json::json!({
-                        "version": 1,
-                        "expected_revision": revision,
+                        "version": 2,
                         "operations": [{
-                            "op": "replace_range",
+                            "op": "edit",
                             "path": "src/lib.rs",
-                            "base_digest": format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-                            "range": {"start":0,"end":bytes.len()},
-                            "expected": {
-                                "encoding": "utf8",
-                                "newline": "lf",
-                                "text": text,
-                                "final_newline": final_newline
-                            },
-                            "replacement": {
-                                "encoding": "utf8",
-                                "newline": "lf",
-                                "text": replacement,
-                                "final_newline": true
-                            },
-                            "executable": "preserve"
+                            "hunks": [{
+                                "context_before": anchor,
+                                "old": [],
+                                "new": [
+                                    "",
+                                    "pub const DOGFOOD_NATIVE_PATH: &str = \"provider-kernel-native\";"
+                                ],
+                                "context_after": []
+                            }]
                         }]
                     }),
                 )

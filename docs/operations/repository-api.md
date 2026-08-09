@@ -24,7 +24,12 @@ durable result is reconciled.
 
 All five calls pass through the M001 capability kernel and then the M004 native dispatcher. Direct
 edit therefore uses the same validation, COW stage, syntax passes, recovery materialization, and
-actual-diff artifact path as an agent tool call. Run uses the registered M003 attempt executor.
+actual-diff artifact path as an agent tool call. `repo edit` accepts the same DR-0008 hunk input
+as the `kit_edit` tool: `{"version": 2, "operations": [{"op": "edit", "path": "src/lib.rs",
+"hunks": [{"context_before": [...], "old": [...], "new": [...], "context_after": [...]}]}, ...]}`
+plus `add_file` (plain-string `content`) and `delete_file`; no revision token or digest rides in
+the input, and a hunk that no longer anchors fails typed as `edit_anchor_not_found` /
+`edit_anchor_ambiguous`. Run uses the registered M003 attempt executor.
 Results, intent/outcome events, costs, and authorized artifact references survive daemon restart.
 Artifact bytes are available only from the authenticated repository artifact endpoint and are
 checked against principal and project ownership.

@@ -13,3 +13,5 @@ Unified-diff hunks consume their declared old and new line counts before another
 `GIT binary patch` and `Binary files <old> and <new> differ` are binary metadata only when they appear as exact lines outside a hunk. The same text prefixed by a hunk line marker is ordinary text content. Binary patches remain unsupported.
 
 The optional grammar-constrained provider path uses this same structured input and normalizer; it does not decode canonical operation IDs and cannot construct a validated plan. See `docs/operations/grammar-edit-output.md`.
+
+The native `kit_edit` tool input is the DR-0008 hunk-anchored v2 format, a front-end over this IR: `{op: "edit", path, hunks: [{context_before, old, new, context_after}]}` operations resolve against the current file content (unique-anchor matching after CRLF-to-LF normalization) and lower to `replace_range` operations with resolver-computed byte ranges and base digests, plus `add_file` and `delete_file`. The IR itself, and everything downstream of it, is unchanged. See `docs/decisions/DR-0008-hunk-anchored-edits.md`.

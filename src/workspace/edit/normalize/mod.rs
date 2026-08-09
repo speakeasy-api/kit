@@ -1,3 +1,4 @@
+pub(crate) mod hunks;
 mod unified_diff;
 
 use std::{collections::BTreeMap, fmt};
@@ -102,26 +103,11 @@ pub(crate) fn structured_edit_schema(
 
 pub(crate) fn native_edit_schema() -> Value {
     let limits = EditLimits::default();
-    let expected =
-        RevisionToken::parse(format!("r:{}", "0".repeat(64))).expect("static revision is valid");
-    let mut schema = structured_edit_schema("kit.native.edit.input.v1", &expected, limits);
-    schema["properties"]["expected_revision"] = json!({
-        "pattern": "^r:[0-9a-f]{64}$",
-        "type": "string"
-    });
-    schema
-        .as_object_mut()
-        .expect("edit schema is an object")
-        .remove("$id");
-    schema
-        .as_object_mut()
-        .expect("edit schema is an object")
-        .remove("$schema");
     json!({
-        "$id": "kit.native.edit.input.v1",
+        "$id": "kit.native.edit.input.v2",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "oneOf": [
-            schema,
+            hunks::hunk_edit_schema(limits),
             {
                 "additionalProperties": false,
                 "properties": {
@@ -422,6 +408,18 @@ pub enum NormalizeError {
     DuplicatePath(String),
     RevisionMismatch { expected: String, supplied: String },
     UnsupportedPatch(String),
+    /// DR-0008: no line region matches `context_before + old + context_after`
+    /// in the current file content.
+    AnchorNotFound { path: String, hunk: usize },
+    /// DR-0008: the hunk anchor matches more than one line region.
+    AnchorAmbiguous {
+        path: String,
+        hunk: usize,
+        matches: usize,
+    },
+    /// DR-0008: an edit or delete target does not exist in the current
+    /// workspace snapshot.
+    BaseFileMissing(String),
     Ir(super::ir::IrError),
 }
 
@@ -459,6 +457,25 @@ impl fmt::Display for NormalizeError {
                 )
             }
             Self::UnsupportedPatch(reason) => write!(formatter, "unsupported patch: {reason}"),
+            Self::AnchorNotFound { path, hunk } => write!(
+                formatter,
+                "hunk {hunk} for {path} matches nothing in the current file content: \
+                 your view of the file is outdated; re-read the file and rebuild the hunk"
+            ),
+            Self::AnchorAmbiguous {
+                path,
+                hunk,
+                matches,
+            } => write!(
+                formatter,
+                "hunk {hunk} for {path} matches {matches} locations: \
+                 add more context lines until the anchor is unique"
+            ),
+            Self::BaseFileMissing(path) => write!(
+                formatter,
+                "{path} does not exist in the current workspace snapshot: \
+                 your view is outdated; re-read before editing"
+            ),
             Self::Ir(error) => error.fmt(formatter),
         }
     }

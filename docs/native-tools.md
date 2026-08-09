@@ -12,8 +12,20 @@ accepted only by `ToolExecutorAdapter`, which persists intent before invoking th
 native dispatcher and persists a terminal outcome or `outcome_unknown` before returning.
 
 Read tools require `WorkspaceRead` and an expected revision. Search cursors are bound to the same
-revision, index, query, and options. Edit requires `WorkspaceWrite` and enters the same production
-`EditOrchestrator` as grammar output: normalization, authorization, validation, private staging
+revision, index, query, and options. Edit requires `WorkspaceWrite` and takes the DR-0008
+hunk-anchored input (v2): `{"version": 2, "operations": [...]}` where an operation is either
+`{op: "edit", path, hunks: [{context_before, old, new, context_after}]}` over exact UTF-8 text
+lines, `{op: "add_file", path, content, executable}` with `content` a plain string, or
+`{op: "delete_file", path}`. Each hunk resolves against the current file content: exactly one
+occurrence of `context_before + old + context_after` replaces `old` with `new`; zero occurrences
+fail typed as `edit_anchor_not_found` (the caller's view is outdated — re-read the file);
+several fail as `edit_anchor_ambiguous` (add context lines). An empty `old` inserts `new`
+between the contexts; an empty `new` deletes `old`. Matching is exact per line after the file's
+CRLF sequences are normalized to LF (mixed newlines and bare CR are rejected); the file's
+newline flavor and final-newline state are preserved on write. There is no `expected_revision`,
+per-operation digest, or byte range in the input — the file content itself is the concurrency
+token. Resolved hunks lower to the canonical edit IR and enter the same production
+`EditOrchestrator` as grammar output: authorization, validation, private staging
 with syntax passes, materialization, and recovery. Edits work with no `.kit/native.json` present;
 the trusted config only tunes the edit validation wall time, approval policy, and the optional
 staged LSP diagnostics pass. When the config declares an `lsp` server and a changed file matches
