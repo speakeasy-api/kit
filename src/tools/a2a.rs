@@ -36,6 +36,23 @@ impl A2aTool {
                     "additionalProperties": false
                 }),
             )
+            .with_output_schema(json!({
+                "type": "object",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"task": {"type": "object"}},
+                        "required": ["task"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"message": {"type": "object"}},
+                        "required": ["message"],
+                        "additionalProperties": false
+                    }
+                ]
+            }))
             .with_annotations(ToolAnnotations::new()),
         }
     }

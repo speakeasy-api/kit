@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -167,8 +168,23 @@ impl ComposeBackend for HiddenRunletBackend {
         RunletBackend.name()
     }
 
-    fn description(&self, catalog: Option<&[ToolSpec]>) -> String {
-        RunletBackend.description(catalog)
+    fn description(&self, _catalog: Option<&[ToolSpec]>) -> String {
+        let mut description = RunletBackend.description(None);
+        description.push_str(
+            "\n\nHidden callable tools. Each entry includes the exact compact JSON schemas \
+             used by Runlet for input checking and output typing:",
+        );
+        for spec in &self.0 {
+            let _ = write!(
+                description,
+                "\n\n- `{}`: {}\n  Input JSON schema: `{}`\n  Output JSON schema: `{}`",
+                spec.name.0,
+                spec.description,
+                spec.input_schema,
+                spec.output_schema.as_ref().unwrap_or(&Value::Null),
+            );
+        }
+        description
     }
 
     fn script_description(&self) -> &'static str {

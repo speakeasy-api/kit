@@ -31,8 +31,9 @@ impl EditTool {
                     "type": "object",
                     "oneOf": [
                         {
+                            "type": "object",
                             "properties": {
-                                "op": {"const": "add"},
+                                "op": {"type": "string", "enum": ["add"]},
                                 "path": {"type": "string"},
                                 "content": {"type": "string"}
                             },
@@ -40,8 +41,9 @@ impl EditTool {
                             "additionalProperties": false
                         },
                         {
+                            "type": "object",
                             "properties": {
-                                "op": {"const": "edit"},
+                                "op": {"type": "string", "enum": ["edit"]},
                                 "path": {"type": "string"},
                                 "hunks": {
                                     "type": "array",
@@ -63,8 +65,9 @@ impl EditTool {
                             "additionalProperties": false
                         },
                         {
+                            "type": "object",
                             "properties": {
-                                "op": {"const": "delete"},
+                                "op": {"type": "string", "enum": ["delete"]},
                                 "path": {"type": "string"}
                             },
                             "required": ["op", "path"],
@@ -73,6 +76,15 @@ impl EditTool {
                     ]
                 }),
             )
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "status": {"type": "string", "enum": ["added", "edited", "deleted"]}
+                },
+                "required": ["path", "status"],
+                "additionalProperties": false
+            }))
             .with_annotations(ToolAnnotations::new()),
         }
     }

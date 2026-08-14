@@ -32,6 +32,7 @@ impl SubagentTool {
                     "additionalProperties": false
                 }),
             )
+            .with_output_schema(json!({"type": "string"}))
             .with_annotations(ToolAnnotations::new()),
         }
     }

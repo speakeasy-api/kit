@@ -34,6 +34,17 @@ impl ShellTool {
                     "additionalProperties": false
                 }),
             )
+            .with_output_schema(json!({
+                "type": "object",
+                "properties": {
+                    "exit_code": {"type": ["integer", "null"]},
+                    "success": {"type": "boolean"},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"}
+                },
+                "required": ["exit_code", "success", "stdout", "stderr"],
+                "additionalProperties": false
+            }))
             .with_annotations(ToolAnnotations::new()),
         }
     }
