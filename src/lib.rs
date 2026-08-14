@@ -1,3 +1,4 @@
+pub mod events;
 pub mod protocols;
 pub mod provider;
 pub mod runtime;

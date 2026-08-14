@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     provider::{OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, SubscriptionConfig},
-    tools::{A2aTool, EditTool, ShellTool, SubagentTool},
+    tools::{A2aTool, EditTool, Observed, ShellTool, SubagentTool},
 };
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -60,10 +60,10 @@ impl Runtime {
 
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
         let children = agentkit_tools_core::ToolRegistry::new()
-            .with(ShellTool::new(self.root.clone()))
-            .with(EditTool::new(self.root.clone()))
-            .with(SubagentTool::new(Arc::clone(self), depth))
-            .with(A2aTool::new());
+            .with(Observed::new(ShellTool::new(self.root.clone())))
+            .with(Observed::new(EditTool::new(self.root.clone())))
+            .with(Observed::new(SubagentTool::new(Arc::clone(self), depth)))
+            .with(Observed::new(A2aTool::new()));
         let child_specs = children.specs();
         ComposeOnly(
             ComposeTool::wrap(children)

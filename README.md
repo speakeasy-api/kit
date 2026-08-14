@@ -35,6 +35,36 @@ available from the HTTP server's Agent Card endpoint.
 Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
 that order. Credential login and refresh remain Codex's job.
 
+## Terminal client
+
+`tui` starts a `kit serve` child and drives it over ACP, so the client sees the
+same protocol any editor would.
+
+While a `compose` call runs, the right-hand pane draws its runtime graph: the
+Runlet program parsed into its call, loop, branch, and boundary structure, with
+each nested shell, edit, subagent, and A2A dispatch shown live under the node
+that most likely issued it, including concurrent fan-out and failures. Child
+call lifecycle is exact; when the same tool appears in several places, node
+attribution is a stable heuristic. Nested-call
+lifecycle reaches the client on stderr as marked JSON lines, enabled for the
+child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
+
+| Key | Action |
+| --- | --- |
+| `⏎` | send |
+| `⇧⏎`, `⌥⏎`, `^j` | newline |
+| `esc` | interrupt the running turn |
+| `^c` | interrupt, or quit when idle |
+| `⌥←/→`, `^a`/`^e`, `home`/`end` | word and line movement |
+| `⌥⌫`, `^w` | delete the previous word |
+| `⌘⌫`, `^u` / `^k` | delete to line start / end |
+| `↑`/`↓` | move between prompt lines, then browse history |
+| `⇧↑`/`⇧↓`, `pgup`/`pgdn`, wheel | scroll the transcript |
+| `^g` / `^l` / `^t` | runtime graph / agent log / reasoning |
+
+`⌘` and `⇧⏎` need a terminal that speaks the Kitty keyboard protocol (Ghostty,
+Kitty, WezTerm, recent iTerm2); the control-key equivalents work everywhere.
+
 ## Deliberate limits
 
 The root is a working directory, not a sandbox. Shell commands can access the
