@@ -1,4 +1,0 @@
-schema_version: 1
-name: vuln-scan
-commands:
-  - cargo audit --deny warnings

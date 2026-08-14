@@ -1,19 +1,7 @@
-extern crate self as kit;
-
-pub mod agent;
-pub mod api;
-pub mod capabilities;
-pub mod cli;
-pub mod domain;
-pub mod evaluation;
-pub mod executor;
 pub mod protocols;
+pub mod provider;
 pub mod runtime;
-pub mod store;
-pub mod telemetry;
-pub mod verify;
-pub mod web;
-pub mod workspace;
+pub mod tools;
+pub mod tui;
 
-#[cfg(any(test, debug_assertions))]
-pub mod test_support;
+pub use runtime::Runtime;

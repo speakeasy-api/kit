@@ -1,6 +1,0 @@
-/target
-.env
-.DS_Store
-/book/book
-agent.db
-.agent-review/

@@ -1,15 +1,4 @@
 /target/
-/dogfood-harness/target/
-/eval/corpora/retrieval/target/
+/.pi-subagents/
 /.kit/
-/.kit.backups/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-/.pytest_cache/
-/.mypy_cache/
-/.ruff_cache/
-/.evidence-tmp/
-/.tools/
-/.playwright-mcp/
+.DS_Store

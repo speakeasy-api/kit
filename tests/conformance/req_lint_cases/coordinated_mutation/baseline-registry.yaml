@@ -1,7 +1,0 @@
-- id: KIT-GOV-901
-  record_class: requirement
-  area: KIT-GOV
-  source_anchor: RFC.md:1
-  source_quote: The fixture implementation MUST preserve every registered behavior.
-  source_fingerprint: ff5f6e5ec8d0d5a019abded2759a3d81ca3752c2e3f68ac0553658bd892043c3
-  atomic_text: The fixture implementation must preserve every registered behavior.

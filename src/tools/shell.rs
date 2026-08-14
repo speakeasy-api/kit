@@ -1,0 +1,161 @@
+use std::{path::PathBuf, process::Stdio, time::Duration};
+
+use agentkit_core::{ToolOutput, ToolResultPart};
+use agentkit_tools_core::{
+    Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
+};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::{io::AsyncReadExt, process::Command};
+
+const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone)]
+pub struct ShellTool {
+    root: PathBuf,
+    spec: ToolSpec,
+}
+
+impl ShellTool {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            spec: ToolSpec::new(
+                ToolName::new("shell"),
+                "Run a shell command with the runtime root as its working directory.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 120}
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            )
+            .with_annotations(ToolAnnotations::new()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ShellInput {
+    command: String,
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u64,
+}
+
+#[async_trait]
+impl Tool for ShellTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _context: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let input: ShellInput = serde_json::from_value(request.input)
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        if input.command.is_empty() || !(1..=3600).contains(&input.timeout_seconds) {
+            return Err(ToolError::InvalidInput(
+                "command and timeout_seconds are outside bounds".into(),
+            ));
+        }
+        let mut command = shell_command(&input.command);
+        command
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::Internal("shell stdout was not piped".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::Internal("shell stderr was not piped".into()))?;
+        let mut stdout_task = tokio::spawn(read_bounded(stdout));
+        let mut stderr_task = tokio::spawn(read_bounded(stderr));
+        let execution = async {
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            let stdout = (&mut stdout_task)
+                .await
+                .map_err(|error| ToolError::Internal(error.to_string()))?
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            let stderr = (&mut stderr_task)
+                .await
+                .map_err(|error| ToolError::Internal(error.to_string()))?
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            Ok::<_, ToolError>((status, stdout, stderr))
+        };
+        let (status, stdout, stderr) =
+            match tokio::time::timeout(Duration::from_secs(input.timeout_seconds), execution).await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return Err(ToolError::ExecutionFailed("shell command timed out".into()));
+                }
+            };
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(json!({
+                "exit_code": status.code(),
+                "success": status.success(),
+                "stdout": stdout,
+                "stderr": stderr
+            })),
+        )))
+    }
+}
+
+async fn read_bounded(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
+    let mut kept = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_OUTPUT_BYTES.saturating_sub(kept.len());
+        kept.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+    let mut output = String::from_utf8_lossy(&kept).into_owned();
+    if truncated {
+        output.push_str("\n[output truncated]");
+    }
+    Ok(output)
+}
+
+#[cfg(unix)]
+fn shell_command(input: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-lc").arg(input);
+    command
+}
+
+#[cfg(windows)]
+fn shell_command(input: &str) -> Command {
+    let mut command = Command::new("cmd");
+    command.arg("/C").arg(input);
+    command
+}
+
+const fn default_timeout() -> u64 {
+    120
+}

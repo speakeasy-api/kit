@@ -1,4 +1,0 @@
-schema_version: 1
-name: reproducible-build
-commands:
-  - python3 scripts/reproducible_build.py

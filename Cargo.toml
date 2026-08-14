@@ -5,80 +5,30 @@ edition = "2024"
 rust-version = "1.94.0"
 publish = false
 
-[features]
-external-git-sandbox = []
-
 [dependencies]
-aho-corasick = "=1.1.4"
-agentkit-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-core" }
-agentkit-loop = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-loop" }
-agentkit-mcp = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-mcp", features = ["kit-authorized"] }
-agentkit-provider-anthropic = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-anthropic" }
-agentkit-provider-ollama = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-ollama" }
-agentkit-provider-openai = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-openai" }
-agentkit-provider-openrouter = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-provider-openrouter" }
-agentkit-tools-core = { version = "=0.10.2", path = "vendor/agentkit/crates/agentkit-tools-core" }
-ast-grep-core = { version = "=0.40.1", default-features = false, features = ["tree-sitter"] }
-ast-grep-language = { version = "=0.40.1", default-features = false, features = ["tree-sitter-rust"] }
+a2a-protocol-client = "=0.7.0"
+a2a-protocol-server = { version = "=0.7.0", default-features = false }
+a2a-protocol-types = "=0.7.0"
+agent-client-protocol = "=1.0.1"
+agentkit-acp = "=0.10.3"
+agentkit-core = "=0.10.3"
+agentkit-loop = "=0.10.3"
+agentkit-tool-compose = { version = "=0.10.3", features = ["runlet"] }
+agentkit-tools-core = "=0.10.3"
 async-trait = "=0.1.91"
-axum = { version = "=0.8.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "=0.22.1"
 blake3 = "=1.8.2"
 bytes = "=1.12.1"
-chacha20poly1305 = "=0.10.1"
-clap = { version = "=4.6.4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
-getrandom = "0.3.4"
-globset = "=0.4.19"
+clap = { version = "=4.6.4", features = ["derive"] }
+crossterm = "=0.29.0"
 futures-util = "=0.3.32"
-hmac = "=0.12.1"
-http = "=1.4.0"
 httpdate = "=1.0.3"
-jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["aws_lc_rs"] }
-keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
-jsonschema = { version = "0.48.2", default-features = false }
-reqwest = { version = "=0.13.2", default-features = false, features = ["blocking", "form", "json", "rustls", "stream"] }
-rmcp = { version = "=1.5.0", default-features = false, features = ["client", "transport-async-rw"] }
-rusqlite = { version = "=0.32.1", features = ["bundled"] }
-rustls = { version = "0.23.32", default-features = false, features = ["aws_lc_rs", "std"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.141", features = ["raw_value"] }
-serde_yaml = "=0.9.34"
-sha2 = "=0.10.9"
-subtle = "=2.6.1"
-syn = { version = "=2.0.119", features = ["full", "visit"] }
-tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-stream = "=0.1.17"
-tokio-util = { version = "=0.7.19", features = ["codec"] }
-toml = { version = "=1.1.4", default-features = false, features = ["parse", "serde"] }
-tree-sitter = "=0.25.10"
-tree-sitter-rust = "=0.24.0"
-unicode-normalization = "=0.1.25"
-url = "2.5.7"
-x509-parser = "0.18.0"
-zeroize = { version = "1.8.2", features = ["derive"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Cryptography",
-    "Win32_Security_WinTrust",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Console",
-    "Win32_System_Com",
-    "Win32_System_JobObjects",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Pipes",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
+ratatui = "=0.30.2"
+reqwest = { version = "=0.13.2", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.145"
+tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "=0.7.19", features = ["compat"] }
+zeroize = { version = "=1.8.2", features = ["derive"] }
 
 [dev-dependencies]
-jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-rcgen = "0.14.3"
-tower = { version = "=0.5.3", features = ["util"] }
+tempfile = "=3.23.0"

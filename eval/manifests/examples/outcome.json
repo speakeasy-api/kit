@@ -1,8 +1,0 @@
-{
-  "schema_version": "1.0",
-  "kind": "outcome",
-  "outcome_id": "empty-trial-pending",
-  "trial_id": "empty-trial-0001",
-  "status": "pending",
-  "provider_request_ids": []
-}

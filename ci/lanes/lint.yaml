@@ -1,6 +1,0 @@
-schema_version: 1
-name: lint
-commands:
-  - cargo clippy --locked --all-targets -- -D warnings
-  - cargo fmt --manifest-path eval/corpora/retrieval/Cargo.toml -- --check
-  - cargo clippy --locked --manifest-path eval/corpora/retrieval/Cargo.toml --all-targets -- -D warnings

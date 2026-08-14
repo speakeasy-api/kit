@@ -1,9 +1,0 @@
-#! expect: { "n": 5, "yesterday": "2026-06-14T12:00:00Z", "encoded": "{\"n\":5}" }
-payload = data.payload()
-parsed = json.parse(payload.body)
-t = time.parse(parsed.when)
-return {
-    n: parsed.n,
-    yesterday: time.format(t - 86400000),
-    encoded: json.encode({ n: parsed.n })
-}

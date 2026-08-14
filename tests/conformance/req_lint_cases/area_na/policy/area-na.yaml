@@ -1,6 +1,0 @@
-schema_version: 1
-decision_record: docs/decisions/DR-0006-empty-area-na.md
-areas:
-  - area: KIT-CONFIG
-    source: RFC.md:1
-    reason: The fixture source contains no normative configuration requirement.
