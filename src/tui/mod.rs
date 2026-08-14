@@ -14,7 +14,12 @@ mod theme;
 mod ui;
 mod wrap;
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::Path,
+    process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
@@ -124,6 +129,8 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
             let mut app = App::new(root, model, a2a);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
+            let mut stop =
+                Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let result = async {
                 loop {
                     terminal
@@ -192,6 +199,7 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
                             None => return Ok(()),
                         },
                         _ = ticker.tick() => app.tick = app.tick.wrapping_add(1),
+                        () = stop.requested() => return Ok(()),
                     }
                 }
             }
@@ -234,16 +242,80 @@ fn enter() -> std::io::Result<DefaultTerminal> {
             stdout,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
+        ENHANCED.store(true, Ordering::Relaxed);
     }
+    // Ratatui's own hook restores raw mode and the alternate screen, but not
+    // the modes turned on above: a panic would otherwise leave the shell
+    // reporting every mouse move as text.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_modes();
+        previous(info);
+    }));
     Ok(terminal)
 }
 
-fn leave(terminal: DefaultTerminal) {
+/// Whether the keyboard enhancement flags were pushed and still need popping.
+static ENHANCED: AtomicBool = AtomicBool::new(false);
+
+/// Turns off the terminal modes the client switched on.
+///
+/// What was pushed is remembered rather than asked about on the way out:
+/// `supports_keyboard_enhancement` queries the terminal and waits for the
+/// reply, which on a torn-down or unresponsive terminal stalls the restore
+/// before mouse reporting is ever turned back off.
+fn restore_modes() {
     let mut stdout = std::io::stdout();
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+    if ENHANCED.swap(false, Ordering::Relaxed) {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
     let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// A client killed from outside never reaches its restore path, which leaves
+/// the shell in raw mode with mouse reporting on — every later mouse move
+/// arrives at the prompt as garbage. Holding the signal streams for the whole
+/// session and returning through the normal exit keeps that from happening.
+struct Stop {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
+}
+
+impl Stop {
+    #[cfg(unix)]
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    #[cfg(unix)]
+    async fn requested(&mut self) {
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn requested(&mut self) {
+        std::future::pending().await
+    }
+}
+
+fn leave(terminal: DefaultTerminal) {
+    restore_modes();
     drop(terminal);
     ratatui::restore();
 }
@@ -359,5 +431,36 @@ mod tests {
     #[test]
     fn leaves_plain_text_alone() {
         assert_eq!(readable("one\ntwo"), ["one", "two"]);
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use std::time::Duration;
+
+    use super::Stop;
+
+    /// A client killed from outside must still reach its restore path, or it
+    /// leaves the shell in raw mode with mouse reporting on.
+    #[tokio::test]
+    async fn a_termination_signal_ends_the_session() {
+        let mut stop = Stop::new().expect("signal handlers install");
+        let mut ticker = tokio::time::interval(Duration::from_millis(20));
+        std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(std::process::id().to_string())
+            .status()
+            .expect("kill runs");
+        let session = async {
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = stop.requested() => return,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(3), session)
+            .await
+            .expect("the loop leaves on the signal");
     }
 }
