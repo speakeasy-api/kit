@@ -8,6 +8,7 @@ use std::{
 };
 
 use agentkit_acp::{AcpAgentFactoryContext, AcpRuntimeError};
+use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{CancellationController, FinishReason, Item, ItemKind, Part};
 use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_tool_compose::{
@@ -22,6 +23,9 @@ use crate::{
     provider::{OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, SubscriptionConfig},
     tools::{A2aTool, EditTool, Observed, ShellTool, SubagentTool},
 };
+
+#[cfg(test)]
+mod tests;
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -104,12 +108,17 @@ impl Runtime {
             .session
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
+        let initial = if request.resume {
+            vec![Item::text(ItemKind::System, self.system_prompt(0))]
+        } else {
+            self.initial_transcript(0).await?
+        };
         let opened = crate::session::open(
             &self.root,
             &request.id,
             request.resume,
             request.force,
-            Item::text(ItemKind::System, self.system_prompt(0)),
+            initial,
         )?;
         let agent = Agent::builder()
             .model(self.adapter.clone())
@@ -134,13 +143,14 @@ impl Runtime {
     ) -> Result<String, LoopError> {
         let session = format!("run-{}", NEXT_SESSION.fetch_add(1, Ordering::Relaxed));
         let controller = CancellationController::new();
+        let transcript = self
+            .initial_transcript(depth)
+            .await
+            .map_err(LoopError::InvalidState)?;
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose(depth))
-            .transcript(vec![Item::text(
-                ItemKind::System,
-                self.system_prompt(depth),
-            )])
+            .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)])
             .cancellation(controller.handle())
             .build()?;
@@ -183,12 +193,19 @@ impl Runtime {
                 resume: false,
                 force: false,
             });
+        let initial = if request.resume {
+            vec![Item::text(ItemKind::System, self.system_prompt(0))]
+        } else {
+            self.initial_transcript(0)
+                .await
+                .map_err(AcpRuntimeError::Loop)?
+        };
         let opened = crate::session::open(
             &self.root,
             &request.id,
             request.resume,
             request.force,
-            Item::text(ItemKind::System, self.system_prompt(0)),
+            initial,
         )
         .map_err(AcpRuntimeError::Loop)?;
         Agent::builder()
@@ -205,6 +222,10 @@ impl Runtime {
             .start(SessionConfig::new(context.agentkit_session_id).without_cache())
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+    }
+
+    async fn initial_transcript(&self, depth: usize) -> Result<Vec<Item>, String> {
+        load_initial_transcript(&self.root, self.system_prompt(depth)).await
     }
 
     fn system_prompt(&self, depth: usize) -> String {
@@ -263,6 +284,17 @@ impl ComposeBackend for HiddenRunletBackend {
         run.visible_specs.clone_from(&self.0);
         RunletBackend.execute(run).await
     }
+}
+
+async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<Vec<Item>, String> {
+    let mut transcript = vec![Item::text(ItemKind::System, system_prompt)];
+    let context = ContextLoader::new()
+        .with_source(AgentsMd::discover_all(root))
+        .load()
+        .await
+        .map_err(|error| format!("could not load AGENTS.md context: {error}"))?;
+    transcript.extend(context);
+    Ok(transcript)
 }
 
 async fn drive(driver: &mut LoopDriver<OpenAiSubscriptionSession>) -> Result<String, LoopError> {

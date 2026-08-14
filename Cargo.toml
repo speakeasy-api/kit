@@ -12,6 +12,7 @@ a2a-protocol-types = "=0.7.0"
 agent-client-protocol = "=1.0.1"
 agentkit-acp = "=0.10.3"
 agentkit-core = "=0.10.3"
+agentkit-context = "=0.10.3"
 agentkit-loop = "=0.10.3"
 agentkit-tool-compose = { version = "=0.10.3", features = ["runlet"] }
 agentkit-tools-core = "=0.10.3"

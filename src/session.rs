@@ -98,9 +98,12 @@ pub fn open(
     session_id: &str,
     resume: bool,
     force: bool,
-    initial: Item,
+    initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
     validate_id(session_id)?;
+    if !resume && initial.is_empty() {
+        return Err("a new session requires an initial transcript".into());
+    }
     let directory = root.join(".kit/sessions");
     fs::create_dir_all(&directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
@@ -131,10 +134,12 @@ pub fn open(
         lock,
     };
     if !resume {
-        writer.append(&initial)?;
+        for item in initial {
+            writer.append(&item)?;
+            transcript.push(item);
+        }
         generation = writer.generation;
-        transcript.push(initial);
-        debug_assert_eq!(generation, 1);
+        debug_assert_eq!(generation, transcript.len() as u64);
     }
     Ok(OpenSession {
         transcript,
@@ -298,7 +303,7 @@ mod tests {
             "abc",
             false,
             false,
-            Item::text(ItemKind::System, "system"),
+            vec![Item::text(ItemKind::System, "system")],
         )
         .unwrap();
         opened.observer.on_transcript_event(TranscriptEvent {
@@ -311,7 +316,7 @@ mod tests {
             "abc",
             true,
             false,
-            Item::text(ItemKind::System, "ignored"),
+            vec![Item::text(ItemKind::System, "ignored")],
         )
         .unwrap();
         assert_eq!(resumed.transcript.len(), 2);
@@ -328,7 +333,7 @@ mod tests {
             "abc",
             false,
             false,
-            Item::text(ItemKind::System, "one"),
+            vec![Item::text(ItemKind::System, "one")],
         )
         .unwrap();
         assert!(
@@ -337,7 +342,7 @@ mod tests {
                 "abc",
                 true,
                 false,
-                Item::text(ItemKind::System, "x")
+                vec![Item::text(ItemKind::System, "x")]
             )
             .is_err()
         );
@@ -351,7 +356,7 @@ mod tests {
                 "abc",
                 true,
                 true,
-                Item::text(ItemKind::System, "x")
+                vec![Item::text(ItemKind::System, "x")]
             )
             .is_err(),
             "force must not steal authority from a live owner"
@@ -366,7 +371,7 @@ mod tests {
                 "abc",
                 true,
                 false,
-                Item::text(ItemKind::System, "x")
+                vec![Item::text(ItemKind::System, "x")]
             )
             .is_ok()
         );

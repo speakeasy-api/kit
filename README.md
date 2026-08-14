@@ -9,6 +9,7 @@ It exposes:
 - a Ratatui ACP client
 - one model-visible tool: `compose`, backed by released Runlet
 - hidden compose children for shell commands, hunk edits, local subagents, and A2A calls
+- `AGENTS.md` instructions loaded from the runtime root and its ancestors
 - ChatGPT Pro through an existing Codex login
 
 It intentionally has no permissions framework, provenance ledger, rollback system,

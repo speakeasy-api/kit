@@ -198,6 +198,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-context"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e79767e51eeb38f96c925d7511a5b270e3ea325dd72f70d369bd225552738bd9"
+dependencies = [
+ "agentkit-core",
+ "async-fs",
+ "async-trait",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "agentkit-core"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -381,6 +394,17 @@ dependencies = [
  "event-listener-strategy",
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "async-fs"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034a681df4aed8b8edbd7fbe472401ecf009251c8b40556b304567052e294c5"
+dependencies = [
+ "async-lock",
+ "blocking",
+ "futures-lite",
 ]
 
 [[package]]
@@ -1937,6 +1961,7 @@ dependencies = [
  "a2a-protocol-types",
  "agent-client-protocol 1.0.1",
  "agentkit-acp",
+ "agentkit-context",
  "agentkit-core",
  "agentkit-loop",
  "agentkit-tool-compose",
