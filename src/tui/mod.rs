@@ -43,6 +43,8 @@ use app::{Action, App, Update};
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
+/// Output lines kept per tool call; the fold shows the count either way.
+const MAX_OUTPUT_LINES: usize = 5_000;
 
 pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
@@ -242,7 +244,7 @@ fn translate(notification: SessionNotification) -> Vec<Update> {
             id: update.tool_call_id.to_string(),
             status: update.fields.status,
             script: update.fields.raw_input.as_ref().and_then(script_of),
-            preview: preview_of(update.fields.content.as_deref()),
+            output: output_of(update.fields.content.as_deref()),
         }],
         SessionUpdate::UsageUpdate(usage) => vec![Update::Usage {
             used: usage.used,
@@ -267,32 +269,70 @@ fn script_of(input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The first few output lines of a tool call, for the transcript card.
-fn preview_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
-    let mut preview = Vec::new();
+/// A tool call's output as readable lines, kept whole for the folded card.
+fn output_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
+    let mut output = Vec::new();
     for entry in content.unwrap_or_default() {
         match entry {
             ToolCallContent::Content(content) => {
                 if let Some(text) = text_of(content.content.clone()) {
-                    preview.extend(
-                        text.lines()
-                            .filter(|line| !line.trim().is_empty())
-                            .take(4)
-                            .map(str::to_string),
-                    );
+                    output.extend(readable(&text));
                 }
             }
-            ToolCallContent::Diff(diff) => preview.push(format!(
+            ToolCallContent::Diff(diff) => output.push(format!(
                 "{} · {} lines",
                 diff.path.display(),
                 diff.new_text.lines().count()
             )),
             _ => {}
         }
-        if preview.len() >= 4 {
+        if output.len() >= MAX_OUTPUT_LINES {
             break;
         }
     }
-    preview.truncate(4);
-    preview
+    output.truncate(MAX_OUTPUT_LINES);
+    output
+}
+
+/// Splits tool output into display lines.
+///
+/// Structured results arrive as JSON, so a bare string unwraps to its own text
+/// — otherwise the card shows one endless line full of `\n` escapes — and an
+/// object or array is pretty-printed.
+fn readable(text: &str) -> Vec<String> {
+    let rendered = match serde_json::from_str::<Value>(text) {
+        Ok(Value::String(inner)) => inner,
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_string()),
+        Err(_) => text.to_string(),
+    };
+    rendered
+        .lines()
+        .map(|line| line.replace('\t', "    "))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable;
+
+    #[test]
+    fn unwraps_json_string_results_into_real_lines() {
+        assert_eq!(
+            readable("\"## Overview\\n\\nKit is small.\""),
+            ["## Overview", "", "Kit is small."]
+        );
+    }
+
+    #[test]
+    fn pretty_prints_structured_results() {
+        assert_eq!(
+            readable("{\"exit_code\":0}"),
+            ["{", "  \"exit_code\": 0", "}"]
+        );
+    }
+
+    #[test]
+    fn leaves_plain_text_alone() {
+        assert_eq!(readable("one\ntwo"), ["one", "two"]);
+    }
 }

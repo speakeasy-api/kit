@@ -61,6 +61,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | `↑`/`↓` | move between prompt lines, then browse history |
 | `⇧↑`/`⇧↓`, `pgup`/`pgdn`, wheel | scroll the transcript |
 | `^g` / `^l` / `^t` | runtime graph / agent log / reasoning |
+| click a tool card, `^o` | fold its raw output open or shut |
 
 `⌘` and `⇧⏎` need a terminal that speaks the Kitty keyboard protocol (Ghostty,
 Kitty, WezTerm, recent iTerm2); the control-key equivalents work everywhere.

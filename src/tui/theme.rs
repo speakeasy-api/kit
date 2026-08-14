@@ -14,8 +14,42 @@ pub const TEXT: Color = Color::Rgb(215, 220, 228);
 pub const CODE_BG: Color = Color::Rgb(30, 33, 41);
 pub const BAR_BG: Color = Color::Rgb(24, 27, 34);
 
-/// Frames of the activity spinner, one per animation tick.
-pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Activity indicators, one per kind of work.
+///
+/// Several of these can be on screen at once — a turn, the tool it is running,
+/// and each nested dispatch — so they animate with different shapes and speeds
+/// instead of beating in unison. Every frame is one cell wide.
+#[derive(Clone, Copy)]
+pub enum Pulse {
+    /// The turn as a whole.
+    Turn,
+    /// A model-visible tool call.
+    Tool,
+    /// One nested dispatch inside a compose run.
+    Child,
+    /// The status bar's heartbeat.
+    Status,
+}
+
+impl Pulse {
+    const fn frames(self) -> &'static [&'static str] {
+        match self {
+            Self::Turn => &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"],
+            Self::Tool => &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+            Self::Child => &["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"],
+            Self::Status => &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "▆", "▅", "▄", "▃", "▂"],
+        }
+    }
+
+    /// Animation ticks per frame; slower indicators read as calmer.
+    const fn every(self) -> usize {
+        match self {
+            Self::Turn | Self::Tool => 1,
+            Self::Child => 2,
+            Self::Status => 3,
+        }
+    }
+}
 
 pub fn text() -> Style {
     Style::default().fg(TEXT)
@@ -45,9 +79,10 @@ pub fn bar() -> Style {
     Style::default().fg(DIM).bg(BAR_BG)
 }
 
-/// The spinner frame for an animation tick.
-pub fn spinner(tick: usize) -> &'static str {
-    SPINNER[tick % SPINNER.len()]
+/// The frame this indicator shows on an animation tick.
+pub fn pulse(kind: Pulse, tick: usize) -> &'static str {
+    let frames = kind.frames();
+    frames[(tick / kind.every()) % frames.len()]
 }
 
 /// Human-readable elapsed time, sized to the magnitude.

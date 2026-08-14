@@ -16,16 +16,26 @@ use super::{
     markdown,
     plan::PlanKind,
     theme,
-    wrap::wrap,
+    wrap::{wrap, wrap_tagged},
 };
 
 /// Width at which the graph moves beside the transcript instead of below it.
 const SIDE_BY_SIDE_WIDTH: u16 = 108;
 const GRAPH_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
+/// Rows of raw tool output rendered when a card is opened.
+const MAX_OUTPUT_ROWS: usize = 400;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let prompt_rows = app.editor.line_count().clamp(1, MAX_PROMPT_ROWS) as u16 + 2;
+    // Two border columns plus the `›` gutter; the prompt grows as the wrapped
+    // text needs more rows, up to the cap.
+    let prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
+    app.prompt_width = prompt_width;
+    let prompt_rows = app
+        .editor
+        .display_rows(prompt_width)
+        .clamp(1, MAX_PROMPT_ROWS) as u16
+        + 2;
     let logs_rows = if app.show_logs { 9 } else { 0 };
     let [header, body, logs, prompt, status] = Layout::vertical([
         Constraint::Length(1),
@@ -100,11 +110,15 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
 
-    let lines = wrap(&transcript_lines(app), inner.width.max(1) as usize);
+    let lines = wrap_tagged(&transcript_lines(app), inner.width.max(1) as usize);
     let total = lines.len();
     let height = inner.height as usize;
     app.total_lines = total;
     app.viewport = height;
+    app.transcript_top = inner.y as usize;
+    app.transcript_left = inner.x as usize;
+    app.transcript_width = inner.width as usize;
+    app.row_calls = lines.iter().map(|(_, call)| call.clone()).collect();
     let bottom = total.saturating_sub(height);
     let offset = if app.follow {
         bottom
@@ -113,7 +127,12 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     app.scroll = offset;
 
-    let visible: Vec<_> = lines.into_iter().skip(offset).take(height).collect();
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(offset)
+        .take(height)
+        .map(|(line, _)| line)
+        .collect();
     frame.render_widget(Paragraph::new(visible), inner);
     if total > height {
         let mut state = ScrollbarState::new(bottom).position(offset);
@@ -160,39 +179,46 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
     ])
 }
 
-fn transcript_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+/// Renders the transcript, tagging each line with the tool call it belongs to
+/// so a click on a card can be traced back to it.
+fn transcript_lines(app: &App) -> Vec<(Line<'static>, Option<String>)> {
+    let mut lines: Vec<(Line<'static>, Option<String>)> = Vec::new();
     for block in &app.blocks {
         if !lines.is_empty() {
-            lines.push(Line::default());
+            lines.push((Line::default(), None));
         }
-        match block {
-            Block::User(text) => lines.extend(user_lines(text)),
-            Block::Agent(text) => lines.extend(markdown::render(text)),
+        let (block_lines, call) = match block {
+            Block::User(text) => (user_lines(text), None),
+            Block::Agent(text) => (markdown::render(text), None),
             Block::Thought {
                 text,
                 started,
                 millis,
-            } => lines.extend(thought_lines(
-                app,
-                text,
-                started.elapsed().as_millis(),
-                *millis,
-            )),
-            Block::Tool(call) => lines.extend(tool_lines(app, call)),
-            Block::Notice(text) => lines.push(Line::from(Span::styled(
-                format!("· {text}"),
-                theme::faint(),
-            ))),
-            Block::Error(text) => lines.push(Line::from(vec![
-                Span::styled("✗ ", theme::bold(theme::ERROR)),
-                Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
-            ])),
-        }
+            } => (
+                thought_lines(app, text, started.elapsed().as_millis(), *millis),
+                None,
+            ),
+            Block::Tool(call) => (tool_lines(app, call), Some(call.id.clone())),
+            Block::Notice(text) => (
+                vec![Line::from(Span::styled(
+                    format!("· {text}"),
+                    theme::faint(),
+                ))],
+                None,
+            ),
+            Block::Error(text) => (
+                vec![Line::from(vec![
+                    Span::styled("✗ ", theme::bold(theme::ERROR)),
+                    Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
+                ])],
+                None,
+            ),
+        };
+        lines.extend(block_lines.into_iter().map(|line| (line, call.clone())));
     }
     if app.working() {
-        lines.push(Line::default());
-        lines.push(working_line(app));
+        lines.push((Line::default(), None));
+        lines.push((working_line(app), None));
     }
     lines
 }
@@ -267,19 +293,59 @@ fn tool_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
             theme::faint(),
         )));
     }
-    for preview in call.preview.iter().take(4) {
+    lines.extend(output_lines(call));
+    lines
+}
+
+/// Raw tool output stays folded: it is machine-shaped, often thousands of
+/// lines, and unreadable inline. The fold row says how much there is and opens
+/// on a click or `^o`.
+fn output_lines(call: &ToolCall) -> Vec<Line<'static>> {
+    if call.output.is_empty() {
+        return Vec::new();
+    }
+    let count = call.output.len();
+    if !call.expanded {
+        return vec![Line::from(vec![
+            Span::styled("   ▸ ", theme::dim()),
+            Span::styled(
+                format!("{count} {} of output", plural("line", count)),
+                theme::dim(),
+            ),
+            Span::styled("  click or ^o to open", theme::faint()),
+        ])];
+    }
+    let mut lines = vec![Line::from(vec![
+        Span::styled("   ▾ ", theme::dim()),
+        Span::styled("output", theme::dim()),
+    ])];
+    lines.extend(call.output.iter().take(MAX_OUTPUT_ROWS).map(|line| {
+        Line::from(vec![
+            Span::styled("   │ ", theme::faint()),
+            Span::styled(line.clone(), theme::dim()),
+        ])
+    }));
+    if count > MAX_OUTPUT_ROWS {
         lines.push(Line::from(Span::styled(
-            format!("   {preview}"),
+            format!("   │ … {} more lines", count - MAX_OUTPUT_ROWS),
             theme::faint(),
         )));
     }
     lines
 }
 
+fn plural(word: &str, count: usize) -> String {
+    if count == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
 fn tool_header(app: &App, call: &ToolCall) -> Vec<Span<'static>> {
     let (glyph, style) = match call.status {
         _ if call.running() => (
-            theme::spinner(app.tick).to_string(),
+            theme::pulse(theme::Pulse::Tool, app.tick).to_string(),
             theme::bold(theme::RUNNING),
         ),
         ToolCallStatus::Failed => ("✗".into(), theme::bold(theme::ERROR)),
@@ -328,7 +394,7 @@ const fn kind_label(kind: ToolKind) -> &'static str {
 fn child_spans(app: &App, child: &Child, indent: &str) -> Vec<Span<'static>> {
     let (glyph, style) = if child.running() {
         (
-            theme::spinner(app.tick).to_string(),
+            theme::pulse(theme::Pulse::Child, app.tick).to_string(),
             Style::default().fg(theme::RUNNING),
         )
     } else if child.ok {
@@ -360,7 +426,7 @@ fn working_line(app: &App) -> Line<'static> {
     };
     Line::from(vec![
         Span::styled(
-            format!("{} ", theme::spinner(app.tick)),
+            format!("{} ", theme::pulse(theme::Pulse::Turn, app.tick)),
             theme::bold(theme::ACCENT),
         ),
         Span::styled(label.to_string(), theme::accent()),
@@ -529,25 +595,20 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
         gutter,
     );
 
-    let rows = field.height as usize;
-    let (cursor_row, cursor_column) = app.editor.cursor_cell();
-    let first = cursor_row.saturating_sub(rows.saturating_sub(1));
-    let lines: Vec<Line<'static>> = app
-        .editor
-        .lines()
-        .skip(first)
-        .take(rows)
-        .map(|line| Line::from(Span::styled(line.to_string(), theme::text())))
-        .collect();
-    let placeholder = app.editor.text().is_empty();
-    frame.render_widget(
-        Paragraph::new(if placeholder {
-            vec![Line::from(Span::styled("message kit…", theme::faint()))]
-        } else {
-            lines
-        }),
-        field,
-    );
+    let height = field.height as usize;
+    let (rows, (cursor_row, cursor_column)) = app.editor.wrapped(field.width as usize);
+    // Keep the cursor's row on screen when the prompt is taller than the box.
+    let first = cursor_row.saturating_sub(height.saturating_sub(1));
+    let lines: Vec<Line<'static>> = if app.editor.text().is_empty() {
+        vec![Line::from(Span::styled("message kit…", theme::faint()))]
+    } else {
+        rows.into_iter()
+            .skip(first)
+            .take(height)
+            .map(|row| Line::from(Span::styled(row, theme::text())))
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), field);
     frame.set_cursor_position(Position::new(
         field.x
             + u16::try_from(cursor_column)
@@ -561,12 +622,15 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut left = match app.phase {
         Phase::Idle => vec![Span::styled(" ready", theme::dim())],
         Phase::Cancelling => vec![
-            Span::styled(format!(" {} ", theme::spinner(app.tick)), theme::bar()),
+            Span::styled(
+                format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
+                theme::bar(),
+            ),
             Span::styled("stopping", Style::default().fg(theme::WARN)),
         ],
         Phase::Working => vec![
             Span::styled(
-                format!(" {} ", theme::spinner(app.tick)),
+                format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
                 Style::default().fg(theme::ACCENT).bg(theme::BAR_BG),
             ),
             Span::styled(
@@ -610,7 +674,7 @@ mod tests {
     use agentkit_acp::ToolKind;
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::draw;
+    use super::{MAX_PROMPT_ROWS, draw};
     use crate::{
         events::RuntimeEvent,
         tui::app::{App, Update},
@@ -701,7 +765,7 @@ mod tests {
             id: "call-1".into(),
             status: Some(agentkit_acp::ToolCallStatus::Failed),
             script: None,
-            preview: vec!["exit code 1".into()],
+            output: vec!["exit code 1".into()],
         });
         app.apply(Update::TurnEnded(Some("model refused the request".into())));
         app.apply(Update::Log("warn: retrying provider request".into()));
@@ -719,6 +783,71 @@ mod tests {
         assert!(frame.contains("agent log"));
         assert!(frame.contains("retrying provider request"));
         assert!(!frame.contains("follow-up number 11"));
+    }
+
+    #[test]
+    fn grows_and_wraps_the_prompt_instead_of_running_past_the_edge() {
+        let mut app = App::new(PathBuf::from("/tmp/kit"), "gpt-5.4".into(), "0:0".into());
+        for word in "explain how the compose tool dispatches hidden children and \
+                     everything internal to it. give me a plan"
+            .split(' ')
+        {
+            for character in word.chars() {
+                app.editor.insert_char(character);
+            }
+            app.editor.insert_char(' ');
+        }
+        let frame = render(&mut app, 60, 20);
+        println!("{frame}");
+        let rows: Vec<&str> = frame.lines().collect();
+        let prompt: Vec<&&str> = rows.iter().filter(|row| row.starts_with('│')).collect();
+        assert!(prompt.len() >= 2, "prompt should have grown: {prompt:?}");
+        for row in prompt {
+            assert!(row.ends_with('│'), "prompt row overflowed: {row:?}");
+        }
+
+        // A prompt taller than the cap scrolls inside the box instead of
+        // pushing the transcript off the screen.
+        for _ in 0..40 {
+            app.editor.insert_str("more text to type ");
+        }
+        let frame = render(&mut app, 60, 20);
+        let prompt = frame.lines().filter(|row| row.starts_with('│')).count();
+        assert_eq!(prompt, MAX_PROMPT_ROWS);
+        assert!(frame.contains("message kit") || frame.contains("more text"));
+    }
+
+    #[test]
+    fn folds_raw_tool_output_until_the_card_is_clicked() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = sample();
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(agentkit_acp::ToolCallStatus::Completed),
+            script: None,
+            output: (0..40)
+                .map(|index| format!("output line {index}"))
+                .collect(),
+        });
+        let frame = render(&mut app, 100, 24);
+        println!("{frame}");
+        assert!(frame.contains("40 lines of output"));
+        assert!(!frame.contains("output line 39"));
+
+        let row = frame
+            .lines()
+            .position(|line| line.contains("lines of output"))
+            .expect("fold row is on screen");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        });
+        let frame = render(&mut app, 100, 24);
+        println!("{frame}");
+        assert!(frame.contains("output line 39"));
     }
 
     #[test]

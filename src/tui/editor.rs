@@ -27,22 +27,88 @@ impl Editor {
         self.text.trim().is_empty()
     }
 
-    pub fn lines(&self) -> impl Iterator<Item = &str> {
-        self.text.split('\n')
+    /// Soft-wraps the prompt to `width` columns, with the cursor's cell in the
+    /// wrapped layout.
+    ///
+    /// The prompt is edited in logical lines but shown in display rows, so
+    /// wrapping and cursor placement have to agree: both come from this one
+    /// pass over the buffer.
+    pub fn wrapped(&self, width: usize) -> (Vec<String>, (usize, usize)) {
+        let ranges = self.rows(width);
+        let index = self.cursor_row(&ranges);
+        let (start, _) = ranges[index];
+        let mut rows: Vec<String> = ranges
+            .iter()
+            .map(|(start, end)| self.text[*start..*end].to_string())
+            .collect();
+        let mut cursor = (index, self.text[start..self.cursor].width());
+        if cursor.1 >= width.max(1) {
+            rows.push(String::new());
+            cursor = (rows.len() - 1, 0);
+        }
+        (rows, cursor)
     }
 
-    pub fn line_count(&self) -> usize {
-        self.text.bytes().filter(|byte| *byte == b'\n').count() + 1
+    /// Display rows the prompt needs at `width` columns.
+    pub fn display_rows(&self, width: usize) -> usize {
+        self.wrapped(width).0.len()
     }
 
-    /// Cursor as a (row, display column) pair for terminal placement.
-    pub fn cursor_cell(&self) -> (usize, usize) {
-        let row = self.text[..self.cursor]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
-        let (start, _) = self.line_bounds(self.cursor);
-        (row, self.text[start..self.cursor].width())
+    /// Moves to the display row above, keeping the column. Returns false on the
+    /// first row so the caller can fall back to history browsing.
+    pub fn move_row_up(&mut self, width: usize) -> bool {
+        let ranges = self.rows(width);
+        let index = self.cursor_row(&ranges);
+        if index == 0 {
+            return false;
+        }
+        self.move_between_rows(ranges[index], ranges[index - 1]);
+        true
+    }
+
+    /// Moves to the display row below, keeping the column.
+    pub fn move_row_down(&mut self, width: usize) -> bool {
+        let ranges = self.rows(width);
+        let index = self.cursor_row(&ranges);
+        if index + 1 >= ranges.len() {
+            return false;
+        }
+        self.move_between_rows(ranges[index], ranges[index + 1]);
+        true
+    }
+
+    fn move_between_rows(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let column = self.text[from.0..self.cursor].chars().count();
+        self.cursor = to.0 + char_offset(&self.text[to.0..to.1], column);
+    }
+
+    /// Byte ranges of the display rows, one per wrapped or logical line.
+    fn rows(&self, width: usize) -> Vec<(usize, usize)> {
+        let width = width.max(1);
+        let mut ranges = Vec::new();
+        let mut line_start = 0;
+        for line in self.text.split('\n') {
+            ranges.extend(
+                segments(line, width)
+                    .into_iter()
+                    .map(|(start, end)| (line_start + start, line_start + end)),
+            );
+            line_start += line.len() + 1;
+        }
+        ranges
+    }
+
+    /// The display row holding the cursor. A cursor resting exactly on a soft
+    /// break belongs to the row that follows it.
+    fn cursor_row(&self, ranges: &[(usize, usize)]) -> usize {
+        ranges
+            .iter()
+            .position(|(_, end)| self.cursor < *end || (self.cursor == *end && self.ends_row(*end)))
+            .unwrap_or_else(|| ranges.len() - 1)
+    }
+
+    fn ends_row(&self, at: usize) -> bool {
+        at == self.text.len() || self.text[at..].starts_with('\n')
     }
 
     /// Takes the prompt, records it in the history, and clears the buffer.
@@ -138,32 +204,6 @@ impl Editor {
 
     pub fn move_line_end(&mut self) {
         self.cursor = self.line_bounds(self.cursor).1;
-    }
-
-    /// Moves up a line, keeping the column. Returns false at the first line so
-    /// the caller can fall back to history browsing.
-    pub fn move_up(&mut self) -> bool {
-        let (start, _) = self.line_bounds(self.cursor);
-        if start == 0 {
-            return false;
-        }
-        let column = self.text[start..self.cursor].chars().count();
-        let (previous_start, previous_end) = self.line_bounds(start - 1);
-        self.cursor =
-            char_offset(&self.text[previous_start..previous_end], column) + previous_start;
-        true
-    }
-
-    /// Moves down a line, keeping the column. Returns false at the last line.
-    pub fn move_down(&mut self) -> bool {
-        let (start, end) = self.line_bounds(self.cursor);
-        if end == self.text.len() {
-            return false;
-        }
-        let column = self.text[start..self.cursor].chars().count();
-        let (next_start, next_end) = self.line_bounds(end + 1);
-        self.cursor = char_offset(&self.text[next_start..next_end], column) + next_start;
-        true
     }
 
     /// Recalls the previous prompt, parking any unsent draft.
@@ -263,6 +303,36 @@ impl Editor {
     }
 }
 
+/// Byte ranges of one logical line's display rows, breaking after spaces when
+/// possible and mid-word only when a word cannot fit on a row of its own.
+fn segments(line: &str, width: usize) -> Vec<(usize, usize)> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    let mut last_break = None;
+    for (index, character) in line.char_indices() {
+        let advance = character.to_string().width();
+        if used + advance > width {
+            let cut = last_break.filter(|cut| *cut > start).unwrap_or(index);
+            if cut > start {
+                segments.push((start, cut));
+                start = cut;
+                used = line[start..index].width();
+            } else {
+                // One character wider than the whole row: let it stand alone.
+                used = 0;
+            }
+            last_break = None;
+        }
+        used += advance;
+        if character == ' ' {
+            last_break = Some(index + character.len_utf8());
+        }
+    }
+    segments.push((start, line.len()));
+    segments
+}
+
 fn is_word(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
@@ -301,11 +371,20 @@ mod tests {
     #[test]
     fn keeps_the_column_when_moving_between_lines() {
         let mut editor = editor("abcdef\nxy\nlonger");
-        editor.move_up();
-        editor.move_up();
-        assert_eq!(editor.cursor_cell(), (0, 2));
-        editor.move_down();
-        assert_eq!(editor.cursor_cell(), (1, 2));
+        assert!(editor.move_row_up(40));
+        assert!(editor.move_row_up(40));
+        assert_eq!(editor.wrapped(40).1, (0, 2));
+        assert!(editor.move_row_down(40));
+        assert_eq!(editor.wrapped(40).1, (1, 2));
+    }
+
+    #[test]
+    fn moves_between_wrapped_rows_before_reaching_history() {
+        let mut editor = editor("one two three four");
+        assert!(editor.move_row_up(8));
+        assert_eq!(editor.wrapped(8).1, (1, 4));
+        assert!(editor.move_row_up(8));
+        assert!(!editor.move_row_up(8));
     }
 
     #[test]
@@ -317,6 +396,47 @@ mod tests {
         assert_eq!(editor.text(), "build it");
         editor.history_next();
         assert_eq!(editor.text(), "draft");
+    }
+
+    #[test]
+    fn soft_wraps_the_prompt_and_follows_the_cursor() {
+        let mut editor = editor("hello world again");
+        let (rows, cursor) = editor.wrapped(8);
+        assert_eq!(rows, ["hello ", "world ", "again"]);
+        assert_eq!(cursor, (2, 5));
+        editor.move_line_start();
+        assert_eq!(editor.wrapped(8).1, (0, 0));
+    }
+
+    #[test]
+    fn puts_the_cursor_on_the_next_row_at_a_soft_break() {
+        let mut editor = editor("hello world");
+        for _ in 0..5 {
+            editor.move_left();
+        }
+        assert_eq!(editor.wrapped(8).1, (1, 0));
+    }
+
+    #[test]
+    fn wraps_words_wider_than_the_row() {
+        let editor = editor("supercalifragilistic");
+        assert_eq!(editor.wrapped(6).0, ["superc", "alifra", "gilist", "ic"]);
+    }
+
+    #[test]
+    fn counts_wrapped_rows_for_the_prompt_box() {
+        let editor = editor("one two three four five");
+        assert_eq!(editor.display_rows(10), 3);
+        assert_eq!(editor.display_rows(80), 1);
+    }
+
+    #[test]
+    fn opens_a_fresh_row_when_the_cursor_fills_the_last_one() {
+        let editor = editor("abcd");
+        assert_eq!(
+            editor.wrapped(4),
+            (vec!["abcd".into(), String::new()], (1, 0))
+        );
     }
 
     #[test]

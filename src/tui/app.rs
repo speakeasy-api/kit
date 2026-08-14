@@ -6,7 +6,9 @@ use std::{
 };
 
 use agentkit_acp::{ToolCallStatus, ToolKind};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::events::RuntimeEvent;
 
@@ -34,7 +36,7 @@ pub enum Update {
         id: String,
         status: Option<ToolCallStatus>,
         script: Option<String>,
-        preview: Vec<String>,
+        output: Vec<String>,
     },
     /// Context window accounting.
     Usage { used: u64, size: u64 },
@@ -89,7 +91,9 @@ pub struct ToolCall {
     pub finished: Option<Instant>,
     pub plan: Vec<PlanNode>,
     pub children: Vec<Child>,
-    pub preview: Vec<String>,
+    /// Raw tool output, kept whole but folded away until asked for.
+    pub output: Vec<String>,
+    pub expanded: bool,
 }
 
 impl ToolCall {
@@ -201,6 +205,14 @@ pub struct App {
     /// Rendered transcript height and total line count from the last frame.
     pub viewport: usize,
     pub total_lines: usize,
+    /// Prompt field width from the last frame, for row-wise cursor movement.
+    pub prompt_width: usize,
+    /// Which tool call owns each rendered transcript row, and where that area
+    /// started, so a click can be mapped back to a card.
+    pub row_calls: Vec<Option<String>>,
+    pub transcript_top: usize,
+    pub transcript_left: usize,
+    pub transcript_width: usize,
     pub toast: Option<(String, Instant)>,
 }
 
@@ -224,6 +236,11 @@ impl App {
             follow: true,
             viewport: 0,
             total_lines: 0,
+            prompt_width: 80,
+            row_calls: Vec::new(),
+            transcript_top: 0,
+            transcript_left: 0,
+            transcript_width: 0,
             toast: None,
         }
     }
@@ -310,14 +327,15 @@ impl App {
                     finished: None,
                     plan: script.as_deref().map(parse_plan).unwrap_or_default(),
                     children: Vec::new(),
-                    preview: Vec::new(),
+                    output: Vec::new(),
+                    expanded: false,
                 }));
             }
             Update::ToolUpdated {
                 id,
                 status,
                 script,
-                preview,
+                output,
             } => {
                 let Some(call) = self.call_mut(&id) else {
                     return;
@@ -325,8 +343,8 @@ impl App {
                 if let Some(script) = script {
                     call.plan = parse_plan(&script);
                 }
-                if !preview.is_empty() {
-                    call.preview = preview;
+                if !output.is_empty() {
+                    call.output = output;
                 }
                 if let Some(status) = status {
                     call.status = status;
@@ -429,6 +447,23 @@ impl App {
         self.scroll = usize::MAX;
     }
 
+    /// Folds a tool call's raw output open or shut.
+    pub fn toggle_output(&mut self, id: &str) {
+        if let Some(call) = self.call_mut(id) {
+            call.expanded = !call.expanded;
+        }
+    }
+
+    /// Folds the most recent tool call, for keyboard use.
+    pub fn toggle_last_output(&mut self) {
+        if let Some(id) = self.blocks.iter().rev().find_map(|block| match block {
+            Block::Tool(call) => Some(call.id.clone()),
+            _ => None,
+        }) {
+            self.toggle_output(&id);
+        }
+    }
+
     pub fn note(&mut self, text: impl Into<String>) {
         self.blocks.push(Block::Notice(text.into()));
     }
@@ -505,6 +540,7 @@ impl App {
                 self.graph_pinned = Some(!self.show_graph());
             }
             KeyCode::Char('l') if control => self.show_logs = !self.show_logs,
+            KeyCode::Char('o') if control => self.toggle_last_output(),
             KeyCode::Char('t') if control => self.show_thoughts = !self.show_thoughts,
             KeyCode::Left if line => self.editor.move_line_start(),
             KeyCode::Right if line => self.editor.move_line_end(),
@@ -515,12 +551,12 @@ impl App {
             KeyCode::Up if shift => self.scroll_by(-1),
             KeyCode::Down if shift => self.scroll_by(1),
             KeyCode::Up => {
-                if !self.editor.move_up() {
+                if !self.editor.move_row_up(self.prompt_width) {
                     self.editor.history_prev();
                 }
             }
             KeyCode::Down => {
-                if !self.editor.move_down() {
+                if !self.editor.move_row_down(self.prompt_width) {
                     self.editor.history_next();
                 }
             }
@@ -553,7 +589,26 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-3),
             MouseEventKind::ScrollDown => self.scroll_by(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.click(mouse.column as usize, mouse.row as usize);
+            }
             _ => {}
+        }
+    }
+
+    /// A click on a tool card folds its output open or shut.
+    fn click(&mut self, column: usize, row: usize) {
+        let Some(offset) = row.checked_sub(self.transcript_top) else {
+            return;
+        };
+        let inside = offset < self.viewport
+            && column >= self.transcript_left
+            && column < self.transcript_left + self.transcript_width;
+        if !inside {
+            return;
+        }
+        if let Some(Some(id)) = self.row_calls.get(self.scroll + offset).cloned() {
+            self.toggle_output(&id);
         }
     }
 }

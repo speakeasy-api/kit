@@ -13,15 +13,33 @@ use unicode_width::UnicodeWidthStr;
 
 /// Wraps rendered lines to `width` columns.
 pub fn wrap(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    let tagged: Vec<(Line<'static>, ())> = lines.iter().map(|line| (line.clone(), ())).collect();
+    wrap_tagged(&tagged, width)
+        .into_iter()
+        .map(|(line, ())| line)
+        .collect()
+}
+
+/// Wraps lines that carry a tag, copying each source line's tag onto every
+/// display row it produces. The client uses this to know which tool call a
+/// clicked row belongs to.
+pub fn wrap_tagged<T: Clone>(
+    lines: &[(Line<'static>, T)],
+    width: usize,
+) -> Vec<(Line<'static>, T)> {
     if width == 0 {
         return Vec::new();
     }
     let mut wrapped = Vec::with_capacity(lines.len());
-    for line in lines {
+    for (line, tag) in lines {
         if line.width() <= width {
-            wrapped.push(line.clone());
+            wrapped.push((line.clone(), tag.clone()));
         } else {
-            wrapped.append(&mut wrap_line(line, width));
+            wrapped.extend(
+                wrap_line(line, width)
+                    .into_iter()
+                    .map(|line| (line, tag.clone())),
+            );
         }
     }
     wrapped
