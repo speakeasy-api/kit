@@ -67,6 +67,14 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("  ·  ", theme::faint()),
         Span::styled(app.model.clone(), theme::dim()),
         Span::styled("  ·  ", theme::faint()),
+        Span::styled(
+            format!(
+                "session {}",
+                app.session_id.as_deref().unwrap_or("starting")
+            ),
+            theme::dim(),
+        ),
+        Span::styled("  ·  ", theme::faint()),
         Span::styled(format!("a2a {}", app.a2a), theme::dim()),
     ];
     if let Some((used, size)) = app.usage {

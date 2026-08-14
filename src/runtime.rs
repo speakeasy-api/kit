@@ -25,10 +25,18 @@ use crate::{
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug)]
+pub struct SessionRequest {
+    pub id: String,
+    pub resume: bool,
+    pub force: bool,
+}
+
 pub struct Runtime {
     root: PathBuf,
     adapter: OpenAiSubscriptionAdapter,
     max_subagent_depth: usize,
+    session: Option<SessionRequest>,
 }
 
 impl Runtime {
@@ -48,7 +56,20 @@ impl Runtime {
             root,
             adapter,
             max_subagent_depth: 2,
+            session: None,
         }))
+    }
+
+    /// Configures the single persistent ACP session served by this runtime.
+    pub fn with_session(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        session: SessionRequest,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(Self::new(root, model)?)
+            .map_err(|_| "could not configure runtime session".to_string())?;
+        runtime.session = Some(session);
+        Ok(Arc::new(runtime))
     }
 
     pub fn root(&self) -> &Path {
@@ -75,6 +96,34 @@ impl Runtime {
 
     pub async fn run(self: &Arc<Self>, prompt: String, depth: usize) -> Result<String, LoopError> {
         self.run_cancelled(prompt, depth, None).await
+    }
+
+    /// Runs one prompt in the configured durable session.
+    pub async fn run_persistent(self: &Arc<Self>, prompt: String) -> Result<String, String> {
+        let request = self
+            .session
+            .clone()
+            .ok_or_else(|| "persistent run requires a configured session".to_string())?;
+        let opened = crate::session::open(
+            &self.root,
+            &request.id,
+            request.resume,
+            request.force,
+            Item::text(ItemKind::System, self.system_prompt(0)),
+        )?;
+        let agent = Agent::builder()
+            .model(self.adapter.clone())
+            .add_tool_source(self.compose(0))
+            .transcript_observer(opened.observer)
+            .transcript(opened.transcript)
+            .input(vec![Item::text(ItemKind::User, prompt)])
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut driver = agent
+            .start(SessionConfig::new(request.id).without_cache())
+            .await
+            .map_err(|error| error.to_string())?;
+        drive(&mut driver).await.map_err(|error| error.to_string())
     }
 
     pub async fn run_cancelled(
@@ -126,14 +175,33 @@ impl Runtime {
                 self.root.display()
             )));
         }
+        let request = self
+            .session
+            .clone()
+            .unwrap_or_else(|| crate::runtime::SessionRequest {
+                id: crate::session::new_id(),
+                resume: false,
+                force: false,
+            });
+        let opened = crate::session::open(
+            &self.root,
+            &request.id,
+            request.resume,
+            request.force,
+            Item::text(ItemKind::System, self.system_prompt(0)),
+        )
+        .map_err(AcpRuntimeError::Loop)?;
         Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose(0))
             .observer(context.integration.as_ref().clone())
-            .transcript(vec![Item::text(ItemKind::System, self.system_prompt(0))])
+            .transcript_observer(opened.observer)
+            .transcript(opened.transcript)
             .cancellation(context.cancellation)
             .build()
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+            // ACP routes observer events by its own bound AgentKit id. The
+            // persisted id names storage; it must not replace that routing key.
             .start(SessionConfig::new(context.agentkit_session_id).without_cache())
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))

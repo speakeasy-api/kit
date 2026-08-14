@@ -6,6 +6,7 @@ use std::{
 };
 
 use agentkit_acp::{ToolCallStatus, ToolKind};
+use agentkit_core::{Item, ItemKind, Part, ToolOutput};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -189,6 +190,7 @@ pub struct App {
     pub root: PathBuf,
     pub model: String,
     pub a2a: String,
+    pub session_id: Option<String>,
     pub blocks: Vec<Block>,
     pub editor: Editor,
     pub phase: Phase,
@@ -223,12 +225,27 @@ pub struct App {
 /// return in such a burst is a line break in the pasted text, not a send.
 const PASTE_GAP: Duration = Duration::from_millis(8);
 
+fn persisted_output(output: &ToolOutput) -> Vec<String> {
+    let text = match output {
+        ToolOutput::Text(text) => text.clone(),
+        ToolOutput::Structured(value) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        ToolOutput::Parts(parts) => {
+            serde_json::to_string_pretty(parts).unwrap_or_else(|_| format!("{} parts", parts.len()))
+        }
+        ToolOutput::Files(files) => format!("{} files", files.len()),
+    };
+    text.lines().map(str::to_string).collect()
+}
+
 impl App {
     pub fn new(root: PathBuf, model: String, a2a: String) -> Self {
         Self {
             root,
             model,
             a2a,
+            session_id: None,
             blocks: Vec::new(),
             editor: Editor::default(),
             phase: Phase::Idle,
@@ -255,6 +272,82 @@ impl App {
 
     pub fn working(&self) -> bool {
         self.phase != Phase::Idle
+    }
+
+    /// Rebuilds the visible history from the same Items preloaded into the model.
+    pub fn restore_transcript(&mut self, session_id: String, transcript: &[Item]) {
+        self.session_id = Some(session_id);
+        for item in transcript {
+            match item.kind {
+                ItemKind::System | ItemKind::Developer | ItemKind::Context => continue,
+                ItemKind::User | ItemKind::Notification => {
+                    let text = item
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            Part::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if !text.is_empty() {
+                        if item.kind == ItemKind::User {
+                            self.blocks.push(Block::User(text));
+                        } else {
+                            self.blocks.push(Block::Notice(text));
+                        }
+                    }
+                }
+                ItemKind::Assistant => {
+                    for part in &item.parts {
+                        match part {
+                            Part::Text(text) if !text.text.is_empty() => {
+                                self.blocks.push(Block::Agent(text.text.clone()))
+                            }
+                            Part::Reasoning(reasoning) if reasoning.summary.is_some() => {
+                                self.blocks.push(Block::Thought {
+                                    text: reasoning.summary.clone().unwrap_or_default(),
+                                    started: Instant::now(),
+                                    millis: Some(0),
+                                })
+                            }
+                            Part::ToolCall(call) => self.blocks.push(Block::Tool(ToolCall {
+                                id: call.id.to_string(),
+                                title: call.name.clone(),
+                                kind: ToolKind::Other,
+                                status: ToolCallStatus::Completed,
+                                started: Instant::now(),
+                                finished: Some(Instant::now()),
+                                plan: call
+                                    .input
+                                    .get("script")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(parse_plan)
+                                    .unwrap_or_default(),
+                                children: Vec::new(),
+                                output: Vec::new(),
+                                expanded: false,
+                            })),
+                            _ => {}
+                        }
+                    }
+                }
+                ItemKind::Tool => {
+                    for part in &item.parts {
+                        if let Part::ToolResult(result) = part
+                            && let Some(call) = self.call_mut(&result.call_id.to_string())
+                        {
+                            call.output = persisted_output(&result.output);
+                            if result.is_error {
+                                call.status = ToolCallStatus::Failed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.follow = true;
+        self.scroll = usize::MAX;
     }
 
     /// The tool call the graph pane should show: the running one, else the

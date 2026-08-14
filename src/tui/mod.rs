@@ -26,7 +26,8 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
-    CancelNotification, ContentBlock, SessionNotification, SessionUpdate, ToolCallContent,
+    CancelNotification, CloseSessionRequest, ContentBlock, SessionNotification, SessionUpdate,
+    ToolCallContent,
 };
 use crossterm::{
     event::{
@@ -64,14 +65,24 @@ const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
 const FAILURE_LINES: usize = 5;
 
-pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    root: &Path,
+    model: &str,
+    a2a: &str,
+    resume: Option<&str>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
     // the same path the agent accepts.
     let root = &root
         .canonicalize()
         .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
-    let mut child = Command::new(std::env::current_exe()?)
+    let persisted_session_id = resume
+        .map(str::to_string)
+        .unwrap_or_else(crate::session::new_id);
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .arg("serve")
         .arg("--root")
         .arg(root)
@@ -79,6 +90,15 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
         .arg(model)
         .arg("--a2a")
         .arg(a2a)
+        .arg("--session-id")
+        .arg(&persisted_session_id);
+    if resume.is_some() {
+        command.arg("--resume");
+    }
+    if force {
+        command.arg("--force");
+    }
+    let mut child = command
         .env(EVENTS_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -127,12 +147,24 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
     // The child is watched from its own task, which also owns it: aborting that
     // task drops the handle, and `kill_on_drop` takes the process with it.
     let (exit_tx, exit_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let watcher = tokio::spawn(async move {
-        let _ = exit_tx.send(child.wait().await);
+        tokio::select! {
+            status = child.wait() => {
+                let _ = exit_tx.send(status);
+            }
+            _ = shutdown_rx => {
+                // Unlike dropping a `kill_on_drop` child, `kill().await` waits
+                // until the process is gone and its OS file locks are released.
+                let _ = child.kill().await;
+            }
+        }
     });
 
     let notifications = updates_tx.clone();
-    agent_client_protocol::Client
+    let cleanup_root = root.clone();
+    let cleanup_session_id = persisted_session_id.clone();
+    let result = agent_client_protocol::Client
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
@@ -175,15 +207,21 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
                 }
             };
             let session_id = session.session_id.clone();
+            // The server has acquired the mutation lock during NewSession, so
+            // this read is the exact stable snapshot it preloaded into the model.
+            let restored = crate::session::load(&root, &persisted_session_id).map_err(|error| {
+                agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
+            })?;
 
             let mut terminal =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut app = App::new(root, model, a2a);
+            app.restore_transcript(persisted_session_id, &restored);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             let mut stop =
                 Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
-            let result = async {
+            let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
                     terminal
                         .draw(|frame| ui::draw(frame, &mut app))
@@ -257,11 +295,30 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
             }
             .await;
             leave(terminal);
-            watcher.abort();
-            result
+            // Closing the ACP session removes its driver from the server,
+            // dropping the transcript observer and its filesystem lock. Merely
+            // closing stdio does not ask the headless runtime to close sessions.
+            let closed = connection
+                .send_request(CloseSessionRequest::new(session_id))
+                .block_task()
+                .await;
+            result?;
+            closed?;
+            Ok(())
         })
         .await
-        .map_err(explain)?;
+        .map_err(explain);
+
+    // The A2A listener keeps the child alive after ACP closes. Stop it only
+    // after CloseSession has unwound the lock owner, then wait for OS locks to
+    // be released rather than relying on `kill_on_drop`.
+    let _ = shutdown_tx.send(());
+    let _ = watcher.await;
+    // If the server failed before acknowledging CloseSession, reclaim only a
+    // lock that is now provably stale; a live owner's OS lock is never stolen.
+    let _ = crate::session::remove_stale_lock(&cleanup_root, &cleanup_session_id);
+
+    result?;
     Ok(())
 }
 

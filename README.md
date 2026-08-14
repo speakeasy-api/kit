@@ -12,7 +12,7 @@ It exposes:
 - ChatGPT Pro through an existing Codex login
 
 It intentionally has no permissions framework, provenance ledger, rollback system,
-control-plane authentication, persistence layer, or web UI.
+control-plane authentication, or web UI.
 
 ## Run
 
@@ -22,6 +22,26 @@ Authenticate with Codex once, then start the TUI:
 codex login
 cargo run -- tui --root /path/to/project
 ```
+
+Every TUI conversation is persisted as an append-only, versioned JSONL transcript
+under `<root>/.kit/sessions`. The session id is shown in the header. Resume it with:
+
+```sh
+cargo run -- tui --root /path/to/project --resume <session-id>
+```
+
+A per-session filesystem lock prevents two live Kit processes from mutating the
+same transcript. If a crashed process left its lock file behind, add `--force`;
+Kit will reclaim it only when no live process still holds the OS lock.
+
+For a non-interactive smoke test, run one prompt and print the resumable session id:
+
+```sh
+cargo run -- prompt --root /path/to/project "Reply with a short project summary"
+```
+
+The command prints the model response followed by `session_id: ...` and exits.
+Pass that id to `prompt --resume <session-id>` or `tui --resume <session-id>`.
 
 Run the headless ACP/A2A server directly:
 
