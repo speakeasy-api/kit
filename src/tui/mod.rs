@@ -17,7 +17,10 @@ mod wrap;
 use std::{
     path::Path,
     process::Stdio,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -39,7 +42,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -53,12 +56,21 @@ const TICK: Duration = Duration::from_millis(90);
 const MAX_BURST: usize = 4_096;
 /// Output lines kept per tool call; the fold shows the count either way.
 const MAX_OUTPUT_LINES: usize = 5_000;
+/// How long the agent gets to answer the ACP handshake before the client gives
+/// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
+const HANDSHAKE: Duration = Duration::from_secs(30);
+/// Grace for the agent's last diagnostics to arrive once it has exited.
+const LAST_WORDS: Duration = Duration::from_millis(250);
+/// Diagnostic lines quoted back when the agent dies during the handshake.
+const FAILURE_LINES: usize = 5;
 
 pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
     // the same path the agent accepts.
-    let root = &root.canonicalize()?;
+    let root = &root
+        .canonicalize()
+        .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
     let mut child = Command::new(std::env::current_exe()?)
         .arg("serve")
         .arg("--root")
@@ -82,13 +94,24 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
     let a2a = a2a.to_string();
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
 
+    // The agent's own diagnostics are the only explanation of a failed start,
+    // so they are kept aside as well as shown in the log pane.
+    let recent: Arc<Mutex<Vec<String>>> = Arc::default();
+    let recorder = Arc::clone(&recent);
     let diagnostics = updates_tx.clone();
-    tokio::spawn(async move {
+    let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let update = match events::parse(&line) {
                 Some(event) => Update::Runtime(event),
-                None => Update::Log(line),
+                None => {
+                    if let Ok(mut recent) = recorder.lock() {
+                        recent.push(line.clone());
+                        let extra = recent.len().saturating_sub(FAILURE_LINES);
+                        recent.drain(..extra);
+                    }
+                    Update::Log(line)
+                }
             };
             if diagnostics.send(update).is_err() {
                 return;
@@ -99,6 +122,13 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
         let _ = diagnostics.send(Update::TurnEnded(Some(
             "the agent process exited — press ctrl+c to leave".into(),
         )));
+    });
+
+    // The child is watched from its own task, which also owns it: aborting that
+    // task drops the handle, and `kill_on_drop` takes the process with it.
+    let (exit_tx, exit_rx) = oneshot::channel();
+    let watcher = tokio::spawn(async move {
+        let _ = exit_tx.send(child.wait().await);
     });
 
     let notifications = updates_tx.clone();
@@ -114,14 +144,36 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(transport, async move |connection| {
-            connection
-                .send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
-            let session = connection
-                .send_request(agentkit_acp::NewSessionRequest::new(root.clone()))
-                .block_task()
-                .await?;
+            // An agent that dies here — a taken A2A port, a bad root, no
+            // credentials — leaves its half of the handshake unanswered, and
+            // waiting on it forever shows the user nothing at all. Its exit and
+            // its silence both end the wait with something to read.
+            let handshake = async {
+                connection
+                    .send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(agentkit_acp::NewSessionRequest::new(root.clone()))
+                    .block_task()
+                    .await
+            };
+            let session = tokio::select! {
+                session = handshake => session?,
+                status = exit_rx => {
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other(died(status.ok().and_then(Result::ok), stderr_task, &recent).await),
+                    ));
+                }
+                () = tokio::time::sleep(HANDSHAKE) => {
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other(format!(
+                            "the agent did not answer the ACP handshake within {} seconds",
+                            HANDSHAKE.as_secs()
+                        )),
+                    ));
+                }
+            };
             let session_id = session.session_id.clone();
 
             let mut terminal =
@@ -205,11 +257,67 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
             }
             .await;
             leave(terminal);
-            let _ = child.kill().await;
+            watcher.abort();
             result
         })
-        .await?;
+        .await
+        .map_err(explain)?;
     Ok(())
+}
+
+/// An ACP error prints its whole JSON-RPC envelope; on the way out of the
+/// client only the sentence inside it is worth showing.
+fn explain(error: agent_client_protocol::Error) -> Box<dyn std::error::Error> {
+    Box::new(Failure(match error.data {
+        Some(Value::String(detail)) => detail,
+        _ => error.message,
+    }))
+}
+
+/// An error that reports as its own sentence, since a failed start is read by
+/// a person on a terminal rather than by another program.
+struct Failure(String);
+
+impl std::fmt::Debug for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+/// Explains an agent that exited before the session was open, quoting the last
+/// thing it said.
+async fn died(
+    status: Option<std::process::ExitStatus>,
+    stderr: tokio::task::JoinHandle<()>,
+    recent: &Mutex<Vec<String>>,
+) -> String {
+    // Its final diagnostics are usually still in flight when it exits, and they
+    // are the part worth reading.
+    let _ = tokio::time::timeout(LAST_WORDS, stderr).await;
+    let said = recent
+        .lock()
+        .map(|lines| lines.join(" · "))
+        .unwrap_or_default();
+    let how = match status {
+        Some(status) => match status.code() {
+            Some(code) => format!("exited with status {code}"),
+            None => format!("was killed ({status})"),
+        },
+        None => "exited".to_string(),
+    };
+    if said.is_empty() {
+        format!("the agent {how} before the session opened")
+    } else {
+        format!("the agent {how} before the session opened: {said}")
+    }
 }
 
 /// Applies one terminal event, returning the work it asks for.

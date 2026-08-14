@@ -66,6 +66,10 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 `⌘` and `⇧⏎` need a terminal that speaks the Kitty keyboard protocol (Ghostty,
 Kitty, WezTerm, recent iTerm2); the control-key equivalents work everywhere.
 
+If the agent dies before the session opens — a taken A2A port, a missing root,
+no credentials — the client exits with that agent's own last diagnostic rather
+than waiting on a handshake that will never finish.
+
 Pasting multi-line text puts line breaks in the prompt instead of sending it.
 The client asks the terminal to bracket pastes; where that is unavailable a
 paste arrives as a key burst, and a return inside such a burst is read as a
