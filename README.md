@@ -66,6 +66,12 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 `⌘` and `⇧⏎` need a terminal that speaks the Kitty keyboard protocol (Ghostty,
 Kitty, WezTerm, recent iTerm2); the control-key equivalents work everywhere.
 
+Pasting multi-line text puts line breaks in the prompt instead of sending it.
+The client asks the terminal to bracket pastes; where that is unavailable a
+paste arrives as a key burst, and a return inside such a burst is read as a
+line break rather than a send. Either way the whole paste is applied in one
+redraw.
+
 ## Deliberate limits
 
 The root is a working directory, not a sandbox. Shell commands can access the

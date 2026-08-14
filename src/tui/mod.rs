@@ -22,12 +22,13 @@ use agentkit_acp::{
 };
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use ratatui::DefaultTerminal;
 use serde_json::Value;
 use tokio::{
@@ -43,6 +44,8 @@ use app::{Action, App, Update};
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
+/// Terminal events applied per frame, so a paste lands in one redraw.
+const MAX_BURST: usize = 4_096;
 /// Output lines kept per tool call; the fold shows the count either way.
 const MAX_OUTPUT_LINES: usize = 5_000;
 
@@ -127,8 +130,28 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
                         .draw(|frame| ui::draw(frame, &mut app))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     tokio::select! {
-                        terminal_event = events.next() => match terminal_event {
-                            Some(Ok(event)) => match handle(&mut app, event) {
+                        terminal_event = events.next() => {
+                            // A paste is a burst: one bracketed-paste event, or
+                            // thousands of key events where the terminal cannot
+                            // bracket it. Applying everything the terminal has
+                            // already buffered keeps a paste to a single redraw
+                            // instead of one frame per character.
+                            let mut next = terminal_event;
+                            let mut action = Action::None;
+                            for _ in 0..MAX_BURST {
+                                match next {
+                                    Some(Ok(event)) => action = handle(&mut app, event),
+                                    Some(Err(_)) | None => return Ok(()),
+                                }
+                                if !matches!(action, Action::None) {
+                                    break;
+                                }
+                                match events.next().now_or_never() {
+                                    Some(buffered) => next = buffered,
+                                    None => break,
+                                }
+                            }
+                            match action {
                                 Action::Quit => return Ok(()),
                                 Action::Submit(prompt) => {
                                     app.push_user(prompt.clone());
@@ -157,8 +180,7 @@ pub async fn run(root: &Path, model: &str, a2a: &str) -> Result<(), Box<dyn std:
                                     );
                                 }
                                 Action::None => {}
-                            },
-                            Some(Err(_)) | None => return Ok(()),
+                            }
                         },
                         update = updates_rx.recv() => match update {
                             Some(update) => {
@@ -191,7 +213,7 @@ fn handle(app: &mut App, event: Event) -> Action {
             Action::None
         }
         Event::Paste(text) => {
-            app.editor.insert_str(&text);
+            app.paste(&text);
             Action::None
         }
         _ => Action::None,
@@ -201,7 +223,10 @@ fn handle(app: &mut App, event: Event) -> Action {
 fn enter() -> std::io::Result<DefaultTerminal> {
     let terminal = ratatui::try_init()?;
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, EnableMouseCapture);
+    // Bracketed paste is what keeps pasted text out of the key stream: without
+    // it every newline in a paste arrives as a return press, which submits the
+    // prompt part-way through.
+    let _ = execute!(stdout, EnableBracketedPaste, EnableMouseCapture);
     // Kitty-protocol terminals report `cmd`, `shift+enter`, and key release
     // separately; the client falls back to control keys where they do not.
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -218,7 +243,7 @@ fn leave(terminal: DefaultTerminal) {
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout, DisableMouseCapture);
+    let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
     drop(terminal);
     ratatui::restore();
 }

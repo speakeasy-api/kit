@@ -135,8 +135,27 @@ impl Editor {
         self.cursor += character.len_utf8();
     }
 
+    /// Inserts text at the cursor, made safe to edit and to draw.
+    ///
+    /// Pasted text arrives here whole, so this is the one place foreign content
+    /// is normalised: every line ending becomes `\n`, tabs become spaces so
+    /// wrapping and cursor columns agree with what is on screen, and any other
+    /// control character is dropped rather than shown as a hole in the prompt.
     pub fn insert_str(&mut self, text: &str) {
-        let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut cleaned = String::with_capacity(text.len());
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\r' => {
+                    characters.next_if_eq(&'\n');
+                    cleaned.push('\n');
+                }
+                '\n' => cleaned.push('\n'),
+                '\t' => cleaned.push_str("    "),
+                other if other.is_control() => {}
+                other => cleaned.push(other),
+            }
+        }
         self.text.insert_str(self.cursor, &cleaned);
         self.cursor += cleaned.len();
     }
@@ -385,6 +404,12 @@ mod tests {
         assert_eq!(editor.wrapped(8).1, (1, 4));
         assert!(editor.move_row_up(8));
         assert!(!editor.move_row_up(8));
+    }
+
+    #[test]
+    fn normalises_pasted_text() {
+        let editor = editor("one\r\ntwo\rthree\tfour\u{7}");
+        assert_eq!(editor.text(), "one\ntwo\nthree    four");
     }
 
     #[test]

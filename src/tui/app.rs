@@ -214,7 +214,14 @@ pub struct App {
     pub transcript_left: usize,
     pub transcript_width: usize,
     pub toast: Option<(String, Instant)>,
+    /// When the last key arrived, for telling a paste from typing.
+    pub last_key: Option<Instant>,
 }
+
+/// A key arriving this soon after the previous one is machine-fast: pasted
+/// text in a terminal that cannot bracket a paste, not someone typing. A
+/// return in such a burst is a line break in the pasted text, not a send.
+const PASTE_GAP: Duration = Duration::from_millis(8);
 
 impl App {
     pub fn new(root: PathBuf, model: String, a2a: String) -> Self {
@@ -242,6 +249,7 @@ impl App {
             transcript_left: 0,
             transcript_width: 0,
             toast: None,
+            last_key: None,
         }
     }
 
@@ -480,11 +488,28 @@ impl App {
         self.scroll = usize::MAX;
     }
 
+    /// Inserts pasted text into the prompt.
+    ///
+    /// A paste never sends: the newlines in it are part of the text. Multi-line
+    /// pastes say so, because the prompt box shows only its last rows and the
+    /// rest is easy to miss.
+    pub fn paste(&mut self, text: &str) {
+        self.editor.insert_str(text);
+        let lines = text.lines().count();
+        if lines > 1 {
+            self.toast(format!("pasted {lines} lines"));
+        }
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
+        // Terminals without bracketed paste deliver a paste as a key burst, so
+        // the arrival gap is the only thing separating it from typing.
+        let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
+        self.last_key = Some(Instant::now());
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -513,7 +538,7 @@ impl App {
                 }
                 self.toast = None;
             }
-            KeyCode::Enter if key.modifiers.is_empty() => {
+            KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
                 if self.editor.is_empty() {
                     return Action::None;
                 }
@@ -525,6 +550,7 @@ impl App {
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
             KeyCode::Char('j') if control => self.editor.insert_char('\n'),
+            KeyCode::Tab => self.editor.insert_str("    "),
             KeyCode::Backspace if command => self.editor.delete_to_line_start(),
             KeyCode::Backspace if alt || control => self.editor.delete_word_back(),
             KeyCode::Backspace => self.editor.backspace(),
@@ -615,12 +641,25 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
 
     use agentkit_acp::{ToolCallStatus, ToolKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    use super::{App, Block, Update};
+    use super::{Action, App, Block, Update};
     use crate::events::RuntimeEvent;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
 
     fn app() -> App {
         App::new(
@@ -687,6 +726,37 @@ mod tests {
         };
         assert_eq!(call.status, ToolCallStatus::Completed);
         assert!(!app.working());
+    }
+
+    #[test]
+    fn a_paste_becomes_prompt_text_rather_than_a_send() {
+        let mut app = app();
+        app.paste("first line\nsecond line");
+        assert_eq!(app.editor.text(), "first line\nsecond line");
+        assert_eq!(app.toast_text(), Some("pasted 2 lines"));
+    }
+
+    #[test]
+    fn a_return_inside_a_key_burst_breaks_the_line() {
+        let mut app = app();
+        app.paste("first line");
+        app.last_key = Some(Instant::now());
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "first line\n");
+    }
+
+    #[test]
+    fn a_return_after_a_pause_still_sends() {
+        let mut app = app();
+        app.paste("first line");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected the prompt to be sent");
+        };
+        assert_eq!(prompt, "first line");
     }
 
     #[test]
