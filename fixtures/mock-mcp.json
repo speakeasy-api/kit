@@ -6,6 +6,14 @@
         "-y",
         "@modelcontextprotocol/server-everything"
       ]
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/mcp",
+      "description": "Linear issues and project management",
+      "auth": {
+        "type": "oauth",
+        "scopes": []
+      }
     }
   }
 }

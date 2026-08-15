@@ -40,6 +40,7 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].name.0, "compose");
     assert!(specs[0].description.contains("`tool_search`"));
+    assert!(specs[0].description.contains("`auth`"));
     assert!(specs[0].description.contains("`tool`"));
     assert!(!specs[0].description.contains("mcp_filesystem_read_file"));
 }

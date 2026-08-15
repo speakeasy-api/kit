@@ -33,13 +33,14 @@ fn runtime_is_rooted_and_exposes_only_compose() {
         "`edit`: Apply exact, git-style text hunks",
         "`subagent`: Run a fresh local coding agent",
         "`a2a`: Send a text task",
-        "`tool_search`: Search connected MCP tools",
-        "`tool`: Invoke a connected MCP tool",
+        "`tool_search`: Search configured MCP server names",
+        "`auth`: Start OAuth for a configured remote MCP server",
+        "`tool`: Invoke an authenticated MCP tool",
     ] {
         assert!(description.contains(expected), "missing {expected:?}");
     }
-    assert_eq!(description.matches("Input JSON schema:").count(), 6);
-    assert_eq!(description.matches("Output JSON schema:").count(), 6);
+    assert_eq!(description.matches("Input JSON schema:").count(), 7);
+    assert_eq!(description.matches("Output JSON schema:").count(), 7);
     assert!(description.contains("\"exit_code\""));
     assert!(description.contains("\"enum\":[\"delete\"]"));
     assert!(!description.contains("\"const\""));
@@ -63,7 +64,7 @@ return { found }"#,
     };
     assert_eq!(
         result.result.output,
-        ToolOutput::structured(json!({"found": []}))
+        ToolOutput::structured(json!({"found": {"servers": []}}))
     );
 
     let outcome = execute_compose(&runtime, r#"return tool({ name: "shell", args: {} })"#).await;

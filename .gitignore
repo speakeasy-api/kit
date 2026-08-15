@@ -1,4 +1,5 @@
 /target/
 /.pi-subagents/
 /.kit/
+/.kit-codesign-identity
 .DS_Store

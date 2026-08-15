@@ -16,7 +16,7 @@ use super::{
     markdown,
     plan::PlanKind,
     theme,
-    wrap::{wrap, wrap_tagged},
+    wrap::{LinkedLine, wrap, wrap_linked_tagged},
 };
 
 /// Width at which the graph moves beside the transcript instead of below it.
@@ -114,11 +114,13 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ..text_area
     };
     if app.blocks.is_empty() {
+        app.row_calls.clear();
+        app.row_links.clear();
         frame.render_widget(welcome(), inner);
         return;
     }
 
-    let lines = wrap_tagged(&transcript_lines(app), inner.width.max(1) as usize);
+    let lines = wrap_linked_tagged(&transcript_lines(app), inner.width.max(1) as usize);
     let total = lines.len();
     let height = inner.height as usize;
     app.total_lines = total;
@@ -126,7 +128,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.transcript_top = inner.y as usize;
     app.transcript_left = inner.x as usize;
     app.transcript_width = inner.width as usize;
-    app.row_calls = lines.iter().map(|(_, call)| call.clone()).collect();
+    app.row_calls = lines.iter().map(|(_, call, _)| call.clone()).collect();
+    app.row_links = lines.iter().map(|(_, _, links)| links.clone()).collect();
     let bottom = total.saturating_sub(height);
     let offset = if app.follow {
         bottom
@@ -139,7 +142,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .into_iter()
         .skip(offset)
         .take(height)
-        .map(|(line, _)| line)
+        .map(|(line, _, _)| line)
         .collect();
     frame.render_widget(Paragraph::new(visible), inner);
     if total > height {
@@ -189,46 +192,55 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
 
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
-fn transcript_lines(app: &App) -> Vec<(Line<'static>, Option<String>)> {
-    let mut lines: Vec<(Line<'static>, Option<String>)> = Vec::new();
+fn transcript_lines(app: &App) -> Vec<(LinkedLine, Option<String>)> {
+    let mut lines: Vec<(LinkedLine, Option<String>)> = Vec::new();
     for block in &app.blocks {
         if !lines.is_empty() {
-            lines.push((Line::default(), None));
+            lines.push((LinkedLine::plain(Line::default()), None));
         }
         let (block_lines, call) = match block {
-            Block::User(text) => (user_lines(text), None),
-            Block::Agent(text) => (markdown::render(text), None),
+            Block::User(text) => (plain_lines(user_lines(text)), None),
+            Block::Agent(text) => (markdown::render_linked(text), None),
             Block::Thought {
                 text,
                 started,
                 millis,
             } => (
-                thought_lines(app, text, started.elapsed().as_millis(), *millis),
+                plain_lines(thought_lines(
+                    app,
+                    text,
+                    started.elapsed().as_millis(),
+                    *millis,
+                )),
                 None,
             ),
-            Block::Tool(call) => (tool_lines(app, call), Some(call.id.clone())),
+            Block::Tool(call) => (plain_lines(tool_lines(app, call)), Some(call.id.clone())),
             Block::Notice(text) => (
-                vec![Line::from(Span::styled(
+                plain_lines(vec![Line::from(Span::styled(
                     format!("· {text}"),
                     theme::faint(),
-                ))],
+                ))]),
                 None,
             ),
             Block::Error(text) => (
-                vec![Line::from(vec![
+                plain_lines(vec![Line::from(vec![
                     Span::styled("✗ ", theme::bold(theme::ERROR)),
                     Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
-                ])],
+                ])]),
                 None,
             ),
         };
         lines.extend(block_lines.into_iter().map(|line| (line, call.clone())));
     }
     if app.working() {
-        lines.push((Line::default(), None));
-        lines.push((working_line(app), None));
+        lines.push((LinkedLine::plain(Line::default()), None));
+        lines.push((LinkedLine::plain(working_line(app)), None));
     }
     lines
+}
+
+fn plain_lines(lines: Vec<Line<'static>>) -> Vec<LinkedLine> {
+    lines.into_iter().map(LinkedLine::plain).collect()
 }
 
 fn user_lines(text: &str) -> Vec<Line<'static>> {
@@ -685,7 +697,7 @@ mod tests {
     use super::{MAX_PROMPT_ROWS, draw};
     use crate::{
         events::RuntimeEvent,
-        tui::app::{App, Update},
+        tui::app::{App, Block, Update},
     };
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\
@@ -856,6 +868,27 @@ mod tests {
         let frame = render(&mut app, 100, 24);
         println!("{frame}");
         assert!(frame.contains("output line 39"));
+    }
+
+    #[test]
+    fn keeps_duplicate_and_wrapped_link_targets_exact() {
+        let mut app = App::new(PathBuf::from("/tmp/kit"), "gpt-5.4".into(), "0:0".into());
+        let first = "https://first.example/a/very/long/path";
+        let second = "https://second.example/a/very/long/path";
+        app.blocks.push(Block::Agent(format!("[same]({first})")));
+        app.blocks.push(Block::Agent(format!("[same]({second})")));
+
+        let _ = render(&mut app, 28, 24);
+        let all_urls: Vec<_> = app
+            .row_links
+            .iter()
+            .flatten()
+            .map(|hit| hit.url.as_str())
+            .collect();
+        assert!(all_urls.len() > 4, "URLs should have wrapped: {all_urls:?}");
+        let mut targets = all_urls.clone();
+        targets.dedup();
+        assert_eq!(targets, [first, second]);
     }
 
     #[test]

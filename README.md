@@ -8,7 +8,7 @@ It exposes:
 - A2A v1 JSON-RPC for agent collaboration
 - a Ratatui ACP client
 - one model-visible tool: `compose`, backed by released Runlet
-- hidden compose children for shell commands, hunk edits, local subagents, and A2A calls
+- hidden compose children for shell commands, hunk edits, local subagents, A2A calls, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
 - ChatGPT Pro through an existing Codex login
 
@@ -58,6 +58,76 @@ from the HTTP server's Agent Card endpoint.
 Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
 that order. Credential login and refresh remain Codex's job.
 
+## MCP
+
+Pass an explicit JSON configuration; Kit never discovers or executes MCP server
+configuration automatically:
+
+```json
+{
+  "mcpServers": {
+    "local": { "command": "my-mcp-server", "args": ["--stdio"] },
+    "linear": {
+      "url": "https://mcp.example.com/mcp",
+      "description": "Issues and project management",
+      "auth": { "type": "oauth", "scopes": [] }
+    }
+  }
+}
+```
+
+```sh
+cargo run -- tui --root /path/to/project --mcp-config /path/to/mcp.json
+```
+
+`tool_search` returns matches grouped by server. Protected remote servers remain
+searchable by their configured name and description, with status
+`authentication_required`. The agent calls `auth` only when needed and gives the
+returned URL to the user. Completing that browser flow updates the catalog in
+place; a later search returns the server's tools. Interactive OAuth is available
+in the long-lived `tui` and `serve` commands, not the one-shot `prompt` command.
+Static `bearerToken` and custom `headers` remain available for non-interactive
+HTTP servers.
+
+OAuth credentials are memory-only by default. Persistence is explicit:
+
+```sh
+# macOS login Keychain
+kit tui --mcp-config mcp.json --mcp-credential-store keychain
+
+# Plain JSON files in an explicit private directory
+kit tui --mcp-config mcp.json --mcp-credential-store file \
+  --mcp-credential-dir ~/.local/share/kit/mcp-credentials
+```
+
+The file backend creates a `0700` directory and one `0600` file per server on
+Unix, but its tokens are not encrypted. Persistent credentials are restored and
+refreshed when Kit starts, so `prompt` can use credentials created earlier by
+`tui` or `serve` without starting an interactive browser flow. Concurrent Kit
+processes can still race when a provider rotates a refresh token.
+
+### Signing on macOS
+
+Build and sign the final release binary with a stable certificate and identifier
+before using Keychain storage:
+
+```sh
+scripts/sign-release.sh
+
+target/release/kit tui --mcp-config mcp.json \
+  --mcp-credential-store keychain
+```
+
+On macOS, `.cargo/config.toml` routes `cargo run` through a runner that signs the
+fresh debug binary before executing it. Set `KIT_CODESIGN_IDENTITY`, or put the
+certificate name in the gitignored `.kit-codesign-identity` file. Both paths use
+the stable identifier `works.earendil.kit`, overridable with
+`KIT_CODESIGN_IDENTIFIER`. A changed identity, a missing certificate, or a
+locked Keychain may prompt again. `cargo install`
+does not run the runner; sign its installed binary separately. Apple Development
+certificates are suitable for local use. Public distribution and notarization
+require a Developer ID Application certificate.
+
 ## Terminal client
 
 `tui` starts a `kit serve` child and drives it over ACP, so the client sees the
@@ -65,7 +135,7 @@ same protocol any editor would.
 
 While a `compose` call runs, the right-hand pane draws its runtime graph: the
 Runlet program parsed into its call, loop, branch, and boundary structure, with
-each nested shell, edit, subagent, and A2A dispatch shown live under the node
+each nested shell, edit, subagent, A2A, and MCP meta-tool dispatch shown live under the node
 that most likely issued it, including concurrent fan-out and failures. Child
 call lifecycle is exact; when the same tool appears in several places, node
 attribution is a stable heuristic. Nested-call

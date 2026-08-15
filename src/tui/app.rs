@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::Command;
+
 use agentkit_acp::{ToolCallStatus, ToolKind};
 use agentkit_core::{Item, ItemKind, Part, ToolOutput};
 use crossterm::event::{
@@ -16,6 +19,7 @@ use crate::events::RuntimeEvent;
 use super::{
     editor::Editor,
     plan::{PlanNode, parse as parse_plan},
+    wrap::LinkHit,
 };
 
 /// Everything the client learns from the agent or its own runtime channel.
@@ -214,6 +218,7 @@ pub struct App {
     /// Which tool call owns each rendered transcript row, and where that area
     /// started, so a click can be mapped back to a card.
     pub row_calls: Vec<Option<String>>,
+    pub row_links: Vec<Vec<LinkHit>>,
     pub transcript_top: usize,
     pub transcript_left: usize,
     pub transcript_width: usize,
@@ -264,6 +269,7 @@ impl App {
             total_lines: 0,
             prompt_width: 80,
             row_calls: Vec::new(),
+            row_links: Vec::new(),
             transcript_top: 0,
             transcript_left: 0,
             transcript_width: 0,
@@ -734,10 +740,43 @@ impl App {
         if !inside {
             return;
         }
+        if let Some(url) = self.clicked_link(column, offset) {
+            match open_url(&url) {
+                Ok(()) => self.toast("opening link"),
+                Err(error) => self.toast(format!("could not open link: {error}")),
+            }
+            return;
+        }
         if let Some(Some(id)) = self.row_calls.get(self.scroll + offset).cloned() {
             self.toggle_output(&id);
         }
     }
+
+    fn clicked_link(&self, column: usize, offset: usize) -> Option<String> {
+        let column = column.checked_sub(self.transcript_left)?;
+        self.row_links
+            .get(self.scroll + offset)?
+            .iter()
+            .find(|link| column >= link.start && column < link.end)
+            .map(|link| link.url.clone())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    Command::new("open").arg(url).spawn()?;
+    #[cfg(target_os = "linux")]
+    Command::new("xdg-open").arg(url).spawn()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_url(_url: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening links is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -751,7 +790,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::{Action, App, Block, Update};
-    use crate::events::RuntimeEvent;
+    use crate::{events::RuntimeEvent, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -858,6 +897,36 @@ mod tests {
             panic!("expected the prompt to be sent");
         };
         assert_eq!(prompt, "first line");
+    }
+
+    #[test]
+    fn maps_clicked_link_columns_after_scrolling() {
+        let mut app = app();
+        app.transcript_left = 4;
+        app.scroll = 1;
+        app.row_links = vec![
+            Vec::new(),
+            vec![LinkHit {
+                start: 2,
+                end: 8,
+                url: "https://example.com".into(),
+            }],
+        ];
+
+        assert_eq!(
+            app.clicked_link(7, 0).as_deref(),
+            Some("https://example.com")
+        );
+        assert!(app.clicked_link(12, 0).is_none());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn rejects_opening_links_on_unsupported_platforms() {
+        assert_eq!(
+            super::open_url("https://example.com").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
     }
 
     #[test]

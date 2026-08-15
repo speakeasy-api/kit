@@ -47,7 +47,10 @@ use tokio::{
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::events::{self, EVENTS_ENV};
+use crate::{
+    events::{self, EVENTS_ENV},
+    tools::mcp::CredentialStorage,
+};
 
 use app::{Action, App, Update};
 
@@ -73,6 +76,7 @@ pub async fn run(
     model: &str,
     a2a: Option<&str>,
     mcp_config: Option<&Path>,
+    credential_storage: &CredentialStorage,
     resume: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -99,6 +103,12 @@ pub async fn run(
     }
     if let Some(path) = mcp_config {
         command.arg("--mcp-config").arg(path);
+    }
+    command
+        .arg("--mcp-credential-store")
+        .arg(credential_storage.cli_name());
+    if let Some(directory) = credential_storage.directory() {
+        command.arg("--mcp-credential-dir").arg(directory);
     }
     if resume.is_some() {
         command.arg("--resume");
