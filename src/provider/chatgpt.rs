@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     pin::Pin,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,6 +22,12 @@ use zeroize::{Zeroize, Zeroizing};
 use super::credentials as auth;
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
+// The catalog filters out models newer than this protocol client version. Keep
+// it aligned with the newest model schema Kit supports, not Kit's own version.
+const MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.0";
+const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MODELS: usize = 1_000;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -61,6 +68,7 @@ pub fn supported_model(model: &str) -> bool {
 pub struct OpenAiSubscriptionAdapter {
     config: SubscriptionConfig,
     client: reqwest::Client,
+    context_windows: Arc<tokio::sync::OnceCell<Arc<HashMap<String, u64>>>>,
 }
 
 impl OpenAiSubscriptionAdapter {
@@ -72,7 +80,11 @@ impl OpenAiSubscriptionAdapter {
             .user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| "could not build openai-subscription TLS client".to_owned())?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            context_windows: Arc::new(tokio::sync::OnceCell::new()),
+        })
     }
 }
 
@@ -89,11 +101,25 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
         let binding = credentials
             .binding()
             .map_err(|error| LoopError::Provider(error.to_string()))?;
+        // Model discovery is best-effort: inference should remain available if
+        // the catalog endpoint is temporarily unavailable. Without a reported
+        // window AgentKit simply omits the ACP context gauge.
+        let context_windows = self
+            .context_windows
+            .get_or_try_init(|| async {
+                fetch_context_windows(&self.client, &credentials)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .cloned()
+            .unwrap_or_default();
         Ok(OpenAiSubscriptionSession {
             config: self.config.clone(),
             client: self.client.clone(),
             session_id,
             binding,
+            context_windows,
         })
     }
 
@@ -107,6 +133,7 @@ pub struct OpenAiSubscriptionSession {
     client: reqwest::Client,
     session_id: String,
     binding: auth::CredentialBinding,
+    context_windows: Arc<HashMap<String, u64>>,
 }
 
 #[async_trait]
@@ -235,6 +262,7 @@ impl ModelSession for OpenAiSubscriptionSession {
             response_model,
             self.binding.clone(),
             self.session_id.clone(),
+            self.context_windows.clone(),
         );
         Ok(turn)
     }
@@ -293,6 +321,80 @@ async fn credentials(
         .map_err(|error| LoopError::Provider(error.to_string()))
 }
 
+async fn fetch_context_windows(
+    client: &reqwest::Client,
+    credentials: &auth::TokenRecord,
+) -> Result<HashMap<String, u64>, LoopError> {
+    let endpoint = format!("{MODELS_ENDPOINT}?client_version={MODEL_CATALOG_CLIENT_VERSION}");
+    let mut request = client
+        .get(endpoint)
+        .bearer_auth(credentials.access_token())
+        .header("originator", "kit")
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(5));
+    if let Some(account_id) = credentials.account_id() {
+        request = request.header("ChatGPT-Account-ID", account_id);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| LoopError::Provider("model catalog transport failed".to_owned()))?;
+    if !response.status().is_success() {
+        return Err(LoopError::Provider(format!(
+            "model catalog returned {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_MODELS_BYTES as u64)
+    {
+        return Err(protocol("model catalog exceeds 2 MiB"));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| LoopError::Provider("model catalog body failed".to_owned()))?;
+        if body.len().saturating_add(chunk.len()) > MAX_MODELS_BYTES {
+            return Err(protocol("model catalog exceeds 2 MiB"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| protocol("model catalog is not valid JSON"))?;
+    parse_context_windows(&value)
+}
+
+fn parse_context_windows(value: &Value) -> Result<HashMap<String, u64>, LoopError> {
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .filter(|models| models.len() <= MAX_MODELS)
+        .ok_or_else(|| protocol("model catalog omitted a bounded models list"))?;
+    let mut windows = HashMap::new();
+    for model in models {
+        let Some(slug) = model
+            .get("slug")
+            .and_then(Value::as_str)
+            .filter(|slug| valid_model(slug))
+        else {
+            continue;
+        };
+        let Some(window) = model
+            .get("context_window")
+            .filter(|window| !window.is_null())
+        else {
+            continue;
+        };
+        let Some(window) = window.as_u64().filter(|window| *window > 0) else {
+            continue;
+        };
+        windows.entry(slug.to_owned()).or_insert(window);
+    }
+    Ok(windows)
+}
+
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 pub struct OpenAiSubscriptionTurn {
@@ -317,6 +419,7 @@ pub struct OpenAiSubscriptionTurn {
     response_model: Option<String>,
     binding: auth::CredentialBinding,
     session_id: String,
+    context_windows: Arc<HashMap<String, u64>>,
     tool_call: bool,
     stream_ended: bool,
 }
@@ -342,6 +445,7 @@ impl OpenAiSubscriptionTurn {
                 generation: "test-generation".to_owned(),
             },
             "s".to_owned(),
+            Arc::new(HashMap::new()),
         )
     }
 
@@ -351,6 +455,7 @@ impl OpenAiSubscriptionTurn {
         header_model: Option<String>,
         binding: auth::CredentialBinding,
         session_id: String,
+        context_windows: Arc<HashMap<String, u64>>,
     ) -> Self {
         Self {
             stream: Box::pin(stream),
@@ -374,6 +479,7 @@ impl OpenAiSubscriptionTurn {
             response_model: None,
             binding,
             session_id,
+            context_windows,
             tool_call: false,
             stream_ended: false,
         }
@@ -646,32 +752,7 @@ impl OpenAiSubscriptionTurn {
             self.observe_model(model)?;
         }
         if let Some(raw) = response.get("usage") {
-            let total_input = nonnegative(raw, "input_tokens")?;
-            let total_output = nonnegative(raw, "output_tokens")?;
-            let cached = optional_usage(raw.pointer("/input_tokens_details/cached_tokens"))?;
-            let cache_write =
-                optional_usage(raw.pointer("/input_tokens_details/cache_write_tokens"))?;
-            let reasoning = optional_usage(raw.pointer("/output_tokens_details/reasoning_tokens"))?;
-            let input = total_input
-                .checked_sub(cached.unwrap_or_default())
-                .and_then(|value| value.checked_sub(cache_write.unwrap_or_default()))
-                .ok_or_else(|| {
-                    protocol("nested input token categories exceed total input tokens")
-                })?;
-            let output = total_output
-                .checked_sub(reasoning.unwrap_or_default())
-                .ok_or_else(|| protocol("reasoning tokens exceed total output tokens"))?;
-            let mut tokens = TokenUsage::new(input, output);
-            if let Some(cached) = cached {
-                tokens = tokens.with_cached_input_tokens(cached);
-            }
-            if let Some(cache_write) = cache_write {
-                tokens = tokens.with_cache_write_input_tokens(cache_write);
-            }
-            if let Some(reasoning) = reasoning {
-                tokens = tokens.with_reasoning_tokens(reasoning);
-            }
-            let usage = Usage::new(tokens);
+            let usage = parse_usage(raw, self.context_window())?;
             self.usage = Some(usage.clone());
             self.queued.push_back(ModelTurnEvent::Usage(usage));
         }
@@ -723,32 +804,7 @@ impl OpenAiSubscriptionTurn {
             self.observe_model(model)?;
         }
         if let Some(raw) = response.get("usage") {
-            let total_input = nonnegative(raw, "input_tokens")?;
-            let total_output = nonnegative(raw, "output_tokens")?;
-            let cached = optional_usage(raw.pointer("/input_tokens_details/cached_tokens"))?;
-            let cache_write =
-                optional_usage(raw.pointer("/input_tokens_details/cache_write_tokens"))?;
-            let reasoning = optional_usage(raw.pointer("/output_tokens_details/reasoning_tokens"))?;
-            let input = total_input
-                .checked_sub(cached.unwrap_or_default())
-                .and_then(|value| value.checked_sub(cache_write.unwrap_or_default()))
-                .ok_or_else(|| {
-                    protocol("nested input token categories exceed total input tokens")
-                })?;
-            let output = total_output
-                .checked_sub(reasoning.unwrap_or_default())
-                .ok_or_else(|| protocol("reasoning tokens exceed total output tokens"))?;
-            let mut tokens = TokenUsage::new(input, output);
-            if let Some(cached) = cached {
-                tokens = tokens.with_cached_input_tokens(cached);
-            }
-            if let Some(cache_write) = cache_write {
-                tokens = tokens.with_cache_write_input_tokens(cache_write);
-            }
-            if let Some(reasoning) = reasoning {
-                tokens = tokens.with_reasoning_tokens(reasoning);
-            }
-            let usage = Usage::new(tokens);
+            let usage = parse_usage(raw, self.context_window())?;
             self.usage = Some(usage.clone());
             self.queued.push_back(ModelTurnEvent::Usage(usage));
         }
@@ -871,6 +927,15 @@ impl OpenAiSubscriptionTurn {
                 .push_back(ModelTurnEvent::Delta(Delta::CommitPart { part }));
         }
         Ok(())
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        let model = self
+            .header_model
+            .as_ref()
+            .or(self.response_model.as_ref())
+            .unwrap_or(&self.requested_model);
+        self.context_windows.get(model).copied()
     }
 
     fn observe_model(&mut self, value: &Value) -> Result<(), LoopError> {
@@ -1463,6 +1528,44 @@ fn bounded_id(value: Option<&Value>) -> Result<&str, LoopError> {
         .ok_or_else(|| protocol("Responses item ID is missing or outside bounds"))
 }
 
+fn parse_usage(value: &Value, context_window: Option<u64>) -> Result<Usage, LoopError> {
+    let total_input = nonnegative(value, "input_tokens")?;
+    let total_output = nonnegative(value, "output_tokens")?;
+    let cached = optional_usage(value.pointer("/input_tokens_details/cached_tokens"))?;
+    let cache_write = optional_usage(value.pointer("/input_tokens_details/cache_write_tokens"))?;
+    let reasoning = optional_usage(value.pointer("/output_tokens_details/reasoning_tokens"))?;
+    if cached.is_some_and(|value| value > total_input)
+        || cache_write.is_some_and(|value| value > total_input)
+    {
+        return Err(protocol("input token detail exceeds total input tokens"));
+    }
+    if reasoning.is_some_and(|value| value > total_output) {
+        return Err(protocol("reasoning tokens exceed total output tokens"));
+    }
+    let context_used = total_input
+        .checked_add(total_output)
+        .ok_or_else(|| protocol("total context token usage overflowed"))?;
+
+    // Cached and reasoning tokens are subsets of the provider's totals. Keep
+    // the totals as the context numerator and expose the categories separately.
+    let mut tokens = TokenUsage::new(total_input, total_output);
+    if let Some(cached) = cached {
+        tokens = tokens.with_cached_input_tokens(cached);
+    }
+    if let Some(cache_write) = cache_write {
+        tokens = tokens.with_cache_write_input_tokens(cache_write);
+    }
+    if let Some(reasoning) = reasoning {
+        tokens = tokens.with_reasoning_tokens(reasoning);
+    }
+    let mut metadata = MetadataMap::new();
+    metadata.insert("context_used".to_owned(), json!(context_used));
+    if let Some(context_window) = context_window {
+        metadata.insert("context_window".to_owned(), json!(context_window));
+    }
+    Ok(Usage::new(tokens).with_metadata(metadata))
+}
+
 fn optional_usage(value: Option<&Value>) -> Result<Option<u64>, LoopError> {
     value
         .map(|value| {
@@ -1556,4 +1659,83 @@ fn model_metadata(header: Option<&str>, observed: Option<&str>) -> MetadataMap {
 
 fn protocol(message: &str) -> LoopError {
     LoopError::Provider(format!("openai-subscription protocol error: {message}"))
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use serde_json::json;
+
+    use super::{parse_context_windows, parse_usage};
+
+    #[test]
+    fn parses_reported_model_context_windows() {
+        let windows = parse_context_windows(&json!({
+            "models": [
+                {"slug": "gpt-5.4", "context_window": 272_000},
+                {"slug": "gpt-no-window", "context_window": null},
+                {"slug": [], "context_window": "future-format"}
+            ]
+        }))
+        .expect("valid catalog");
+
+        assert_eq!(windows.get("gpt-5.4"), Some(&272_000));
+        assert!(!windows.contains_key("gpt-no-window"));
+    }
+
+    #[test]
+    fn usage_keeps_provider_totals_for_context_occupancy() {
+        let usage = parse_usage(
+            &json!({
+                "input_tokens": 50_000,
+                "output_tokens": 3_000,
+                "input_tokens_details": {"cached_tokens": 40_000},
+                "output_tokens_details": {"reasoning_tokens": 2_000}
+            }),
+            Some(272_000),
+        )
+        .expect("valid usage");
+        let tokens = usage.tokens.expect("token usage");
+
+        assert_eq!(tokens.input_tokens, 50_000);
+        assert_eq!(tokens.output_tokens, 3_000);
+        assert_eq!(tokens.cached_input_tokens, Some(40_000));
+        assert_eq!(tokens.reasoning_tokens, Some(2_000));
+        assert_eq!(usage.metadata.get("context_used"), Some(&json!(53_000)));
+        assert_eq!(usage.metadata.get("context_window"), Some(&json!(272_000)));
+    }
+
+    #[test]
+    fn rejects_usage_details_larger_than_their_totals() {
+        assert!(
+            parse_usage(
+                &json!({
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": 11}
+                }),
+                Some(272_000),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_usage(
+                &json!({
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "output_tokens_details": {"reasoning_tokens": 3}
+                }),
+                Some(272_000),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn usage_without_a_reported_window_keeps_token_accounting() {
+        let usage = parse_usage(&json!({"input_tokens": 10, "output_tokens": 2}), None)
+            .expect("valid usage");
+
+        assert_eq!(usage.metadata.get("context_used"), Some(&json!(12)));
+        assert!(!usage.metadata.contains_key("context_window"));
+    }
 }

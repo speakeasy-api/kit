@@ -74,16 +74,21 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             theme::dim(),
         ),
-        Span::styled("  ·  ", theme::faint()),
-        Span::styled(format!("a2a {}", app.a2a), theme::dim()),
     ];
-    if let Some((used, size)) = app.usage {
+    if let Some(usage) = app.usage {
         spans.push(Span::styled("  ·  ", theme::faint()));
         spans.push(Span::styled(
-            format!("ctx {}/{}", compact(used), compact(size)),
+            format!(
+                "{} {}/{}",
+                percent(usage.used, usage.size),
+                compact(usage.used),
+                compact(usage.size)
+            ),
             theme::dim(),
         ));
     }
+    spans.push(Span::styled("  ·  ", theme::faint()));
+    spans.push(Span::styled(format!("a2a {}", app.a2a), theme::dim()));
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::bar()), area);
 }
 
@@ -676,6 +681,13 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(left)).style(theme::bar()), area);
 }
 
+fn percent(used: u64, size: u64) -> String {
+    if size == 0 {
+        return "?%".to_owned();
+    }
+    format!("{:.1}%", used as f64 * 100.0 / size as f64)
+}
+
 /// Token counts read better rounded: `128k` beats `128000`.
 fn compact(value: u64) -> String {
     if value >= 1_000_000 {
@@ -889,6 +901,20 @@ mod tests {
         let mut targets = all_urls.clone();
         targets.dedup();
         assert_eq!(targets, [first, second]);
+    }
+
+    #[test]
+    fn shows_reported_context_usage_in_the_header() {
+        let mut app = sample();
+        app.apply(Update::Usage {
+            used: 1_360,
+            size: 272_000,
+        });
+
+        let frame = render(&mut app, 120, 24);
+
+        assert!(frame.contains("0.5% 1k/272k"));
+        assert!(!frame.contains("ctx "));
     }
 
     #[test]

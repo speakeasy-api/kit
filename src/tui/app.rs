@@ -55,6 +55,13 @@ pub enum Update {
     TurnEnded(Option<String>),
 }
 
+/// Latest provider-reported occupancy of the main model's context window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub size: u64,
+}
+
 /// What the event loop should do after a key press.
 pub enum Action {
     None,
@@ -201,7 +208,7 @@ pub struct App {
     pub editor: Editor,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
-    pub usage: Option<(u64, u64)>,
+    pub usage: Option<ContextUsage>,
     pub logs: Vec<String>,
     pub show_logs: bool,
     pub show_thoughts: bool,
@@ -463,7 +470,9 @@ impl App {
                     }
                 }
             }
-            Update::Usage { used, size } => self.usage = Some((used, size)),
+            Update::Usage { used, size } => {
+                self.usage = Some(ContextUsage { used, size });
+            }
             Update::Runtime(event) => self.apply_runtime(event),
             Update::Log(line) => {
                 self.logs.push(line);
