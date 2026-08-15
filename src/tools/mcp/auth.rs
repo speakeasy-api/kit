@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rmcp::transport::auth::{
-    AuthError, AuthorizationManager, AuthorizationSession, OAuthClientConfig,
+    AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession, OAuthClientConfig,
 };
 use serde::Deserialize;
 use tokio::{
@@ -48,10 +48,10 @@ pub async fn begin(
 ) -> Result<PendingAuthorization, String> {
     let mut manager = manager(resource_url, config, credential_storage).await?;
     let metadata = manager
-        .discover_metadata()
+        .resolve_metadata()
         .await
         .map_err(|error| format!("OAuth discovery failed: {error}"))?;
-    manager.set_metadata(metadata);
+    manager.set_metadata(metadata.metadata);
     if config.client_id.is_some() {
         manager
             .initialize_from_store()
@@ -84,15 +84,15 @@ pub async fn begin(
             .map_err(|error| format!("could not create OAuth URL: {error}"))?;
         AuthorizationSession::for_scope_upgrade(manager, url, &redirect_uri)
     } else {
-        AuthorizationSession::new(
-            manager,
-            &scope_refs,
-            &redirect_uri,
-            Some("Kit"),
-            config.client_metadata_url.as_deref(),
-        )
-        .await
-        .map_err(|error| format!("OAuth client registration failed: {error}"))?
+        let mut request = AuthorizationRequest::new(&redirect_uri)
+            .with_scopes(scopes)
+            .with_client_name("Kit");
+        if let Some(url) = config.client_metadata_url.as_deref() {
+            request = request.with_client_metadata_url(url);
+        }
+        AuthorizationSession::new(manager, request)
+            .await
+            .map_err(|(_, error)| format!("OAuth client registration failed: {error}"))?
     };
     Ok(PendingAuthorization {
         url: session.get_authorization_url().to_string(),
