@@ -247,7 +247,8 @@ impl Runtime {
 
     fn system_prompt(&self, depth: usize) -> String {
         format!(
-            "You are a coding agent rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, and a2a tools. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, and a2a tools. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            env!("CARGO_PKG_VERSION"),
             self.root.display(),
             self.max_subagent_depth
         )
