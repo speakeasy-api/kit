@@ -79,34 +79,44 @@ impl Tool for A2aTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _context: &mut ToolContext<'_>,
+        context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        let cancellation = context.cancellation.clone();
         let input: Input = serde_json::from_value(request.input)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
         let client = ClientBuilder::new(&input.url)
             .build()
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        let response = client
-            .send_message(MessageSendParams {
-                tenant: None,
-                message: Message {
-                    id: MessageId::new(format!(
-                        "kit-{}",
-                        NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed)
-                    )),
-                    role: MessageRole::User,
-                    parts: vec![Part::text(input.prompt)],
-                    task_id: None,
-                    context_id: None,
-                    reference_task_ids: None,
-                    extensions: None,
-                    metadata: None,
-                },
-                configuration: None,
+        let sent = client.send_message(MessageSendParams {
+            tenant: None,
+            message: Message {
+                id: MessageId::new(format!(
+                    "kit-{}",
+                    NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed)
+                )),
+                role: MessageRole::User,
+                parts: vec![Part::text(input.prompt)],
+                task_id: None,
+                context_id: None,
+                reference_task_ids: None,
+                extensions: None,
                 metadata: None,
-            })
-            .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            },
+            configuration: None,
+            metadata: None,
+        });
+        // A remote agent can take as long as it likes; an interrupted turn
+        // cannot wait for it.
+        let interrupted = async {
+            match &cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let response = tokio::select! {
+            response = sent => response.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+            () = interrupted => return Err(ToolError::Cancelled),
+        };
         let value = serde_json::to_value(response)
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         Ok(ToolResult::new(ToolResultPart::success(

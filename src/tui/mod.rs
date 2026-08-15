@@ -64,6 +64,9 @@ const HANDSHAKE: Duration = Duration::from_secs(30);
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
 const FAILURE_LINES: usize = 5;
+/// How long a turn interrupted on the way out gets to finish unwinding, so the
+/// transcript it owns is closed out before the agent is killed.
+const SETTLE: Duration = Duration::from_secs(3);
 
 pub async fn run(
     root: &Path,
@@ -219,6 +222,8 @@ pub async fn run(
             app.restore_transcript(persisted_session_id, &restored);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
+            // The turn in flight, if any: leaving is not allowed to abandon it.
+            let mut turn: Option<tokio::task::JoinHandle<()>> = None;
             let mut stop =
                 Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let result: Result<(), agent_client_protocol::Error> = async {
@@ -255,7 +260,7 @@ pub async fn run(
                                     let connection = connection.clone();
                                     let session = session_id.clone();
                                     let updates = updates_tx.clone();
-                                    tokio::spawn(async move {
+                                    turn = Some(tokio::spawn(async move {
                                         let outcome = connection
                                             .send_request(agentkit_acp::PromptRequest::new(
                                                 session,
@@ -269,7 +274,7 @@ pub async fn run(
                                             Ok(_) => None,
                                             Err(error) => Some(error.to_string()),
                                         }));
-                                    });
+                                    }));
                                 }
                                 Action::Cancel => {
                                     let _ = connection.send_notification(
@@ -295,6 +300,15 @@ pub async fn run(
             }
             .await;
             leave(terminal);
+            // Quitting mid-turn — by key, by signal, or because the terminal
+            // went away — must not abandon a running tool call. The agent is
+            // asked to interrupt and given a moment to record the results it
+            // owes, since the transcript it writes has to stay resumable even
+            // though the process is about to be killed.
+            if let Some(turn) = turn.filter(|turn| !turn.is_finished()) {
+                let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+                let _ = tokio::time::timeout(SETTLE, turn).await;
+            }
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.

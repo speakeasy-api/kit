@@ -10,12 +10,12 @@ a2a-protocol-client = "=0.7.0"
 a2a-protocol-server = { version = "=0.7.0", default-features = false }
 a2a-protocol-types = "=0.7.0"
 agent-client-protocol = "=1.0.1"
-agentkit-acp = "=0.10.3"
-agentkit-core = "=0.10.3"
-agentkit-context = "=0.10.3"
-agentkit-loop = "=0.10.3"
-agentkit-tool-compose = { version = "=0.10.3", features = ["runlet"] }
-agentkit-tools-core = "=0.10.3"
+agentkit-acp = "=0.10.5"
+agentkit-core = "=0.10.5"
+agentkit-context = "=0.10.5"
+agentkit-loop = "=0.10.5"
+agentkit-tool-compose = { version = "=0.10.5", features = ["runlet"] }
+agentkit-tools-core = "=0.10.5"
 async-trait = "=0.1.91"
 blake3 = "=1.8.2"
 bytes = "=1.12.1"
@@ -25,7 +25,7 @@ futures-util = "=0.3.32"
 httpdate = "=1.0.3"
 ratatui = "=0.30.2"
 reqwest = { version = "=0.13.2", default-features = false, features = ["json", "rustls", "stream"] }
-runlet = "=0.2.0"
+runlet = "=0.2.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.145"
 tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

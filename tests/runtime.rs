@@ -1,6 +1,12 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolOutput, TurnId};
+use agentkit_core::{
+    CancellationController, MetadataMap, SessionId, ToolCallId, ToolOutput, TurnCancellation,
+    TurnId,
+};
 use agentkit_tools_core::{
     AllowAllPermissions, BasicToolExecutor, ToolExecutionOutcome, ToolExecutionScope, ToolName,
     ToolRequest, ToolSource,
@@ -82,7 +88,44 @@ async fn compose_rejects_invalid_hidden_tool_input() {
     );
 }
 
+#[tokio::test]
+async fn cancelling_a_turn_stops_a_running_shell_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let controller = CancellationController::new();
+    let cancellation = TurnCancellation::new(controller.handle());
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        controller.interrupt();
+    });
+
+    let started = Instant::now();
+    let outcome = execute_compose_cancelled(
+        &runtime,
+        r#"return shell({ command: "sleep 30", timeout_seconds: 600 })"#,
+        Some(cancellation),
+    )
+    .await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cancellation waited for the command: {outcome:?}"
+    );
+    assert!(
+        matches!(outcome, ToolExecutionOutcome::Failed(_)),
+        "cancelled shell did not fail the compose run: {outcome:?}"
+    );
+}
+
 async fn execute_compose(runtime: &Arc<kit::Runtime>, script: &str) -> ToolExecutionOutcome {
+    execute_compose_cancelled(runtime, script, None).await
+}
+
+async fn execute_compose_cancelled(
+    runtime: &Arc<kit::Runtime>,
+    script: &str,
+    cancellation: Option<TurnCancellation>,
+) -> ToolExecutionOutcome {
     let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
     let executor = Arc::new(BasicToolExecutor::new([source]));
     let scope = ToolExecutionScope {
@@ -91,7 +134,7 @@ async fn execute_compose(runtime: &Arc<kit::Runtime>, script: &str) -> ToolExecu
         turn_id: TurnId::new("turn"),
         permissions: Arc::new(AllowAllPermissions),
         resources: Arc::new(()),
-        cancellation: None,
+        cancellation,
     };
     scope
         .execute_child(ToolRequest {

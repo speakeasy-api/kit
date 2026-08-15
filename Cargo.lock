@@ -166,9 +166,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d07a6071a5b0b5203cfc18c9e6b532dc8bb3b9f88ed40fc2c53d5fa410a080f"
+checksum = "0f01d36f3f924a9f4eab61bb32824dcadc56b8895a2dd71c8581d083c14a53ee"
 dependencies = [
  "agent-client-protocol 1.0.1",
  "agent-client-protocol-tokio",
@@ -186,9 +186,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-capabilities"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa61ad633d4c7dd1f59c8cf8b9d2e998a1913801c3532fcf6e33c3fa35e23431"
+checksum = "7193f4a771e30b61fbabecd90dba9a9bc16bdafc2cf717d086727871e9d0e3cf"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -199,9 +199,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-context"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79767e51eeb38f96c925d7511a5b270e3ea325dd72f70d369bd225552738bd9"
+checksum = "4b3c5c91fed4a5ceb3afa3584877aa94304c2bccb2b383ddb964b4c0024165e8"
 dependencies = [
  "agentkit-core",
  "async-fs",
@@ -212,9 +212,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-core"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7226f0f00e7b58ec8797cc2a6d75c9cb02ae3c5acc9fc01ce6191746f634ab9a"
+checksum = "2110778950cdd87cc8ea3f0697c0551eb515ef23841b9c5d255a01974be17798"
 dependencies = [
  "futures-timer",
  "serde",
@@ -224,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10fe97fc09498e15dda5913081b960caf9e331fc5aae33fd1c85920b8b27b1a3"
+checksum = "8f7b0cf5bef52e65d2e2930126e78b6d0aa7aa620d536cfb8283187f05776481"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-task-manager"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a473c23b08be43d4f6259200dc0159ae72f69b29c360e85a9fde7998caef6db4"
+checksum = "7b0ff043a61611fb3b867ac367cfb9beb3a1c71487a15754acb17b2f4d8920fd"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -254,9 +254,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b72ed676e55289a530eccbc9424754975ffc1db81eda029b5fc67b1a79eeac6"
+checksum = "22e92aa2212c6cb742d6f08aa9c0eaf881bcab0b135fe4a757cc19c736aeb847"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -270,9 +270,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tools-core"
-version = "0.10.3"
+version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7858d5c7dad8d7f378f3c2c1757076c0e000b9f2e40c1c8b65df28995dd3d819"
+checksum = "10b9a8af3f09c79fc0707ea87dc377edd40bdf65db11e6ebfb50783f4e8e8ff3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -2895,9 +2895,9 @@ dependencies = [
 
 [[package]]
 name = "runlet"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c22fd3c8f1f87a76a658d22a82ac463b317091147b0d7f3d72814eac8f99875f"
+checksum = "948fe7980341b596c1bcca6cd2c553c35d27fa3455842f3bcda6acee06e46b4b"
 dependencies = [
  "hex",
  "regex",

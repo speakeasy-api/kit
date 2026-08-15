@@ -64,9 +64,14 @@ pub fn new_id() -> String {
 }
 
 /// Loads a transcript without taking mutating authority.
+///
+/// A file that lost a tool result is repaired in memory only; writing the
+/// repair back is reserved for [`open`], which holds the transcript's lock.
 pub fn load(root: &Path, session_id: &str) -> Result<Vec<Item>, String> {
     validate_id(session_id)?;
-    read_records(&transcript_path(root, session_id), session_id).map(|(items, _)| items)
+    let (mut items, _) = read_records(&transcript_path(root, session_id), session_id)?;
+    crate::transcript::repair_unanswered_tool_calls(&mut items);
+    Ok(items)
 }
 
 /// Removes an abandoned lock file, but never one held by a live process.
@@ -140,6 +145,16 @@ pub fn open(
         }
         generation = writer.generation;
         debug_assert_eq!(generation, transcript.len() as u64);
+    }
+    // Nothing guards a transcript between sessions: it is a plain file a user
+    // can edit, truncate, or lose a write from, and a tool call left unanswered
+    // by any of that is history no provider will accept again. The repair is
+    // written back here, under the lock this session just took, so the stored
+    // transcript is sound rather than repaired anew on every read. Appending
+    // keeps the file append-only; the in-memory copy carries each result next
+    // to its own call.
+    for item in crate::transcript::repair_unanswered_tool_calls(&mut transcript) {
+        writer.append(&item)?;
     }
     Ok(OpenSession {
         transcript,
@@ -293,7 +308,7 @@ fn validate_id(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentkit_core::ItemKind;
+    use agentkit_core::{ItemKind, Part};
 
     #[test]
     fn appends_versioned_generations_and_resumes() {
@@ -323,6 +338,130 @@ mod tests {
         let text = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
         assert!(text.contains("\"schema_version\":1"));
         assert!(text.contains("\"generation\":2"));
+    }
+
+    fn call_item(id: &str) -> Item {
+        Item::new(
+            ItemKind::Assistant,
+            vec![Part::ToolCall(agentkit_core::ToolCallPart::new(
+                id,
+                "compose",
+                serde_json::json!({}),
+            ))],
+        )
+    }
+
+    fn write(observer: &SessionObserver, item: &Item) {
+        observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("abc"),
+            item,
+        });
+    }
+
+    fn stored(root: &Path) -> Vec<Item> {
+        read_records(&transcript_path(root, "abc"), "abc")
+            .unwrap()
+            .0
+    }
+
+    /// The writer records what the loop commits and nothing else: closing an
+    /// interrupted call is the loop's job, and synthesizing anything here would
+    /// duplicate the result it already appended.
+    #[test]
+    fn the_writer_records_exactly_what_it_is_given() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(&opened.observer, &call_item("call-1"));
+        write(
+            &opened.observer,
+            &Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+                    "call-1",
+                    agentkit_core::ToolOutput::text("done"),
+                ))],
+            ),
+        );
+        write(&opened.observer, &Item::text(ItemKind::User, "next"));
+
+        assert_eq!(stored(root.path()).len(), 4, "nothing extra was recorded");
+    }
+
+    #[test]
+    fn resuming_answers_and_persists_a_tool_call_the_file_never_answered() {
+        use agentkit_core::ToolCallPart;
+
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        // The shape a damaged file carries: the call is recorded, its result is
+        // missing, and the next prompt lands after it.
+        for item in [
+            Item::new(
+                ItemKind::Assistant,
+                vec![Part::ToolCall(ToolCallPart::new(
+                    "call-1",
+                    "compose",
+                    serde_json::json!({}),
+                ))],
+            ),
+            Item::text(ItemKind::User, "changes published"),
+        ] {
+            opened.observer.on_transcript_event(TranscriptEvent {
+                session_id: &agentkit_core::SessionId::new("abc"),
+                item: &item,
+            });
+        }
+        drop(opened);
+
+        let resumed = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+
+        assert!(!crate::transcript::has_unanswered_tool_calls(
+            &resumed.transcript
+        ));
+        assert_eq!(
+            resumed
+                .transcript
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            [
+                ItemKind::System,
+                ItemKind::Assistant,
+                ItemKind::Tool,
+                ItemKind::User
+            ],
+            "the synthesized result belongs next to its call"
+        );
+        drop(resumed);
+
+        // The repair was written back, so a later resume finds nothing to fix
+        // and never records the same result twice.
+        let again = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(again.transcript.len(), 4);
+        let results = again
+            .transcript
+            .iter()
+            .flat_map(|item| &item.parts)
+            .filter(|part| matches!(part, Part::ToolResult(_)))
+            .count();
+        assert_eq!(results, 1);
+        let text = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        assert!(text.contains("\"generation\":4"));
     }
 
     #[test]

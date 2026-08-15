@@ -9,7 +9,9 @@ use std::{
 
 use agentkit_acp::{AcpAgentFactoryContext, AcpRuntimeError};
 use agentkit_context::{AgentsMd, ContextLoader};
-use agentkit_core::{CancellationController, FinishReason, Item, ItemKind, Part};
+use agentkit_core::{
+    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
+};
 use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
@@ -99,7 +101,7 @@ impl Runtime {
     }
 
     pub async fn run(self: &Arc<Self>, prompt: String, depth: usize) -> Result<String, LoopError> {
-        self.run_cancelled(prompt, depth, None).await
+        self.run_interruptible(prompt, depth, None).await
     }
 
     /// Runs one prompt in the configured durable session.
@@ -141,22 +143,7 @@ impl Runtime {
         depth: usize,
         cancellation: Option<CancellationToken>,
     ) -> Result<String, LoopError> {
-        let session = format!("run-{}", NEXT_SESSION.fetch_add(1, Ordering::Relaxed));
         let controller = CancellationController::new();
-        let transcript = self
-            .initial_transcript(depth)
-            .await
-            .map_err(LoopError::InvalidState)?;
-        let agent = Agent::builder()
-            .model(self.adapter.clone())
-            .add_tool_source(self.compose(depth))
-            .transcript(transcript)
-            .input(vec![Item::text(ItemKind::User, prompt)])
-            .cancellation(controller.handle())
-            .build()?;
-        let mut driver = agent
-            .start(SessionConfig::new(session).without_cache())
-            .await?;
         let bridge = cancellation.map(|token| {
             let controller = controller.clone();
             tokio::spawn(async move {
@@ -164,11 +151,41 @@ impl Runtime {
                 controller.interrupt();
             })
         });
-        let result = drive(&mut driver).await;
+        let result = self
+            .run_interruptible(prompt, depth, Some(controller.handle()))
+            .await;
         if let Some(bridge) = bridge {
             bridge.abort();
         }
         result
+    }
+
+    /// Runs a nested prompt under a cancellation handle owned by the caller, so
+    /// interrupting the outer turn also ends everything it started.
+    pub(crate) async fn run_interruptible(
+        self: &Arc<Self>,
+        prompt: String,
+        depth: usize,
+        cancellation: Option<CancellationHandle>,
+    ) -> Result<String, LoopError> {
+        let session = format!("run-{}", NEXT_SESSION.fetch_add(1, Ordering::Relaxed));
+        let transcript = self
+            .initial_transcript(depth)
+            .await
+            .map_err(LoopError::InvalidState)?;
+        let mut builder = Agent::builder()
+            .model(self.adapter.clone())
+            .add_tool_source(self.compose(depth))
+            .transcript(transcript)
+            .input(vec![Item::text(ItemKind::User, prompt)]);
+        if let Some(cancellation) = cancellation {
+            builder = builder.cancellation(cancellation);
+        }
+        let mut driver = builder
+            .build()?
+            .start(SessionConfig::new(session).without_cache())
+            .await?;
+        drive(&mut driver).await
     }
 
     pub(crate) async fn start_acp_driver(

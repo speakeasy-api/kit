@@ -66,8 +66,9 @@ impl Tool for ShellTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _context: &mut ToolContext<'_>,
+        context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        let cancellation = context.cancellation.clone();
         let input: ShellInput = serde_json::from_value(request.input)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
         if input.command.is_empty() || !(1..=3600).contains(&input.timeout_seconds) {
@@ -110,17 +111,33 @@ impl Tool for ShellTool {
                 .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
             Ok::<_, ToolError>((status, stdout, stderr))
         };
-        let (status, stdout, stderr) =
-            match tokio::time::timeout(Duration::from_secs(input.timeout_seconds), execution).await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    let _ = child.kill().await;
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    return Err(ToolError::ExecutionFailed("shell command timed out".into()));
-                }
-            };
+        // A cancelled turn must not wait out the command: the loop awaits this
+        // invocation, so an uncooperative tool keeps the whole turn alive until
+        // the timeout, however long the caller asked for.
+        let interrupted = async {
+            match &cancellation {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let finished = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(input.timeout_seconds), execution) => Some(result),
+            () = interrupted => None,
+        };
+        // The command's futures are dropped with the select, so the child is
+        // ours to kill again.
+        let (status, stdout, stderr) = match finished {
+            Some(Ok(result)) => result?,
+            outcome => {
+                let _ = child.kill().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(match outcome {
+                    Some(_) => ToolError::ExecutionFailed("shell command timed out".into()),
+                    None => ToolError::Cancelled,
+                });
+            }
+        };
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::structured(json!({

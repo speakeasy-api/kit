@@ -52,8 +52,14 @@ impl Tool for SubagentTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _context: &mut ToolContext<'_>,
+        context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        // The child agent runs on the parent's cancellation handle, so one
+        // interrupt stops the whole tree instead of just the outer turn.
+        let cancellation = context
+            .cancellation
+            .as_ref()
+            .map(|cancellation| cancellation.handle().clone());
         let input: Input = serde_json::from_value(request.input)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
         if self.depth >= self.runtime.max_subagent_depth() {
@@ -64,9 +70,12 @@ impl Tool for SubagentTool {
         }
         let output = self
             .runtime
-            .run(input.prompt, self.depth + 1)
+            .run_interruptible(input.prompt, self.depth + 1, cancellation)
             .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            .map_err(|error| match error {
+                agentkit_loop::LoopError::Cancelled => ToolError::Cancelled,
+                error => ToolError::ExecutionFailed(error.to_string()),
+            })?;
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::text(output),

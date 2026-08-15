@@ -4,6 +4,7 @@ pub mod provider;
 pub mod runtime;
 pub mod session;
 pub mod tools;
+pub mod transcript;
 pub mod tui;
 
 pub use runtime::Runtime;

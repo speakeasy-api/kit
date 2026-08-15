@@ -614,6 +614,11 @@ impl App {
 
         match key.code {
             KeyCode::Char('c') if control => {
+                // A turn that will not stop must still be escapable: the second
+                // ctrl+c leaves, which takes the agent process with it.
+                if self.phase == Phase::Cancelling {
+                    return Action::Quit;
+                }
                 if self.working() {
                     return self.request_cancel();
                 }
@@ -696,7 +701,7 @@ impl App {
 
     fn request_cancel(&mut self) -> Action {
         if self.phase == Phase::Cancelling {
-            self.toast("still stopping…");
+            self.toast("still stopping — ctrl+c leaves");
             return Action::None;
         }
         self.phase = Phase::Cancelling;
