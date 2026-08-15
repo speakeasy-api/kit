@@ -15,7 +15,8 @@ use agentkit_core::Item;
 use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,7 +24,10 @@ struct Record {
     schema_version: u32,
     session_id: String,
     generation: u64,
-    item: Item,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item: Option<Item>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replacement: Option<Vec<Item>>,
 }
 
 /// A loaded transcript together with the observer that owns its mutation lock.
@@ -162,6 +166,21 @@ pub fn open(
     })
 }
 
+impl SessionObserver {
+    /// Durably records a complete transcript replacement produced by a mutator.
+    /// Existing append records remain intact, while readers treat this record as
+    /// a new canonical snapshot.
+    pub fn replace(&self, transcript: &[Item]) -> Result<(), String> {
+        if transcript.is_empty() {
+            return Err("cannot persist an empty transcript replacement".into());
+        }
+        self.0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?
+            .replace(transcript)
+    }
+}
+
 impl TranscriptObserver for SessionObserver {
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
         let mut writer = self.0.lock().expect("session transcript writer poisoned");
@@ -185,8 +204,29 @@ impl Writer {
             schema_version: SCHEMA_VERSION,
             session_id: self.session_id.clone(),
             generation,
-            item: item.clone(),
+            item: Some(item.clone()),
+            replacement: None,
         };
+        self.write_record(record, generation)
+    }
+
+    fn replace(&mut self, transcript: &[Item]) -> Result<(), String> {
+        self.lock.check()?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?;
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            generation,
+            item: None,
+            replacement: Some(transcript.to_vec()),
+        };
+        self.write_record(record, generation)
+    }
+
+    fn write_record(&mut self, record: Record, generation: u64) -> Result<(), String> {
         // Encode before touching the append-only file, so serialization
         // failures can never leave a partial JSON record behind.
         let mut encoded = serde_json::to_vec(&record)
@@ -264,7 +304,10 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
             line.map_err(|error| format!("could not read transcript line {}: {error}", index + 1))?;
         let record: Record = serde_json::from_str(&line)
             .map_err(|error| format!("invalid transcript line {}: {error}", index + 1))?;
-        if record.schema_version != SCHEMA_VERSION {
+        if !matches!(
+            record.schema_version,
+            LEGACY_SCHEMA_VERSION | SCHEMA_VERSION
+        ) {
             return Err(format!(
                 "unsupported session schema version {} on line {} (Kit supports {})",
                 record.schema_version,
@@ -278,7 +321,20 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
                 index + 1
             ));
         }
-        items.push(record.item);
+        match (record.item, record.replacement) {
+            (Some(item), None) => items.push(item),
+            (None, Some(replacement))
+                if record.schema_version == SCHEMA_VERSION && !replacement.is_empty() =>
+            {
+                items = replacement;
+            }
+            _ => {
+                return Err(format!(
+                    "transcript line {} must contain exactly one item or replacement",
+                    index + 1
+                ));
+            }
+        }
         expected += 1;
     }
     if items.is_empty() {
@@ -336,8 +392,56 @@ mod tests {
         .unwrap();
         assert_eq!(resumed.transcript.len(), 2);
         let text = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
-        assert!(text.contains("\"schema_version\":1"));
+        assert!(text.contains("\"schema_version\":2"));
         assert!(text.contains("\"generation\":2"));
+    }
+
+    #[test]
+    fn reads_legacy_schema_one_records() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(".kit/sessions");
+        fs::create_dir_all(&directory).unwrap();
+        let item = Item::text(ItemKind::System, "legacy");
+        let line = serde_json::json!({
+            "schema_version": LEGACY_SCHEMA_VERSION,
+            "session_id": "abc",
+            "generation": 1,
+            "item": item,
+        });
+        fs::write(directory.join("abc.jsonl"), format!("{line}\n")).unwrap();
+
+        let loaded = load(root.path(), "abc").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, ItemKind::System);
+    }
+
+    #[test]
+    fn replacement_is_canonical_across_resume_and_later_appends() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(&opened.observer, &Item::text(ItemKind::User, "discard me"));
+        let replacement = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::Context, "summary"),
+        ];
+        opened.observer.replace(&replacement).unwrap();
+        write(&opened.observer, &Item::text(ItemKind::User, "after"));
+        drop(opened);
+
+        let resumed = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(resumed.transcript.len(), 3);
+        assert_eq!(resumed.transcript[1].kind, ItemKind::Context);
+        assert_eq!(resumed.transcript[2].kind, ItemKind::User);
+        let stored = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
+        assert!(stored.contains("\"replacement\""));
+        assert!(stored.contains("\"generation\":4"));
     }
 
     fn call_item(id: &str) -> Item {

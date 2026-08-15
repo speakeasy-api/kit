@@ -146,9 +146,15 @@ impl Runtime {
             request.force,
             initial,
         )?;
+        let compactor = crate::compaction::automatic(
+            self.adapter.clone(),
+            Some(opened.observer.clone()),
+            format!("compaction-{}", crate::session::new_id()),
+        )?;
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose(0))
+            .mutator(compactor)
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
             .input(vec![Item::text(ItemKind::User, prompt)])
@@ -197,9 +203,16 @@ impl Runtime {
             .initial_transcript(depth)
             .await
             .map_err(LoopError::InvalidState)?;
+        let compactor = crate::compaction::automatic(
+            self.adapter.clone(),
+            None,
+            format!("compaction-{session}"),
+        )
+        .map_err(LoopError::InvalidState)?;
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose(depth))
+            .mutator(compactor)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
         if let Some(cancellation) = cancellation {
@@ -249,9 +262,16 @@ impl Runtime {
             initial,
         )
         .map_err(AcpRuntimeError::Loop)?;
+        let compactor = crate::compaction::automatic(
+            self.adapter.clone(),
+            Some(opened.observer.clone()),
+            format!("compaction-{}", crate::session::new_id()),
+        )
+        .map_err(AcpRuntimeError::Loop)?;
         Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose(0))
+            .mutator(compactor)
             .observer(context.integration.as_ref().clone())
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)

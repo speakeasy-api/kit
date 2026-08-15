@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -13,6 +13,7 @@ agent-client-protocol = "=2.0.0"
 agentkit-acp = "=0.10.6"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
+agentkit-compaction = "=0.10.5"
 agentkit-loop = "=0.10.5"
 agentkit-mcp = "=0.10.6"
 agentkit-tool-compose = { version = "=0.10.6", default-features = false, features = ["runlet"] }

@@ -134,6 +134,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-compaction"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "483b8de89e4d2de33370151c398c4d81bfd3267899cdc2caee4361c9dab052f2"
+dependencies = [
+ "agentkit-core",
+ "agentkit-loop",
+ "async-trait",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "agentkit-context"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1818,13 +1831,14 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
  "a2a-protocol-types",
  "agent-client-protocol",
  "agentkit-acp",
+ "agentkit-compaction",
  "agentkit-context",
  "agentkit-core",
  "agentkit-loop",

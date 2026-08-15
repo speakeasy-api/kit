@@ -25,7 +25,10 @@ cargo run -- tui --root /path/to/project
 ```
 
 Every TUI conversation is persisted as an append-only, versioned JSONL transcript
-under `<root>/.kit/sessions`. The session id is shown in the header. Resume it with:
+under `<root>/.kit/sessions`. When reported context use reaches 80% of the model's
+window, Kit automatically summarizes mutable history while preserving bootstrap
+instructions and the latest user request; the replacement is persisted for resume.
+The session id is shown in the header. Resume it with:
 
 ```sh
 cargo run -- tui --root /path/to/project --resume <session-id>

@@ -1,3 +1,4 @@
+pub mod compaction;
 pub mod events;
 pub mod protocols;
 pub mod provider;
