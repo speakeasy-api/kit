@@ -1,6 +1,9 @@
 use agentkit_core::{ItemKind, Part};
 
 use super::load_initial_transcript;
+use agentkit_tools_core::ToolSource;
+
+use super::Runtime;
 
 #[tokio::test]
 async fn loads_all_agents_md_files_outermost_first() {
@@ -27,4 +30,16 @@ async fn loads_all_agents_md_files_outermost_first() {
         .collect::<Vec<_>>();
     assert!(text[0].contains("outer guidance"));
     assert!(text[1].contains("inner guidance"));
+}
+
+#[test]
+fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let specs = runtime.compose(0).specs();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].name.0, "compose");
+    assert!(specs[0].description.contains("`tool_search`"));
+    assert!(specs[0].description.contains("`tool`"));
+    assert!(!specs[0].description.contains("mcp_filesystem_read_file"));
 }

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mock": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-everything"
+      ]
+    }
+  }
+}

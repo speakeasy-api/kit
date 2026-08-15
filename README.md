@@ -47,11 +47,13 @@ Pass that id to `prompt --resume <session-id>` or `tui --resume <session-id>`.
 Run the headless ACP/A2A server directly:
 
 ```sh
-cargo run -- serve --root /path/to/project --a2a 127.0.0.1:7331
+cargo run -- serve --root /path/to/project
 ```
 
-`serve` reserves stdout for ACP. Diagnostics go to stderr. A2A discovery is
-available from the HTTP server's Agent Card endpoint.
+`serve` reserves stdout for ACP. Diagnostics go to stderr. Kit chooses an
+available loopback port for A2A and reports it on stderr; pass `--a2a
+127.0.0.1:7331` to request a specific address. A2A discovery is available
+from the HTTP server's Agent Card endpoint.
 
 Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
 that order. Credential login and refresh remain Codex's job.

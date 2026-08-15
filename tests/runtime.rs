@@ -33,17 +33,41 @@ fn runtime_is_rooted_and_exposes_only_compose() {
         "`edit`: Apply exact, git-style text hunks",
         "`subagent`: Run a fresh local coding agent",
         "`a2a`: Send a text task",
+        "`tool_search`: Search connected MCP tools",
+        "`tool`: Invoke a connected MCP tool",
     ] {
         assert!(description.contains(expected), "missing {expected:?}");
     }
-    assert_eq!(description.matches("Input JSON schema:").count(), 4);
-    assert_eq!(description.matches("Output JSON schema:").count(), 4);
+    assert_eq!(description.matches("Input JSON schema:").count(), 6);
+    assert_eq!(description.matches("Output JSON schema:").count(), 6);
     assert!(description.contains("\"exit_code\""));
     assert!(description.contains("\"enum\":[\"delete\"]"));
     assert!(!description.contains("\"const\""));
 
     assert!(visible.get(&ToolName::new("shell")).is_some());
     assert!(visible.get(&ToolName::new("edit")).is_some());
+}
+
+#[tokio::test]
+async fn mcp_meta_tools_are_available_without_an_implicit_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"found = tool_search({ query: "anything" })
+return { found }"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("search failed: {outcome:?}")
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::structured(json!({"found": []}))
+    );
+
+    let outcome = execute_compose(&runtime, r#"return tool({ name: "shell", args: {} })"#).await;
+    assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
 }
 
 #[tokio::test]

@@ -13,17 +13,18 @@ use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
 };
 use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_mcp::McpServerManager;
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
 };
-use agentkit_tools_core::{Tool, ToolName, ToolSource, ToolSpec};
+use agentkit_tools_core::{CatalogReader, Tool, ToolName, ToolSource, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     provider::{OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, SubscriptionConfig},
-    tools::{A2aTool, EditTool, Observed, ShellTool, SubagentTool},
+    tools::{A2aTool, EditTool, McpTool, Observed, ShellTool, SubagentTool, ToolSearch},
 };
 
 #[cfg(test)]
@@ -43,6 +44,8 @@ pub struct Runtime {
     adapter: OpenAiSubscriptionAdapter,
     max_subagent_depth: usize,
     session: Option<SessionRequest>,
+    _mcp_manager: McpServerManager,
+    mcp_catalog: CatalogReader,
 }
 
 impl Runtime {
@@ -58,11 +61,14 @@ impl Runtime {
             ));
         }
         let adapter = OpenAiSubscriptionAdapter::new(SubscriptionConfig::new(model.into())?)?;
+        let (_mcp_manager, mcp_catalog) = crate::tools::mcp::empty();
         Ok(Arc::new(Self {
             root,
             adapter,
             max_subagent_depth: 2,
             session: None,
+            _mcp_manager,
+            mcp_catalog,
         }))
     }
 
@@ -82,6 +88,22 @@ impl Runtime {
         &self.root
     }
 
+    /// Connects the explicitly configured MCP servers before the runtime is served.
+    pub async fn with_mcp_config(
+        runtime: Arc<Self>,
+        path: Option<&Path>,
+    ) -> Result<Arc<Self>, String> {
+        let Some(path) = path else {
+            return Ok(runtime);
+        };
+        let (manager, catalog) = crate::tools::mcp::connect(path).await?;
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
+        runtime._mcp_manager = manager;
+        runtime.mcp_catalog = catalog;
+        Ok(Arc::new(runtime))
+    }
+
     pub const fn max_subagent_depth(&self) -> usize {
         self.max_subagent_depth
     }
@@ -91,10 +113,13 @@ impl Runtime {
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())))
             .with(Observed::new(SubagentTool::new(Arc::clone(self), depth)))
-            .with(Observed::new(A2aTool::new()));
+            .with(Observed::new(A2aTool::new()))
+            .with(Observed::new(ToolSearch::new(self.mcp_catalog.clone())))
+            .with(Observed::new(McpTool::new(self.mcp_catalog.clone())));
         let child_specs = children.specs();
         ComposeOnly(
             ComposeTool::wrap(children)
+                .with_source(self.mcp_catalog.clone().unadvertised())
                 .with_config(ComposeConfig::new().with_max_nested_tool_calls(128))
                 .with_backend(HiddenRunletBackend(child_specs)),
         )
@@ -247,7 +272,7 @@ impl Runtime {
 
     fn system_prompt(&self, depth: usize) -> String {
         format!(
-            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, and a2a tools. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, and a2a tools, plus the MCP meta-tools tool_search and tool. Use tool_search to discover MCP tools (query `mcp` when asked to list everything available) and tool to invoke only those returned MCP names. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
             self.max_subagent_depth

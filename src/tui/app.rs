@@ -21,6 +21,8 @@ use super::{
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    /// The actual dynamically allocated A2A listen address.
+    A2aAddress(String),
     /// A chunk of agent prose.
     Text(String),
     /// A chunk of agent reasoning.
@@ -393,6 +395,7 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         match update {
+            Update::A2aAddress(address) => self.a2a = address,
             Update::Text(text) => {
                 self.close_thought();
                 match self.blocks.last_mut() {

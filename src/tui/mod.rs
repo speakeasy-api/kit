@@ -71,7 +71,8 @@ const SETTLE: Duration = Duration::from_secs(3);
 pub async fn run(
     root: &Path,
     model: &str,
-    a2a: &str,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
     resume: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -91,10 +92,14 @@ pub async fn run(
         .arg(root)
         .arg("--model")
         .arg(model)
-        .arg("--a2a")
-        .arg(a2a)
         .arg("--session-id")
         .arg(&persisted_session_id);
+    if let Some(address) = a2a {
+        command.arg("--a2a").arg(address);
+    }
+    if let Some(path) = mcp_config {
+        command.arg("--mcp-config").arg(path);
+    }
     if resume.is_some() {
         command.arg("--resume");
     }
@@ -114,7 +119,7 @@ pub async fn run(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let root = root.to_path_buf();
     let model = model.to_string();
-    let a2a = a2a.to_string();
+    let a2a = a2a.unwrap_or("allocating…").to_string();
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
 
     // The agent's own diagnostics are the only explanation of a failed start,
@@ -127,6 +132,9 @@ pub async fn run(
         while let Ok(Some(line)) = lines.next_line().await {
             let update = match events::parse(&line) {
                 Some(event) => Update::Runtime(event),
+                None if line.starts_with("A2A listening on ") => {
+                    Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
+                }
                 None => {
                     if let Ok(mut recent) = recorder.lock() {
                         recent.push(line.clone());

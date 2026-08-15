@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
 
 use a2a_protocol_server::{
     AgentExecutor, EventEmitter, JsonRpcDispatcher, RequestHandlerBuilder,
@@ -72,6 +72,21 @@ pub async fn start(
     runtime: Arc<Runtime>,
     address: String,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    // Resolve port zero before building the Agent Card so discovery advertises
+    // the selected port rather than `:0`. The listener is held until the
+    // server bind to minimize the reservation window.
+    let reservation = if address
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| address.port() == 0)
+    {
+        Some(tokio::net::TcpListener::bind(&address).await?)
+    } else {
+        None
+    };
+    let address = match &reservation {
+        Some(listener) => listener.local_addr()?.to_string(),
+        None => address,
+    };
     let url = format!("http://{address}");
     let card = AgentCard {
         url: None,
@@ -109,5 +124,20 @@ pub async fn start(
             .with_agent_card(card)
             .build()?,
     );
+    drop(reservation);
     Ok(serve_with_addr(&address, JsonRpcDispatcher::new(handler)).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::start;
+
+    #[tokio::test]
+    async fn port_zero_allocates_a_real_port() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let bound = start(runtime, "127.0.0.1:0".into()).await.unwrap();
+        assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(bound.port(), 0);
+    }
 }

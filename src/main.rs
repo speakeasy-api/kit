@@ -17,8 +17,12 @@ enum Command {
         root: PathBuf,
         #[arg(long, default_value = "gpt-5.4")]
         model: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        a2a: String,
+        /// A2A listen address. An available loopback port is selected when omitted.
+        #[arg(long)]
+        a2a: Option<String>,
+        /// Explicit MCP server configuration (never discovered automatically).
+        #[arg(long)]
+        mcp_config: Option<PathBuf>,
         /// Persistent session id selected by the hosting client.
         #[arg(long)]
         session_id: Option<String>,
@@ -35,6 +39,9 @@ enum Command {
         root: PathBuf,
         #[arg(long, default_value = "gpt-5.4")]
         model: String,
+        /// Explicit MCP server configuration (never discovered automatically).
+        #[arg(long)]
+        mcp_config: Option<PathBuf>,
         /// Resume this persisted session id.
         #[arg(long)]
         resume: Option<String>,
@@ -50,8 +57,12 @@ enum Command {
         root: PathBuf,
         #[arg(long, default_value = "gpt-5.4")]
         model: String,
-        #[arg(long, default_value = "127.0.0.1:7331")]
-        a2a: String,
+        /// A2A listen address. An available loopback port is selected when omitted.
+        #[arg(long)]
+        a2a: Option<String>,
+        /// Explicit MCP server configuration (never discovered automatically).
+        #[arg(long)]
+        mcp_config: Option<PathBuf>,
         /// Resume this persisted session id.
         #[arg(long)]
         resume: Option<String>,
@@ -68,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             model,
             a2a,
+            mcp_config,
             session_id,
             resume,
             force,
@@ -80,12 +92,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?,
                 None => kit::Runtime::new(root, model)?,
             };
-            kit::protocols::a2a::start(runtime.clone(), a2a).await?;
+            let runtime = kit::Runtime::with_mcp_config(runtime, mcp_config.as_deref()).await?;
+            let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
+            let bound = kit::protocols::a2a::start(runtime.clone(), address).await?;
+            eprintln!("A2A listening on {bound}");
             kit::protocols::acp::serve(runtime).await?;
         }
         Command::Prompt {
             root,
             model,
+            mcp_config,
             resume,
             force,
             prompt,
@@ -100,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     force,
                 },
             )?;
+            let runtime = kit::Runtime::with_mcp_config(runtime, mcp_config.as_deref()).await?;
             let output = runtime.run_persistent(prompt).await?;
             println!("{output}");
             println!("session_id: {session_id}");
@@ -108,9 +125,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             model,
             a2a,
+            mcp_config,
             resume,
             force,
-        } => kit::tui::run(&root, &model, &a2a, resume.as_deref(), force).await?,
+        } => {
+            kit::tui::run(
+                &root,
+                &model,
+                a2a.as_deref(),
+                mcp_config.as_deref(),
+                resume.as_deref(),
+                force,
+            )
+            .await?
+        }
     }
     Ok(())
 }
