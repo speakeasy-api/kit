@@ -58,10 +58,31 @@ from the HTTP server's Agent Card endpoint.
 Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
 that order. Credential login and refresh remain Codex's job.
 
+## Configuration
+
+Kit loads optional defaults from `~/.kit/config.toml`. Command-line values take
+precedence, and omitted values that are not configured retain Kit's built-in
+defaults (`root = "."`, `model = "gpt-5.4"`, and in-memory OAuth
+credentials). Supported keys are:
+
+```toml
+root = "/path/to/project"
+model = "gpt-5.4"
+a2a = "127.0.0.1:7331"
+mcp_config = "/path/to/mcp.json"
+mcp_credential_store = "file" # memory, keychain, or file
+mcp_credential_dir = "/path/to/private/credentials"
+```
+
+`root`, `model`, and the MCP settings apply to every command. `a2a` applies to
+`serve` and `tui`. Missing config files are ignored; unreadable or invalid files
+produce an error rather than silently discarding configured values.
+
 ## MCP
 
-Pass an explicit JSON configuration; Kit never discovers or executes MCP server
-configuration automatically:
+Point Kit at an explicit JSON configuration, either with `--mcp-config` or the
+`mcp_config` TOML key. Kit never discovers or executes MCP server configuration
+automatically:
 
 ```json
 {
