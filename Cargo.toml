@@ -14,7 +14,7 @@ agentkit-acp = "=0.10.5"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-loop = "=0.10.5"
-agentkit-tool-compose = { version = "=0.10.5", features = ["runlet"] }
+agentkit-tool-compose = { version = "=0.10.6", default-features = false, features = ["runlet"] }
 agentkit-tools-core = "=0.10.5"
 async-trait = "=0.1.92"
 blake3 = "=1.8.6"
