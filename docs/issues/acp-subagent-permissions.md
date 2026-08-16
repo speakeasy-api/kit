@@ -1,6 +1,6 @@
 # Headless ACP subagents cannot request permission
 
-Kit answers every nested ACP `RequestPermissionRequest` with `Cancelled` so a headless child cannot wait indefinitely for a human response. As a result, ACP harnesses that require approval for protected actions must be configured in a noninteractive or pretrusted mode, or those actions fail.
+Kit handles nested ACP `RequestPermissionRequest` values with a fail-closed profile policy so a headless child cannot wait indefinitely for a human response. The default `deny` policy selects only a rejection option when available, while `cancel` returns `Cancelled`. As a result, ACP harnesses that require approval for protected actions must be configured in a noninteractive or pretrusted mode, or those actions fail.
 
 A future design could route permission requests through the parent interaction surface while preserving cancellation, attribution, and noninteractive safety. Until then this limitation should remain explicit in harness setup guidance.
 

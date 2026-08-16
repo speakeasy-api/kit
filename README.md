@@ -81,6 +81,7 @@ mcp_credential_dir = "/path/to/private/credentials"
 [acp.review]
 command = "review-agent"
 args = ["acp"]
+permissions = "deny" # deny (default) or cancel
 
 # Override only the Kit executable/base argv; Kit appends its runtime flags.
 [acp.kit]
@@ -123,6 +124,7 @@ lookup portable:
 [acp.claude]
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp@0.63.0"]
+permissions = "deny"
 
 [acp.codex]
 command = "npx"
