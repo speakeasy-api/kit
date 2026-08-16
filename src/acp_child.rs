@@ -248,7 +248,7 @@ impl ChildSession {
             ready = &mut ready_rx => ready.map_err(|_| ChildError::Failed("nested agent exited during startup".into())),
             () = cancellation.cancelled() => Err(ChildError::Cancelled),
             () = tokio::time::sleep(HANDSHAKE) => Err(ChildError::Failed(format!("nested agent did not answer the ACP handshake within {} seconds", HANDSHAKE.as_secs()))),
-            joined = &mut task => Err(ChildError::Failed(match joined { Ok(Ok(())) => "nested agent exited during startup".into(), Ok(Err(e)) => e, Err(e) => format!("nested agent startup actor failed: {e}") })),
+            joined = &mut task => return Err(ChildError::Failed(match joined { Ok(Ok(())) => "nested agent exited during startup".into(), Ok(Err(e)) => e, Err(e) => format!("nested agent startup actor failed: {e}") })),
         };
         match result {
             Ok(ready) => Ok(Self {
@@ -630,6 +630,47 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--resume"));
         assert!(args.iter().any(|arg| arg == "--mcp-credential-store"));
         assert_eq!(command.as_std().get_current_dir(), Some(root.path()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_startup_failures_do_not_poll_join_handles_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "broken".into(),
+            AcpHarnessProfile {
+                command: "kit-test-acp-executable-that-does-not-exist".into(),
+                args: Vec::new(),
+            },
+        );
+        let config = ChildConfig {
+            root: root.path().to_path_buf(),
+            model: "unused".into(),
+            mcp_config: None,
+            credential_storage: Default::default(),
+            harnesses: AcpHarnesses::new(profiles).unwrap(),
+            default_harness: "acp.broken".into(),
+        };
+        let starts = (0..64)
+            .map(|_| {
+                let config = config.clone();
+                tokio::spawn(async move {
+                    ChildSession::start(
+                        config,
+                        "acp.broken".into(),
+                        None,
+                        1,
+                        TurnCancellation::default(),
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for start in starts {
+            let result = start.await.expect("child startup must not panic");
+            assert!(matches!(result, Err(ChildError::Failed(_))));
+        }
     }
 
     #[tokio::test]
