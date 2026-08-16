@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agentkit_core::Item;
+use agentkit_core::{Item, Timestamp};
 use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
@@ -84,7 +84,7 @@ pub fn load(root: &Path, session_id: &str) -> Result<Vec<Item>, String> {
 /// with prompts so the read is a stable, completed-turn snapshot.
 pub fn clone_completed(root: &Path, source: &str, destination: &str) -> Result<(), String> {
     let transcript = load(root, source)?;
-    let opened = open(root, destination, false, false, transcript)?;
+    let opened = open_with_initial_timestamps(root, destination, false, false, transcript, false)?;
     drop(opened);
     Ok(())
 }
@@ -120,6 +120,17 @@ pub fn open(
     force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
+    open_with_initial_timestamps(root, session_id, resume, force, initial, true)
+}
+
+fn open_with_initial_timestamps(
+    root: &Path,
+    session_id: &str,
+    resume: bool,
+    force: bool,
+    initial: Vec<Item>,
+    stamp_initial: bool,
+) -> Result<OpenSession, String> {
     validate_id(session_id)?;
     if !resume && initial.is_empty() {
         return Err("a new session requires an initial transcript".into());
@@ -154,8 +165,13 @@ pub fn open(
         lock,
     };
     if !resume {
-        for item in initial {
-            writer.append(&item)?;
+        for mut item in initial {
+            if stamp_initial {
+                stamp_item(&mut item, Timestamp::now());
+                writer.append(&item)?;
+            } else {
+                writer.append_snapshot_item(&item)?;
+            }
             transcript.push(item);
         }
         generation = writer.generation;
@@ -206,6 +222,13 @@ impl TranscriptObserver for SessionObserver {
 
 impl Writer {
     fn append(&mut self, item: &Item) -> Result<(), String> {
+        if item.created_at.is_none() {
+            return Err("transcript item missing created_at before persistence".into());
+        }
+        self.append_snapshot_item(item)
+    }
+
+    fn append_snapshot_item(&mut self, item: &Item) -> Result<(), String> {
         self.lock.check()?;
         let generation = self
             .generation
@@ -305,6 +328,12 @@ impl Drop for SessionLock {
     }
 }
 
+fn stamp_item(item: &mut Item, now: Timestamp) {
+    if item.created_at.is_none() {
+        item.created_at = Some(now);
+    }
+}
+
 fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), String> {
     let file =
         File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -390,7 +419,7 @@ mod tests {
         .unwrap();
         opened.observer.on_transcript_event(TranscriptEvent {
             session_id: &agentkit_core::SessionId::new("abc"),
-            item: &Item::text(ItemKind::User, "hello"),
+            item: &Item::text(ItemKind::User, "hello").with_created_at(Timestamp(123)),
         });
         drop(opened);
         let resumed = open(
@@ -402,28 +431,128 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed.transcript.len(), 2);
+        assert!(resumed.transcript[0].created_at.is_some());
+        assert_eq!(resumed.transcript[1].created_at, Some(Timestamp(123)));
         let text = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
         assert!(text.contains("\"schema_version\":2"));
         assert!(text.contains("\"generation\":2"));
     }
 
     #[test]
-    fn reads_legacy_schema_one_records() {
+    #[should_panic(expected = "transcript item missing created_at before persistence")]
+    fn observer_rejects_unstamped_items() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("abc"),
+            item: &Item::text(ItemKind::User, "unstamped"),
+        });
+    }
+
+    #[test]
+    fn persisted_tool_boundaries_preserve_loop_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(&opened.observer, &call_item("call-1"));
+        write(
+            &opened.observer,
+            &Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+                    "call-1",
+                    agentkit_core::ToolOutput::text("done"),
+                ))],
+            ),
+        );
+
+        let items = stored(root.path());
+        assert!(items.iter().all(|item| item.created_at.is_some()));
+        let dispatched = items[1].created_at.unwrap().0;
+        let completed = items[2].created_at.unwrap().0;
+        assert!(completed >= dispatched);
+    }
+
+    #[test]
+    fn reads_legacy_null_and_missing_timestamps() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join(".kit/sessions");
         fs::create_dir_all(&directory).unwrap();
-        let item = Item::text(ItemKind::System, "legacy");
-        let line = serde_json::json!({
-            "schema_version": LEGACY_SCHEMA_VERSION,
-            "session_id": "abc",
-            "generation": 1,
-            "item": item,
-        });
-        fs::write(directory.join("abc.jsonl"), format!("{line}\n")).unwrap();
+        let mut missing = serde_json::to_value(Item::text(ItemKind::System, "missing")).unwrap();
+        missing.as_object_mut().unwrap().remove("created_at");
+        let lines = [
+            serde_json::json!({
+                "schema_version": LEGACY_SCHEMA_VERSION,
+                "session_id": "abc",
+                "generation": 1,
+                "item": missing,
+            }),
+            serde_json::json!({
+                "schema_version": LEGACY_SCHEMA_VERSION,
+                "session_id": "abc",
+                "generation": 2,
+                "item": Item::text(ItemKind::System, "null"),
+            }),
+        ];
+        let stored = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(directory.join("abc.jsonl"), stored).unwrap();
 
         let loaded = load(root.path(), "abc").unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].kind, ItemKind::System);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|item| item.created_at.is_none()));
+    }
+
+    #[test]
+    fn cloning_preserves_historical_unknown_timestamps() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(".kit/sessions");
+        fs::create_dir_all(&directory).unwrap();
+        let lines = [
+            serde_json::json!({
+                "schema_version": LEGACY_SCHEMA_VERSION,
+                "session_id": "source",
+                "generation": 1,
+                "item": Item::text(ItemKind::System, "unknown"),
+            }),
+            serde_json::json!({
+                "schema_version": LEGACY_SCHEMA_VERSION,
+                "session_id": "source",
+                "generation": 2,
+                "item": Item::text(ItemKind::User, "known").with_created_at(Timestamp(77)),
+            }),
+        ];
+        let stored = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(directory.join("source.jsonl"), stored).unwrap();
+
+        clone_completed(root.path(), "source", "branch").unwrap();
+
+        let cloned = load(root.path(), "branch").unwrap();
+        assert_eq!(cloned[0].created_at, None);
+        assert_eq!(cloned[1].created_at, Some(Timestamp(77)));
     }
 
     #[test]
@@ -438,8 +567,9 @@ mod tests {
         )
         .unwrap();
         write(&opened.observer, &Item::text(ItemKind::User, "discard me"));
+        let original_timestamp = opened.transcript[0].created_at;
         let replacement = vec![
-            Item::text(ItemKind::System, "system"),
+            opened.transcript[0].clone(),
             Item::text(ItemKind::Context, "summary"),
         ];
         opened.observer.replace(&replacement).unwrap();
@@ -450,6 +580,9 @@ mod tests {
         assert_eq!(resumed.transcript.len(), 3);
         assert_eq!(resumed.transcript[1].kind, ItemKind::Context);
         assert_eq!(resumed.transcript[2].kind, ItemKind::User);
+        assert_eq!(resumed.transcript[0].created_at, original_timestamp);
+        assert_eq!(resumed.transcript[1].created_at, None);
+        assert!(resumed.transcript[2].created_at.is_some());
         let stored = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
         assert!(stored.contains("\"replacement\""));
         assert!(stored.contains("\"generation\":4"));
@@ -467,9 +600,11 @@ mod tests {
     }
 
     fn write(observer: &SessionObserver, item: &Item) {
+        let mut item = item.clone();
+        stamp_item(&mut item, Timestamp::now());
         observer.on_transcript_event(TranscriptEvent {
             session_id: &agentkit_core::SessionId::new("abc"),
-            item,
+            item: &item,
         });
     }
 
@@ -535,10 +670,7 @@ mod tests {
             ),
             Item::text(ItemKind::User, "changes published"),
         ] {
-            opened.observer.on_transcript_event(TranscriptEvent {
-                session_id: &agentkit_core::SessionId::new("abc"),
-                item: &item,
-            });
+            write(&opened.observer, &item);
         }
         drop(opened);
 
@@ -561,9 +693,13 @@ mod tests {
             ],
             "the synthesized result belongs next to its call"
         );
+        let repaired_timestamp = resumed.transcript[2].created_at;
+        assert!(repaired_timestamp.is_some());
+        resumed.observer.replace(&resumed.transcript).unwrap();
         drop(resumed);
 
-        // The repair was written back, so a later resume finds nothing to fix
+        // The repair and its construction timestamp survive a later replacement,
+        // and a subsequent resume finds nothing else to fix.
         // and never records the same result twice.
         let again = open(root.path(), "abc", true, false, Vec::new()).unwrap();
         assert_eq!(again.transcript.len(), 4);
@@ -574,9 +710,10 @@ mod tests {
             .filter(|part| matches!(part, Part::ToolResult(_)))
             .count();
         assert_eq!(results, 1);
+        assert_eq!(again.transcript[2].created_at, repaired_timestamp);
         let text = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
-        assert_eq!(text.lines().count(), 4);
-        assert!(text.contains("\"generation\":4"));
+        assert_eq!(text.lines().count(), 5);
+        assert!(text.contains("\"generation\":5"));
     }
 
     #[test]

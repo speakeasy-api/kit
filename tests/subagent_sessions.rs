@@ -15,7 +15,7 @@ fn completed_transcript_can_be_cloned_while_source_is_owned() {
 
     assert_eq!(
         kit::session::load(directory.path(), "branch").unwrap(),
-        transcript
+        source.transcript
     );
     drop(source);
 }

@@ -5,7 +5,7 @@ use agentkit_compaction::{
     CompactionRequest, CompactionResult, CompactionStrategy, Compactor, DropReasoningStrategy,
     StrategyCompactor, SummaryRequest, SummaryResult,
 };
-use agentkit_core::{FinishReason, Item, ItemKind, MetadataMap, Part, SessionId};
+use agentkit_core::{FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, Timestamp};
 use agentkit_loop::{
     Agent, AgentEvent, LoopCtx, LoopError, LoopInterrupt, LoopMutator, LoopStep, ModelAdapter,
     MutationPoint, SessionConfig, TranscriptCursor,
@@ -170,12 +170,18 @@ impl CompactionStrategy for SummarizeForContinuation {
             .iter()
             .map(|index| request.transcript[*index].clone())
             .collect();
-        let summary = backend
+        let mut summary = backend
             .summarize(
                 SummaryRequest::new(summarized, request.reason),
                 ctx.cancellation.clone(),
             )
             .await?;
+        let now = Timestamp::now();
+        for item in &mut summary.items {
+            if item.created_at.is_none() {
+                item.created_at = Some(now);
+            }
+        }
         let summarized = summarized_indices
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
@@ -395,6 +401,8 @@ mod tests {
                 ItemKind::User,
             ]
         );
+        let summary = &result.transcript[2];
+        assert!(summary.created_at.is_some());
         let current = result.transcript.last().unwrap();
         let Part::Text(text) = &current.parts[0] else {
             panic!("latest user should remain text");

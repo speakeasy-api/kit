@@ -15,7 +15,9 @@
 
 use std::collections::HashSet;
 
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, ToolCallId, ToolOutput, ToolResultPart};
+use agentkit_core::{
+    Item, ItemKind, MetadataMap, Part, Timestamp, ToolCallId, ToolOutput, ToolResultPart,
+};
 use serde_json::Value;
 
 const MISSING: &str = "No result for this tool call survived in the stored transcript. The work \
@@ -51,7 +53,7 @@ pub fn repair_unanswered_tool_calls(transcript: &mut Vec<Item>) -> Vec<Item> {
             .collect::<Vec<_>>();
         repaired.push(item);
         if !missing.is_empty() {
-            let result = Item::new(ItemKind::Tool, missing);
+            let result = Item::new(ItemKind::Tool, missing).with_created_at(Timestamp::now());
             synthesized.push(result.clone());
             repaired.push(result);
         }
@@ -131,6 +133,8 @@ mod tests {
         let synthesized = repair_unanswered_tool_calls(&mut transcript);
 
         assert_eq!(synthesized.len(), 1);
+        assert!(synthesized[0].created_at.is_some());
+        assert_eq!(synthesized[0].created_at, transcript[2].created_at);
         assert_eq!(
             transcript.iter().map(|item| item.kind).collect::<Vec<_>>(),
             [
