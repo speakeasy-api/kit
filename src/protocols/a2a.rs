@@ -1,8 +1,8 @@
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use a2a_protocol_server::{
-    AgentExecutor, EventEmitter, JsonRpcDispatcher, RequestHandlerBuilder,
-    request_context::RequestContext, serve_with_addr, streaming::EventQueueWriter,
+    AgentExecutor, Dispatcher, EventEmitter, JsonRpcDispatcher, RequestHandlerBuilder,
+    request_context::RequestContext, streaming::EventQueueWriter,
 };
 use a2a_protocol_types::{
     agent_card::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill},
@@ -72,22 +72,12 @@ pub async fn start(
     runtime: Arc<Runtime>,
     address: String,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
-    // Resolve port zero before building the Agent Card so discovery advertises
-    // the selected port rather than `:0`. The listener is held until the
-    // server bind to minimize the reservation window.
-    let reservation = if address
-        .parse::<SocketAddr>()
-        .is_ok_and(|address| address.port() == 0)
-    {
-        Some(tokio::net::TcpListener::bind(&address).await?)
-    } else {
-        None
-    };
-    let address = match &reservation {
-        Some(listener) => listener.local_addr()?.to_string(),
-        None => address,
-    };
-    let url = format!("http://{address}");
+    // Bind exactly once and keep this listener for the server. Selecting an
+    // ephemeral port with one listener and rebinding it with another creates a
+    // TOCTOU window in which another process can claim the advertised port.
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    let bound = listener.local_addr()?;
+    let url = format!("http://{bound}");
     let card = AgentCard {
         url: None,
         name: "Kit".into(),
@@ -124,8 +114,41 @@ pub async fn start(
             .with_agent_card(card)
             .build()?,
     );
-    drop(reservation);
-    Ok(serve_with_addr(&address, JsonRpcDispatcher::new(handler)).await?)
+    serve_bound(listener, JsonRpcDispatcher::new(handler)).await
+}
+
+async fn serve_bound(
+    listener: tokio::net::TcpListener,
+    dispatcher: impl Dispatcher,
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+    let bound = listener.local_addr()?;
+    let dispatcher = Arc::new(dispatcher);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            let dispatcher = Arc::clone(&dispatcher);
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |request| {
+                    let dispatcher = Arc::clone(&dispatcher);
+                    async move { Ok::<_, Infallible>(dispatcher.dispatch(request).await) }
+                });
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, service)
+                .await;
+            });
+        }
+    });
+    Ok(bound)
 }
 
 #[cfg(test)]
@@ -139,5 +162,10 @@ mod tests {
         let bound = start(runtime, "127.0.0.1:0".into()).await.unwrap();
         assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
         assert_ne!(bound.port(), 0);
+        let rebound = tokio::net::TcpListener::bind(bound).await;
+        assert!(
+            matches!(rebound, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
+            "the server must retain the listener that selected the ephemeral port"
+        );
     }
 }
