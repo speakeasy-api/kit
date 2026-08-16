@@ -675,4 +675,43 @@ mod tests {
         );
         assert!(manager.lookup(&prior).is_err());
     }
+
+    #[tokio::test]
+    async fn generic_harness_without_native_fork_returns_unsupported() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+            "generic".into(),
+            crate::acp_child::AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![fixture, "--no-fork".into()],
+            },
+        )]))
+        .unwrap();
+        let manager = Subagents::new(
+            ChildConfig {
+                root: root.path().to_path_buf(),
+                model: "unused".into(),
+                mcp_config: None,
+                credential_storage: Default::default(),
+                harnesses,
+                default_harness: "acp.generic".into(),
+            },
+            2,
+        );
+        let prior = manager
+            .create("base".into(), None, 0, TurnCancellation::default(), None)
+            .await
+            .unwrap();
+
+        let error = manager
+            .fork(prior, "branch".into(), 0, TurnCancellation::default(), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
+        );
+    }
 }

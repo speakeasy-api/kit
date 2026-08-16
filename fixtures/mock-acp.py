@@ -6,6 +6,7 @@ import time
 
 write_lock = threading.Lock()
 next_session = 1
+supports_fork = "--no-fork" not in sys.argv
 
 
 def send(message):
@@ -45,11 +46,20 @@ for line in sys.stdin:
     if method == "initialize":
         respond(request["id"], {
             "protocolVersion": 1,
-            "agentCapabilities": {"sessionCapabilities": {"fork": {}}},
+            "agentCapabilities": {
+                "sessionCapabilities": {"fork": {}} if supports_fork else {}
+            },
         })
     elif method == "session/new":
         respond(request["id"], {"sessionId": "base"})
     elif method == "session/fork":
+        if not supports_fork:
+            send({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": -32601, "message": "Method not found"},
+            })
+            continue
         session_id = f"branch-{next_session}"
         next_session += 1
         respond(request["id"], {"sessionId": session_id})

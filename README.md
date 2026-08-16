@@ -78,10 +78,6 @@ mcp_config = "/path/to/mcp.json"
 mcp_credential_store = "file" # memory, keychain, or file
 mcp_credential_dir = "/path/to/private/credentials"
 
-[acp.claude]
-command = "claude-agent-acp"
-args = []
-
 [acp.review]
 command = "review-agent"
 args = ["acp"]
@@ -92,7 +88,7 @@ command = "kit"
 args = ["acp"]
 
 [subagent]
-harness = "acp.claude"
+harness = "acp.review"
 ```
 
 `root`, `model`, and the MCP settings apply to every command. `a2a` applies to
@@ -108,6 +104,62 @@ fallback. Other profiles remain literal generic ACP argv. Configured child
 processes inherit Kit's environment unchanged in this release.
 Missing config files are ignored; unreadable or invalid files and unknown selected
 harness references produce an error rather than being silently discarded.
+
+### Generic ACP harnesses
+
+Any ACP v1 agent that speaks newline-delimited JSON-RPC over stdio can be a
+profile. Put only the executable in `command` and each argument in `args`; Kit
+spawns it directly, so shell quoting, pipes, environment assignments, and
+compound commands do not work. Use an executable on `PATH` for a portable
+configuration, or an absolute path for a machine-specific one. The agent must
+keep stdout protocol-only, may log to stderr, and must support `initialize`,
+`session/new`, and `session/prompt`. Kit sets its cwd to the runtime root and
+inherits the parent environment.
+
+For example, these profiles pin the npm adapters while leaving the executable
+lookup portable:
+
+```toml
+[acp.claude]
+command = "npx"
+args = ["-y", "@agentclientprotocol/claude-agent-acp@0.63.0"]
+
+[acp.codex]
+command = "npx"
+args = ["-y", "@agentclientprotocol/codex-acp@1.4.0"]
+
+[acp.cursor]
+command = "cursor-agent"
+args = ["acp"]
+
+[subagent]
+harness = "acp.claude"
+```
+
+Install Node.js for the npm-backed profiles and install the
+[Cursor CLI](https://cursor.com/docs/cli/installation) for `cursor-agent`.
+Authenticate each agent before starting Kit (`claude auth login`, `codex login`,
+or `cursor-agent login` respectively); Kit does not initiate a generic agent's
+ACP authentication flow. A generic child's permission request is answered with
+`cancelled`, because the headless parent cannot ask a human. Configure any
+non-interactive approval policy in the agent itself, with the same care as for
+running that agent directly.
+
+This compatibility snapshot records only the capabilities relevant to Kit,
+based on each listed release's `initialize` response as inspected on 2026-08-16.
+It is not a claim of full feature parity, and a different release may advertise
+different capabilities.
+
+| Agent | Version inspected | Profile argv | New session and prompt | Advertises `session/fork` | Kit `fork` |
+| --- | --- | --- | --- | --- | --- |
+| [Claude Agent ACP](https://github.com/agentclientprotocol/claude-agent-acp/tree/v0.63.0) | 0.63.0 (2026-07-27) | `npx -y @agentclientprotocol/claude-agent-acp@0.63.0` | Yes | Yes | Native ACP fork |
+| [Codex ACP](https://github.com/agentclientprotocol/codex-acp/releases/tag/v1.4.0) | 1.4.0 (2026-08-16) | `npx -y @agentclientprotocol/codex-acp@1.4.0` | Yes | No | Unsupported for a generic profile |
+| [Cursor CLI ACP](https://cursor.com/docs/cli/acp) | 2026.08.04-aaa8809 (checked 2026-08-16) | `cursor-agent acp` | Yes | No | Unsupported for a generic profile |
+
+Kit decides from the initialization response at runtime rather than from this
+table. If a generic agent does not advertise `session/fork`, ordinary `subagent`
+and `prompt` calls still work, but `fork` returns an explicit unsupported error.
+Only `acp.kit` has Kit's isolated transcript fallback.
 
 ## MCP
 
@@ -319,4 +371,5 @@ redraw.
 
 The root is a working directory, not a sandbox. Shell commands can access the
 host. Edits are atomic per file but multi-file changes are not transactional.
-Subagents are in-process, share the same root, and are bounded to depth two.
+Subagents are child ACP processes, use the same root as their working directory,
+and are bounded to depth two.
