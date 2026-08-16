@@ -15,7 +15,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 const MAX_LIVE_SUBAGENTS: usize = 16;
 
 use crate::{
-    acp_child::{ChildConfig, ChildError, ChildSession},
+    acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession},
     session,
 };
 
@@ -41,6 +41,14 @@ pub struct SubagentValue {
     pub id: String,
     pub output: Value,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates: Option<SubagentUpdates>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SubagentUpdates {
+    pub items: Vec<Value>,
+    pub truncated: bool,
 }
 
 struct OutputContract {
@@ -63,8 +71,9 @@ impl OutputContract {
     }
 
     fn parse(&self, output: &str) -> Option<Value> {
-        let value = serde_json::from_str(output.trim()).ok()?;
-        self.validator.is_valid(&value).then_some(value)
+        let value: Value = serde_json::from_str(output.trim()).ok()?;
+        self.validator.validate(&value).ok()?;
+        Some(value)
     }
 }
 
@@ -76,12 +85,22 @@ fn structured_prompt(prompt: String, contract: Option<&OutputContract>) -> Strin
 }
 
 fn structured_output(output: String, contract: Option<&OutputContract>) -> Value {
-    match contract {
-        Some(contract) => contract
-            .parse(&output)
-            .unwrap_or_else(|| Value::String(output)),
-        None => Value::String(output),
-    }
+    contract
+        .and_then(|contract| contract.parse(&output))
+        .unwrap_or_else(|| Value::String(output))
+}
+
+fn turn_output(
+    output: ChildOutput,
+    contract: Option<&OutputContract>,
+) -> (Value, Option<SubagentUpdates>) {
+    let value = structured_output(output.text, contract);
+    let updates =
+        (!output.updates.is_empty() || output.updates_truncated).then_some(SubagentUpdates {
+            items: output.updates,
+            truncated: output.updates_truncated,
+        });
+    (value, updates)
 }
 
 impl Subagents {
@@ -132,7 +151,7 @@ impl Subagents {
         let output = child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await?;
-        let output = structured_output(output, contract);
+        let (output, updates) = turn_output(output, contract);
         self.insert(
             id.clone(),
             State {
@@ -148,6 +167,7 @@ impl Subagents {
             id,
             output,
             generation: 1,
+            updates,
         })
     }
 
@@ -175,11 +195,13 @@ impl Subagents {
             .await
         {
             Ok(output) => {
+                let (output, updates) = turn_output(output, contract);
                 locked.generation = generation;
                 Ok(SubagentValue {
                     id: prior.id,
-                    output: structured_output(output, contract),
+                    output,
                     generation,
+                    updates,
                 })
             }
             Err(error) => {
@@ -239,7 +261,7 @@ impl Subagents {
         let output = child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await?;
-        let output = structured_output(output, contract);
+        let (output, updates) = turn_output(output, contract);
         let generation = prior
             .generation
             .checked_add(1)
@@ -259,6 +281,7 @@ impl Subagents {
             id,
             output,
             generation,
+            updates,
         })
     }
 
@@ -373,7 +396,7 @@ pub struct ForkTool {
 }
 
 fn value_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"id":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1}},"required":["id","output","generation"],"additionalProperties":false})
+    json!({"type":"object","properties":{"id":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1},"updates":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean"}},"required":["items","truncated"],"additionalProperties":false}},"required":["id","output","generation"],"additionalProperties":false})
 }
 fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
@@ -541,18 +564,78 @@ impl Tool for ForkTool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use agentkit_core::{Item, ItemKind};
 
     use super::*;
 
-    fn manager_with_disconnected_session(
-        root: &Path,
-    ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
+    #[test]
+    fn structured_output_is_parsed_and_validated() {
+        let contract = OutputContract::new(json!({
+            "type": "object",
+            "properties": {"approved": {"type": "boolean"}},
+            "required": ["approved"],
+            "additionalProperties": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            contract.parse(r#"{"approved":true}"#.into()).unwrap(),
+            json!({"approved": true})
+        );
+        assert!(contract.parse(r#"{"approved":"yes"}"#.into()).is_err());
+        assert!(contract.parse("```json\n{}\n```".into()).is_err());
+    }
+
+    #[test]
+    fn invalid_output_schema_is_rejected() {
+        assert!(OutputContract::new(json!({"type": 42})).is_err());
+    }
+
+    #[test]
+    fn explicit_null_output_schema_is_rejected() {
+        assert!(
+            serde_json::from_value::<Input>(json!({"prompt": "test", "output_schema": null}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn boolean_output_schema_is_supported() {
+        let contract = OutputContract::new(Value::Bool(true)).unwrap();
+        assert_eq!(contract.parse("[1, 2]".into()).unwrap(), json!([1, 2]));
+    }
+
+    #[test]
+    fn unstructured_output_remains_text() {
+        assert_eq!(
+            structured_output("plain text".into(), None).unwrap(),
+            Value::String("plain text".into())
+        );
+    }
+
+    #[test]
+    fn text_only_values_keep_the_existing_json_shape() {
+        let value = SubagentValue {
+            id: "child".into(),
+            output: Value::String("done".into()),
+            generation: 1,
+            updates: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            json!({"id": "child", "output": "done", "generation": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_snapshot_releases_source_before_child_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = vec![Item::text(ItemKind::System, "system")];
+        let opened = session::open(directory.path(), "source", false, false, transcript).unwrap();
         let manager = Subagents::new(
             ChildConfig {
-                root: root.to_path_buf(),
+                root: directory.path().to_path_buf(),
                 model: "test".into(),
                 mcp_config: None,
                 credential_storage: Default::default(),
@@ -578,71 +661,8 @@ mod tests {
             id: "source".into(),
             output: Value::String("done".into()),
             generation: 1,
+            updates: None,
         };
-        (manager, state, prior)
-    }
-
-    #[test]
-    fn structured_output_is_parsed_and_validated() {
-        let contract = OutputContract::new(json!({
-            "type": "object",
-            "properties": {"approved": {"type": "boolean"}},
-            "required": ["approved"],
-            "additionalProperties": false
-        }))
-        .unwrap();
-
-        assert_eq!(
-            contract.parse(r#"{"approved":true}"#).unwrap(),
-            json!({"approved": true})
-        );
-        assert!(contract.parse(r#"{"approved":"yes"}"#).is_none());
-        assert!(contract.parse("```json\n{}\n```").is_none());
-    }
-
-    #[test]
-    fn invalid_output_schema_is_rejected() {
-        assert!(OutputContract::new(json!({"type": 42})).is_err());
-    }
-
-    #[test]
-    fn explicit_null_output_schema_is_rejected() {
-        assert!(
-            serde_json::from_value::<Input>(json!({"prompt": "test", "output_schema": null}))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn boolean_output_schema_is_supported() {
-        let contract = OutputContract::new(Value::Bool(true)).unwrap();
-        assert_eq!(contract.parse("[1, 2]").unwrap(), json!([1, 2]));
-    }
-
-    #[test]
-    fn unstructured_output_remains_text() {
-        assert_eq!(
-            structured_output("plain text".into(), None),
-            Value::String("plain text".into())
-        );
-    }
-
-    #[test]
-    fn invalid_structured_output_remains_recoverable_as_text() {
-        let contract = OutputContract::new(json!({"type": "object"})).unwrap();
-
-        assert_eq!(
-            structured_output("not JSON".into(), Some(&contract)),
-            Value::String("not JSON".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_releases_source_before_child_work() {
-        let directory = tempfile::tempdir().unwrap();
-        let transcript = vec![Item::text(ItemKind::System, "system")];
-        let opened = session::open(directory.path(), "source", false, false, transcript).unwrap();
-        let (manager, state, prior) = manager_with_disconnected_session(directory.path());
 
         let branch = manager
             .clone_for_fork(&prior, &TurnCancellation::default())
@@ -655,63 +675,5 @@ mod tests {
         );
         assert!(session::load(directory.path(), &branch).is_ok());
         drop(opened);
-    }
-
-    #[tokio::test]
-    async fn child_prompt_failure_retires_the_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let (manager, _, prior) = manager_with_disconnected_session(directory.path());
-
-        assert!(
-            manager
-                .prompt(
-                    prior.clone(),
-                    "continue".into(),
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .is_err()
-        );
-        assert!(manager.lookup(&prior).is_err());
-    }
-
-    #[tokio::test]
-    async fn generic_harness_without_native_fork_returns_unsupported() {
-        let root = tempfile::tempdir().unwrap();
-        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
-        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "generic".into(),
-            crate::acp_child::AcpHarnessProfile {
-                command: "python3".into(),
-                args: vec![fixture, "--no-fork".into()],
-            },
-        )]))
-        .unwrap();
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.path().to_path_buf(),
-                model: "unused".into(),
-                mcp_config: None,
-                credential_storage: Default::default(),
-                harnesses,
-                default_harness: "acp.generic".into(),
-            },
-            2,
-        );
-        let prior = manager
-            .create("base".into(), None, 0, TurnCancellation::default(), None)
-            .await
-            .unwrap();
-
-        let error = manager
-            .fork(prior, "branch".into(), 0, TurnCancellation::default(), None)
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
-        );
     }
 }

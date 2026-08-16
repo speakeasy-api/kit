@@ -26,6 +26,45 @@ def prompt(request):
     time.sleep(0.40)
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
+    if "MOCK_RICH_OUTPUT" in text:
+        updates = [
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "internal"},
+            },
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "image",
+                    "data": "aGVsbG8=",
+                    "mimeType": "image/png",
+                },
+            },
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "Inspect files",
+            },
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": "completed",
+            },
+            {
+                "sessionUpdate": "plan",
+                "entries": [
+                    {"content": "Inspect", "priority": "high", "status": "completed"}
+                ],
+            },
+            {"sessionUpdate": "usage_update", "used": 10, "size": 100},
+        ]
+        for update in updates:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": session_id, "update": update},
+            })
+        text = "rich done"
     send({
         "jsonrpc": "2.0",
         "method": "session/update",

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -16,6 +17,7 @@ use agentkit_acp::{
 };
 use agentkit_core::TurnCancellation;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -28,6 +30,8 @@ use crate::tools::mcp::CredentialStorage;
 
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
+const MAX_CAPTURED_UPDATES: usize = 64;
+const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
 pub const BUILTIN_HARNESS: &str = "acp.kit";
 
 /// A trusted argv-only ACP harness profile from `~/.kit/config.toml`.
@@ -204,7 +208,7 @@ struct Prompt {
     session_id: SessionId,
     text: String,
     cancellation: TurnCancellation,
-    reply: oneshot::Sender<Result<String, ChildError>>,
+    reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
 }
 struct Fork {
     session_id: SessionId,
@@ -218,6 +222,54 @@ enum Request {
 struct Ready {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChildOutput {
+    pub text: String,
+    pub updates: Vec<Value>,
+    pub updates_truncated: bool,
+    update_bytes: usize,
+}
+
+impl ChildOutput {
+    fn record(&mut self, update: SessionUpdate) {
+        if let SessionUpdate::AgentMessageChunk(chunk) = &update
+            && let ContentBlock::Text(text) = &chunk.content
+        {
+            self.text.push_str(&text.text);
+            return;
+        }
+        if !matches!(
+            update,
+            SessionUpdate::AgentMessageChunk(_)
+                | SessionUpdate::ToolCall(_)
+                | SessionUpdate::ToolCallUpdate(_)
+                | SessionUpdate::Plan(_)
+        ) {
+            return;
+        }
+        if self.updates.len() >= MAX_CAPTURED_UPDATES {
+            self.updates_truncated = true;
+            return;
+        }
+        let remaining = MAX_CAPTURED_UPDATE_BYTES - self.update_bytes;
+        let mut encoded = vec![0; remaining];
+        let mut writer = Cursor::new(encoded.as_mut_slice());
+        if serde_json::to_writer(&mut writer, &update).is_err() {
+            self.updates_truncated = true;
+            return;
+        }
+        let length = writer.position() as usize;
+        encoded.truncate(length);
+        match serde_json::from_slice(&encoded) {
+            Ok(value) => {
+                self.updates.push(value);
+                self.update_bytes += length;
+            }
+            Err(_) => self.updates_truncated = true,
+        }
+    }
 }
 
 /// A logical ACP session. Multiple forked sessions may share one child process.
@@ -318,7 +370,7 @@ impl ChildSession {
         &self,
         text: String,
         cancellation: TurnCancellation,
-    ) -> Result<String, ChildError> {
+    ) -> Result<ChildOutput, ChildError> {
         let _serial = tokio::select! {
             serial = self.serial.lock() => serial,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
@@ -395,22 +447,23 @@ async fn run(
         }
     });
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-    let routes = Arc::new(Mutex::new(HashMap::<
-        SessionId,
-        mpsc::UnboundedSender<String>,
-    >::new()));
+    let routes = Arc::new(Mutex::new(
+        HashMap::<SessionId, Arc<Mutex<ChildOutput>>>::new(),
+    ));
     let notification_routes = Arc::clone(&routes);
     let root = config.root.clone();
     let connected = agent_client_protocol::Client
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
-                    && let ContentBlock::Text(text) = chunk.content
-                    && let Ok(routes) = notification_routes.lock()
-                    && let Some(route) = routes.get(&notification.session_id)
+                let route = notification_routes
+                    .lock()
+                    .ok()
+                    .and_then(|routes| routes.get(&notification.session_id).cloned());
+                if let Some(route) = route
+                    && let Ok(mut output) = route.lock()
                 {
-                    let _ = route.send(text.text);
+                    output.record(notification.update);
                 }
                 Ok(())
             },
@@ -480,8 +533,8 @@ async fn run(
                         let fatal = fatal_tx.clone();
                         tasks.spawn(async move {
                             let session_id = prompt.session_id.clone();
-                            let (chunks_tx, mut chunks_rx) = mpsc::unbounded_channel();
-                            if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), chunks_tx); }
+                            let output = Arc::new(Mutex::new(ChildOutput::default()));
+                            if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
                             let request = connection.send_request(agentkit_acp::PromptRequest::new(
                                 session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
                             )).block_task();
@@ -502,7 +555,7 @@ async fn run(
                                 }
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
-                            let output = std::iter::from_fn(|| chunks_rx.try_recv().ok()).collect::<String>();
+                            let output = output.lock().map(|output| output.clone()).unwrap_or_default();
                             let outcome = if cancelled { Err(ChildError::Cancelled) } else {
                                 response.map_err(ChildError::Failed).and_then(|response| prompt_outcome(response, output))
                             };
@@ -534,7 +587,10 @@ async fn run(
     connected.map_err(|e| e.to_string())
 }
 
-fn prompt_outcome(response: PromptResponse, output: String) -> Result<String, ChildError> {
+fn prompt_outcome(
+    response: PromptResponse,
+    output: ChildOutput,
+) -> Result<ChildOutput, ChildError> {
     match response.stop_reason {
         StopReason::EndTurn | StopReason::MaxTokens => Ok(output),
         StopReason::Cancelled => Err(ChildError::Cancelled),
@@ -550,7 +606,74 @@ fn prompt_outcome(response: PromptResponse, output: String) -> Result<String, Ch
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    fn update(value: Value) -> SessionUpdate {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn captures_text_separately_from_safe_rich_updates() {
+        let mut output = ChildOutput::default();
+        output.record(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hello"}
+        })));
+        output.record(update(json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "private reasoning"}
+        })));
+        output.record(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+        })));
+        output.record(update(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-1",
+            "title": "Inspect files"
+        })));
+        output.record(update(json!({
+            "sessionUpdate": "plan",
+            "entries": [{"content": "Inspect", "priority": "high", "status": "pending"}]
+        })));
+
+        assert_eq!(output.text, "hello");
+        assert_eq!(output.updates.len(), 3);
+        assert_eq!(output.updates[0]["content"]["type"], "image");
+        assert_eq!(output.updates[1]["sessionUpdate"], "tool_call");
+        assert_eq!(output.updates[2]["sessionUpdate"], "plan");
+        assert!(!output.updates_truncated);
+    }
+
+    #[test]
+    fn rich_updates_are_bounded_by_count_and_bytes() {
+        let image = || {
+            update(json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "image", "data": "eA==", "mimeType": "image/png"}
+            }))
+        };
+        let mut counted = ChildOutput::default();
+        for _ in 0..=MAX_CAPTURED_UPDATES {
+            counted.record(image());
+        }
+        assert_eq!(counted.updates.len(), MAX_CAPTURED_UPDATES);
+        assert!(counted.updates_truncated);
+
+        let mut oversized = ChildOutput::default();
+        oversized.record(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "type": "image",
+                "data": "x".repeat(MAX_CAPTURED_UPDATE_BYTES),
+                "mimeType": "image/png"
+            }
+        })));
+        assert!(oversized.updates.is_empty());
+        assert!(oversized.updates_truncated);
+    }
 
     #[test]
     fn configured_profile_is_spawned_as_literal_argv_at_the_root() {
@@ -708,7 +831,8 @@ mod tests {
         assert_eq!(
             base.prompt("standard".into(), TurnCancellation::default())
                 .await
-                .unwrap(),
+                .unwrap()
+                .text,
             "standard"
         );
         let first = base.fork(&TurnCancellation::default()).await.unwrap();
@@ -718,8 +842,8 @@ mod tests {
             first.prompt("first".into(), TurnCancellation::default()),
             second.prompt("second".into(), TurnCancellation::default()),
         );
-        assert_eq!(first.unwrap(), "first");
-        assert_eq!(second.unwrap(), "second");
+        assert_eq!(first.unwrap().text, "first");
+        assert_eq!(second.unwrap().text, "second");
         assert!(
             started.elapsed() < Duration::from_millis(700),
             "native fork sibling prompts were serialized: {:?}",
@@ -733,8 +857,8 @@ mod tests {
             same_session.prompt("same-first".into(), TurnCancellation::default()),
             same_session_clone.prompt("same-second".into(), TurnCancellation::default()),
         );
-        assert_eq!(first.unwrap(), "same-first");
-        assert_eq!(second.unwrap(), "same-second");
+        assert_eq!(first.unwrap().text, "same-first");
+        assert_eq!(second.unwrap().text, "same-second");
         assert!(
             started.elapsed() >= Duration::from_millis(750),
             "one logical session was not serialized: {:?}",

@@ -226,8 +226,15 @@ return { main: second.output, alternative: branch.output }
 ```
 
 Each call returns `{ id, output, generation }`. By default, `output` remains the
-agent's text. To require structured output, pass an `output_schema` JSON Schema to
-any turn-producing call:
+agent's text. When a turn also emits non-text agent content, tool calls, tool-call
+updates, or plans, the value gains an optional `updates` field containing the
+ordered ACP update objects and a `truncated` flag. Text-only turns keep the
+existing three-field shape. Capture is limited to 64 updates and 64 KiB of
+serialized update data per turn; an oversized or excess update is omitted and
+sets `truncated` to `true`. Agent thoughts, user-message echoes, usage, modes,
+commands, configuration, and session metadata are not exposed. To require
+structured `output`, pass an `output_schema` JSON Schema to any turn-producing
+call:
 
 ```text
 review = subagent({

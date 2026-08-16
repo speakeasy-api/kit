@@ -46,6 +46,7 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     assert_eq!(description.matches("Output JSON schema:").count(), 9);
     assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
     assert!(description.contains("\"generation\""));
+    assert!(description.contains("\"updates\""));
     assert!(description.contains("\"minimum\":1"));
     assert!(description.contains("\"output_schema\""));
     assert!(description.contains("\"enum\":[\"acp.kit\"]"));
@@ -145,6 +146,68 @@ return if review.output.approved {
     assert_eq!(
         result.result.output,
         ToolOutput::structured(json!({"reason": "mock approved"}))
+    );
+}
+
+#[tokio::test]
+async fn subagent_exposes_bounded_rich_updates_without_changing_text_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "rich".into(),
+        kit::AcpHarnessProfile {
+            command: "python3".into(),
+            args: vec![fixture],
+        },
+    )]))
+    .unwrap();
+    let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.rich".into()).unwrap();
+
+    let outcome = execute_compose(
+        &runtime,
+        r#"child = subagent({ harness: "acp.rich", prompt: "MOCK_RICH_OUTPUT" })
+return { output: child.output, updates: child.updates }"#,
+    )
+    .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("rich compose failed: {outcome:?}");
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::structured(json!({
+            "output": "rich done",
+            "updates": {
+                "items": [
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {
+                            "type": "image",
+                            "data": "aGVsbG8=",
+                            "mimeType": "image/png"
+                        }
+                    },
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "Inspect files"
+                    },
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-1",
+                        "status": "completed"
+                    },
+                    {
+                        "sessionUpdate": "plan",
+                        "entries": [
+                            {"content": "Inspect", "priority": "high", "status": "completed"}
+                        ]
+                    }
+                ],
+                "truncated": false
+            }
+        }))
     );
 }
 
