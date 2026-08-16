@@ -31,7 +31,9 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     for expected in [
         "`shell`: Run a shell command",
         "`edit`: Apply exact, git-style text hunks",
-        "`subagent`: Run a fresh local coding agent",
+        "`subagent`: Start a parent-owned Kit subprocess over ACP",
+        "`prompt`: Re-prompt the same completed ACP subagent session",
+        "`fork`: Clone a completed subagent transcript",
         "`a2a`: Send a text task",
         "`tool_search`: Search configured MCP server names",
         "`auth`: Start OAuth for a configured remote MCP server",
@@ -39,8 +41,11 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     ] {
         assert!(description.contains(expected), "missing {expected:?}");
     }
-    assert_eq!(description.matches("Input JSON schema:").count(), 7);
-    assert_eq!(description.matches("Output JSON schema:").count(), 7);
+    assert_eq!(description.matches("Input JSON schema:").count(), 9);
+    assert_eq!(description.matches("Output JSON schema:").count(), 9);
+    assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
+    assert!(description.contains("\"generation\""));
+    assert!(description.contains("\"minimum\":1"));
     assert!(description.contains("\"exit_code\""));
     assert!(description.contains("\"enum\":[\"delete\"]"));
     assert!(!description.contains("\"const\""));

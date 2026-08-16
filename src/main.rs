@@ -149,6 +149,12 @@ enum Command {
         /// Override a stale session lock.
         #[arg(long, requires = "resume")]
         force: bool,
+        /// Inherited nested-agent depth (used by parent-owned Kit children).
+        #[arg(long, default_value_t = 0, hide = true)]
+        subagent_depth: usize,
+        /// Disable the A2A listener (used by parent-owned Kit children).
+        #[arg(long, hide = true)]
+        no_a2a: bool,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
@@ -204,6 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             resume,
             force,
+            subagent_depth,
+            no_a2a,
         } => {
             let root = config.root(root);
             let model = config.model(model);
@@ -217,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?,
                 None => kit::Runtime::new(root, model)?,
             };
+            let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let runtime = kit::Runtime::with_mcp_config(
                 runtime,
                 mcp.config_path(&config),
@@ -224,9 +233,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 credential_storage,
             )
             .await?;
-            let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
-            let bound = kit::protocols::a2a::start(runtime.clone(), address).await?;
-            eprintln!("A2A listening on {bound}");
+            // Depth is checked as defense in depth in case an internal caller
+            // forgets the hidden --no-a2a child-process flag.
+            if !no_a2a && runtime.base_depth() == 0 {
+                let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
+                let bound = kit::protocols::a2a::start(runtime.clone(), address).await?;
+                eprintln!("A2A listening on {bound}");
+            }
             kit::protocols::acp::serve(runtime).await?;
         }
         Command::Prompt {

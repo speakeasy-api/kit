@@ -22,8 +22,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    acp_child::ChildConfig,
     provider::{OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, SubscriptionConfig},
-    tools::{A2aTool, AuthTool, EditTool, McpTool, Observed, ShellTool, SubagentTool, ToolSearch},
+    tools::{
+        A2aTool, AuthTool, EditTool, ForkTool, McpTool, Observed, PromptTool, ShellTool,
+        SubagentTool, Subagents, ToolSearch,
+    },
 };
 
 #[cfg(test)]
@@ -41,7 +45,10 @@ pub struct SessionRequest {
 pub struct Runtime {
     root: PathBuf,
     adapter: OpenAiSubscriptionAdapter,
+    model: String,
     max_subagent_depth: usize,
+    base_depth: usize,
+    subagents: Subagents,
     session: Option<SessionRequest>,
     mcp: crate::tools::mcp::McpRuntime,
 }
@@ -58,11 +65,25 @@ impl Runtime {
                 root.display()
             ));
         }
-        let adapter = OpenAiSubscriptionAdapter::new(SubscriptionConfig::new(model.into())?)?;
+        let model = model.into();
+        let adapter = OpenAiSubscriptionAdapter::new(SubscriptionConfig::new(model.clone())?)?;
+        let max_subagent_depth = 2;
+        let subagents = Subagents::new(
+            ChildConfig {
+                root: root.clone(),
+                model: model.clone(),
+                mcp_config: None,
+                credential_storage: Default::default(),
+            },
+            max_subagent_depth,
+        );
         Ok(Arc::new(Self {
             root,
             adapter,
-            max_subagent_depth: 2,
+            model,
+            max_subagent_depth,
+            base_depth: 0,
+            subagents,
             session: None,
             mcp: crate::tools::mcp::empty(),
         }))
@@ -77,6 +98,20 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(Self::new(root, model)?)
             .map_err(|_| "could not configure runtime session".to_string())?;
         runtime.session = Some(session);
+        Ok(Arc::new(runtime))
+    }
+
+    /// Sets the inherited nesting depth for an ACP subprocess.
+    pub fn with_depth(runtime: Arc<Self>, depth: usize) -> Result<Arc<Self>, String> {
+        if depth > runtime.max_subagent_depth {
+            return Err(format!(
+                "subagent depth {depth} exceeds limit {}",
+                runtime.max_subagent_depth
+            ));
+        }
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
+        runtime.base_depth = depth;
         Ok(Arc::new(runtime))
     }
 
@@ -95,10 +130,20 @@ impl Runtime {
             return Ok(runtime);
         };
         let mcp =
-            crate::tools::mcp::connect(path, interactive_oauth_enabled, credential_storage).await?;
+            crate::tools::mcp::connect(path, interactive_oauth_enabled, credential_storage.clone())
+                .await?;
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
         runtime.mcp = mcp;
+        runtime.subagents = Subagents::new(
+            ChildConfig {
+                root: runtime.root.clone(),
+                model: runtime.model.clone(),
+                mcp_config: Some(path.to_path_buf()),
+                credential_storage,
+            },
+            runtime.max_subagent_depth,
+        );
         Ok(Arc::new(runtime))
     }
 
@@ -106,11 +151,21 @@ impl Runtime {
         self.max_subagent_depth
     }
 
+    /// Returns the depth inherited by this runtime process.
+    pub const fn base_depth(&self) -> usize {
+        self.base_depth
+    }
+
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
         let children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())))
-            .with(Observed::new(SubagentTool::new(Arc::clone(self), depth)))
+            .with(Observed::new(SubagentTool::new(
+                self.subagents.clone(),
+                depth,
+            )))
+            .with(Observed::new(PromptTool::new(self.subagents.clone())))
+            .with(Observed::new(ForkTool::new(self.subagents.clone(), depth)))
             .with(Observed::new(A2aTool::new()))
             .with(Observed::new(ToolSearch::new(self.mcp.clone())))
             .with(Observed::new(AuthTool::new(self.mcp.clone())))
@@ -248,9 +303,12 @@ impl Runtime {
                 force: false,
             });
         let initial = if request.resume {
-            vec![Item::text(ItemKind::System, self.system_prompt(0))]
+            vec![Item::text(
+                ItemKind::System,
+                self.system_prompt(self.base_depth),
+            )]
         } else {
-            self.initial_transcript(0)
+            self.initial_transcript(self.base_depth)
                 .await
                 .map_err(AcpRuntimeError::Loop)?
         };
@@ -270,7 +328,7 @@ impl Runtime {
         .map_err(AcpRuntimeError::Loop)?;
         Agent::builder()
             .model(self.adapter.clone())
-            .add_tool_source(self.compose(0))
+            .add_tool_source(self.compose(self.base_depth))
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
             .transcript_observer(opened.observer)
@@ -291,7 +349,7 @@ impl Runtime {
 
     fn system_prompt(&self, depth: usize) -> String {
         format!(
-            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, and a2a tools, plus the MCP meta-tools tool_search, auth, and tool. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, prompt, fork, and a2a tools, plus the MCP meta-tools tool_search, auth, and tool. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
             self.max_subagent_depth

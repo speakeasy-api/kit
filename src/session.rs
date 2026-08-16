@@ -78,6 +78,17 @@ pub fn load(root: &Path, session_id: &str) -> Result<Vec<Item>, String> {
     Ok(items)
 }
 
+/// Copies a completed transcript into a new durable session.
+///
+/// The source remains owned by its ACP child; callers serialize this operation
+/// with prompts so the read is a stable, completed-turn snapshot.
+pub fn clone_completed(root: &Path, source: &str, destination: &str) -> Result<(), String> {
+    let transcript = load(root, source)?;
+    let opened = open(root, destination, false, false, transcript)?;
+    drop(opened);
+    Ok(())
+}
+
 /// Removes an abandoned lock file, but never one held by a live process.
 ///
 /// This is the last-resort cleanup path for a hosting client whose server had

@@ -10,4 +10,4 @@ pub use edit::EditTool;
 pub use mcp::{AuthTool, CredentialStorage, McpTool, ToolSearch};
 pub use observed::Observed;
 pub use shell::ShellTool;
-pub use subagent::SubagentTool;
+pub use subagent::{ForkTool, PromptTool, SubagentTool, Subagents};

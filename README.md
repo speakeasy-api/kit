@@ -8,7 +8,7 @@ It exposes:
 - A2A v1 JSON-RPC for agent collaboration
 - a Ratatui ACP client
 - one model-visible tool: `compose`, backed by released Runlet
-- hidden compose children for shell commands, hunk edits, local subagents, A2A calls, and MCP discovery/authentication
+- hidden compose children for shell commands, hunk edits, reusable ACP-backed Kit subagents, A2A calls, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
 - ChatGPT Pro through an existing Codex login
 
@@ -113,7 +113,34 @@ in the long-lived `tui` and `serve` commands, not the one-shot `prompt` command.
 Static `bearerToken` and custom `headers` remain available for non-interactive
 HTTP servers.
 
-OAuth credentials are memory-only by default. Persistence is explicit:
+## Reusable subagents
+
+Nested agents are parent-owned `kit serve` subprocesses driven over ACP. They
+are ordinary Runlet values rather than background tasks:
+
+```text
+first = subagent({ prompt: "Inspect the parser" })
+second = prompt({ subagent: first, prompt: "Now propose the smallest fix" })
+branch = fork({ subagent: second, prompt: "Try the alternative design" })
+return { main: second.output, alternative: branch.output }
+```
+
+Each call returns `{ id, output, generation }`. `prompt` advances the same
+session; `fork` copies a completed transcript into a new durable session and
+starts a new ACP child. A stale generation is rejected, which makes concurrent
+reuse explicit in the Runlet dataflow. The pinned Runlet/AgentKit bridge exposes
+one JSON argument per hidden tool, so `prompt` and `fork` use the small object
+form above instead of two positional arguments. Children inherit root, model,
+MCP configuration, credential storage, cancellation, and nesting depth. They
+remain reusable only for the lifetime of the parent Kit process; the durable
+transcripts remain on disk afterward. A max-token stop returns the partial output
+as a successful, reusable completed turn; cancellation, refusal, protocol errors,
+and other uncertain stops retire the child instead. Nested children do not start
+A2A listeners.
+
+OAuth credentials are memory-only by default. Because that store is process-local,
+nested Kit subprocesses cannot inherit credentials already entered into the parent;
+use keychain or file storage when nested agents need authenticated MCP access. Persistence is explicit:
 
 ```sh
 # macOS login Keychain
@@ -159,7 +186,7 @@ same protocol any editor would.
 
 While a `compose` call runs, the right-hand pane draws its runtime graph: the
 Runlet program parsed into its call, loop, branch, and boundary structure, with
-each nested shell, edit, subagent, A2A, and MCP meta-tool dispatch shown live under the node
+each nested shell, edit, subagent, prompt, fork, A2A, and MCP meta-tool dispatch shown live under the node
 that most likely issued it, including concurrent fan-out and failures. Child
 call lifecycle is exact; when the same tool appears in several places, node
 attribution is a stable heuristic. Nested-call

@@ -366,7 +366,7 @@ mod tests {
     fn preserves_a_leading_margin_when_the_line_wraps() {
         let line = Line::from(vec![Span::raw("  "), Span::raw("alpha beta gamma")]);
         assert_eq!(
-            text(&wrap(&[line.clone()], 10)),
+            text(&wrap(std::slice::from_ref(&line), 10)),
             ["  alpha", "  beta", "  gamma"]
         );
 

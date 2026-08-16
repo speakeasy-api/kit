@@ -42,7 +42,6 @@ use ratatui::DefaultTerminal;
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::Command,
     sync::{mpsc, oneshot},
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -89,15 +88,14 @@ pub async fn run(
     let persisted_session_id = resume
         .map(str::to_string)
         .unwrap_or_else(crate::session::new_id);
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg("serve")
-        .arg("--root")
-        .arg(root)
-        .arg("--model")
-        .arg(model)
-        .arg("--session-id")
-        .arg(&persisted_session_id);
+    let mut command = crate::acp_child::serve_command(
+        root,
+        model,
+        &persisted_session_id,
+        resume.is_some(),
+        0,
+        false,
+    )?;
     if let Some(address) = a2a {
         command.arg("--a2a").arg(address);
     }
@@ -109,9 +107,6 @@ pub async fn run(
         .arg(credential_storage.cli_name());
     if let Some(directory) = credential_storage.directory() {
         command.arg("--mcp-credential-dir").arg(directory);
-    }
-    if resume.is_some() {
-        command.arg("--resume");
     }
     if force {
         command.arg("--force");
