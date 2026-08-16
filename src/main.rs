@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs, io,
     path::{Path, PathBuf},
 };
@@ -79,6 +80,15 @@ struct Config {
     mcp_config: Option<PathBuf>,
     mcp_credential_store: Option<CredentialStoreKind>,
     mcp_credential_dir: Option<PathBuf>,
+    #[serde(default)]
+    acp: BTreeMap<String, kit::AcpHarnessProfile>,
+    subagent: Option<SubagentConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubagentConfig {
+    harness: String,
 }
 
 impl Config {
@@ -123,6 +133,19 @@ impl Config {
     fn a2a(&self, value: Option<String>) -> Option<String> {
         value.or_else(|| self.a2a.clone())
     }
+
+    fn harnesses(&self) -> Result<(kit::AcpHarnesses, String), String> {
+        let harnesses = kit::AcpHarnesses::new(self.acp.clone())?;
+        let selected = self
+            .subagent
+            .as_ref()
+            .map(|value| value.harness.clone())
+            .unwrap_or_else(|| kit::BUILTIN_HARNESS.into());
+        if !harnesses.contains(&selected) {
+            return Err(format!("unknown subagent ACP harness {selected:?}"));
+        }
+        Ok((harnesses, selected))
+    }
 }
 
 #[derive(Subcommand)]
@@ -149,12 +172,23 @@ enum Command {
         /// Override a stale session lock.
         #[arg(long, requires = "resume")]
         force: bool,
-        /// Inherited nested-agent depth (used by parent-owned Kit children).
+    },
+    /// Serve only the Agent Client Protocol on stdio.
+    Acp {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[command(flatten)]
+        mcp: McpArgs,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, requires = "session_id")]
+        resume: bool,
+        #[arg(long, requires = "resume")]
+        force: bool,
         #[arg(long, default_value_t = 0, hide = true)]
         subagent_depth: usize,
-        /// Disable the A2A listener (used by parent-owned Kit children).
-        #[arg(long, hide = true)]
-        no_a2a: bool,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
@@ -210,8 +244,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             resume,
             force,
-            subagent_depth,
-            no_a2a,
         } => {
             let root = config.root(root);
             let model = config.model(model);
@@ -225,7 +257,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?,
                 None => kit::Runtime::new(root, model)?,
             };
-            let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
+            let (harnesses, default_harness) = config.harnesses()?;
+            let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
                 runtime,
                 mcp.config_path(&config),
@@ -233,13 +266,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 credential_storage,
             )
             .await?;
-            // Depth is checked as defense in depth in case an internal caller
-            // forgets the hidden --no-a2a child-process flag.
-            if !no_a2a && runtime.base_depth() == 0 {
-                let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
-                let bound = kit::protocols::a2a::start(runtime.clone(), address).await?;
-                eprintln!("A2A listening on {bound}");
-            }
+            let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
+            let bound = kit::protocols::a2a::start(runtime.clone(), address).await?;
+            eprintln!("A2A listening on {bound}");
+            kit::protocols::acp::serve(runtime).await?;
+        }
+        Command::Acp {
+            root,
+            model,
+            mcp,
+            session_id,
+            resume,
+            force,
+            subagent_depth,
+        } => {
+            let root = config.root(root);
+            let model = config.model(model);
+            let credential_storage = mcp.storage(&config)?;
+            let runtime = match session_id {
+                Some(id) => kit::Runtime::with_session(
+                    root,
+                    model,
+                    kit::runtime::SessionRequest { id, resume, force },
+                )?,
+                None => kit::Runtime::new(root, model)?,
+            };
+            let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
+            let (harnesses, default_harness) = config.harnesses()?;
+            let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
+            let runtime = kit::Runtime::with_mcp_config(
+                runtime,
+                mcp.config_path(&config),
+                true,
+                credential_storage,
+            )
+            .await?;
             kit::protocols::acp::serve(runtime).await?;
         }
         Command::Prompt {
@@ -263,6 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     force,
                 },
             )?;
+            let (harnesses, default_harness) = config.harnesses()?;
+            let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
                 runtime,
                 mcp.config_path(&config),
@@ -282,6 +345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
         } => {
+            // The TUI child reloads this config, but validate profile names and
+            // the selected reference before starting that subprocess.
+            let _ = config.harnesses()?;
             let root = config.root(root);
             let model = config.model(model);
             let a2a = config.a2a(a2a);
@@ -305,7 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{Config, CredentialStoreKind, McpArgs};
+    use clap::Parser as _;
+
+    use super::{Cli, Config, CredentialStoreKind, McpArgs};
 
     #[test]
     fn config_file_supplies_defaults_and_cli_values_win() {
@@ -383,5 +451,66 @@ mcp_credential_dir = "/configured/credentials"
             mcp_credential_dir: Some("credentials".into()),
         };
         assert!(stray.storage(&Config::default()).is_err());
+    }
+
+    #[test]
+    fn named_acp_profiles_are_strict_and_selectable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[acp.alpha]
+command = "agent-a"
+args = ["--stdio"]
+[acp.beta]
+command = "agent-b"
+[subagent]
+harness = "acp.beta"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let (harnesses, selected) = config.harnesses().unwrap();
+        assert!(harnesses.contains("acp.alpha"));
+        assert!(harnesses.contains("acp.beta"));
+        assert!(!harnesses.contains("beta"));
+        assert!(harnesses.contains(kit::BUILTIN_HARNESS));
+        assert_eq!(selected, "acp.beta");
+
+        fs::write(&path, "[acp.bad]\ncommand = 'agent'\nenv = {}\n").unwrap();
+        assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn dedicated_acp_command_exists_and_serve_has_no_no_a2a_escape_hatch() {
+        assert!(Cli::try_parse_from(["kit", "acp", "--root", "."]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
+    }
+
+    #[test]
+    fn acp_kit_is_the_kit_profile_with_or_without_explicit_launch_argv() {
+        let config = Config::default();
+        let (_, selected) = config.harnesses().unwrap();
+        assert_eq!(selected, kit::BUILTIN_HARNESS);
+
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "kit".into(),
+            kit::AcpHarnessProfile {
+                command: "other".into(),
+                args: Vec::new(),
+            },
+        );
+        let harnesses = kit::AcpHarnesses::new(profiles).unwrap();
+        assert!(harnesses.is_kit(kit::BUILTIN_HARNESS));
+
+        let configured: Config = toml::from_str(
+            "[acp.kit]\ncommand = 'kit'\nargs = ['acp']\n[subagent]\nharness = 'acp.kit'\n",
+        )
+        .unwrap();
+        let (harnesses, selected) = configured.harnesses().unwrap();
+        assert_eq!(selected, "acp.kit");
+        assert!(harnesses.is_kit(&selected));
     }
 }

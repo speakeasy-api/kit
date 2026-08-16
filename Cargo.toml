@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -9,7 +9,7 @@ publish = false
 a2a-protocol-client = "=0.8.0"
 a2a-protocol-server = { version = "=0.8.0", default-features = false }
 a2a-protocol-types = "=0.8.0"
-agent-client-protocol = "=2.0.0"
+agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork"] }
 agentkit-acp = "=0.10.6"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"

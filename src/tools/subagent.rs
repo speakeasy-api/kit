@@ -29,6 +29,8 @@ pub struct Subagents {
 
 struct State {
     generation: u64,
+    harness: String,
+    kit: bool,
     child: ChildSession,
     _permit: OwnedSemaphorePermit,
 }
@@ -50,19 +52,36 @@ impl Subagents {
         }
     }
 
+    pub(crate) fn child_config(&self) -> ChildConfig {
+        self.config.clone()
+    }
+
+    fn harness_references(&self) -> Vec<String> {
+        self.config.harnesses.references()
+    }
+
     async fn create(
         &self,
         prompt: String,
+        harness: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
     ) -> Result<SubagentValue, ChildError> {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
         let id = session::new_id();
+        let harness = harness.unwrap_or_else(|| self.config.default_harness.clone());
+        if !self.config.harnesses.contains(&harness) {
+            return Err(ChildError::Failed(format!(
+                "unknown ACP harness {harness:?}"
+            )));
+        }
+        let kit = self.config.harnesses.is_kit(&harness);
+        let persisted = kit.then(|| (id.clone(), false));
         let child = ChildSession::start(
             self.config.clone(),
-            id.clone(),
-            false,
+            harness.clone(),
+            persisted,
             depth + 1,
             cancellation.clone(),
         )
@@ -72,6 +91,8 @@ impl Subagents {
             id.clone(),
             State {
                 generation: 1,
+                harness,
+                kit,
                 child,
                 _permit: permit,
             },
@@ -127,15 +148,38 @@ impl Subagents {
     ) -> Result<SubagentValue, ChildError> {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
-        let id = self.clone_for_fork(&prior, &cancellation).await?;
-        let child = ChildSession::start(
-            self.config.clone(),
-            id.clone(),
-            true,
-            depth + 1,
-            cancellation.clone(),
-        )
-        .await?;
+        let source_state = self.lookup(&prior)?;
+        let source = tokio::select! {
+            source = source_state.lock() => source,
+            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+        };
+        self.check_generation(&prior, source.generation)?;
+        let id = session::new_id();
+        let harness = source.harness.clone();
+        let kit = source.kit;
+        let child = if source.child.supports_native_fork() {
+            let child = source.child.fork(&cancellation).await?;
+            drop(source);
+            child
+        } else if kit {
+            session::clone_completed(&self.config.root, &prior.id, &id)
+                .map_err(ChildError::Failed)?;
+            // The clone is the stable snapshot boundary. Do not keep the source
+            // registry lock across child startup or the branch prompt.
+            drop(source);
+            ChildSession::start(
+                self.config.clone(),
+                harness.clone(),
+                Some((id.clone(), true)),
+                depth + 1,
+                cancellation.clone(),
+            )
+            .await?
+        } else {
+            return Err(ChildError::Failed(format!(
+                "ACP harness {harness:?} does not advertise session/fork; transcript fallback is only available for Kit"
+            )));
+        };
         let output = child.prompt(prompt, cancellation).await?;
         let generation = prior
             .generation
@@ -145,6 +189,8 @@ impl Subagents {
             id.clone(),
             State {
                 generation,
+                harness,
+                kit,
                 child,
                 _permit: permit,
             },
@@ -156,6 +202,7 @@ impl Subagents {
         })
     }
 
+    #[cfg(test)]
     async fn clone_for_fork(
         &self,
         prior: &SubagentValue,
@@ -266,7 +313,8 @@ fn continuation_schema() -> serde_json::Value {
 
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned Kit subprocess over ACP, prompt it, and return its reusable session value.", json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        let harnesses = manager.harness_references();
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -285,15 +333,18 @@ impl PromptTool {
 }
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Clone a completed subagent transcript into a new ACP-backed Kit child, prompt it, and return the new session value.", continuation_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, prompt it, and return the new session value.", continuation_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     prompt: String,
+    harness: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Continuation {
     subagent: SubagentValue,
     prompt: String,
@@ -336,7 +387,12 @@ impl Tool for SubagentTool {
         result(
             request,
             self.manager
-                .create(input.prompt, self.depth, cancellation(context))
+                .create(
+                    input.prompt,
+                    input.harness,
+                    self.depth,
+                    cancellation(context),
+                )
                 .await,
         )
     }
@@ -406,11 +462,15 @@ mod tests {
                 model: "test".into(),
                 mcp_config: None,
                 credential_storage: Default::default(),
+                harnesses: Default::default(),
+                default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
             },
             2,
         );
         let state = Arc::new(AsyncMutex::new(State {
             generation: 1,
+            harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            kit: true,
             child: ChildSession::disconnected_for_test(),
             _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
         }));

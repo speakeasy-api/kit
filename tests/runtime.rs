@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,9 +32,9 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     for expected in [
         "`shell`: Run a shell command",
         "`edit`: Apply exact, git-style text hunks",
-        "`subagent`: Start a parent-owned Kit subprocess over ACP",
+        "`subagent`: Start a parent-owned configured ACP harness",
         "`prompt`: Re-prompt the same completed ACP subagent session",
-        "`fork`: Clone a completed subagent transcript",
+        "`fork`: Fork a completed ACP subagent session",
         "`a2a`: Send a text task",
         "`tool_search`: Search configured MCP server names",
         "`auth`: Start OAuth for a configured remote MCP server",
@@ -46,12 +47,31 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
     assert!(description.contains("\"generation\""));
     assert!(description.contains("\"minimum\":1"));
+    assert!(description.contains("\"enum\":[\"acp.kit\"]"));
     assert!(description.contains("\"exit_code\""));
     assert!(description.contains("\"enum\":[\"delete\"]"));
     assert!(!description.contains("\"const\""));
 
     assert!(visible.get(&ToolName::new("shell")).is_some());
     assert!(visible.get(&ToolName::new("edit")).is_some());
+}
+
+#[test]
+fn compose_advertises_only_configured_acp_harnesses() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "review".into(),
+        kit::AcpHarnessProfile {
+            command: "review-agent".into(),
+            args: vec!["acp".into()],
+        },
+    )]))
+    .unwrap();
+    let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.kit".into()).unwrap();
+    let description = &runtime.compose(0).specs()[0].description;
+    assert!(description.contains("\"enum\":[\"acp.kit\",\"acp.review\"]"));
+    assert!(!description.contains("acp.unknown"));
 }
 
 #[tokio::test]

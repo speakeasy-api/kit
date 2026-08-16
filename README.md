@@ -47,16 +47,18 @@ cargo run -- prompt --root /path/to/project "Reply with a short project summary"
 The command prints the model response followed by `session_id: ...` and exits.
 Pass that id to `prompt --resume <session-id>` or `tui --resume <session-id>`.
 
-Run the headless ACP/A2A server directly:
+Run the combined headless ACP/A2A server, or the dedicated stdio-only ACP server:
 
 ```sh
 cargo run -- serve --root /path/to/project
+cargo run -- acp --root /path/to/project
 ```
 
-`serve` reserves stdout for ACP. Diagnostics go to stderr. Kit chooses an
-available loopback port for A2A and reports it on stderr; pass `--a2a
-127.0.0.1:7331` to request a specific address. A2A discovery is available
-from the HTTP server's Agent Card endpoint.
+Both commands reserve stdout for ACP and send diagnostics to stderr. `serve`
+also chooses an available loopback port for A2A and reports it on stderr; pass
+`--a2a 127.0.0.1:7331` to request a specific address. `acp` never starts an
+HTTP listener. A2A discovery is available from the combined server's Agent Card
+endpoint.
 
 Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
 that order. Credential login and refresh remain Codex's job.
@@ -75,11 +77,37 @@ a2a = "127.0.0.1:7331"
 mcp_config = "/path/to/mcp.json"
 mcp_credential_store = "file" # memory, keychain, or file
 mcp_credential_dir = "/path/to/private/credentials"
+
+[acp.claude]
+command = "claude-agent-acp"
+args = []
+
+[acp.review]
+command = "review-agent"
+args = ["acp"]
+
+# Override only the Kit executable/base argv; Kit appends its runtime flags.
+[acp.kit]
+command = "kit"
+args = ["acp"]
+
+[subagent]
+harness = "acp.claude"
 ```
 
 `root`, `model`, and the MCP settings apply to every command. `a2a` applies to
-`serve` and `tui`. Missing config files are ignored; unreadable or invalid files
-produce an error rather than silently discarding configured values.
+`serve` and `tui`. ACP profiles are trusted, strict `command`/`args` argv
+configurations: Kit does not invoke a shell and always sets the child cwd to the
+runtime root. Multiple names may be configured. `[subagent].harness` selects the
+default; references must use the fully qualified `acp.<name>` form. When
+omitted, `acp.kit` runs the current executable with `acp` as its base argv. An
+explicit `[acp.kit]` overrides that executable/base argv. In both cases Kit then
+appends root, model, persistent session, resume, MCP, credential, and inherited
+depth flags, and the profile remains eligible for isolated Kit transcript fork
+fallback. Other profiles remain literal generic ACP argv. Configured child
+processes inherit Kit's environment unchanged in this release.
+Missing config files are ignored; unreadable or invalid files and unknown selected
+harness references produce an error rather than being silently discarded.
 
 ## MCP
 
@@ -115,28 +143,36 @@ HTTP servers.
 
 ## Reusable subagents
 
-Nested agents are parent-owned `kit serve` subprocesses driven over ACP. They
-are ordinary Runlet values rather than background tasks:
+Nested agents are parent-owned named ACP subprocesses. They are ordinary Runlet
+values rather than background tasks:
 
 ```text
-first = subagent({ prompt: "Inspect the parser" })
+first = subagent({ prompt: "Inspect the parser", harness: "acp.claude" })
 second = prompt({ subagent: first, prompt: "Now propose the smallest fix" })
 branch = fork({ subagent: second, prompt: "Try the alternative design" })
 return { main: second.output, alternative: branch.output }
 ```
 
-Each call returns `{ id, output, generation }`. `prompt` advances the same
-session; `fork` copies a completed transcript into a new durable session and
-starts a new ACP child. A stale generation is rejected, which makes concurrent
-reuse explicit in the Runlet dataflow. The pinned Runlet/AgentKit bridge exposes
+Each call returns `{ id, output, generation }`. The optional `harness` is used
+only by `subagent`; `prompt` and `fork` infer the original profile from the
+parent-owned session. Parent IDs remain distinct from ACP child session IDs.
+`fork` uses native `session/fork` only when initialization advertised that
+capability; sibling fork sessions can prompt concurrently while each individual
+session remains serialized. Otherwise the `acp.kit` profile creates an isolated durable transcript/process
+fallback, whether its executable/base argv is implicit or configured; other profiles return an explicit
+unsupported error. A stale generation is rejected, which makes concurrent reuse
+explicit in the Runlet dataflow. The pinned Runlet/AgentKit bridge exposes
 one JSON argument per hidden tool, so `prompt` and `fork` use the small object
-form above instead of two positional arguments. Children inherit root, model,
-MCP configuration, credential storage, cancellation, and nesting depth. They
-remain reusable only for the lifetime of the parent Kit process; the durable
-transcripts remain on disk afterward. A max-token stop returns the partial output
-as a successful, reusable completed turn; cancellation, refusal, protocol errors,
-and other uncertain stops retire the child instead. Nested children do not start
-A2A listeners.
+form above instead of two positional arguments. Built-in Kit children inherit
+root, model, MCP configuration, credential storage, cancellation, and nesting
+depth; generic profiles receive standard ACP initialization/new-session/prompt
+traffic and run with the root as cwd. Sessions remain reusable only for the
+lifetime of the parent Kit process. Built-in Kit transcripts remain on disk
+afterward; persistence for generic harnesses is agent-defined. A max-token stop
+returns the partial output as a successful, reusable completed turn; cancellation,
+refusal, protocol errors, and other uncertain stops retire the child instead. Permission requests from a
+headless child are conservatively cancelled so they cannot hang. Nested built-in
+children use `kit acp` and never start A2A listeners.
 
 OAuth credentials are memory-only by default. Because that store is process-local,
 nested Kit subprocesses cannot inherit credentials already entered into the parent;

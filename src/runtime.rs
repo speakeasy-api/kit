@@ -22,7 +22,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    acp_child::ChildConfig,
+    acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
     provider::{OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, SubscriptionConfig},
     tools::{
         A2aTool, AuthTool, EditTool, ForkTool, McpTool, Observed, PromptTool, ShellTool,
@@ -74,6 +74,8 @@ impl Runtime {
                 model: model.clone(),
                 mcp_config: None,
                 credential_storage: Default::default(),
+                harnesses: AcpHarnesses::default(),
+                default_harness: BUILTIN_HARNESS.into(),
             },
             max_subagent_depth,
         );
@@ -119,6 +121,32 @@ impl Runtime {
         &self.root
     }
 
+    /// Configures the trusted named ACP harnesses used by nested agents.
+    pub fn with_acp_harnesses(
+        runtime: Arc<Self>,
+        harnesses: AcpHarnesses,
+        default_harness: String,
+    ) -> Result<Arc<Self>, String> {
+        if !harnesses.contains(&default_harness) {
+            return Err(format!("unknown subagent ACP harness {default_harness:?}"));
+        }
+        let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
+            "could not configure ACP harnesses after runtime was shared".to_string()
+        })?;
+        runtime.subagents = Subagents::new(
+            ChildConfig {
+                root: runtime.root.clone(),
+                model: runtime.model.clone(),
+                mcp_config: None,
+                credential_storage: Default::default(),
+                harnesses,
+                default_harness,
+            },
+            runtime.max_subagent_depth,
+        );
+        Ok(Arc::new(runtime))
+    }
+
     /// Connects the explicitly configured MCP servers before the runtime is served.
     pub async fn with_mcp_config(
         runtime: Arc<Self>,
@@ -135,12 +163,15 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
         runtime.mcp = mcp;
+        let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
                 mcp_config: Some(path.to_path_buf()),
                 credential_storage,
+                harnesses: previous.harnesses,
+                default_harness: previous.default_harness,
             },
             runtime.max_subagent_depth,
         );

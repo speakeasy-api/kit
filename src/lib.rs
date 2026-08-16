@@ -9,4 +9,5 @@ pub mod tools;
 pub mod transcript;
 pub mod tui;
 
+pub use acp_child::{AcpHarnessProfile, AcpHarnesses, BUILTIN_HARNESS};
 pub use runtime::Runtime;

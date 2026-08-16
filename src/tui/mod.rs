@@ -88,14 +88,8 @@ pub async fn run(
     let persisted_session_id = resume
         .map(str::to_string)
         .unwrap_or_else(crate::session::new_id);
-    let mut command = crate::acp_child::serve_command(
-        root,
-        model,
-        &persisted_session_id,
-        resume.is_some(),
-        0,
-        false,
-    )?;
+    let mut command =
+        crate::acp_child::serve_command(root, model, &persisted_session_id, resume.is_some())?;
     if let Some(address) = a2a {
         command.arg("--a2a").arg(address);
     }
