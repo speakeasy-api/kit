@@ -5,7 +5,10 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -102,6 +105,20 @@ impl AcpHarnesses {
         (!name.is_empty() && !name.contains('.')).then_some(name)
     }
 
+    fn launch_context(&self, reference: &str) -> LaunchContext {
+        let source = if reference == BUILTIN_HARNESS && !self.0.contains_key("kit") {
+            "built-in current executable"
+        } else if reference == BUILTIN_HARNESS {
+            "configured acp.kit profile"
+        } else {
+            "configured ACP profile"
+        };
+        LaunchContext {
+            harness: reference.into(),
+            source,
+        }
+    }
+
     fn permission_policy(&self, reference: &str) -> Result<AcpPermissionPolicy, String> {
         let name = self.profile_name(reference).ok_or_else(|| {
             format!("ACP harness references must use acp.<name>, got {reference:?}")
@@ -186,6 +203,21 @@ impl AcpHarnesses {
             command.arg("--mcp-credential-dir").arg(path);
         }
         Ok(command)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LaunchContext {
+    harness: String,
+    source: &'static str,
+}
+
+impl LaunchContext {
+    fn error(&self, phase: &str, error: impl std::fmt::Display) -> String {
+        format!(
+            "ACP harness {phase}: {error} (harness={:?}, source={}, cwd=runtime root)",
+            self.harness, self.source
+        )
     }
 }
 
@@ -320,17 +352,37 @@ impl ChildSession {
         depth: usize,
         cancellation: TurnCancellation,
     ) -> Result<Self, ChildError> {
+        let context = config.harnesses.launch_context(&harness);
+        let actor_context = context.clone();
         let (tx, mut rx) = mpsc::channel(1);
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let actor_tx = tx.clone();
-        let mut task =
-            tokio::spawn(
-                async move { run(config, harness, persisted, depth, &mut rx, ready_tx).await },
-            );
+        let mut task = tokio::spawn(async move {
+            run(
+                config,
+                harness,
+                persisted,
+                depth,
+                &mut rx,
+                ready_tx,
+                actor_context,
+            )
+            .await
+        });
         let result = tokio::select! {
-            ready = &mut ready_rx => ready.map_err(|_| ChildError::Failed("nested agent exited during startup".into())),
+            ready = &mut ready_rx => match ready {
+                Ok(ready) => Ok(ready),
+                Err(_) => return Err(ChildError::Failed(match task.await {
+                    Ok(Ok(())) => "nested agent exited during startup".into(),
+                    Ok(Err(error)) => error,
+                    Err(error) => format!("nested agent startup actor failed: {error}"),
+                })),
+            },
             () = cancellation.cancelled() => Err(ChildError::Cancelled),
-            () = tokio::time::sleep(HANDSHAKE) => Err(ChildError::Failed(format!("nested agent did not answer the ACP handshake within {} seconds", HANDSHAKE.as_secs()))),
+            () = tokio::time::sleep(HANDSHAKE) => Err(ChildError::Failed(context.error(
+                "handshake timeout",
+                format!("no response within {} seconds", HANDSHAKE.as_secs()),
+            ))),
             joined = &mut task => return Err(ChildError::Failed(match joined { Ok(Ok(())) => "nested agent exited during startup".into(), Ok(Err(e)) => e, Err(e) => format!("nested agent startup actor failed: {e}") })),
         };
         match result {
@@ -430,6 +482,7 @@ async fn run(
     depth: usize,
     rx: &mut mpsc::Receiver<Request>,
     ready: oneshot::Sender<Ready>,
+    context: LaunchContext,
 ) -> Result<(), String> {
     let permission_policy = config.harnesses.permission_policy(&harness)?;
     let mut command = config.harnesses.spawn(
@@ -446,7 +499,7 @@ async fn run(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("could not start ACP harness {harness:?}: {e}"))?;
+        .map_err(|error| context.error("spawn failure", error))?;
     let stdin = child
         .stdin
         .take()
@@ -484,6 +537,8 @@ async fn run(
     ));
     let notification_routes = Arc::clone(&routes);
     let root = config.root.clone();
+    let startup_complete = Arc::new(AtomicBool::new(false));
+    let ready_flag = Arc::clone(&startup_complete);
     let connected = agent_client_protocol::Client
         .builder()
         .on_receive_notification(
@@ -520,6 +575,7 @@ async fn run(
             let sessions = Arc::new(Mutex::new(vec![session.session_id.clone()]));
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = JoinSet::new();
+            ready_flag.store(true, Ordering::Release);
             let _ = ready.send(Ready { session_id: session.session_id, capabilities });
             loop {
                 let request = tokio::select! {
@@ -619,7 +675,18 @@ async fn run(
         })
         .await;
     let _ = child.kill().await;
-    connected.map_err(|e| e.to_string())
+    connected.map_err(|error| {
+        if startup_complete.load(Ordering::Acquire) {
+            error.to_string()
+        } else {
+            // ACP error messages and data are child-controlled and may contain
+            // secrets. Keep launch diagnostics to a fixed local reason.
+            context.error(
+                "protocol handshake failure",
+                "the child did not complete the ACP handshake",
+            )
+        }
+    })
 }
 
 fn permission_outcome(
@@ -729,6 +796,91 @@ mod tests {
         })));
         assert!(oversized.updates.is_empty());
         assert!(oversized.updates_truncated);
+    }
+
+    #[test]
+    fn launch_context_omits_command_arguments_and_root_path() {
+        let profiles = BTreeMap::from([(
+            "safe-name".into(),
+            AcpHarnessProfile {
+                command: "secret-command-name".into(),
+                args: vec!["secret-argument".into()],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        )]);
+        let harnesses = AcpHarnesses::new(profiles).unwrap();
+        let context = harnesses.launch_context("acp.safe-name");
+        let error = context.error("handshake timeout", "no response within 30 seconds");
+        assert!(error.contains("harness=\"acp.safe-name\""));
+        assert!(error.contains("source=configured ACP profile"));
+        assert!(error.contains("cwd=runtime root"));
+        assert!(!error.contains("secret-command-name"));
+        assert!(!error.contains("secret-argument"));
+        assert!(!error.contains("/private/runtime/root"));
+
+        assert_eq!(
+            AcpHarnesses::default()
+                .launch_context(BUILTIN_HARNESS)
+                .source,
+            "built-in current executable"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_handshake_failure_includes_only_safe_launch_context() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = BTreeMap::from([(
+            "broken".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![
+                    "-c".into(),
+                    concat!(
+                        "import json,sys; ",
+                        "request=json.loads(sys.stdin.readline()); ",
+                        "response={'jsonrpc':'2.0','id':request['id'],'error':",
+                        "{'code':-32000,'message':'remote-secret-message',",
+                        "'data':{'token':'remote-secret-data'}}}; ",
+                        "print(json.dumps(response), flush=True)"
+                    )
+                    .into(),
+                ],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        )]);
+        let config = ChildConfig {
+            root: root.path().into(),
+            model: "unused".into(),
+            mcp_config: None,
+            credential_storage: Default::default(),
+            harnesses: AcpHarnesses::new(profiles).unwrap(),
+            default_harness: "acp.broken".into(),
+        };
+        let result = ChildSession::start(
+            config,
+            "acp.broken".into(),
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("harness unexpectedly completed its handshake"),
+        };
+        assert!(error.contains("protocol handshake failure"), "{error}");
+        assert!(error.contains("harness=\"acp.broken\""), "{error}");
+        assert!(error.contains("source=configured ACP profile"), "{error}");
+        assert!(error.contains("cwd=runtime root"), "{error}");
+        assert!(
+            error.contains("the child did not complete the ACP handshake"),
+            "{error}"
+        );
+        assert!(!error.contains("python3"), "{error}");
+        assert!(!error.contains("remote-secret-message"), "{error}");
+        assert!(!error.contains("remote-secret-data"), "{error}");
+        assert!(!error.contains("token"), "{error}");
+        assert!(!error.contains(root.path().to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -851,7 +1003,15 @@ mod tests {
 
         for start in starts {
             let result = start.await.expect("child startup must not panic");
-            assert!(matches!(result, Err(ChildError::Failed(_))));
+            let Err(ChildError::Failed(error)) = result else {
+                panic!("expected a spawn failure");
+            };
+            assert!(error.contains("spawn failure"), "{error}");
+            assert!(error.contains("harness=\"acp.broken\""), "{error}");
+            assert!(error.contains("source=configured ACP profile"), "{error}");
+            assert!(error.contains("cwd=runtime root"), "{error}");
+            assert!(!error.contains("kit-test-acp-executable-that-does-not-exist"));
+            assert!(!error.contains(root.path().to_string_lossy().as_ref()));
         }
     }
 
