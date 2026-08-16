@@ -200,13 +200,14 @@ return if review.output.approved {
 
 Kit appends the schema to the child prompt, requires the response to be a bare
 JSON value, parses it, and validates it before returning the turn. Invalid schemas
-are rejected before dispatch; malformed or non-matching responses fail the tool
-call. A failed structured continuation retires that session because its transcript
-may already have advanced. The schema may be changed on a later `prompt` or
-`fork`. In the current pinned Runlet version, `output` is dynamically typed: its
+are rejected before dispatch. If a completed response is malformed or does not
+match the schema, its raw text is returned as `output` and the session generation
+still advances, allowing a repair prompt in the same session. The schema may be
+changed on a later `prompt` or `fork`. In the current pinned Runlet version,
+`output` is dynamically typed: its
 fields can be used in control flow as above, but Runlet does not statically check
-field names or types against the per-call schema. Runtime validation remains
-authoritative.
+field names or types against the per-call schema. Runtime validation determines
+whether `output` is the parsed value or the raw-text fallback.
 
 The optional `harness` is used only by `subagent`; `prompt` and `fork` infer the original profile from the
 parent-owned session. Parent IDs remain distinct from ACP child session IDs.

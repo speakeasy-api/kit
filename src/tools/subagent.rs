@@ -62,19 +62,9 @@ impl OutputContract {
         )
     }
 
-    fn parse(&self, output: String) -> Result<Value, ChildError> {
-        let value: Value = serde_json::from_str(output.trim()).map_err(|error| {
-            ChildError::Failed(format!(
-                "subagent returned invalid JSON for output_schema: {error}"
-            ))
-        })?;
-        if let Err(error) = self.validator.validate(&value) {
-            return Err(ChildError::Failed(format!(
-                "subagent output did not match output_schema at {}: {error}",
-                error.instance_path()
-            )));
-        }
-        Ok(value)
+    fn parse(&self, output: &str) -> Option<Value> {
+        let value = serde_json::from_str(output.trim()).ok()?;
+        self.validator.is_valid(&value).then_some(value)
     }
 }
 
@@ -85,13 +75,12 @@ fn structured_prompt(prompt: String, contract: Option<&OutputContract>) -> Strin
     }
 }
 
-fn structured_output(
-    output: String,
-    contract: Option<&OutputContract>,
-) -> Result<Value, ChildError> {
+fn structured_output(output: String, contract: Option<&OutputContract>) -> Value {
     match contract {
-        Some(contract) => contract.parse(output),
-        None => Ok(Value::String(output)),
+        Some(contract) => contract
+            .parse(&output)
+            .unwrap_or_else(|| Value::String(output)),
+        None => Value::String(output),
     }
 }
 
@@ -143,7 +132,7 @@ impl Subagents {
         let output = child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await?;
-        let output = structured_output(output, contract)?;
+        let output = structured_output(output, contract);
         self.insert(
             id.clone(),
             State {
@@ -185,22 +174,14 @@ impl Subagents {
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
         {
-            Ok(output) => match structured_output(output, contract) {
-                Ok(output) => {
-                    locked.generation = generation;
-                    Ok(SubagentValue {
-                        id: prior.id,
-                        output,
-                        generation,
-                    })
-                }
-                Err(error) => {
-                    locked.retired = true;
-                    drop(locked);
-                    self.remove_if_same(&prior.id, &state);
-                    Err(error)
-                }
-            },
+            Ok(output) => {
+                locked.generation = generation;
+                Ok(SubagentValue {
+                    id: prior.id,
+                    output: structured_output(output, contract),
+                    generation,
+                })
+            }
             Err(error) => {
                 // Any dispatched unsuccessful turn may have changed the durable
                 // transcript. Retire it rather than accepting the old generation.
@@ -258,7 +239,7 @@ impl Subagents {
         let output = child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await?;
-        let output = structured_output(output, contract)?;
+        let output = structured_output(output, contract);
         let generation = prior
             .generation
             .checked_add(1)
@@ -560,63 +541,18 @@ impl Tool for ForkTool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use agentkit_core::{Item, ItemKind};
 
     use super::*;
 
-    #[test]
-    fn structured_output_is_parsed_and_validated() {
-        let contract = OutputContract::new(json!({
-            "type": "object",
-            "properties": {"approved": {"type": "boolean"}},
-            "required": ["approved"],
-            "additionalProperties": false
-        }))
-        .unwrap();
-
-        assert_eq!(
-            contract.parse(r#"{"approved":true}"#.into()).unwrap(),
-            json!({"approved": true})
-        );
-        assert!(contract.parse(r#"{"approved":"yes"}"#.into()).is_err());
-        assert!(contract.parse("```json\n{}\n```".into()).is_err());
-    }
-
-    #[test]
-    fn invalid_output_schema_is_rejected() {
-        assert!(OutputContract::new(json!({"type": 42})).is_err());
-    }
-
-    #[test]
-    fn explicit_null_output_schema_is_rejected() {
-        assert!(
-            serde_json::from_value::<Input>(json!({"prompt": "test", "output_schema": null}))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn boolean_output_schema_is_supported() {
-        let contract = OutputContract::new(Value::Bool(true)).unwrap();
-        assert_eq!(contract.parse("[1, 2]".into()).unwrap(), json!([1, 2]));
-    }
-
-    #[test]
-    fn unstructured_output_remains_text() {
-        assert_eq!(
-            structured_output("plain text".into(), None).unwrap(),
-            Value::String("plain text".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_releases_source_before_child_work() {
-        let directory = tempfile::tempdir().unwrap();
-        let transcript = vec![Item::text(ItemKind::System, "system")];
-        let opened = session::open(directory.path(), "source", false, false, transcript).unwrap();
+    fn manager_with_disconnected_session(
+        root: &Path,
+    ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
         let manager = Subagents::new(
             ChildConfig {
-                root: directory.path().to_path_buf(),
+                root: root.to_path_buf(),
                 model: "test".into(),
                 mcp_config: None,
                 credential_storage: Default::default(),
@@ -643,6 +579,70 @@ mod tests {
             output: Value::String("done".into()),
             generation: 1,
         };
+        (manager, state, prior)
+    }
+
+    #[test]
+    fn structured_output_is_parsed_and_validated() {
+        let contract = OutputContract::new(json!({
+            "type": "object",
+            "properties": {"approved": {"type": "boolean"}},
+            "required": ["approved"],
+            "additionalProperties": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            contract.parse(r#"{"approved":true}"#).unwrap(),
+            json!({"approved": true})
+        );
+        assert!(contract.parse(r#"{"approved":"yes"}"#).is_none());
+        assert!(contract.parse("```json\n{}\n```").is_none());
+    }
+
+    #[test]
+    fn invalid_output_schema_is_rejected() {
+        assert!(OutputContract::new(json!({"type": 42})).is_err());
+    }
+
+    #[test]
+    fn explicit_null_output_schema_is_rejected() {
+        assert!(
+            serde_json::from_value::<Input>(json!({"prompt": "test", "output_schema": null}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn boolean_output_schema_is_supported() {
+        let contract = OutputContract::new(Value::Bool(true)).unwrap();
+        assert_eq!(contract.parse("[1, 2]").unwrap(), json!([1, 2]));
+    }
+
+    #[test]
+    fn unstructured_output_remains_text() {
+        assert_eq!(
+            structured_output("plain text".into(), None),
+            Value::String("plain text".into())
+        );
+    }
+
+    #[test]
+    fn invalid_structured_output_remains_recoverable_as_text() {
+        let contract = OutputContract::new(json!({"type": "object"})).unwrap();
+
+        assert_eq!(
+            structured_output("not JSON".into(), Some(&contract)),
+            Value::String("not JSON".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_snapshot_releases_source_before_child_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = vec![Item::text(ItemKind::System, "system")];
+        let opened = session::open(directory.path(), "source", false, false, transcript).unwrap();
+        let (manager, state, prior) = manager_with_disconnected_session(directory.path());
 
         let branch = manager
             .clone_for_fork(&prior, &TurnCancellation::default())
@@ -655,5 +655,24 @@ mod tests {
         );
         assert!(session::load(directory.path(), &branch).is_ok());
         drop(opened);
+    }
+
+    #[tokio::test]
+    async fn child_prompt_failure_retires_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _, prior) = manager_with_disconnected_session(directory.path());
+
+        assert!(
+            manager
+                .prompt(
+                    prior.clone(),
+                    "continue".into(),
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(manager.lookup(&prior).is_err());
     }
 }

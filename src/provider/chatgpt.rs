@@ -430,7 +430,7 @@ struct PartAccumulator {
 }
 
 impl OpenAiSubscriptionTurn {
-    #[cfg(any())]
+    #[cfg(test)]
     fn new(
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         requested_model: String,
@@ -627,6 +627,7 @@ impl OpenAiSubscriptionTurn {
             | "response.metadata" => {
                 self.require_created()?;
             }
+            "keepalive" => {}
             _ => return Err(protocol(&format!("unknown Responses SSE event: {kind}"))),
         }
         Ok(())
@@ -1663,9 +1664,38 @@ fn protocol(message: &str) -> LoopError {
 
 #[cfg(test)]
 mod usage_tests {
+    use futures_util::stream;
     use serde_json::json;
 
-    use super::{parse_context_windows, parse_usage};
+    use super::{OpenAiSubscriptionTurn, parse_context_windows, parse_usage};
+
+    #[test]
+    fn responses_keepalive_is_ignored_without_weakening_unknown_events() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+
+        turn.consume_frame(
+            br#"event: keepalive
+data: {"type":"keepalive","sequence_number":0}
+"#,
+        )
+        .unwrap();
+        turn.consume_frame(
+            br#"event: response.created
+data: {"type":"response.created","sequence_number":1,"response":{}}
+"#,
+        )
+        .unwrap();
+
+        assert!(turn.created);
+        assert!(
+            turn.consume_frame(
+                br#"event: future.event
+data: {"type":"future.event","sequence_number":2}
+"#,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_reported_model_context_windows() {
