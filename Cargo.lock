@@ -225,9 +225,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8ed6ed211635a2a9c8dc425f809ae0fed5532fd3ff76afd682b2ec29b113bfd"
+checksum = "03836ac7156e03bb54cc0361b02474f8172cd80a4e1cd242dd45843ceab1f5ca"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
@@ -2823,9 +2823,9 @@ dependencies = [
 
 [[package]]
 name = "runlet"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "948fe7980341b596c1bcca6cd2c553c35d27fa3455842f3bcda6acee06e46b4b"
+checksum = "2ce954be656e6063bd38192fa8b8d16af93f6164097f9b2e31b9e88db88625c4"
 dependencies = [
  "hex",
  "regex",

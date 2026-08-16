@@ -52,6 +52,9 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     assert!(description.contains("\"exit_code\""));
     assert!(description.contains("\"enum\":[\"delete\"]"));
     assert!(!description.contains("\"const\""));
+    assert!(description.contains("Independent calls, including effectful calls, run CONCURRENTLY"));
+    assert!(description.contains("Source order alone never sequences independent calls"));
+    assert!(description.contains("checkpoint = after shaped {"));
 
     assert!(visible.get(&ToolName::new("shell")).is_some());
     assert!(visible.get(&ToolName::new("edit")).is_some());
@@ -169,6 +172,50 @@ return { code: result.exit_code, ok: result.success, stdout: result.stdout, stde
             "stdout": "hidden-ok",
             "stderr": ""
         })
+    );
+}
+
+#[tokio::test]
+async fn independent_top_level_tool_calls_run_concurrently() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"first = shell({ command: "touch first; for i in $(seq 1 100); do test -e second && exit 0; sleep 0.02; done; exit 1" })
+second = shell({ command: "touch second; for i in $(seq 1 100); do test -e first && exit 0; sleep 0.02; done; exit 1" })
+return { first: first.success, second: second.success }"#,
+    )
+    .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("concurrent compose failed: {outcome:?}");
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::structured(json!({"first": true, "second": true}))
+    );
+}
+
+#[tokio::test]
+async fn after_orders_calls_without_data_flow() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"prerequisite = shell({ command: "sleep 0.1; touch ready" })
+dependent = after prerequisite {
+  return shell({ command: "test -e ready" })
+}
+return { prerequisite: prerequisite.success, dependent: dependent.success }"#,
+    )
+    .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("ordered compose failed: {outcome:?}");
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::structured(json!({"prerequisite": true, "dependent": true}))
     );
 }
 

@@ -141,6 +141,26 @@ in the long-lived `tui` and `serve` commands, not the one-shot `prompt` command.
 Static `bearerToken` and custom `headers` remain available for non-interactive
 HTTP servers.
 
+## Compose ordering
+
+Runlet schedules independent top-level calls concurrently, including effectful
+tool and `subagent` calls. Source order does not sequence them. An ordinary data
+reference creates a dependency, but when later work must wait for a prerequisite
+whose value it does not consume, express that control ordering explicitly with
+`after prerequisite { return tool(...) }`:
+
+```text
+prepared = shell({ command: "./prepare-workspace" })
+published = after prepared {
+  return shell({ command: "./publish-workspace" })
+}
+return published
+```
+
+Calls lexically created inside the `after` block start only after the prerequisite
+succeeds. Without a data dependency or `after` edge, adjacent tool or subagent
+calls may overlap.
+
 ## Reusable subagents
 
 Nested agents are parent-owned named ACP subprocesses. They are ordinary Runlet
