@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
