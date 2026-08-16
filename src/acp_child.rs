@@ -11,9 +11,10 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ContentBlock, ForkSessionRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason,
+    CancelNotification, CloseSessionRequest, ContentBlock, ForkSessionRequest, PermissionOption,
+    PermissionOptionKind, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, StopReason,
 };
 use agentkit_core::TurnCancellation;
 use serde::Deserialize;
@@ -34,6 +35,17 @@ const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
 pub const BUILTIN_HARNESS: &str = "acp.kit";
 
+/// How a headless nested ACP client handles permission requests.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpPermissionPolicy {
+    /// Select a rejection option when offered, otherwise cancel the request.
+    #[default]
+    Deny,
+    /// Always cancel the request without selecting an option.
+    Cancel,
+}
+
 /// A trusted argv-only ACP harness profile from `~/.kit/config.toml`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +53,8 @@ pub struct AcpHarnessProfile {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub permissions: AcpPermissionPolicy,
 }
 
 /// Validated named ACP harness profiles. `acp.kit` is always Kit; its launch base may be overridden.
@@ -86,6 +100,23 @@ impl AcpHarnesses {
     fn profile_name<'a>(&self, reference: &'a str) -> Option<&'a str> {
         let name = reference.strip_prefix("acp.")?;
         (!name.is_empty() && !name.contains('.')).then_some(name)
+    }
+
+    fn permission_policy(&self, reference: &str) -> Result<AcpPermissionPolicy, String> {
+        let name = self.profile_name(reference).ok_or_else(|| {
+            format!("ACP harness references must use acp.<name>, got {reference:?}")
+        })?;
+        if name == "kit" {
+            Ok(self
+                .0
+                .get(name)
+                .map_or(AcpPermissionPolicy::Deny, |profile| profile.permissions))
+        } else {
+            self.0
+                .get(name)
+                .map(|profile| profile.permissions)
+                .ok_or_else(|| format!("unknown ACP harness {reference:?}"))
+        }
     }
 
     fn spawn(
@@ -400,6 +431,7 @@ async fn run(
     rx: &mut mpsc::Receiver<Request>,
     ready: oneshot::Sender<Ready>,
 ) -> Result<(), String> {
+    let permission_policy = config.harnesses.permission_policy(&harness)?;
     let mut command = config.harnesses.spawn(
         &harness,
         &config,
@@ -472,8 +504,11 @@ async fn run(
         // A headless nested client cannot ask a human. Always answer rather than
         // leaving an agent waiting forever, and choose the conservative outcome.
         .on_receive_request(
-            async move |_request: RequestPermissionRequest, responder, _cx| {
-                responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled))
+            async move |request: RequestPermissionRequest, responder, _cx| {
+                responder.respond(RequestPermissionResponse::new(permission_outcome(
+                    permission_policy,
+                    &request.options,
+                )))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -587,6 +622,27 @@ async fn run(
     connected.map_err(|e| e.to_string())
 }
 
+fn permission_outcome(
+    policy: AcpPermissionPolicy,
+    options: &[PermissionOption],
+) -> RequestPermissionOutcome {
+    if policy == AcpPermissionPolicy::Deny
+        && let Some(option) = options
+            .iter()
+            .find(|option| option.kind == PermissionOptionKind::RejectAlways)
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|option| option.kind == PermissionOptionKind::RejectOnce)
+            })
+    {
+        return RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+            option.option_id.clone(),
+        ));
+    }
+    RequestPermissionOutcome::Cancelled
+}
+
 fn prompt_outcome(
     response: PromptResponse,
     output: ChildOutput,
@@ -684,6 +740,7 @@ mod tests {
             AcpHarnessProfile {
                 command: "agent binary".into(),
                 args: vec!["two words".into(), "; not a shell".into()],
+                permissions: AcpPermissionPolicy::Deny,
             },
         );
         let harnesses = AcpHarnesses::new(profiles).unwrap();
@@ -713,6 +770,7 @@ mod tests {
             AcpHarnessProfile {
                 command: "kit".into(),
                 args: vec!["acp".into()],
+                permissions: AcpPermissionPolicy::Deny,
             },
         );
         let harnesses = AcpHarnesses::new(profiles).unwrap();
@@ -764,6 +822,7 @@ mod tests {
             AcpHarnessProfile {
                 command: "kit-test-acp-executable-that-does-not-exist".into(),
                 args: Vec::new(),
+                permissions: AcpPermissionPolicy::Deny,
             },
         );
         let config = ChildConfig {
@@ -808,6 +867,7 @@ mod tests {
                     "{}/fixtures/mock-acp.py",
                     env!("CARGO_MANIFEST_DIR")
                 )],
+                permissions: AcpPermissionPolicy::Deny,
             },
         );
         let harnesses = AcpHarnesses::new(profiles).unwrap();
@@ -863,6 +923,36 @@ mod tests {
             started.elapsed() >= Duration::from_millis(750),
             "one logical session was not serialized: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn deny_policy_selects_only_rejection_options() {
+        let options = [
+            PermissionOption::new("allow-once", "Allow once", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowAlways),
+            PermissionOption::new("once", "Reject once", PermissionOptionKind::RejectOnce),
+            PermissionOption::new(
+                "always",
+                "Reject always",
+                PermissionOptionKind::RejectAlways,
+            ),
+        ];
+        assert_eq!(
+            permission_outcome(AcpPermissionPolicy::Deny, &options),
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("always"))
+        );
+        assert_eq!(
+            permission_outcome(AcpPermissionPolicy::Cancel, &options),
+            RequestPermissionOutcome::Cancelled
+        );
+        assert_eq!(
+            permission_outcome(AcpPermissionPolicy::Deny, &options[..2]),
+            RequestPermissionOutcome::Cancelled
+        );
+        assert_eq!(
+            permission_outcome(AcpPermissionPolicy::Deny, &options[..3]),
+            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("once"))
         );
     }
 }

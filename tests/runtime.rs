@@ -70,6 +70,7 @@ fn compose_advertises_only_configured_acp_harnesses() {
         kit::AcpHarnessProfile {
             command: "review-agent".into(),
             args: vec!["acp".into()],
+            permissions: kit::AcpPermissionPolicy::Deny,
         },
     )]))
     .unwrap();
@@ -111,6 +112,7 @@ async fn structured_subagent_output_can_drive_runlet_control_flow() {
         kit::AcpHarnessProfile {
             command: "python3".into(),
             args: vec![fixture],
+            permissions: kit::AcpPermissionPolicy::Deny,
         },
     )]))
     .unwrap();
@@ -159,6 +161,7 @@ async fn subagent_exposes_bounded_rich_updates_without_changing_text_output() {
         kit::AcpHarnessProfile {
             command: "python3".into(),
             args: vec![fixture],
+            permissions: Default::default(),
         },
     )]))
     .unwrap();

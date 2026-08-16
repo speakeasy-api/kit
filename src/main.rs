@@ -463,6 +463,7 @@ mcp_credential_dir = "/configured/credentials"
 [acp.alpha]
 command = "agent-a"
 args = ["--stdio"]
+permissions = "cancel"
 [acp.beta]
 command = "agent-b"
 [subagent]
@@ -477,8 +478,23 @@ harness = "acp.beta"
         assert!(!harnesses.contains("beta"));
         assert!(harnesses.contains(kit::BUILTIN_HARNESS));
         assert_eq!(selected, "acp.beta");
+        assert_eq!(
+            config.acp["alpha"].permissions,
+            kit::AcpPermissionPolicy::Cancel
+        );
+        assert_eq!(
+            config.acp["beta"].permissions,
+            kit::AcpPermissionPolicy::Deny
+        );
 
         fs::write(&path, "[acp.bad]\ncommand = 'agent'\nenv = {}\n").unwrap();
+        assert!(Config::load(&path).is_err());
+
+        fs::write(
+            &path,
+            "[acp.bad]\ncommand = 'agent'\npermissions = 'allow'\n",
+        )
+        .unwrap();
         assert!(Config::load(&path).is_err());
     }
 
@@ -500,6 +516,7 @@ harness = "acp.beta"
             kit::AcpHarnessProfile {
                 command: "other".into(),
                 args: Vec::new(),
+                permissions: kit::AcpPermissionPolicy::Deny,
             },
         );
         let harnesses = kit::AcpHarnesses::new(profiles).unwrap();

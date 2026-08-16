@@ -140,10 +140,10 @@ Install Node.js for the npm-backed profiles and install the
 [Cursor CLI](https://cursor.com/docs/cli/installation) for `cursor-agent`.
 Authenticate each agent before starting Kit (`claude auth login`, `codex login`,
 or `cursor-agent login` respectively); Kit does not initiate a generic agent's
-ACP authentication flow. A generic child's permission request is answered with
-`cancelled`, because the headless parent cannot ask a human. Configure any
-non-interactive approval policy in the agent itself, with the same care as for
-running that agent directly.
+ACP authentication flow. A generic child's permission request is handled by
+the profile's fail-closed `permissions` policy: `deny` by default, or `cancel`.
+Configure any additional non-interactive policy in the agent itself, with the
+same care as for running that agent directly.
 
 This compatibility snapshot records only the capabilities relevant to Kit,
 based on each listed release's `initialize` response as inspected on 2026-08-16.
@@ -160,6 +160,13 @@ Kit decides from the initialization response at runtime rather than from this
 table. If a generic agent does not advertise `session/fork`, ordinary `subagent`
 and `prompt` calls still work, but `fork` returns an explicit unsupported error.
 Only `acp.kit` has Kit's isolated transcript fallback.
+
+Nested ACP permission policy is configured only in these trusted local profiles.
+The default `permissions = "deny"` selects `reject_always`, or `reject_once` when
+that is the only rejection offered; if the child offers no rejection, Kit
+cancels the request. `permissions = "cancel"` always cancels. Kit never selects
+an allow option: ACP permission requests contain no trustworthy, machine-verifiable
+scope that could safely support unattended approval.
 
 ## MCP
 
