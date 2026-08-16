@@ -286,6 +286,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | Key | Action |
 | --- | --- |
 | `⏎` | send |
+| `/new` | start a fresh persisted session (`/new prompt` sends its first prompt) |
 | `⇧⏎`, `⌥⏎`, `^j` | newline |
 | `esc` | interrupt the running turn |
 | `^c` | interrupt, or quit when idle |
@@ -304,7 +305,10 @@ If the agent dies before the session opens — a taken A2A port, a missing root,
 no credentials — the client exits with that agent's own last diagnostic rather
 than waiting on a handshake that will never finish.
 
-Pasting multi-line text puts line breaks in the prompt instead of sending it.
+`/new` clears the visible transcript but leaves the prior persisted session
+intact and resumable. Slash commands are recognized only as exact leading
+tokens. Unknown slash commands are sent to the model unchanged. Pasting
+multi-line text puts line breaks in the prompt instead of sending it.
 The client asks the terminal to bracket pastes; where that is unavailable a
 paste arrives as a key burst, and a return inside such a burst is read as a
 line break rather than a send. Either way the whole paste is applied in one

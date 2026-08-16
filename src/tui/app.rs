@@ -17,6 +17,7 @@ use crossterm::event::{
 use crate::events::RuntimeEvent;
 
 use super::{
+    command::{Parsed, parse},
     editor::Editor,
     plan::{PlanNode, parse as parse_plan},
     wrap::LinkHit,
@@ -66,6 +67,7 @@ pub struct ContextUsage {
 pub enum Action {
     None,
     Submit(String),
+    New(Option<String>),
     Cancel,
     Quit,
 }
@@ -520,6 +522,7 @@ impl App {
 
     fn apply_runtime(&mut self, event: RuntimeEvent) {
         let event = match event {
+            RuntimeEvent::SessionStarted { .. } => return,
             RuntimeEvent::CompactionStarted { .. } => {
                 self.compacting = true;
                 return;
@@ -558,9 +561,9 @@ impl App {
                 millis,
                 ..
             } => call.finish_child(&child_call, ok, summary, millis),
-            RuntimeEvent::CompactionStarted { .. } | RuntimeEvent::CompactionFinished { .. } => {
-                unreachable!("handled above")
-            }
+            RuntimeEvent::SessionStarted { .. }
+            | RuntimeEvent::CompactionStarted { .. }
+            | RuntimeEvent::CompactionFinished { .. } => unreachable!("handled above"),
         }
     }
 
@@ -587,6 +590,22 @@ impl App {
         {
             *millis = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         }
+    }
+
+    /// Switches the visible client state to a fresh persisted session. Editor
+    /// history and diagnostics remain useful, while transcript-derived state
+    /// starts empty.
+    pub fn start_session(&mut self, session_id: String) {
+        self.session_id = Some(session_id);
+        self.blocks.clear();
+        self.phase = Phase::Idle;
+        self.turn_started = None;
+        self.compacting = false;
+        self.usage = None;
+        self.scroll = usize::MAX;
+        self.follow = true;
+        self.row_calls.clear();
+        self.row_links.clear();
     }
 
     pub fn push_user(&mut self, prompt: String) {
@@ -693,7 +712,11 @@ impl App {
                     self.toast("a turn is already running — esc interrupts it");
                     return Action::None;
                 }
-                return Action::Submit(self.editor.submit());
+                let input = self.editor.submit();
+                return match parse(&input) {
+                    Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
+                    Parsed::Prompt(prompt) => Action::Submit(prompt.to_string()),
+                };
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
             KeyCode::Char('j') if control => self.editor.insert_char('\n'),
@@ -996,6 +1019,54 @@ mod tests {
             panic!("expected the prompt to be sent");
         };
         assert_eq!(prompt, "first line");
+    }
+
+    #[test]
+    fn new_command_carries_an_optional_first_prompt() {
+        let mut app = app();
+        app.paste("/new begin fresh");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        let Action::New(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected a new session");
+        };
+        assert_eq!(prompt.as_deref(), Some("begin fresh"));
+    }
+
+    #[test]
+    fn unknown_slash_commands_are_submitted_unchanged() {
+        let mut app = app();
+        app.paste("/newer keep this");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected a model prompt");
+        };
+        assert_eq!(prompt, "/newer keep this");
+    }
+
+    #[test]
+    fn new_command_waits_for_the_active_turn_to_be_idle() {
+        let mut app = app();
+        app.push_user("working".into());
+        app.paste("/new");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "/new");
+    }
+
+    #[test]
+    fn switching_sessions_clears_only_transcript_derived_state() {
+        let mut app = app();
+        app.blocks.push(Block::User("old transcript".into()));
+        app.logs.push("diagnostic".into());
+        app.usage = Some(super::ContextUsage { used: 1, size: 2 });
+        app.start_session("fresh".into());
+        assert_eq!(app.session_id.as_deref(), Some("fresh"));
+        assert!(app.blocks.is_empty());
+        assert!(app.usage.is_none());
+        assert_eq!(app.logs, ["diagnostic"]);
     }
 
     #[test]

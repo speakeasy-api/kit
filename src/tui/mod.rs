@@ -7,6 +7,7 @@
 //! ([`crate::events`]) that feeds the live graph of a running Runlet program.
 
 mod app;
+mod command;
 mod editor;
 mod markdown;
 mod plan;
@@ -62,6 +63,8 @@ const MAX_OUTPUT_LINES: usize = 5_000;
 /// How long the agent gets to answer the ACP handshake before the client gives
 /// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
 const HANDSHAKE: Duration = Duration::from_secs(30);
+/// Maximum time to correlate a new ACP route with its persisted transcript.
+const SESSION_EVENT_WAIT: Duration = Duration::from_secs(5);
 /// Grace for the agent's last diagnostics to arrive once it has exited.
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
@@ -88,6 +91,7 @@ pub async fn run(
     let persisted_session_id = resume
         .map(str::to_string)
         .unwrap_or_else(crate::session::new_id);
+    let active_persisted_id = Arc::new(Mutex::new(persisted_session_id.clone()));
     let mut command =
         crate::acp_child::serve_command(root, model, &persisted_session_id, resume.is_some())?;
     if let Some(address) = a2a {
@@ -173,7 +177,7 @@ pub async fn run(
 
     let notifications = updates_tx.clone();
     let cleanup_root = root.clone();
-    let cleanup_session_id = persisted_session_id.clone();
+    let transition_session = Arc::clone(&active_persisted_id);
     let result = agent_client_protocol::Client
         .builder()
         .on_receive_notification(
@@ -216,7 +220,7 @@ pub async fn run(
                     ));
                 }
             };
-            let session_id = session.session_id.clone();
+            let mut session_id = session.session_id.clone();
             // The server has acquired the mutation lock during NewSession, so
             // this read is the exact stable snapshot it preloaded into the model.
             let restored = crate::session::load(&root, &persisted_session_id).map_err(|error| {
@@ -225,7 +229,7 @@ pub async fn run(
 
             let mut terminal =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
-            let mut app = App::new(root, model, a2a);
+            let mut app = App::new(root.clone(), model, a2a);
             app.restore_transcript(persisted_session_id, &restored);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
@@ -283,6 +287,73 @@ pub async fn run(
                                         }));
                                     }));
                                 }
+                                Action::New(first_prompt) => {
+                                    // Idle-only key handling guarantees there is no active
+                                    // turn to abandon. Await its completed task before closing
+                                    // the old ACP driver and its transcript lock.
+                                    if let Some(completed) = turn.take() {
+                                        let _ = completed.await;
+                                    }
+                                    connection
+                                        .send_request(CloseSessionRequest::new(session_id.clone()))
+                                        .block_task()
+                                        .await?;
+                                    let session = connection
+                                        .send_request(agentkit_acp::NewSessionRequest::new(root.clone()))
+                                        .block_task()
+                                        .await?;
+                                    session_id = session.session_id;
+                                    let expected_acp_session_id = session_id.to_string();
+                                    // Session events share one ordered stderr stream. Apply
+                                    // everything from the old session before clearing it, then
+                                    // wait only for the persisted id bound to this ACP route.
+                                    let persisted_id = tokio::select! {
+                                        result = wait_for_started_session(
+                                            &mut updates_rx,
+                                            &mut app,
+                                            &expected_acp_session_id,
+                                            SESSION_EVENT_WAIT,
+                                        ) => result.map_err(|error| {
+                                            let detail = match error {
+                                                SessionEventError::Closed =>
+                                                    "runtime event stream closed during /new".to_string(),
+                                                SessionEventError::TimedOut => format!(
+                                                    "runtime did not report the new persisted session within {} seconds",
+                                                    SESSION_EVENT_WAIT.as_secs(),
+                                                ),
+                                            };
+                                            agent_client_protocol::Error::into_internal_error(
+                                                std::io::Error::other(detail),
+                                            )
+                                        })?,
+                                        () = stop.requested() => return Ok(()),
+                                    };
+                                    if let Ok(mut active) = transition_session.lock() {
+                                        *active = persisted_id.clone();
+                                    }
+                                    app.start_session(persisted_id);
+                                    if let Some(prompt) = first_prompt {
+                                        app.push_user(prompt.clone());
+                                        let connection = connection.clone();
+                                        let session = session_id.clone();
+                                        let updates = updates_tx.clone();
+                                        turn = Some(tokio::spawn(async move {
+                                            let outcome = connection
+                                                .send_request(agentkit_acp::PromptRequest::new(
+                                                    session,
+                                                    vec![ContentBlock::Text(
+                                                        agentkit_acp::TextContent::new(prompt),
+                                                    )],
+                                                ))
+                                                .block_task()
+                                                .await;
+                                            let _ = updates.send(Update::TurnEnded(match outcome {
+                                                Ok(_) => None,
+                                                Err(error) => Some(error.to_string()),
+                                            }));
+                                        }));
+                                    }
+                                }
                                 Action::Cancel => {
                                     let _ = connection.send_notification(
                                         CancelNotification::new(session_id.clone()),
@@ -337,7 +408,9 @@ pub async fn run(
     let _ = watcher.await;
     // If the server failed before acknowledging CloseSession, reclaim only a
     // lock that is now provably stale; a live owner's OS lock is never stolen.
-    let _ = crate::session::remove_stale_lock(&cleanup_root, &cleanup_session_id);
+    if let Ok(active) = active_persisted_id.lock() {
+        let _ = crate::session::remove_stale_lock(&cleanup_root, &active);
+    }
 
     result?;
     Ok(())
@@ -506,6 +579,44 @@ fn leave(terminal: DefaultTerminal) {
     ratatui::restore();
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SessionEventError {
+    Closed,
+    TimedOut,
+}
+
+async fn wait_for_started_session(
+    updates: &mut mpsc::UnboundedReceiver<Update>,
+    app: &mut App,
+    expected_acp_session_id: &str,
+    wait: Duration,
+) -> Result<String, SessionEventError> {
+    tokio::time::timeout(wait, async {
+        loop {
+            let update = updates.recv().await.ok_or(SessionEventError::Closed)?;
+            if let Some(id) = started_session(&update, expected_acp_session_id) {
+                return Ok(id.to_string());
+            }
+            app.apply(update);
+        }
+    })
+    .await
+    .map_err(|_| SessionEventError::TimedOut)?
+}
+
+/// Returns the persisted id only when a session event belongs to the ACP
+/// route just returned by `session/new`.
+fn started_session<'a>(update: &'a Update, expected_acp_session_id: &str) -> Option<&'a str> {
+    match update {
+        Update::Runtime(events::RuntimeEvent::SessionStarted { acp_session_id, id })
+            if acp_session_id == expected_acp_session_id =>
+        {
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
 /// Maps one ACP session notification onto client updates.
 fn translate(notification: SessionNotification) -> Vec<Update> {
     match notification.update {
@@ -596,7 +707,64 @@ fn readable(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::readable;
+    use std::{path::PathBuf, time::Duration};
+
+    use super::{SessionEventError, readable, started_session, wait_for_started_session};
+    use crate::{
+        events::RuntimeEvent,
+        tui::app::{App, Update},
+    };
+
+    #[test]
+    fn correlates_persisted_sessions_with_the_new_acp_route() {
+        let update = Update::Runtime(RuntimeEvent::SessionStarted {
+            acp_session_id: "session-2".into(),
+            id: "persisted-2".into(),
+        });
+        assert_eq!(started_session(&update, "session-2"), Some("persisted-2"));
+        assert_eq!(started_session(&update, "session-1"), None);
+    }
+
+    #[tokio::test]
+    async fn new_session_wait_is_correlated_bounded_and_detects_stream_failure() {
+        let app = || App::new(PathBuf::from("/tmp"), "model".into(), "a2a".into());
+        let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Update::Runtime(RuntimeEvent::SessionStarted {
+            acp_session_id: "other".into(),
+            id: "wrong".into(),
+        }))
+        .unwrap();
+        tx.send(Update::Runtime(RuntimeEvent::SessionStarted {
+            acp_session_id: "expected".into(),
+            id: "right".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            wait_for_started_session(&mut updates, &mut app(), "expected", Duration::from_secs(1),)
+                .await,
+            Ok("right".into())
+        );
+
+        let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx);
+        assert_eq!(
+            wait_for_started_session(&mut updates, &mut app(), "expected", Duration::from_secs(1),)
+                .await,
+            Err(SessionEventError::Closed)
+        );
+
+        let (_tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            wait_for_started_session(
+                &mut updates,
+                &mut app(),
+                "expected",
+                Duration::from_millis(1),
+            )
+            .await,
+            Err(SessionEventError::TimedOut)
+        );
+    }
 
     #[test]
     fn unwraps_json_string_results_into_real_lines() {

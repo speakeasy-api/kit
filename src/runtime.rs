@@ -2,7 +2,7 @@ use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -42,6 +42,44 @@ pub struct SessionRequest {
     pub force: bool,
 }
 
+#[derive(Default)]
+struct SessionSelection {
+    configured: Option<SessionRequest>,
+    claimed: bool,
+}
+
+impl SessionSelection {
+    fn claim(&mut self) -> (SessionRequest, bool) {
+        if !self.claimed
+            && let Some(request) = self.configured.clone()
+        {
+            self.claimed = true;
+            return (request, true);
+        }
+        (
+            SessionRequest {
+                id: crate::session::new_id(),
+                resume: false,
+                force: false,
+            },
+            false,
+        )
+    }
+
+    fn finish(&mut self, configured: bool, succeeded: bool, opened_new: bool) {
+        if configured {
+            if succeeded {
+                self.configured.take();
+            } else if opened_new && let Some(request) = &mut self.configured {
+                // Opening already persisted the bootstrap transcript. A retry
+                // must resume it rather than trying to create the same file.
+                request.resume = true;
+            }
+            self.claimed = false;
+        }
+    }
+}
+
 pub struct Runtime {
     root: PathBuf,
     adapter: OpenAiSubscriptionAdapter,
@@ -49,7 +87,9 @@ pub struct Runtime {
     max_subagent_depth: usize,
     base_depth: usize,
     subagents: Subagents,
-    session: Option<SessionRequest>,
+    /// The explicitly selected session is consumed by the first ACP session.
+    /// Later ACP sessions receive their own persisted ids.
+    session: Mutex<SessionSelection>,
     mcp: crate::tools::mcp::McpRuntime,
 }
 
@@ -86,12 +126,13 @@ impl Runtime {
             max_subagent_depth,
             base_depth: 0,
             subagents,
-            session: None,
+            session: Mutex::new(SessionSelection::default()),
             mcp: crate::tools::mcp::empty(),
         }))
     }
 
-    /// Configures the single persistent ACP session served by this runtime.
+    /// Selects the persistent session used by the first ACP session. Later ACP
+    /// sessions receive fresh persisted ids.
     pub fn with_session(
         root: impl AsRef<Path>,
         model: impl Into<String>,
@@ -99,7 +140,11 @@ impl Runtime {
     ) -> Result<Arc<Self>, String> {
         let mut runtime = Arc::try_unwrap(Self::new(root, model)?)
             .map_err(|_| "could not configure runtime session".to_string())?;
-        runtime.session = Some(session);
+        runtime
+            .session
+            .get_mut()
+            .map_err(|_| "could not configure poisoned runtime session".to_string())?
+            .configured = Some(session);
         Ok(Arc::new(runtime))
     }
 
@@ -218,6 +263,9 @@ impl Runtime {
     pub async fn run_persistent(self: &Arc<Self>, prompt: String) -> Result<String, String> {
         let request = self
             .session
+            .lock()
+            .map_err(|_| "runtime session selection is poisoned".to_string())?
+            .configured
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
         let initial = if request.resume {
@@ -325,53 +373,66 @@ impl Runtime {
                 self.root.display()
             )));
         }
-        let request = self
+        let (request, configured) = self
             .session
-            .clone()
-            .unwrap_or_else(|| crate::runtime::SessionRequest {
-                id: crate::session::new_id(),
-                resume: false,
-                force: false,
-            });
-        let initial = if request.resume {
-            vec![Item::text(
-                ItemKind::System,
-                self.system_prompt(self.base_depth),
-            )]
-        } else {
-            self.initial_transcript(self.base_depth)
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
+            .claim();
+        let acp_session_id = context.acp_session_id.to_string();
+        let mut opened_new = false;
+        let result = async {
+            let initial = if request.resume {
+                vec![Item::text(
+                    ItemKind::System,
+                    self.system_prompt(self.base_depth),
+                )]
+            } else {
+                self.initial_transcript(self.base_depth)
+                    .await
+                    .map_err(AcpRuntimeError::Loop)?
+            };
+            let opened = crate::session::open(
+                &self.root,
+                &request.id,
+                request.resume,
+                request.force,
+                initial,
+            )
+            .map_err(AcpRuntimeError::Loop)?;
+            opened_new = !request.resume;
+            let compactor = crate::compaction::automatic(
+                self.adapter.clone(),
+                Some(opened.observer.clone()),
+                format!("compaction-{}", crate::session::new_id()),
+            )
+            .map_err(AcpRuntimeError::Loop)?;
+            Agent::builder()
+                .model(self.adapter.clone())
+                .add_tool_source(self.compose(self.base_depth))
+                .mutator(compactor)
+                .observer(context.integration.as_ref().clone())
+                .transcript_observer(opened.observer)
+                .transcript(opened.transcript)
+                .cancellation(context.cancellation)
+                .build()
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+                // ACP routes observer events by its own bound AgentKit id. The
+                // persisted id names storage; it must not replace that routing key.
+                .start(SessionConfig::new(context.agentkit_session_id).without_cache())
                 .await
-                .map_err(AcpRuntimeError::Loop)?
-        };
-        let opened = crate::session::open(
-            &self.root,
-            &request.id,
-            request.resume,
-            request.force,
-            initial,
-        )
-        .map_err(AcpRuntimeError::Loop)?;
-        let compactor = crate::compaction::automatic(
-            self.adapter.clone(),
-            Some(opened.observer.clone()),
-            format!("compaction-{}", crate::session::new_id()),
-        )
-        .map_err(AcpRuntimeError::Loop)?;
-        Agent::builder()
-            .model(self.adapter.clone())
-            .add_tool_source(self.compose(self.base_depth))
-            .mutator(compactor)
-            .observer(context.integration.as_ref().clone())
-            .transcript_observer(opened.observer)
-            .transcript(opened.transcript)
-            .cancellation(context.cancellation)
-            .build()
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
-            // ACP routes observer events by its own bound AgentKit id. The
-            // persisted id names storage; it must not replace that routing key.
-            .start(SessionConfig::new(context.agentkit_session_id).without_cache())
-            .await
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+        }
+        .await;
+        self.session
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
+            .finish(configured, result.is_ok(), opened_new);
+        let driver = result?;
+        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
+            acp_session_id,
+            id: request.id,
+        });
+        Ok(driver)
     }
 
     async fn initial_transcript(&self, depth: usize) -> Result<Vec<Item>, String> {

@@ -3,7 +3,33 @@ use agentkit_core::{ItemKind, Part};
 use super::load_initial_transcript;
 use agentkit_tools_core::ToolSource;
 
-use super::Runtime;
+use super::{Runtime, SessionRequest, SessionSelection};
+
+#[test]
+fn configured_session_is_consumed_only_after_successful_start() {
+    let request = SessionRequest {
+        id: "selected".into(),
+        resume: false,
+        force: false,
+    };
+    let mut selection = SessionSelection {
+        configured: Some(request),
+        claimed: false,
+    };
+
+    let (first, configured) = selection.claim();
+    assert_eq!(first.id, "selected");
+    assert!(configured);
+    selection.finish(configured, false, true);
+    let (retry, configured) = selection.claim();
+    assert_eq!(retry.id, "selected");
+    assert!(
+        retry.resume,
+        "a transcript opened before failure is resumed"
+    );
+    selection.finish(configured, true, false);
+    assert!(selection.configured.is_none());
+}
 
 #[tokio::test]
 async fn loads_all_agents_md_files_outermost_first() {

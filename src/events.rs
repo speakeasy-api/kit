@@ -1,5 +1,5 @@
 //! Side channel that carries nested tool activity from `kit serve` to the
-//! terminal client.
+//! terminal client, along with the id of each persisted ACP session it opens.
 //!
 //! ACP reports the model-visible `compose` call, but every interesting thing
 //! Kit does happens *inside* that call: the Runlet program dispatches shell,
@@ -29,13 +29,15 @@ pub const EVENT_MARKER: &str = "\u{1}kit-runtime\u{1}";
 /// Environment variable that turns emission on for a `serve` process.
 pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 
-/// One lifecycle step of a tool call nested inside a `compose` run.
+/// One runtime event sent privately to the terminal client.
 ///
 /// `call` is the compose child call id, shaped `<parent>:compose:<operation>`,
 /// so a client can attribute every child to the ACP tool call it belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    /// A persisted ACP session was opened by the child runtime.
+    SessionStarted { acp_session_id: String, id: String },
     /// A nested tool call started running.
     ChildStarted {
         call: String,
@@ -68,7 +70,9 @@ impl RuntimeEvent {
     pub fn parent_call(&self) -> Option<&str> {
         let call = match self {
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
-            Self::CompactionStarted { .. } | Self::CompactionFinished { .. } => return None,
+            Self::SessionStarted { .. }
+            | Self::CompactionStarted { .. }
+            | Self::CompactionFinished { .. } => return None,
         };
         call.rsplit_once(":compose:").map(|(parent, _)| parent)
     }

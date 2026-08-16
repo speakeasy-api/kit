@@ -13,7 +13,7 @@ use ratatui::{
 
 use super::{
     app::{App, Block, Child, Phase, ToolCall},
-    markdown,
+    command, markdown,
     plan::PlanKind,
     theme,
     wrap::{LinkedLine, wrap, wrap_linked_tagged},
@@ -635,10 +635,10 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lines: Vec<Line<'static>> = if app.editor.text().is_empty() {
         vec![Line::from(Span::styled("message kit…", theme::faint()))]
     } else {
-        rows.into_iter()
+        prompt_lines(rows, app.editor.text())
+            .into_iter()
             .skip(first)
             .take(height)
-            .map(|row| Line::from(Span::styled(row, theme::text())))
             .collect()
     };
     frame.render_widget(Paragraph::new(lines), field);
@@ -649,6 +649,24 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .min(field.width.saturating_sub(1)),
         field.y + u16::try_from(cursor_row - first).unwrap_or(0),
     ));
+}
+
+fn prompt_lines(rows: Vec<String>, input: &str) -> Vec<Line<'static>> {
+    let mut highlighted = command::known_token(input).map_or(0, |range| range.len());
+    rows.into_iter()
+        .map(|row| {
+            let prefix = highlighted.min(row.len());
+            highlighted -= prefix;
+            if prefix == 0 {
+                Line::from(Span::styled(row, theme::text()))
+            } else {
+                Line::from(vec![
+                    Span::styled(row[..prefix].to_string(), theme::accent()),
+                    Span::styled(row[prefix..].to_string(), theme::text()),
+                ])
+            }
+        })
+        .collect()
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -714,7 +732,7 @@ mod tests {
     use agentkit_acp::ToolKind;
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{MAX_PROMPT_ROWS, draw, graph_lines};
+    use super::{MAX_PROMPT_ROWS, draw, graph_lines, prompt_lines};
     use crate::{
         events::RuntimeEvent,
         tui::app::{App, Block, Update},
@@ -974,6 +992,35 @@ mod tests {
 
         assert!(frame.contains("0.5% 1k/272k"));
         assert!(!frame.contains("ctx "));
+    }
+
+    #[test]
+    fn highlights_only_the_known_new_token() {
+        let known = prompt_lines(vec!["/new prompt".into()], "/new prompt");
+        assert_eq!(known[0].spans[0].content, "/new");
+        assert_eq!(known[0].spans[0].style, crate::tui::theme::accent());
+        assert_eq!(known[0].spans[1].content, " prompt");
+
+        let unknown = prompt_lines(vec!["/newer prompt".into()], "/newer prompt");
+        assert_eq!(unknown[0].spans.len(), 1);
+        assert_eq!(unknown[0].spans[0].style, crate::tui::theme::text());
+    }
+
+    #[test]
+    fn keeps_new_highlighted_when_the_real_editor_wraps_the_token() {
+        let mut editor = crate::tui::editor::Editor::default();
+        editor.insert_str("/new prompt");
+        let (rows, _) = editor.wrapped(2);
+        let lines = prompt_lines(rows, editor.text());
+        let highlighted = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style == crate::tui::theme::accent())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(highlighted, "/new");
+        assert_eq!(lines[0].spans[0].content, "/n");
+        assert_eq!(lines[1].spans[0].content, "ew");
     }
 
     #[test]
