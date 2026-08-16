@@ -564,6 +564,8 @@ impl Tool for ForkTool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use agentkit_core::{Item, ItemKind};
 
     use super::*;
@@ -582,8 +584,8 @@ mod tests {
             contract.parse(r#"{"approved":true}"#.into()).unwrap(),
             json!({"approved": true})
         );
-        assert!(contract.parse(r#"{"approved":"yes"}"#.into()).is_err());
-        assert!(contract.parse("```json\n{}\n```".into()).is_err());
+        assert!(contract.parse(r#"{"approved":"yes"}"#).is_none());
+        assert!(contract.parse("```json\n{}\n```").is_none());
     }
 
     #[test]
@@ -602,13 +604,13 @@ mod tests {
     #[test]
     fn boolean_output_schema_is_supported() {
         let contract = OutputContract::new(Value::Bool(true)).unwrap();
-        assert_eq!(contract.parse("[1, 2]".into()).unwrap(), json!([1, 2]));
+        assert_eq!(contract.parse("[1, 2]").unwrap(), json!([1, 2]));
     }
 
     #[test]
     fn unstructured_output_remains_text() {
         assert_eq!(
-            structured_output("plain text".into(), None).unwrap(),
+            structured_output("plain text".into(), None),
             Value::String("plain text".into())
         );
     }
@@ -675,5 +677,108 @@ mod tests {
         );
         assert!(session::load(directory.path(), &branch).is_ok());
         drop(opened);
+    }
+    fn manager_with_disconnected_session(
+        root: &Path,
+    ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
+        let manager = Subagents::new(
+            ChildConfig {
+                root: root.to_path_buf(),
+                model: "test".into(),
+                mcp_config: None,
+                credential_storage: Default::default(),
+                harnesses: Default::default(),
+                default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            },
+            2,
+        );
+        let state = Arc::new(AsyncMutex::new(State {
+            generation: 1,
+            retired: false,
+            harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            kit: true,
+            child: ChildSession::disconnected_for_test(),
+            _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
+        }));
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("source".into(), Arc::clone(&state));
+        let prior = SubagentValue {
+            id: "source".into(),
+            output: Value::String("done".into()),
+            generation: 1,
+            updates: None,
+        };
+        (manager, state, prior)
+    }
+
+    #[test]
+    fn invalid_structured_output_remains_recoverable_as_text() {
+        let contract = OutputContract::new(json!({"type": "object"})).unwrap();
+
+        assert_eq!(
+            structured_output("not JSON".into(), Some(&contract)),
+            Value::String("not JSON".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn child_prompt_failure_retires_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _, prior) = manager_with_disconnected_session(directory.path());
+
+        assert!(
+            manager
+                .prompt(
+                    prior.clone(),
+                    "continue".into(),
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(manager.lookup(&prior).is_err());
+    }
+    #[tokio::test]
+    async fn generic_harness_without_native_fork_returns_unsupported() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+            "generic".into(),
+            crate::acp_child::AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![fixture, "--no-fork".into()],
+                permissions: Default::default(),
+            },
+        )]))
+        .unwrap();
+        let manager = Subagents::new(
+            ChildConfig {
+                root: root.path().to_path_buf(),
+                model: "unused".into(),
+                mcp_config: None,
+                credential_storage: Default::default(),
+                harnesses,
+                default_harness: "acp.generic".into(),
+            },
+            2,
+        );
+        let prior = manager
+            .create("base".into(), None, 0, TurnCancellation::default(), None)
+            .await
+            .unwrap();
+
+        let error = manager
+            .fork(prior, "branch".into(), 0, TurnCancellation::default(), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
+        );
     }
 }
