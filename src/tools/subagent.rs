@@ -581,7 +581,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            contract.parse(r#"{"approved":true}"#.into()).unwrap(),
+            contract.parse(r#"{"approved":true}"#).unwrap(),
             json!({"approved": true})
         );
         assert!(contract.parse(r#"{"approved":"yes"}"#).is_none());
