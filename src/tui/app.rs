@@ -707,6 +707,9 @@ impl App {
             KeyCode::Char('u') if control => self.editor.delete_to_line_start(),
             KeyCode::Char('k') if control => self.editor.delete_to_line_end(),
             KeyCode::Char('d') if alt => self.editor.delete_word_forward(),
+            // Legacy terminal encoding reports option+left/right as alt+b/f.
+            KeyCode::Char('b') if alt => self.editor.move_word_left(),
+            KeyCode::Char('f') if alt => self.editor.move_word_right(),
             KeyCode::Char('a') if control => self.editor.move_line_start(),
             KeyCode::Char('e') if control => self.editor.move_line_end(),
             KeyCode::Char('g') if control => {
@@ -834,9 +837,13 @@ mod tests {
     use crate::{events::RuntimeEvent, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
+        modified_press(code, KeyModifiers::NONE)
+    }
+
+    fn modified_press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         }
@@ -989,6 +996,20 @@ mod tests {
             panic!("expected the prompt to be sent");
         };
         assert_eq!(prompt, "first line");
+    }
+
+    #[test]
+    fn option_arrow_legacy_sequences_move_by_word() {
+        let mut app = app();
+        app.paste("first second");
+
+        app.handle_key(modified_press(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(app.editor.wrapped(80).1, (0, 6));
+        assert_eq!(app.editor.text(), "first second");
+
+        app.handle_key(modified_press(KeyCode::Char('f'), KeyModifiers::ALT));
+        assert_eq!(app.editor.wrapped(80).1, (0, 12));
+        assert_eq!(app.editor.text(), "first second");
     }
 
     #[test]
