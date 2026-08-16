@@ -208,6 +208,7 @@ pub struct App {
     pub editor: Editor,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
+    pub compacting: bool,
     pub usage: Option<ContextUsage>,
     pub logs: Vec<String>,
     pub show_logs: bool,
@@ -239,6 +240,13 @@ pub struct App {
 /// return in such a burst is a line break in the pasted text, not a send.
 const PASTE_GAP: Duration = Duration::from_millis(8);
 
+fn is_compaction_summary(item: &Item) -> bool {
+    item.metadata
+        .get("kit.compaction.summary")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 fn persisted_output(output: &ToolOutput) -> Vec<String> {
     let text = match output {
         ToolOutput::Text(text) => text.clone(),
@@ -264,6 +272,7 @@ impl App {
             editor: Editor::default(),
             phase: Phase::Idle,
             turn_started: None,
+            compacting: false,
             usage: None,
             logs: Vec::new(),
             show_logs: false,
@@ -294,6 +303,9 @@ impl App {
         self.session_id = Some(session_id);
         for item in transcript {
             match item.kind {
+                ItemKind::Developer if is_compaction_summary(item) => {
+                    self.blocks.push(Block::Notice("context compacted".into()));
+                }
                 ItemKind::System | ItemKind::Developer | ItemKind::Context => continue,
                 ItemKind::User | ItemKind::Notification => {
                     let text = item
@@ -485,6 +497,7 @@ impl App {
                 let interrupted = self.phase == Phase::Cancelling;
                 self.phase = Phase::Idle;
                 self.turn_started = None;
+                self.compacting = false;
                 for block in &mut self.blocks {
                     if let Block::Tool(call) = block
                         && call.running()
@@ -506,6 +519,21 @@ impl App {
     }
 
     fn apply_runtime(&mut self, event: RuntimeEvent) {
+        let event = match event {
+            RuntimeEvent::CompactionStarted { .. } => {
+                self.compacting = true;
+                return;
+            }
+            RuntimeEvent::CompactionFinished { ok, compacted, .. } => {
+                self.compacting = false;
+                if ok && compacted {
+                    self.usage = None;
+                    self.note("context compacted");
+                }
+                return;
+            }
+            event => event,
+        };
         let parent = event.parent_call().map(str::to_string);
         let call = match parent.and_then(|parent| self.call_mut(&parent)) {
             Some(call) => call,
@@ -530,6 +558,9 @@ impl App {
                 millis,
                 ..
             } => call.finish_child(&child_call, ok, summary, millis),
+            RuntimeEvent::CompactionStarted { .. } | RuntimeEvent::CompactionFinished { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
@@ -796,6 +827,7 @@ mod tests {
     };
 
     use agentkit_acp::{ToolCallStatus, ToolKind};
+    use agentkit_core::{Item, ItemKind, MetadataMap};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::{Action, App, Block, Update};
@@ -834,6 +866,57 @@ mod tests {
             summary: "ls".into(),
             at: 0,
         }
+    }
+
+    #[test]
+    fn surfaces_compaction_lifecycle_without_a_tool_call() {
+        let mut app = app();
+        app.push_user("continue".into());
+        app.usage = Some(super::ContextUsage {
+            used: 80,
+            size: 100,
+        });
+        app.apply(Update::Runtime(RuntimeEvent::CompactionStarted {
+            reason: "TokenThreshold".into(),
+            at: 0,
+        }));
+        assert!(app.compacting);
+
+        app.apply(Update::Runtime(RuntimeEvent::CompactionFinished {
+            reason: "TokenThreshold".into(),
+            ok: true,
+            compacted: true,
+            millis: 12,
+        }));
+        assert!(!app.compacting);
+        assert!(app.usage.is_none());
+        assert!(
+            matches!(app.blocks.last(), Some(Block::Notice(text)) if text == "context compacted")
+        );
+    }
+
+    #[test]
+    fn turn_end_clears_compaction_state() {
+        let mut app = app();
+        app.compacting = true;
+        app.apply(Update::TurnEnded(None));
+        assert!(!app.compacting);
+    }
+
+    #[test]
+    fn restores_only_tagged_developer_items_as_compaction_markers() {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("kit.compaction.summary".into(), true.into());
+        let transcript = vec![
+            Item::text(ItemKind::Developer, "ordinary instruction"),
+            Item::text(ItemKind::Developer, "summary").with_metadata(metadata),
+        ];
+        let mut app = app();
+        app.restore_transcript("session".into(), &transcript);
+        assert_eq!(app.blocks.len(), 1);
+        assert!(
+            matches!(app.blocks.first(), Some(Block::Notice(text)) if text == "context compacted")
+        );
     }
 
     #[test]

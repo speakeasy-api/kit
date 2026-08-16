@@ -11,8 +11,12 @@ use agentkit_loop::{
     MutationPoint, SessionConfig, TranscriptCursor,
 };
 use async_trait::async_trait;
+use std::time::Instant;
 
-use crate::session::SessionObserver;
+use crate::{
+    events::{self, RuntimeEvent},
+    session::SessionObserver,
+};
 
 const COMPACTION_PERCENT: u64 = 80;
 
@@ -209,6 +213,25 @@ impl LoopMutator for AutomaticCompactor {
             mutator: "automatic-compaction".into(),
             point: ctx.point,
         });
+        let reason_label = format!("{reason:?}");
+        let started = Instant::now();
+        let report_runtime = self.persistence.is_some();
+        if report_runtime {
+            events::emit(&RuntimeEvent::CompactionStarted {
+                reason: reason_label.clone(),
+                at: events::now_millis(),
+            });
+        }
+        let finish = |ok, compacted| {
+            if report_runtime {
+                events::emit(&RuntimeEvent::CompactionFinished {
+                    reason: reason_label.clone(),
+                    ok,
+                    compacted,
+                    millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        };
 
         let before = cursor.len();
         let result = self
@@ -228,6 +251,7 @@ impl LoopMutator for AutomaticCompactor {
                         dirty: false,
                         metadata,
                     });
+                    finish(true, false);
                     return Ok(());
                 }
                 if let Some(persistence) = &self.persistence
@@ -241,6 +265,7 @@ impl LoopMutator for AutomaticCompactor {
                         dirty: false,
                         metadata,
                     });
+                    finish(false, false);
                     return Err(LoopError::Mutator(error));
                 }
                 metadata.insert(
@@ -255,6 +280,7 @@ impl LoopMutator for AutomaticCompactor {
                     dirty: true,
                     metadata,
                 });
+                finish(true, true);
                 Ok(())
             }
             Err(error) => {
@@ -266,6 +292,7 @@ impl LoopMutator for AutomaticCompactor {
                     dirty: false,
                     metadata,
                 });
+                finish(false, false);
                 match error {
                     CompactionError::Cancelled => Err(LoopError::Cancelled),
                     other => Err(LoopError::Mutator(other.to_string())),

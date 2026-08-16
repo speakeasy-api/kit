@@ -446,6 +446,7 @@ fn child_spans(app: &App, child: &Child, indent: &str) -> Vec<Span<'static>> {
 fn working_line(app: &App) -> Line<'static> {
     let label = match app.phase {
         Phase::Cancelling => "stopping",
+        _ if app.compacting => "compacting context",
         _ if app.focus_call().is_some_and(ToolCall::running) => "running tools",
         _ => "thinking",
     };
@@ -777,6 +778,22 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn labels_compaction_while_it_is_running() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.push_user("continue".into());
+        app.apply(Update::Runtime(RuntimeEvent::CompactionStarted {
+            reason: "TokenThreshold".into(),
+            at: 0,
+        }));
+        let frame = render(&mut app, 80, 20);
+        assert!(frame.contains("compacting context"));
     }
 
     #[test]

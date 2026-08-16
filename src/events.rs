@@ -51,6 +51,15 @@ pub enum RuntimeEvent {
         summary: String,
         millis: u64,
     },
+    /// Automatic transcript compaction started.
+    CompactionStarted { reason: String, at: u64 },
+    /// Automatic transcript compaction finished.
+    CompactionFinished {
+        reason: String,
+        ok: bool,
+        compacted: bool,
+        millis: u64,
+    },
 }
 
 impl RuntimeEvent {
@@ -59,6 +68,7 @@ impl RuntimeEvent {
     pub fn parent_call(&self) -> Option<&str> {
         let call = match self {
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
+            Self::CompactionStarted { .. } | Self::CompactionFinished { .. } => return None,
         };
         call.rsplit_once(":compose:").map(|(parent, _)| parent)
     }
@@ -169,6 +179,18 @@ mod tests {
         let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
         let parsed = parse(&line).expect("event round trips");
         assert_eq!(parsed.parent_call(), Some("call-1"));
+    }
+
+    #[test]
+    fn reads_back_a_compaction_event() {
+        let event = RuntimeEvent::CompactionStarted {
+            reason: "TokenThreshold".into(),
+            at: 7,
+        };
+        let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+        let parsed = parse(&line).expect("event round trips");
+        assert!(matches!(parsed, RuntimeEvent::CompactionStarted { .. }));
+        assert_eq!(parsed.parent_call(), None);
     }
 
     #[test]

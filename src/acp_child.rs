@@ -379,7 +379,15 @@ async fn run(
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if crate::events::parse(&line).is_some() {
+            if matches!(
+                crate::events::parse(&line),
+                Some(
+                    crate::events::RuntimeEvent::ChildStarted { .. }
+                        | crate::events::RuntimeEvent::ChildFinished { .. }
+                )
+            ) {
+                // Only nested tool events belong to this process's runtime graph.
+                // A harness's compaction changes its own transcript, not ours.
                 eprintln!("{line}");
             } else {
                 eprintln!("ACP harness {label}: {line}");
