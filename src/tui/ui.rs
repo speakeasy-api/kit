@@ -496,13 +496,20 @@ fn graph_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
     ])];
     let done = call.children.len() - call.running_children();
     let failed = call.children.iter().filter(|child| !child.ok).count();
+    let program = if call.running() {
+        "running"
+    } else if call.status == ToolCallStatus::Failed {
+        "failed"
+    } else {
+        "complete"
+    };
     lines.push(Line::from(Span::styled(
         format!(
-            "{} nodes · {done} done · {} running{}",
+            "{} plan nodes · {done} calls done · {} calls running{} · program {program}",
             call.plan.len(),
             call.running_children(),
             if failed > 0 {
-                format!(" · {failed} failed")
+                format!(" · {failed} calls failed")
             } else {
                 String::new()
             }
@@ -706,7 +713,7 @@ mod tests {
     use agentkit_acp::ToolKind;
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{MAX_PROMPT_ROWS, draw};
+    use super::{MAX_PROMPT_ROWS, draw, graph_lines};
     use crate::{
         events::RuntimeEvent,
         tui::app::{App, Block, Update},
@@ -788,6 +795,41 @@ mod tests {
         let frame = render(&mut sample(), 70, 30);
         println!("{frame}");
         assert!(frame.contains("runtime graph"));
+    }
+
+    #[test]
+    fn distinguishes_finished_child_calls_from_a_running_program() {
+        let mut app = sample();
+        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
+            call: "call-1:compose:two".into(),
+            tool: "shell".into(),
+            ok: true,
+            summary: "checked".into(),
+            millis: 240,
+        }));
+
+        let summary = graph_lines(&app, app.focus_call().unwrap())[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            summary,
+            "4 plan nodes · 2 calls done · 0 calls running · program running"
+        );
+
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(agentkit_acp::ToolCallStatus::Completed),
+            script: None,
+            output: Vec::new(),
+        });
+        let summary = graph_lines(&app, app.focus_call().unwrap())[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(summary.ends_with("0 calls running · program complete"));
     }
 
     #[test]
