@@ -23,6 +23,8 @@ def prompt(request):
     session_id = params["sessionId"]
     text = params["prompt"][0]["text"]
     time.sleep(0.40)
+    if "MOCK_STRUCTURED_OUTPUT" in text:
+        text = json.dumps({"approved": True, "reason": "mock approved"})
     send({
         "jsonrpc": "2.0",
         "method": "session/update",

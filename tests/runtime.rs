@@ -47,6 +47,7 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
     assert!(description.contains("\"generation\""));
     assert!(description.contains("\"minimum\":1"));
+    assert!(description.contains("\"output_schema\""));
     assert!(description.contains("\"enum\":[\"acp.kit\"]"));
     assert!(description.contains("\"exit_code\""));
     assert!(description.contains("\"enum\":[\"delete\"]"));
@@ -94,6 +95,54 @@ return { found }"#,
 
     let outcome = execute_compose(&runtime, r#"return tool({ name: "shell", args: {} })"#).await;
     assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
+}
+
+#[tokio::test]
+async fn structured_subagent_output_can_drive_runlet_control_flow() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "review".into(),
+        kit::AcpHarnessProfile {
+            command: "python3".into(),
+            args: vec![fixture],
+        },
+    )]))
+    .unwrap();
+    let runtime =
+        kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.review".into()).unwrap();
+
+    let outcome = execute_compose(
+        &runtime,
+        r#"review = subagent({
+  harness: "acp.review",
+  prompt: "MOCK_STRUCTURED_OUTPUT",
+  output_schema: {
+    type: "object",
+    properties: {
+      approved: { type: "boolean" },
+      reason: { type: "string" }
+    },
+    required: ["approved", "reason"],
+    additionalProperties: false
+  }
+})
+return if review.output.approved {
+  return { reason: review.output.reason }
+} else {
+  return fail("REJECTED", review.output.reason)
+}"#,
+    )
+    .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("structured compose failed: {outcome:?}");
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::structured(json!({"reason": "mock approved"}))
+    );
 }
 
 #[tokio::test]

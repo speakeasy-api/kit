@@ -9,7 +9,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_SUBAGENTS: usize = 16;
@@ -29,6 +29,7 @@ pub struct Subagents {
 
 struct State {
     generation: u64,
+    retired: bool,
     harness: String,
     kit: bool,
     child: ChildSession,
@@ -38,8 +39,60 @@ struct State {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentValue {
     pub id: String,
-    pub output: String,
+    pub output: Value,
     pub generation: u64,
+}
+
+struct OutputContract {
+    schema: Value,
+    validator: jsonschema::Validator,
+}
+
+impl OutputContract {
+    fn new(schema: Value) -> Result<Self, ToolError> {
+        let validator = jsonschema::validator_for(&schema)
+            .map_err(|error| ToolError::InvalidInput(format!("invalid output_schema: {error}")))?;
+        Ok(Self { schema, validator })
+    }
+
+    fn prompt(&self, prompt: String) -> String {
+        format!(
+            "{prompt}\n\nReturn only a JSON value matching this JSON Schema. Do not wrap it in Markdown or add commentary:\n{}",
+            serde_json::to_string(&self.schema).expect("JSON Schema serializes")
+        )
+    }
+
+    fn parse(&self, output: String) -> Result<Value, ChildError> {
+        let value: Value = serde_json::from_str(output.trim()).map_err(|error| {
+            ChildError::Failed(format!(
+                "subagent returned invalid JSON for output_schema: {error}"
+            ))
+        })?;
+        if let Err(error) = self.validator.validate(&value) {
+            return Err(ChildError::Failed(format!(
+                "subagent output did not match output_schema at {}: {error}",
+                error.instance_path()
+            )));
+        }
+        Ok(value)
+    }
+}
+
+fn structured_prompt(prompt: String, contract: Option<&OutputContract>) -> String {
+    match contract {
+        Some(contract) => contract.prompt(prompt),
+        None => prompt,
+    }
+}
+
+fn structured_output(
+    output: String,
+    contract: Option<&OutputContract>,
+) -> Result<Value, ChildError> {
+    match contract {
+        Some(contract) => contract.parse(output),
+        None => Ok(Value::String(output)),
+    }
 }
 
 impl Subagents {
@@ -66,6 +119,7 @@ impl Subagents {
         harness: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
+        contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
@@ -86,11 +140,15 @@ impl Subagents {
             cancellation.clone(),
         )
         .await?;
-        let output = child.prompt(prompt, cancellation).await?;
+        let output = child
+            .prompt(structured_prompt(prompt, contract), cancellation)
+            .await?;
+        let output = structured_output(output, contract)?;
         self.insert(
             id.clone(),
             State {
                 generation: 1,
+                retired: false,
                 harness,
                 kit,
                 child,
@@ -109,29 +167,44 @@ impl Subagents {
         prior: SubagentValue,
         prompt: String,
         cancellation: TurnCancellation,
+        contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
         let state = self.lookup(&prior)?;
         let mut locked = tokio::select! {
             locked = state.lock() => locked,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
+        self.check_active(&locked)?;
         self.check_generation(&prior, locked.generation)?;
         let generation = locked
             .generation
             .checked_add(1)
             .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
-        match locked.child.prompt(prompt, cancellation).await {
-            Ok(output) => {
-                locked.generation = generation;
-                Ok(SubagentValue {
-                    id: prior.id,
-                    output,
-                    generation,
-                })
-            }
+        match locked
+            .child
+            .prompt(structured_prompt(prompt, contract), cancellation)
+            .await
+        {
+            Ok(output) => match structured_output(output, contract) {
+                Ok(output) => {
+                    locked.generation = generation;
+                    Ok(SubagentValue {
+                        id: prior.id,
+                        output,
+                        generation,
+                    })
+                }
+                Err(error) => {
+                    locked.retired = true;
+                    drop(locked);
+                    self.remove_if_same(&prior.id, &state);
+                    Err(error)
+                }
+            },
             Err(error) => {
                 // Any dispatched unsuccessful turn may have changed the durable
                 // transcript. Retire it rather than accepting the old generation.
+                locked.retired = true;
                 drop(locked);
                 self.remove_if_same(&prior.id, &state);
                 Err(error)
@@ -145,6 +218,7 @@ impl Subagents {
         prompt: String,
         depth: usize,
         cancellation: TurnCancellation,
+        contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
@@ -153,6 +227,7 @@ impl Subagents {
             source = source_state.lock() => source,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
+        self.check_active(&source)?;
         self.check_generation(&prior, source.generation)?;
         let id = session::new_id();
         let harness = source.harness.clone();
@@ -180,7 +255,10 @@ impl Subagents {
                 "ACP harness {harness:?} does not advertise session/fork; transcript fallback is only available for Kit"
             )));
         };
-        let output = child.prompt(prompt, cancellation).await?;
+        let output = child
+            .prompt(structured_prompt(prompt, contract), cancellation)
+            .await?;
+        let output = structured_output(output, contract)?;
         let generation = prior
             .generation
             .checked_add(1)
@@ -189,6 +267,7 @@ impl Subagents {
             id.clone(),
             State {
                 generation,
+                retired: false,
                 harness,
                 kit,
                 child,
@@ -213,6 +292,7 @@ impl Subagents {
             source = source.lock() => source,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
+        self.check_active(&source)?;
         self.check_generation(prior, source.generation)?;
         let id = session::new_id();
         session::clone_completed(&self.config.root, &prior.id, &id).map_err(ChildError::Failed)?;
@@ -264,6 +344,13 @@ impl Subagents {
             sessions.remove(id);
         }
     }
+    fn check_active(&self, state: &State) -> Result<(), ChildError> {
+        if state.retired {
+            Err(ChildError::Failed("subagent session is retired".into()))
+        } else {
+            Ok(())
+        }
+    }
     fn check_generation(&self, prior: &SubagentValue, actual: u64) -> Result<(), ChildError> {
         if prior.generation == actual {
             Ok(())
@@ -305,16 +392,16 @@ pub struct ForkTool {
 }
 
 fn value_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"id":{"type":"string"},"output":{"type":"string"},"generation":{"type":"integer","minimum":1}},"required":["id","output","generation"],"additionalProperties":false})
+    json!({"type":"object","properties":{"id":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1}},"required":["id","output","generation"],"additionalProperties":false})
 }
 fn continuation_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"}},"required":["subagent","prompt"],"additionalProperties":false})
+    json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
 
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -342,14 +429,30 @@ impl ForkTool {
 struct Input {
     prompt: String,
     harness: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_output_schema")]
+    output_schema: Option<Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Continuation {
     subagent: SubagentValue,
     prompt: String,
+    #[serde(default, deserialize_with = "deserialize_output_schema")]
+    output_schema: Option<Value>,
 }
 
+fn deserialize_output_schema<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Err(serde::de::Error::custom(
+            "output_schema must be a JSON Schema object or boolean",
+        ));
+    }
+    Ok(Some(value))
+}
 fn cancellation(context: &ToolContext<'_>) -> TurnCancellation {
     context
         .cancellation
@@ -384,6 +487,7 @@ impl Tool for SubagentTool {
     ) -> Result<ToolResult, ToolError> {
         let input: Input = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let contract = input.output_schema.map(OutputContract::new).transpose()?;
         result(
             request,
             self.manager
@@ -392,6 +496,7 @@ impl Tool for SubagentTool {
                     input.harness,
                     self.depth,
                     cancellation(context),
+                    contract.as_ref(),
                 )
                 .await,
         )
@@ -410,10 +515,16 @@ impl Tool for PromptTool {
     ) -> Result<ToolResult, ToolError> {
         let input: Continuation = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let contract = input.output_schema.map(OutputContract::new).transpose()?;
         result(
             request,
             self.manager
-                .prompt(input.subagent, input.prompt, cancellation(context))
+                .prompt(
+                    input.subagent,
+                    input.prompt,
+                    cancellation(context),
+                    contract.as_ref(),
+                )
                 .await,
         )
     }
@@ -431,6 +542,7 @@ impl Tool for ForkTool {
     ) -> Result<ToolResult, ToolError> {
         let input: Continuation = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let contract = input.output_schema.map(OutputContract::new).transpose()?;
         result(
             request,
             self.manager
@@ -439,6 +551,7 @@ impl Tool for ForkTool {
                     input.prompt,
                     self.depth,
                     cancellation(context),
+                    contract.as_ref(),
                 )
                 .await,
         )
@@ -450,6 +563,51 @@ mod tests {
     use agentkit_core::{Item, ItemKind};
 
     use super::*;
+
+    #[test]
+    fn structured_output_is_parsed_and_validated() {
+        let contract = OutputContract::new(json!({
+            "type": "object",
+            "properties": {"approved": {"type": "boolean"}},
+            "required": ["approved"],
+            "additionalProperties": false
+        }))
+        .unwrap();
+
+        assert_eq!(
+            contract.parse(r#"{"approved":true}"#.into()).unwrap(),
+            json!({"approved": true})
+        );
+        assert!(contract.parse(r#"{"approved":"yes"}"#.into()).is_err());
+        assert!(contract.parse("```json\n{}\n```".into()).is_err());
+    }
+
+    #[test]
+    fn invalid_output_schema_is_rejected() {
+        assert!(OutputContract::new(json!({"type": 42})).is_err());
+    }
+
+    #[test]
+    fn explicit_null_output_schema_is_rejected() {
+        assert!(
+            serde_json::from_value::<Input>(json!({"prompt": "test", "output_schema": null}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn boolean_output_schema_is_supported() {
+        let contract = OutputContract::new(Value::Bool(true)).unwrap();
+        assert_eq!(contract.parse("[1, 2]".into()).unwrap(), json!([1, 2]));
+    }
+
+    #[test]
+    fn unstructured_output_remains_text() {
+        assert_eq!(
+            structured_output("plain text".into(), None).unwrap(),
+            Value::String("plain text".into())
+        );
+    }
 
     #[tokio::test]
     async fn fork_snapshot_releases_source_before_child_work() {
@@ -469,6 +627,7 @@ mod tests {
         );
         let state = Arc::new(AsyncMutex::new(State {
             generation: 1,
+            retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
             kit: true,
             child: ChildSession::disconnected_for_test(),
@@ -481,7 +640,7 @@ mod tests {
             .insert("source".into(), Arc::clone(&state));
         let prior = SubagentValue {
             id: "source".into(),
-            output: "done".into(),
+            output: Value::String("done".into()),
             generation: 1,
         };
 

@@ -153,8 +153,42 @@ branch = fork({ subagent: second, prompt: "Try the alternative design" })
 return { main: second.output, alternative: branch.output }
 ```
 
-Each call returns `{ id, output, generation }`. The optional `harness` is used
-only by `subagent`; `prompt` and `fork` infer the original profile from the
+Each call returns `{ id, output, generation }`. By default, `output` remains the
+agent's text. To require structured output, pass an `output_schema` JSON Schema to
+any turn-producing call:
+
+```text
+review = subagent({
+  harness: "acp.claude",
+  prompt: "Review the proposed change",
+  output_schema: {
+    type: "object",
+    properties: {
+      approved: { type: "boolean" },
+      reason: { type: "string" }
+    },
+    required: ["approved", "reason"],
+    additionalProperties: false
+  }
+})
+return if review.output.approved {
+  return { reason: review.output.reason }
+} else {
+  return fail("REJECTED", review.output.reason)
+}
+```
+
+Kit appends the schema to the child prompt, requires the response to be a bare
+JSON value, parses it, and validates it before returning the turn. Invalid schemas
+are rejected before dispatch; malformed or non-matching responses fail the tool
+call. A failed structured continuation retires that session because its transcript
+may already have advanced. The schema may be changed on a later `prompt` or
+`fork`. In the current pinned Runlet version, `output` is dynamically typed: its
+fields can be used in control flow as above, but Runlet does not statically check
+field names or types against the per-call schema. Runtime validation remains
+authoritative.
+
+The optional `harness` is used only by `subagent`; `prompt` and `fork` infer the original profile from the
 parent-owned session. Parent IDs remain distinct from ACP child session IDs.
 `fork` uses native `session/fork` only when initialization advertised that
 capability; sibling fork sessions can prompt concurrently while each individual
