@@ -119,7 +119,10 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     for (chunk, style) in chunks(line) {
         let chunk_width = chunk.width();
         let blank = chunk.trim().is_empty();
-        if blank && spans.is_empty() {
+        // Keep source indentation on the first display row. Whitespace at a
+        // wrap point is discarded, but its continuation indent is restored
+        // when the next word arrives.
+        if blank && spans.is_empty() && !lines.is_empty() {
             continue;
         }
         if used + chunk_width > width && !spans.is_empty() {
@@ -132,6 +135,10 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
                 spans.push(Span::raw(" ".repeat(indent)));
                 used = indent;
             }
+        }
+        if spans.is_empty() && !lines.is_empty() && !blank && indent > 0 {
+            spans.push(Span::raw(" ".repeat(indent)));
+            used = indent;
         }
         if used + chunk_width <= width {
             used += chunk_width;
@@ -172,7 +179,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<Vec<LinkedSpan>> {
     for (chunk, style, url) in linked_chunks(line) {
         let chunk_width = chunk.width();
         let blank = chunk.trim().is_empty();
-        if blank && spans.is_empty() {
+        if blank && spans.is_empty() && !lines.is_empty() {
             continue;
         }
         if used + chunk_width > width && !spans.is_empty() {
@@ -188,6 +195,13 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<Vec<LinkedSpan>> {
                 });
                 used = indent;
             }
+        }
+        if spans.is_empty() && !lines.is_empty() && !blank && indent > 0 {
+            spans.push(LinkedSpan {
+                span: Span::raw(" ".repeat(indent)),
+                url: None,
+            });
+            used = indent;
         }
         if used + chunk_width <= width {
             used += chunk_width;
@@ -322,7 +336,7 @@ fn hanging_indent(line: &Line<'static>) -> usize {
 mod tests {
     use ratatui::text::{Line, Span};
 
-    use super::wrap;
+    use super::{LinkedLine, wrap, wrap_linked_tagged};
 
     fn text(lines: &[Line<'static>]) -> Vec<String> {
         lines
@@ -346,6 +360,28 @@ mod tests {
     fn hangs_continuations_under_the_gutter() {
         let line = Line::from(vec![Span::raw("› "), Span::raw("alpha beta gamma")]);
         assert_eq!(text(&wrap(&[line], 10)), ["› alpha", "  beta", "  gamma"]);
+    }
+
+    #[test]
+    fn preserves_a_leading_margin_when_the_line_wraps() {
+        let line = Line::from(vec![Span::raw("  "), Span::raw("alpha beta gamma")]);
+        assert_eq!(
+            text(&wrap(&[line.clone()], 10)),
+            ["  alpha", "  beta", "  gamma"]
+        );
+
+        let linked = wrap_linked_tagged(&[(LinkedLine::plain(line), ())], 10);
+        let linked_lines = linked
+            .into_iter()
+            .map(|(line, (), _)| line)
+            .collect::<Vec<_>>();
+        assert_eq!(text(&linked_lines), ["  alpha", "  beta", "  gamma"]);
+    }
+
+    #[test]
+    fn restores_the_margin_when_whitespace_causes_the_wrap() {
+        let line = Line::from(vec![Span::raw("› "), Span::raw("alpha beta")]);
+        assert_eq!(text(&wrap(&[line], 7)), ["› alpha", "  beta"]);
     }
 
     #[test]
