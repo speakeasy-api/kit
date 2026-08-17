@@ -12,7 +12,7 @@ if [ "$(basename "$binary")" = kit ]; then
   if [ -z "$identity" ] && [ -r "$root/.kit-codesign-identity" ]; then
     IFS= read -r identity < "$root/.kit-codesign-identity"
   fi
-  identifier="${KIT_CODESIGN_IDENTIFIER:-works.earendil.kit}"
+  identifier="${KIT_CODESIGN_IDENTIFIER:-com.danielkov.kit}"
   if [ -n "$identity" ] && security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"$identity\""; then
     codesign --force --options runtime --identifier "$identifier" --sign "$identity" "$binary"
   else

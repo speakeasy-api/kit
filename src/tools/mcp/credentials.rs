@@ -12,7 +12,7 @@ use keyring_core::Error as KeyringError;
 use rmcp::transport::auth::{AuthError, AuthorizationManager, CredentialStore, StoredCredentials};
 use zeroize::Zeroizing;
 
-const KEYCHAIN_SERVICE: &str = "works.earendil.kit.mcp.oauth";
+const KEYCHAIN_SERVICE: &str = "com.danielkov.kit.mcp.oauth";
 
 #[derive(Clone, Debug, Default)]
 pub enum CredentialStorage {

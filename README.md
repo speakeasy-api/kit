@@ -331,7 +331,7 @@ target/release/kit tui --mcp-config mcp.json \
 On macOS, `.cargo/config.toml` routes `cargo run` through a runner that signs the
 fresh debug binary before executing it. Set `KIT_CODESIGN_IDENTITY`, or put the
 certificate name in the gitignored `.kit-codesign-identity` file. Both paths use
-the stable identifier `works.earendil.kit`, overridable with
+the stable identifier `com.danielkov.kit`, overridable with
 `KIT_CODESIGN_IDENTIFIER`. A changed identity, a missing certificate, or a
 locked Keychain may prompt again. `cargo install`
 does not run the runner; sign its installed binary separately. Apple Development

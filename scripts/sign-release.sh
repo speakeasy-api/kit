@@ -7,7 +7,7 @@ if [ -z "$KIT_CODESIGN_IDENTITY" ] && [ -r "$root/.kit-codesign-identity" ]; the
   IFS= read -r KIT_CODESIGN_IDENTITY < "$root/.kit-codesign-identity"
 fi
 : "${KIT_CODESIGN_IDENTITY:?set KIT_CODESIGN_IDENTITY or create .kit-codesign-identity}"
-KIT_CODESIGN_IDENTIFIER="${KIT_CODESIGN_IDENTIFIER:-works.earendil.kit}"
+KIT_CODESIGN_IDENTIFIER="${KIT_CODESIGN_IDENTIFIER:-com.danielkov.kit}"
 
 if [ "$(uname -s)" != Darwin ]; then
   echo "codesigning is only supported on macOS" >&2
