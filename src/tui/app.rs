@@ -813,7 +813,12 @@ impl App {
             }
             return;
         }
-        if let Some(Some(id)) = self.row_calls.get(self.scroll + offset).cloned() {
+        if let Some(Some(id)) = self
+            .scroll
+            .checked_add(offset)
+            .and_then(|row| self.row_calls.get(row))
+            .cloned()
+        {
             self.toggle_output(&id);
         }
     }
@@ -821,7 +826,7 @@ impl App {
     fn clicked_link(&self, column: usize, offset: usize) -> Option<String> {
         let column = column.checked_sub(self.transcript_left)?;
         self.row_links
-            .get(self.scroll + offset)?
+            .get(self.scroll.checked_add(offset)?)?
             .iter()
             .find(|link| column >= link.start && column < link.end)
             .map(|link| link.url.clone())
@@ -1102,6 +1107,20 @@ mod tests {
             Some("https://example.com")
         );
         assert!(app.clicked_link(12, 0).is_none());
+    }
+
+    #[test]
+    fn ignores_clicks_while_follow_scroll_is_waiting_for_a_redraw() {
+        let mut app = app();
+        app.scroll = usize::MAX;
+        app.viewport = 2;
+        app.transcript_width = 10;
+        app.row_calls = vec![None, None];
+        app.row_links = vec![Vec::new(), Vec::new()];
+
+        app.click(0, 1);
+
+        assert!(app.clicked_link(0, 1).is_none());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
