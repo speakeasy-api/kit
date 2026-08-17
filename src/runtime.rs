@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
-    provider::{OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, SubscriptionConfig},
+    provider::{KitAdapter, KitSession, ProviderKind},
     tools::{
         A2aTool, AuthTool, EditTool, ForkTool, McpTool, Observed, PromptTool, ShellTool,
         SubagentTool, Subagents, ToolSearch,
@@ -82,7 +82,8 @@ impl SessionSelection {
 
 pub struct Runtime {
     root: PathBuf,
-    adapter: OpenAiSubscriptionAdapter,
+    adapter: KitAdapter,
+    provider: ProviderKind,
     model: String,
     max_subagent_depth: usize,
     base_depth: usize,
@@ -95,6 +96,14 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(root: impl AsRef<Path>, model: impl Into<String>) -> Result<Arc<Self>, String> {
+        Self::new_with_provider(root, model, ProviderKind::default())
+    }
+
+    pub fn new_with_provider(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+    ) -> Result<Arc<Self>, String> {
         let root = root
             .as_ref()
             .canonicalize()
@@ -106,12 +115,13 @@ impl Runtime {
             ));
         }
         let model = model.into();
-        let adapter = OpenAiSubscriptionAdapter::new(SubscriptionConfig::new(model.clone())?)?;
+        let adapter = KitAdapter::new(provider, model.clone())?;
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
             ChildConfig {
                 root: root.clone(),
                 model: model.clone(),
+                provider,
                 mcp_config: None,
                 credential_storage: Default::default(),
                 harnesses: AcpHarnesses::default(),
@@ -122,6 +132,7 @@ impl Runtime {
         Ok(Arc::new(Self {
             root,
             adapter,
+            provider,
             model,
             max_subagent_depth,
             base_depth: 0,
@@ -138,7 +149,16 @@ impl Runtime {
         model: impl Into<String>,
         session: SessionRequest,
     ) -> Result<Arc<Self>, String> {
-        let mut runtime = Arc::try_unwrap(Self::new(root, model)?)
+        Self::with_session_and_provider(root, model, ProviderKind::default(), session)
+    }
+
+    pub fn with_session_and_provider(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        session: SessionRequest,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(Self::new_with_provider(root, model, provider)?)
             .map_err(|_| "could not configure runtime session".to_string())?;
         runtime
             .session
@@ -182,6 +202,7 @@ impl Runtime {
             ChildConfig {
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
+                provider: runtime.provider,
                 mcp_config: None,
                 credential_storage: Default::default(),
                 harnesses,
@@ -213,6 +234,7 @@ impl Runtime {
             ChildConfig {
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
+                provider: runtime.provider,
                 mcp_config: Some(path.to_path_buf()),
                 credential_storage,
                 harnesses: previous.harnesses,
@@ -362,7 +384,7 @@ impl Runtime {
     pub(crate) async fn start_acp_driver(
         self: &Arc<Self>,
         context: AcpAgentFactoryContext,
-    ) -> Result<LoopDriver<OpenAiSubscriptionSession>, AcpRuntimeError> {
+    ) -> Result<LoopDriver<KitSession>, AcpRuntimeError> {
         let cwd = context
             .cwd
             .canonicalize()
@@ -509,7 +531,7 @@ async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<V
     Ok(transcript)
 }
 
-async fn drive(driver: &mut LoopDriver<OpenAiSubscriptionSession>) -> Result<String, LoopError> {
+async fn drive(driver: &mut LoopDriver<KitSession>) -> Result<String, LoopError> {
     loop {
         match driver.next().await? {
             LoopStep::Finished(result) => {

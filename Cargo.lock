@@ -121,6 +121,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-adapter-completions"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58423da8d1fb5c75833664fce574d6b51c16ec99b9a7192c8ea9ea6ffba8e143"
+dependencies = [
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "agentkit-tools-core",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -172,6 +191,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-http"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbd4da0aa486968a37043d459bbd34ffa1dfe2f46e868c7b45d9d1f328b8386c"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "agentkit-loop"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,6 +242,23 @@ dependencies = [
  "sse-stream",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentkit-provider-openrouter"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ba24725f0826e1a62d2fb46498ff0f85021d7e4f703bd934d4ec5e97c2c6f8"
+dependencies = [
+ "agentkit-adapter-completions",
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -1985,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
@@ -1997,6 +2049,7 @@ dependencies = [
  "agentkit-core",
  "agentkit-loop",
  "agentkit-mcp",
+ "agentkit-provider-openrouter",
  "agentkit-tool-compose",
  "agentkit-tools-core",
  "apple-native-keyring-store",

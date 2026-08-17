@@ -639,6 +639,7 @@ mod tests {
             ChildConfig {
                 root: directory.path().to_path_buf(),
                 model: "test".into(),
+                provider: Default::default(),
                 mcp_config: None,
                 credential_storage: Default::default(),
                 harnesses: Default::default(),
@@ -685,6 +686,7 @@ mod tests {
             ChildConfig {
                 root: root.to_path_buf(),
                 model: "test".into(),
+                provider: Default::default(),
                 mcp_config: None,
                 credential_storage: Default::default(),
                 harnesses: Default::default(),
@@ -759,6 +761,7 @@ mod tests {
             ChildConfig {
                 root: root.path().to_path_buf(),
                 model: "unused".into(),
+                provider: Default::default(),
                 mcp_config: None,
                 credential_storage: Default::default(),
                 harnesses,

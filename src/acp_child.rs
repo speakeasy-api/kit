@@ -186,6 +186,8 @@ impl AcpHarnesses {
             .arg(&config.root)
             .arg("--model")
             .arg(&config.model)
+            .arg("--provider")
+            .arg(config.provider.as_str())
             .arg("--session-id")
             .arg(id)
             .arg("--subagent-depth")
@@ -225,6 +227,7 @@ impl LaunchContext {
 pub(crate) fn serve_command(
     root: &Path,
     model: &str,
+    provider: crate::ProviderKind,
     session_id: &str,
     resume: bool,
 ) -> std::io::Result<Command> {
@@ -235,6 +238,8 @@ pub(crate) fn serve_command(
         .arg(root)
         .arg("--model")
         .arg(model)
+        .arg("--provider")
+        .arg(provider.as_str())
         .arg("--session-id")
         .arg(session_id);
     if resume {
@@ -247,6 +252,7 @@ pub(crate) fn serve_command(
 pub(crate) struct ChildConfig {
     pub root: PathBuf,
     pub model: String,
+    pub provider: crate::ProviderKind,
     pub mcp_config: Option<PathBuf>,
     pub credential_storage: CredentialStorage,
     pub harnesses: AcpHarnesses,
@@ -851,6 +857,7 @@ mod tests {
         let config = ChildConfig {
             root: root.path().into(),
             model: "unused".into(),
+            provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
@@ -899,6 +906,7 @@ mod tests {
         let config = ChildConfig {
             root: root.path().to_path_buf(),
             model: "unused".into(),
+            provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
             harnesses: harnesses.clone(),
@@ -932,6 +940,7 @@ mod tests {
         let config = ChildConfig {
             root: root.path().to_path_buf(),
             model: "test-model".into(),
+            provider: crate::ProviderKind::OpenRouter,
             mcp_config: None,
             credential_storage: Default::default(),
             harnesses: harnesses.clone(),
@@ -950,6 +959,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--model", "test-model"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--provider", "openrouter"])
         );
         assert!(
             args.windows(2)
@@ -980,6 +993,7 @@ mod tests {
         let config = ChildConfig {
             root: root.path().to_path_buf(),
             model: "unused".into(),
+            provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
@@ -1034,6 +1048,7 @@ mod tests {
         let config = ChildConfig {
             root: root.path().to_path_buf(),
             model: "unused".into(),
+            provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
             harnesses,

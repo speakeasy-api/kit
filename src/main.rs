@@ -76,6 +76,7 @@ enum CredentialStoreKind {
 struct Config {
     root: Option<PathBuf>,
     model: Option<String>,
+    provider: Option<kit::ProviderKind>,
     a2a: Option<String>,
     mcp_config: Option<PathBuf>,
     mcp_credential_store: Option<CredentialStoreKind>,
@@ -130,6 +131,10 @@ impl Config {
             .unwrap_or_else(|| "gpt-5.4".into())
     }
 
+    fn provider(&self, value: Option<kit::ProviderKind>) -> kit::ProviderKind {
+        value.or(self.provider).unwrap_or_default()
+    }
+
     fn a2a(&self, value: Option<String>) -> Option<String> {
         value.or_else(|| self.a2a.clone())
     }
@@ -158,6 +163,9 @@ enum Command {
         /// Model name (defaults to config or `gpt-5.4`).
         #[arg(long)]
         model: Option<String>,
+        /// Model provider (defaults to config or `openai-subscription`).
+        #[arg(long, value_enum)]
+        provider: Option<kit::ProviderKind>,
         /// A2A listen address. An available loopback port is selected when omitted.
         #[arg(long)]
         a2a: Option<String>,
@@ -179,6 +187,8 @@ enum Command {
         root: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long, value_enum)]
+        provider: Option<kit::ProviderKind>,
         #[command(flatten)]
         mcp: McpArgs,
         #[arg(long)]
@@ -198,6 +208,9 @@ enum Command {
         /// Model name (defaults to config or `gpt-5.4`).
         #[arg(long)]
         model: Option<String>,
+        /// Model provider (defaults to config or `openai-subscription`).
+        #[arg(long, value_enum)]
+        provider: Option<kit::ProviderKind>,
         #[command(flatten)]
         mcp: McpArgs,
         /// Resume this persisted session id.
@@ -217,6 +230,9 @@ enum Command {
         /// Model name (defaults to config or `gpt-5.4`).
         #[arg(long)]
         model: Option<String>,
+        /// Model provider (defaults to config or `openai-subscription`).
+        #[arg(long, value_enum)]
+        provider: Option<kit::ProviderKind>,
         /// A2A listen address. An available loopback port is selected when omitted.
         #[arg(long)]
         a2a: Option<String>,
@@ -239,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve {
             root,
             model,
+            provider,
             a2a,
             mcp,
             session_id,
@@ -247,15 +264,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let root = config.root(root);
             let model = config.model(model);
+            let provider = config.provider(provider);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.storage(&config)?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session(
+                Some(id) => kit::Runtime::with_session_and_provider(
                     root,
                     model,
+                    provider,
                     kit::runtime::SessionRequest { id, resume, force },
                 )?,
-                None => kit::Runtime::new(root, model)?,
+                None => kit::Runtime::new_with_provider(root, model, provider)?,
             };
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -274,6 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Acp {
             root,
             model,
+            provider,
             mcp,
             session_id,
             resume,
@@ -282,14 +302,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let root = config.root(root);
             let model = config.model(model);
+            let provider = config.provider(provider);
             let credential_storage = mcp.storage(&config)?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session(
+                Some(id) => kit::Runtime::with_session_and_provider(
                     root,
                     model,
+                    provider,
                     kit::runtime::SessionRequest { id, resume, force },
                 )?,
-                None => kit::Runtime::new(root, model)?,
+                None => kit::Runtime::new_with_provider(root, model, provider)?,
             };
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -306,6 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Prompt {
             root,
             model,
+            provider,
             mcp,
             resume,
             force,
@@ -313,11 +336,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let root = config.root(root);
             let model = config.model(model);
+            let provider = config.provider(provider);
             let credential_storage = mcp.storage(&config)?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
-            let runtime = kit::Runtime::with_session(
+            let runtime = kit::Runtime::with_session_and_provider(
                 root,
                 model,
+                provider,
                 kit::runtime::SessionRequest {
                     id: session_id.clone(),
                     resume: resume.is_some(),
@@ -340,6 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Tui {
             root,
             model,
+            provider,
             a2a,
             mcp,
             resume,
@@ -350,11 +376,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = config.harnesses()?;
             let root = config.root(root);
             let model = config.model(model);
+            let provider = config.provider(provider);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.storage(&config)?;
             kit::tui::run(
                 &root,
                 &model,
+                provider,
                 a2a.as_deref(),
                 mcp.config_path(&config),
                 &credential_storage,
@@ -384,6 +412,7 @@ mod tests {
             r#"
 root = "/configured/root"
 model = "configured-model"
+provider = "openrouter"
 a2a = "127.0.0.1:7331"
 mcp_config = "/configured/mcp.json"
 mcp_credential_store = "file"
@@ -400,6 +429,11 @@ mcp_credential_dir = "/configured/credentials"
         );
         assert_eq!(config.model(None), "configured-model");
         assert_eq!(config.model(Some("cli-model".into())), "cli-model");
+        assert_eq!(config.provider(None), kit::ProviderKind::OpenRouter);
+        assert_eq!(
+            config.provider(Some(kit::ProviderKind::OpenAiSubscription)),
+            kit::ProviderKind::OpenAiSubscription
+        );
         assert_eq!(config.a2a(None).as_deref(), Some("127.0.0.1:7331"));
 
         let mcp = McpArgs {
@@ -433,6 +467,7 @@ mcp_credential_dir = "/configured/credentials"
         let config = Config::load(&directory.path().join("missing.toml")).unwrap();
         assert_eq!(config.root(None), PathBuf::from("."));
         assert_eq!(config.model(None), "gpt-5.4");
+        assert_eq!(config.provider(None), kit::ProviderKind::OpenAiSubscription);
         assert_eq!(config.a2a(None), None);
     }
 
@@ -500,7 +535,10 @@ harness = "acp.beta"
 
     #[test]
     fn dedicated_acp_command_exists_and_serve_has_no_no_a2a_escape_hatch() {
-        assert!(Cli::try_parse_from(["kit", "acp", "--root", "."]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "openrouter",]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
     }
 

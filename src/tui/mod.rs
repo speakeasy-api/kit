@@ -73,9 +73,11 @@ const FAILURE_LINES: usize = 5;
 /// transcript it owns is closed out before the agent is killed.
 const SETTLE: Duration = Duration::from_secs(3);
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     root: &Path,
     model: &str,
+    provider: crate::ProviderKind,
     a2a: Option<&str>,
     mcp_config: Option<&Path>,
     credential_storage: &CredentialStorage,
@@ -92,8 +94,13 @@ pub async fn run(
         .map(str::to_string)
         .unwrap_or_else(crate::session::new_id);
     let active_persisted_id = Arc::new(Mutex::new(persisted_session_id.clone()));
-    let mut command =
-        crate::acp_child::serve_command(root, model, &persisted_session_id, resume.is_some())?;
+    let mut command = crate::acp_child::serve_command(
+        root,
+        model,
+        provider,
+        &persisted_session_id,
+        resume.is_some(),
+    )?;
     if let Some(address) = a2a {
         command.arg("--a2a").arg(address);
     }

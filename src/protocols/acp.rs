@@ -6,20 +6,18 @@ use agentkit_acp::{
 };
 use async_trait::async_trait;
 
-use crate::{provider::OpenAiSubscriptionAdapter, runtime::Runtime};
+use crate::{provider::KitAdapter, runtime::Runtime};
 
 #[derive(Clone)]
 struct Factory(Arc<Runtime>);
 
 #[async_trait]
-impl AcpAgentFactory<OpenAiSubscriptionAdapter> for Factory {
+impl AcpAgentFactory<KitAdapter> for Factory {
     async fn start(
         &self,
         context: AcpAgentFactoryContext,
     ) -> Result<
-        agentkit_loop::LoopDriver<
-            <OpenAiSubscriptionAdapter as agentkit_loop::ModelAdapter>::Session,
-        >,
+        agentkit_loop::LoopDriver<<KitAdapter as agentkit_loop::ModelAdapter>::Session>,
         AcpRuntimeError,
     > {
         self.0.start_acp_driver(context).await
@@ -38,7 +36,7 @@ async fn serve_transport(
         .name("kit")
         .approval_resolver(AutoDenyResolver)
         .build()?;
-    AcpHeadlessRuntime::<OpenAiSubscriptionAdapter>::builder()
+    AcpHeadlessRuntime::<KitAdapter>::builder()
         .integration(integration)
         .agent_factory(Factory(runtime))
         .serve_transport(transport)

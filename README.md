@@ -11,6 +11,7 @@ It exposes:
 - hidden compose children for shell commands, hunk edits, reusable ACP-backed Kit subagents, A2A calls, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
 - ChatGPT Pro through an existing Codex login
+- OpenRouter through AgentKit's OpenRouter provider adapter
 
 It intentionally has no permissions framework, provenance ledger, rollback system,
 control-plane authentication, or web UI.
@@ -63,15 +64,36 @@ endpoint.
 Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
 that order. Credential login and refresh remain Codex's job.
 
+To use OpenRouter, set `OPENROUTER_API_KEY`, select the provider, and pass an
+OpenRouter model identifier:
+
+```sh
+OPENROUTER_API_KEY=sk-or-v1-... cargo run -- prompt \
+  --provider openrouter --model anthropic/claude-sonnet-4 \
+  --root /path/to/project "Reply with a short project summary"
+```
+
+Kit uses the selected `--model` or configured `model`; `OPENROUTER_MODEL` does not
+override it. The adapter also honors its optional `OPENROUTER_BASE_URL`,
+`OPENROUTER_APP_NAME`, `OPENROUTER_SITE_URL`, `OPENROUTER_MAX_COMPLETION_TOKENS`,
+`OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT` settings.
+
+Kit also reads the OpenRouter model catalog's
+`context_length` for the selected model, enabling the normal context gauge and
+80% automatic-compaction threshold. Catalog lookup is best-effort; an unknown
+model or unavailable catalog leaves usage reporting intact but disables the gauge
+and automatic compaction rather than guessing a window.
+
 ## Configuration
 
 Kit loads optional defaults from `~/.kit/config.toml`. Command-line values take
 precedence, and omitted values that are not configured retain Kit's built-in
-defaults (`root = "."`, `model = "gpt-5.4"`, and in-memory OAuth
-credentials). Supported keys are:
+defaults (`root = "."`, `provider = "openai-subscription"`,
+`model = "gpt-5.4"`, and in-memory OAuth credentials). Supported keys are:
 
 ```toml
 root = "/path/to/project"
+provider = "openai-subscription" # or openrouter
 model = "gpt-5.4"
 a2a = "127.0.0.1:7331"
 mcp_config = "/path/to/mcp.json"
@@ -92,14 +114,14 @@ args = ["acp"]
 harness = "acp.review"
 ```
 
-`root`, `model`, and the MCP settings apply to every command. `a2a` applies to
+`root`, `provider`, `model`, and the MCP settings apply to every command. `a2a` applies to
 `serve` and `tui`. ACP profiles are trusted, strict `command`/`args` argv
 configurations: Kit does not invoke a shell and always sets the child cwd to the
 runtime root. Multiple names may be configured. `[subagent].harness` selects the
 default; references must use the fully qualified `acp.<name>` form. When
 omitted, `acp.kit` runs the current executable with `acp` as its base argv. An
 explicit `[acp.kit]` overrides that executable/base argv. In both cases Kit then
-appends root, model, persistent session, resume, MCP, credential, and inherited
+appends root, provider, model, persistent session, resume, MCP, credential, and inherited
 depth flags, and the profile remains eligible for isolated Kit transcript fork
 fallback. Other profiles remain literal generic ACP argv. Configured child
 processes inherit Kit's environment unchanged in this release.
@@ -290,7 +312,7 @@ unsupported error. A stale generation is rejected, which makes concurrent reuse
 explicit in the Runlet dataflow. The pinned Runlet/AgentKit bridge exposes
 one JSON argument per hidden tool, so `prompt` and `fork` use the small object
 form above instead of two positional arguments. Built-in Kit children inherit
-root, model, MCP configuration, credential storage, cancellation, and nesting
+root, provider, model, MCP configuration, credential storage, cancellation, and nesting
 depth; generic profiles receive standard ACP initialization/new-session/prompt
 traffic and run with the root as cwd. Sessions remain reusable only for the
 lifetime of the parent Kit process. Built-in Kit transcripts remain on disk
