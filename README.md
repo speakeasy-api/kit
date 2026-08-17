@@ -228,11 +228,14 @@ Nested agents are parent-owned named ACP subprocesses. They are ordinary Runlet
 values rather than background tasks:
 
 ```text
-first = subagent({ prompt: "Inspect the parser", harness: "acp.claude" })
+first = subagent({ prompt: "Inspect the parser" })
 second = prompt({ subagent: first, prompt: "Now propose the smallest fix" })
 branch = fork({ subagent: second, prompt: "Try the alternative design" })
 return { main: second.output, alternative: branch.output }
 ```
+
+The optional `harness` argument overrides the user's configured harness preference
+with the selected value. Default to omitting it.
 
 Each call returns `{ id, output, generation }`. By default, `output` remains the
 agent's text. When a turn also emits non-text agent content, tool calls, tool-call
