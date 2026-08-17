@@ -1,8 +1,9 @@
 //! Durable, append-only session transcripts and their filesystem lock.
 
 use std::{
+    env,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -42,6 +43,7 @@ pub struct SessionObserver(Arc<Mutex<Writer>>);
 struct Writer {
     session_id: String,
     generation: u64,
+    path: PathBuf,
     file: File,
     lock: SessionLock,
 }
@@ -72,8 +74,17 @@ pub fn new_id() -> String {
 /// A file that lost a tool result is repaired in memory only; writing the
 /// repair back is reserved for [`open`], which holds the transcript's lock.
 pub fn load(root: &Path, session_id: &str) -> Result<Vec<Item>, String> {
+    load_in(root, &default_directory()?, session_id)
+}
+
+pub(crate) fn load_in(
+    root: &Path,
+    directory: &Path,
+    session_id: &str,
+) -> Result<Vec<Item>, String> {
     validate_id(session_id)?;
-    let (mut items, _) = read_records(&transcript_path(root, session_id), session_id)?;
+    let path = preferred_transcript(directory, root, session_id)?;
+    let (mut items, _) = read_records(&path, session_id)?;
     crate::transcript::repair_unanswered_tool_calls(&mut items);
     Ok(items)
 }
@@ -83,8 +94,25 @@ pub fn load(root: &Path, session_id: &str) -> Result<Vec<Item>, String> {
 /// The source remains owned by its ACP child; callers serialize this operation
 /// with prompts so the read is a stable, completed-turn snapshot.
 pub fn clone_completed(root: &Path, source: &str, destination: &str) -> Result<(), String> {
-    let transcript = load(root, source)?;
-    let opened = open_with_initial_timestamps(root, destination, false, false, transcript, false)?;
+    clone_completed_in(root, &default_directory()?, source, destination)
+}
+
+pub(crate) fn clone_completed_in(
+    root: &Path,
+    directory: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<(), String> {
+    let transcript = load_in(root, directory, source)?;
+    let opened = open_with_initial_timestamps_in(
+        root,
+        directory,
+        destination,
+        false,
+        false,
+        transcript,
+        false,
+    )?;
     drop(opened);
     Ok(())
 }
@@ -93,11 +121,13 @@ pub fn clone_completed(root: &Path, source: &str, destination: &str) -> Result<(
 ///
 /// This is the last-resort cleanup path for a hosting client whose server had
 /// to be killed before normal `SessionLock` destruction completed.
-pub fn remove_stale_lock(root: &Path, session_id: &str) -> Result<(), String> {
+pub fn remove_stale_lock(_root: &Path, session_id: &str) -> Result<(), String> {
+    remove_stale_lock_in(&default_directory()?, session_id)
+}
+
+pub(crate) fn remove_stale_lock_in(directory: &Path, session_id: &str) -> Result<(), String> {
     validate_id(session_id)?;
-    let path = root
-        .join(".kit/sessions")
-        .join(format!("{session_id}.lock"));
+    let path = lock_path(directory, session_id);
     let file = match OpenOptions::new().read(true).write(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -120,11 +150,30 @@ pub fn open(
     force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
-    open_with_initial_timestamps(root, session_id, resume, force, initial, true)
+    open_in(
+        root,
+        &default_directory()?,
+        session_id,
+        resume,
+        force,
+        initial,
+    )
 }
 
-fn open_with_initial_timestamps(
+pub(crate) fn open_in(
     root: &Path,
+    directory: &Path,
+    session_id: &str,
+    resume: bool,
+    force: bool,
+    initial: Vec<Item>,
+) -> Result<OpenSession, String> {
+    open_with_initial_timestamps_in(root, directory, session_id, resume, force, initial, true)
+}
+
+fn open_with_initial_timestamps_in(
+    root: &Path,
+    directory: &Path,
     session_id: &str,
     resume: bool,
     force: bool,
@@ -135,25 +184,36 @@ fn open_with_initial_timestamps(
     if !resume && initial.is_empty() {
         return Err("a new session requires an initial transcript".into());
     }
-    let directory = root.join(".kit/sessions");
-    fs::create_dir_all(&directory)
+    fs::create_dir_all(directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
-    let path = transcript_path(root, session_id);
-    if resume && !path.is_file() {
-        return Err(format!("session {session_id:?} does not exist"));
-    }
-    if !resume && path.exists() {
+    let path = transcript_path(directory, session_id);
+    let legacy = legacy_transcript(root, session_id);
+    let lock = SessionLock::acquire(lock_path(directory, session_id), force)?;
+    let global_exists = path
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+    let legacy_exists = legacy
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?;
+    if resume && !global_exists {
+        if !legacy_exists {
+            return Err(format!("session {session_id:?} does not exist"));
+        }
+        let _legacy_lock = lock_legacy_for_migration(&legacy)?;
+        read_records(&legacy, session_id)?;
+        copy_new(&legacy, &path)?;
+    } else if !resume && (global_exists || legacy_exists) {
         return Err(format!(
             "session {session_id:?} already exists; use --resume"
         ));
     }
-    let lock = SessionLock::acquire(directory.join(format!("{session_id}.lock")), force)?;
     let (mut transcript, mut generation) = if resume {
         read_records(&path, session_id)?
     } else {
         (Vec::new(), 0)
     };
     let file = OpenOptions::new()
+        .read(true)
         .create(true)
         .append(true)
         .open(&path)
@@ -161,6 +221,7 @@ fn open_with_initial_timestamps(
     let mut writer = Writer {
         session_id: session_id.into(),
         generation,
+        path,
         file,
         lock,
     };
@@ -229,7 +290,7 @@ impl Writer {
     }
 
     fn append_snapshot_item(&mut self, item: &Item) -> Result<(), String> {
-        self.lock.check()?;
+        self.ensure_lock()?;
         let generation = self
             .generation
             .checked_add(1)
@@ -245,7 +306,7 @@ impl Writer {
     }
 
     fn replace(&mut self, transcript: &[Item]) -> Result<(), String> {
-        self.lock.check()?;
+        self.ensure_lock()?;
         let generation = self
             .generation
             .checked_add(1)
@@ -272,6 +333,75 @@ impl Writer {
             .map_err(|error| format!("could not persist transcript record: {error}"))?;
         self.generation = generation;
         Ok(())
+    }
+
+    fn ensure_lock(&mut self) -> Result<(), String> {
+        match self.lock.check() {
+            Ok(()) => {
+                if self.path.try_exists().map_err(|error| {
+                    format!("could not inspect {}: {error}", self.path.display())
+                })? {
+                    Ok(())
+                } else {
+                    self.reconstruct()
+                }
+            }
+            Err(LockError::Missing) => self.recover(),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn recover(&mut self) -> Result<(), String> {
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| "session transcript has no parent directory".to_string())?;
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("could not recreate session directory: {error}"))?;
+        let lock = SessionLock::acquire(lock_path(directory, &self.session_id), false)?;
+        self.reconstruct()?;
+        self.lock = lock;
+        Ok(())
+    }
+
+    fn reconstruct(&mut self) -> Result<(), String> {
+        let mut source = self
+            .file
+            .try_clone()
+            .and_then(|mut file| {
+                file.rewind()?;
+                Ok(file)
+            })
+            .map_err(|error| format!("could not read open session transcript: {error}"))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(&self.path)
+            .map_err(|error| format!("could not reconstruct {}: {error}", self.path.display()))?;
+        if let Err(error) = io::copy(&mut source, &mut file).and_then(|_| file.sync_all()) {
+            let _ = fs::remove_file(&self.path);
+            return Err(format!(
+                "could not reconstruct {}: {error}",
+                self.path.display()
+            ));
+        }
+        self.file = file;
+        Ok(())
+    }
+}
+
+enum LockError {
+    Missing,
+    Other(String),
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("session lock was lost"),
+            Self::Other(error) => formatter.write_str(error),
+        }
     }
 }
 
@@ -309,13 +439,20 @@ impl SessionLock {
         })
     }
 
-    fn check(&self) -> Result<(), String> {
-        let current = fs::read_to_string(&self.path)
-            .map_err(|error| format!("session lock was lost: {error}"))?;
+    fn check(&self) -> Result<(), LockError> {
+        let current = fs::read_to_string(&self.path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                LockError::Missing
+            } else {
+                LockError::Other(format!("session lock was lost: {error}"))
+            }
+        })?;
         if current == self.token {
             Ok(())
         } else {
-            Err("session lock was overridden by another Kit instance".into())
+            Err(LockError::Other(
+                "session lock was overridden by another Kit instance".into(),
+            ))
         }
     }
 }
@@ -383,9 +520,84 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
     Ok((items, expected - 1))
 }
 
-fn transcript_path(root: &Path, session_id: &str) -> PathBuf {
-    root.join(".kit/sessions")
-        .join(format!("{session_id}.jsonl"))
+fn default_directory() -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".kit/sessions"))
+        .ok_or_else(|| "HOME is unset; cannot locate durable sessions".into())
+}
+
+fn preferred_transcript(
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    let global = transcript_path(directory, session_id);
+    if global
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
+    {
+        Ok(global)
+    } else {
+        Ok(legacy_transcript(root, session_id))
+    }
+}
+
+fn lock_legacy_for_migration(transcript: &Path) -> Result<Option<File>, String> {
+    let path = transcript.with_extension("lock");
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect legacy session lock {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    file.try_lock().map_err(|_| {
+        format!(
+            "legacy session is actively locked by another Kit instance ({}); stop it before resuming with this Kit version",
+            path.display()
+        )
+    })?;
+    Ok(Some(file))
+}
+
+fn copy_new(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut source =
+        File::open(source).map_err(|error| format!("could not read legacy session: {error}"))?;
+    let mut copied = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| {
+            format!(
+                "could not copy legacy session to {}: {error}",
+                destination.display()
+            )
+        })?;
+    if let Err(error) = io::copy(&mut source, &mut copied).and_then(|_| copied.sync_all()) {
+        let _ = fs::remove_file(destination);
+        return Err(format!(
+            "could not copy legacy session to {}: {error}",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn transcript_path(directory: &Path, session_id: &str) -> PathBuf {
+    directory.join(format!("{session_id}.jsonl"))
+}
+
+fn legacy_transcript(root: &Path, session_id: &str) -> PathBuf {
+    transcript_path(&root.join(".kit/sessions"), session_id)
+}
+
+fn lock_path(directory: &Path, session_id: &str) -> PathBuf {
+    directory.join(format!("{session_id}.lock"))
 }
 
 fn validate_id(value: &str) -> Result<(), String> {
@@ -405,6 +617,52 @@ fn validate_id(value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use agentkit_core::{ItemKind, Part};
+
+    fn session_directory(root: &Path) -> PathBuf {
+        root.join("sessions")
+    }
+
+    fn project_root(root: &Path) -> PathBuf {
+        root.join("project")
+    }
+
+    fn open(
+        root: &Path,
+        session_id: &str,
+        resume: bool,
+        force: bool,
+        initial: Vec<Item>,
+    ) -> Result<OpenSession, String> {
+        open_in(
+            &project_root(root),
+            &session_directory(root),
+            session_id,
+            resume,
+            force,
+            initial,
+        )
+    }
+
+    fn load(root: &Path, session_id: &str) -> Result<Vec<Item>, String> {
+        load_in(&project_root(root), &session_directory(root), session_id)
+    }
+
+    fn clone_completed(root: &Path, source: &str, destination: &str) -> Result<(), String> {
+        clone_completed_in(
+            &project_root(root),
+            &session_directory(root),
+            source,
+            destination,
+        )
+    }
+
+    fn remove_stale_lock(root: &Path, session_id: &str) -> Result<(), String> {
+        remove_stale_lock_in(&session_directory(root), session_id)
+    }
+
+    fn transcript_path(root: &Path, session_id: &str) -> PathBuf {
+        super::transcript_path(&session_directory(root), session_id)
+    }
 
     #[test]
     fn appends_versioned_generations_and_resumes() {
@@ -490,7 +748,7 @@ mod tests {
     #[test]
     fn reads_legacy_null_and_missing_timestamps() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(".kit/sessions");
+        let directory = session_directory(root.path());
         fs::create_dir_all(&directory).unwrap();
         let mut missing = serde_json::to_value(Item::text(ItemKind::System, "missing")).unwrap();
         missing.as_object_mut().unwrap().remove("created_at");
@@ -524,7 +782,7 @@ mod tests {
     #[test]
     fn cloning_preserves_historical_unknown_timestamps() {
         let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join(".kit/sessions");
+        let directory = session_directory(root.path());
         fs::create_dir_all(&directory).unwrap();
         let lines = [
             serde_json::json!({
@@ -753,9 +1011,9 @@ mod tests {
             "force must not steal authority from a live owner"
         );
         drop(first);
-        fs::write(root.path().join(".kit/sessions/abc.lock"), "abandoned").unwrap();
+        fs::write(session_directory(root.path()).join("abc.lock"), "abandoned").unwrap();
         remove_stale_lock(root.path(), "abc").unwrap();
-        assert!(!root.path().join(".kit/sessions/abc.lock").exists());
+        assert!(!session_directory(root.path()).join("abc.lock").exists());
         assert!(
             open(
                 root.path(),
@@ -766,5 +1024,158 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn legacy_load_falls_back_without_copy_and_resume_migrates() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = project_root(root.path()).join(".kit/sessions");
+        fs::create_dir_all(&legacy).unwrap();
+        let item = Item::text(ItemKind::System, "legacy").with_created_at(Timestamp(7));
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: "abc".into(),
+            generation: 1,
+            item: Some(item.clone()),
+            replacement: None,
+        };
+        fs::write(
+            legacy.join("abc.jsonl"),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(load(root.path(), "abc").unwrap(), vec![item.clone()]);
+        assert!(!transcript_path(root.path(), "abc").exists());
+
+        let legacy_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(legacy.join("abc.lock"))
+            .unwrap();
+        legacy_lock.try_lock().unwrap();
+        assert!(
+            open(root.path(), "abc", true, false, Vec::new())
+                .err()
+                .unwrap()
+                .contains("legacy session is actively locked")
+        );
+        drop(legacy_lock);
+
+        let resumed = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(resumed.transcript, vec![item]);
+        write(&resumed.observer, &Item::text(ItemKind::User, "global"));
+        drop(resumed);
+
+        assert!(transcript_path(root.path(), "abc").is_file());
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn global_transcript_wins_over_legacy() {
+        let root = tempfile::tempdir().unwrap();
+        let global = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "global")],
+        )
+        .unwrap();
+        let expected = global.transcript.clone();
+        drop(global);
+        let legacy = project_root(root.path()).join(".kit/sessions");
+        fs::create_dir_all(&legacy).unwrap();
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: "abc".into(),
+            generation: 1,
+            item: Some(Item::text(ItemKind::System, "legacy")),
+            replacement: None,
+        };
+        fs::write(
+            legacy.join("abc.jsonl"),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(load(root.path(), "abc").unwrap(), expected);
+    }
+
+    #[test]
+    fn writer_reconstructs_deleted_storage_from_open_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(&opened.observer, &Item::text(ItemKind::User, "before"));
+
+        fs::remove_dir_all(session_directory(root.path())).unwrap();
+        write(&opened.observer, &Item::text(ItemKind::Assistant, "after"));
+        write(&opened.observer, &Item::text(ItemKind::User, "continued"));
+
+        assert!(session_directory(root.path()).join("abc.lock").is_file());
+        assert_eq!(stored(root.path()).len(), 4);
+        drop(opened);
+        assert_eq!(
+            open(root.path(), "abc", true, false, Vec::new())
+                .unwrap()
+                .transcript
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn writer_reconstructs_a_deleted_transcript_while_keeping_its_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(&opened.observer, &Item::text(ItemKind::User, "before"));
+        fs::remove_file(transcript_path(root.path(), "abc")).unwrap();
+
+        write(&opened.observer, &Item::text(ItemKind::Assistant, "after"));
+
+        assert_eq!(stored(root.path()).len(), 3);
+        assert!(session_directory(root.path()).join("abc.lock").is_file());
+    }
+
+    #[test]
+    fn writer_fails_closed_when_another_owner_wins_recovery_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        fs::remove_dir_all(session_directory(root.path())).unwrap();
+        fs::create_dir_all(session_directory(root.path())).unwrap();
+        let other = SessionLock::acquire(
+            super::lock_path(&session_directory(root.path()), "abc"),
+            false,
+        )
+        .unwrap();
+        let item = Item::text(ItemKind::User, "must not persist").with_created_at(Timestamp(9));
+
+        let error = opened.observer.0.lock().unwrap().append(&item).unwrap_err();
+
+        assert!(error.contains("overridden by another Kit instance"));
+        assert!(!transcript_path(root.path(), "abc").exists());
+        drop(other);
     }
 }

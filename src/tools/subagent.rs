@@ -290,6 +290,7 @@ impl Subagents {
         &self,
         prior: &SubagentValue,
         cancellation: &TurnCancellation,
+        directory: &std::path::Path,
     ) -> Result<String, ChildError> {
         let source = self.lookup(prior)?;
         let source = tokio::select! {
@@ -299,7 +300,8 @@ impl Subagents {
         self.check_active(&source)?;
         self.check_generation(prior, source.generation)?;
         let id = session::new_id();
-        session::clone_completed(&self.config.root, &prior.id, &id).map_err(ChildError::Failed)?;
+        session::clone_completed_in(&self.config.root, directory, &prior.id, &id)
+            .map_err(ChildError::Failed)?;
         // This is the stable snapshot boundary. Returning drops the source
         // guard before child startup or the branch prompt can begin.
         drop(source);
@@ -634,7 +636,16 @@ mod tests {
     async fn fork_snapshot_releases_source_before_child_work() {
         let directory = tempfile::tempdir().unwrap();
         let transcript = vec![Item::text(ItemKind::System, "system")];
-        let opened = session::open(directory.path(), "source", false, false, transcript).unwrap();
+        let sessions = directory.path().join("sessions");
+        let opened = session::open_in(
+            directory.path(),
+            &sessions,
+            "source",
+            false,
+            false,
+            transcript,
+        )
+        .unwrap();
         let manager = Subagents::new(
             ChildConfig {
                 root: directory.path().to_path_buf(),
@@ -668,7 +679,7 @@ mod tests {
         };
 
         let branch = manager
-            .clone_for_fork(&prior, &TurnCancellation::default())
+            .clone_for_fork(&prior, &TurnCancellation::default(), &sessions)
             .await
             .unwrap();
 
@@ -676,7 +687,7 @@ mod tests {
             state.try_lock().is_ok(),
             "source remained locked after snapshot"
         );
-        assert!(session::load(directory.path(), &branch).is_ok());
+        assert!(session::load_in(directory.path(), &sessions, &branch).is_ok());
         drop(opened);
     }
     fn manager_with_disconnected_session(
