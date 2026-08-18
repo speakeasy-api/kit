@@ -33,7 +33,31 @@ base64 < AuthKey_KEYID.p8 | tr -d '\n' | \
 Do not use the private repository's broad personal token for
 `KIT_RELEASES_TOKEN`.
 
-## Publish a release
+## Publish an unsigned prerelease
+
+For fast internal or early testing, tag the release commit with the Cargo version
+and a `-pre` suffix:
+
+```sh
+git tag v0.1.29-pre
+git push origin v0.1.29-pre
+```
+
+Use `-pre.N` for additional candidates of the same Cargo version, for example
+`v0.1.29-pre.2`. The prerelease workflow runs the Rust checks, builds Linux x64
+and macOS arm64 in parallel, and publishes a GitHub prerelease. It does not use
+the Developer ID certificate or submit the macOS binary to Apple for
+notarization. Consequently, macOS Gatekeeper may require users to explicitly
+approve the prerelease binary.
+
+Prerelease tags do not trigger the signed release workflow. Install a specific
+prerelease with:
+
+```sh
+mise use github:danielkov/kit-releases@0.1.29-pre
+```
+
+## Publish a signed release
 
 1. Update `Cargo.toml` and `Cargo.lock` to the new version.
 2. Merge the release commit to the default branch.
@@ -44,9 +68,9 @@ Do not use the private repository's broad personal token for
    git push origin v0.1.28
    ```
 
-The release workflow verifies the tag, runs the Rust checks, builds Linux x64
-and macOS arm64 binaries, signs and notarizes macOS, generates SHA-256 checksums,
-and creates the public release. A missing target or credential fails the release
+The signed release workflow verifies the tag, runs the Rust checks, builds Linux
+x64 and macOS arm64 binaries, signs and notarizes macOS, generates SHA-256
+checksums, and creates the public release. A missing target or credential fails the release
 rather than publishing a partial one.
 
 Verify the published result from a clean environment:
