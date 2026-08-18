@@ -1061,6 +1061,7 @@ mod tests {
                 .unwrap()
                 .contains("legacy session is actively locked")
         );
+        legacy_lock.unlock().unwrap();
         drop(legacy_lock);
 
         let resumed = open(root.path(), "abc", true, false, Vec::new()).unwrap();

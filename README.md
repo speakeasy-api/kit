@@ -16,6 +16,21 @@ It exposes:
 It intentionally has no permissions framework, provenance ledger, rollback system,
 control-plane authentication, or web UI.
 
+## Install
+
+Prebuilt binaries are published from the public, binary-only
+[`danielkov/kit-releases`](https://github.com/danielkov/kit-releases) repository.
+Install the latest release with mise:
+
+```sh
+mise use -g github:danielkov/kit-releases
+kit --version
+```
+
+Pin a release by appending its version, for example
+`github:danielkov/kit-releases@0.1.28`. The source repository remains private;
+the release repository contains only packaged executables and checksums.
+
 ## Run
 
 Authenticate with Codex once, then start the TUI:
