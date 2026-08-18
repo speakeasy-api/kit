@@ -294,6 +294,34 @@ pub async fn run(
                                         }));
                                     }));
                                 }
+                                Action::Compact(next_prompt) => {
+                                    let control = crate::compaction::manual_prompt(
+                                        next_prompt.as_deref(),
+                                    );
+                                    if let Some(prompt) = next_prompt {
+                                        app.push_user(prompt);
+                                    } else {
+                                        app.begin_compaction();
+                                    }
+                                    let connection = connection.clone();
+                                    let session = session_id.clone();
+                                    let updates = updates_tx.clone();
+                                    turn = Some(tokio::spawn(async move {
+                                        let outcome = connection
+                                            .send_request(agentkit_acp::PromptRequest::new(
+                                                session,
+                                                vec![ContentBlock::Text(
+                                                    agentkit_acp::TextContent::new(control),
+                                                )],
+                                            ))
+                                            .block_task()
+                                            .await;
+                                        let _ = updates.send(Update::TurnEnded(match outcome {
+                                            Ok(_) => None,
+                                            Err(error) => Some(error.to_string()),
+                                        }));
+                                    }));
+                                }
                                 Action::New(first_prompt) => {
                                     // Idle-only key handling guarantees there is no active
                                     // turn to abandon. Await its completed task before closing

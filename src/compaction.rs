@@ -19,6 +19,25 @@ use crate::{
 };
 
 const COMPACTION_PERCENT: u64 = 80;
+// The TUI sends this model-invisible control input through ACP. NUL cannot be
+// entered in its editor, so an ordinary user prompt cannot collide with it.
+const MANUAL_PREFIX: &str = "\0kit:compact\0";
+
+/// Encodes a manual-compaction request as an ACP text prompt. The mutator
+/// consumes the marker before provider dispatch and retains only `next`.
+pub fn manual_prompt(next: Option<&str>) -> String {
+    format!("{MANUAL_PREFIX}{}", next.unwrap_or_default())
+}
+
+fn manual_message(item: &Item) -> Option<&str> {
+    if item.kind != ItemKind::User || item.parts.len() != 1 {
+        return None;
+    }
+    let Part::Text(text) = &item.parts[0] else {
+        return None;
+    };
+    text.text.strip_prefix(MANUAL_PREFIX)
+}
 
 /// Builds the standard Kit compactor.
 ///
@@ -38,7 +57,13 @@ where
         session_id: session_id.into(),
     };
     let inner = StrategyCompactor::new(
-        |transcript: &[Item], _point: MutationPoint| compaction_reason(transcript),
+        |transcript: &[Item], _point: MutationPoint| {
+            transcript
+                .last()
+                .and_then(manual_message)
+                .map(|_| CompactionReason::Manual)
+                .or_else(|| compaction_reason(transcript))
+        },
         CompactionPipeline::new()
             .with_strategy(DropReasoningStrategy::new())
             .with_strategy(SummarizeForContinuation),
@@ -148,6 +173,15 @@ impl CompactionStrategy for SummarizeForContinuation {
         let backend = ctx.backend.ok_or_else(|| {
             CompactionError::MissingBackend("automatic compaction requires a backend".into())
         })?;
+        let manual = (request.reason == CompactionReason::Manual)
+            .then(|| {
+                request
+                    .transcript
+                    .last()
+                    .and_then(manual_message)
+                    .map(str::to_string)
+            })
+            .flatten();
         let latest_user = request
             .transcript
             .iter()
@@ -163,7 +197,15 @@ impl CompactionStrategy for SummarizeForContinuation {
             })
             .collect::<Vec<_>>();
         if summarized_indices.is_empty() {
-            return Ok(CompactionResult::new(request.transcript, 0));
+            let mut transcript = request.transcript;
+            if let Some(next) = manual {
+                let marker = transcript.pop().expect("manual marker is the last item");
+                if !next.is_empty() {
+                    transcript.push(user_message_from_marker(marker, &next));
+                }
+                return Ok(CompactionResult::new(transcript, 1));
+            }
+            return Ok(CompactionResult::new(transcript, 0));
         }
         let first = summarized_indices[0];
         let summarized = summarized_indices
@@ -191,11 +233,24 @@ impl CompactionStrategy for SummarizeForContinuation {
                 replacement.extend(summary.items.clone());
             }
             if !summarized.contains(&index) {
-                replacement.push(item);
+                if Some(index) == latest_user
+                    && let Some(next) = &manual
+                {
+                    if !next.is_empty() {
+                        replacement.push(user_message_from_marker(item, next));
+                    }
+                } else {
+                    replacement.push(item);
+                }
             }
         }
         Ok(CompactionResult::new(replacement, summarized.len()))
     }
+}
+
+fn user_message_from_marker(mut marker: Item, message: &str) -> Item {
+    marker.parts = Item::text(ItemKind::User, message).parts;
+    marker
 }
 
 pub struct AutomaticCompactor {
@@ -408,6 +463,68 @@ mod tests {
             panic!("latest user should remain text");
         };
         assert_eq!(text.text, "current request");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_consumes_command_without_starting_a_model_turn() {
+        let transcript = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::User, "old request"),
+            Item::text(ItemKind::Assistant, "old answer"),
+            Item::text(ItemKind::User, manual_prompt(None)),
+        ];
+        let backend = FixedBackend;
+        let mut context = CompactionContext::new().with_backend(&backend);
+        let result = SummarizeForContinuation
+            .apply(
+                CompactionRequest::new(transcript, CompactionReason::Manual),
+                &mut context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .transcript
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            [ItemKind::System, ItemKind::Developer]
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_retains_the_optional_next_user_message() {
+        let transcript = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::User, "old request"),
+            Item::text(ItemKind::Assistant, "old answer"),
+            Item::text(ItemKind::User, manual_prompt(Some("next request"))),
+        ];
+        let backend = FixedBackend;
+        let mut context = CompactionContext::new().with_backend(&backend);
+        let result = SummarizeForContinuation
+            .apply(
+                CompactionRequest::new(transcript, CompactionReason::Manual),
+                &mut context,
+            )
+            .await
+            .unwrap();
+
+        let next = result.transcript.last().unwrap();
+        assert_eq!(next.kind, ItemKind::User);
+        let Part::Text(text) = &next.parts[0] else {
+            panic!("next message should remain text");
+        };
+        assert_eq!(text.text, "next request");
+    }
+
+    #[test]
+    fn manual_prompt_triggers_without_usage() {
+        assert_eq!(
+            manual_message(&Item::text(ItemKind::User, manual_prompt(None))),
+            Some("")
+        );
     }
 
     #[test]

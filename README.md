@@ -398,6 +398,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | --- | --- |
 | `⏎` | send |
 | `/new` | start a fresh persisted session (`/new prompt` sends its first prompt) |
+| `/compact` | compact context now (`/compact prompt` starts the next turn with `prompt`) |
 | `⇧⏎`, `⌥⏎`, `^j` | newline |
 | `esc` | interrupt the running turn |
 | `^c` | interrupt, or quit when idle |
@@ -417,7 +418,9 @@ no credentials — the client exits with that agent's own last diagnostic rather
 than waiting on a handshake that will never finish.
 
 `/new` clears the visible transcript but leaves the prior persisted session
-intact and resumable. Slash commands are recognized only as exact leading
+intact and resumable. `/compact` ends after compaction when used alone; text after
+the command is retained as a new user message and starts the next model turn.
+Slash commands are recognized only as exact leading
 tokens. Unknown slash commands are sent to the model unchanged. Pasting
 multi-line text puts line breaks in the prompt instead of sending it.
 The client asks the terminal to bracket pastes; where that is unavailable a

@@ -67,6 +67,7 @@ pub struct ContextUsage {
 pub enum Action {
     None,
     Submit(String),
+    Compact(Option<String>),
     New(Option<String>),
     Cancel,
     Quit,
@@ -610,6 +611,17 @@ impl App {
 
     pub fn push_user(&mut self, prompt: String) {
         self.blocks.push(Block::User(prompt));
+        self.begin_turn();
+    }
+
+    /// Starts a command-only compaction turn without adding the internal
+    /// control prompt to the visible transcript.
+    pub fn begin_compaction(&mut self) {
+        self.compacting = true;
+        self.begin_turn();
+    }
+
+    fn begin_turn(&mut self) {
         self.phase = Phase::Working;
         self.turn_started = Some(Instant::now());
         self.follow = true;
@@ -714,6 +726,7 @@ impl App {
                 }
                 let input = self.editor.submit();
                 return match parse(&input) {
+                    Parsed::Compact { prompt } => Action::Compact(prompt.map(str::to_string)),
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Prompt(prompt) => Action::Submit(prompt.to_string()),
                 };
@@ -1024,6 +1037,17 @@ mod tests {
             panic!("expected the prompt to be sent");
         };
         assert_eq!(prompt, "first line");
+    }
+
+    #[test]
+    fn compact_command_carries_an_optional_next_prompt() {
+        let mut app = app();
+        app.paste("/compact continue with this");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        let Action::Compact(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected manual compaction");
+        };
+        assert_eq!(prompt.as_deref(), Some("continue with this"));
     }
 
     #[test]
