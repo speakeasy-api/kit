@@ -167,8 +167,8 @@ impl ModelSession for OpenAiSubscriptionSession {
             return Err(protocol("request exceeds 8 MiB"));
         }
         let mut unauthorized = false;
-        let mut retry = false;
-        let response = loop {
+        let mut retried = false;
+        loop {
             self.ensure_binding(&credentials)?;
             let mut builder = self
                 .client
@@ -202,18 +202,9 @@ impl ModelSession for OpenAiSubscriptionSession {
             }
             if known_not_dispatched(response.status()) {
                 let delay = retry_after(response.headers());
-                if !retry {
-                    retry = true;
-                    if let Some(delay) = delay {
-                        if let Some(cancel) = cancellation.clone() {
-                            tokio::select! {
-                                _ = cancel.cancelled() => return Err(LoopError::Cancelled),
-                                _ = tokio::time::sleep(delay) => {}
-                            }
-                        } else {
-                            tokio::time::sleep(delay).await;
-                        }
-                    }
+                if !retried {
+                    retried = true;
+                    sleep_before_retry(delay, cancellation.clone()).await?;
                     credentials = self.credentials(None, cancellation.clone()).await?;
                     continue;
                 }
@@ -222,49 +213,68 @@ impl ModelSession for OpenAiSubscriptionSession {
                     response.status()
                 )));
             }
-            break response;
-        };
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(LoopError::Provider(
-                "openai-subscription unauthorized after one refresh".to_owned(),
-            ));
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(LoopError::Provider(
+                    "openai-subscription unauthorized after one refresh".to_owned(),
+                ));
+            }
+            if !status.is_success() {
+                let detail = failure_body_excerpt(response).await;
+                return Err(LoopError::Provider(format!(
+                    "openai-subscription returned {status}{detail}"
+                )));
+            }
+            // The codex backend omits Content-Type on successful SSE responses, so absence
+            // is accepted; only an explicitly different declared type is rejected. The SSE
+            // parser remains fail-closed on malformed bodies.
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            if content_type.is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_none_or(|value| value.trim() != "text/event-stream")
+            }) {
+                return Err(protocol("response is not an SSE stream"));
+            }
+            let response_model = response
+                .headers()
+                .get("openai-model")
+                .map(validated_model_header)
+                .transpose()?;
+            let mut turn = OpenAiSubscriptionTurn::new_inner(
+                response.bytes_stream(),
+                self.config.model.clone(),
+                response_model,
+                self.binding.clone(),
+                self.session_id.clone(),
+                self.context_windows.clone(),
+            );
+            match turn.next_event(cancellation.clone()).await {
+                Ok(Some(event)) => {
+                    turn.queued.push_front(event);
+                    return Ok(turn);
+                }
+                Ok(None) => return Ok(turn),
+                Err(error) => {
+                    let retry = turn
+                        .pending_failure
+                        .as_ref()
+                        .filter(|failure| failure.retriable && !retried)
+                        .map(|failure| failure.retry_after);
+                    if let Some(delay) = retry {
+                        retried = true;
+                        sleep_before_retry(delay, cancellation.clone()).await?;
+                        credentials = self.credentials(None, cancellation.clone()).await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
         }
-        if !status.is_success() {
-            let detail = failure_body_excerpt(response).await;
-            return Err(LoopError::Provider(format!(
-                "openai-subscription returned {status}{detail}"
-            )));
-        }
-        // The codex backend omits Content-Type on successful SSE responses, so absence
-        // is accepted; only an explicitly different declared type is rejected. The SSE
-        // parser remains fail-closed on malformed bodies.
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        if content_type.is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_none_or(|value| value.trim() != "text/event-stream")
-        }) {
-            return Err(protocol("response is not an SSE stream"));
-        }
-        let response_model = response
-            .headers()
-            .get("openai-model")
-            .map(validated_model_header)
-            .transpose()?;
-        let turn = OpenAiSubscriptionTurn::new_inner(
-            response.bytes_stream(),
-            self.config.model.clone(),
-            response_model,
-            self.binding.clone(),
-            self.session_id.clone(),
-            self.context_windows.clone(),
-        );
-        Ok(turn)
     }
 
     fn model_name(&self) -> Option<&str> {
@@ -422,6 +432,20 @@ pub struct OpenAiSubscriptionTurn {
     context_windows: Arc<HashMap<String, u64>>,
     tool_call: bool,
     stream_ended: bool,
+    pending_failure: Option<ResponseFailure>,
+}
+
+#[derive(Clone, Debug)]
+struct ResponseFailure {
+    message: String,
+    retriable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl ResponseFailure {
+    fn error(&self) -> LoopError {
+        LoopError::Provider(self.message.clone())
+    }
 }
 
 struct PartAccumulator {
@@ -482,6 +506,7 @@ impl OpenAiSubscriptionTurn {
             context_windows,
             tool_call: false,
             stream_ended: false,
+            pending_failure: None,
         }
     }
 
@@ -541,6 +566,9 @@ impl OpenAiSubscriptionTurn {
     fn consume_value(&mut self, kind: &str, value: &Value) -> Result<(), LoopError> {
         if self.completed {
             return Err(protocol("event followed response.completed"));
+        }
+        if self.pending_failure.is_some() {
+            return Err(protocol("event followed terminal provider error"));
         }
         match kind {
             "response.created" => {
@@ -613,7 +641,10 @@ impl OpenAiSubscriptionTurn {
                         .iter()
                         .all(|part| !matches!(part, Part::ToolCall(_)))
                 });
-                return Err(classify_response_failure(value));
+                self.pending_failure = Some(classify_response_failure(value));
+            }
+            "error" => {
+                self.pending_failure = Some(classify_top_level_error(value));
             }
             "response.function_call_arguments.delta"
             | "response.function_call_arguments.done"
@@ -963,8 +994,17 @@ impl ModelTurn for OpenAiSubscriptionTurn {
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         loop {
+            if cancellation
+                .as_ref()
+                .is_some_and(|value| value.is_cancelled())
+            {
+                return Err(LoopError::Cancelled);
+            }
             if let Some(event) = self.queued.pop_front() {
                 return Ok(Some(event));
+            }
+            if let Some(failure) = &self.pending_failure {
+                return Err(failure.error());
             }
             if self.completed {
                 return Ok(None);
@@ -1001,6 +1041,10 @@ impl ModelTurn for OpenAiSubscriptionTurn {
                 self.buffer.drain(..end + delimiter);
                 if !frame.is_empty() {
                     self.consume_frame(&frame)?;
+                }
+                if self.pending_failure.is_some() {
+                    self.buffer.clear();
+                    break;
                 }
             }
             if self.buffer.len() > MAX_EVENT_BYTES {
@@ -1349,32 +1393,39 @@ fn apply_prompt_cache(body: &mut Value, request: &TurnRequest) -> Result<(), Loo
     Ok(())
 }
 
-fn classify_response_failure(value: &Value) -> LoopError {
+fn classify_response_failure(value: &Value) -> ResponseFailure {
     let error = value.pointer("/response/error").unwrap_or(&Value::Null);
-    let code = error
-        .get("code")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 128 && value.is_ascii())
-        .unwrap_or("response_failed");
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 128 && value.is_ascii())
-        .unwrap_or("unknown");
+    classify_provider_error(error, Some(value), "response_failed")
+}
+
+fn classify_top_level_error(value: &Value) -> ResponseFailure {
+    let error = value.get("error").unwrap_or(value);
+    classify_provider_error(error, Some(value), "error")
+}
+
+fn classify_provider_error(
+    error: &Value,
+    envelope: Option<&Value>,
+    fallback_code: &str,
+) -> ResponseFailure {
+    let code = canonical_error_field(error.get("code")).unwrap_or(fallback_code);
+    let error_type = canonical_error_field(error.get("type")).unwrap_or("unknown");
     let status = error
         .get("status")
-        .or_else(|| value.pointer("/response/status_code"))
+        .or_else(|| envelope.and_then(|value| value.get("status")))
+        .or_else(|| envelope.and_then(|value| value.pointer("/response/status_code")))
         .and_then(Value::as_u64);
-    let _retry_after = error
+    let retry_after = error
         .get("retry_after")
-        .or_else(|| value.pointer("/response/retry_after"))
+        .or_else(|| envelope.and_then(|value| value.get("retry_after")))
+        .or_else(|| envelope.and_then(|value| value.pointer("/response/retry_after")))
         .and_then(|value| {
             value
                 .as_u64()
                 .or_else(|| value.as_str()?.parse::<u64>().ok())
         })
         .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
-    let transient = status.is_some_and(|status| status == 429 || (500..=599).contains(&status))
+    let retriable = status.is_some_and(retriable_status_code)
         || [code, error_type].iter().any(|value| {
             matches!(
                 *value,
@@ -1383,13 +1434,13 @@ fn classify_response_failure(value: &Value) -> LoopError {
                     | "rate_limited"
                     | "overloaded"
                     | "server_overloaded"
+                    | "server_error"
+                    | "internal_error"
+                    | "service_unavailable"
+                    | "request_timeout"
+                    | "timeout"
             )
         });
-    if transient {
-        return LoopError::Provider(format!(
-            "openai-subscription transient response failed: {error_type}/{code}"
-        ));
-    }
     let authentication = status.is_some_and(|status| status == 401 || status == 403)
         || [code, error_type].iter().any(|value| {
             matches!(
@@ -1400,21 +1451,24 @@ fn classify_response_failure(value: &Value) -> LoopError {
                     | "unauthorized"
             )
         });
-    if authentication {
-        LoopError::Provider(
-            "openai-subscription authentication failed after inference acceptance".to_owned(),
-        )
+    let message = if authentication {
+        "openai-subscription authentication failed after inference acceptance".to_owned()
+    } else if retriable {
+        format!("openai-subscription transient response failed: {error_type}/{code}")
     } else {
-        LoopError::Provider(format!(
-            "openai-subscription response failed: {error_type}/{code}"
-        ))
+        format!("openai-subscription response failed: {error_type}/{code}")
+    };
+    ResponseFailure {
+        message,
+        retriable,
+        retry_after,
     }
 }
 
-#[cfg(test)]
-#[cfg(any())]
-fn response_failure(value: &Value) -> LoopError {
-    classify_response_failure(value)
+fn canonical_error_field(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128 && value.is_ascii())
 }
 
 fn zeroize_encrypted_content(value: &mut Value) {
@@ -1606,6 +1660,24 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
 }
 
+async fn sleep_before_retry(
+    delay: Option<Duration>,
+    cancellation: Option<agentkit_core::TurnCancellation>,
+) -> Result<(), LoopError> {
+    let Some(delay) = delay else {
+        return Ok(());
+    };
+    if let Some(cancel) = cancellation {
+        tokio::select! {
+            _ = cancel.cancelled() => Err(LoopError::Cancelled),
+            _ = tokio::time::sleep(delay) => Ok(()),
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+}
+
 /// Bounded, printable excerpt of a failure response body, prefixed for message
 /// concatenation; empty when the body is absent or unreadable.
 async fn failure_body_excerpt(response: reqwest::Response) -> String {
@@ -1644,6 +1716,10 @@ fn known_not_dispatched(status: reqwest::StatusCode) -> bool {
     )
 }
 
+fn retriable_status_code(status: u64) -> bool {
+    status == 408 || status == 409 || status == 429 || (500..=599).contains(&status)
+}
+
 fn model_metadata(header: Option<&str>, observed: Option<&str>) -> MetadataMap {
     let mut metadata = MetadataMap::new();
     if let Some(observed) = observed {
@@ -1664,10 +1740,18 @@ fn protocol(message: &str) -> LoopError {
 
 #[cfg(test)]
 mod usage_tests {
+    use std::time::Duration;
+
+    use agentkit_core::CancellationController;
+    use agentkit_loop::{LoopError, ModelTurn, ModelTurnEvent};
+    use bytes::Bytes;
     use futures_util::stream;
     use serde_json::json;
 
-    use super::{OpenAiSubscriptionTurn, parse_context_windows, parse_usage};
+    use super::{
+        MAX_RETRY_AFTER, OpenAiSubscriptionTurn, classify_response_failure,
+        classify_top_level_error, parse_context_windows, parse_usage,
+    };
 
     #[test]
     fn responses_keepalive_is_ignored_without_weakening_unknown_events() {
@@ -1695,6 +1779,120 @@ data: {"type":"future.event","sequence_number":2}
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn top_level_errors_are_classified_without_exposing_provider_messages() {
+        let failure = classify_top_level_error(&json!({
+            "type": "error",
+            "code": "server_error",
+            "message": "sensitive provider detail",
+            "retry_after": "9999"
+        }));
+
+        assert!(failure.retriable);
+        assert_eq!(failure.retry_after, Some(MAX_RETRY_AFTER));
+        assert_eq!(
+            failure.message,
+            "openai-subscription transient response failed: error/server_error"
+        );
+        assert!(!failure.message.contains("sensitive"));
+
+        let permanent = classify_top_level_error(&json!({
+            "type": "error",
+            "code": "invalid_request_error",
+            "message": "do not expose me"
+        }));
+        assert!(!permanent.retriable);
+        assert_eq!(permanent.retry_after, None);
+    }
+
+    #[test]
+    fn response_failed_uses_the_same_retriable_classification() {
+        let failure = classify_response_failure(&json!({
+            "type": "response.failed",
+            "response": {
+                "status_code": 503,
+                "retry_after": 2,
+                "error": {"type": "server_error", "code": "internal_error"}
+            }
+        }));
+
+        assert!(failure.retriable);
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn queued_output_precedes_a_terminal_top_level_error() {
+        let chunk = Bytes::from_static(
+            br#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1","output_index":0,"content_index":0,"delta":"hello"}
+
+event: error
+data: {"type":"error","sequence_number":3,"code":"server_error","message":"retry"}
+
+event: future.event
+data: {"type":"future.event","sequence_number":4}
+
+"#,
+        );
+        let mut turn = OpenAiSubscriptionTurn::new(
+            stream::iter([Ok::<_, reqwest::Error>(chunk)]),
+            "gpt-5.4".into(),
+            None,
+        );
+
+        assert!(matches!(
+            turn.next_event(None).await.unwrap(),
+            Some(ModelTurnEvent::Delta(_))
+        ));
+        assert!(matches!(
+            turn.next_event(None).await.unwrap(),
+            Some(ModelTurnEvent::Delta(_))
+        ));
+        let error = turn.next_event(None).await.unwrap_err().to_string();
+        assert!(error.contains("transient response failed: error/server_error"));
+        assert!(!error.contains("unknown Responses SSE event"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_prefetched_output() {
+        let chunk = Bytes::from_static(
+            br#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1","output_index":0,"content_index":0,"delta":"hello"}
+
+"#,
+        );
+        let mut turn = OpenAiSubscriptionTurn::new(
+            stream::iter([Ok::<_, reqwest::Error>(chunk)]),
+            "gpt-5.4".into(),
+            None,
+        );
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+
+        assert!(matches!(
+            turn.next_event(Some(cancellation.clone())).await.unwrap(),
+            Some(ModelTurnEvent::Delta(_))
+        ));
+        controller.interrupt();
+
+        assert!(matches!(
+            turn.next_event(Some(cancellation)).await,
+            Err(LoopError::Cancelled)
+        ));
     }
 
     #[test]
