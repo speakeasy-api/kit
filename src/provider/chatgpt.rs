@@ -418,6 +418,8 @@ pub struct OpenAiSubscriptionTurn {
     done_ids: HashSet<String>,
     item_indices: HashMap<String, u64>,
     text: HashMap<(String, u64), PartAccumulator>,
+    reasoning: HashMap<(String, u64), PartAccumulator>,
+    reasoning_sections: HashSet<(String, u64)>,
     created: bool,
     completed: bool,
     sequence: Option<u64>,
@@ -492,6 +494,8 @@ impl OpenAiSubscriptionTurn {
             done_ids: HashSet::new(),
             item_indices: HashMap::new(),
             text: HashMap::new(),
+            reasoning: HashMap::new(),
+            reasoning_sections: HashSet::new(),
             created: false,
             completed: false,
             sequence: None,
@@ -594,8 +598,9 @@ impl OpenAiSubscriptionTurn {
             }
             "response.reasoning_summary_text.delta" => {
                 self.require_created()?;
-                bounded_string(value, "delta")?;
-                event_item(value, "summary_index", &self.item_indices)?;
+                let delta = bounded_string(value, "delta")?;
+                let item = event_item(value, "summary_index", &self.item_indices)?;
+                self.append_reasoning_delta(item, delta)?;
             }
             "response.output_item.added" => {
                 self.require_created()?;
@@ -732,14 +737,25 @@ impl OpenAiSubscriptionTurn {
                     .ok_or_else(|| {
                         protocol("encrypted reasoning is missing or outside canonical bounds")
                     })?;
-                for summary in summaries {
-                    bounded_string(summary, "text")?;
+                let item_id = bounded_id(item.get("id"))?;
+                let mut summary_texts = Vec::with_capacity(summaries.len());
+                for (index, summary) in summaries.iter().enumerate() {
+                    let text = bounded_string(summary, "text")?;
+                    self.commit_reasoning_part(item_id, index as u64, text)?;
+                    summary_texts.push(text);
                 }
+                if self.reasoning.keys().any(|(id, _)| id == item_id) {
+                    return Err(protocol(
+                        "completed reasoning omitted streamed summary content",
+                    ));
+                }
+                self.reasoning_sections.retain(|(id, _)| id != item_id);
+                let summary = (!summary_texts.is_empty()).then(|| summary_texts.join("\n\n"));
                 let metadata = continuation_metadata(
                     &self.binding,
                     &self.requested_model,
                     &self.session_id,
-                    bounded_id(item.get("id"))?,
+                    item_id,
                     output_index,
                     "reasoning",
                     Some(encrypted_content),
@@ -749,7 +765,7 @@ impl OpenAiSubscriptionTurn {
                     Item::new(
                         ItemKind::Assistant,
                         vec![Part::Reasoning(ReasoningPart {
-                            summary: None,
+                            summary,
                             data: None,
                             redacted: true,
                             metadata,
@@ -764,7 +780,7 @@ impl OpenAiSubscriptionTurn {
 
     fn complete(&mut self, value: &Value) -> Result<(), LoopError> {
         self.require_created()?;
-        if self.seen_ids != self.done_ids || !self.text.is_empty() {
+        if self.seen_ids != self.done_ids || !self.text.is_empty() || !self.reasoning.is_empty() {
             return Err(protocol(
                 "response.completed preceded complete output items",
             ));
@@ -845,6 +861,7 @@ impl OpenAiSubscriptionTurn {
             item.parts.retain(|part| matches!(part, Part::Text(_)));
         }
         self.output.retain(|item| !item.parts.is_empty());
+        self.reasoning_sections.clear();
         let reason = response
             .get("incomplete_details")
             .and_then(Value::as_object)
@@ -879,6 +896,11 @@ impl OpenAiSubscriptionTurn {
             .text
             .drain()
             .map(|((id, index), part)| (id, index, false, part))
+            .chain(
+                self.reasoning
+                    .drain()
+                    .map(|((id, index), part)| (id, index, true, part)),
+            )
             .collect::<Vec<_>>();
         partial.sort_by_key(|(id, index, reasoning, _)| {
             (
@@ -887,8 +909,17 @@ impl OpenAiSubscriptionTurn {
                 *reasoning,
             )
         });
-        for (id, _, _, part) in partial {
-            let output = Part::Text(TextPart::new(part.text));
+        for (id, _, reasoning, part) in partial {
+            let output = if reasoning {
+                Part::Reasoning(ReasoningPart {
+                    summary: Some(part.text),
+                    data: None,
+                    redacted: true,
+                    metadata: MetadataMap::new(),
+                })
+            } else {
+                Part::Text(TextPart::new(part.text))
+            };
             self.queued
                 .push_back(ModelTurnEvent::Delta(Delta::CommitPart {
                     part: output.clone(),
@@ -957,6 +988,59 @@ impl OpenAiSubscriptionTurn {
             }
             self.queued
                 .push_back(ModelTurnEvent::Delta(Delta::CommitPart { part }));
+        }
+        Ok(())
+    }
+
+    fn append_reasoning_delta(
+        &mut self,
+        item: (String, u64),
+        delta: &str,
+    ) -> Result<(), LoopError> {
+        if self.reasoning_sections.insert(item.clone()) && item.1 > 0 {
+            append_part(
+                &mut self.reasoning,
+                item.clone(),
+                "\n\n",
+                PartKind::Reasoning,
+                &mut self.queued,
+            )?;
+        }
+        append_part(
+            &mut self.reasoning,
+            item,
+            delta,
+            PartKind::Reasoning,
+            &mut self.queued,
+        )
+    }
+
+    fn commit_reasoning_part(
+        &mut self,
+        item_id: &str,
+        index: u64,
+        completed: &str,
+    ) -> Result<(), LoopError> {
+        if let Some(streamed) = self.reasoning.remove(&(item_id.to_owned(), index)) {
+            let expected = if index == 0 {
+                completed.to_owned()
+            } else {
+                format!("\n\n{completed}")
+            };
+            if streamed.text != expected {
+                return Err(protocol(
+                    "completed reasoning differs from streamed summary deltas",
+                ));
+            }
+            self.queued
+                .push_back(ModelTurnEvent::Delta(Delta::CommitPart {
+                    part: Part::Reasoning(ReasoningPart {
+                        summary: Some(expected),
+                        data: None,
+                        redacted: true,
+                        metadata: MetadataMap::new(),
+                    }),
+                }));
         }
         Ok(())
     }
@@ -1742,14 +1826,14 @@ fn protocol(message: &str) -> LoopError {
 mod usage_tests {
     use std::time::Duration;
 
-    use agentkit_core::CancellationController;
+    use agentkit_core::{CancellationController, Delta, Part, PartKind};
     use agentkit_loop::{LoopError, ModelTurn, ModelTurnEvent};
     use bytes::Bytes;
     use futures_util::stream;
     use serde_json::json;
 
     use super::{
-        MAX_RETRY_AFTER, OpenAiSubscriptionTurn, classify_response_failure,
+        CONTINUATION_METADATA, MAX_RETRY_AFTER, OpenAiSubscriptionTurn, classify_response_failure,
         classify_top_level_error, parse_context_windows, parse_usage,
     };
 
@@ -1779,6 +1863,225 @@ data: {"type":"future.event","sequence_number":2}
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn reasoning_summaries_stream_and_are_stored() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "reasoning-1"}
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "Inspecting the repository"
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-1",
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "Inspecting the repository"
+                    }],
+                    "encrypted_content": "ciphertext"
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &turn.queued[0],
+            ModelTurnEvent::Delta(Delta::BeginPart {
+                kind: PartKind::Reasoning,
+                ..
+            })
+        ));
+        assert!(matches!(
+            &turn.queued[1],
+            ModelTurnEvent::Delta(Delta::AppendText { chunk, .. })
+                if chunk == "Inspecting the repository"
+        ));
+        assert!(matches!(
+            &turn.queued[2],
+            ModelTurnEvent::Delta(Delta::CommitPart {
+                part: Part::Reasoning(reasoning)
+            }) if reasoning.summary.as_deref() == Some("Inspecting the repository")
+        ));
+        let Part::Reasoning(reasoning) = &turn.output[0].parts[0] else {
+            panic!("expected stored reasoning");
+        };
+        assert_eq!(
+            reasoning.summary.as_deref(),
+            Some("Inspecting the repository")
+        );
+        assert_eq!(
+            reasoning.metadata[CONTINUATION_METADATA]["encrypted_content"],
+            json!("ciphertext")
+        );
+
+        turn.consume_value(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "response-1", "model": "gpt-5.4"}
+            }),
+        )
+        .unwrap();
+        let finished = turn.queued.iter().find_map(|event| match event {
+            ModelTurnEvent::Finished(result) => Some(result),
+            _ => None,
+        });
+        let Part::Reasoning(reasoning) = &finished.unwrap().output_items[0].parts[0] else {
+            panic!("expected finished reasoning");
+        };
+        assert_eq!(
+            reasoning.metadata[CONTINUATION_METADATA]["response_id"],
+            json!("response-1")
+        );
+    }
+
+    #[test]
+    fn multiple_reasoning_summaries_keep_wire_and_stored_separators() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "reasoning-1"}
+            }),
+        )
+        .unwrap();
+        for (index, delta) in [(0, "first"), (1, "second")] {
+            turn.consume_value(
+                "response.reasoning_summary_text.delta",
+                &json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "reasoning-1",
+                    "output_index": 0,
+                    "summary_index": index,
+                    "delta": delta
+                }),
+            )
+            .unwrap();
+        }
+        turn.consume_value(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-1",
+                    "type": "reasoning",
+                    "summary": [
+                        {"type": "summary_text", "text": "first"},
+                        {"type": "summary_text", "text": "second"}
+                    ],
+                    "encrypted_content": "ciphertext"
+                }
+            }),
+        )
+        .unwrap();
+
+        let streamed = turn
+            .queued
+            .iter()
+            .filter_map(|event| match event {
+                ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(streamed, "first\n\nsecond");
+        let committed = turn
+            .queued
+            .iter()
+            .filter_map(|event| match event {
+                ModelTurnEvent::Delta(Delta::CommitPart {
+                    part: Part::Reasoning(reasoning),
+                }) => reasoning.summary.as_deref(),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(committed, streamed);
+        let Part::Reasoning(reasoning) = &turn.output[0].parts[0] else {
+            panic!("expected stored reasoning");
+        };
+        assert_eq!(reasoning.summary.as_deref(), Some(streamed.as_str()));
+    }
+
+    #[test]
+    fn reasoning_summary_must_match_streamed_deltas() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "reasoning-1"}
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "first"
+            }),
+        )
+        .unwrap();
+        let error = turn
+            .consume_value(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "reasoning-1",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "different"}],
+                        "encrypted_content": "ciphertext"
+                    }
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("differs from streamed summary deltas"));
     }
 
     #[test]
