@@ -5,8 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(test, target_os = "linux"))]
+use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use agentkit_acp::{ToolCallStatus, ToolKind};
 use agentkit_core::{Item, ItemKind, Part, ToolOutput};
@@ -820,10 +822,7 @@ impl App {
             return;
         }
         if let Some(url) = self.clicked_link(column, offset) {
-            match open_url(&url) {
-                Ok(()) => self.toast("opening link"),
-                Err(error) => self.toast(format!("could not open link: {error}")),
-            }
+            open_url(&url);
             return;
         }
         if let Some(Some(id)) = self
@@ -846,22 +845,41 @@ impl App {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn open_url(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    Command::new("open").arg(url).spawn()?;
-    #[cfg(target_os = "linux")]
-    Command::new("xdg-open").arg(url).spawn()?;
-    Ok(())
+#[cfg(target_os = "macos")]
+fn open_url(url: &str) {
+    let _ = Command::new("open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(target_os = "linux")]
+fn open_url(url: &str) {
+    let display = std::env::var_os("DISPLAY");
+    let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+    if !has_graphical_session(display.as_deref(), wayland_display.as_deref()) {
+        return;
+    }
+    let _ = Command::new("xdg-open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn has_graphical_session(display: Option<&OsStr>, wayland_display: Option<&OsStr>) -> bool {
+    [display, wayland_display]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn open_url(_url: &str) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "opening links is unsupported on this platform",
-    ))
-}
+fn open_url(_url: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -1147,13 +1165,17 @@ mod tests {
         assert!(app.clicked_link(0, 1).is_none());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn rejects_opening_links_on_unsupported_platforms() {
-        assert_eq!(
-            super::open_url("https://example.com").unwrap_err().kind(),
-            std::io::ErrorKind::Unsupported
-        );
+    fn detects_graphical_sessions() {
+        use std::ffi::OsStr;
+
+        assert!(!super::has_graphical_session(None, None));
+        assert!(!super::has_graphical_session(Some(OsStr::new("")), None));
+        assert!(super::has_graphical_session(Some(OsStr::new(":0")), None));
+        assert!(super::has_graphical_session(
+            None,
+            Some(OsStr::new("wayland-0"))
+        ));
     }
 
     #[test]
