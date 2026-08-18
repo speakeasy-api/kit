@@ -5,30 +5,16 @@ Kit's source remains private. Public, binary-only releases are published to
 
 ## One-time repository setup
 
-Configure these Actions secrets on the private `danielkov/kit` repository:
+Configure `KIT_RELEASES_TOKEN` on the private `danielkov/kit` repository.
+It must be a fine-grained GitHub token with Contents read/write access only to
+`danielkov/kit-releases`; a narrowly installed GitHub App token is preferable
+when available.
 
-- `KIT_RELEASES_TOKEN`: a fine-grained GitHub token with Contents read/write
-  access only to `danielkov/kit-releases`. A narrowly installed GitHub App token
-  is preferable when available.
-- `MACOS_CERTIFICATE_P12_BASE64`: base64-encoded Developer ID Application
-  certificate and private key exported as PKCS#12.
-- `MACOS_CERTIFICATE_PASSWORD`: password for that PKCS#12 export.
-- `MACOS_SIGNING_IDENTITY`: the full Developer ID Application identity.
-- `APPLE_API_KEY_P8_BASE64`: the base64-encoded `.p8` private key for an App
-  Store Connect team API key.
-- `APPLE_API_KEY_ID`: key ID shown for that API key.
-- `APPLE_API_ISSUER_ID`: issuer ID shown under App Store Connect API access.
-
-Create the certificate and API key under the Inlucent Limited Apple Developer team.
-The Developer ID certificate and notarization API key must belong to that same
-provider. Downloaded `.p8` keys cannot be downloaded again, so retain the original
-in the company's secret manager. Encode it without line wrapping before adding the
-secret:
-
-```sh
-base64 < AuthKey_KEYID.p8 | tr -d '\n' | \
-  gh secret set APPLE_API_KEY_P8_BASE64 --repo danielkov/kit
-```
+Signing and notarization run on the trusted local Mac, not in GitHub Actions.
+Install the Inlucent Limited Developer ID Application identity in its Keychain
+and retain the matching App Store Connect API key in 1Password. Downloaded `.p8`
+keys cannot be downloaded again, so keep the original in the company's secret
+manager.
 
 Do not use the private repository's broad personal token for
 `KIT_RELEASES_TOKEN`.
@@ -80,19 +66,33 @@ binary Apple is evaluating.
 
 ## Publish a signed release
 
-1. Update `Cargo.toml` and `Cargo.lock` to the new version.
-2. Merge the release commit to the default branch.
-3. Tag that commit with the matching `v`-prefixed version and push it:
+1. Update `Cargo.toml` and `Cargo.lock` to the new version and commit it.
+2. Prepare the signed and notarized macOS archive locally as described above.
+3. Create a hidden draft release containing that archive:
 
    ```sh
-   git tag v0.1.28
-   git push origin v0.1.28
+   version=0.1.31
+   gh release create "v$version" \
+     "dist/notarize/v$version/kit-v$version-aarch64-apple-darwin.tar.gz" \
+     --repo danielkov/kit-releases \
+     --target main \
+     --draft \
+     --title "Kit $version" \
+     --notes "Prebuilt Kit binaries. Source code is maintained separately."
    ```
 
-The signed release workflow verifies the tag, runs the Rust checks, builds Linux
-x64 and macOS arm64 binaries, signs and notarizes macOS, generates SHA-256
-checksums, and creates the public release. A missing target or credential fails the release
-rather than publishing a partial one.
+4. Push the release commit and its matching source tag:
+
+   ```sh
+   git push origin HEAD
+   git tag v0.1.31
+   git push origin v0.1.31
+   ```
+
+The signed release workflow verifies the tag, runs the Rust checks, builds only
+Linux x64, downloads the locally prepared macOS archive from the draft, creates
+`SHA256SUMS`, and publishes the draft atomically. It uses no GitHub-hosted macOS
+runner and fails rather than publishing without both platform archives.
 
 Verify the published result from a clean environment:
 

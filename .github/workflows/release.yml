@@ -54,74 +54,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  macos-arm64:
-    needs: verify
-    runs-on: macos-14
-    env:
-      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: aarch64-apple-darwin
-      - name: Require signing and notarization credentials
-        shell: bash
-        run: |
-          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD \
-            MACOS_SIGNING_IDENTITY APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID \
-            APPLE_API_ISSUER_ID; do
-            test -n "${!name}" || { echo "missing repository secret: $name" >&2; exit 1; }
-          done
-      - name: Import Developer ID certificate
-        shell: bash
-        run: |
-          keychain=$RUNNER_TEMP/kit-signing.keychain-db
-          certificate=$RUNNER_TEMP/kit-signing.p12
-          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
-          security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
-          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" \
-            -f pkcs12 -k "$keychain" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s \
-            -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Build, sign, and notarize
-        shell: bash
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          cargo build --locked --release --target aarch64-apple-darwin
-          mkdir -p stage dist
-          cp target/aarch64-apple-darwin/release/kit stage/kit
-          codesign --force --options runtime --timestamp \
-            --identifier com.danielkov.kit \
-            --sign "$MACOS_SIGNING_IDENTITY" stage/kit
-          codesign --verify --strict --verbose=2 stage/kit
-          stage/kit --version
-          ditto -c -k --keepParent stage/kit "$RUNNER_TEMP/kit-notarization.zip"
-          api_key=$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8
-          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$api_key"
-          chmod 600 "$api_key"
-          xcrun notarytool submit "$RUNNER_TEMP/kit-notarization.zip" \
-            --key "$api_key" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID" \
-            --wait
-          tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" kit
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kit-macos-arm64
-          path: dist/*
-          if-no-files-found: error
-
   publish:
-    needs: [linux-x64, macos-arm64]
+    needs: linux-x64
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.KIT_RELEASES_TOKEN }}
@@ -131,18 +65,22 @@ jobs:
           pattern: kit-*
           path: dist
           merge-multiple: true
-      - name: Publish binary-only release
+      - name: Complete and publish draft release
         shell: bash
         run: |
           test -n "$GH_TOKEN" || { echo "missing repository secret: KIT_RELEASES_TOKEN" >&2; exit 1; }
+          version=${GITHUB_REF_NAME#v}
+          macos="kit-v${version}-aarch64-apple-darwin.tar.gz"
+          draft=$(gh release view "$GITHUB_REF_NAME" \
+            --repo danielkov/kit-releases --json isDraft --jq .isDraft)
+          test "$draft" = true || { echo "release must exist as a draft" >&2; exit 1; }
+          gh release download "$GITHUB_REF_NAME" \
+            --repo danielkov/kit-releases --pattern "$macos" --dir dist
           cd dist
+          test -f "$macos"
+          test -f "kit-v${version}-x86_64-unknown-linux-gnu.tar.gz"
           sha256sum kit-*.tar.gz > SHA256SUMS
-          if gh release view "$GITHUB_REF_NAME" --repo danielkov/kit-releases >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS \
-              --clobber --repo danielkov/kit-releases
-          else
-            gh release create "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS \
-              --repo danielkov/kit-releases \
-              --title "Kit ${GITHUB_REF_NAME#v}" \
-              --notes "Prebuilt Kit binaries. Source code is maintained separately."
-          fi
+          gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS \
+            --clobber --repo danielkov/kit-releases
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo danielkov/kit-releases --draft=false --latest
