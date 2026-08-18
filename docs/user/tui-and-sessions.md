@@ -1,0 +1,119 @@
+# TUI Interaction, Sessions, and Recovery
+
+Kit's terminal UI is an ACP client backed by a persisted session. It supports prompt editing, turn cancellation, transcript and tool-output navigation, fresh or resumed conversations, and automatic or manual context compaction. The session ID appears in the TUI header. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line options.
+
+## Start or resume the terminal UI
+
+Start an interactive session at a project root with the installed binary:
+
+```sh
+kit tui --root /path/to/project
+```
+
+Resume the ID shown in the header:
+
+```sh
+kit tui --root /path/to/project --resume <session-id>
+```
+
+A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
+
+## TUI keys, prompt editing, and navigation
+
+| Key or input | Action |
+| --- | --- |
+| `Enter` | Send a non-empty prompt when idle |
+| `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
+| `Esc` | Interrupt a running turn; dismiss a notice when idle |
+| `Ctrl+C` | Interrupt a running turn; clear a non-empty idle prompt; quit when idle with an empty prompt |
+| `Ctrl+D` | Quit when the prompt is empty |
+| `Option+Left/Right`, `Ctrl+A`/`Ctrl+E`, `Home`/`End` | Move by word or to the start/end of a line |
+| `Option+Backspace`, `Ctrl+W` | Delete the previous word |
+| `Command+Backspace`, `Ctrl+U` / `Ctrl+K` | Delete to line start / end |
+| `Up` / `Down` | Move through prompt lines, then prompt history |
+| `Shift+Up` / `Shift+Down`, `PageUp` / `PageDown`, mouse wheel | Scroll the transcript |
+| `Ctrl+Home` / `Ctrl+End` | Jump to transcript top / bottom |
+| `Ctrl+G` / `Ctrl+L` / `Ctrl+T` | Toggle the runtime graph / agent log / reasoning |
+| `Ctrl+O`, or click a tool card | Fold or unfold raw tool output |
+
+`Command` and `Shift+Enter` require a terminal with the Kitty keyboard protocol, such as Ghostty, Kitty, WezTerm, or recent iTerm2. The control-key alternatives work without that protocol.
+
+Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
+
+### Interrupt a running turn or quit
+
+Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes. Sending another prompt while work is active is refused with `a turn is already running — esc interrupts it`.
+
+If a turn does not stop, press `Ctrl+C` again while Kit is cancelling to leave the TUI and terminate its agent child. On normal exit during a turn, Kit first requests cancellation and briefly allows the turn to unwind so tool outcomes can be persisted, then closes the session and releases its lock.
+
+At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
+
+## Start a new session and compact from the TUI
+
+The TUI recognizes two exact leading slash-command tokens:
+
+```text
+/new
+/new Start by reviewing the tests
+/compact
+/compact Continue with the migration
+```
+
+`/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt.
+
+`/compact` requests compaction without starting an ordinary model turn. Used alone, it ends after compaction. Text following `/compact` is retained as the latest user message and starts the next turn after compaction. Commands are recognized only at the start of the input and only as exact tokens; `/newer`, a space before `/new`, and unknown slash commands are sent to the model unchanged.
+
+## Persisted transcripts and session files
+
+Kit stores durable JSONL transcripts and lock files in:
+
+```text
+~/.kit/sessions/<session-id>.jsonl
+~/.kit/sessions/<session-id>.lock
+```
+
+`HOME is unset; cannot locate durable sessions` means Kit cannot determine this directory. Set `HOME` to the intended home directory before starting Kit.
+
+Transcript records are versioned and have consecutive generations. Normal items are appended and synced to disk before they are accepted into the in-memory conversation. Operations such as compaction append a replacement record; older records remain in the JSONL file, but readers treat the latest valid replacement as the canonical transcript.
+
+Older sessions under `<root>/.kit/sessions` remain readable. The first resume validates and copies a legacy transcript into `~/.kit/sessions`; a live legacy lock produces `legacy session is actively locked by another Kit instance ...; stop it before resuming with this Kit version`. When both locations contain the ID, the global transcript is preferred.
+
+### Session locks, `--resume`, and `--force`
+
+Only one live Kit instance may mutate a session. A normal exit removes its `.lock` file. If opening a session reports:
+
+```text
+session is locked by another Kit instance (...); use --force to override a stale lock
+```
+
+first confirm that no Kit process is still using the session. Then retry the resume with:
+
+```sh
+kit tui --root /path/to/project --resume <session-id> --force
+```
+
+`--force` is only for a stale lock left by an exited or crashed process, and the CLI accepts it only with `--resume`. It does not steal a lock held by a live process: the OS-level lock check instead reports `session is actively locked by another Kit instance (...)`. Do not manually remove a lock belonging to a running Kit process.
+
+A new session ID that already exists reports `session ... already exists; use --resume`; a missing resume target reports `session ... does not exist`. Use the correct ID and mode rather than `--force` for either error.
+
+## Automatic context compaction
+
+Kit checks the latest provider-reported usage. When `context_used` reaches 80% of `context_window`, it automatically compacts mutable history. If the provider did not report a context window, automatic compaction stays disabled rather than guessing a limit.
+
+Compaction drops historical reasoning and summarizes mutable historical items into a continuation note while preserving bootstrap `System` and `Context` items and the latest user input. A successful durable-session compaction is appended as a canonical transcript replacement, so resuming uses the compacted history. The TUI shows the compaction lifecycle and adds `context compacted` after a real replacement. Use `/compact` to request the same process before the automatic threshold.
+
+Compaction uses the selected model to produce the summary and can fail or be cancelled like other model work. An error such as `compaction agent returned an empty summary` leaves the previous transcript canonical; resolve the provider problem and retry `/compact`.
+
+## Transcript repair and crash recovery
+
+Kit automatically repairs one specific stranded-transcript condition: a stored tool call with no surviving tool result. On load it synthesizes an error result directly after each unanswered call. On resume, while holding the session lock, it also persists the repair so later resumes see a valid call/result pair. The synthetic result says that the work may or may not have completed, so inspect project state before retrying a tool or assuming its side effects occurred.
+
+This repair does not hide general JSONL damage. Errors including `invalid transcript line`, `unsupported session schema version`, `invalid session identity or generation`, or `transcript line ... must contain exactly one item or replacement` indicate malformed, incompatible, reordered, or edited records. Preserve a backup of the `.jsonl` file before investigating; use the session ID and line number in the diagnostic, and do not invent generations or delete arbitrary records. If no trustworthy repair is possible, start a new session and re-establish the needed context.
+
+While a session is open, Kit can reconstruct a transcript path deleted from disk using its still-open file and can reacquire a missing lock only if no other owner won the lock. It fails closed if another process owns recovery authority. After an abnormal TUI shutdown, restarting with `--resume` should be the first recovery attempt; add `--force` only after confirming the remaining lock is stale.
+
+### TUI startup and terminal recovery
+
+The TUI runs a `kit serve` child. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.
+
+If an external hard kill leaves the shell in raw mode or mouse reporting appears as text, run `reset` (or reopen the terminal) before resuming. Prefer `Esc`, `Ctrl+C`, `Ctrl+D`, `SIGTERM`, or `SIGHUP` for normal shutdown so Kit can restore terminal modes, cancel active work, close the session, and clean up only locks proven stale.

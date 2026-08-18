@@ -1,5 +1,6 @@
 mod acp_child;
 pub mod compaction;
+pub mod docs;
 pub mod events;
 pub mod protocols;
 pub mod provider;

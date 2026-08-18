@@ -8,13 +8,13 @@ It exposes:
 - A2A v1 JSON-RPC for agent collaboration
 - a Ratatui ACP client
 - one model-visible tool: `compose`, backed by released Runlet
-- hidden compose children for shell commands, hunk edits, reusable ACP-backed Kit subagents, A2A calls, and MCP discovery/authentication
+- hidden compose children for bundled Kit documentation, shell commands, hunk edits, reusable ACP subagents, A2A calls, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
-- ChatGPT Pro through an existing Codex login
+- OpenAI subscription access through an existing Codex login
 - OpenRouter through AgentKit's OpenRouter provider adapter
 
-It intentionally has no permissions framework, provenance ledger, rollback system,
-control-plane authentication, or web UI.
+It intentionally has no general interactive permissions framework, provenance ledger,
+rollback system, control-plane authentication, or web UI.
 
 ## Install
 
@@ -236,8 +236,8 @@ cargo run -- tui --root /path/to/project --mcp-config /path/to/mcp.json
 searchable by their configured name and description, with status
 `authentication_required`. The agent calls `auth` only when needed and gives the
 returned URL to the user. Completing that browser flow updates the catalog in
-place; a later search returns the server's tools. Interactive OAuth is available
-in the long-lived `tui` and `serve` commands, not the one-shot `prompt` command.
+place; a later search returns the server's tools. Interactive OAuth is available in `tui`, `serve`, and `acp`, but not the
+one-shot `prompt` command.
 Static `bearerToken` and custom `headers` remain available for non-interactive
 HTTP servers.
 

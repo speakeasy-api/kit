@@ -30,6 +30,7 @@ fn runtime_is_rooted_and_exposes_only_compose() {
 
     let description = &specs[0].description;
     for expected in [
+        "`docs`: Search the version-matched Kit documentation",
         "`shell`: Run a shell command",
         "`edit`: Apply exact, git-style text hunks",
         "`subagent`: Start a parent-owned configured ACP harness",
@@ -42,8 +43,9 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     ] {
         assert!(description.contains(expected), "missing {expected:?}");
     }
-    assert_eq!(description.matches("Input JSON schema:").count(), 9);
-    assert_eq!(description.matches("Output JSON schema:").count(), 9);
+    assert_eq!(description.matches("Input JSON schema:").count(), 10);
+    assert_eq!(description.matches("Output JSON schema:").count(), 10);
+    assert!(description.contains("\"required\":[\"query\"]"));
     assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
     assert!(description.contains("\"generation\""));
     assert!(description.contains("\"updates\""));
@@ -212,6 +214,30 @@ return { output: child.output, updates: child.updates }"#,
             }
         }))
     );
+}
+
+#[tokio::test]
+async fn compose_dispatches_bundled_docs_search_through_runlet() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"return docs({ query: "Kit documentation troubleshooting" })"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("compose failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(output) = result.result.output else {
+        panic!("compose returned a non-JSON result");
+    };
+    assert_eq!(output["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        output["matches"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    assert!(output["matches"].as_array().unwrap().len() <= 5);
 }
 
 #[tokio::test]

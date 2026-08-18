@@ -25,7 +25,7 @@ use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
     provider::{KitAdapter, KitSession, ProviderKind},
     tools::{
-        A2aTool, AuthTool, EditTool, ForkTool, McpTool, Observed, PromptTool, ShellTool,
+        A2aTool, AuthTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool, ShellTool,
         SubagentTool, Subagents, ToolSearch,
     },
 };
@@ -256,6 +256,7 @@ impl Runtime {
 
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
         let children = agentkit_tools_core::ToolRegistry::new()
+            .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())))
             .with(Observed::new(SubagentTool::new(
@@ -463,7 +464,7 @@ impl Runtime {
 
     fn system_prompt(&self, depth: usize) -> String {
         format!(
-            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call the hidden shell, edit, subagent, prompt, fork, and a2a tools, plus the MCP meta-tools tool_search, auth, and tool. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call docs, shell, edit, subagent, prompt, fork, and a2a, plus the MCP meta-tools tool_search, auth, and tool. Use `docs({{ query: \"<your query here>\" }})` to troubleshoot issues in Kit and find user guidance. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
             self.max_subagent_depth

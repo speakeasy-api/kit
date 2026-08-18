@@ -384,8 +384,7 @@ impl McpRuntime {
     async fn authorize(&self, name: &str) -> Result<Value, ToolError> {
         if !self.inner.interactive_oauth_enabled {
             return Err(ToolError::Unavailable(
-                "interactive MCP authentication requires the long-lived TUI or serve command"
-                    .into(),
+                "interactive MCP authentication requires the tui, serve, or acp command".into(),
             ));
         }
         let _setup = self.inner.auth_setup.lock().await;

@@ -70,3 +70,13 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     assert!(specs[0].description.contains("`tool`"));
     assert!(!specs[0].description.contains("mcp_filesystem_read_file"));
 }
+
+#[test]
+fn system_prompt_points_to_docs_for_kit_guidance() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let prompt = runtime.system_prompt(0);
+    assert!(prompt.contains(
+        "Use `docs({ query: \"<your query here>\" })` to troubleshoot issues in Kit and find user guidance."
+    ));
+}
