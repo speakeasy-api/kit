@@ -12,7 +12,9 @@ when available.
 
 Signing and notarization run on the trusted local Mac, not in GitHub Actions.
 Install the Inlucent Limited Developer ID Application identity in its Keychain
-and retain the matching App Store Connect API key in 1Password. Downloaded `.p8`
+and retain the matching App Store Connect API key in 1Password. The machine also
+needs a running Docker-compatible container engine and `gh` authenticated as an
+account with write access to `danielkov/kit-releases`. Downloaded `.p8`
 keys cannot be downloaded again, so keep the original in the company's secret
 manager.
 
@@ -36,7 +38,7 @@ the Developer ID certificate or submit the macOS binary to Apple for
 notarization. Consequently, macOS Gatekeeper may require users to explicitly
 approve the prerelease binary.
 
-Prerelease tags do not trigger the signed release workflow. Install a specific
+Prerelease tags are separate from the local signed release process. Install a specific
 prerelease with:
 
 ```sh
@@ -66,37 +68,28 @@ binary Apple is evaluating.
 
 ## Publish a signed release
 
-1. Update `Cargo.toml` and `Cargo.lock` to the new version and commit it.
-2. Prepare the signed and notarized macOS archive locally as described above.
-3. Create a hidden draft release containing that archive:
+Update `Cargo.toml` and `Cargo.lock` to the new version, commit every intended
+release change, and run the local orchestrator from a clean working tree:
 
-   ```sh
-   version=0.1.31
-   gh release create "v$version" \
-     "dist/notarize/v$version/kit-v$version-aarch64-apple-darwin.tar.gz" \
-     --repo danielkov/kit-releases \
-     --target main \
-     --draft \
-     --title "Kit $version" \
-     --notes "Prebuilt Kit binaries. Source code is maintained separately."
-   ```
+```sh
+scripts/release-local.sh v0.1.32
+```
 
-4. Push the release commit and its matching source tag:
+The script runs format, Clippy, and tests; signs and notarizes macOS; builds
+Linux x86-64 with a cached native ARM64 cross-build container; smoke-tests the
+Linux binary in an x86-64 Debian container; generates checksums; and creates a
+hidden draft release. Only after all artifacts are ready does it push the source
+branch and tag, publish the draft atomically, and test installation through mise.
+No GitHub Actions workflow participates in a signed release.
 
-   ```sh
-   git push origin HEAD
-   git tag v0.1.31
-   git push origin v0.1.31
-   ```
-
-The signed release workflow verifies the tag, runs the Rust checks, builds only
-Linux x64, downloads the locally prepared macOS archive from the draft, creates
-`SHA256SUMS`, and publishes the draft atomically. It uses no GitHub-hosted macOS
-runner and fails rather than publishing without both platform archives.
+The first Linux build creates a local container image and takes longer. Later
+builds reuse that image, the Cargo registry volume, and the target directory.
+The lower-level `notarize-release.sh` and `build-linux-release.sh` scripts remain
+available for diagnosis, but normal releases should use `release-local.sh`.
 
 Verify the published result from a clean environment:
 
 ```sh
-mise use github:danielkov/kit-releases@0.1.28
+mise use github:danielkov/kit-releases@0.1.32
 kit --version
 ```
