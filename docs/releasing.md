@@ -57,6 +57,27 @@ prerelease with:
 mise use github:danielkov/kit-releases@0.1.29-pre
 ```
 
+## Prepare a signed macOS release locally
+
+Run signing and notarization on a trusted macOS machine so Apple queue delays do
+not consume metered GitHub-hosted macOS runner time. The script reads the App
+Store Connect API key from 1Password, uses the installed Developer ID identity,
+and preserves the exact submitted binary under `dist/notarize/`:
+
+```sh
+caffeinate -i scripts/notarize-release.sh v0.1.29
+```
+
+The working tree must be clean when the script starts and the requested version
+must match `Cargo.toml`. The script builds an immutable archive of the current
+commit, records its SHA in `source-commit.txt`, and does not read later source
+edits. `caffeinate` prevents idle sleep while `notarytool --wait` runs. The API
+key exists only in a permission-restricted temporary directory and is deleted
+when the script exits. If Apple accepts the submission, the script
+creates the final macOS archive and its SHA-256 checksum. Do not delete the
+output directory while a submission is active; it contains the exact signed
+binary Apple is evaluating.
+
 ## Publish a signed release
 
 1. Update `Cargo.toml` and `Cargo.lock` to the new version.

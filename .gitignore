@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.pi-subagents/
 /.kit/
 /.kit-codesign-identity
