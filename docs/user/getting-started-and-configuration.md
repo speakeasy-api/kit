@@ -18,30 +18,30 @@ A version can be pinned with a mise package such as `github:danielkov/kit-releas
 
 Kit supports `openai-subscription` and `openrouter`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
 
-### ChatGPT subscription through an existing Codex login
+### ChatGPT subscription with native OpenAI login
 
-Authenticate with Codex first:
+Authenticate directly with Kit, then start the runtime:
 
 ```sh
-codex login
+kit auth login openai
+kit auth status openai
 kit tui --root /path/to/project
 ```
 
-For `openai-subscription`, Kit looks for Codex credentials in this order:
+Login opens OpenAI's browser authorization flow and accepts the callback only on
+`http://localhost:1455/auth/callback` or port 1457. Kit uses PKCE plus state and
+nonce checks, validates RS256 access and ID tokens against OpenAI's JWKS, and
+stores the resulting credential only in the operating system credential store.
+There is no environment, Codex-file, or plaintext-file fallback. The OS store must
+be available and unlocked.
 
-1. the file named by `KIT_CODEX_AUTH`;
-2. `$CODEX_HOME/auth.json`;
-3. `$HOME/.codex/auth.json`.
-
-Codex owns login and credential refresh. Errors can include:
-
-```text
-could not read ...; run `codex login` first
-... has no ChatGPT subscription tokens; run `codex login`
-ChatGPT rejected the Codex credential; run `codex login` to refresh it
-```
-
-Run `codex login` and retry. `HOME and CODEX_HOME are unset` means neither a default credential location nor `CODEX_HOME` is available; set one of those variables or set `KIT_CODEX_AUTH` to an auth file.
+Kit refreshes credentials within five minutes of expiry. Refreshes are synchronized
+across threads and processes, preserve the authenticated account and credential
+generation, and are forced once after a 401 response without changing the normal
+provider retry behavior. Use `kit auth status openai` to check the credential.
+`kit auth logout openai` revokes the refresh token before local deletion and keeps
+the local credential if revocation fails. `kit auth logout openai --local-only`
+skips revocation and prints a warning.
 
 ### OpenRouter API key and model
 
@@ -186,4 +186,4 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 - **`mcp_credential_dir is required when mcp_credential_store is file`**: add the directory or choose another store.
 - **`mcp_credential_dir requires mcp_credential_store to be file`**: remove the directory or select `file`.
 - **Unexpected project or model**: check the command line first, then `~/.kit/config.toml`, then the built-in defaults. Use `kit <command> --help` to confirm which options that command accepts.
-- **Provider authentication failure**: for `openai-subscription`, refresh with `codex login` and check `KIT_CODEX_AUTH`/`CODEX_HOME`; for `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier.
+- **Provider authentication failure**: for `openai-subscription`, run `kit auth status openai`, then `kit auth login openai` if needed; ensure the OS credential store is available and that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier.

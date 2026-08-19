@@ -153,8 +153,33 @@ impl Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AuthProvider {
+    Openai,
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Authenticate a ChatGPT subscription in the OS credential store.
+    Login { provider: AuthProvider },
+    /// Show ChatGPT subscription authentication status.
+    Status { provider: AuthProvider },
+    /// Revoke and remove ChatGPT subscription credentials.
+    Logout {
+        provider: AuthProvider,
+        /// Remove local credentials without revoking the remote refresh token.
+        #[arg(long)]
+        local_only: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Manage provider authentication without starting a runtime.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Serve the Agent Client Protocol on stdio and A2A over HTTP.
     Serve {
         /// Runtime root (defaults to config or `.`).
@@ -247,11 +272,38 @@ enum Command {
     },
 }
 
+fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
+    let command = match action {
+        AuthAction::Login {
+            provider: AuthProvider::Openai,
+        } => kit::provider::OpenAiAuthCommand::Login,
+        AuthAction::Status {
+            provider: AuthProvider::Openai,
+        } => kit::provider::OpenAiAuthCommand::Status,
+        AuthAction::Logout {
+            provider: AuthProvider::Openai,
+            local_only,
+        } => kit::provider::OpenAiAuthCommand::Logout {
+            local_only: *local_only,
+        },
+    };
+    print!(
+        "{}",
+        kit::provider::execute_openai_auth(command).map_err(io::Error::other)?
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Command::Auth { action } = &cli.command {
+        execute_auth(action)?;
+        return Ok(());
+    }
     let config = Config::load_default()?;
     match cli.command {
+        Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
         Command::Serve {
             root,
             model,
@@ -531,6 +583,15 @@ harness = "acp.beta"
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn auth_commands_parse_without_runtime_arguments() {
+        assert!(Cli::try_parse_from(["kit", "auth", "login", "openai"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "status", "openai"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "openai", "--local-only"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "login", "openrouter"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "--local-only"]).is_err());
     }
 
     #[test]

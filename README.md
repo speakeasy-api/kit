@@ -11,7 +11,7 @@ It exposes:
 - hidden compose children for bundled Kit documentation, shell commands, hunk edits, reusable ACP subagents, A2A calls, Agent Skills, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
 - Agent Skills discovered from `<root>/.agents/skills` and `~/.agents/skills`, with project skills taking precedence
-- OpenAI subscription access through an existing Codex login
+- OpenAI subscription access through Kit's native ChatGPT OAuth login
 - OpenRouter through AgentKit's OpenRouter provider adapter
 
 It intentionally has no general interactive permissions framework, provenance ledger,
@@ -34,12 +34,19 @@ the release repository contains only packaged executables and checksums.
 
 ## Run
 
-Authenticate with Codex once, then start the TUI:
+Authenticate your ChatGPT subscription once, then start the TUI:
 
 ```sh
-codex login
+cargo run -- auth login openai
 cargo run -- tui --root /path/to/project
 ```
+
+The native login uses OAuth authorization code flow with PKCE, state, and nonce.
+It listens only on registered loopback callback ports 1455 and 1457, validates
+OpenAI RS256 tokens against the pinned JWKS endpoint, and stores tokens only in
+the operating system credential store. No plaintext credential fallback exists.
+Protocol source attribution and reproduced upstream licenses are in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 Every TUI conversation is persisted as an append-only, versioned JSONL transcript
 under `~/.kit/sessions`. Sessions from the legacy `<root>/.kit/sessions` location
@@ -79,8 +86,12 @@ also chooses an available loopback port for A2A and reports it on stderr; pass
 HTTP listener. A2A discovery is available from the combined server's Agent Card
 endpoint.
 
-Kit reads `$KIT_CODEX_AUTH`, `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`, in
-that order. Credential login and refresh remain Codex's job.
+Inspect or remove the credential with `kit auth status openai` and
+`kit auth logout openai`. Logout revokes the refresh token before deleting the
+local record; if remote revocation is unavailable, credentials are retained. Use
+`--local-only` only when you intentionally need deletion without revocation.
+Kit refreshes expiring credentials proactively and retries one rejected credential
+with a synchronized forced refresh.
 
 To use OpenRouter, set `OPENROUTER_API_KEY`, select the provider, and pass an
 OpenRouter model identifier:
