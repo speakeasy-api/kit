@@ -272,7 +272,7 @@ enum Command {
     },
 }
 
-fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
+async fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
     let command = match action {
         AuthAction::Login {
             provider: AuthProvider::Openai,
@@ -287,10 +287,11 @@ fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
             local_only: *local_only,
         },
     };
-    print!(
-        "{}",
-        kit::provider::execute_openai_auth(command).map_err(io::Error::other)?
-    );
+    let output = tokio::task::spawn_blocking(move || kit::provider::execute_openai_auth(command))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
+    print!("{output}");
     Ok(())
 }
 
@@ -298,7 +299,7 @@ fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     if let Command::Auth { action } = &cli.command {
-        execute_auth(action)?;
+        execute_auth(action).await?;
         return Ok(());
     }
     let config = Config::load_default()?;
