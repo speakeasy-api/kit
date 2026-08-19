@@ -23,6 +23,7 @@ use super::credentials as auth;
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
+const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 // The catalog filters out models newer than this protocol client version. Keep
 // it aligned with the newest model schema Kit supports, not Kit's own version.
 const MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.0";
@@ -168,6 +169,7 @@ impl ModelSession for OpenAiSubscriptionSession {
         }
         let mut unauthorized = false;
         let mut retried = false;
+        let mut turn_state = None;
         loop {
             self.ensure_binding(&credentials)?;
             let mut builder = self
@@ -181,6 +183,9 @@ impl ModelSession for OpenAiSubscriptionSession {
                 .header("Content-Type", "application/json");
             if let Some(account_id) = credentials.account_id() {
                 builder = builder.header("ChatGPT-Account-ID", account_id);
+            }
+            if let Some(value) = turn_state.as_ref() {
+                builder = builder.header(X_CODEX_TURN_STATE, value);
             }
             let send = builder.body(body_bytes.to_vec()).send();
             let response = if let Some(cancel) = cancellation.clone() {
@@ -245,10 +250,17 @@ impl ModelSession for OpenAiSubscriptionSession {
                 .get("openai-model")
                 .map(validated_model_header)
                 .transpose()?;
+            if turn_state.is_none() {
+                turn_state = response.headers().get(X_CODEX_TURN_STATE).cloned();
+            }
             let mut turn = OpenAiSubscriptionTurn::new_inner(
                 response.bytes_stream(),
                 self.config.model.clone(),
                 response_model,
+                turn_state
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
                 self.binding.clone(),
                 self.session_id.clone(),
                 self.context_windows.clone(),
@@ -260,6 +272,12 @@ impl ModelSession for OpenAiSubscriptionSession {
                 }
                 Ok(None) => return Ok(turn),
                 Err(error) => {
+                    if turn_state.is_none() {
+                        turn_state = turn
+                            .turn_state
+                            .as_deref()
+                            .and_then(|value| value.parse().ok());
+                    }
                     let retry = turn
                         .pending_failure
                         .as_ref()
@@ -429,6 +447,7 @@ pub struct OpenAiSubscriptionTurn {
     requested_model: String,
     header_model: Option<String>,
     response_model: Option<String>,
+    turn_state: Option<String>,
     binding: auth::CredentialBinding,
     session_id: String,
     context_windows: Arc<HashMap<String, u64>>,
@@ -466,6 +485,7 @@ impl OpenAiSubscriptionTurn {
             stream,
             requested_model,
             actual_model,
+            None,
             auth::CredentialBinding {
                 account_id: "test-account".to_owned(),
                 generation: "test-generation".to_owned(),
@@ -479,6 +499,7 @@ impl OpenAiSubscriptionTurn {
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         requested_model: String,
         header_model: Option<String>,
+        turn_state: Option<String>,
         binding: auth::CredentialBinding,
         session_id: String,
         context_windows: Arc<HashMap<String, u64>>,
@@ -505,6 +526,7 @@ impl OpenAiSubscriptionTurn {
             requested_model,
             header_model,
             response_model: None,
+            turn_state,
             binding,
             session_id,
             context_windows,
@@ -659,12 +681,23 @@ impl OpenAiSubscriptionTurn {
             | "response.content_part.added"
             | "response.content_part.done"
             | "response.output_text.done"
-            | "response.in_progress"
-            | "response.metadata" => {
+            | "response.in_progress" => {
                 self.require_created()?;
             }
+            "response.metadata" => {
+                self.require_created()?;
+                if let Some(model) = responses_header(value, &["openai-model", "x-openai-model"]) {
+                    self.observe_model(&Value::String(model.to_owned()))?;
+                }
+                if self.turn_state.is_none()
+                    && let Some(state) = responses_header(value, &[X_CODEX_TURN_STATE])
+                    && state.parse::<reqwest::header::HeaderValue>().is_ok()
+                {
+                    self.turn_state = Some(state.to_owned());
+                }
+            }
             "keepalive" => {}
-            _ => return Err(protocol(&format!("unknown Responses SSE event: {kind}"))),
+            _ => {}
         }
         Ok(())
     }
@@ -698,11 +731,11 @@ impl OpenAiSubscriptionTurn {
                 self.push_output(output_index, Item::new(ItemKind::Assistant, parts));
             }
             Some("function_call") => {
-                let call_id = bounded_string(item, "call_id")?;
+                let call_id = bounded_nonempty_string(item, "call_id")?;
                 if !self.seen_call_ids.insert(call_id.to_owned()) {
                     return Err(protocol("duplicate function call ID"));
                 }
-                let name = bounded_string(item, "name")?;
+                let name = bounded_nonempty_string(item, "name")?;
                 let arguments = bounded_string(item, "arguments")?;
                 let input: Value = serde_json::from_str(arguments)
                     .map_err(|_| protocol("function-call arguments are not JSON"))?;
@@ -1574,12 +1607,44 @@ fn zeroize_encrypted_content(value: &mut Value) {
     }
 }
 
+fn responses_header<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
+    [value.pointer("/response/headers"), value.get("headers")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .find_map(|headers| {
+            headers.iter().find_map(|(name, value)| {
+                names
+                    .iter()
+                    .any(|expected| name.eq_ignore_ascii_case(expected))
+                    .then(|| match value {
+                        Value::String(value) => Some(value.as_str()),
+                        Value::Array(values) => values.first().and_then(Value::as_str),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+        })
+}
+
 fn bounded_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, LoopError> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= MAX_EVENT_BYTES)
-        .ok_or_else(|| protocol("Responses string field is missing or outside bounds"))
+        .filter(|value| value.len() <= MAX_EVENT_BYTES)
+        .ok_or_else(|| protocol(&format!("Responses {field} is missing or outside bounds")))
+}
+
+fn bounded_nonempty_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, LoopError> {
+    bounded_string(value, field).and_then(|value| {
+        if value.is_empty() {
+            Err(protocol(&format!(
+                "Responses {field} is missing or outside bounds"
+            )))
+        } else {
+            Ok(value)
+        }
+    })
 }
 
 fn nonnegative(value: &Value, field: &str) -> Result<u64, LoopError> {
@@ -1838,7 +1903,7 @@ mod usage_tests {
     };
 
     #[test]
-    fn responses_keepalive_is_ignored_without_weakening_unknown_events() {
+    fn responses_keepalive_and_unknown_events_are_ignored() {
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
 
         turn.consume_frame(
@@ -1855,14 +1920,135 @@ data: {"type":"response.created","sequence_number":1,"response":{}}
         .unwrap();
 
         assert!(turn.created);
-        assert!(
-            turn.consume_frame(
-                br#"event: future.event
+        turn.consume_frame(
+            br#"event: future.event
 data: {"type":"future.event","sequence_number":2}
 "#,
-            )
-            .is_err()
-        );
+        )
+        .unwrap();
+        turn.consume_frame(
+            br#"event: response.future.delta
+data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn response_metadata_captures_turn_state_and_effective_model() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.metadata",
+            &json!({
+                "type": "response.metadata",
+                "headers": {
+                    "X-Codex-Turn-State": "sticky-state",
+                    "X-OpenAI-Model": ["gpt-5.4-mini"]
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(turn.turn_state.as_deref(), Some("sticky-state"));
+        assert_eq!(turn.response_model.as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn empty_response_text_is_accepted_like_official_codex() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "message-1"}
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_text.delta",
+            &json!({
+                "type": "response.output_text.delta",
+                "item_id": "message-1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": ""
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "message-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": ""}]
+                }
+            }),
+        )
+        .unwrap();
+
+        let Part::Text(text) = &turn.output[0].parts[0] else {
+            panic!("expected empty text output");
+        };
+        assert_eq!(text.text, "");
+    }
+
+    #[test]
+    fn empty_reasoning_delta_is_accepted_like_official_codex() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "reasoning-1"}
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": ""
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-1",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": ""}],
+                    "encrypted_content": "ciphertext"
+                }
+            }),
+        )
+        .unwrap();
     }
 
     #[test]

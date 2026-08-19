@@ -6,4 +6,4 @@ Kit's ACP harness transport should tolerate provider keepalive events (or otherw
 
 ## Resolution
 
-Responses SSE `keepalive` frames are now ignored as transport metadata while unknown event kinds still fail. A regression test covers both behaviors.
+Responses SSE `keepalive` frames are ignored as transport metadata. Kit initially continued to reject unknown event kinds, but later aligned with official Codex by ignoring additive events while retaining strict validation for known events.
