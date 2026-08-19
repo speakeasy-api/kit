@@ -11,5 +11,6 @@ pub use docs::DocsTool;
 pub use edit::EditTool;
 pub use mcp::{AuthTool, CredentialStorage, McpTool, ToolSearch};
 pub use observed::Observed;
+pub(crate) use observed::shared as observe_shared;
 pub use shell::ShellTool;
 pub use subagent::{CloseTool, ForkTool, PromptTool, SubagentTool, Subagents, SubagentsTool};

@@ -162,6 +162,23 @@ Kit discovers `AGENTS.md` files at the runtime root and its ancestor directories
 
 If startup reports `could not load AGENTS.md context`, inspect the `AGENTS.md` files at the root and above it for read or loading problems. Changing `~/.kit/config.toml` does not replace project instructions; configuration selects runtime behavior, while `AGENTS.md` supplies instructions to the agent.
 
+## Agent Skills
+
+Kit discovers [Agent Skills](https://agentskills.io/) recursively from `<root>/.agents/skills` and `~/.agents/skills`. Project skills are searched first and override user skills with the same name. Each skill lives in a directory containing `SKILL.md`; its frontmatter must include a `name` using lowercase letters, digits, and hyphens that matches the directory name and a non-empty `description`.
+
+```markdown
+---
+name: review
+description: Review code changes for correctness.
+---
+
+Review the change and run the smallest relevant checks.
+```
+
+The `activate_skill` entry in `compose` initially discloses only valid skill names and descriptions. When a task matches, the agent activates the skill before proceeding; activation returns the full Markdown body, skill directory, and paths to supporting resources. Project and user skill files are read with the Kit process's normal host permissions. Invalid or unreadable skills are omitted, and repeated activation of the same skill is deduplicated for a session within the current Kit process.
+
+The hidden-tool catalog is captured when Kit creates the session's compose source. Restart the session after adding or removing a skill so its advertised schema is refreshed.
+
 ## Troubleshoot startup and configuration
 
 - **`invalid config ...`**: validate TOML spelling and types. The schema rejects unknown fields; provider values are exactly `openai-subscription` and `openrouter`, and credential-store values are `memory`, `keychain`, and `file`.

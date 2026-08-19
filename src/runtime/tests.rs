@@ -72,6 +72,24 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
 }
 
 #[test]
+fn system_prompt_explains_skill_activation() {
+    let root = tempfile::tempdir().unwrap();
+    let skill = root.path().join(".agents/skills/review");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review code.\n---\nReview it.\n",
+    )
+    .unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let prompt = runtime.system_prompt(0);
+    assert!(prompt.contains("Available agent skills are listed"));
+    assert!(
+        prompt.contains("return `activate_skill({ name: \"<skill-name>\" })` before proceeding")
+    );
+}
+
+#[test]
 fn system_prompt_points_to_docs_for_kit_guidance() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();

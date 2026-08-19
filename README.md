@@ -8,8 +8,9 @@ It exposes:
 - A2A v1 JSON-RPC for agent collaboration
 - a Ratatui ACP client
 - one model-visible tool: `compose`, backed by released Runlet
-- hidden compose children for bundled Kit documentation, shell commands, hunk edits, reusable ACP subagents, A2A calls, and MCP discovery/authentication
+- hidden compose children for bundled Kit documentation, shell commands, hunk edits, reusable ACP subagents, A2A calls, Agent Skills, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
+- Agent Skills discovered from `<root>/.agents/skills` and `~/.agents/skills`, with project skills taking precedence
 - OpenAI subscription access through an existing Codex login
 - OpenRouter through AgentKit's OpenRouter provider adapter
 

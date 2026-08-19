@@ -12,7 +12,7 @@ use agentkit_tools_core::{
     AllowAllPermissions, BasicToolExecutor, ToolExecutionOutcome, ToolExecutionScope, ToolName,
     ToolRequest, ToolSource,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn runtime_is_rooted_and_exposes_only_compose() {
@@ -45,8 +45,12 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     ] {
         assert!(description.contains(expected), "missing {expected:?}");
     }
-    assert_eq!(description.matches("Input JSON schema:").count(), 12);
-    assert_eq!(description.matches("Output JSON schema:").count(), 12);
+    let input_schemas = description.matches("Input JSON schema:").count();
+    assert!(input_schemas >= 12);
+    assert_eq!(
+        description.matches("Output JSON schema:").count(),
+        input_schemas
+    );
     assert!(description.contains("\"required\":[\"query\"]"));
     assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
     assert!(description.contains("\"generation\""));
@@ -63,6 +67,48 @@ fn runtime_is_rooted_and_exposes_only_compose() {
 
     assert!(visible.get(&ToolName::new("shell")).is_some());
     assert!(visible.get(&ToolName::new("edit")).is_some());
+}
+
+#[tokio::test]
+async fn compose_discovers_and_activates_project_skill() {
+    let directory = tempfile::tempdir().unwrap();
+    let skill = directory.path().join(".agents/skills/review");
+    std::fs::create_dir_all(skill.join("references")).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review code carefully.\n---\n\n# Review\n\nFollow the checklist.\n",
+    )
+    .unwrap();
+    std::fs::write(skill.join("references/checklist.md"), "Check behavior.").unwrap();
+
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let description = &runtime.compose(0).specs()[0].description;
+    assert!(description.contains("`activate_skill`: Load a skill's full instructions"));
+    assert!(description.contains("Review code carefully."));
+    assert!(description.contains("\"enum\":[\"review\"]"));
+
+    let outcome = execute_compose(&runtime, r#"return activate_skill({ name: "review" })"#).await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("skill activation failed: {outcome:?}")
+    };
+    let output_value = result.result.output;
+    let ToolOutput::Structured(Value::String(output)) = output_value else {
+        panic!("skill activation did not return a string: {output_value:?}")
+    };
+    assert!(output.contains("skill: review"));
+    assert!(output.contains("# Review\n\nFollow the checklist."));
+    assert!(output.contains(skill.to_string_lossy().as_ref()));
+    assert!(output.contains("references/checklist.md"));
+    assert!(!output.contains("description: Review code carefully."));
+
+    let repeated = execute_compose(&runtime, r#"return activate_skill({ name: "review" })"#).await;
+    let ToolExecutionOutcome::Completed(result) = repeated else {
+        panic!("repeated skill activation failed: {repeated:?}")
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::Structured(json!("Skill already read."))
+    );
 }
 
 #[test]

@@ -5,7 +5,7 @@
 //! start/finish events on the runtime side channel (see [`crate::events`]) so
 //! a client can draw what a Runlet program is doing while it runs.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use agentkit_core::ToolOutput;
 use agentkit_tools_core::{
@@ -23,6 +23,39 @@ pub struct Observed<T>(T);
 impl<T: Tool> Observed<T> {
     pub const fn new(tool: T) -> Self {
         Self(tool)
+    }
+}
+
+/// Wraps a dynamically dispatched tool without hiding its changing spec.
+pub(crate) fn shared(tool: Arc<dyn Tool>) -> impl Tool {
+    Observed(SharedTool(tool))
+}
+
+struct SharedTool(Arc<dyn Tool>);
+
+#[async_trait]
+impl Tool for SharedTool {
+    fn spec(&self) -> &ToolSpec {
+        self.0.spec()
+    }
+
+    fn current_spec(&self) -> Option<ToolSpec> {
+        self.0.current_spec()
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        self.0.proposed_requests(request)
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        context: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.0.invoke(request, context).await
     }
 }
 

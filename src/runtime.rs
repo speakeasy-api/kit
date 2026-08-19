@@ -16,7 +16,8 @@ use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, Sessi
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
 };
-use agentkit_tools_core::{Tool, ToolName, ToolSource, ToolSpec};
+use agentkit_tool_skills::SkillRegistry;
+use agentkit_tools_core::{Tool, ToolName, ToolRegistry, ToolSource, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -26,7 +27,7 @@ use crate::{
     provider::{KitAdapter, KitSession, ProviderKind},
     tools::{
         A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
-        ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch,
+        ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
     },
 };
 
@@ -92,6 +93,7 @@ pub struct Runtime {
     /// Later ACP sessions receive their own persisted ids.
     session: Mutex<SessionSelection>,
     mcp: crate::tools::mcp::McpRuntime,
+    skills: ToolRegistry,
 }
 
 impl Runtime {
@@ -114,6 +116,7 @@ impl Runtime {
                 root.display()
             ));
         }
+        let skills = SkillRegistry::from_paths(default_skill_roots(&root)).tool_registry();
         let model = model.into();
         let adapter = KitAdapter::new(provider, model.clone())?;
         let max_subagent_depth = 2;
@@ -139,6 +142,7 @@ impl Runtime {
             subagents,
             session: Mutex::new(SessionSelection::default()),
             mcp: crate::tools::mcp::empty(),
+            skills,
         }))
     }
 
@@ -259,7 +263,7 @@ impl Runtime {
     }
 
     fn compose_with(&self, depth: usize, subagents: Subagents) -> ComposeOnly {
-        let children = agentkit_tools_core::ToolRegistry::new()
+        let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())))
@@ -272,6 +276,9 @@ impl Runtime {
             .with(Observed::new(ToolSearch::new(self.mcp.clone())))
             .with(Observed::new(AuthTool::new(self.mcp.clone())))
             .with(Observed::new(McpTool::new(self.mcp.catalog())));
+        if let Some(skill_tool) = self.skills.get(&ToolName::new("activate_skill")) {
+            children.register(observe_shared(skill_tool));
+        }
         let child_specs = children.specs();
         ComposeOnly(
             ComposeTool::wrap(children)
@@ -469,13 +476,32 @@ impl Runtime {
     }
 
     fn system_prompt(&self, depth: usize) -> String {
+        let skill_guidance = if self.skills.specs().is_empty() {
+            ""
+        } else {
+            " Available agent skills are listed in the hidden activate_skill tool entry. When a task matches a skill's description, use compose to return `activate_skill({ name: \"<skill-name>\" })` before proceeding, then follow the returned instructions."
+        };
         format!(
-            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call docs, shell, edit, subagent, prompt, fork, subagents, close, and a2a, plus the MCP meta-tools tool_search, auth, and tool. Use `docs({{ query: \"<your query here>\" }})` to troubleshoot issues in Kit and find user guidance. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call docs, shell, edit, subagent, prompt, fork, subagents, close, and a2a, plus the MCP meta-tools tool_search, auth, and tool.{skill_guidance} Use `docs({{ query: \"<your query here>\" }})` to troubleshoot issues in Kit and find user guidance. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
             self.max_subagent_depth
         )
     }
+}
+
+fn default_skill_roots(root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![root.join(".agents/skills")];
+    #[cfg(unix)]
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
+    #[cfg(not(unix))]
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()));
+    if let Some(home) = home {
+        roots.push(PathBuf::from(home).join(".agents/skills"));
+    }
+    roots
 }
 
 pub struct ComposeOnly(ComposeTool);
