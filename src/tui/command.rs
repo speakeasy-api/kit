@@ -9,6 +9,7 @@ use std::ops::Range;
 enum Kind {
     Compact,
     New,
+    Model,
 }
 
 struct Spec {
@@ -26,12 +27,17 @@ const COMMANDS: &[Spec] = &[
         token: "/new",
         kind: Kind::New,
     },
+    Spec {
+        token: "/model",
+        kind: Kind::Model,
+    },
 ];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed<'a> {
     Compact { prompt: Option<&'a str> },
     New { prompt: Option<&'a str> },
+    Model { query: Option<&'a str> },
     Prompt(&'a str),
 }
 
@@ -56,6 +62,7 @@ pub fn parse(input: &str) -> Parsed<'_> {
     match spec.kind {
         Kind::Compact => Parsed::Compact { prompt },
         Kind::New => Parsed::New { prompt },
+        Kind::Model => Parsed::Model { query: prompt },
     }
 }
 
@@ -78,6 +85,13 @@ mod tests {
             }
         );
         assert_eq!(parse("/new"), Parsed::New { prompt: None });
+        assert_eq!(parse("/model"), Parsed::Model { query: None });
+        assert_eq!(
+            parse("/model   sonnet"),
+            Parsed::Model {
+                query: Some("sonnet")
+            }
+        );
         assert_eq!(
             parse("/new   start here"),
             Parsed::New {
@@ -94,11 +108,12 @@ mod tests {
 
     #[test]
     fn requires_an_exact_command_token_and_preserves_unknown_commands() {
-        for input in ["/newer", "/new/path", " /new", "/unknown arg"] {
+        for input in ["/newer", "/new/path", "/models", " /new", "/unknown arg"] {
             assert_eq!(parse(input), Parsed::Prompt(input));
             assert_eq!(known_token(input), None);
         }
         assert_eq!(known_token("/new prompt"), Some(0..4));
         assert_eq!(known_token("/compact prompt"), Some(0..8));
+        assert_eq!(known_token("/model sonnet"), Some(0..6));
     }
 }

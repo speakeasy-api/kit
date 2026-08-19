@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use agentkit_core::{TurnCancellation, Usage};
 use agentkit_loop::{
@@ -20,6 +23,7 @@ use super::{
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
+const MAX_SELECTOR_MODELS: usize = 2_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
 pub enum ProviderKind {
@@ -32,12 +36,165 @@ pub enum ProviderKind {
     OpenRouter,
 }
 
+impl std::str::FromStr for ProviderKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "openai-subscription" => Ok(Self::OpenAiSubscription),
+            "openrouter" => Ok(Self::OpenRouter),
+            _ => Err(format!("unknown model provider {value:?}")),
+        }
+    }
+}
+
 impl ProviderKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiSubscription => "openai-subscription",
             Self::OpenRouter => "openrouter",
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSelection {
+    pub provider: ProviderKind,
+    pub model: String,
+}
+
+impl ModelSelection {
+    pub fn new(provider: ProviderKind, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+        }
+    }
+
+    pub fn id(&self) -> String {
+        format!("{}:{}", self.provider.as_str(), self.model)
+    }
+
+    pub fn from_id(value: &str) -> Result<Self, String> {
+        let (provider, model) = value
+            .split_once(':')
+            .ok_or_else(|| "model selection must include a provider".to_string())?;
+        if !valid_model_id(model) {
+            return Err("model name is outside canonical bounds".into());
+        }
+        Ok(Self::new(provider.parse()?, model))
+    }
+}
+
+fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._:/".contains(&byte))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelGroup {
+    pub provider: ProviderKind,
+    pub models: Vec<String>,
+}
+
+/// A per-session adapter whose selection is read only when a new model turn begins.
+#[derive(Clone)]
+pub struct SelectableAdapter {
+    selection: Arc<Mutex<ModelSelection>>,
+}
+
+impl SelectableAdapter {
+    pub fn new(provider: ProviderKind, model: impl Into<String>) -> Result<Self, String> {
+        let selection = ModelSelection::new(provider, model);
+        if !valid_model_id(&selection.model) {
+            return Err("model name is outside canonical bounds".into());
+        }
+        KitAdapter::new(selection.provider, selection.model.clone())?;
+        Ok(Self {
+            selection: Arc::new(Mutex::new(selection)),
+        })
+    }
+
+    pub fn selection(&self) -> Result<ModelSelection, String> {
+        self.selection
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| "model selection lock is poisoned".into())
+    }
+
+    pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
+        if !valid_model_id(&selection.model) {
+            return Err("model name is outside canonical bounds".into());
+        }
+        KitAdapter::new(selection.provider, selection.model.clone())?;
+        *self
+            .selection
+            .lock()
+            .map_err(|_| "model selection lock is poisoned")? = selection;
+        Ok(())
+    }
+}
+
+pub struct SelectableSession {
+    selection: Arc<Mutex<ModelSelection>>,
+    config: SessionConfig,
+    active: ModelSelection,
+    inner: KitSession,
+}
+
+#[async_trait]
+impl ModelAdapter for SelectableAdapter {
+    type Session = SelectableSession;
+
+    async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
+        let active = self.selection().map_err(LoopError::InvalidState)?;
+        let inner = KitAdapter::new(active.provider, active.model.clone())
+            .map_err(LoopError::InvalidState)?
+            .start_session(config.clone())
+            .await?;
+        Ok(SelectableSession {
+            selection: Arc::clone(&self.selection),
+            config,
+            active,
+            inner,
+        })
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("kit-selectable")
+    }
+}
+
+#[async_trait]
+impl ModelSession for SelectableSession {
+    type Turn = KitTurn;
+
+    async fn begin_turn(
+        &mut self,
+        request: TurnRequest,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError> {
+        let selected = self
+            .selection
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| LoopError::InvalidState("model selection lock is poisoned".into()))?;
+        if selected != self.active {
+            self.inner = KitAdapter::new(selected.provider, selected.model.clone())
+                .map_err(LoopError::InvalidState)?
+                .start_session(self.config.clone())
+                .await?;
+            self.active = selected;
+        }
+        self.inner.begin_turn(request, cancellation).await
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.active.model)
     }
 }
 
@@ -275,12 +432,165 @@ fn parse_context_window(value: &Value, model: &str) -> Option<u64> {
     })
 }
 
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+fn catalog_models_url(configured_base: Option<&str>) -> Option<String> {
+    match configured_base {
+        Some(url) => models_url(url),
+        None => Some(OPENROUTER_MODELS_URL.to_string()),
+    }
+}
+
+const OPENROUTER_FALLBACK: &[&str] = &[
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-5.4",
+    "google/gemini-2.5-pro",
+];
+
+/// Returns a bounded, provider-grouped catalog. Remote discovery is best effort.
+pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
+    let openai = [
+        "gpt-5.6-sol",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
+        None => catalog_models_url(None),
+        Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
+    };
+    let mut openrouter = match openrouter_url {
+        Some(url) => fetch_model_ids(&url)
+            .await
+            .unwrap_or_else(|_| openrouter_fallback()),
+        None => openrouter_fallback(),
+    };
+    if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
+        openrouter.push(current.model.clone());
+    }
+    openrouter.sort();
+    openrouter.dedup();
+    openrouter.truncate(MAX_SELECTOR_MODELS);
+    if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
+        if openrouter.len() == MAX_SELECTOR_MODELS {
+            openrouter.pop();
+        }
+        openrouter.push(current.model.clone());
+    }
+    vec![
+        ModelGroup {
+            provider: ProviderKind::OpenAiSubscription,
+            models: openai,
+        },
+        ModelGroup {
+            provider: ProviderKind::OpenRouter,
+            models: openrouter,
+        },
+    ]
+}
+
+fn openrouter_fallback() -> Vec<String> {
+    OPENROUTER_FALLBACK
+        .iter()
+        .map(|model| (*model).to_string())
+        .collect()
+}
+
+async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|_| "could not build model catalog client".to_string())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "model catalog transport failed".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("model catalog returned {}", response.status()));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "model catalog body failed".to_string())?;
+        if body.len().saturating_add(chunk.len()) > MAX_MODELS_BYTES {
+            return Err("model catalog exceeds 2 MiB".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| "model catalog is not valid JSON".to_string())?;
+    let entries = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "model catalog omitted data".to_string())?;
+    if entries.len() > MAX_MODELS {
+        return Err("model catalog has too many entries".into());
+    }
+    Ok(entries
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .filter(|id| valid_model_id(id))
+        .take(MAX_SELECTOR_MODELS)
+        .map(str::to_string)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use agentkit_core::{TokenUsage, Usage};
     use serde_json::json;
 
-    use super::{add_context_window, models_url, parse_context_window};
+    use super::{
+        ModelSelection, OPENROUTER_MODELS_URL, ProviderKind, SelectableAdapter, add_context_window,
+        catalog_models_url, models_url, parse_context_window,
+    };
+
+    #[test]
+    fn model_selection_ids_round_trip_and_switch_atomically() {
+        let adapter = SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+        let selected = ModelSelection::from_id("openai-subscription:gpt-5.4-mini").unwrap();
+
+        adapter.select(selected.clone()).unwrap();
+
+        assert_eq!(adapter.selection().unwrap(), selected);
+        assert_eq!(
+            adapter.selection().unwrap().id(),
+            "openai-subscription:gpt-5.4-mini"
+        );
+        assert!(ModelSelection::from_id("unknown:model").is_err());
+        assert!(ModelSelection::from_id("openrouter:").is_err());
+    }
+
+    #[test]
+    fn invalid_switch_keeps_the_previous_selection() {
+        let adapter = SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+
+        assert!(
+            adapter
+                .select(ModelSelection::new(
+                    ProviderKind::OpenAiSubscription,
+                    "not-supported",
+                ))
+                .is_err()
+        );
+        assert_eq!(adapter.selection().unwrap().model, "gpt-5.4");
+    }
+
+    #[test]
+    fn explicit_unusable_openrouter_base_does_not_select_the_public_catalog() {
+        assert_eq!(
+            catalog_models_url(None).as_deref(),
+            Some(OPENROUTER_MODELS_URL)
+        );
+        assert_eq!(catalog_models_url(Some("https://example.com/custom")), None);
+    }
 
     #[test]
     fn derives_and_parses_openrouter_model_catalog_context() {

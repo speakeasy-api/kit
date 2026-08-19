@@ -9,9 +9,11 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block as Panel, BorderType, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Block as Panel, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
     },
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     app::{App, Block, Child, CodeHit, Phase, ToolCall},
@@ -55,6 +57,158 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     draw_prompt(frame, app, prompt);
     draw_status(frame, app, status);
+    if app.model_dialog.is_some() {
+        draw_model_dialog(frame, app);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModelDialogRow<'a> {
+    Provider(&'a str),
+    Choice { index: usize, label: String },
+}
+
+fn model_dialog_rows<'a>(
+    choices: &[&'a crate::tui::app::ModelChoice],
+    grouped: bool,
+) -> Vec<ModelDialogRow<'a>> {
+    let mut rows = Vec::new();
+    let mut last_provider = None;
+    for (index, choice) in choices.iter().enumerate() {
+        if grouped && last_provider != Some(choice.provider.as_str()) {
+            rows.push(ModelDialogRow::Provider(&choice.provider));
+            last_provider = Some(&choice.provider);
+        }
+        let label = if grouped {
+            choice.model.clone()
+        } else {
+            format!("{} · {}", choice.provider, choice.model)
+        };
+        rows.push(ModelDialogRow::Choice { index, label });
+    }
+    rows
+}
+
+fn model_dialog_viewport(
+    rows: &[ModelDialogRow<'_>],
+    selected: usize,
+    height: usize,
+) -> std::ops::Range<usize> {
+    if height == 0 || rows.is_empty() {
+        return 0..0;
+    }
+    let selected_row = rows
+        .iter()
+        .position(|row| matches!(row, ModelDialogRow::Choice { index, .. } if *index == selected))
+        .unwrap_or(0);
+    let start = selected_row
+        .saturating_sub(height / 2)
+        .min(rows.len().saturating_sub(height));
+    start..(start + height).min(rows.len())
+}
+
+fn visible_query_tail(query: &str, width: usize) -> &str {
+    let mut tail = query;
+    while UnicodeWidthStr::width(tail) > width {
+        let Some((index, _)) = tail.char_indices().nth(1) else {
+            return "";
+        };
+        tail = &tail[index..];
+    }
+    tail
+}
+
+fn draw_model_dialog(frame: &mut Frame<'_>, app: &App) {
+    let outer = frame.area();
+    let width = if outer.width > 20 {
+        outer.width.saturating_sub(4).min(72)
+    } else {
+        outer.width
+    };
+    let height = if outer.height > 8 {
+        outer.height.saturating_sub(4).min(22)
+    } else {
+        outer.height
+    };
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let dialog = app.model_dialog.as_ref().expect("checked above");
+    let choices = app.selected_model_choices();
+    let footer = format!(
+        "tab defaults [{}]  ·  enter select  ·  esc close",
+        if dialog.save_defaults { "x" } else { " " }
+    );
+    let panel = Panel::bordered().title(" model ");
+    let inner = panel.inner(area);
+    let footer_rows = u16::from(inner.height >= 3);
+    let search_rows = u16::from(inner.height >= 2);
+    let [search, list, footer_area] = Layout::vertical([
+        Constraint::Length(search_rows),
+        Constraint::Min(0),
+        Constraint::Length(footer_rows),
+    ])
+    .areas(inner);
+    let visible = list.height as usize;
+    let rows = model_dialog_rows(&choices, dialog.query.trim().is_empty());
+    let viewport = model_dialog_viewport(&rows, dialog.selected, visible);
+    let lines = rows[viewport]
+        .iter()
+        .map(|row| match row {
+            ModelDialogRow::Provider(provider) => {
+                Line::from(Span::styled((*provider).to_owned(), theme::faint()))
+            }
+            ModelDialogRow::Choice { index, label } => {
+                let selected = *index == dialog.selected;
+                let marker = if selected { "› " } else { "  " };
+                let style = if selected {
+                    theme::accent()
+                } else {
+                    theme::text()
+                };
+                Line::from(Span::styled(format!("{marker}{label}"), style))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    let search_prefix = if search.width >= 8 {
+        "search: "
+    } else {
+        "› "
+    };
+    let prefix_width = UnicodeWidthStr::width(search_prefix).min(search.width as usize);
+    let query = visible_query_tail(
+        &dialog.query,
+        (search.width as usize)
+            .saturating_sub(prefix_width)
+            .saturating_sub(1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(search_prefix, theme::dim()),
+            Span::styled(query.to_owned(), theme::text()),
+        ])),
+        search,
+    );
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(Span::styled(footer, theme::dim())),
+        footer_area,
+    );
+    if search.width > 0 && search.height > 0 {
+        let column = prefix_width + UnicodeWidthStr::width(query);
+        frame.set_cursor_position(Position::new(
+            search.x
+                + u16::try_from(column)
+                    .unwrap_or(u16::MAX)
+                    .min(search.width - 1),
+            search.y,
+        ));
+    }
 }
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -67,7 +221,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("▏ ", theme::faint()),
         Span::styled(root, theme::text()),
         Span::styled("  ·  ", theme::faint()),
-        Span::styled(app.model.clone(), theme::dim()),
+        Span::styled(format!("{} / {}", app.provider, app.model), theme::dim()),
         Span::styled("  ·  ", theme::faint()),
         Span::styled(
             format!(
@@ -752,11 +906,81 @@ mod tests {
     use agentkit_acp::ToolKind;
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{MAX_PROMPT_ROWS, draw, graph_lines, prompt_lines};
+    use super::{
+        MAX_PROMPT_ROWS, ModelDialogRow, draw, graph_lines, model_dialog_rows,
+        model_dialog_viewport, prompt_lines,
+    };
     use crate::{
         events::RuntimeEvent,
-        tui::app::{Action, App, Block, Update},
+        tui::app::{Action, App, Block, ModelDialog, Update},
     };
+
+    fn model_choice(provider: &str, model: &str) -> crate::tui::app::ModelChoice {
+        crate::tui::app::ModelChoice {
+            id: format!("{provider}:{model}"),
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn model_viewport_keeps_a_selection_beyond_the_first_page_visible() {
+        let choices = (0..8)
+            .map(|index| model_choice("provider", &format!("model-{index}")))
+            .collect::<Vec<_>>();
+        let choices = choices.iter().collect::<Vec<_>>();
+        let rows = model_dialog_rows(&choices, true);
+        let viewport = model_dialog_viewport(&rows, 6, 4);
+
+        assert!(
+            rows[viewport]
+                .iter()
+                .any(|row| matches!(row, ModelDialogRow::Choice { index: 6, .. }))
+        );
+    }
+
+    #[test]
+    fn model_viewport_counts_provider_headers_at_group_boundaries() {
+        let choices = vec![
+            model_choice("alpha", "one"),
+            model_choice("alpha", "two"),
+            model_choice("beta", "three"),
+            model_choice("beta", "four"),
+        ];
+        let choices = choices.iter().collect::<Vec<_>>();
+        let rows = model_dialog_rows(&choices, true);
+        let viewport = model_dialog_viewport(&rows, 2, 2);
+
+        assert_eq!(
+            &rows[viewport],
+            &[
+                ModelDialogRow::Provider("beta"),
+                ModelDialogRow::Choice {
+                    index: 2,
+                    label: "three".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn model_dialog_renders_the_selected_item_on_a_small_terminal() {
+        let mut app = sample();
+        app.model_choices = (0..10)
+            .map(|index| model_choice("provider", &format!("model-{index}")))
+            .collect();
+        app.model_dialog = Some(ModelDialog {
+            query: String::new(),
+            selected: 9,
+            save_defaults: false,
+        });
+
+        let frame = render(&mut app, 24, 8);
+        assert!(frame.contains("› model-9"), "{frame}");
+
+        let tiny = render(&mut app, 16, 3);
+        assert!(tiny.contains("› model-9"), "{tiny}");
+    }
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\
         checked = for file in files.lines {\n\
@@ -767,6 +991,7 @@ mod tests {
     fn sample() -> App {
         let mut app = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         );
@@ -823,6 +1048,7 @@ mod tests {
     fn labels_compaction_while_it_is_running() {
         let mut app = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         );
@@ -919,7 +1145,12 @@ mod tests {
 
     #[test]
     fn grows_and_wraps_the_prompt_instead_of_running_past_the_edge() {
-        let mut app = App::new(PathBuf::from("/tmp/kit"), "gpt-5.4".into(), "0:0".into());
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
         for word in "explain how the compose tool dispatches hidden children and \
                      everything internal to it. give me a plan"
             .split(' ')
@@ -1009,7 +1240,12 @@ mod tests {
 
     #[test]
     fn keeps_duplicate_and_wrapped_link_targets_exact() {
-        let mut app = App::new(PathBuf::from("/tmp/kit"), "gpt-5.4".into(), "0:0".into());
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
         let first = "https://first.example/a/very/long/path";
         let second = "https://second.example/a/very/long/path";
         app.blocks.push(Block::Agent(format!("[same]({first})")));
@@ -1038,6 +1274,7 @@ mod tests {
 
         let frame = render(&mut app, 120, 24);
 
+        assert!(frame.contains("openai-subscription / gpt-5.4"));
         assert!(frame.contains("0.5% 1k/272k"));
         assert!(!frame.contains("ctx "));
     }
@@ -1073,7 +1310,12 @@ mod tests {
 
     #[test]
     fn shows_the_welcome_screen_before_the_first_prompt() {
-        let mut app = App::new(PathBuf::from("/tmp/kit"), "gpt-5.4".into(), "0:0".into());
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
         let frame = render(&mut app, 90, 24);
         println!("{frame}");
         assert!(frame.contains("send"));

@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
-    provider::{KitAdapter, KitSession, ProviderKind},
+    provider::{ProviderKind, SelectableAdapter, SelectableSession},
     tools::{
         A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
         ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
@@ -97,13 +97,14 @@ pub(crate) struct AcpDriverContext {
 }
 
 pub(crate) struct AcpDriver {
-    pub driver: LoopDriver<KitSession>,
+    pub driver: LoopDriver<SelectableSession>,
     pub tasks: TaskManagerHandle,
+    pub adapter: SelectableAdapter,
 }
 
 pub struct Runtime {
     root: PathBuf,
-    adapter: KitAdapter,
+    adapter: SelectableAdapter,
     provider: ProviderKind,
     model: String,
     max_subagent_depth: usize,
@@ -138,7 +139,7 @@ impl Runtime {
         }
         let skills = SkillRegistry::from_paths(default_skill_roots(&root)).tool_registry();
         let model = model.into();
-        let adapter = KitAdapter::new(provider, model.clone())?;
+        let adapter = SelectableAdapter::new(provider, model.clone())?;
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
             ChildConfig {
@@ -459,8 +460,12 @@ impl Runtime {
             )
             .map_err(AcpRuntimeError::Loop)?;
             opened_new = !request.resume;
+            // Every ACP route owns its model selection. Changing one session
+            // cannot redirect another session served by the same runtime.
+            let adapter = SelectableAdapter::new(self.provider, self.model.clone())
+                .map_err(AcpRuntimeError::Loop)?;
             let compactor = crate::compaction::automatic(
-                self.adapter.clone(),
+                adapter.clone(),
                 Some(opened.observer.clone()),
                 format!("compaction-{}", crate::session::new_id()),
             )
@@ -469,7 +474,7 @@ impl Runtime {
             let task_manager = background_task_manager();
             let tasks = task_manager.handle();
             let driver = Agent::builder()
-                .model(self.adapter.clone())
+                .model(adapter.clone())
                 .add_tool_source(self.compose_with(self.base_depth, subagents))
                 .task_manager(task_manager)
                 .mutator(compactor)
@@ -484,7 +489,11 @@ impl Runtime {
                 .start(SessionConfig::new(context.agentkit_session_id).without_cache())
                 .await
                 .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
-            Ok(AcpDriver { driver, tasks })
+            Ok(AcpDriver {
+                driver,
+                tasks,
+                adapter,
+            })
         }
         .await;
         self.session
@@ -723,7 +732,7 @@ async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<V
     Ok(transcript)
 }
 
-async fn drive(driver: &mut LoopDriver<KitSession>) -> Result<String, LoopError> {
+async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {
     loop {
         match driver.next().await? {
             LoopStep::Finished(result) => {

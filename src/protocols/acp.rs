@@ -12,7 +12,9 @@ use agentkit_acp::{
     AutoDenyResolver, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
     PromptCapabilities, PromptRequest, PromptResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, StopReason,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
 use agentkit_core::{
     CancellationController, FinishReason, MetadataMap, SessionId as AgentkitSessionId,
@@ -22,7 +24,12 @@ use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::runtime::{AcpDriverContext, Runtime};
+use crate::{
+    provider::{ModelGroup, ModelSelection, SelectableAdapter, model_catalog},
+    runtime::{AcpDriverContext, Runtime},
+};
+
+const MODEL_CONFIG_ID: &str = "model";
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(error.to_string())
@@ -34,6 +41,10 @@ enum Command {
         reply: oneshot::Sender<Result<PromptResponse, AcpRuntimeError>>,
     },
     Cancel,
+    SetModel {
+        request: SetSessionConfigOptionRequest,
+        reply: oneshot::Sender<Result<SetSessionConfigOptionResponse, AcpRuntimeError>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -109,14 +120,19 @@ impl Server {
             .lock()
             .await
             .insert(acp_session_id.clone(), tx);
+        let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
+        let catalog = model_catalog(&current).await;
+        let options = model_options(&current, &catalog);
         tokio::spawn(session_actor(
             acp_session_id.clone(),
             Arc::clone(&self.integration),
             driver.driver,
             driver.tasks,
+            driver.adapter,
+            catalog,
             rx,
         ));
-        Ok(NewSessionResponse::new(acp_session_id))
+        Ok(NewSessionResponse::new(acp_session_id).config_options(Some(options)))
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, AcpRuntimeError> {
@@ -124,6 +140,19 @@ impl Server {
         let (tx, rx) = oneshot::channel();
         sender
             .send(Command::Prompt { request, reply: tx })
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+    }
+
+    async fn set_config(
+        &self,
+        request: SetSessionConfigOptionRequest,
+    ) -> Result<SetSessionConfigOptionResponse, AcpRuntimeError> {
+        let sender = self.sender(&request.session_id).await?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(Command::SetModel { request, reply: tx })
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -188,6 +217,8 @@ async fn session_actor<S: ModelSession>(
     integration: Arc<AcpIntegration>,
     mut driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
+    adapter: SelectableAdapter,
+    catalog: Vec<ModelGroup>,
     mut commands: mpsc::Receiver<Command>,
 ) {
     loop {
@@ -203,6 +234,10 @@ async fn session_actor<S: ModelSession>(
                 // The server already interrupted the shared controller; this
                 // marker only establishes its serialized actor position.
                 Some(Command::Cancel) => {}
+                Some(Command::SetModel { request, reply }) => {
+                    let result = set_model(&adapter, &catalog, request);
+                    let _ = reply.send(result);
+                }
                 Some(Command::Close { reply }) => {
                     clean_up_session(&session_id, &mut driver, &tasks).await;
                     let _ = reply.send(());
@@ -232,6 +267,67 @@ async fn session_actor<S: ModelSession>(
             }
         }
     }
+}
+
+fn model_options(current: &ModelSelection, catalog: &[ModelGroup]) -> Vec<SessionConfigOption> {
+    let groups = catalog
+        .iter()
+        .map(|group| {
+            let provider = group.provider.as_str();
+            let name = match group.provider {
+                crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
+                crate::ProviderKind::OpenRouter => "OpenRouter",
+            };
+            let options = group
+                .models
+                .iter()
+                .map(|model| {
+                    let selection = ModelSelection {
+                        provider: group.provider,
+                        model: model.clone(),
+                    };
+                    SessionConfigSelectOption::new(selection.id(), model.clone())
+                })
+                .collect();
+            SessionConfigSelectGroup::new(provider, name, options)
+        })
+        .collect::<Vec<_>>();
+    vec![
+        SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.id(), groups)
+            .category(SessionConfigOptionCategory::Model),
+    ]
+}
+
+fn set_model(
+    adapter: &SelectableAdapter,
+    catalog: &[ModelGroup],
+    request: SetSessionConfigOptionRequest,
+) -> Result<SetSessionConfigOptionResponse, AcpRuntimeError> {
+    if request.config_id.to_string() != MODEL_CONFIG_ID {
+        return Err(AcpRuntimeError::Unsupported(
+            "unknown session configuration option".into(),
+        ));
+    }
+    let value = request
+        .value
+        .as_value_id()
+        .ok_or_else(|| AcpRuntimeError::Unsupported("model selection requires an id value".into()))?
+        .to_string();
+    let selection = ModelSelection::from_id(&value).map_err(AcpRuntimeError::Loop)?;
+    let offered = catalog.iter().any(|group| {
+        group.provider == selection.provider && group.models.contains(&selection.model)
+    });
+    if !offered {
+        return Err(AcpRuntimeError::Unsupported(
+            "model is not in the advertised catalog".into(),
+        ));
+    }
+    adapter
+        .select(selection.clone())
+        .map_err(AcpRuntimeError::Loop)?;
+    Ok(SetSessionConfigOptionResponse::new(model_options(
+        &selection, catalog,
+    )))
 }
 
 async fn clean_up_session<S: ModelSession>(
@@ -376,6 +472,20 @@ async fn serve_transport(
                     cx.spawn(async move {
                         responder
                             .respond_with_result(state.prompt(request).await.map_err(sdk_error))
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: SetSessionConfigOptionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder
+                            .respond_with_result(state.set_config(request).await.map_err(sdk_error))
                     })?;
                     Ok(())
                 }
@@ -782,6 +892,8 @@ mod tests {
             Arc::clone(&integration),
             driver,
             tasks,
+            SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap(),
+            Vec::new(),
             commands_rx,
         ));
 
@@ -848,6 +960,30 @@ mod tests {
             .unwrap()
             .unwrap();
         drain.abort();
+    }
+
+    #[test]
+    fn model_config_switches_the_shared_session_adapter() {
+        let adapter =
+            SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+        let catalog = vec![ModelGroup {
+            provider: crate::ProviderKind::OpenAiSubscription,
+            models: vec!["gpt-5.4".into(), "gpt-5.4-mini".into()],
+        }];
+
+        let response = set_model(
+            &adapter,
+            &catalog,
+            SetSessionConfigOptionRequest::new(
+                "session",
+                MODEL_CONFIG_ID,
+                "openai-subscription:gpt-5.4-mini",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(adapter.selection().unwrap().model, "gpt-5.4-mini");
+        assert_eq!(response.config_options.len(), 1);
     }
 
     #[tokio::test]

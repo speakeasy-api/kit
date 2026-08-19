@@ -1,6 +1,7 @@
 //! Client state: the transcript, the live runtime graph, and key handling.
 
 use std::{
+    cmp::Reverse,
     ops::Range,
     path::PathBuf,
     time::{Duration, Instant},
@@ -75,12 +76,29 @@ pub struct CodeHit {
 }
 
 /// What the event loop should do after a key press.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub id: String,
+    pub provider: String,
+    pub model: String,
+}
+
+pub struct ModelDialog {
+    pub query: String,
+    pub selected: usize,
+    pub save_defaults: bool,
+}
+
 pub enum Action {
     None,
     Redraw,
     Submit(String),
     Compact(Option<String>),
     New(Option<String>),
+    SelectModel {
+        choice: ModelChoice,
+        save_defaults: bool,
+    },
     Copy(String),
     Cancel,
     Quit,
@@ -219,7 +237,10 @@ pub enum Phase {
 
 pub struct App {
     pub root: PathBuf,
+    pub provider: String,
     pub model: String,
+    pub model_choices: Vec<ModelChoice>,
+    pub model_dialog: Option<ModelDialog>,
     pub a2a: String,
     pub session_id: Option<String>,
     pub blocks: Vec<Block>,
@@ -266,6 +287,137 @@ pub struct App {
 /// return in such a burst is a line break in the pasted text, not a send.
 const PASTE_GAP: Duration = Duration::from_millis(8);
 
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut costs = (0..=right.chars().count()).collect::<Vec<_>>();
+    for (row, a) in left.chars().enumerate() {
+        let mut previous = costs[0];
+        costs[0] = row + 1;
+        for (column, b) in right.chars().enumerate() {
+            let old = costs[column + 1];
+            costs[column + 1] = if a == b {
+                previous
+            } else {
+                1 + previous.min(costs[column]).min(old)
+            };
+            previous = old;
+        }
+    }
+    *costs.last().unwrap_or(&0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ModelScore {
+    tier: u8,
+    distance: usize,
+    unmatched: usize,
+    gaps: usize,
+    start: usize,
+}
+
+fn model_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn typo_limit(term: &str) -> usize {
+    match term.chars().count() {
+        0..=3 => 0,
+        4..=7 => 1,
+        _ => 2,
+    }
+}
+
+fn ordered_token_score(candidate: &[String], query: &[String]) -> Option<ModelScore> {
+    let mut previous = vec![None; candidate.len()];
+    for (term_index, term) in query.iter().enumerate() {
+        let mut next = vec![None; candidate.len()];
+        for (index, token) in candidate.iter().enumerate() {
+            let edit = edit_distance(token, term);
+            if !token.starts_with(term) && edit > typo_limit(term) {
+                continue;
+            }
+            next[index] = if term_index == 0 {
+                Some((edit, index))
+            } else {
+                previous[..index]
+                    .iter()
+                    .flatten()
+                    .map(|(distance, start)| (distance + edit, *start))
+                    .min_by_key(|(distance, start)| (*distance, Reverse(*start)))
+            };
+        }
+        previous = next;
+    }
+
+    previous
+        .into_iter()
+        .enumerate()
+        .filter_map(|(end, state)| {
+            state.map(|(distance, start)| ModelScore {
+                tier: 3,
+                distance,
+                unmatched: candidate.len().saturating_sub(query.len()),
+                gaps: (end - start + 1).saturating_sub(query.len()),
+                start,
+            })
+        })
+        .min()
+}
+
+fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
+    let query = query.trim().to_lowercase();
+    let model = choice.model.to_lowercase();
+    let basename = model.rsplit('/').next().unwrap_or(&model);
+    let query_tokens = model_tokens(&query);
+    if query_tokens.is_empty() {
+        return None;
+    }
+
+    if query == model || query == basename {
+        return Some(ModelScore {
+            tier: 0,
+            distance: 0,
+            unmatched: 0,
+            gaps: 0,
+            start: 0,
+        });
+    }
+
+    let basename_tokens = model_tokens(basename);
+    let candidate_tokens = model_tokens(&model);
+    if basename_tokens == query_tokens || candidate_tokens == query_tokens {
+        return Some(ModelScore {
+            tier: 1,
+            distance: 0,
+            unmatched: 0,
+            gaps: 0,
+            start: 0,
+        });
+    }
+    if let Some(start) = candidate_tokens
+        .windows(query_tokens.len())
+        .position(|tokens| tokens == query_tokens)
+    {
+        return Some(ModelScore {
+            tier: 2,
+            distance: 0,
+            unmatched: candidate_tokens.len() - query_tokens.len(),
+            gaps: 0,
+            start,
+        });
+    }
+    if let Some(score) = ordered_token_score(&candidate_tokens, &query_tokens) {
+        return Some(score);
+    }
+
+    let mut all_tokens = model_tokens(&choice.provider);
+    all_tokens.extend(candidate_tokens);
+    ordered_token_score(&all_tokens, &query_tokens).map(|score| ModelScore { tier: 4, ..score })
+}
+
 fn is_compaction_summary(item: &Item) -> bool {
     item.metadata
         .get("kit.compaction.summary")
@@ -288,10 +440,13 @@ fn persisted_output(output: &ToolOutput) -> Vec<String> {
 }
 
 impl App {
-    pub fn new(root: PathBuf, model: String, a2a: String) -> Self {
+    pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
             root,
+            provider,
             model,
+            model_choices: Vec::new(),
+            model_dialog: None,
             a2a,
             session_id: None,
             blocks: Vec::new(),
@@ -739,10 +894,101 @@ impl App {
         }
     }
 
+    pub fn set_model_choices(&mut self, choices: Vec<ModelChoice>) {
+        self.model_choices = choices;
+    }
+
+    pub fn selected_model_choices(&self) -> Vec<&ModelChoice> {
+        let Some(dialog) = &self.model_dialog else {
+            return Vec::new();
+        };
+        if dialog.query.trim().is_empty() {
+            return self.model_choices.iter().collect();
+        }
+        let mut choices = self
+            .model_choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                model_score(choice, &dialog.query).map(|score| (score, index, choice))
+            })
+            .collect::<Vec<_>>();
+        choices.sort_by_key(|(score, index, _)| (*score, *index));
+        choices.into_iter().map(|(_, _, choice)| choice).collect()
+    }
+
+    fn closest_model(&self, query: &str) -> Option<ModelChoice> {
+        self.model_choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                model_score(choice, query).map(|score| (score, index, choice))
+            })
+            .min_by_key(|(score, index, _)| (*score, *index))
+            .map(|(_, _, choice)| choice.clone())
+    }
+
+    fn handle_model_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => self.model_dialog = None,
+            KeyCode::Tab => {
+                if let Some(dialog) = &mut self.model_dialog {
+                    dialog.save_defaults = !dialog.save_defaults;
+                }
+            }
+            KeyCode::Up => {
+                if let Some(dialog) = &mut self.model_dialog {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let count = self.selected_model_choices().len();
+                if let Some(dialog) = &mut self.model_dialog {
+                    dialog.selected = (dialog.selected + 1).min(count.saturating_sub(1));
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = &mut self.model_dialog {
+                    dialog.query.pop();
+                    dialog.selected = 0;
+                }
+            }
+            KeyCode::Enter => {
+                let choice = self
+                    .selected_model_choices()
+                    .get(self.model_dialog.as_ref().map_or(0, |value| value.selected))
+                    .cloned()
+                    .cloned();
+                let save_defaults = self
+                    .model_dialog
+                    .as_ref()
+                    .is_some_and(|value| value.save_defaults);
+                if let Some(choice) = choice {
+                    self.model_dialog = None;
+                    return Action::SelectModel {
+                        choice,
+                        save_defaults,
+                    };
+                }
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(dialog) = &mut self.model_dialog {
+                    dialog.query.push(character);
+                    dialog.selected = 0;
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if self.model_dialog.is_some() {
+            return self.handle_model_key(key);
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
         // the arrival gap is the only thing separating it from typing.
@@ -801,6 +1047,28 @@ impl App {
                 return match parse(&input) {
                     Parsed::Compact { prompt } => Action::Compact(prompt.map(str::to_string)),
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
+                    Parsed::Model { query: Some(query) } => match self.closest_model(query) {
+                        Some(choice) => Action::SelectModel {
+                            choice,
+                            save_defaults: false,
+                        },
+                        None => {
+                            self.toast(format!("no model matches {query:?}"));
+                            Action::None
+                        }
+                    },
+                    Parsed::Model { query: None } => {
+                        if self.model_choices.is_empty() {
+                            self.toast("no models are available");
+                        } else {
+                            self.model_dialog = Some(ModelDialog {
+                                query: String::new(),
+                                selected: 0,
+                                save_defaults: false,
+                            });
+                        }
+                        Action::None
+                    }
                     Parsed::Prompt(prompt) => Action::Submit(prompt.to_string()),
                 };
             }
@@ -1013,6 +1281,7 @@ mod tests {
     fn app() -> App {
         App::new(
             PathBuf::from("/tmp"),
+            "openai-subscription".into(),
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         )
@@ -1405,5 +1674,103 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(agents, ["first completion", "second completion continued"]);
+    }
+
+    fn model_choice(provider: &str, model: &str) -> super::ModelChoice {
+        super::ModelChoice {
+            id: format!("{provider}:{model}"),
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    fn similar_models() -> Vec<super::ModelChoice> {
+        vec![
+            model_choice("openai-subscription", "gpt-4o"),
+            model_choice("openai-subscription", "gpt-4o-mini"),
+            model_choice("openai-subscription", "gpt-5.4"),
+            model_choice("anthropic", "claude-3-5-haiku"),
+            model_choice("anthropic", "claude-3-7-sonnet"),
+            model_choice("openrouter", "anthropic/claude-sonnet-4"),
+        ]
+    }
+
+    #[test]
+    fn model_search_ranks_the_full_query_and_only_keeps_meaningful_matches() {
+        let mut app = app();
+        app.set_model_choices(similar_models());
+        app.model_dialog = Some(super::ModelDialog {
+            query: "claude sonet".into(),
+            selected: 0,
+            save_defaults: false,
+        });
+
+        let ranked = app.selected_model_choices();
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["anthropic/claude-sonnet-4", "claude-3-7-sonnet"]
+        );
+
+        app.model_dialog.as_mut().unwrap().query = "totally unrelated".into();
+        assert!(app.selected_model_choices().is_empty());
+    }
+
+    #[test]
+    fn model_command_uses_multi_token_relevance_and_does_not_guess_on_no_match() {
+        let mut app = app();
+        app.set_model_choices(similar_models());
+        app.editor.insert_str("/model claude 3 7 sonnet");
+
+        let Action::SelectModel { choice, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected model selection");
+        };
+        assert_eq!(choice.model, "claude-3-7-sonnet");
+
+        app.editor.insert_str("/model gpt mini");
+        app.last_key = None;
+        let Action::SelectModel { choice, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected model selection");
+        };
+        assert_eq!(choice.model, "gpt-4o-mini");
+
+        app.editor.insert_str("/model completely unknown");
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(
+            app.toast_text(),
+            Some("no model matches \"completely unknown\"")
+        );
+    }
+
+    #[test]
+    fn exact_basename_and_contiguous_phrase_beat_broader_token_matches() {
+        let mut app = app();
+        app.set_model_choices(vec![
+            model_choice("second", "gpt-4o-mini"),
+            model_choice("second", "claude-sonnet-old"),
+            model_choice("first", "family/claude-sonnet"),
+            model_choice("second", "claude-new-sonnet"),
+            model_choice("third", "other/claude-sonnet"),
+            model_choice("first", "gpt-4o"),
+        ]);
+
+        assert_eq!(
+            app.closest_model("claude-sonnet").unwrap().provider,
+            "first"
+        );
+        assert_eq!(
+            app.closest_model("claude sonnet").unwrap().provider,
+            "first"
+        );
+        assert_eq!(app.closest_model("gpt 4o").unwrap().model, "gpt-4o");
+
+        app.set_model_choices(vec![model_choice("first", "fooo-bar-foo")]);
+        assert_eq!(app.closest_model("foo bar").unwrap().model, "fooo-bar-foo");
     }
 }

@@ -27,7 +27,8 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ContentBlock, SessionNotification, SessionUpdate,
+    CancelNotification, CloseSessionRequest, ContentBlock, SessionConfigKind, SessionConfigOption,
+    SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     ToolCallContent,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -54,7 +55,7 @@ use crate::{
     tools::mcp::CredentialStorage,
 };
 
-use app::{Action, App, Update};
+use app::{Action, App, ModelChoice, Update};
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
@@ -74,6 +75,53 @@ const FAILURE_LINES: usize = 5;
 /// How long a turn interrupted on the way out gets to finish unwinding, so the
 /// transcript it owns is closed out before the agent is killed.
 const SETTLE: Duration = Duration::from_secs(3);
+
+fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<ModelChoice> {
+    let current = options
+        .unwrap_or_default()
+        .iter()
+        .find(|option| option.id.to_string() == "model")
+        .and_then(|option| match &option.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+            _ => None,
+        })?;
+    model_choices(options)
+        .into_iter()
+        .find(|choice| choice.id == current)
+}
+
+fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
+    let Some(SessionConfigOption {
+        kind: SessionConfigKind::Select(select),
+        ..
+    }) = options
+        .unwrap_or_default()
+        .iter()
+        .find(|option| option.id.to_string() == "model")
+    else {
+        return Vec::new();
+    };
+    let SessionConfigSelectOptions::Grouped(groups) = &select.options else {
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .flat_map(|group| {
+            let provider = group.group.to_string();
+            group.options.iter().map(move |option| {
+                let id = option.value.to_string();
+                let model = id
+                    .split_once(':')
+                    .map_or_else(|| option.name.clone(), |(_, model)| model.to_string());
+                ModelChoice {
+                    id,
+                    provider: provider.clone(),
+                    model,
+                }
+            })
+        })
+        .collect()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -238,7 +286,14 @@ pub async fn run(
 
             let mut terminal =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
-            let mut app = App::new(root.clone(), model, a2a);
+            let initial_choices = model_choices(session.config_options.as_deref());
+            let mut app = App::new(
+                root.clone(),
+                provider.as_str().to_string(),
+                model,
+                a2a,
+            );
+            app.set_model_choices(initial_choices);
             app.restore_transcript(persisted_session_id, &restored);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
@@ -369,6 +424,11 @@ pub async fn run(
                                         *active = persisted_id.clone();
                                     }
                                     app.start_session(persisted_id);
+                                    if let Some(choice) = current_model_choice(session.config_options.as_deref()) {
+                                        app.provider = choice.provider;
+                                        app.model = choice.model;
+                                    }
+                                    app.set_model_choices(model_choices(session.config_options.as_deref()));
                                     if let Some(prompt) = first_prompt {
                                         app.push_user(prompt.clone());
                                         let connection = connection.clone();
@@ -389,6 +449,29 @@ pub async fn run(
                                                 Err(error) => Some(error.to_string()),
                                             }));
                                         }));
+                                    }
+                                }
+                                Action::SelectModel { choice, save_defaults } => {
+                                    let response = connection.send_request(
+                                        SetSessionConfigOptionRequest::new(
+                                            session_id.clone(), "model", choice.id.as_str(),
+                                        ),
+                                    ).block_task().await;
+                                    match response {
+                                        Ok(response) => {
+                                            app.provider = choice.provider.clone();
+                                            app.model = choice.model.clone();
+                                            app.usage = None;
+                                            app.set_model_choices(model_choices(Some(&response.config_options)));
+                                            app.note(format!("model changed to {} via {}", choice.model, choice.provider));
+                                            if save_defaults {
+                                                match save_model_defaults(&choice) {
+                                                    Ok(()) => app.note("saved model defaults to ~/.kit/config.toml"),
+                                                    Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
+                                                }
+                                            }
+                                        }
+                                        Err(error) => app.note(format!("model change failed: {}", error.message)),
                                     }
                                 }
                                 Action::Copy(text) => {
@@ -455,6 +538,49 @@ pub async fn run(
 
     result?;
     Ok(())
+}
+
+fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "HOME is unset; cannot save defaults".to_string())?;
+    save_model_defaults_to(
+        &std::path::PathBuf::from(home).join(".kit/config.toml"),
+        choice,
+    )
+}
+
+fn save_model_defaults_to(path: &Path, choice: &ModelChoice) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let contents = match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let mut config = if contents.is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str::<toml::Value>(&contents)
+            .map_err(|error| format!("invalid {}: {error}", path.display()))?
+    };
+    let root = config
+        .as_table_mut()
+        .ok_or_else(|| format!("invalid {}: root must be a table", path.display()))?;
+    root.insert(
+        "provider".into(),
+        toml::Value::String(choice.provider.clone()),
+    );
+    root.insert("model".into(), toml::Value::String(choice.model.clone()));
+    let output = toml::to_string_pretty(&config)
+        .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "config path has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
+        .write(|file| file.write_all(output.as_bytes()))
+        .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 /// An ACP error prints its whole JSON-RPC envelope; on the way out of the
@@ -765,11 +891,71 @@ fn readable(text: &str) -> Vec<String> {
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
-    use super::{SessionEventError, osc52, readable, started_session, wait_for_started_session};
+    use agentkit_acp::{SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption};
+
+    use super::{
+        ModelChoice, SessionEventError, current_model_choice, osc52, readable,
+        save_model_defaults_to, started_session, wait_for_started_session,
+    };
     use crate::{
         events::RuntimeEvent,
         tui::app::{App, Update},
     };
+
+    #[test]
+    fn saves_defaults_by_parsing_and_reserializing_valid_toml() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#""provider" = "old"
+model = "old"
+message = """
+a = [still text]
+"""
+
+[custom]
+"quoted.key" = "preserved"
+"#,
+        )
+        .unwrap();
+        let choice = ModelChoice {
+            id: "openrouter:anthropic/claude-sonnet-4".into(),
+            provider: "openrouter".into(),
+            model: "anthropic/claude-sonnet-4".into(),
+        };
+
+        save_model_defaults_to(&path, &choice).unwrap();
+
+        let saved = toml::from_str::<toml::Value>(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved["provider"].as_str(), Some("openrouter"));
+        assert_eq!(saved["model"].as_str(), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(saved["message"].as_str(), Some("a = [still text]\n"));
+        assert_eq!(saved["custom"]["quoted.key"].as_str(), Some("preserved"));
+    }
+
+    #[test]
+    fn reads_the_current_model_from_new_session_options() {
+        let options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "openrouter:anthropic/claude-sonnet-4",
+            vec![SessionConfigSelectGroup::new(
+                "openrouter",
+                "OpenRouter",
+                vec![SessionConfigSelectOption::new(
+                    "openrouter:anthropic/claude-sonnet-4",
+                    "anthropic/claude-sonnet-4",
+                )],
+            )],
+        )];
+
+        let choice = current_model_choice(Some(&options)).unwrap();
+
+        assert_eq!(choice.provider, "openrouter");
+        assert_eq!(choice.model, "anthropic/claude-sonnet-4");
+    }
 
     #[test]
     fn encodes_exact_text_for_the_terminal_clipboard() {
@@ -791,7 +977,14 @@ mod tests {
 
     #[tokio::test]
     async fn new_session_wait_is_correlated_bounded_and_detects_stream_failure() {
-        let app = || App::new(PathBuf::from("/tmp"), "model".into(), "a2a".into());
+        let app = || {
+            App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            )
+        };
         let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Update::Runtime(RuntimeEvent::SessionStarted {
             acp_session_id: "other".into(),

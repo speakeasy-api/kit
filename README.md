@@ -416,6 +416,8 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | `⏎` | send |
 | `/new` | start a fresh persisted session (`/new prompt` sends its first prompt) |
 | `/compact` | compact context now (`/compact prompt` starts the next turn with `prompt`) |
+| `/model` | open the searchable provider-grouped model picker |
+| `/model name` | switch immediately to the closest catalog match |
 | `⇧⏎`, `⌥⏎`, `^j` | newline |
 | `esc` | interrupt the running turn |
 | `^c` | interrupt, or quit when idle |
@@ -435,7 +437,15 @@ no credentials — the client exits with that agent's own last diagnostic rather
 than waiting on a handshake that will never finish.
 
 `/new` clears the visible transcript but leaves the prior persisted session
-intact and resumable. `/compact` ends after compaction when used alone; text after
+intact and resumable. `/model` switches the main agent and compactor in the same
+live ACP session at the next safe turn boundary; it does not rewrite transcript
+history or restart the child process. The picker groups models by provider and
+ranks fuzzy matches as you type. Press `tab` before confirming to also replace the `provider`
+and `model` defaults in the active user's `~/.kit/config.toml`; this safely
+rewrites the TOML but does not preserve its formatting or comments. Otherwise, the
+choice lasts only for this live ACP session. Catalog discovery is bounded and
+falls back to a small built-in list when a provider catalog is unavailable.
+`/compact` ends after compaction when used alone; text after
 the command is retained as a new user message and starts the next model turn.
 Slash commands are recognized only as exact leading
 tokens. Unknown slash commands are sent to the model unchanged. Pasting
