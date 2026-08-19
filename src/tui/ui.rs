@@ -30,6 +30,9 @@ const MAX_PROMPT_ROWS: usize = 10;
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
 
+type TranscriptTag = (Option<String>, Option<CodeHit>);
+type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
@@ -355,7 +358,7 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
 
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
-fn transcript_lines(app: &App) -> Vec<(LinkedLine, (Option<String>, Option<CodeHit>))> {
+fn transcript_lines(app: &App) -> Vec<TaggedTranscriptLine> {
     let mut lines = Vec::new();
     for (block_index, block) in app.blocks.iter().enumerate() {
         if !lines.is_empty() {
@@ -941,7 +944,7 @@ mod tests {
 
     #[test]
     fn model_viewport_counts_provider_headers_at_group_boundaries() {
-        let choices = vec![
+        let choices = [
             model_choice("alpha", "one"),
             model_choice("alpha", "two"),
             model_choice("beta", "three"),

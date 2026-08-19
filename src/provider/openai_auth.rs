@@ -344,12 +344,11 @@ pub(crate) fn execute(
 ) -> Result<Output, AuthError> {
     let store = BackendCredentialStore::new(storage);
     let deadline = Instant::now() + timeout.min(Duration::from_secs(300));
-    let result = match command {
+    match command {
         AuthCommand::Login => login(&store, format, deadline),
         AuthCommand::Status => status(&store, format, deadline),
         AuthCommand::Logout { local_only } => logout(&store, format, deadline, local_only),
-    };
-    result
+    }
 }
 
 fn login(

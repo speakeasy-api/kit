@@ -1126,7 +1126,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            stream.read(&mut request).await.unwrap();
+            let bytes_read = stream.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0);
             stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
