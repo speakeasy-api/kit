@@ -270,13 +270,17 @@ values rather than background tasks:
 first = subagent({ prompt: "Inspect the parser" })
 second = prompt({ subagent: first, prompt: "Now propose the smallest fix" })
 branch = fork({ subagent: second, prompt: "Try the alternative design" })
-return { main: second.output, alternative: branch.output }
+active = subagents({})
+closed = close({ id: branch.id })
+return { main: second.output, alternative: branch.output, active, closed }
 ```
 
 The optional `harness` argument overrides the user's configured harness preference
 with the selected value. Default to omitting it.
 
-Each call returns `{ id, output, generation }`. By default, `output` remains the
+`subagents({})` lists the current reusable handles, including idle completed sessions, and `close(handle)` or `close({ id: handle.id })` explicitly terminates one. Closing removes the handle from the parent registry and releases its capacity. For native-fork siblings sharing a process, the harness must advertise ACP `session/close`; otherwise Kit reports that it cannot close only one sibling. All retained subagents are terminated when their owning parent session closes. A parent session can retain at most 120 subagents.
+
+Each turn-producing call returns `{ id, output, generation }`. By default, `output` remains the
 agent's text. When a turn also emits non-text agent content, tool calls, tool-call
 updates, or plans, the value gains an optional `updates` field containing the
 ordered ACP update objects and a `truncated` flag. Text-only turns keep the
@@ -387,7 +391,7 @@ same protocol any editor would.
 
 While a `compose` call runs, the right-hand pane draws its runtime graph: the
 Runlet program parsed into its call, loop, branch, and boundary structure, with
-each nested shell, edit, subagent, prompt, fork, A2A, and MCP meta-tool dispatch shown live under the node
+each nested shell, edit, subagent, prompt, fork, subagents, close, A2A, and MCP meta-tool dispatch shown live under the node
 that most likely issued it, including concurrent fan-out and failures. Child
 call lifecycle is exact; when the same tool appears in several places, node
 attribution is a stable heuristic. Nested-call

@@ -36,6 +36,8 @@ fn runtime_is_rooted_and_exposes_only_compose() {
         "`subagent`: Start a parent-owned configured ACP harness",
         "`prompt`: Re-prompt the same completed ACP subagent session",
         "`fork`: Fork a completed ACP subagent session",
+        "`subagents`: List the active reusable subagent session handles",
+        "`close`: Close an active subagent",
         "`a2a`: Send a text task",
         "`tool_search`: Search configured MCP server names",
         "`auth`: Start OAuth for a configured remote MCP server",
@@ -43,8 +45,8 @@ fn runtime_is_rooted_and_exposes_only_compose() {
     ] {
         assert!(description.contains(expected), "missing {expected:?}");
     }
-    assert_eq!(description.matches("Input JSON schema:").count(), 10);
-    assert_eq!(description.matches("Output JSON schema:").count(), 10);
+    assert_eq!(description.matches("Input JSON schema:").count(), 12);
+    assert_eq!(description.matches("Output JSON schema:").count(), 12);
     assert!(description.contains("\"required\":[\"query\"]"));
     assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
     assert!(description.contains("\"generation\""));
@@ -151,6 +153,54 @@ return if review.output.approved {
         result.result.output,
         ToolOutput::structured(json!({"reason": "mock approved"}))
     );
+}
+
+#[tokio::test]
+async fn compose_lists_and_closes_subagents_by_handle_or_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "review".into(),
+        kit::AcpHarnessProfile {
+            command: "python3".into(),
+            args: vec![fixture],
+            permissions: Default::default(),
+        },
+    )]))
+    .unwrap();
+    let runtime =
+        kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.review".into()).unwrap();
+
+    let outcome = execute_compose(
+        &runtime,
+        r#"first = subagent({ prompt: "first" })
+second = subagent({ prompt: "second" })
+before = after [first, second] { return subagents({}) }
+closed_first = after before { return close(first) }
+closed_second = after closed_first { return close({ id: second.id }) }
+after_close = after closed_second { return subagents({}) }
+return { before, closed_first, closed_second, after_close }"#,
+    )
+    .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("subagent lifecycle compose failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(value) = result.result.output else {
+        panic!("compose did not return structured output");
+    };
+    assert_eq!(value["before"].as_array().unwrap().len(), 2);
+    assert!(value["after_close"].as_array().unwrap().is_empty());
+    let before_ids = value["before"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|child| child["id"].clone())
+        .collect::<Vec<_>>();
+    assert!(before_ids.contains(&value["closed_first"]["id"]));
+    assert!(before_ids.contains(&value["closed_second"]["id"]));
+    assert_ne!(value["closed_first"]["id"], value["closed_second"]["id"]);
 }
 
 #[tokio::test]

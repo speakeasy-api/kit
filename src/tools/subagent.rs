@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
-const MAX_LIVE_SUBAGENTS: usize = 16;
+const MAX_LIVE_SUBAGENTS: usize = 120;
 
 use crate::{
     acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession},
@@ -29,6 +29,8 @@ pub struct Subagents {
 
 struct State {
     generation: u64,
+    output: Value,
+    updates: Option<SubagentUpdates>,
     retired: bool,
     harness: String,
     kit: bool,
@@ -37,6 +39,7 @@ struct State {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubagentValue {
     pub id: String,
     pub output: Value,
@@ -117,6 +120,10 @@ impl Subagents {
         self.config.clone()
     }
 
+    pub(crate) fn fresh(&self) -> Self {
+        Self::new(self.config.clone(), self.max_depth)
+    }
+
     fn harness_references(&self) -> Vec<String> {
         self.config.harnesses.references()
     }
@@ -156,6 +163,8 @@ impl Subagents {
             id.clone(),
             State {
                 generation: 1,
+                output: output.clone(),
+                updates: updates.clone(),
                 retired: false,
                 harness,
                 kit,
@@ -197,6 +206,8 @@ impl Subagents {
             Ok(output) => {
                 let (output, updates) = turn_output(output, contract);
                 locked.generation = generation;
+                locked.output.clone_from(&output);
+                locked.updates.clone_from(&updates);
                 Ok(SubagentValue {
                     id: prior.id,
                     output,
@@ -258,9 +269,16 @@ impl Subagents {
                 "ACP harness {harness:?} does not advertise session/fork; transcript fallback is only available for Kit"
             )));
         };
-        let output = child
+        let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = child.close().await;
+                return Err(error);
+            }
+        };
         let (output, updates) = turn_output(output, contract);
         let generation = prior
             .generation
@@ -270,6 +288,8 @@ impl Subagents {
             id.clone(),
             State {
                 generation,
+                output: output.clone(),
+                updates: updates.clone(),
                 retired: false,
                 harness,
                 kit,
@@ -306,6 +326,56 @@ impl Subagents {
         // guard before child startup or the branch prompt can begin.
         drop(source);
         Ok(id)
+    }
+
+    async fn list(
+        &self,
+        cancellation: &TurnCancellation,
+    ) -> Result<Vec<SubagentValue>, ChildError> {
+        let states = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
+            .iter()
+            .map(|(id, state)| (id.clone(), Arc::clone(state)))
+            .collect::<Vec<_>>();
+        let mut values = Vec::with_capacity(states.len());
+        for (id, state) in states {
+            let state = tokio::select! {
+                state = state.lock() => state,
+                () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            };
+            if !state.retired && !state.child.is_closed() {
+                values.push(SubagentValue {
+                    id,
+                    output: state.output.clone(),
+                    generation: state.generation,
+                    updates: state.updates.clone(),
+                });
+            }
+        }
+        values.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(values)
+    }
+
+    async fn close(&self, id: &str, cancellation: &TurnCancellation) -> Result<(), ChildError> {
+        let state = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {id:?}")))?;
+        let mut locked = tokio::select! {
+            locked = state.lock() => locked,
+            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+        };
+        self.check_active(&locked)?;
+        locked.child.close().await?;
+        locked.retired = true;
+        drop(locked);
+        self.remove_if_same(id, &state);
+        Ok(())
     }
 
     fn lookup(&self, prior: &SubagentValue) -> Result<Arc<AsyncMutex<State>>, ChildError> {
@@ -396,12 +466,47 @@ pub struct ForkTool {
     depth: usize,
     spec: ToolSpec,
 }
+#[derive(Clone)]
+pub struct SubagentsTool {
+    manager: Subagents,
+    spec: ToolSpec,
+}
+#[derive(Clone)]
+pub struct CloseTool {
+    manager: Subagents,
+    spec: ToolSpec,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubagentId {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CloseInput {
+    Handle(SubagentValue),
+    Id(SubagentId),
+}
+
+impl CloseInput {
+    fn id(self) -> String {
+        match self {
+            Self::Handle(value) => value.id,
+            Self::Id(value) => value.id,
+        }
+    }
+}
 
 fn value_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1},"updates":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean"}},"required":["items","truncated"],"additionalProperties":false}},"required":["id","output","generation"],"additionalProperties":false})
 }
 fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
+}
+fn id_schema() -> serde_json::Value {
+    json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
 }
 
 impl SubagentTool {
@@ -427,6 +532,25 @@ impl PromptTool {
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, prompt it, and return the new session value.", continuation_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+    }
+}
+impl SubagentsTool {
+    pub fn new(manager: Subagents) -> Self {
+        Self {
+            manager,
+            spec: ToolSpec::new(
+                ToolName::new("subagents"),
+                "List the active reusable subagent session handles owned by this parent session.",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            )
+            .with_output_schema(json!({"type":"array","items":value_schema()}))
+            .with_annotations(ToolAnnotations::new()),
+        }
+    }
+}
+impl CloseTool {
+    pub fn new(manager: Subagents) -> Self {
+        Self { manager, spec: ToolSpec::new(ToolName::new("close"), "Close an active subagent by its complete handle or by an object containing its id. The handle becomes unusable and its capacity is released.", json!({"oneOf":[value_schema(), id_schema()]})).with_output_schema(id_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 
@@ -478,6 +602,61 @@ fn result(
         request.call_id,
         ToolOutput::structured(serde_json::to_value(value).expect("subagent value serializes")),
     )))
+}
+
+#[async_trait]
+impl Tool for SubagentsTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        context: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        if request.input != json!({}) {
+            return Err(ToolError::InvalidInput(
+                "subagents input must be an empty object".into(),
+            ));
+        }
+        let values = self
+            .manager
+            .list(&cancellation(context))
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(
+                serde_json::to_value(values).expect("subagent values serialize"),
+            ),
+        )))
+    }
+}
+
+#[async_trait]
+impl Tool for CloseTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        context: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let id = serde_json::from_value::<CloseInput>(request.input.clone())
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))?
+            .id();
+        self.manager
+            .close(&id, &cancellation(context))
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(json!({ "id": id })),
+        )))
+    }
 }
 
 #[async_trait]
@@ -660,6 +839,8 @@ mod tests {
         );
         let state = Arc::new(AsyncMutex::new(State {
             generation: 1,
+            output: Value::String("done".into()),
+            updates: None,
             retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
             kit: true,
@@ -707,6 +888,8 @@ mod tests {
         );
         let state = Arc::new(AsyncMutex::new(State {
             generation: 1,
+            output: Value::String("done".into()),
+            updates: None,
             retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
             kit: true,
@@ -725,6 +908,74 @@ mod tests {
             updates: None,
         };
         (manager, state, prior)
+    }
+
+    #[tokio::test]
+    async fn active_subagents_can_be_listed_and_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, state, prior) = manager_with_disconnected_session(directory.path());
+        let (child, closed) = ChildSession::closure_probe_for_test();
+        state.lock().await.child = child;
+        drop(state);
+
+        let cancellation = TurnCancellation::default();
+        assert_eq!(manager.list(&cancellation).await.unwrap().len(), 1);
+        assert_eq!(manager.list(&cancellation).await.unwrap()[0].id, prior.id);
+        manager.close(&prior.id, &cancellation).await.unwrap();
+        assert!(manager.list(&cancellation).await.unwrap().is_empty());
+        assert!(manager.lookup(&prior).is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
+            .await
+            .expect("closing did not terminate the child actor")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_manager_terminates_its_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, state, _) = manager_with_disconnected_session(directory.path());
+        let (child, closed) = ChildSession::closure_probe_for_test();
+        state.lock().await.child = child;
+        drop(state);
+
+        drop(manager);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
+            .await
+            .expect("manager drop did not terminate the child actor")
+            .unwrap();
+    }
+
+    #[test]
+    fn close_input_accepts_a_handle_or_an_id() {
+        let handle = json!({"id": "child", "output": "done", "generation": 1});
+        let id = json!({"id": "child"});
+        assert_eq!(
+            serde_json::from_value::<CloseInput>(handle).unwrap().id(),
+            "child"
+        );
+        assert_eq!(
+            serde_json::from_value::<CloseInput>(id).unwrap().id(),
+            "child"
+        );
+        assert!(
+            serde_json::from_value::<CloseInput>(json!({"id": "child", "extra": true})).is_err()
+        );
+    }
+
+    #[test]
+    fn live_session_limit_is_120_per_manager() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _, prior) = manager_with_disconnected_session(directory.path());
+        manager.sessions.lock().unwrap().remove(&prior.id);
+        let permits = (0..MAX_LIVE_SUBAGENTS)
+            .map(|_| manager.reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(permits.len(), 120);
+        assert_eq!(
+            manager.reserve().unwrap_err().to_string(),
+            "live subagent session limit (120) reached"
+        );
     }
 
     #[test]

@@ -25,8 +25,8 @@ use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
     provider::{KitAdapter, KitSession, ProviderKind},
     tools::{
-        A2aTool, AuthTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool, ShellTool,
-        SubagentTool, Subagents, ToolSearch,
+        A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
+        ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch,
     },
 };
 
@@ -255,16 +255,19 @@ impl Runtime {
     }
 
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
+        self.compose_with(depth, self.subagents.fresh())
+    }
+
+    fn compose_with(&self, depth: usize, subagents: Subagents) -> ComposeOnly {
         let children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())))
-            .with(Observed::new(SubagentTool::new(
-                self.subagents.clone(),
-                depth,
-            )))
-            .with(Observed::new(PromptTool::new(self.subagents.clone())))
-            .with(Observed::new(ForkTool::new(self.subagents.clone(), depth)))
+            .with(Observed::new(SubagentTool::new(subagents.clone(), depth)))
+            .with(Observed::new(PromptTool::new(subagents.clone())))
+            .with(Observed::new(ForkTool::new(subagents.clone(), depth)))
+            .with(Observed::new(SubagentsTool::new(subagents.clone())))
+            .with(Observed::new(CloseTool::new(subagents)))
             .with(Observed::new(A2aTool::new()))
             .with(Observed::new(ToolSearch::new(self.mcp.clone())))
             .with(Observed::new(AuthTool::new(self.mcp.clone())))
@@ -308,9 +311,10 @@ impl Runtime {
             Some(opened.observer.clone()),
             format!("compaction-{}", crate::session::new_id()),
         )?;
+        let subagents = self.subagents.fresh();
         let agent = Agent::builder()
             .model(self.adapter.clone())
-            .add_tool_source(self.compose(0))
+            .add_tool_source(self.compose_with(0, subagents))
             .mutator(compactor)
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
@@ -366,9 +370,10 @@ impl Runtime {
             format!("compaction-{session}"),
         )
         .map_err(LoopError::InvalidState)?;
+        let subagents = self.subagents.fresh();
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
-            .add_tool_source(self.compose(depth))
+            .add_tool_source(self.compose_with(depth, subagents))
             .mutator(compactor)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
@@ -429,9 +434,10 @@ impl Runtime {
                 format!("compaction-{}", crate::session::new_id()),
             )
             .map_err(AcpRuntimeError::Loop)?;
+            let subagents = self.subagents.fresh();
             Agent::builder()
                 .model(self.adapter.clone())
-                .add_tool_source(self.compose(self.base_depth))
+                .add_tool_source(self.compose_with(self.base_depth, subagents))
                 .mutator(compactor)
                 .observer(context.integration.as_ref().clone())
                 .transcript_observer(opened.observer)
@@ -464,7 +470,7 @@ impl Runtime {
 
     fn system_prompt(&self, depth: usize) -> String {
         format!(
-            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call docs, shell, edit, subagent, prompt, fork, and a2a, plus the MCP meta-tools tool_search, auth, and tool. Use `docs({{ query: \"<your query here>\" }})` to troubleshoot issues in Kit and find user guidance. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call docs, shell, edit, subagent, prompt, fork, subagents, close, and a2a, plus the MCP meta-tools tool_search, auth, and tool. Use `docs({{ query: \"<your query here>\" }})` to troubleshoot issues in Kit and find user guidance. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
             self.max_subagent_depth

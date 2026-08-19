@@ -284,9 +284,14 @@ struct Fork {
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<SessionId, ChildError>>,
 }
+struct Close {
+    session_id: SessionId,
+    reply: oneshot::Sender<Result<(), ChildError>>,
+}
 enum Request {
     Prompt(Prompt),
     Fork(Fork),
+    Close(Close),
 }
 struct Ready {
     session_id: SessionId,
@@ -411,6 +416,48 @@ impl ChildSession {
     }
     pub fn supports_native_fork(&self) -> bool {
         self.capabilities.session_capabilities.fork.is_some()
+    }
+
+    pub async fn close(&self) -> Result<(), ChildError> {
+        if self.capabilities.session_capabilities.close.is_none() {
+            return if self.tx.strong_count() == 1 {
+                Ok(())
+            } else {
+                Err(ChildError::Failed(
+                    "ACP harness does not support closing one session while sibling sessions share its process".into(),
+                ))
+            };
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Request::Close(Close {
+                session_id: self.session_id.clone(),
+                reply,
+            }))
+            .await
+            .map_err(|_| ChildError::Failed("nested agent process is no longer running".into()))?;
+        response.await.map_err(|_| {
+            ChildError::Failed("nested agent process exited without a close response".into())
+        })?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn closure_probe_for_test() -> (Self, oneshot::Receiver<()>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+            let _ = closed_tx.send(());
+        });
+        (
+            Self {
+                tx,
+                session_id: "test".into(),
+                capabilities: agentkit_acp::AgentCapabilities::default(),
+                serial: Arc::new(tokio::sync::Mutex::new(())),
+            },
+            closed_rx,
+        )
     }
 
     #[cfg(test)]
@@ -622,6 +669,31 @@ async fn run(
                                 }
                             };
                             let _ = fork.reply.send(result);
+                        });
+                    }
+                    Request::Close(close) => {
+                        let connection = connection.clone();
+                        let sessions = Arc::clone(&sessions);
+                        tasks.spawn(async move {
+                            let request = connection
+                                .send_request(CloseSessionRequest::new(close.session_id.clone()))
+                                .block_task();
+                            let result = tokio::time::timeout(CANCEL_SETTLE, request)
+                                .await
+                                .map_err(|_| {
+                                    ChildError::Failed("ACP harness did not answer session/close within 5 seconds".into())
+                                })
+                                .and_then(|result| {
+                                    result
+                                        .map(|_| ())
+                                        .map_err(|error| ChildError::Failed(error.to_string()))
+                                });
+                            if result.is_ok()
+                                && let Ok(mut sessions) = sessions.lock()
+                            {
+                                sessions.retain(|id| id != &close.session_id);
+                            }
+                            let _ = close.reply.send(result);
                         });
                     }
                     Request::Prompt(prompt) => {
@@ -1070,6 +1142,16 @@ mod tests {
                 .text,
             "standard"
         );
+        let closed = base.fork(&TurnCancellation::default()).await.unwrap();
+        closed.close().await.unwrap();
+        assert_eq!(
+            base.prompt("after sibling close".into(), TurnCancellation::default())
+                .await
+                .unwrap()
+                .text,
+            "after sibling close"
+        );
+
         let first = base.fork(&TurnCancellation::default()).await.unwrap();
         let second = base.fork(&TurnCancellation::default()).await.unwrap();
         let started = std::time::Instant::now();

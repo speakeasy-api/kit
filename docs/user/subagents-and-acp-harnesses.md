@@ -1,6 +1,6 @@
 # Reusable subagents and ACP harnesses
 
-Kit can start parent-owned nested agents through the Agent Client Protocol (ACP). A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, or branch its completed context with `fork`.
+Kit can start parent-owned nested agents through the Agent Client Protocol (ACP). A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, branch its completed context with `fork`, list retained handles with `subagents({})`, or terminate one with `close`.
 
 ## Start, prompt, and fork a reusable subagent
 
@@ -19,7 +19,7 @@ branch = fork({
 return { main: second.output, alternative: branch.output }
 ```
 
-Each successful turn returns a session value with `id`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and increments its generation. `fork` creates a different ID whose generation is one greater than the supplied source value; it does not advance the source session.
+Each successful turn returns a session value with `id`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and increments its generation. `fork` creates a different ID whose generation is one greater than the supplied source value; it does not advance the source session. `subagents({})` returns the latest values for all active sessions in ID order, including completed sessions retained for reuse. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
 
 Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
 
@@ -76,7 +76,7 @@ args = ["acp"]
 
 Kit appends its required runtime, persistent-session, resume, MCP, credential, and inherited-depth arguments after those base arguments. Use installed-binary commands such as `kit --help` and `kit acp --help` to inspect the current command interface rather than relying on an exhaustive flag list here.
 
-Built-in subagent transcripts are durable on disk, but their reusable parent-owned values exist only for the lifetime of the parent Kit process. A later Kit process cannot pass an old value to `prompt` or `fork`.
+Built-in subagent transcripts are durable on disk, but their reusable parent-owned values exist only for the lifetime of the owning parent session. Closing that main session drops its subagent manager, which closes every child actor and terminates the retained child processes. A later Kit process cannot pass an old value to `prompt` or `fork`.
 
 ## Configure a generic ACP v1 harness
 
@@ -124,7 +124,7 @@ Cancelling an outer turn propagates to nested work. For a dispatched prompt, Kit
 
 ## Limits and troubleshooting
 
-Kit currently permits nesting to depth 2 and at most 16 live parent-owned subagent sessions. Starting or forking beyond those bounds reports `subagent depth limit (2) reached` or `live subagent session limit (16) reached`. Closed or failed children are removed when capacity is next reserved. Avoid retaining unnecessary branches when planning wide fan-out.
+Kit currently permits nesting to depth 2 and at most 120 live parent-owned subagent sessions per main session. Starting or forking beyond those bounds reports `subagent depth limit (2) reached` or `live subagent session limit (120) reached`. Use `subagents({})` to inspect retained sessions and `close` to release sessions that are no longer needed. Closed, failed, or explicitly closed children no longer consume capacity.
 
 ACP startup must complete within 30 seconds. Native `session/fork` must also answer within 30 seconds. Common diagnostics include:
 

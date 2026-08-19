@@ -78,13 +78,13 @@ Use `kit tui --help` for credential-store options. If nested Kit agents need the
 The following are fixed runtime limits, not configurable policy controls:
 
 - Shell timeout: 120 seconds by default; accepted values are 1 through 3600 seconds. Timeout reports `shell command timed out`. Captured stdout and stderr are each limited to 4 MiB and end with `[output truncated]` when exceeded.
-- Subagents: nesting depth is two and at most 16 live subagent sessions are retained per runtime. Errors include `subagent depth limit (2) reached` and `live subagent session limit (16) reached`. Reuse completed sessions instead of creating unbounded children.
+- Subagents: nesting depth is two and at most 120 live subagent sessions are retained per main session. Errors include `subagent depth limit (2) reached` and `live subagent session limit (120) reached`. Reuse completed sessions or release unneeded ones with `close` instead of creating unbounded children.
 - ACP children: startup handshake and `session/fork` waits are 30 seconds. Cancellation allows 5 seconds to settle before Kit tears down the child. Captured ACP updates are limited to 64 updates and 64 KiB; the returned `updates.truncated` flag reports loss.
 - MCP: initial server connection uses a 20-second timeout. OAuth authorization expires after 10 minutes. `tool_search` returns at most a bounded set of matching tools per server; search with a more specific product or capability term.
 - A2A outbound calls have no Kit request deadline, but remain interruptible. Inbound A2A requests must contain a text part or fail with `A2A request must contain a text part`.
 - Session IDs are 1–128 ASCII letters, digits, `-`, or `_`. A stale subagent value fails with `stale subagent generation ...`; always pass the latest returned value to `prompt` or `fork`. An uncertain failed subagent turn retires that child because it may already have changed durable state.
 
-Provider context windows, model token limits, child-agent turn limits, remote rate limits, and operating-system resource limits are separate. For example, `nested agent reached its turn-request limit` comes from the child ACP stop reason, not the 16-session capacity limit.
+Provider context windows, model token limits, child-agent turn limits, remote rate limits, and operating-system resource limits are separate. For example, `nested agent reached its turn-request limit` comes from the child ACP stop reason, not the 120-session capacity limit.
 
 ## Troubleshooting decision tree
 
@@ -107,7 +107,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 1. `unknown ACP harness` means the requested `acp.<name>` is not a configured trusted profile. Check local configuration and omit the `harness` override to use the configured default.
 2. `ACP harness spawn failure` means the configured executable could not start; verify it is installed and executable. `ACP harness handshake timeout` or `protocol handshake failure` means it did not complete ACP v1 startup within 30 seconds. Child-controlled startup errors are intentionally replaced with a fixed local diagnostic to avoid leaking secrets.
 3. A cancelled permission request is expected for children that require interactive approval; Kit's headless policy never allows it.
-4. For a depth or live-session limit, reuse `prompt`, allow unused children to exit, or simplify fan-out.
+4. For a depth or live-session limit, inspect retained handles with `subagents({})`, reuse `prompt`, close unneeded children with `close`, or simplify fan-out.
 5. `ACP harness does not support session/fork` means the generic harness did not advertise native fork; transcript fallback exists only for `acp.kit`.
 6. For `stale subagent generation`, use the newest session value. After an unsuccessful dispatched continuation, start a new child because the old session is retired.
 

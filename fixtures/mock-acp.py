@@ -86,7 +86,9 @@ for line in sys.stdin:
         respond(request["id"], {
             "protocolVersion": 1,
             "agentCapabilities": {
-                "sessionCapabilities": {"fork": {}} if supports_fork else {}
+                "sessionCapabilities": (
+                    {"fork": {}, "close": {}} if supports_fork else {"close": {}}
+                )
             },
         })
     elif method == "session/new":
