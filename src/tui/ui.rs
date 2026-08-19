@@ -1,5 +1,7 @@
 //! Frame drawing: header, transcript, runtime graph, prompt, status.
 
+use std::ops::Range;
+
 use agentkit_acp::{ToolCallStatus, ToolKind};
 use ratatui::{
     Frame,
@@ -12,7 +14,7 @@ use ratatui::{
 };
 
 use super::{
-    app::{App, Block, Child, Phase, ToolCall},
+    app::{App, Block, Child, CodeHit, Phase, ToolCall},
     command, markdown,
     plan::PlanKind,
     theme,
@@ -121,6 +123,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if app.blocks.is_empty() {
         app.row_calls.clear();
         app.row_links.clear();
+        app.row_code.clear();
         frame.render_widget(welcome(), inner);
         return;
     }
@@ -133,7 +136,8 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.transcript_top = inner.y as usize;
     app.transcript_left = inner.x as usize;
     app.transcript_width = inner.width as usize;
-    app.row_calls = lines.iter().map(|(_, call, _)| call.clone()).collect();
+    app.row_calls = lines.iter().map(|(_, (call, _), _)| call.clone()).collect();
+    app.row_code = lines.iter().map(|(_, (_, code), _)| code.clone()).collect();
     app.row_links = lines.iter().map(|(_, _, links)| links.clone()).collect();
     let bottom = total.saturating_sub(height);
     let offset = if app.follow {
@@ -197,51 +201,64 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
 
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
-fn transcript_lines(app: &App) -> Vec<(LinkedLine, Option<String>)> {
-    let mut lines: Vec<(LinkedLine, Option<String>)> = Vec::new();
-    for block in &app.blocks {
+fn transcript_lines(app: &App) -> Vec<(LinkedLine, (Option<String>, Option<CodeHit>))> {
+    let mut lines = Vec::new();
+    for (block_index, block) in app.blocks.iter().enumerate() {
         if !lines.is_empty() {
-            lines.push((LinkedLine::plain(Line::default()), None));
+            lines.push((LinkedLine::plain(Line::default()), (None, None)));
         }
         let (block_lines, call) = match block {
-            Block::User(text) => (plain_lines(user_lines(text)), None),
-            Block::Agent(text) => (markdown::render_linked(text), None),
+            Block::User(text) => (uncopyable(plain_lines(user_lines(text))), None),
+            Block::Agent(text) => (markdown::render_copyable(text), None),
             Block::Thought {
                 text,
                 started,
                 millis,
             } => (
-                plain_lines(thought_lines(
+                uncopyable(plain_lines(thought_lines(
                     app,
                     text,
                     started.elapsed().as_millis(),
                     *millis,
-                )),
+                ))),
                 None,
             ),
-            Block::Tool(call) => (plain_lines(tool_lines(app, call)), Some(call.id.clone())),
+            Block::Tool(call) => (
+                uncopyable(plain_lines(tool_lines(app, call))),
+                Some(call.id.clone()),
+            ),
             Block::Notice(text) => (
-                plain_lines(vec![Line::from(Span::styled(
+                uncopyable(plain_lines(vec![Line::from(Span::styled(
                     format!("· {text}"),
                     theme::faint(),
-                ))]),
+                ))])),
                 None,
             ),
             Block::Error(text) => (
-                plain_lines(vec![Line::from(vec![
+                uncopyable(plain_lines(vec![Line::from(vec![
                     Span::styled("✗ ", theme::bold(theme::ERROR)),
                     Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
-                ])]),
+                ])])),
                 None,
             ),
         };
-        lines.extend(block_lines.into_iter().map(|line| (line, call.clone())));
+        lines.extend(block_lines.into_iter().map(|(line, code)| {
+            let code = code.map(|range| CodeHit {
+                block: block_index,
+                range,
+            });
+            (line, (call.clone(), code))
+        }));
     }
     if app.working() {
-        lines.push((LinkedLine::plain(Line::default()), None));
-        lines.push((LinkedLine::plain(working_line(app)), None));
+        lines.push((LinkedLine::plain(Line::default()), (None, None)));
+        lines.push((LinkedLine::plain(working_line(app)), (None, None)));
     }
     lines
+}
+
+fn uncopyable(lines: Vec<LinkedLine>) -> Vec<(LinkedLine, Option<Range<usize>>)> {
+    lines.into_iter().map(|line| (line, None)).collect()
 }
 
 fn plain_lines(lines: Vec<Line<'static>>) -> Vec<LinkedLine> {
@@ -738,7 +755,7 @@ mod tests {
     use super::{MAX_PROMPT_ROWS, draw, graph_lines, prompt_lines};
     use crate::{
         events::RuntimeEvent,
-        tui::app::{App, Block, Update},
+        tui::app::{Action, App, Block, Update},
     };
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\
@@ -930,6 +947,30 @@ mod tests {
         let prompt = frame.lines().filter(|row| row.starts_with('│')).count();
         assert_eq!(prompt, MAX_PROMPT_ROWS);
         assert!(frame.contains("message kit") || frame.contains("more text"));
+    }
+
+    #[test]
+    fn clicking_a_code_block_copies_exact_content() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = sample();
+        let frame = render(&mut app, 100, 24);
+        let row = frame
+            .lines()
+            .position(|line| line.contains("  cargo check"))
+            .expect("code row is on screen");
+
+        let action = app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let Action::Copy(text) = action else {
+            panic!("expected code copy action");
+        };
+        assert_eq!(text, "cargo check");
     }
 
     #[test]

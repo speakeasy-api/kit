@@ -35,8 +35,12 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 | `Ctrl+Home` / `Ctrl+End` | Jump to transcript top / bottom |
 | `Ctrl+G` / `Ctrl+L` / `Ctrl+T` | Toggle the runtime graph / agent log / reasoning |
 | `Ctrl+O`, or click a tool card | Fold or unfold raw tool output |
+| `Ctrl+Y` | Copy the latest agent response as original Markdown |
+| Click a fenced code block | Copy its contents without the backticks or language label |
 
 `Command` and `Shift+Enter` require a terminal with the Kitty keyboard protocol, such as Ghostty, Kitty, WezTerm, or recent iTerm2. The control-key alternatives work without that protocol.
+
+`Ctrl+Y` copies with the terminal's OSC 52 clipboard protocol. It preserves the agent's original Markdown, whitespace, and newlines instead of copying rendered TUI borders, list glyphs, or wrapped lines. Clipboard access must be enabled in the terminal; multiplexers such as tmux may also require OSC 52 passthrough.
 
 Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
 

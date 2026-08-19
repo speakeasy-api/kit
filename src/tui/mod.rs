@@ -30,6 +30,7 @@ use agentkit_acp::{
     CancelNotification, CloseSessionRequest, ContentBlock, SessionNotification, SessionUpdate,
     ToolCallContent,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -37,6 +38,7 @@ use crossterm::{
         PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
 };
 use futures_util::{FutureExt, StreamExt};
 use ratatui::DefaultTerminal;
@@ -389,12 +391,16 @@ pub async fn run(
                                         }));
                                     }
                                 }
+                                Action::Copy(text) => {
+                                    execute!(terminal.backend_mut(), Print(osc52(&text)))
+                                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                                }
                                 Action::Cancel => {
                                     let _ = connection.send_notification(
                                         CancelNotification::new(session_id.clone()),
                                     );
                                 }
-                                Action::None => {}
+                                Action::None | Action::Redraw => {}
                             }
                         },
                         update = updates_rx.recv() => match update {
@@ -506,14 +512,16 @@ async fn died(
     }
 }
 
+/// Encodes exact source text for the terminal clipboard.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
+}
+
 /// Applies one terminal event, returning the work it asks for.
 fn handle(app: &mut App, event: Event) -> Action {
     match event {
         Event::Key(key) => app.handle_key(key),
-        Event::Mouse(mouse) => {
-            app.handle_mouse(mouse);
-            Action::None
-        }
+        Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
             app.paste(&text);
             Action::None
@@ -757,11 +765,19 @@ fn readable(text: &str) -> Vec<String> {
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
-    use super::{SessionEventError, readable, started_session, wait_for_started_session};
+    use super::{SessionEventError, osc52, readable, started_session, wait_for_started_session};
     use crate::{
         events::RuntimeEvent,
         tui::app::{App, Update},
     };
+
+    #[test]
+    fn encodes_exact_text_for_the_terminal_clipboard() {
+        assert_eq!(
+            osc52("# hi\n\tthere  "),
+            "\x1b]52;c;IyBoaQoJdGhlcmUgIA==\x07"
+        );
+    }
 
     #[test]
     fn correlates_persisted_sessions_with_the_new_acp_route() {

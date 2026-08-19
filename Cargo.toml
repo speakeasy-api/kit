@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.38"
+version = "0.1.39"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -23,6 +23,7 @@ agentkit-tool-skills = "=0.10.6"
 agentkit-tools-core = "=0.10.5"
 async-trait = "=0.1.92"
 atomicwrites = "=0.4.4"
+base64 = "=0.22.1"
 blake3 = "=1.8.6"
 bytes = "=1.12.1"
 clap = { version = "=4.6.6", features = ["derive"] }

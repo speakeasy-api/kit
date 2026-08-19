@@ -5,6 +5,8 @@
 //! actually show up in agent output and deliberately stops there: block
 //! quotes, rules, fenced and inline code, bullets, and emphasis.
 
+use std::ops::Range;
+
 use super::{
     theme,
     wrap::{LinkedLine, LinkedSpan},
@@ -24,46 +26,112 @@ pub fn render(source: &str) -> Vec<Line<'static>> {
 }
 
 /// Renders Markdown while attaching each URL directly to the spans it owns.
+#[cfg(test)]
 pub fn render_linked(source: &str) -> Vec<LinkedLine> {
+    render_copyable(source)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+/// Renders Markdown and tags every row of a fenced code block with its exact
+/// source content, excluding the fence and language label.
+pub fn render_copyable(source: &str) -> Vec<(LinkedLine, Option<Range<usize>>)> {
+    let mut next_offset = 0;
+    let raw_lines: Vec<(usize, &str)> = source
+        .split('\n')
+        .map(|raw| {
+            let offset = next_offset;
+            next_offset += raw.len() + 1;
+            (offset, raw)
+        })
+        .collect();
     let mut lines = Vec::new();
-    let mut fence: Option<String> = None;
-    for raw in source.split('\n') {
+    let mut fence: Option<(String, char, usize, Range<usize>)> = None;
+    for (index, (offset, raw)) in raw_lines.iter().copied().enumerate() {
         let trimmed = raw.trim_start();
-        if let Some(language) = fence.as_ref() {
-            if trimmed.starts_with("```") {
-                lines.push(code_frame(&format!(
-                    "└─ {}",
-                    if language.is_empty() {
-                        "code"
-                    } else {
-                        language
-                    }
-                )));
+        let candidate = fence_line(raw);
+        if let Some((language, marker, length, content)) = fence.as_ref() {
+            if candidate.is_some_and(|line| closing_fence(line, *marker, *length)) {
+                lines.push((
+                    code_frame(&format!(
+                        "└─ {}",
+                        if language.is_empty() {
+                            "code"
+                        } else {
+                            language
+                        }
+                    )),
+                    Some(content.clone()),
+                ));
                 fence = None;
             } else {
-                lines.push(code_line(raw));
+                lines.push((code_line(raw), Some(content.clone())));
             }
             continue;
         }
-        if let Some(language) = trimmed.strip_prefix("```") {
+        if let Some((marker, length, language)) = candidate.and_then(opening_fence) {
+            let content_start = (offset + raw.len() + 1).min(source.len());
+            let closing_offset = raw_lines[index + 1..]
+                .iter()
+                .find(|(_, line)| {
+                    fence_line(line).is_some_and(|line| closing_fence(line, marker, length))
+                })
+                .map(|(offset, _)| *offset);
+            let content_end = closing_offset
+                .map(|end| {
+                    let before = &source[..end];
+                    let line_ending = if before.ends_with("\r\n") { 2 } else { 1 };
+                    end.saturating_sub(line_ending).max(content_start)
+                })
+                .unwrap_or(source.len());
+            let content = content_start..content_end;
             let language = language.trim().to_string();
-            lines.push(code_frame(&format!(
-                "┌─ {}",
-                if language.is_empty() {
-                    "code"
-                } else {
-                    &language
-                }
-            )));
-            fence = Some(language);
+            lines.push((
+                code_frame(&format!(
+                    "┌─ {}",
+                    if language.is_empty() {
+                        "code"
+                    } else {
+                        &language
+                    }
+                )),
+                Some(content.clone()),
+            ));
+            fence = Some((language, marker, length, content));
             continue;
         }
-        lines.push(block_line(raw, trimmed));
+        lines.push((block_line(raw, trimmed), None));
     }
-    if fence.is_some() {
-        lines.push(code_frame("└─ code"));
+    if let Some((_, _, _, content)) = fence {
+        lines.push((code_frame("└─ code"), Some(content)));
     }
     lines
+}
+
+fn fence_line(line: &str) -> Option<&str> {
+    let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    (spaces <= 3).then(|| &line[spaces..])
+}
+
+fn opening_fence(line: &str) -> Option<(char, usize, &str)> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let length = line
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then(|| (marker, length, &line[length..]))
+}
+
+fn closing_fence(line: &str, marker: char, minimum: usize) -> bool {
+    let length = line
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    length >= minimum && line[length..].trim().is_empty()
 }
 
 fn block_line(raw: &str, trimmed: &str) -> LinkedLine {
@@ -323,7 +391,7 @@ fn inline(source: &str, base: Style) -> Vec<LinkedSpan> {
 mod tests {
     use ratatui::style::Modifier;
 
-    use super::{render, render_linked};
+    use super::{render, render_copyable, render_linked};
 
     #[test]
     fn styles_code_fences_apart_from_prose() {
@@ -331,6 +399,45 @@ mod tests {
         assert_eq!(lines.len(), 5);
         assert!(lines[1].spans[0].content.contains("rust"));
         assert!(lines[2].spans[1].content.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn tags_fenced_rows_with_exact_code_content() {
+        let source = "before\n```rust\n\tlet x = 1;  \n\n```\nafter";
+        let rendered = render_copyable(source);
+        let code: Vec<_> = rendered.into_iter().filter_map(|(_, code)| code).collect();
+        assert_eq!(code.len(), 4);
+        assert!(
+            code.iter()
+                .all(|range| &source[range.clone()] == "\tlet x = 1;  \n")
+        );
+    }
+
+    #[test]
+    fn matches_fence_character_and_length() {
+        let source = "~~~~rust\n```\nvalue\n```\n~~~~";
+        let ranges: Vec<_> = render_copyable(source)
+            .into_iter()
+            .filter_map(|(_, range)| range)
+            .collect();
+        assert!(
+            ranges
+                .iter()
+                .all(|range| &source[range.clone()] == "```\nvalue\n```")
+        );
+    }
+
+    #[test]
+    fn preserves_internal_crlf_but_excludes_the_closing_line_ending() {
+        let source = "```text\r\none\r\ntwo\r\n```\r\n";
+        let range = render_copyable(source)[0].1.clone().unwrap();
+        assert_eq!(&source[range], "one\r\ntwo");
+    }
+
+    #[test]
+    fn does_not_treat_four_space_indented_markers_as_fences() {
+        let rendered = render_copyable("    ```\ncode\n    ```");
+        assert!(rendered.into_iter().all(|(_, range)| range.is_none()));
     }
 
     #[test]

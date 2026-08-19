@@ -1,6 +1,7 @@
 //! Client state: the transcript, the live runtime graph, and key handling.
 
 use std::{
+    ops::Range,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -67,12 +68,20 @@ pub struct ContextUsage {
     pub size: u64,
 }
 
+#[derive(Clone)]
+pub struct CodeHit {
+    pub block: usize,
+    pub range: Range<usize>,
+}
+
 /// What the event loop should do after a key press.
 pub enum Action {
     None,
+    Redraw,
     Submit(String),
     Compact(Option<String>),
     New(Option<String>),
+    Copy(String),
     Cancel,
     Quit,
 }
@@ -219,6 +228,8 @@ pub struct App {
     pub turn_started: Option<Instant>,
     /// The previous assistant stream ended; the next text starts a new block.
     agent_stream_sealed: bool,
+    /// Exact source bytes in the latest assistant stream, before TUI rendering.
+    latest_agent_source: String,
     pub compacting: bool,
     pub usage: Option<ContextUsage>,
     pub logs: Vec<String>,
@@ -240,6 +251,8 @@ pub struct App {
     /// started, so a click can be mapped back to a card.
     pub row_calls: Vec<Option<String>>,
     pub row_links: Vec<Vec<LinkHit>>,
+    /// Exact fenced-code content owned by each rendered transcript row.
+    pub row_code: Vec<Option<CodeHit>>,
     pub transcript_top: usize,
     pub transcript_left: usize,
     pub transcript_width: usize,
@@ -286,6 +299,7 @@ impl App {
             phase: Phase::Idle,
             turn_started: None,
             agent_stream_sealed: false,
+            latest_agent_source: String::new(),
             compacting: false,
             usage: None,
             logs: Vec::new(),
@@ -301,6 +315,7 @@ impl App {
             prompt_width: 80,
             row_calls: Vec::new(),
             row_links: Vec::new(),
+            row_code: Vec::new(),
             transcript_top: 0,
             transcript_left: 0,
             transcript_width: 0,
@@ -334,6 +349,7 @@ impl App {
                         .join("");
                     if !text.is_empty() {
                         if item.kind == ItemKind::User {
+                            self.latest_agent_source.clear();
                             self.blocks.push(Block::User(text));
                         } else {
                             self.blocks.push(Block::Notice(text));
@@ -344,6 +360,7 @@ impl App {
                     for part in &item.parts {
                         match part {
                             Part::Text(text) if !text.text.is_empty() => {
+                                self.latest_agent_source.push_str(&text.text);
                                 self.blocks.push(Block::Agent(text.text.clone()))
                             }
                             Part::Reasoning(reasoning) if reasoning.summary.is_some() => {
@@ -448,9 +465,12 @@ impl App {
             Update::Text(text) => {
                 self.close_thought();
                 if self.agent_stream_sealed {
+                    self.latest_agent_source.clear();
+                    self.latest_agent_source.push_str(&text);
                     self.blocks.push(Block::Agent(text));
                     self.agent_stream_sealed = false;
                 } else {
+                    self.latest_agent_source.push_str(&text);
                     match self.blocks.last_mut() {
                         Some(Block::Agent(existing)) => existing.push_str(&text),
                         _ => self.blocks.push(Block::Agent(text)),
@@ -640,6 +660,7 @@ impl App {
     pub fn start_session(&mut self, session_id: String) {
         self.session_id = Some(session_id);
         self.blocks.clear();
+        self.latest_agent_source.clear();
         self.phase = Phase::Idle;
         self.turn_started = None;
         self.compacting = false;
@@ -649,6 +670,7 @@ impl App {
         self.focused_call_id = None;
         self.row_calls.clear();
         self.row_links.clear();
+        self.row_code.clear();
     }
 
     pub fn push_user(&mut self, prompt: String) {
@@ -664,6 +686,7 @@ impl App {
     }
 
     fn begin_turn(&mut self) {
+        self.agent_stream_sealed = true;
         self.phase = Phase::Working;
         self.turn_started = Some(Instant::now());
         self.follow = true;
@@ -752,6 +775,14 @@ impl App {
                 self.toast("prompt cleared — ctrl+c again to quit");
             }
             KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
+            KeyCode::Char('y') if control => {
+                let Some(text) = self.latest_agent_text() else {
+                    self.toast("no agent response to copy");
+                    return Action::None;
+                };
+                self.toast("copied latest agent response as Markdown");
+                return Action::Copy(text);
+            }
             KeyCode::Esc => {
                 if self.working() {
                     return self.request_cancel();
@@ -829,6 +860,12 @@ impl App {
         Action::None
     }
 
+    /// Returns the latest agent response exactly as received, including text
+    /// split around tool calls. Rendering and wrapping never touch this source.
+    fn latest_agent_text(&self) -> Option<String> {
+        (!self.latest_agent_source.is_empty()).then(|| self.latest_agent_source.clone())
+    }
+
     fn request_cancel(&mut self) -> Action {
         if self.phase == Phase::Cancelling {
             self.toast("still stopping — ctrl+c leaves");
@@ -839,31 +876,53 @@ impl App {
         Action::Cancel
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(-3),
-            MouseEventKind::ScrollDown => self.scroll_by(3),
+            MouseEventKind::ScrollUp => {
+                self.scroll_by(-3);
+                return Action::Redraw;
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_by(3);
+                return Action::Redraw;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
-                self.click(mouse.column as usize, mouse.row as usize);
+                return self.click(mouse.column as usize, mouse.row as usize);
             }
             _ => {}
         }
+        Action::None
     }
 
-    /// A click on a tool card folds its output open or shut.
-    fn click(&mut self, column: usize, row: usize) {
+    /// Copies code, opens links, or folds tool output at the clicked row.
+    fn click(&mut self, column: usize, row: usize) -> Action {
         let Some(offset) = row.checked_sub(self.transcript_top) else {
-            return;
+            return Action::None;
         };
         let inside = offset < self.viewport
             && column >= self.transcript_left
             && column < self.transcript_left + self.transcript_width;
         if !inside {
-            return;
+            return Action::None;
         }
         if let Some(url) = self.clicked_link(column, offset) {
             open_url(&url);
-            return;
+            return Action::None;
+        }
+        let code = self
+            .scroll
+            .checked_add(offset)
+            .and_then(|row| self.row_code.get(row))
+            .and_then(Option::as_ref)
+            .and_then(|hit| self.blocks.get(hit.block).map(|block| (block, hit)))
+            .and_then(|(block, hit)| match block {
+                Block::Agent(source) => source.get(hit.range.clone()),
+                _ => None,
+            })
+            .map(str::to_string);
+        if let Some(code) = code {
+            self.toast("copied code block");
+            return Action::Copy(code);
         }
         if let Some(Some(id)) = self
             .scroll
@@ -875,6 +934,7 @@ impl App {
             self.graph_pinned = Some(true);
             self.toggle_output(&id);
         }
+        Action::None
     }
 
     fn clicked_link(&self, column: usize, offset: usize) -> Option<String> {
@@ -1255,6 +1315,32 @@ mod tests {
     }
 
     #[test]
+    fn copies_latest_agent_source_across_tool_boundaries() {
+        let mut app = app();
+        app.push_user("first".into());
+        app.apply(Update::Text("# Heading\n\tindented  ".into()));
+        compose(&mut app, "value = tool({})");
+        app.apply(Update::Text("\n\n- item".into()));
+
+        let action = app.handle_key(modified_press(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        let Action::Copy(text) = action else {
+            panic!("expected clipboard action");
+        };
+        assert_eq!(text, "# Heading\n\tindented  \n\n- item");
+    }
+
+    #[test]
+    fn copies_only_agent_text_after_the_latest_user_message() {
+        let mut app = app();
+        app.apply(Update::Text("old".into()));
+        app.apply(Update::TurnEnded(None));
+        app.push_user("next".into());
+        app.apply(Update::Text("new".into()));
+
+        assert_eq!(app.latest_agent_text().as_deref(), Some("new"));
+    }
+
+    #[test]
     fn streams_agent_text_into_one_block() {
         let mut app = app();
         app.apply(Update::Text("he".into()));
@@ -1283,6 +1369,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(agents, ["Started.", "RAVENS_HARBOR_INEVITABLE"]);
+        assert_eq!(
+            app.latest_agent_text().as_deref(),
+            Some("RAVENS_HARBOR_INEVITABLE")
+        );
     }
 
     #[test]
