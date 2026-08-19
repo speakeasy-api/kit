@@ -5,21 +5,26 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
-use agentkit_acp::{AcpAgentFactoryContext, AcpRuntimeError};
+use agentkit_acp::{AcpIntegration, AcpRuntimeError};
 use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
-    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
+    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part, SessionId,
 };
 use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
 };
 use agentkit_tool_skills::SkillRegistry;
-use agentkit_tools_core::{Tool, ToolName, ToolRegistry, ToolSource, ToolSpec};
+use agentkit_tools_core::{
+    PermissionRequest, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolName, ToolRegistry,
+    ToolRequest, ToolResult, ToolSource, ToolSpec,
+};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -35,6 +40,7 @@ use crate::{
 mod tests;
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+const MAX_BACKGROUND_AFTER_SECONDS: u64 = 86_400;
 
 #[derive(Clone, Debug)]
 pub struct SessionRequest {
@@ -79,6 +85,20 @@ impl SessionSelection {
             self.claimed = false;
         }
     }
+}
+
+pub(crate) struct AcpDriverContext {
+    pub acp_session_id: agentkit_acp::SessionId,
+    pub agentkit_session_id: SessionId,
+    pub cwd: PathBuf,
+    pub additional_directories: Vec<PathBuf>,
+    pub integration: Arc<AcpIntegration>,
+    pub cancellation: CancellationHandle,
+}
+
+pub(crate) struct AcpDriver {
+    pub driver: LoopDriver<KitSession>,
+    pub tasks: TaskManagerHandle,
 }
 
 pub struct Runtime {
@@ -280,12 +300,14 @@ impl Runtime {
             children.register(observe_shared(skill_tool));
         }
         let child_specs = children.specs();
-        ComposeOnly(
-            ComposeTool::wrap(children)
-                .with_source(self.mcp.catalog().unadvertised())
-                .with_config(ComposeConfig::new().with_max_nested_tool_calls(128))
-                .with_backend(HiddenRunletBackend(child_specs)),
-        )
+        let compose = ComposeTool::wrap(children)
+            .with_source(self.mcp.catalog().unadvertised())
+            .with_config(ComposeConfig::new().with_max_nested_tool_calls(128))
+            .with_backend(HiddenRunletBackend(child_specs));
+        ComposeOnly {
+            backgroundable: BackgroundableCompose::new(compose.clone()),
+            compose,
+        }
     }
 
     pub async fn run(self: &Arc<Self>, prompt: String, depth: usize) -> Result<String, LoopError> {
@@ -322,6 +344,7 @@ impl Runtime {
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose_with(0, subagents))
+            .task_manager(background_task_manager())
             .mutator(compactor)
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
@@ -381,6 +404,7 @@ impl Runtime {
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
             .add_tool_source(self.compose_with(depth, subagents))
+            .task_manager(background_task_manager())
             .mutator(compactor)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
@@ -396,8 +420,8 @@ impl Runtime {
 
     pub(crate) async fn start_acp_driver(
         self: &Arc<Self>,
-        context: AcpAgentFactoryContext,
-    ) -> Result<LoopDriver<KitSession>, AcpRuntimeError> {
+        context: AcpDriverContext,
+    ) -> Result<AcpDriver, AcpRuntimeError> {
         let cwd = context
             .cwd
             .canonicalize()
@@ -442,9 +466,12 @@ impl Runtime {
             )
             .map_err(AcpRuntimeError::Loop)?;
             let subagents = self.subagents.fresh();
-            Agent::builder()
+            let task_manager = background_task_manager();
+            let tasks = task_manager.handle();
+            let driver = Agent::builder()
                 .model(self.adapter.clone())
                 .add_tool_source(self.compose_with(self.base_depth, subagents))
+                .task_manager(task_manager)
                 .mutator(compactor)
                 .observer(context.integration.as_ref().clone())
                 .transcript_observer(opened.observer)
@@ -456,7 +483,8 @@ impl Runtime {
                 // persisted id names storage; it must not replace that routing key.
                 .start(SessionConfig::new(context.agentkit_session_id).without_cache())
                 .await
-                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+            Ok(AcpDriver { driver, tasks })
         }
         .await;
         self.session
@@ -504,15 +532,138 @@ fn default_skill_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
-pub struct ComposeOnly(ComposeTool);
+pub struct ComposeOnly {
+    compose: ComposeTool,
+    backgroundable: BackgroundableCompose,
+}
 
 impl ToolSource for ComposeOnly {
     fn specs(&self) -> Vec<ToolSpec> {
-        vec![self.0.spec().clone()]
+        vec![
+            self.backgroundable
+                .current_spec()
+                .unwrap_or_else(|| self.backgroundable.spec().clone()),
+        ]
     }
 
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
-        ToolSource::get(&self.0, name)
+        if name.0 == agentkit_tool_compose::COMPOSE_TOOL_NAME {
+            Some(Arc::new(self.backgroundable.clone()))
+        } else {
+            ToolSource::get(&self.compose, name)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BackgroundableCompose {
+    inner: ComposeTool,
+    spec: ToolSpec,
+}
+
+impl BackgroundableCompose {
+    fn new(inner: ComposeTool) -> Self {
+        let spec = backgroundable_spec(inner.spec().clone());
+        Self { inner, spec }
+    }
+
+    fn sanitized(mut request: ToolRequest) -> Result<ToolRequest, ToolError> {
+        let Some(object) = request.input.as_object_mut() else {
+            return Ok(request);
+        };
+        if let Some(background) = object.remove("background") {
+            let valid = matches!(background, Value::Bool(_))
+                || background
+                    .as_u64()
+                    .is_some_and(|seconds| (1..=MAX_BACKGROUND_AFTER_SECONDS).contains(&seconds));
+            if !valid {
+                return Err(ToolError::InvalidInput(format!(
+                    "background must be a boolean or an integer from 1 to {MAX_BACKGROUND_AFTER_SECONDS}"
+                )));
+            }
+        }
+        Ok(request)
+    }
+}
+
+#[async_trait]
+impl Tool for BackgroundableCompose {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn current_spec(&self) -> Option<ToolSpec> {
+        self.inner.current_spec().map(backgroundable_spec)
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        self.inner
+            .proposed_requests(&Self::sanitized(request.clone())?)
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.inner.invoke(Self::sanitized(request)?, ctx).await
+    }
+
+    async fn invoke_outcome(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        match Self::sanitized(request) {
+            Ok(request) => self.inner.invoke_outcome(request, ctx).await,
+            Err(error) => ToolExecutionOutcome::Failed(error),
+        }
+    }
+}
+
+fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
+    if let Some(properties) = spec
+        .input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "background".into(),
+            json!({
+                "description": "Run immediately in the background when true, or move to the background after this many seconds. False keeps the call in the foreground.",
+                "oneOf": [
+                    { "type": "boolean" },
+                    {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_BACKGROUND_AFTER_SECONDS
+                    }
+                ]
+            }),
+        );
+    }
+    spec
+}
+
+fn background_task_manager() -> AsyncTaskManager {
+    AsyncTaskManager::new().routing(background_route)
+}
+
+fn background_route(request: &ToolRequest) -> RoutingDecision {
+    if request.tool_name.0 != agentkit_tool_compose::COMPOSE_TOOL_NAME {
+        return RoutingDecision::Foreground;
+    }
+    match request.input.get("background") {
+        Some(Value::Bool(true)) => RoutingDecision::ForegroundThenDetachAfter(Duration::ZERO),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .filter(|seconds| (1..=MAX_BACKGROUND_AFTER_SECONDS).contains(seconds))
+            .map(|seconds| RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(seconds)))
+            .unwrap_or(RoutingDecision::Foreground),
+        _ => RoutingDecision::Foreground,
     }
 }
 

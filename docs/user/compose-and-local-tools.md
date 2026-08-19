@@ -26,6 +26,12 @@ return result
 
 Retries repeat the body. Do not retry a write unless repeating it is safe or the destination is idempotent. Kit currently limits one compose program to 128 nested child tool calls; prefer focused programs and bounded loops.
 
+## Run compose in the background
+
+`background` is an optional argument on the outer `compose` tool call, not a Runlet expression. `true` starts the program in the background, a positive integer keeps it in the foreground for that many seconds before detaching it, and `false` or omission keeps it in the foreground. Delays are limited to integers from 1 through 86,400 seconds. Invalid values fail as tool input.
+
+Background calls no longer hold their originating turn open. The TUI keeps every running call visible; select a tool card to inspect its runtime graph. Completion or failure is delivered back to the owning session, and completion wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
+
 ## Ordering, dependencies, and concurrency
 
 Independent calls run concurrently, including effectful `shell`, `edit`, `a2a`, and subagent calls. Source order alone does not sequence adjacent statements. This is intentional even at the top level:

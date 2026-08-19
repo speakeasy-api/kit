@@ -385,6 +385,9 @@ fn tool_header(app: &App, call: &ToolCall) -> Vec<Span<'static>> {
             theme::dim(),
         ),
     ];
+    if call.backgrounded && call.running() {
+        spans.push(Span::styled("  · background", theme::accent()));
+    }
     let running = call.running_children();
     if running > 0 {
         spans.push(Span::styled(
@@ -759,6 +762,7 @@ mod tests {
             title: "compose".into(),
             kind: ToolKind::Other,
             script: Some(SCRIPT.into()),
+            backgrounded: false,
         });
         app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
             call: "call-1:compose:one".into(),
@@ -858,6 +862,7 @@ mod tests {
             status: Some(agentkit_acp::ToolCallStatus::Completed),
             script: None,
             output: Vec::new(),
+            backgrounded: false,
         });
         let summary = graph_lines(&app, app.focus_call().unwrap())[1]
             .spans
@@ -875,6 +880,7 @@ mod tests {
             status: Some(agentkit_acp::ToolCallStatus::Failed),
             script: None,
             output: vec!["exit code 1".into()],
+            backgrounded: false,
         });
         app.apply(Update::TurnEnded(Some("model refused the request".into())));
         app.apply(Update::Log("warn: retrying provider request".into()));
@@ -938,6 +944,7 @@ mod tests {
             output: (0..40)
                 .map(|index| format!("output line {index}"))
                 .collect(),
+            backgrounded: false,
         });
         let frame = render(&mut app, 100, 24);
         println!("{frame}");

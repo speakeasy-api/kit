@@ -668,13 +668,26 @@ fn translate(notification: SessionNotification) -> Vec<Update> {
             title: call.title,
             kind: call.kind,
             script: call.raw_input.as_ref().and_then(script_of),
+            backgrounded: call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("background"))
+                .and_then(Value::as_bool)
+                == Some(true),
         }],
-        SessionUpdate::ToolCallUpdate(update) => vec![Update::ToolUpdated {
-            id: update.tool_call_id.to_string(),
-            status: update.fields.status,
-            script: update.fields.raw_input.as_ref().and_then(script_of),
-            output: output_of(update.fields.content.as_deref()),
-        }],
+        SessionUpdate::ToolCallUpdate(update) => {
+            let output = output_of(update.fields.content.as_deref());
+            let backgrounded = output
+                .iter()
+                .any(|line| line.contains("is now running in the background"));
+            vec![Update::ToolUpdated {
+                id: update.tool_call_id.to_string(),
+                status: update.fields.status,
+                script: update.fields.raw_input.as_ref().and_then(script_of),
+                output,
+                backgrounded,
+            }]
+        }
         SessionUpdate::UsageUpdate(usage) => vec![Update::Usage {
             used: usage.used,
             size: usage.size,

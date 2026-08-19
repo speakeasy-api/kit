@@ -1,9 +1,17 @@
-use agentkit_core::{ItemKind, Part};
+use std::{sync::Arc, time::Duration};
 
-use super::load_initial_transcript;
-use agentkit_tools_core::ToolSource;
+use agentkit_core::{ItemKind, MetadataMap, Part, SessionId, ToolCallId, ToolOutput, TurnId};
+use agentkit_task_manager::RoutingDecision;
+use agentkit_tools_core::{
+    AllowAllPermissions, BasicToolExecutor, OwnedToolContext, Tool, ToolExecutionOutcome,
+    ToolExecutionScope, ToolExecutor, ToolName, ToolRequest, ToolSource,
+};
+use serde_json::{Value, json};
 
-use super::{Runtime, SessionRequest, SessionSelection};
+use super::{
+    BackgroundableCompose, Runtime, SessionRequest, SessionSelection, background_route,
+    load_initial_transcript,
+};
 
 #[test]
 fn configured_session_is_consumed_only_after_successful_start() {
@@ -65,6 +73,13 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     let specs = runtime.compose(0).specs();
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].name.0, "compose");
+    assert_eq!(
+        specs[0].input_schema["properties"]["background"]["oneOf"],
+        json!([
+            {"type": "boolean"},
+            {"type": "integer", "minimum": 1, "maximum": 86_400}
+        ])
+    );
     assert!(specs[0].description.contains("`tool_search`"));
     assert!(specs[0].description.contains("`auth`"));
     assert!(specs[0].description.contains("`tool`"));
@@ -87,6 +102,115 @@ fn system_prompt_explains_skill_activation() {
     assert!(
         prompt.contains("return `activate_skill({ name: \"<skill-name>\" })` before proceeding")
     );
+}
+
+#[test]
+fn compose_background_values_select_agentkit_task_routes() {
+    let request = |background| {
+        ToolRequest::new(
+            ToolCallId::new("call"),
+            ToolName::new("compose"),
+            json!({"script": "return 1", "background": background}),
+            SessionId::new("session"),
+            TurnId::new("turn"),
+        )
+    };
+
+    assert_eq!(
+        background_route(&request(json!(true))),
+        RoutingDecision::ForegroundThenDetachAfter(Duration::ZERO)
+    );
+    assert_eq!(
+        background_route(&request(json!(60))),
+        RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(60))
+    );
+    for value in [json!(false), json!(0), json!(-1), json!(1.5), json!("60")] {
+        assert_eq!(
+            background_route(&request(value)),
+            RoutingDecision::Foreground
+        );
+    }
+}
+
+#[tokio::test]
+async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let request = |background| {
+        ToolRequest::new(
+            ToolCallId::new("call"),
+            ToolName::new("compose"),
+            json!({"script": "return 7", "background": background}),
+            SessionId::new("session"),
+            TurnId::new("turn"),
+        )
+    };
+
+    async fn invoke(runtime: &Arc<Runtime>, background: Value) -> ToolExecutionOutcome {
+        let compose = runtime.compose(0);
+        let executor: Arc<dyn ToolExecutor> =
+            Arc::new(BasicToolExecutor::new(Vec::<Arc<dyn ToolSource>>::new()));
+        let permissions = Arc::new(AllowAllPermissions);
+        let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+        let session_id = SessionId::new("session");
+        let turn_id = TurnId::new("turn");
+        let owned = OwnedToolContext {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            metadata: MetadataMap::new(),
+            permissions: permissions.clone(),
+            resources: resources.clone(),
+            cancellation: None,
+            execution_scope: Some(ToolExecutionScope {
+                executor,
+                session_id,
+                turn_id,
+                permissions,
+                resources,
+                cancellation: None,
+            }),
+            approved_request: None,
+        };
+        compose
+            .backgroundable
+            .invoke_outcome(
+                ToolRequest::new(
+                    ToolCallId::new("call"),
+                    ToolName::new("compose"),
+                    json!({"script": "return 7", "background": background}),
+                    SessionId::new("session"),
+                    TurnId::new("turn"),
+                ),
+                &mut owned.borrowed(),
+            )
+            .await
+    }
+
+    for value in [json!(true), json!(false), json!(1), json!(86_400)] {
+        let sanitized = BackgroundableCompose::sanitized(request(value.clone())).unwrap();
+        assert!(sanitized.input.get("background").is_none());
+
+        let outcome = invoke(&runtime, value).await;
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("valid background value did not reach compose: {outcome:?}");
+        };
+        assert_eq!(result.result.output, ToolOutput::structured(json!(7)));
+    }
+
+    for value in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("1"),
+        json!(null),
+        json!(86_401),
+    ] {
+        assert!(BackgroundableCompose::sanitized(request(value.clone())).is_err());
+        assert!(matches!(
+            invoke(&runtime, value).await,
+            ToolExecutionOutcome::Failed(_)
+        ));
+    }
 }
 
 #[test]

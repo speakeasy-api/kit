@@ -262,6 +262,18 @@ Calls lexically created inside the `after` block start only after the prerequisi
 succeeds. Without a data dependency or `after` edge, adjacent tool or subagent
 calls may overlap.
 
+## Background compose calls
+
+The model can detach an entire compose program from its turn with the optional
+top-level `background` argument. `background: true` starts it in the background;
+`background: 60` runs it in the foreground for up to 60 seconds and then detaches
+it if it is still running. `false` or omission keeps normal foreground behavior.
+The delay must be an integer from 1 through 86,400 seconds.
+
+Detached calls remain visible and selectable in the TUI runtime graph, and their
+result is delivered to the session when ready. They are scoped to the live Kit
+session/process; closing it does not create durable external jobs.
+
 ## Reusable subagents
 
 Nested agents are parent-owned named ACP subprocesses. They are ordinary Runlet

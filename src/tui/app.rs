@@ -40,6 +40,7 @@ pub enum Update {
         title: String,
         kind: ToolKind,
         script: Option<String>,
+        backgrounded: bool,
     },
     /// A tool call changed status or produced output.
     ToolUpdated {
@@ -47,6 +48,7 @@ pub enum Update {
         status: Option<ToolCallStatus>,
         script: Option<String>,
         output: Vec<String>,
+        backgrounded: bool,
     },
     /// Context window accounting.
     Usage { used: u64, size: u64 },
@@ -113,6 +115,8 @@ pub struct ToolCall {
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
     pub expanded: bool,
+    /// The call detached from its originating turn.
+    pub backgrounded: bool,
 }
 
 impl ToolCall {
@@ -213,6 +217,8 @@ pub struct App {
     pub editor: Editor,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
+    /// The previous assistant stream ended; the next text starts a new block.
+    agent_stream_sealed: bool,
     pub compacting: bool,
     pub usage: Option<ContextUsage>,
     pub logs: Vec<String>,
@@ -220,6 +226,8 @@ pub struct App {
     pub show_thoughts: bool,
     /// `None` shows the graph while a tool runs; `Some` pins it open or shut.
     pub graph_pinned: Option<bool>,
+    /// Tool card selected for the runtime graph.
+    pub focused_call_id: Option<String>,
     pub tick: usize,
     pub scroll: usize,
     pub follow: bool,
@@ -277,12 +285,14 @@ impl App {
             editor: Editor::default(),
             phase: Phase::Idle,
             turn_started: None,
+            agent_stream_sealed: false,
             compacting: false,
             usage: None,
             logs: Vec::new(),
             show_logs: false,
             show_thoughts: false,
             graph_pinned: None,
+            focused_call_id: None,
             tick: 0,
             scroll: 0,
             follow: true,
@@ -359,6 +369,7 @@ impl App {
                                 children: Vec::new(),
                                 output: Vec::new(),
                                 expanded: false,
+                                backgrounded: false,
                             })),
                             _ => {}
                         }
@@ -385,6 +396,14 @@ impl App {
     /// The tool call the graph pane should show: the running one, else the
     /// most recent, so a finished program stays readable.
     pub fn focus_call(&self) -> Option<&ToolCall> {
+        if let Some(id) = &self.focused_call_id
+            && let Some(call) = self.blocks.iter().find_map(|block| match block {
+                Block::Tool(call) if &call.id == id => Some(call),
+                _ => None,
+            })
+        {
+            return Some(call);
+        }
         let calls = self.blocks.iter().rev().filter_map(|block| match block {
             Block::Tool(call) => Some(call),
             _ => None,
@@ -428,9 +447,14 @@ impl App {
             Update::A2aAddress(address) => self.a2a = address,
             Update::Text(text) => {
                 self.close_thought();
-                match self.blocks.last_mut() {
-                    Some(Block::Agent(existing)) => existing.push_str(&text),
-                    _ => self.blocks.push(Block::Agent(text)),
+                if self.agent_stream_sealed {
+                    self.blocks.push(Block::Agent(text));
+                    self.agent_stream_sealed = false;
+                } else {
+                    match self.blocks.last_mut() {
+                        Some(Block::Agent(existing)) => existing.push_str(&text),
+                        _ => self.blocks.push(Block::Agent(text)),
+                    }
                 }
             }
             Update::Thought(text) => match self.blocks.last_mut() {
@@ -450,8 +474,10 @@ impl App {
                 title,
                 kind,
                 script,
+                backgrounded,
             } => {
                 self.close_thought();
+                self.focused_call_id = Some(id.clone());
                 self.blocks.push(Block::Tool(ToolCall {
                     id,
                     title,
@@ -463,6 +489,7 @@ impl App {
                     children: Vec::new(),
                     output: Vec::new(),
                     expanded: false,
+                    backgrounded,
                 }));
             }
             Update::ToolUpdated {
@@ -470,22 +497,32 @@ impl App {
                 status,
                 script,
                 output,
+                backgrounded,
             } => {
-                let Some(call) = self.call_mut(&id) else {
-                    return;
-                };
-                if let Some(script) = script {
-                    call.plan = parse_plan(&script);
-                }
-                if !output.is_empty() {
-                    call.output = output;
-                }
-                if let Some(status) = status {
-                    call.status = status;
-                    if !call.running() {
-                        call.finished = Some(Instant::now());
+                let completed_background = {
+                    let Some(call) = self.call_mut(&id) else {
+                        return;
+                    };
+                    let was_running = call.running();
+                    if let Some(script) = script {
+                        call.plan = parse_plan(&script);
                     }
-                }
+                    if !output.is_empty() {
+                        call.output = output;
+                    }
+                    call.backgrounded |= backgrounded;
+                    if let Some(status) = status {
+                        call.status = status;
+                        if !call.running() {
+                            call.finished = Some(Instant::now());
+                        }
+                    }
+                    was_running && !call.running() && call.backgrounded
+                };
+                // Autonomous model output follows the terminal update for a
+                // detached call without a new ACP prompt/TurnEnded pair. Seal
+                // the current stream so that output starts a new agent block.
+                self.agent_stream_sealed |= completed_background;
             }
             Update::Usage { used, size } => {
                 self.usage = Some(ContextUsage { used, size });
@@ -499,6 +536,7 @@ impl App {
             }
             Update::TurnEnded(error) => {
                 self.close_thought();
+                self.agent_stream_sealed = true;
                 let interrupted = self.phase == Phase::Cancelling;
                 self.phase = Phase::Idle;
                 self.turn_started = None;
@@ -506,6 +544,7 @@ impl App {
                 for block in &mut self.blocks {
                     if let Block::Tool(call) = block
                         && call.running()
+                        && !call.backgrounded
                     {
                         call.status = ToolCallStatus::Completed;
                         call.finished = Some(Instant::now());
@@ -607,6 +646,7 @@ impl App {
         self.usage = None;
         self.scroll = usize::MAX;
         self.follow = true;
+        self.focused_call_id = None;
         self.row_calls.clear();
         self.row_links.clear();
     }
@@ -831,6 +871,8 @@ impl App {
             .and_then(|row| self.row_calls.get(row))
             .cloned()
         {
+            self.focused_call_id = Some(id.clone());
+            self.graph_pinned = Some(true);
             self.toggle_output(&id);
         }
     }
@@ -922,6 +964,7 @@ mod tests {
             title: "compose".into(),
             kind: ToolKind::Other,
             script: Some(script.into()),
+            backgrounded: false,
         });
     }
 
@@ -1023,6 +1066,39 @@ mod tests {
             panic!("expected a tool block");
         };
         assert_eq!(call.status, ToolCallStatus::Completed);
+        assert!(!app.working());
+    }
+
+    #[test]
+    fn background_calls_remain_running_after_the_turn_ends() {
+        let mut app = app();
+        app.apply(Update::ToolStarted {
+            id: "background-1".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some("return shell({ command: \"sleep 1\" })".into()),
+            backgrounded: true,
+        });
+        app.apply(Update::ToolStarted {
+            id: "background-2".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some("return shell({ command: \"sleep 2\" })".into()),
+            backgrounded: true,
+        });
+
+        app.apply(Update::TurnEnded(None));
+
+        let running = app
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Tool(call) if call.running()))
+            .count();
+        assert_eq!(running, 2);
+        assert_eq!(
+            app.focus_call().map(|call| call.id.as_str()),
+            Some("background-2")
+        );
         assert!(!app.working());
     }
 
@@ -1188,5 +1264,56 @@ mod tests {
             panic!("expected an agent block");
         };
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn autonomous_text_starts_a_new_block_after_turn_end() {
+        let mut app = app();
+        app.apply(Update::Text("Started.".into()));
+        app.apply(Update::TurnEnded(None));
+        app.apply(Update::Text("RAVENS_".into()));
+        app.apply(Update::Text("HARBOR_INEVITABLE".into()));
+
+        let agents = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Agent(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(agents, ["Started.", "RAVENS_HARBOR_INEVITABLE"]);
+    }
+
+    #[test]
+    fn each_background_completion_seals_the_previous_agent_stream() {
+        let mut app = app();
+        app.apply(Update::ToolStarted {
+            id: "background".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: None,
+            backgrounded: true,
+        });
+        app.apply(Update::Text("first completion".into()));
+        app.apply(Update::ToolUpdated {
+            id: "background".into(),
+            status: Some(ToolCallStatus::Completed),
+            script: None,
+            output: Vec::new(),
+            backgrounded: false,
+        });
+        app.apply(Update::Text("second completion".into()));
+        app.apply(Update::Text(" continued".into()));
+
+        let agents = app
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Agent(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(agents, ["first completion", "second completion continued"]);
     }
 }
