@@ -114,11 +114,11 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 ### MCP tools are missing or authentication fails
 
 1. Confirm an explicit MCP configuration was supplied; Kit does not auto-discover MCP server config.
-2. Search for `mcp` with `tool_search` and inspect exact statuses: `authenticated`, `authentication_required`, `authentication_unavailable`, or `pending`. Invoke only tool names returned by the search.
+2. Search for `mcp` with `tool_search` and inspect exact statuses: `authenticated`, `authentication_required`, `authentication_unavailable`, `pending`, or `error`. An `error` result includes the server's startup diagnostic. Invoke only tool names returned by the search.
 3. For `authentication_required`, call `auth` with the exact server name in a `kit tui`, `kit serve`, or `kit acp` session, open its URL, complete the browser flow within 10 minutes, then search again.
 4. For `authentication_unavailable`, use a long-lived command or configure persistent credentials there for later one-shot use.
 5. For file-store errors such as `OAuth credential directory must be a real directory, not a symlink`, `OAuth credential path must be a regular file`, or `OAuth credential file is accessible by other users`, correct ownership, path type, and permissions rather than weakening the checks.
-6. If a server will not connect, test the configured stdio command or remote URL independently and check the 20-second connection limit. Treat server diagnostics as potentially sensitive.
+6. If a server has status `error`, relay its diagnostic to the user, test the configured stdio command or remote URL independently, and check the 20-second connection limit. Treat server diagnostics as potentially sensitive.
 
 ### A session cannot be resumed
 

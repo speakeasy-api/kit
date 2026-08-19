@@ -91,19 +91,21 @@ struct ServerRecord {
     status: ServerStatus,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ServerStatus {
     Connected,
     AuthenticationRequired,
     Pending,
+    Error(String),
 }
 
 impl ServerStatus {
-    const fn as_str(self) -> &'static str {
+    const fn as_str(&self) -> &'static str {
         match self {
             Self::Connected => "authenticated",
             Self::AuthenticationRequired => "authentication_required",
             Self::Pending => "pending",
+            Self::Error(_) => "error",
         }
     }
 }
@@ -246,24 +248,41 @@ pub async fn connect(
         },
     )));
     for id in eager {
-        manager
-            .connect_server(&McpServerId::new(id))
-            .await
-            .map_err(|error| format!("could not connect MCP servers: {error}"))?;
+        if let Err(error) = manager.connect_server(&McpServerId::new(&id)).await
+            && let Some(record) = servers.write().await.get_mut(&id)
+        {
+            record.status =
+                ServerStatus::Error(format!("could not connect MCP server {id}: {error}"));
+        }
     }
     let mut oauth_managers = BTreeMap::new();
     for (id, url, oauth) in persistent_oauth {
-        let Some((token, oauth_manager)) = auth::restore(&url, &oauth, &credential_storage).await?
-        else {
+        let restored = match auth::restore(&url, &oauth, &credential_storage).await {
+            Ok(restored) => restored,
+            Err(error) => {
+                if let Some(record) = servers.write().await.get_mut(&id) {
+                    record.status = ServerStatus::Error(error);
+                }
+                continue;
+            }
+        };
+        let Some((token, oauth_manager)) = restored else {
             continue;
         };
         let request = connect_auth_request(&id);
         let mut credentials = MetadataMap::new();
         credentials.insert("access_token".into(), Value::String(token));
-        manager
+        if let Err(error) = manager
             .resolve_auth(AuthResolution::provided(request, credentials))
             .await
-            .map_err(|error| format!("could not restore MCP credentials for {id}: {error}"))?;
+        {
+            if let Some(record) = servers.write().await.get_mut(&id) {
+                record.status = ServerStatus::Error(format!(
+                    "could not restore MCP credentials for {id}: {error}"
+                ));
+            }
+            continue;
+        }
         match manager.connect_server(&McpServerId::new(&id)).await {
             Ok(_) => {
                 if let Some(record) = servers.write().await.get_mut(&id) {
@@ -274,9 +293,12 @@ pub async fn connect(
                 challenges.lock().await.insert(id.clone(), *request);
             }
             Err(error) => {
-                return Err(format!(
-                    "could not connect MCP server {id} with stored credentials: {error}"
-                ));
+                if let Some(record) = servers.write().await.get_mut(&id) {
+                    record.status = ServerStatus::Error(format!(
+                        "could not connect MCP server {id} with stored credentials: {error}"
+                    ));
+                }
+                continue;
             }
         }
         oauth_managers.insert(id, oauth_manager);
@@ -364,18 +386,22 @@ impl McpRuntime {
             if server_matches || !tools.is_empty() {
                 let status = if record.oauth.is_some()
                     && !self.inner.interactive_oauth_enabled
-                    && !matches!(record.status, ServerStatus::Connected)
+                    && matches!(record.status, ServerStatus::AuthenticationRequired)
                 {
                     "authentication_unavailable"
                 } else {
                     record.status.as_str()
                 };
-                groups.push(json!({
+                let mut group = json!({
                     "name": name,
                     "description": record.description,
                     "status": status,
                     "tools": tools
-                }));
+                });
+                if let ServerStatus::Error(error) = record.status {
+                    group["error"] = Value::String(error);
+                }
+                groups.push(group);
             }
         }
         Ok(json!({"servers": groups}))
@@ -1092,18 +1118,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_failure_is_reported_at_startup() {
+    async fn remote_auth_failure_is_searchable_without_failing_startup() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
         std::fs::write(
             &path,
-            r#"{"mcpServers":{"broken":{"command":"kit-command-that-does-not-exist"}}}"#,
+            format!(r#"{{"mcpServers":{{"remote":{{"url":"http://{address}/mcp"}}}}}}"#),
         )
         .unwrap();
-        let error = super::connect(&path, true, CredentialStorage::Memory)
+
+        let runtime = super::connect(&path, true, CredentialStorage::Memory)
             .await
-            .err()
-            .expect("connection should fail");
-        assert!(error.contains("could not connect MCP servers"), "{error}");
+            .expect("authentication failure should not prevent startup");
+        server.await.unwrap();
+        let results = runtime.search("mcp").await.unwrap();
+        assert_eq!(results["servers"][0]["name"], "remote");
+        assert_eq!(results["servers"][0]["status"], "error");
+        assert!(
+            results["servers"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("auth required")
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_searchable_without_failing_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"broken":{"command":"kit-command-that-does-not-exist","description":"Broken test server"},"linear":{"url":"https://unused.invalid/mcp","auth":{"type":"oauth"}}}}"#,
+        )
+        .unwrap();
+        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+            .await
+            .expect("connection failure should not prevent startup");
+        let results = runtime.search("mcp").await.unwrap();
+        let broken = &results["servers"][0];
+        assert_eq!(broken["name"], "broken");
+        assert_eq!(broken["status"], "error");
+        assert!(
+            broken["error"]
+                .as_str()
+                .unwrap()
+                .contains("could not connect MCP server broken")
+        );
+        assert_eq!(results["servers"][1]["name"], "linear");
+        assert_eq!(results["servers"][1]["status"], "authentication_required");
     }
 }

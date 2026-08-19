@@ -90,7 +90,7 @@ MCP tools are model-visible through three meta-tools rather than as an unrestric
 3. After the user completes OAuth in the browser, call `tool_search` again so the connected server's tools appear.
 4. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema.
 
-A connected server reports `authenticated`, including servers that do not need OAuth. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a server without OAuth reports `is not configured for OAuth`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
+A connected server reports `authenticated`, including servers that do not need OAuth. If a server fails to connect during startup, Kit continues running and reports the server with status `error` and an `error` message in `tool_search`; the agent can relay that diagnostic to the user. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a server without OAuth reports `is not configured for OAuth`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
 
 ## Interactive OAuth availability
 
@@ -152,7 +152,7 @@ Persistent stores restore OAuth credentials when Kit starts and may refresh acce
 - **`could not read MCP config ...`**: verify the `--mcp-config`/`mcp_config` path and file permissions. MCP configuration is never found automatically.
 - **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
-- **`could not connect MCP servers`**: run the configured stdio command directly to check that it exists and speaks MCP over stdio; for HTTP, check DNS, HTTPS, proxy/firewall access, headers, and the endpoint URL. Initial connection timeout is 20 seconds.
+- **MCP server status `error`**: Kit tolerates startup connection failures and includes the per-server diagnostic in `tool_search`. Run a failing stdio command directly to check that it exists and speaks MCP over stdio; for HTTP, check DNS, HTTPS, proxy/firewall access, authentication settings, headers, and the endpoint URL. Initial connection timeout is 20 seconds.
 
 ### OAuth and authentication errors
 
