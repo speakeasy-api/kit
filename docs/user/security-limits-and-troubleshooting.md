@@ -11,7 +11,7 @@ The root does not confine processes:
 - `shell` starts the platform shell with the root as its current directory. The command can read or change anything allowed by the Kit process, including paths outside the root, the network, and inherited environment variables.
 - ACP subagents are child processes started directly from trusted local `command` and `args` profiles, with the same root as their current directory. They inherit normal child-process host access; selecting a harness is not isolation.
 - MCP stdio servers are local processes, while MCP HTTP servers and A2A agents are remote trust domains. Tool arguments, prompts, and returned data cross those boundaries.
-- `edit` is narrower than `shell`: it accepts only non-empty root-relative paths and rejects `..`, absolute paths, and existing symlink paths that resolve outside the root. This containment applies only to `edit`, not to shell commands or child processes.
+- `edit` resolves relative paths from the runtime root, but also accepts `..`, absolute paths, and paths through symlinks. It can change any filesystem path allowed by the Kit process.
 
 Kit has no general permissions or interactive approval framework for its own tools. The fact that only `compose` is model-visible organizes tool use; it does not make hidden `shell`, `edit`, subagent, A2A, or MCP calls harmless. Review requested work and run Kit with the least host, repository, network, and account access appropriate for it.
 
@@ -99,7 +99,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 
 1. For `shell command timed out`, reduce the task, diagnose a blocked subprocess, or intentionally raise `timeout_seconds` within 1–3600. An interrupt kills Kit's child command but still inspect for partial side effects.
 2. For `[output truncated]`, redirect verbose output to a file in the root and inspect a small relevant range instead of increasing output.
-3. For `path must be a non-empty root-relative path` or `path resolves outside the runtime root`, use a normal relative path inside the configured root. Do not work around containment with `shell` unless outside-root access is explicitly intended and trusted.
+3. For `path must be non-empty`, provide either a path relative to the runtime root or an absolute path.
 4. For a hunk mismatch or ambiguity, reread the file and provide more unique exact context.
 
 ### A subagent fails, hangs, or cannot fork

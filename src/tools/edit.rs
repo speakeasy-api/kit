@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -126,7 +126,6 @@ impl Tool for EditTool {
             | EditInput::Edit { path, .. }
             | EditInput::Delete { path } => rooted(&self.root, path)?,
         };
-        ensure_contained(&self.root, &path)?;
         let status = match input {
             EditInput::Add { content, .. } => {
                 if path.exists() {
@@ -194,39 +193,19 @@ fn apply_hunk(mut content: String, hunk: Hunk) -> Result<String, ToolError> {
 }
 
 fn rooted(root: &Path, value: &str) -> Result<PathBuf, ToolError> {
-    let relative = Path::new(value);
-    if value.is_empty()
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err(ToolError::InvalidInput(
-            "path must be a non-empty root-relative path".into(),
-        ));
+    if value.is_empty() {
+        return Err(ToolError::InvalidInput("path must be non-empty".into()));
     }
-    Ok(root.join(relative))
+    let path = Path::new(value);
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    })
 }
 
 fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
-}
-
-fn ensure_contained(root: &Path, path: &Path) -> Result<(), ToolError> {
-    let mut existing = path;
-    while !existing.exists() {
-        existing = existing
-            .parent()
-            .ok_or_else(|| ToolError::InvalidInput("path has no existing ancestor".into()))?;
-    }
-    let resolved = existing.canonicalize().map_err(io_error)?;
-    if resolved.starts_with(root) {
-        Ok(())
-    } else {
-        Err(ToolError::InvalidInput(
-            "path resolves outside the runtime root".into(),
-        ))
-    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
@@ -272,19 +251,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_path_escape() {
-        assert!(rooted(Path::new("/tmp/root"), "../outside").is_err());
-        assert!(rooted(Path::new("/tmp/root"), "/outside").is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_symlink_escape() {
-        use std::os::unix::fs::symlink;
-
+    fn accepts_paths_outside_root() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), root.path().join("link")).unwrap();
-        assert!(ensure_contained(root.path(), &root.path().join("link/file")).is_err());
+        assert_eq!(
+            rooted(root.path(), "../outside").unwrap(),
+            root.path().join("../outside")
+        );
+        assert_eq!(
+            rooted(root.path(), outside.path().to_str().unwrap()).unwrap(),
+            outside.path()
+        );
+        assert!(rooted(root.path(), "").is_err());
     }
 }

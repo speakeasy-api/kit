@@ -82,7 +82,7 @@ The runtime root is a working directory, not an operating-system security bounda
 
 ## Make exact file changes with `edit`
 
-`edit` operates on one root-relative file path with `op: "add"`, `"edit"`, or `"delete"`. Paths must be non-empty, relative, and composed only of normal path components; absolute paths and `..` are rejected with `path must be a non-empty root-relative path`. Existing ancestors are resolved so symlinks cannot direct an edit outside the runtime root; that case reports `path resolves outside the runtime root`.
+`edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from the runtime root. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.
 
 An edit hunk replaces `old` while using optional `context_before` and `context_after` as its exact anchor:
 
