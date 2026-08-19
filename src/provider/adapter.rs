@@ -105,17 +105,31 @@ pub struct ModelGroup {
 #[derive(Clone)]
 pub struct SelectableAdapter {
     selection: Arc<Mutex<ModelSelection>>,
+    credential_storage: crate::credentials::CredentialStorage,
 }
 
 impl SelectableAdapter {
     pub fn new(provider: ProviderKind, model: impl Into<String>) -> Result<Self, String> {
+        Self::new_with_credentials(provider, model, Default::default())
+    }
+
+    pub(crate) fn new_with_credentials(
+        provider: ProviderKind,
+        model: impl Into<String>,
+        credential_storage: crate::credentials::CredentialStorage,
+    ) -> Result<Self, String> {
         let selection = ModelSelection::new(provider, model);
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new(selection.provider, selection.model.clone())?;
+        KitAdapter::new_with_credentials(
+            selection.provider,
+            selection.model.clone(),
+            credential_storage.clone(),
+        )?;
         Ok(Self {
             selection: Arc::new(Mutex::new(selection)),
+            credential_storage,
         })
     }
 
@@ -130,7 +144,11 @@ impl SelectableAdapter {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new(selection.provider, selection.model.clone())?;
+        KitAdapter::new_with_credentials(
+            selection.provider,
+            selection.model.clone(),
+            self.credential_storage.clone(),
+        )?;
         *self
             .selection
             .lock()
@@ -141,6 +159,7 @@ impl SelectableAdapter {
 
 pub struct SelectableSession {
     selection: Arc<Mutex<ModelSelection>>,
+    credential_storage: crate::credentials::CredentialStorage,
     config: SessionConfig,
     active: ModelSelection,
     inner: KitSession,
@@ -152,12 +171,17 @@ impl ModelAdapter for SelectableAdapter {
 
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
         let active = self.selection().map_err(LoopError::InvalidState)?;
-        let inner = KitAdapter::new(active.provider, active.model.clone())
-            .map_err(LoopError::InvalidState)?
-            .start_session(config.clone())
-            .await?;
+        let inner = KitAdapter::new_with_credentials(
+            active.provider,
+            active.model.clone(),
+            self.credential_storage.clone(),
+        )
+        .map_err(LoopError::InvalidState)?
+        .start_session(config.clone())
+        .await?;
         Ok(SelectableSession {
             selection: Arc::clone(&self.selection),
+            credential_storage: self.credential_storage.clone(),
             config,
             active,
             inner,
@@ -184,10 +208,14 @@ impl ModelSession for SelectableSession {
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("model selection lock is poisoned".into()))?;
         if selected != self.active {
-            self.inner = KitAdapter::new(selected.provider, selected.model.clone())
-                .map_err(LoopError::InvalidState)?
-                .start_session(self.config.clone())
-                .await?;
+            self.inner = KitAdapter::new_with_credentials(
+                selected.provider,
+                selected.model.clone(),
+                self.credential_storage.clone(),
+            )
+            .map_err(LoopError::InvalidState)?
+            .start_session(self.config.clone())
+            .await?;
             self.active = selected;
         }
         self.inner.begin_turn(request, cancellation).await
@@ -215,11 +243,19 @@ pub struct OpenRouterKitAdapter {
 
 impl KitAdapter {
     pub fn new(provider: ProviderKind, model: String) -> Result<Self, String> {
+        Self::new_with_credentials(provider, model, Default::default())
+    }
+
+    pub(crate) fn new_with_credentials(
+        provider: ProviderKind,
+        model: String,
+        credential_storage: crate::credentials::CredentialStorage,
+    ) -> Result<Self, String> {
         match provider {
-            ProviderKind::OpenAiSubscription => {
-                OpenAiSubscriptionAdapter::new(SubscriptionConfig::new(model)?)
-                    .map(Self::OpenAiSubscription)
-            }
+            ProviderKind::OpenAiSubscription => OpenAiSubscriptionAdapter::new(
+                SubscriptionConfig::new(model)?.with_credential_storage(credential_storage),
+            )
+            .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
                 let mut config = OpenRouterConfig::from_env().map_err(|error| error.to_string())?;
                 config.model = model.clone();

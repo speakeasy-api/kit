@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::credentials::{CredentialEntry, CredentialStorage};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
@@ -55,8 +56,6 @@ const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const REVOKE_URL: &str = "https://auth.openai.com/oauth/revoke";
 const JWKS_URL: &str = "https://auth.openai.com/.well-known/jwks.json";
 const CALLBACK_PATH: &str = "/auth/callback";
-const KEYRING_SERVICE: &str = "dev.kit.openai";
-const KEYRING_USER: &str = "subscription";
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -265,28 +264,27 @@ trait CredentialStore: Send + Sync {
     fn delete(&self) -> Result<bool, AuthError>;
 }
 
-struct OsCredentialStore;
+struct BackendCredentialStore {
+    entry: CredentialEntry,
+}
 
-impl OsCredentialStore {
-    fn entry() -> Result<keyring::Entry, AuthError> {
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|_| {
-            AuthError::unavailable(
-                "credential_backend_unavailable",
-                "the OS credential store is unavailable; no plaintext fallback is permitted",
-            )
-        })
+impl BackendCredentialStore {
+    fn new(storage: &CredentialStorage) -> Self {
+        Self {
+            entry: storage.entry("openai-subscription", "subscription"),
+        }
     }
 }
 
-impl CredentialStore for OsCredentialStore {
+impl CredentialStore for BackendCredentialStore {
     fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
-        let mut bytes = match Self::entry()?.get_secret() {
-            Ok(bytes) => bytes,
-            Err(keyring::Error::NoEntry) => return Ok(None),
+        let mut bytes = match self.entry.load() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
             Err(_) => {
                 return Err(AuthError::unavailable(
                     "credential_read_failed",
-                    "could not read OpenAI credentials from the OS credential store",
+                    "could not read OpenAI credentials from the configured credential store",
                 ));
             }
         };
@@ -318,10 +316,10 @@ impl CredentialStore for OsCredentialStore {
                 "the credential record exceeds 64 KiB",
             ));
         }
-        let result = Self::entry()?.set_secret(&bytes).map_err(|_| {
+        let result = self.entry.save(&bytes).map_err(|_| {
             AuthError::unavailable(
                 "credential_write_failed",
-                "could not atomically store OpenAI credentials in the OS credential store",
+                "could not atomically store OpenAI credentials in the configured credential store",
             )
         });
         bytes.zeroize();
@@ -329,23 +327,22 @@ impl CredentialStore for OsCredentialStore {
     }
 
     fn delete(&self) -> Result<bool, AuthError> {
-        match Self::entry()?.delete_credential() {
-            Ok(()) => Ok(true),
-            Err(keyring::Error::NoEntry) => Ok(false),
-            Err(_) => Err(AuthError::unavailable(
+        self.entry.delete().map_err(|_| {
+            AuthError::unavailable(
                 "credential_delete_failed",
-                "could not delete OpenAI credentials from the OS credential store",
-            )),
-        }
+                "could not delete OpenAI credentials from the configured credential store",
+            )
+        })
     }
 }
 
 pub(crate) fn execute(
     command: AuthCommand,
+    storage: &CredentialStorage,
     format: OutputFormat,
     timeout: Duration,
 ) -> Result<Output, AuthError> {
-    let store = OsCredentialStore;
+    let store = BackendCredentialStore::new(storage);
     let deadline = Instant::now() + timeout.min(Duration::from_secs(300));
     let result = match command {
         AuthCommand::Login => login(&store, format, deadline),
@@ -559,8 +556,11 @@ fn render_status(
         .map_err(|error| AuthError::invalid("output_failed", error.to_string()))
 }
 
-pub(crate) fn access_token(deadline: Instant) -> Result<TokenRecord, AuthError> {
-    let store = OsCredentialStore;
+pub(crate) fn access_token(
+    storage: &CredentialStorage,
+    deadline: Instant,
+) -> Result<TokenRecord, AuthError> {
+    let store = BackendCredentialStore::new(storage);
     let mut record = store.load()?.ok_or_else(|| {
         AuthError::invalid(
             "openai_auth_required",
@@ -585,10 +585,11 @@ pub(crate) fn access_token(deadline: Instant) -> Result<TokenRecord, AuthError> 
 }
 
 pub(crate) fn refresh_after_unauthorized(
+    storage: &CredentialStorage,
     rejected_access_token: &str,
     deadline: Instant,
 ) -> Result<TokenRecord, AuthError> {
-    let store = OsCredentialStore;
+    let store = BackendCredentialStore::new(storage);
     refresh_locked(&store, deadline, Some(rejected_access_token), TOKEN_URL)
 }
 
@@ -1906,6 +1907,21 @@ mod tests {
     }
 
     #[test]
+    fn shared_file_backend_round_trips_openai_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+        let store = BackendCredentialStore::new(&storage);
+        let record = TokenRecord::for_test("access", "account");
+
+        store.save(&record).unwrap();
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.access_token(), "access");
+        assert_eq!(loaded.account_id(), Some("account"));
+        assert!(store.delete().unwrap());
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
     fn rejected_token_generation_refreshes_once_past_old_id_expiry_and_logout_wins() {
         let kid = "refresh-key";
         let store = std::sync::Arc::new(MemoryStore::default());
@@ -2259,7 +2275,7 @@ mod tests {
     #[ignore = "requires an interactive OS keyring entry created by kit auth login openai"]
     fn real_openai_auth_smoke() {
         let output = status(
-            &OsCredentialStore,
+            &BackendCredentialStore::new(&CredentialStorage::Keychain),
             OutputFormat::Json,
             Instant::now() + Duration::from_secs(30),
         )

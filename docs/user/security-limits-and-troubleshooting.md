@@ -57,13 +57,13 @@ Persisted session transcripts are append-only JSONL records under `~/.kit/sessio
 
 Kit can expose credentials through the authority of its process even when it does not print them. Shell commands and ACP harnesses normally inherit the process environment. Local MCP servers are executable code. Remote MCP tools receive invoked arguments, and explicit MCP configuration may contain a plain `bearerToken`. Keep config files and environment variables private, use narrowly scoped accounts, and do not ask the model to echo tokens for diagnosis.
 
-OpenAI subscription credentials are separate from MCP credentials. `kit auth login openai` uses PKCE, state, and nonce on fixed loopback callback ports 1455 and 1457, verifies RS256 tokens against OpenAI's pinned JWKS endpoint, and persists secrets only in the operating system credential store on macOS, Windows, and Linux. There is no plaintext fallback. Token values are redacted from diagnostics and zeroized where practical. The synchronization lock file contains no credentials. `kit auth logout openai` revokes before deletion and retains the credential when revocation fails; `--local-only` deliberately skips revocation and should be used only when remote revocation cannot be completed.
+OpenAI and MCP use one credential backend selected with `--credential-store` or `credential_store`. The default is `memory`. `kit auth login openai` uses PKCE, state, and nonce on fixed loopback callback ports 1455 and 1457 and verifies RS256 tokens against OpenAI's pinned JWKS endpoint. Standalone OpenAI login rejects `memory`; select persistent `keychain` or `file` storage and use the same selection for runtime commands. Token values are redacted from diagnostics and zeroized where practical. The synchronization lock file contains no credentials. `kit auth logout openai` revokes before deletion and retains the credential when revocation fails; `--local-only` deliberately skips revocation and should be used only when remote revocation cannot be completed.
 
-MCP OAuth credentials are memory-only by default. The choices are:
+The shared backend choices are:
 
-- `memory`: not persisted and not shared with nested Kit subprocesses.
-- `keychain`: persistent macOS Keychain storage; unavailable on non-macOS systems.
-- `file`: persistent but **not encrypted**. On Unix, Kit creates the credential directory with mode `0700` and files with mode `0600`, rejects symlinked storage directories, and rejects credential files accessible by other users.
+- `memory`: not persisted. It is process-local, so credentials are not available to the TUI server process or nested Kit children.
+- `keychain`: persistent operating-system storage through macOS Keychain, Windows Credential Manager, or Secret Service on Linux and other Unix systems.
+- `file`: persistent but **not encrypted**. It requires `--credential-dir` or `credential_dir`. On Unix, Kit creates the credential directory with mode `0700` and files with mode `0600`, rejects symlinked storage directories and non-regular paths, and rejects credential files accessible by other users.
 
 Interactive OAuth is available in `kit tui`, `kit serve`, and the stdio-only `kit acp` command. The one-shot `kit prompt` command can report `authentication_unavailable` or `interactive MCP authentication requires the tui, serve, or acp command`; it can still restore previously persisted credentials. An OAuth flow binds a loopback callback, expires after 10 minutes, and may report `OAuth callback timed out`.
 
@@ -95,7 +95,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 1. Run `kit --version` and `kit <command> --help` to verify the installed binary and command syntax.
 2. If the diagnostic says `could not open runtime root` or `runtime root is not a directory`, verify that `--root` exists, is a directory, and is accessible to the Kit process.
 3. If A2A binding fails or the port is taken, omit the fixed address to get an available loopback port, choose another loopback port, or use `kit acp` when HTTP is unnecessary.
-4. If the failure mentions OpenAI subscription credentials, run `kit auth status openai` and, if needed, `kit auth login openai`; ensure the OS credential store is unlocked and loopback port 1455 or 1457 is available. Retry without pasting secrets into the prompt.
+4. If the failure mentions OpenAI subscription credentials, run status and login with the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` used by the runtime; standalone login rejects `memory`. Ensure loopback port 1455 or 1457 is available. Retry without pasting secrets into the prompt.
 
 ### A shell or edit tool fails
 

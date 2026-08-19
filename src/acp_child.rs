@@ -199,10 +199,10 @@ impl AcpHarnesses {
             command.arg("--mcp-config").arg(path);
         }
         command
-            .arg("--mcp-credential-store")
+            .arg("--credential-store")
             .arg(config.credential_storage.cli_name());
         if let Some(path) = config.credential_storage.directory() {
-            command.arg("--mcp-credential-dir").arg(path);
+            command.arg("--credential-dir").arg(path);
         }
         Ok(command)
     }
@@ -1014,7 +1014,7 @@ mod tests {
             model: "test-model".into(),
             provider: crate::ProviderKind::OpenRouter,
             mcp_config: None,
-            credential_storage: Default::default(),
+            credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
             harnesses: harnesses.clone(),
             default_harness: BUILTIN_HARNESS.into(),
         };
@@ -1046,7 +1046,14 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg == "--root"));
         assert!(args.iter().any(|arg| arg == "--resume"));
-        assert!(args.iter().any(|arg| arg == "--mcp-credential-store"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--credential-store", "file"])
+        );
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--credential-dir"
+                && pair[1] == root.path().join("credentials").to_string_lossy()
+        }));
         assert_eq!(command.as_std().get_current_dir(), Some(root.path()));
     }
 

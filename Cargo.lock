@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
@@ -2275,7 +2275,6 @@ dependencies = [
  "agentkit-tool-compose",
  "agentkit-tool-skills",
  "agentkit-tools-core",
- "apple-native-keyring-store",
  "async-trait",
  "atomicwrites",
  "base64 0.22.1",
@@ -2292,7 +2291,6 @@ dependencies = [
  "jsonschema",
  "jsonwebtoken",
  "keyring",
- "keyring-core",
  "libc",
  "ratatui",
  "reqwest",

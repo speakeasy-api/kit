@@ -100,22 +100,22 @@ Interactive browser authentication is enabled in the long-lived `kit tui`, `kit 
 
 ## OAuth credential stores
 
-Choose a store with `--mcp-credential-store` or `mcp_credential_store` in `~/.kit/config.toml`. The allowed values are `memory`, `keychain`, and `file`.
+OpenAI and MCP use one shared backend. Choose it with `--credential-store` or `credential_store` in `~/.kit/config.toml`. The allowed values are `memory`, `keychain`, and `file`.
 
 ### Memory store (default)
 
-`memory` is process-local and writes no OAuth credentials to persistent storage. Credentials disappear when the process exits and are not inherited by nested Kit processes. This is the default when no store is selected.
+`memory` is process-local and writes no OAuth credentials to persistent storage. Credentials disappear when the process exits and are not available to the TUI server process or nested Kit children. This is the default when no store is selected. Standalone OpenAI login rejects `memory`; select `keychain` or `file` for login and reuse that backend in runtime commands.
 
 ```sh
-kit tui --mcp-config /path/to/mcp.json --mcp-credential-store memory
+kit tui --mcp-config /path/to/mcp.json --credential-store memory
 ```
 
-### macOS Keychain store
+### Operating-system credential store
 
-`keychain` persists OAuth credentials in the user's macOS Keychain. It is only available on macOS; other platforms report `keychain credential storage is only available on macOS`. A stable, signed installed binary avoids repeated Keychain identity prompts; a changed signing identity, missing certificate, or locked Keychain can require attention.
+`keychain` persists OAuth credentials in the platform credential store: macOS Keychain, Windows Credential Manager, or Secret Service on Linux and other Unix systems. The store must be available and unlocked. On macOS, a stable, signed installed binary avoids repeated Keychain identity prompts; a changed signing identity, missing certificate, or locked Keychain can require attention.
 
 ```sh
-kit tui --mcp-config /path/to/mcp.json --mcp-credential-store keychain
+kit tui --mcp-config /path/to/mcp.json --credential-store keychain
 ```
 
 ### File credential store
@@ -124,18 +124,18 @@ kit tui --mcp-config /path/to/mcp.json --mcp-credential-store keychain
 
 ```sh
 kit tui --mcp-config /path/to/mcp.json \
-  --mcp-credential-store file \
-  --mcp-credential-dir ~/.local/share/kit/mcp-credentials
+  --credential-store file \
+  --credential-dir ~/.local/share/kit/credentials
 ```
 
 The corresponding TOML is:
 
 ```toml
-mcp_credential_store = "file"
-mcp_credential_dir = "/path/to/private/credentials"
+credential_store = "file"
+credential_dir = "/path/to/private/credentials"
 ```
 
-Persistent stores restore OAuth credentials when Kit starts and may refresh access tokens. Reuse the same store and MCP server identity across commands. Concurrent Kit processes can race if an OAuth provider rotates refresh tokens.
+Persistent stores restore OpenAI and MCP OAuth credentials when Kit starts and may refresh access tokens. Reuse the same backend, directory, and MCP server identity across commands. Concurrent Kit processes can race if an OAuth provider rotates refresh tokens.
 
 ## Security guidance
 
@@ -164,9 +164,9 @@ Persistent stores restore OAuth credentials when Kit starts and may refresh acce
 
 ### Credential-store errors
 
-- **`mcp_credential_dir is required when mcp_credential_store is file`**: supply `--mcp-credential-dir` or the TOML key.
-- **`mcp_credential_dir requires mcp_credential_store to be file`**: remove the directory setting or select `file`.
+- **`credential_dir is required when credential_store is file`**: supply `--credential-dir` or the TOML key.
+- **`credential_dir requires credential_store to be file`**: remove the directory setting or select `file`.
 - **`OAuth credential directory must be a real directory, not a symlink`**: select a real private directory.
 - **`OAuth credential path must be a regular file`**: remove the conflicting symlink or non-file entry.
 - **`OAuth credential file is accessible by other users`**: on Unix, restrict the file to its owner (for example, mode `0600`) before retrying.
-- **Keychain read/write failures**: confirm macOS Keychain is unlocked and that the installed binary has the expected stable signing identity.
+- **Credential-store read/write failures**: confirm the operating-system store is available and unlocked. On macOS, also confirm that the installed binary has the expected stable signing identity.

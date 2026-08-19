@@ -21,7 +21,10 @@ pub enum OpenAiAuthCommand {
 }
 
 #[doc(hidden)]
-pub fn execute_openai_auth(command: OpenAiAuthCommand) -> Result<String, String> {
+pub fn execute_openai_auth(
+    command: OpenAiAuthCommand,
+    storage: &crate::credentials::CredentialStorage,
+) -> Result<String, String> {
     let command = match command {
         OpenAiAuthCommand::Login => openai_auth::AuthCommand::Login,
         OpenAiAuthCommand::Status => openai_auth::AuthCommand::Status,
@@ -33,7 +36,7 @@ pub fn execute_openai_auth(command: OpenAiAuthCommand) -> Result<String, String>
             std::time::Duration::from_secs(30)
         }
     };
-    openai_auth::execute(command, openai_auth::OutputFormat::Human, timeout)
+    openai_auth::execute(command, storage, openai_auth::OutputFormat::Human, timeout)
         .map(|output| output.stdout)
         .map_err(|error| error.to_string())
 }

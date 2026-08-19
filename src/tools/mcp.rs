@@ -1,7 +1,7 @@
 mod auth;
 mod credentials;
 
-pub use credentials::CredentialStorage;
+pub use crate::credentials::CredentialStorage;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

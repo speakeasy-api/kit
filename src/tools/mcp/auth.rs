@@ -132,7 +132,11 @@ async fn manager(
     let mut manager = AuthorizationManager::new(resource_url)
         .await
         .map_err(|error| format!("OAuth setup failed: {error}"))?;
-    credential_storage.configure(&mut manager, &credential_identity(resource_url, config));
+    super::credentials::configure(
+        credential_storage,
+        &mut manager,
+        &credential_identity(resource_url, config),
+    );
     Ok(manager)
 }
 

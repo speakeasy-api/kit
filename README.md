@@ -37,14 +37,15 @@ the release repository contains only packaged executables and checksums.
 Authenticate your ChatGPT subscription once, then start the TUI:
 
 ```sh
-cargo run -- auth login openai
-cargo run -- tui --root /path/to/project
+cargo run -- auth login openai --credential-store keychain
+cargo run -- tui --root /path/to/project --credential-store keychain
 ```
 
 The native login uses OAuth authorization code flow with PKCE, state, and nonce.
 It listens only on registered loopback callback ports 1455 and 1457, validates
-OpenAI RS256 tokens against the pinned JWKS endpoint, and stores tokens only in
-the operating system credential store. No plaintext credential fallback exists.
+OpenAI RS256 tokens against the pinned JWKS endpoint, and uses the same selected
+credential backend as MCP. Standalone login rejects the default `memory` backend;
+select persistent `keychain` or `file` storage.
 Protocol source attribution and reproduced upstream licenses are in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
@@ -126,8 +127,8 @@ provider = "openai-subscription" # or openrouter
 model = "gpt-5.4"
 a2a = "127.0.0.1:7331"
 mcp_config = "/path/to/mcp.json"
-mcp_credential_store = "file" # memory, keychain, or file
-mcp_credential_dir = "/path/to/private/credentials"
+credential_store = "file" # memory, keychain, or file
+credential_dir = "/path/to/private/credentials"
 
 [acp.review]
 command = "review-agent"
@@ -143,7 +144,7 @@ args = ["acp"]
 harness = "acp.review"
 ```
 
-`root`, `provider`, `model`, and the MCP settings apply to every command. `a2a` applies to
+`root`, `provider`, `model`, and credential settings apply to every command. `a2a` applies to
 `serve` and `tui`. ACP profiles are trusted, strict `command`/`args` argv
 configurations: Kit does not invoke a shell and always sets the child cwd to the
 runtime root. Multiple names may be configured. `[subagent].harness` selects the
@@ -367,21 +368,26 @@ refusal, protocol errors, and other uncertain stops retire the child instead. Pe
 headless child are conservatively cancelled so they cannot hang. Nested built-in
 children use `kit acp` and never start A2A listeners.
 
-OAuth credentials are memory-only by default. Because that store is process-local,
-nested Kit subprocesses cannot inherit credentials already entered into the parent;
-use keychain or file storage when nested agents need authenticated MCP access. Persistence is explicit:
+OpenAI and MCP use one shared credential backend, selected with
+`--credential-store` or `credential_store`. The default `memory` backend is
+process-local, so credentials disappear at exit and are not available to the
+TUI server process or nested Kit children. Use persistent storage when those
+processes need the same credentials. Standalone OpenAI login rejects `memory`:
 
 ```sh
-# macOS login Keychain
-kit tui --mcp-config mcp.json --mcp-credential-store keychain
+# Operating-system credential store
+kit auth login openai --credential-store keychain
+kit tui --mcp-config mcp.json --credential-store keychain
 
 # Plain JSON files in an explicit private directory
-kit tui --mcp-config mcp.json --mcp-credential-store file \
-  --mcp-credential-dir ~/.local/share/kit/mcp-credentials
+kit auth login openai --credential-store file \
+  --credential-dir ~/.local/share/kit/credentials
+kit tui --mcp-config mcp.json --credential-store file \
+  --credential-dir ~/.local/share/kit/credentials
 ```
 
-The file backend creates a `0700` directory and one `0600` file per server on
-Unix, but its tokens are not encrypted. Persistent credentials are restored and
+The file backend creates a `0700` directory and `0600` credential files on
+Unix, rejects unsafe paths and permissions, and does not encrypt tokens. Persistent credentials are restored and
 refreshed when Kit starts, so `prompt` can use credentials created earlier by
 `tui` or `serve` without starting an interactive browser flow. Concurrent Kit
 processes can still race when a provider rotates a refresh token.
@@ -395,7 +401,7 @@ before using Keychain storage:
 scripts/sign-release.sh
 
 target/release/kit tui --mcp-config mcp.json \
-  --mcp-credential-store keychain
+  --credential-store keychain
 ```
 
 On macOS, `.cargo/config.toml` routes `cargo run` through a runner that signs the

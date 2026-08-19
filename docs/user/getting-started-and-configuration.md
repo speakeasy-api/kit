@@ -23,17 +23,17 @@ Kit supports `openai-subscription` and `openrouter`. The default provider is `op
 Authenticate directly with Kit, then start the runtime:
 
 ```sh
-kit auth login openai
-kit auth status openai
-kit tui --root /path/to/project
+kit auth login openai --credential-store keychain
+kit auth status openai --credential-store keychain
+kit tui --root /path/to/project --credential-store keychain
 ```
 
 Login opens OpenAI's browser authorization flow and accepts the callback only on
 `http://localhost:1455/auth/callback` or port 1457. Kit uses PKCE plus state and
-nonce checks, validates RS256 access and ID tokens against OpenAI's JWKS, and
-stores the resulting credential only in the operating system credential store.
-There is no environment, Codex-file, or plaintext-file fallback. The OS store must
-be available and unlocked.
+nonce checks and validates RS256 access and ID tokens against OpenAI's JWKS.
+OpenAI and MCP use one selected credential backend. The default is process-local
+`memory`, but standalone OpenAI login rejects it; select persistent `keychain` or
+`file` storage, including `--credential-dir` when selecting `file`.
 
 Kit refreshes credentials within five minutes of expiry. Refreshes are synchronized
 across threads and processes, preserve the authenticated account and credential
@@ -121,8 +121,8 @@ model = "gpt-5.4"
 a2a = "127.0.0.1:7331"
 
 mcp_config = "/path/to/mcp.json"
-mcp_credential_store = "file" # "memory", "keychain", or "file"
-mcp_credential_dir = "/path/to/private/credentials"
+credential_store = "file" # "memory", "keychain", or "file"
+credential_dir = "/path/to/private/credentials"
 
 [acp.review]
 command = "review-agent"
@@ -133,7 +133,7 @@ permissions = "deny" # "deny" or "cancel"
 harness = "acp.review"
 ```
 
-`root`, `provider`, `model`, and MCP settings apply to all four commands. `a2a` applies to `serve` and `tui`. `mcp_credential_store` defaults to `memory`; selecting `file` requires `mcp_credential_dir`, while a credential directory is invalid with `memory` or `keychain`. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`root`, `provider`, `model`, and credential settings apply to all four runtime commands. `a2a` applies to `serve` and `tui`. `credential_store` selects one backend for OpenAI and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 ### Configuration precedence and built-in defaults
 
@@ -150,7 +150,7 @@ The main built-in defaults are:
 | `root` | `.` |
 | `provider` | `openai-subscription` |
 | `model` | `gpt-5.4` |
-| `mcp_credential_store` | `memory` |
+| `credential_store` | `memory` |
 | `serve`/`tui` A2A address | an available loopback port |
 | subagent harness | `acp.kit` |
 
@@ -183,7 +183,7 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 
 - **`invalid config ...`**: validate TOML spelling and types. The schema rejects unknown fields; provider values are exactly `openai-subscription` and `openrouter`, and credential-store values are `memory`, `keychain`, and `file`.
 - **`could not read config ...`**: check permissions and that `$HOME/.kit/config.toml` is a readable regular file. Deleting an unwanted config is valid because a missing file falls back to defaults.
-- **`mcp_credential_dir is required when mcp_credential_store is file`**: add the directory or choose another store.
-- **`mcp_credential_dir requires mcp_credential_store to be file`**: remove the directory or select `file`.
+- **`credential_dir is required when credential_store is file`**: add the directory or choose another store.
+- **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.
 - **Unexpected project or model**: check the command line first, then `~/.kit/config.toml`, then the built-in defaults. Use `kit <command> --help` to confirm which options that command accepts.
-- **Provider authentication failure**: for `openai-subscription`, run `kit auth status openai`, then `kit auth login openai` if needed; ensure the OS credential store is available and that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier.
+- **Provider authentication failure**: for `openai-subscription`, use the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` for login, status, and runtime commands; standalone login rejects `memory`. Also check that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier.

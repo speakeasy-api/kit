@@ -158,10 +158,10 @@ pub async fn run(
         command.arg("--mcp-config").arg(path);
     }
     command
-        .arg("--mcp-credential-store")
+        .arg("--credential-store")
         .arg(credential_storage.cli_name());
     if let Some(directory) = credential_storage.directory() {
-        command.arg("--mcp-credential-dir").arg(directory);
+        command.arg("--credential-dir").arg(directory);
     }
     if force {
         command.arg("--force");

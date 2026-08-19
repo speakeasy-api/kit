@@ -43,6 +43,7 @@ const CONTINUATION_SCHEMA_VERSION: u64 = 1;
 #[derive(Clone, Debug)]
 pub struct SubscriptionConfig {
     pub model: String,
+    pub credential_storage: crate::credentials::CredentialStorage,
 }
 
 impl SubscriptionConfig {
@@ -50,7 +51,18 @@ impl SubscriptionConfig {
         if !supported_model(&model) {
             return Err("openai-subscription model is not in the supported model set".to_owned());
         }
-        Ok(Self { model })
+        Ok(Self {
+            model,
+            credential_storage: Default::default(),
+        })
+    }
+
+    pub(crate) fn with_credential_storage(
+        mut self,
+        credential_storage: crate::credentials::CredentialStorage,
+    ) -> Self {
+        self.credential_storage = credential_storage;
+        self
     }
 
     fn endpoint(&self) -> &str {
@@ -328,13 +340,17 @@ async fn credentials(
     rejected: Option<auth::TokenRecord>,
     cancellation: Option<agentkit_core::TurnCancellation>,
 ) -> Result<auth::TokenRecord, LoopError> {
-    let _ = config;
+    let config = config.clone();
     let worker = tokio::task::spawn_blocking(move || match rejected {
         Some(record) => auth::refresh_after_unauthorized(
+            &config.credential_storage,
             record.access_token(),
             Instant::now() + Duration::from_secs(30),
         ),
-        None => auth::access_token(Instant::now() + Duration::from_secs(30)),
+        None => auth::access_token(
+            &config.credential_storage,
+            Instant::now() + Duration::from_secs(30),
+        ),
     });
     let result = if let Some(cancel) = cancellation {
         tokio::select! {

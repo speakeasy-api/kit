@@ -107,6 +107,7 @@ pub struct Runtime {
     adapter: SelectableAdapter,
     provider: ProviderKind,
     model: String,
+    credential_storage: crate::credentials::CredentialStorage,
     max_subagent_depth: usize,
     base_depth: usize,
     subagents: Subagents,
@@ -127,6 +128,15 @@ impl Runtime {
         model: impl Into<String>,
         provider: ProviderKind,
     ) -> Result<Arc<Self>, String> {
+        Self::new_with_provider_and_credentials(root, model, provider, Default::default())
+    }
+
+    pub fn new_with_provider_and_credentials(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        credential_storage: crate::credentials::CredentialStorage,
+    ) -> Result<Arc<Self>, String> {
         let root = root
             .as_ref()
             .canonicalize()
@@ -139,7 +149,11 @@ impl Runtime {
         }
         let skills = SkillRegistry::from_paths(default_skill_roots(&root)).tool_registry();
         let model = model.into();
-        let adapter = SelectableAdapter::new(provider, model.clone())?;
+        let adapter = SelectableAdapter::new_with_credentials(
+            provider,
+            model.clone(),
+            credential_storage.clone(),
+        )?;
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
             ChildConfig {
@@ -147,7 +161,7 @@ impl Runtime {
                 model: model.clone(),
                 provider,
                 mcp_config: None,
-                credential_storage: Default::default(),
+                credential_storage: credential_storage.clone(),
                 harnesses: AcpHarnesses::default(),
                 default_harness: BUILTIN_HARNESS.into(),
             },
@@ -158,6 +172,7 @@ impl Runtime {
             adapter,
             provider,
             model,
+            credential_storage,
             max_subagent_depth,
             base_depth: 0,
             subagents,
@@ -183,8 +198,29 @@ impl Runtime {
         provider: ProviderKind,
         session: SessionRequest,
     ) -> Result<Arc<Self>, String> {
-        let mut runtime = Arc::try_unwrap(Self::new_with_provider(root, model, provider)?)
-            .map_err(|_| "could not configure runtime session".to_string())?;
+        Self::with_session_provider_and_credentials(
+            root,
+            model,
+            provider,
+            session,
+            Default::default(),
+        )
+    }
+
+    pub fn with_session_provider_and_credentials(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        session: SessionRequest,
+        credential_storage: crate::credentials::CredentialStorage,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(Self::new_with_provider_and_credentials(
+            root,
+            model,
+            provider,
+            credential_storage,
+        )?)
+        .map_err(|_| "could not configure runtime session".to_string())?;
         runtime
             .session
             .get_mut()
@@ -229,7 +265,7 @@ impl Runtime {
                 model: runtime.model.clone(),
                 provider: runtime.provider,
                 mcp_config: None,
-                credential_storage: Default::default(),
+                credential_storage: runtime.credential_storage.clone(),
                 harnesses,
                 default_harness,
             },
@@ -254,6 +290,7 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
         runtime.mcp = mcp;
+        runtime.credential_storage = credential_storage.clone();
         let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
@@ -462,8 +499,12 @@ impl Runtime {
             opened_new = !request.resume;
             // Every ACP route owns its model selection. Changing one session
             // cannot redirect another session served by the same runtime.
-            let adapter = SelectableAdapter::new(self.provider, self.model.clone())
-                .map_err(AcpRuntimeError::Loop)?;
+            let adapter = SelectableAdapter::new_with_credentials(
+                self.provider,
+                self.model.clone(),
+                self.credential_storage.clone(),
+            )
+            .map_err(AcpRuntimeError::Loop)?;
             let compactor = crate::compaction::automatic(
                 adapter.clone(),
                 Some(opened.observer.clone()),

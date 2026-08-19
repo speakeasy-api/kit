@@ -16,36 +16,29 @@ struct Cli {
 }
 
 #[derive(Args)]
-struct McpArgs {
-    /// Explicit MCP server configuration (never discovered automatically).
-    #[arg(long)]
-    mcp_config: Option<PathBuf>,
-    /// OAuth credential storage backend (defaults to config or memory).
-    #[arg(long, value_enum)]
-    mcp_credential_store: Option<CredentialStoreKind>,
-    /// Private directory for file-backed OAuth credentials.
-    #[arg(long)]
-    mcp_credential_dir: Option<PathBuf>,
+struct CredentialArgs {
+    /// Credential storage backend (defaults to config or memory).
+    #[arg(long, value_enum, global = true)]
+    credential_store: Option<CredentialStoreKind>,
+    /// Private directory for file-backed credentials.
+    #[arg(long, global = true)]
+    credential_dir: Option<PathBuf>,
 }
 
-impl McpArgs {
-    fn config_path<'a>(&'a self, config: &'a Config) -> Option<&'a Path> {
-        self.mcp_config.as_deref().or(config.mcp_config.as_deref())
-    }
-
+impl CredentialArgs {
     fn storage(&self, config: &Config) -> io::Result<CredentialStorage> {
         let kind = self
-            .mcp_credential_store
-            .or(config.mcp_credential_store)
+            .credential_store
+            .or(config.credential_store)
             .unwrap_or(CredentialStoreKind::Memory);
-        let directory = match self.mcp_credential_store {
+        let directory = match self.credential_store {
             Some(CredentialStoreKind::Memory | CredentialStoreKind::Keychain) => {
-                self.mcp_credential_dir.as_ref()
+                self.credential_dir.as_ref()
             }
             Some(CredentialStoreKind::File) | None => self
-                .mcp_credential_dir
+                .credential_dir
                 .as_ref()
-                .or(config.mcp_credential_dir.as_ref()),
+                .or(config.credential_dir.as_ref()),
         };
         match (kind, directory) {
             (CredentialStoreKind::Memory, None) => Ok(CredentialStorage::Memory),
@@ -54,12 +47,27 @@ impl McpArgs {
                 Ok(CredentialStorage::Filesystem(path.clone()))
             }
             (CredentialStoreKind::File, None) => Err(io::Error::other(
-                "mcp_credential_dir is required when mcp_credential_store is file",
+                "credential_dir is required when credential_store is file",
             )),
             (_, Some(_)) => Err(io::Error::other(
-                "mcp_credential_dir requires mcp_credential_store to be file",
+                "credential_dir requires credential_store to be file",
             )),
         }
+    }
+}
+
+#[derive(Args)]
+struct McpArgs {
+    /// Explicit MCP server configuration (never discovered automatically).
+    #[arg(long)]
+    mcp_config: Option<PathBuf>,
+    #[command(flatten)]
+    credentials: CredentialArgs,
+}
+
+impl McpArgs {
+    fn config_path<'a>(&'a self, config: &'a Config) -> Option<&'a Path> {
+        self.mcp_config.as_deref().or(config.mcp_config.as_deref())
     }
 }
 
@@ -79,8 +87,8 @@ struct Config {
     provider: Option<kit::ProviderKind>,
     a2a: Option<String>,
     mcp_config: Option<PathBuf>,
-    mcp_credential_store: Option<CredentialStoreKind>,
-    mcp_credential_dir: Option<PathBuf>,
+    credential_store: Option<CredentialStoreKind>,
+    credential_dir: Option<PathBuf>,
     #[serde(default)]
     acp: BTreeMap<String, kit::AcpHarnessProfile>,
     subagent: Option<SubagentConfig>,
@@ -160,7 +168,7 @@ enum AuthProvider {
 
 #[derive(Subcommand)]
 enum AuthAction {
-    /// Authenticate a ChatGPT subscription in the OS credential store.
+    /// Authenticate a ChatGPT subscription in the configured credential store.
     Login { provider: AuthProvider },
     /// Show ChatGPT subscription authentication status.
     Status { provider: AuthProvider },
@@ -179,6 +187,8 @@ enum Command {
     Auth {
         #[command(subcommand)]
         action: AuthAction,
+        #[command(flatten)]
+        credentials: CredentialArgs,
     },
     /// Serve the Agent Client Protocol on stdio and A2A over HTTP.
     Serve {
@@ -272,7 +282,16 @@ enum Command {
     },
 }
 
-async fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
+fn validate_auth_storage(action: &AuthAction, storage: &CredentialStorage) -> io::Result<()> {
+    if matches!(action, AuthAction::Login { .. }) && matches!(storage, CredentialStorage::Memory) {
+        return Err(io::Error::other(
+            "OpenAI login cannot use memory credential storage; select --credential-store file --credential-dir <private-directory> or --credential-store keychain",
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result<(), io::Error> {
     let command = match action {
         AuthAction::Login {
             provider: AuthProvider::Openai,
@@ -287,10 +306,11 @@ async fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
             local_only: *local_only,
         },
     };
-    let output = tokio::task::spawn_blocking(move || kit::provider::execute_openai_auth(command))
-        .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
+    let output =
+        tokio::task::spawn_blocking(move || kit::provider::execute_openai_auth(command, &storage))
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
     print!("{output}");
     Ok(())
 }
@@ -298,11 +318,17 @@ async fn execute_auth(action: &AuthAction) -> Result<(), io::Error> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if let Command::Auth { action } = &cli.command {
-        execute_auth(action).await?;
+    let config = Config::load_default()?;
+    if let Command::Auth {
+        action,
+        credentials,
+    } = &cli.command
+    {
+        let storage = credentials.storage(&config)?;
+        validate_auth_storage(action, &storage)?;
+        execute_auth(action, storage).await?;
         return Ok(());
     }
-    let config = Config::load_default()?;
     match cli.command {
         Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
         Command::Serve {
@@ -319,15 +345,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model = config.model(model);
             let provider = config.provider(provider);
             let a2a = config.a2a(a2a);
-            let credential_storage = mcp.storage(&config)?;
+            let credential_storage = mcp.credentials.storage(&config)?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session_and_provider(
+                Some(id) => kit::Runtime::with_session_provider_and_credentials(
                     root,
                     model,
                     provider,
                     kit::runtime::SessionRequest { id, resume, force },
+                    credential_storage.clone(),
                 )?,
-                None => kit::Runtime::new_with_provider(root, model, provider)?,
+                None => kit::Runtime::new_with_provider_and_credentials(
+                    root,
+                    model,
+                    provider,
+                    credential_storage.clone(),
+                )?,
             };
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -356,15 +388,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
-            let credential_storage = mcp.storage(&config)?;
+            let credential_storage = mcp.credentials.storage(&config)?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session_and_provider(
+                Some(id) => kit::Runtime::with_session_provider_and_credentials(
                     root,
                     model,
                     provider,
                     kit::runtime::SessionRequest { id, resume, force },
+                    credential_storage.clone(),
                 )?,
-                None => kit::Runtime::new_with_provider(root, model, provider)?,
+                None => kit::Runtime::new_with_provider_and_credentials(
+                    root,
+                    model,
+                    provider,
+                    credential_storage.clone(),
+                )?,
             };
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -390,9 +428,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
-            let credential_storage = mcp.storage(&config)?;
+            let credential_storage = mcp.credentials.storage(&config)?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
-            let runtime = kit::Runtime::with_session_and_provider(
+            let runtime = kit::Runtime::with_session_provider_and_credentials(
                 root,
                 model,
                 provider,
@@ -401,6 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     resume: resume.is_some(),
                     force,
                 },
+                credential_storage.clone(),
             )?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -431,7 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model = config.model(model);
             let provider = config.provider(provider);
             let a2a = config.a2a(a2a);
-            let credential_storage = mcp.storage(&config)?;
+            let credential_storage = mcp.credentials.storage(&config)?;
             kit::tui::run(
                 &root,
                 &model,
@@ -453,8 +492,12 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use clap::Parser as _;
+    use kit::tools::CredentialStorage;
 
-    use super::{Cli, Config, CredentialStoreKind, McpArgs};
+    use super::{
+        AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
+        validate_auth_storage,
+    };
 
     #[test]
     fn config_file_supplies_defaults_and_cli_values_win() {
@@ -468,8 +511,8 @@ model = "configured-model"
 provider = "openrouter"
 a2a = "127.0.0.1:7331"
 mcp_config = "/configured/mcp.json"
-mcp_credential_store = "file"
-mcp_credential_dir = "/configured/credentials"
+credential_store = "file"
+credential_dir = "/configured/credentials"
 "#,
         )
         .unwrap();
@@ -491,14 +534,16 @@ mcp_credential_dir = "/configured/credentials"
 
         let mcp = McpArgs {
             mcp_config: None,
-            mcp_credential_store: None,
-            mcp_credential_dir: None,
+            credentials: CredentialArgs {
+                credential_store: None,
+                credential_dir: None,
+            },
         };
         assert_eq!(
             mcp.config_path(&config),
             Some(std::path::Path::new("/configured/mcp.json"))
         );
-        let storage = mcp.storage(&config).unwrap();
+        let storage = mcp.credentials.storage(&config).unwrap();
         assert_eq!(storage.cli_name(), "file");
         assert_eq!(
             storage.directory(),
@@ -507,10 +552,12 @@ mcp_credential_dir = "/configured/credentials"
 
         let override_mcp = McpArgs {
             mcp_config: None,
-            mcp_credential_store: Some(CredentialStoreKind::Memory),
-            mcp_credential_dir: None,
+            credentials: CredentialArgs {
+                credential_store: Some(CredentialStoreKind::Memory),
+                credential_dir: None,
+            },
         };
-        let storage = override_mcp.storage(&config).unwrap();
+        let storage = override_mcp.credentials.storage(&config).unwrap();
         assert_eq!(storage.cli_name(), "memory");
     }
 
@@ -528,17 +575,21 @@ mcp_credential_dir = "/configured/credentials"
     fn file_credentials_require_an_explicit_directory() {
         let missing = McpArgs {
             mcp_config: None,
-            mcp_credential_store: Some(CredentialStoreKind::File),
-            mcp_credential_dir: None,
+            credentials: CredentialArgs {
+                credential_store: Some(CredentialStoreKind::File),
+                credential_dir: None,
+            },
         };
-        assert!(missing.storage(&Config::default()).is_err());
+        assert!(missing.credentials.storage(&Config::default()).is_err());
 
         let stray = McpArgs {
             mcp_config: None,
-            mcp_credential_store: Some(CredentialStoreKind::Memory),
-            mcp_credential_dir: Some("credentials".into()),
+            credentials: CredentialArgs {
+                credential_store: Some(CredentialStoreKind::Memory),
+                credential_dir: Some("credentials".into()),
+            },
         };
-        assert!(stray.storage(&Config::default()).is_err());
+        assert!(stray.credentials.storage(&Config::default()).is_err());
     }
 
     #[test]
@@ -589,10 +640,32 @@ harness = "acp.beta"
     #[test]
     fn auth_commands_parse_without_runtime_arguments() {
         assert!(Cli::try_parse_from(["kit", "auth", "login", "openai"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "auth",
+                "login",
+                "openai",
+                "--credential-store",
+                "keychain"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["kit", "auth", "status", "openai"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "openai", "--local-only"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "login", "openrouter"]).is_err());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "--local-only"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err());
+    }
+
+    #[test]
+    fn standalone_openai_login_rejects_memory_storage() {
+        let login = AuthAction::Login {
+            provider: AuthProvider::Openai,
+        };
+        assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
+        assert!(validate_auth_storage(&login, &CredentialStorage::Keychain).is_ok());
     }
 
     #[test]
