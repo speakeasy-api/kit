@@ -87,24 +87,6 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
 }
 
 #[test]
-fn system_prompt_explains_skill_activation() {
-    let root = tempfile::tempdir().unwrap();
-    let skill = root.path().join(".agents/skills/review");
-    std::fs::create_dir_all(&skill).unwrap();
-    std::fs::write(
-        skill.join("SKILL.md"),
-        "---\nname: review\ndescription: Review code.\n---\nReview it.\n",
-    )
-    .unwrap();
-    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-    let prompt = runtime.system_prompt(0);
-    assert!(prompt.contains("Available agent skills are listed"));
-    assert!(
-        prompt.contains("return `activate_skill({ name: \"<skill-name>\" })` before proceeding")
-    );
-}
-
-#[test]
 fn compose_background_values_select_agentkit_task_routes() {
     let request = |background| {
         ToolRequest::new(
@@ -214,11 +196,15 @@ async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispa
 }
 
 #[test]
-fn system_prompt_points_to_docs_for_kit_guidance() {
+fn system_prompt_guides_compose_and_subagent_hygiene() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let prompt = runtime.system_prompt(0);
-    assert!(prompt.contains(
-        "Use `docs({ query: \"<your query here>\" })` to troubleshoot issues in Kit and find user guidance."
-    ));
+    assert!(prompt.contains("Use compose as a dependency graph"));
+    assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
+    assert!(prompt.contains("keeping the session responsive or doing other independent work"));
+    assert!(prompt.contains("it also suits one-shot triggers"));
+    assert!(prompt.contains("first complete one context-loading subagent, then fork it"));
+    assert!(prompt.contains("start fresh subagents from concise summaries"));
+    assert!(prompt.contains("close subagents when no longer needed"));
 }

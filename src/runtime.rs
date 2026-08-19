@@ -504,16 +504,24 @@ impl Runtime {
     }
 
     fn system_prompt(&self, depth: usize) -> String {
-        let skill_guidance = if self.skills.specs().is_empty() {
-            ""
-        } else {
-            " Available agent skills are listed in the hidden activate_skill tool entry. When a task matches a skill's description, use compose to return `activate_skill({ name: \"<skill-name>\" })` before proceeding, then follow the returned instructions."
-        };
         format!(
-            "You are a coding agent using Kit version {} as your harness, rooted at {}. The only model-visible tool is compose. Use Runlet scripts inside compose to call docs, shell, edit, subagent, prompt, fork, subagents, close, and a2a, plus the MCP meta-tools tool_search, auth, and tool.{skill_guidance} Use `docs({{ query: \"<your query here>\" }})` to troubleshoot issues in Kit and find user guidance. The subagent `harness` argument overrides the user's configured harness preference with a different value; default to omitting it. Use tool_search to discover MCP servers and tools. When a matching server requires authentication, call auth with its exact name and give the returned URL to the user; search again after they complete it. Invoke only MCP tool names returned by tool_search. Make minimal changes, inspect before editing, and run the smallest useful check. Current subagent depth: {depth}/{}.",
+            concat!(
+                "You are a coding agent using Kit version {} as your harness, rooted at {}. ",
+                "Make minimal changes, inspect before editing, and run the smallest useful check.\n\n",
+                "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",
+                "express required ordering with data dependencies or `after`, and use `fold` only for reductions or genuinely sequential chains. ",
+                "Parallelize independent work deliberately. Background long-running compose work when keeping the session responsive or doing other independent work meanwhile is more useful than waiting; it also suits one-shot triggers. ",
+                "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
+                "Keep work foregrounded when the next step needs its immediate result, and do not treat backgrounding as durable job execution.\n\n",
+                "When several subagents need the same context, first complete one context-loading subagent, then fork it into parallel branches. ",
+                "When work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
+                "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n",
+                "Current subagent depth: {depth}/{}."
+            ),
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
-            self.max_subagent_depth
+            self.max_subagent_depth,
+            depth = depth
         )
     }
 }
