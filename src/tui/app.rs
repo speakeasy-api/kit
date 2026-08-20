@@ -219,6 +219,14 @@ impl ToolCall {
     pub fn running_children(&self) -> usize {
         self.children.iter().filter(|child| child.running()).count()
     }
+
+    fn finish_running_children(&mut self) {
+        let ok = self.status != ToolCallStatus::Failed;
+        for child in self.children.iter_mut().filter(|child| child.running()) {
+            child.millis = Some(child.elapsed());
+            child.ok = ok;
+        }
+    }
 }
 
 /// One entry in the transcript.
@@ -704,6 +712,7 @@ impl App {
                         call.status = status;
                         if !call.running() {
                             call.finished = Some(Instant::now());
+                            call.finish_running_children();
                         }
                     }
                     was_running && !call.running() && call.backgrounded
@@ -1434,6 +1443,29 @@ mod tests {
         assert_eq!(call.children.len(), 1);
         assert_eq!(call.children[0].node, Some(0));
         assert_eq!(call.running_children(), 1);
+    }
+
+    #[test]
+    fn terminal_parent_finishes_children_missing_completion_events() {
+        let mut app = app();
+        compose(&mut app, "a = shell({ command: \"sleep 60\" })\nreturn a");
+        app.apply(Update::Runtime(child("call-1:compose:shell", "shell")));
+
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(ToolCallStatus::Failed),
+            script: None,
+            output: Vec::new(),
+            backgrounded: false,
+        });
+
+        let Some(Block::Tool(call)) = app.blocks.last() else {
+            panic!("expected a tool block");
+        };
+        assert_eq!(call.status, ToolCallStatus::Failed);
+        assert_eq!(call.running_children(), 0);
+        assert!(call.children[0].millis.is_some());
+        assert!(!call.children[0].ok);
     }
 
     #[test]
