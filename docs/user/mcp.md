@@ -4,7 +4,7 @@ Kit connects only to Model Context Protocol (MCP) servers in an explicit JSON fi
 
 ## MCP JSON configuration
 
-The top-level key is `mcpServers`; each key beneath it is the server name shown by `tool_search` and accepted by `auth`. The JSON schema is strict: unknown fields make the configuration invalid.
+The top-level key is `mcpServers`; each key beneath it is the server name shown by `tool_search` and accepted by `auth`. The JSON schema is strict: unknown fields make the configuration invalid. Kit validates and registers this configuration at startup, then reloads it before each `tool_search` and `auth` call so live sessions see added, changed, and removed servers without a restart. An invalid edit makes the current call fail but retains the last valid configuration so it becomes usable again when the file is repaired. Kit connects servers only when `tool_search` matches their configured name or description. Before connection, tool metadata is unavailable, so give every server a specific, capability-rich `description` containing terms an agent is likely to search for. Use the exact query `mcp` to initialize and list all configured servers.
 
 ```json
 {
@@ -42,7 +42,7 @@ mcp_config = "/path/to/mcp.json"
 
 ### Local stdio transport
 
-A stdio server requires a non-empty `command`. Optional fields are `args` (an array of strings), `env` (a string-to-string object), `cwd`, and `description`. Kit starts and connects configured stdio servers when the runtime starts; treat `command`, `args`, `cwd`, and environment values as executable configuration, and review the file before using it.
+A stdio server requires a non-empty `command`. Optional fields are `args` (an array of strings), `env` (a string-to-string object), `cwd`, and `description`. Kit starts and connects a configured stdio server only when a search matches its name or description, or when the exact query `mcp` initializes all servers. Treat `command`, `args`, `cwd`, and environment values as executable configuration, and review the file before using it.
 
 ### Remote Streamable HTTP transport
 
@@ -85,12 +85,12 @@ OAuth is available only for remote HTTP servers. Set `auth.type` to the exact va
 
 MCP tools are model-visible through three meta-tools rather than as an unrestricted static list. The expected workflow is:
 
-1. Call `tool_search({ query: "issues" })`. Use `tool_search({ query: "mcp" })` to list every configured server. Results are grouped by server and include the configured name, description, status, and matching tools.
+1. Call `tool_search({ query: "issues" })`. A match against the configured server name or description connects that server and returns its discovered tools. Use the exact query `tool_search({ query: "mcp" })` to initialize and list every configured server.
 2. If the selected server has status `authentication_required`, call `auth({ name: "projects" })` with its exact server name. Give the returned `url` to the user. While the flow is active, status is `pending`; the loopback browser callback expires after 10 minutes.
-3. After the user completes OAuth in the browser, call `tool_search` again so the connected server's tools appear.
+3. When the user completes OAuth, Kit stores the credentials, connects the server, and sends a notification to the originating ACP session. The agent resumes automatically and can search or call the newly available tools; no manual post-authentication search is required.
 4. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema.
 
-A connected server reports `authenticated`, including servers that do not need OAuth. If a server fails to connect during startup, Kit continues running and reports the server with status `error` and an `error` message in `tool_search`; the agent can relay that diagnostic to the user. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a server without OAuth reports `is not configured for OAuth`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
+A connected server reports `authenticated`, including servers that do not need OAuth. If lazy initialization fails, `tool_search` reports the server with status `error` and an `error` message; the agent can relay that diagnostic to the user. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a server without OAuth reports `is not configured for OAuth`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
 
 ## Interactive OAuth availability
 
@@ -135,7 +135,7 @@ credential_store = "file"
 credential_dir = "/path/to/private/credentials"
 ```
 
-Persistent stores restore OpenAI and MCP OAuth credentials when Kit starts and may refresh access tokens. Reuse the same backend, directory, and MCP server identity across commands. Concurrent Kit processes can race if an OAuth provider rotates refresh tokens.
+Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials when a matching search initializes the server; either path may refresh access tokens. Reuse the same backend, directory, and MCP server identity across commands. Kit serializes MCP token refreshes across processes that share a credential backend, and reloads credentials after taking the lock so rotating refresh tokens are not reused.
 
 ## Security guidance
 
@@ -152,15 +152,15 @@ Persistent stores restore OpenAI and MCP OAuth credentials when Kit starts and m
 - **`could not read MCP config ...`**: verify the `--mcp-config`/`mcp_config` path and file permissions. MCP configuration is never found automatically.
 - **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
-- **MCP server status `error`**: Kit tolerates startup connection failures and includes the per-server diagnostic in `tool_search`. Run a failing stdio command directly to check that it exists and speaks MCP over stdio; for HTTP, check DNS, HTTPS, proxy/firewall access, authentication settings, headers, and the endpoint URL. Initial connection timeout is 20 seconds.
+- **MCP server status `error`**: Kit tolerates lazy initialization failures and includes the per-server diagnostic in `tool_search`. Run a failing stdio command directly to check that it exists and speaks MCP over stdio; for HTTP, check DNS, HTTPS, proxy/firewall access, authentication settings, headers, and the endpoint URL. Lazy connection timeout is 20 seconds.
 
 ### OAuth and authentication errors
 
 - **`authentication_unavailable`**: use `kit tui`, `kit serve`, or `kit acp` to complete browser OAuth, or configure a persistent store containing credentials created earlier.
 - **`OAuth discovery failed` / `OAuth client registration failed`**: verify the server's OAuth metadata and whether it supports dynamic registration. If it requires a registered client, configure `clientId`.
 - **`could not bind OAuth callback`**: permit Kit to bind a loopback port. **`OAuth callback timed out`** means the browser flow was not completed within 10 minutes; call `auth` again.
-- **Authentication completed but tools are missing**: wait for the callback to finish, then call `tool_search` again. If authentication failed asynchronously, Kit writes `MCP authentication for <server> failed: ...` to stderr and returns the server to `authentication_required`.
-- **Stored credentials no longer work**: authenticate again in a long-lived runtime. Avoid using the same rotating refresh token from concurrent processes.
+- **Authentication completed but the agent did not resume**: wait for the callback to finish and keep the originating ACP session open. Kit sends that session a success or failure notification after the connection attempt; failures are also written as `MCP authentication for <server> failed: ...` on stderr. A manual `tool_search` can inspect current status but is not required for the normal flow.
+- **Stored credentials no longer work**: authenticate again in a long-lived runtime. Processes sharing a persistent backend serialize refreshes; if credentials were changed externally, restart or authenticate again.
 
 ### Credential-store errors
 

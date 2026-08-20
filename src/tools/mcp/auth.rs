@@ -46,6 +46,12 @@ pub async fn begin(
     credential_storage: &CredentialStorage,
     required_scope: Option<&str>,
 ) -> Result<PendingAuthorization, String> {
+    let migration_lock = credential_storage
+        .lock_refresh()
+        .await
+        .map_err(|error| format!("could not lock MCP credential migration: {error}"))?;
+    migrate_credentials(resource_url, config, credential_storage).await?;
+    drop(migration_lock);
     let mut manager = manager(resource_url, config, credential_storage).await?;
     let metadata = manager
         .resolve_metadata()
@@ -109,6 +115,11 @@ pub async fn restore(
     if !credential_storage.is_persistent() {
         return Ok(None);
     }
+    let _refresh_lock = credential_storage
+        .lock_refresh()
+        .await
+        .map_err(|error| format!("could not lock MCP credential refresh: {error}"))?;
+    migrate_credentials(resource_url, config, credential_storage).await?;
     let mut manager = manager(resource_url, config, credential_storage).await?;
     if !manager
         .initialize_from_store()
@@ -122,6 +133,20 @@ pub async fn restore(
         Err(AuthError::AuthorizationRequired) => Ok(None),
         Err(error) => Err(format!("could not restore OAuth access token: {error}")),
     }
+}
+
+pub async fn refresh(
+    manager: &mut AuthorizationManager,
+    credential_storage: &CredentialStorage,
+) -> Result<String, AuthError> {
+    let _refresh_lock = credential_storage.lock_refresh().await.map_err(|error| {
+        AuthError::InternalError(format!("could not lock MCP credential refresh: {error}"))
+    })?;
+    if !manager.initialize_from_store().await? {
+        return Err(AuthError::AuthorizationRequired);
+    }
+    manager.refresh_token().await?;
+    manager.get_access_token().await
 }
 
 async fn manager(
@@ -140,11 +165,34 @@ async fn manager(
     Ok(manager)
 }
 
-fn credential_identity(resource_url: &str, config: &Config) -> String {
+async fn migrate_credentials(
+    resource_url: &str,
+    config: &Config,
+    credential_storage: &CredentialStorage,
+) -> Result<(), String> {
+    super::credentials::migrate_legacy(
+        credential_storage,
+        &legacy_credential_identity(resource_url, config),
+        &credential_identity(resource_url, config),
+    )
+    .await
+    .map_err(|error| format!("could not migrate OAuth credentials: {error}"))
+}
+
+fn legacy_credential_identity(resource_url: &str, config: &Config) -> String {
     format!(
         "{resource_url}\0{}\0{}",
         config.client_id.as_deref().unwrap_or_default(),
         config.client_metadata_url.as_deref().unwrap_or_default()
+    )
+}
+
+fn credential_identity(resource_url: &str, config: &Config) -> String {
+    format!(
+        "{resource_url}\0{}\0{}\0{}",
+        config.client_id.as_deref().unwrap_or_default(),
+        config.client_metadata_url.as_deref().unwrap_or_default(),
+        serde_json::to_string(&config.scopes).expect("OAuth scopes encode as JSON")
     )
 }
 

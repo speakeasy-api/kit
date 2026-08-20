@@ -11,7 +11,7 @@ use agentkit_acp::{
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
 use agentkit_core::{
-    CancellationController, FinishReason, MetadataMap, SessionId as AgentkitSessionId,
+    CancellationController, FinishReason, Item, MetadataMap, SessionId as AgentkitSessionId,
 };
 use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
@@ -142,6 +142,7 @@ impl Server {
             "acp.additional_directories".into(),
             json!(request.additional_directories),
         );
+        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
         let binding = AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client)
             .cancellation(cancellation)
             .workspace(request.cwd.clone(), request.additional_directories.clone())
@@ -170,6 +171,7 @@ impl Server {
             catalog,
             commands: rx,
             turn_states,
+            mcp_events,
         };
 
         // Hold the map lock across the synchronous commit/publication boundary.
@@ -289,6 +291,7 @@ struct SessionActor<S: ModelSession> {
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
     turn_states: mpsc::UnboundedSender<TurnStateNotification>,
+    mcp_events: crate::tools::mcp::McpSubscription,
 }
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
@@ -302,6 +305,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         catalog,
         mut commands,
         turn_states,
+        mut mcp_events,
     } = actor;
     let mut binding = Some(binding);
     let mut next_autonomous_turn_id = 0_u64;
@@ -335,32 +339,39 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     break;
                 },
             },
+            event = mcp_events.recv() => {
+                if let Some(event) = event {
+                    let result = driver
+                        .submit_input(vec![Item::notification(event.message)])
+                        .map_err(|error| AcpRuntimeError::Loop(error.to_string()));
+                    let result = match result {
+                        Ok(()) => drive_unsolicited(
+                            &session_id,
+                            &integration,
+                            &mut driver,
+                            &turn_states,
+                            &mut next_autonomous_turn_id,
+                        ).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        eprintln!("autonomous MCP continuation failed for {session_id}: {error}");
+                    }
+                }
+            }
             // Task events remain queued while a prompt is being driven, so a
             // completion cannot be lost in the prompt-to-idle transition.
             event = tasks.next_event() => match event {
                 Some(TaskEvent::Completed(snapshot, _))
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background =>
                 {
-                    next_autonomous_turn_id = next_autonomous_turn_id.wrapping_add(1);
-                    let turn_id = next_autonomous_turn_id;
-                    let _ = turn_states.send(TurnStateNotification {
-                        session_id: session_id.clone(),
-                        turn_id,
-                        active: true,
-                        error: None,
-                    });
-                    let result = drive_autonomous(
+                    let result = drive_unsolicited(
                         &session_id,
                         &integration,
                         &mut driver,
+                        &turn_states,
+                        &mut next_autonomous_turn_id,
                     ).await;
-                    let error = result.as_ref().err().map(ToString::to_string);
-                    let _ = turn_states.send(TurnStateNotification {
-                        session_id: session_id.clone(),
-                        turn_id,
-                        active: false,
-                        error,
-                    });
                     if let Err(error) = result {
                         eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
                     }
@@ -461,6 +472,32 @@ async fn drive_prompt<S: ModelSession>(
     drive_until_pause(session_id, integration, driver, true)
         .await?
         .ok_or_else(|| AcpRuntimeError::Loop("prompt ended without a response".into()))
+}
+
+async fn drive_unsolicited<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    integration: &AcpIntegration,
+    driver: &mut LoopDriver<S>,
+    turn_states: &mpsc::UnboundedSender<TurnStateNotification>,
+    next_turn_id: &mut u64,
+) -> Result<(), AcpRuntimeError> {
+    *next_turn_id = next_turn_id.wrapping_add(1);
+    let turn_id = *next_turn_id;
+    let _ = turn_states.send(TurnStateNotification {
+        session_id: session_id.clone(),
+        turn_id,
+        active: true,
+        error: None,
+    });
+    let result = drive_autonomous(session_id, integration, driver).await;
+    let error = result.as_ref().err().map(ToString::to_string);
+    let _ = turn_states.send(TurnStateNotification {
+        session_id: session_id.clone(),
+        turn_id,
+        active: false,
+        error,
+    });
+    result
 }
 
 async fn drive_autonomous<S: ModelSession>(
@@ -756,11 +793,13 @@ mod tests {
     struct ScriptAdapter {
         turns: Arc<AtomicUsize>,
         user_items_seen: Arc<AtomicUsize>,
+        notification_items_seen: Arc<AtomicUsize>,
     }
 
     struct ScriptSession {
         turns: Arc<AtomicUsize>,
         user_items_seen: Arc<AtomicUsize>,
+        notification_items_seen: Arc<AtomicUsize>,
     }
 
     struct ScriptTurn {
@@ -800,6 +839,7 @@ mod tests {
             Ok(ScriptSession {
                 turns: Arc::clone(&self.turns),
                 user_items_seen: Arc::clone(&self.user_items_seen),
+                notification_items_seen: Arc::clone(&self.notification_items_seen),
             })
         }
     }
@@ -819,6 +859,14 @@ mod tests {
                     .transcript
                     .iter()
                     .filter(|item| item.kind == ItemKind::User)
+                    .count(),
+                Ordering::SeqCst,
+            );
+            self.notification_items_seen.store(
+                request
+                    .transcript
+                    .iter()
+                    .filter(|item| item.kind == ItemKind::Notification)
                     .count(),
                 Ordering::SeqCst,
             );
@@ -977,6 +1025,7 @@ mod tests {
     async fn completed_background_task_advances_actor_and_emits_unsolicited_update() {
         let turns = Arc::new(AtomicUsize::new(0));
         let user_items_seen = Arc::new(AtomicUsize::new(0));
+        let notification_items_seen = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(AtomicBool::new(false));
         let release = Arc::new(Notify::new());
         let integration = Arc::new(
@@ -1039,6 +1088,7 @@ mod tests {
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
                 user_items_seen: Arc::clone(&user_items_seen),
+                notification_items_seen: Arc::clone(&notification_items_seen),
             })
             .add_tool_source(tools)
             .task_manager(task_manager)
@@ -1051,6 +1101,8 @@ mod tests {
             .unwrap();
         let (commands_tx, commands_rx) = mpsc::channel(8);
         let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
+        let test_mcp = crate::tools::mcp::empty();
+        let mcp_events = test_mcp.subscribe(acp_session_id.to_string());
         let actor = tokio::spawn(session_actor(SessionActor {
             session_id: acp_session_id.clone(),
             integration: Arc::clone(&integration),
@@ -1062,6 +1114,7 @@ mod tests {
             catalog: Vec::new(),
             commands: commands_rx,
             turn_states: turn_states_tx,
+            mcp_events,
         }));
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1118,6 +1171,20 @@ mod tests {
             1,
             "autonomous progress must not insert synthetic user content"
         );
+
+        test_mcp.publish(
+            &acp_session_id.to_string(),
+            crate::tools::mcp::McpEvent {
+                message: "MCP server linear connected".into(),
+            },
+        );
+        let mcp_started = turn_states_rx.recv().await.expect("missing MCP turn start");
+        let mcp_ended = turn_states_rx.recv().await.expect("missing MCP turn end");
+        assert!(mcp_started.active);
+        assert!(!mcp_ended.active);
+        assert_eq!(turns.load(Ordering::SeqCst), 3);
+        assert_eq!(notification_items_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(user_items_seen.load(Ordering::SeqCst), 1);
 
         let (close_tx, close_rx) = oneshot::channel();
         commands_tx

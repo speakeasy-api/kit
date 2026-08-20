@@ -271,11 +271,16 @@ automatically:
 cargo run -- tui --root /path/to/project --mcp-config /path/to/mcp.json
 ```
 
-`tool_search` returns matches grouped by server. Protected remote servers remain
-searchable by their configured name and description, with status
-`authentication_required`. The agent calls `auth` only when needed and gives the
-returned URL to the user. Completing that browser flow updates the catalog in
-place; a later search returns the server's tools. Interactive OAuth is available in `tui`, `serve`, and `acp`, but not the
+Kit validates and registers MCP configuration at startup, reloads it before each
+`tool_search` and `auth` call, and connects servers lazily when search matches their
+configured name or description. Added, changed, and removed servers become visible
+to live sessions without a restart. Before
+connection, tool metadata is unavailable, so descriptions should include concrete
+capabilities and likely search terms. The exact query `mcp` initializes all servers.
+Protected remote servers report `authentication_required`; the agent calls `auth`
+only when needed and gives the returned URL to the user. Completing that browser
+flow updates the catalog and notifies the originating ACP session, which resumes
+automatically without requiring a manual follow-up search. Interactive OAuth is available in `tui`, `serve`, and `acp`, but not the
 one-shot `prompt` command.
 Static `bearerToken` and custom `headers` remain available for non-interactive
 HTTP servers.
@@ -417,10 +422,12 @@ kit tui --mcp-config mcp.json --credential-store file \
 ```
 
 The file backend creates a `0700` directory and `0600` credential files on
-Unix, rejects unsafe paths and permissions, and does not encrypt tokens. Persistent credentials are restored and
-refreshed when Kit starts, so `prompt` can use credentials created earlier by
-`tui` or `serve` without starting an interactive browser flow. Concurrent Kit
-processes can still race when a provider rotates a refresh token.
+Unix, rejects unsafe paths and permissions, and does not encrypt tokens. Persistent OpenAI credentials are restored when Kit starts. MCP credentials are
+restored and refreshed when a matching search initializes the server, so `prompt`
+can use credentials created earlier by
+`tui` or `serve` without starting an interactive browser flow. MCP refreshes are
+serialized across processes sharing that backend, with credentials reloaded only
+after the lock is held so rotating refresh tokens are not reused.
 
 ### Signing on macOS
 

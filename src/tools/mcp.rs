@@ -6,7 +6,10 @@ pub use crate::credentials::CredentialStorage;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -24,7 +27,7 @@ use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -79,7 +82,12 @@ struct Inner {
     pending: Mutex<BTreeMap<String, PendingRecord>>,
     oauth_managers: Mutex<BTreeMap<String, AuthorizationManager>>,
     credential_storage: CredentialStorage,
+    reload: Mutex<ReloadState>,
+    reload_flight: Arc<Semaphore>,
+    initialization: Mutex<()>,
     auth_setup: Mutex<()>,
+    event_routes: Arc<std::sync::Mutex<BTreeMap<String, (u64, mpsc::UnboundedSender<McpEvent>)>>>,
+    next_event_route: AtomicU64,
     interactive_oauth_enabled: bool,
 }
 
@@ -88,11 +96,24 @@ struct ServerRecord {
     description: String,
     url: Option<String>,
     oauth: Option<auth::Config>,
+    fingerprint: Vec<u8>,
     status: ServerStatus,
+}
+
+struct ReloadState {
+    path: Option<PathBuf>,
+    raw: Vec<u8>,
+    entries: BTreeMap<String, Vec<u8>>,
+}
+
+struct PreparedServer {
+    config: McpServerConfig,
+    record: ServerRecord,
 }
 
 #[derive(Clone)]
 enum ServerStatus {
+    Uninitialized,
     Connected,
     AuthenticationRequired,
     Pending,
@@ -102,6 +123,7 @@ enum ServerStatus {
 impl ServerStatus {
     const fn as_str(&self) -> &'static str {
         match self {
+            Self::Uninitialized => "available",
             Self::Connected => "authenticated",
             Self::AuthenticationRequired => "authentication_required",
             Self::Pending => "pending",
@@ -114,6 +136,38 @@ impl ServerStatus {
 struct PendingRecord {
     url: String,
     expires: Instant,
+    fingerprint: Vec<u8>,
+    abort: tokio::task::AbortHandle,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct McpEvent {
+    pub message: String,
+}
+
+pub(crate) struct McpSubscription {
+    session_id: String,
+    generation: u64,
+    routes: Arc<std::sync::Mutex<BTreeMap<String, (u64, mpsc::UnboundedSender<McpEvent>)>>>,
+    receiver: mpsc::UnboundedReceiver<McpEvent>,
+}
+
+impl McpSubscription {
+    pub(crate) async fn recv(&mut self) -> Option<McpEvent> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for McpSubscription {
+    fn drop(&mut self) {
+        if let Ok(mut routes) = self.routes.lock()
+            && routes
+                .get(&self.session_id)
+                .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            routes.remove(&self.session_id);
+        }
+    }
 }
 
 struct AuthRecorder {
@@ -155,6 +209,102 @@ fn challenge_requires_interactive_authorization(challenge: &MetadataMap) -> bool
         || challenge.get("insufficient_scope").and_then(Value::as_bool) == Some(true)
 }
 
+fn prepare_config(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(BTreeMap<String, PreparedServer>, BTreeMap<String, Vec<u8>>), String> {
+    let config: Config = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
+    let raw_entries = value
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .expect("strict Config parsing guarantees an mcpServers object");
+    let entries = raw_entries
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                serde_json::to_vec(value).expect("JSON re-encodes"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut prepared = BTreeMap::new();
+    for (id, server) in config.mcp_servers {
+        if id.trim().is_empty() {
+            return Err("MCP server names must not be empty".into());
+        }
+        let fingerprint = entries[&id].clone();
+        let (binding, record) = prepare_server(&id, server, fingerprint)?;
+        prepared.insert(
+            id.clone(),
+            PreparedServer {
+                config: McpServerConfig::new(id, binding),
+                record,
+            },
+        );
+    }
+    Ok((prepared, entries))
+}
+
+fn prepare_server(
+    id: &str,
+    server: Server,
+    fingerprint: Vec<u8>,
+) -> Result<(McpTransportBinding, ServerRecord), String> {
+    match server {
+        Server::Stdio(server) => {
+            if server.command.trim().is_empty() {
+                return Err(format!("MCP server {id} has an empty command"));
+            }
+            let mut transport = StdioTransportConfig::new(server.command);
+            transport.args = server.args;
+            transport.env = server.env.into_iter().collect();
+            transport.cwd = server.cwd;
+            Ok((
+                McpTransportBinding::Stdio(transport),
+                ServerRecord {
+                    description: server.description.unwrap_or_else(|| id.to_string()),
+                    url: None,
+                    oauth: None,
+                    fingerprint,
+                    status: ServerStatus::Uninitialized,
+                },
+            ))
+        }
+        Server::Http(server) => {
+            if server.url.trim().is_empty() {
+                return Err(format!("MCP server {id} has an empty URL"));
+            }
+            if server.auth.is_some() && server.bearer_token.is_some() {
+                return Err(format!(
+                    "MCP server {id} cannot use both OAuth and bearerToken"
+                ));
+            }
+            let mut transport = StreamableHttpTransportConfig::new(server.url.clone());
+            if let Some(token) = server.bearer_token {
+                transport = transport.with_bearer_token(token);
+            }
+            for (name, value) in server.headers {
+                transport = transport
+                    .with_header(name.as_str(), value.as_str())
+                    .map_err(|error| format!("invalid MCP config for {id}: {error}"))?;
+            }
+            Ok((
+                McpTransportBinding::StreamableHttp(transport),
+                ServerRecord {
+                    description: server.description.unwrap_or_else(|| id.to_string()),
+                    url: Some(server.url),
+                    oauth: server.auth,
+                    fingerprint,
+                    status: ServerStatus::Uninitialized,
+                },
+            ))
+        }
+    }
+}
+
 pub async fn connect(
     path: &Path,
     interactive_oauth_enabled: bool,
@@ -163,78 +313,15 @@ pub async fn connect(
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|error| format!("could not read MCP config {}: {error}", path.display()))?;
-    let config: Config = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
+    let (prepared, entries) = prepare_config(&bytes, path)?;
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let mut manager = McpServerManager::new();
     let mut records = BTreeMap::new();
-    let mut eager = Vec::new();
-    let mut persistent_oauth = Vec::new();
 
-    for (id, server) in config.mcp_servers {
-        if id.trim().is_empty() {
-            return Err("MCP server names must not be empty".into());
-        }
-        let (binding, record) = match server {
-            Server::Stdio(server) => {
-                if server.command.trim().is_empty() {
-                    return Err(format!("MCP server {id} has an empty command"));
-                }
-                let mut transport = StdioTransportConfig::new(server.command);
-                transport.args = server.args;
-                transport.env = server.env.into_iter().collect();
-                transport.cwd = server.cwd;
-                eager.push(id.clone());
-                (
-                    McpTransportBinding::Stdio(transport),
-                    ServerRecord {
-                        description: server.description.unwrap_or_else(|| id.clone()),
-                        url: None,
-                        oauth: None,
-                        status: ServerStatus::Connected,
-                    },
-                )
-            }
-            Server::Http(server) => {
-                if server.url.trim().is_empty() {
-                    return Err(format!("MCP server {id} has an empty URL"));
-                }
-                if server.auth.is_some() && server.bearer_token.is_some() {
-                    return Err(format!(
-                        "MCP server {id} cannot use both OAuth and bearerToken"
-                    ));
-                }
-                let mut transport = StreamableHttpTransportConfig::new(server.url.clone());
-                if let Some(token) = server.bearer_token {
-                    transport = transport.with_bearer_token(token);
-                }
-                for (name, value) in server.headers {
-                    transport = transport
-                        .with_header(name.as_str(), value.as_str())
-                        .map_err(|error| format!("invalid MCP config for {id}: {error}"))?;
-                }
-                let status = if let Some(oauth) = &server.auth {
-                    if credential_storage.is_persistent() {
-                        persistent_oauth.push((id.clone(), server.url.clone(), oauth.clone()));
-                    }
-                    ServerStatus::AuthenticationRequired
-                } else {
-                    eager.push(id.clone());
-                    ServerStatus::Connected
-                };
-                (
-                    McpTransportBinding::StreamableHttp(transport),
-                    ServerRecord {
-                        description: server.description.unwrap_or_else(|| id.clone()),
-                        url: Some(server.url),
-                        oauth: server.auth,
-                        status,
-                    },
-                )
-            }
-        };
+    for (id, server) in prepared {
+        let PreparedServer { config, record } = server;
         manager.register_server_with_options(
-            McpServerConfig::new(id.clone(), binding),
+            config,
             McpServerOptions::new().with_timeout(CONNECT_TIMEOUT),
         );
         records.insert(id, record);
@@ -247,68 +334,17 @@ pub async fn connect(
             servers: Arc::clone(&servers),
         },
     )));
-    for id in eager {
-        if let Err(error) = manager.connect_server(&McpServerId::new(&id)).await
-            && let Some(record) = servers.write().await.get_mut(&id)
-        {
-            record.status =
-                ServerStatus::Error(format!("could not connect MCP server {id}: {error}"));
-        }
-    }
-    let mut oauth_managers = BTreeMap::new();
-    for (id, url, oauth) in persistent_oauth {
-        let restored = match auth::restore(&url, &oauth, &credential_storage).await {
-            Ok(restored) => restored,
-            Err(error) => {
-                if let Some(record) = servers.write().await.get_mut(&id) {
-                    record.status = ServerStatus::Error(error);
-                }
-                continue;
-            }
-        };
-        let Some((token, oauth_manager)) = restored else {
-            continue;
-        };
-        let request = connect_auth_request(&id);
-        let mut credentials = MetadataMap::new();
-        credentials.insert("access_token".into(), Value::String(token));
-        if let Err(error) = manager
-            .resolve_auth(AuthResolution::provided(request, credentials))
-            .await
-        {
-            if let Some(record) = servers.write().await.get_mut(&id) {
-                record.status = ServerStatus::Error(format!(
-                    "could not restore MCP credentials for {id}: {error}"
-                ));
-            }
-            continue;
-        }
-        match manager.connect_server(&McpServerId::new(&id)).await {
-            Ok(_) => {
-                if let Some(record) = servers.write().await.get_mut(&id) {
-                    record.status = ServerStatus::Connected;
-                }
-            }
-            Err(McpError::AuthRequired(request)) => {
-                challenges.lock().await.insert(id.clone(), *request);
-            }
-            Err(error) => {
-                if let Some(record) = servers.write().await.get_mut(&id) {
-                    record.status = ServerStatus::Error(format!(
-                        "could not connect MCP server {id} with stored credentials: {error}"
-                    ));
-                }
-                continue;
-            }
-        }
-        oauth_managers.insert(id, oauth_manager);
-    }
     Ok(McpRuntime::new(
         manager,
         servers,
         challenges,
-        oauth_managers,
+        BTreeMap::new(),
         credential_storage,
+        ReloadState {
+            path: Some(path.to_path_buf()),
+            raw: bytes,
+            entries,
+        },
         interactive_oauth_enabled,
     ))
 }
@@ -320,6 +356,7 @@ impl McpRuntime {
         challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
         oauth_managers: BTreeMap<String, AuthorizationManager>,
         credential_storage: CredentialStorage,
+        reload: ReloadState,
         interactive_oauth_enabled: bool,
     ) -> Self {
         let catalog = manager.source();
@@ -332,7 +369,12 @@ impl McpRuntime {
                 pending: Mutex::new(BTreeMap::new()),
                 oauth_managers: Mutex::new(oauth_managers),
                 credential_storage,
+                reload: Mutex::new(reload),
+                reload_flight: Arc::new(Semaphore::new(1)),
+                initialization: Mutex::new(()),
                 auth_setup: Mutex::new(()),
+                event_routes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                next_event_route: AtomicU64::new(0),
                 interactive_oauth_enabled,
             }),
         }
@@ -342,11 +384,252 @@ impl McpRuntime {
         self.inner.catalog.clone()
     }
 
+    pub(crate) fn subscribe(&self, session_id: String) -> McpSubscription {
+        let generation = self.inner.next_event_route.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.inner
+            .event_routes
+            .lock()
+            .expect("MCP event routes are poisoned")
+            .insert(session_id.clone(), (generation, sender));
+        McpSubscription {
+            session_id,
+            generation,
+            routes: Arc::clone(&self.inner.event_routes),
+            receiver,
+        }
+    }
+
+    fn event_generation(&self, session_id: &str) -> Option<u64> {
+        self.inner
+            .event_routes
+            .lock()
+            .ok()
+            .and_then(|routes| routes.get(session_id).map(|(generation, _)| *generation))
+    }
+
+    fn publish_to(&self, session_id: &str, generation: Option<u64>, event: McpEvent) {
+        let Some(generation) = generation else {
+            return;
+        };
+        let sender = self.inner.event_routes.lock().ok().and_then(|routes| {
+            routes
+                .get(session_id)
+                .and_then(|(current, sender)| (*current == generation).then(|| sender.clone()))
+        });
+        if let Some(sender) = sender {
+            let _ = sender.send(event);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish(&self, session_id: &str, event: McpEvent) {
+        self.publish_to(session_id, self.event_generation(session_id), event);
+    }
+
+    async fn reload_config(&self) -> Result<(), String> {
+        let permit = Arc::clone(&self.inner.reload_flight)
+            .acquire_owned()
+            .await
+            .map_err(|_| "MCP config reload coordinator closed".to_string())?;
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            runtime.reload_config_inner().await
+        })
+        .await
+        .map_err(|error| format!("MCP config reload task failed: {error}"))?
+    }
+
+    async fn reload_config_inner(&self) -> Result<(), String> {
+        let mut state = self.inner.reload.lock().await;
+        let _initialization = self.inner.initialization.lock().await;
+        let Some(path) = state.path.clone() else {
+            return Ok(());
+        };
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|error| format!("could not read MCP config {}: {error}", path.display()))?;
+        if bytes == state.raw {
+            return Ok(());
+        }
+
+        // Validate and prepare every transport before changing live state.
+        let (mut prepared, entries) = prepare_config(&bytes, &path)?;
+        let changed = state
+            .entries
+            .keys()
+            .chain(entries.keys())
+            .filter(|name| state.entries.get(*name) != entries.get(*name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if changed.is_empty() {
+            state.raw = bytes;
+            return Ok(());
+        }
+
+        {
+            let mut manager = self.inner.manager.lock().await;
+            for name in &changed {
+                let _ = manager.unregister_server(&McpServerId::new(name)).await;
+            }
+            for name in &changed {
+                if let Some(server) = prepared.get(name) {
+                    manager.register_server_with_options(
+                        server.config.clone(),
+                        McpServerOptions::new().with_timeout(CONNECT_TIMEOUT),
+                    );
+                }
+            }
+        }
+        {
+            let mut servers = self.inner.servers.write().await;
+            for name in &changed {
+                servers.remove(name);
+                if let Some(server) = prepared.remove(name) {
+                    servers.insert(name.clone(), server.record);
+                }
+            }
+        }
+        {
+            let mut challenges = self.inner.challenges.lock().await;
+            let mut pending = self.inner.pending.lock().await;
+            let mut oauth_managers = self.inner.oauth_managers.lock().await;
+            for name in &changed {
+                challenges.remove(name);
+                if let Some(pending) = pending.remove(name) {
+                    pending.abort.abort();
+                }
+                oauth_managers.remove(name);
+            }
+        }
+        state.raw = bytes;
+        state.entries = entries;
+        Ok(())
+    }
+
+    async fn initialize_server(&self, name: &str) {
+        let _initialization = self.inner.initialization.lock().await;
+        let Some(record) = self.inner.servers.read().await.get(name).cloned() else {
+            return;
+        };
+        if !matches!(record.status, ServerStatus::Uninitialized) {
+            return;
+        }
+
+        if let (Some(resource_url), Some(oauth)) = (record.url, record.oauth) {
+            if !self.inner.credential_storage.is_persistent() {
+                self.set_status(name, ServerStatus::AuthenticationRequired)
+                    .await;
+                return;
+            }
+            let restored =
+                match auth::restore(&resource_url, &oauth, &self.inner.credential_storage).await {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        self.set_status(name, ServerStatus::Error(error)).await;
+                        return;
+                    }
+                };
+            let Some((token, oauth_manager)) = restored else {
+                self.set_status(name, ServerStatus::AuthenticationRequired)
+                    .await;
+                return;
+            };
+            let request = connect_auth_request(name);
+            let mut credentials = MetadataMap::new();
+            credentials.insert("access_token".into(), Value::String(token));
+            let result = {
+                let mut manager = self.inner.manager.lock().await;
+                match manager
+                    .resolve_auth(AuthResolution::provided(request, credentials))
+                    .await
+                {
+                    Ok(()) => manager.connect_server(&McpServerId::new(name)).await,
+                    Err(error) => {
+                        self.set_status(
+                            name,
+                            ServerStatus::Error(format!(
+                                "could not restore MCP credentials for {name}: {error}"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            };
+            self.inner
+                .oauth_managers
+                .lock()
+                .await
+                .insert(name.to_string(), oauth_manager);
+            match result {
+                Ok(_) => self.set_status(name, ServerStatus::Connected).await,
+                Err(McpError::AuthRequired(request)) => {
+                    self.inner
+                        .challenges
+                        .lock()
+                        .await
+                        .insert(name.to_string(), *request);
+                    self.set_status(name, ServerStatus::AuthenticationRequired)
+                        .await;
+                }
+                Err(error) => {
+                    self.set_status(
+                        name,
+                        ServerStatus::Error(format!(
+                            "could not connect MCP server {name} with stored credentials: {error}"
+                        )),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
+
+        let result = self
+            .inner
+            .manager
+            .lock()
+            .await
+            .connect_server(&McpServerId::new(name))
+            .await;
+        match result {
+            Ok(_) => self.set_status(name, ServerStatus::Connected).await,
+            Err(error) => {
+                self.set_status(
+                    name,
+                    ServerStatus::Error(format!("could not connect MCP server {name}: {error}")),
+                )
+                .await;
+            }
+        }
+    }
+
     async fn search(&self, query: &str) -> Result<Value, ToolError> {
         let prepared = PreparedQuery::new(query).ok_or_else(|| {
             ToolError::InvalidInput("query must contain a letter or number".into())
         })?;
-        let wildcard = prepared.0.normalized == "mcp";
+        self.reload_config().await.map_err(ToolError::Unavailable)?;
+        let wildcard = query == "mcp";
+        let configured = self.inner.servers.read().await.clone();
+        for (name, record) in &configured {
+            let server_spec = PreparedSpec::new(ToolSpec::new(
+                ToolName::new(name),
+                &record.description,
+                json!({"type":"object"}),
+            ));
+            if wildcard
+                || score_spec(
+                    &prepared,
+                    &server_spec,
+                    &vec![false; prepared.0.tokens.len()],
+                )
+                .is_some()
+            {
+                self.initialize_server(name).await;
+            }
+        }
         let records = self.inner.servers.read().await.clone();
         let manager = self.inner.manager.lock().await;
         let mut groups = Vec::new();
@@ -407,13 +690,16 @@ impl McpRuntime {
         Ok(json!({"servers": groups}))
     }
 
-    async fn authorize(&self, name: &str) -> Result<Value, ToolError> {
+    async fn authorize(&self, name: &str, session_id: String) -> Result<Value, ToolError> {
+        self.reload_config().await.map_err(ToolError::Unavailable)?;
         if !self.inner.interactive_oauth_enabled {
             return Err(ToolError::Unavailable(
                 "interactive MCP authentication requires the tui, serve, or acp command".into(),
             ));
         }
+        self.initialize_server(name).await;
         let _setup = self.inner.auth_setup.lock().await;
+        let _reload = self.inner.reload.lock().await;
         if let Some(pending) = self.inner.pending.lock().await.get(name).cloned() {
             let remaining = pending
                 .expires
@@ -441,7 +727,8 @@ impl McpRuntime {
             .url
             .ok_or_else(|| ToolError::InvalidInput(format!("MCP server {name} is not remote")))?;
 
-        let request = match self.inner.challenges.lock().await.get(name).cloned() {
+        let challenge = { self.inner.challenges.lock().await.get(name).cloned() };
+        let request = match challenge {
             Some(request) => request,
             None => {
                 let mut manager = self.inner.manager.lock().await;
@@ -473,9 +760,8 @@ impl McpRuntime {
             .and_then(Value::as_str)
             .map(str::to_string);
         if !challenge_requires_interactive_authorization(&request.challenge)
-            && let Some(manager) = self.inner.oauth_managers.lock().await.remove(name)
-            && manager.refresh_token().await.is_ok()
-            && let Ok(token) = manager.get_access_token().await
+            && let Some(mut manager) = self.inner.oauth_managers.lock().await.remove(name)
+            && let Ok(token) = auth::refresh(&mut manager, &self.inner.credential_storage).await
             && self
                 .apply_credentials(name, request.clone(), token)
                 .await
@@ -499,21 +785,36 @@ impl McpRuntime {
         .await
         .map_err(ToolError::Unavailable)?;
         let url = pending.url.clone();
+        self.set_status(name, ServerStatus::Pending).await;
+        let runtime = self.clone();
+        let server = name.to_string();
+        let fingerprint = record.fingerprint.clone();
+        let event_generation = self.event_generation(&session_id);
+        let (start, started) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if started.await.is_ok() {
+                runtime
+                    .complete_authorization(
+                        server,
+                        fingerprint,
+                        request,
+                        pending,
+                        session_id,
+                        event_generation,
+                    )
+                    .await;
+            }
+        });
         self.inner.pending.lock().await.insert(
             name.to_string(),
             PendingRecord {
                 url: url.clone(),
                 expires: Instant::now() + auth::FLOW_TIMEOUT,
+                fingerprint: record.fingerprint,
+                abort: task.abort_handle(),
             },
         );
-        self.set_status(name, ServerStatus::Pending).await;
-        let runtime = self.clone();
-        let server = name.to_string();
-        tokio::spawn(async move {
-            runtime
-                .complete_authorization(server, request, pending)
-                .await;
-        });
+        let _ = start.send(());
         Ok(json!({
             "server": name,
             "status": "pending",
@@ -525,16 +826,38 @@ impl McpRuntime {
     async fn complete_authorization(
         &self,
         server: String,
+        fingerprint: Vec<u8>,
         request: AuthRequest,
         pending: auth::PendingAuthorization,
+        session_id: String,
+        event_generation: Option<u64>,
     ) {
+        let finished = auth::finish(pending).await;
+        let _reload = self.inner.reload.lock().await;
+        let current = self
+            .inner
+            .servers
+            .read()
+            .await
+            .get(&server)
+            .is_some_and(|record| record.fingerprint == fingerprint);
+        if !current {
+            return;
+        }
         let result = async {
-            let (token, oauth_manager) = auth::finish(pending).await?;
+            let (token, oauth_manager) = finished?;
             self.apply_credentials(&server, request, token).await?;
             Ok::<_, String>(oauth_manager)
         }
         .await;
-        self.inner.pending.lock().await.remove(&server);
+        let mut pending = self.inner.pending.lock().await;
+        if pending
+            .get(&server)
+            .is_some_and(|record| record.fingerprint == fingerprint)
+        {
+            pending.remove(&server);
+        }
+        drop(pending);
         if result.is_ok() {
             self.inner.challenges.lock().await.remove(&server);
         }
@@ -553,9 +876,29 @@ impl McpRuntime {
                     .oauth_managers
                     .lock()
                     .await
-                    .insert(server, manager);
+                    .insert(server.clone(), manager);
+                self.publish_to(
+                    &session_id,
+                    event_generation,
+                    McpEvent {
+                        message: format!(
+                            "MCP server {server} connected. Its tools are available now; continue the task using tool_search and tool as needed."
+                        ),
+                    },
+                );
             }
-            Err(error) => eprintln!("MCP authentication for {server} failed: {error}"),
+            Err(error) => {
+                eprintln!("MCP authentication for {server} failed: {error}");
+                self.publish_to(
+                    &session_id,
+                    event_generation,
+                    McpEvent {
+                        message: format!(
+                            "MCP server {server} failed to connect after authentication: {error}"
+                        ),
+                    },
+                );
+            }
         }
     }
 
@@ -601,7 +944,7 @@ impl ToolSearch {
             runtime,
             spec: ToolSpec::new(
                 ToolName::new("tool_search"),
-                "Search configured MCP server names and discovered tool names. Results are grouped by server and include authentication status.",
+                "Reload the MCP config, then search configured server names and descriptions plus discovered tool names. Matching servers connect lazily; use `mcp` to initialize and list all servers. Before first connection, only the configured name and description are searchable.",
                 json!({"type":"object","properties":{"query":{"type":"string","description":"Capability, product, server, or tool keywords. Use `mcp` to list all configured servers."}},"required":["query"],"additionalProperties":false}),
             )
             .with_output_schema(json!({"type":"object","properties":{"servers":{"type":"array","items":{"type":"object"}}},"required":["servers"],"additionalProperties":false})),
@@ -648,7 +991,7 @@ impl AuthTool {
             runtime,
             spec: ToolSpec::new(
                 ToolName::new("auth"),
-                "Start OAuth for a configured remote MCP server. Return the URL to the user, then search again after they complete it.",
+                "Reload the MCP config and start OAuth for a configured remote server. Return the URL to the user. Browser completion connects the server and notifies the originating ACP session automatically.",
                 json!({"type":"object","properties":{"name":{"type":"string","description":"Exact server name returned by tool_search."}},"required":["name"],"additionalProperties":false}),
             )
             .with_output_schema(json!({"type":"object"})),
@@ -675,7 +1018,10 @@ impl Tool for AuthTool {
     ) -> Result<ToolResult, ToolError> {
         let input: AuthInput = serde_json::from_value(request.input)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-        let result = self.runtime.authorize(&input.name).await?;
+        let result = self
+            .runtime
+            .authorize(&input.name, request.session_id.to_string())
+            .await?;
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::structured(result),
@@ -802,6 +1148,11 @@ pub fn empty() -> McpRuntime {
         challenges,
         BTreeMap::new(),
         CredentialStorage::Memory,
+        ReloadState {
+            path: None,
+            raw: Vec::new(),
+            entries: BTreeMap::new(),
+        },
         true,
     )
 }
@@ -1118,12 +1469,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_and_auth_reload_servers_added_after_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"linear":{"url":"https://unused.invalid/mcp","description":"Issue tracking","auth":{"type":"oauth"}},"local":{"command":"kit-command-that-does-not-exist","description":"Local helper"}}}"#,
+        )
+        .unwrap();
+
+        let results = runtime.search("issue").await.unwrap();
+        assert_eq!(results["servers"][0]["name"], "linear");
+        assert_eq!(results["servers"][0]["status"], "authentication_required");
+        let error = runtime
+            .authorize("local", "session".into())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("MCP server local is not configured for OAuth"),
+            "added server should be found by auth lookup: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_reload_preserves_the_last_valid_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let valid = r#"{"mcpServers":{"linear":{"url":"https://unused.invalid/mcp","description":"Issue tracking","auth":{"type":"oauth"}}}}"#;
+        std::fs::write(&path, valid).unwrap();
+        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"replacement":{"command":"server","unknown":true}}}"#,
+        )
+        .unwrap();
+        let error = runtime.search("linear").await.unwrap_err();
+        assert!(error.to_string().contains("invalid MCP config"));
+
+        std::fs::write(&path, valid).unwrap();
+        let results = runtime.search("linear").await.unwrap();
+        assert_eq!(results["servers"][0]["name"], "linear");
+        assert_eq!(results["servers"][0]["status"], "authentication_required");
+    }
+
+    #[tokio::test]
+    async fn completion_events_are_routed_to_one_session() {
+        let runtime = super::empty();
+        let mut first = runtime.subscribe("first".into());
+        let mut second = runtime.subscribe("second".into());
+        runtime.publish_to(
+            "first",
+            runtime.event_generation("first"),
+            super::McpEvent {
+                message: "connected".into(),
+            },
+        );
+        assert_eq!(first.recv().await.unwrap().message, "connected");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), second.recv())
+                .await
+                .is_err()
+        );
+
+        let generation = runtime.event_generation("first");
+        drop(first);
+        let mut replacement = runtime.subscribe("first".into());
+        runtime.publish_to(
+            "first",
+            generation,
+            super::McpEvent {
+                message: "stale callback".into(),
+            },
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), replacement.recv())
+                .await
+                .is_err(),
+            "a stale callback reached a replacement session"
+        );
+    }
+
+    #[tokio::test]
     async fn remote_auth_failure_is_searchable_without_failing_startup() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
+        let mut server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             let bytes_read = stream.read(&mut request).await.unwrap();
@@ -1145,9 +1587,21 @@ mod tests {
 
         let runtime = super::connect(&path, true, CredentialStorage::Memory)
             .await
-            .expect("authentication failure should not prevent startup");
+            .expect("registration should not contact the server");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut server)
+                .await
+                .is_err(),
+            "MCP server was contacted during startup"
+        );
+        assert!(
+            runtime.search("calendar").await.unwrap()["servers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let results = runtime.search("remote").await.unwrap();
         server.await.unwrap();
-        let results = runtime.search("mcp").await.unwrap();
         assert_eq!(results["servers"][0]["name"], "remote");
         assert_eq!(results["servers"][0]["status"], "error");
         assert!(
@@ -1170,6 +1624,12 @@ mod tests {
         let runtime = super::connect(&path, true, CredentialStorage::Memory)
             .await
             .expect("connection failure should not prevent startup");
+        assert!(
+            runtime.search("MCP").await.unwrap()["servers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let results = runtime.search("mcp").await.unwrap();
         let broken = &results["servers"][0];
         assert_eq!(broken["name"], "broken");

@@ -67,7 +67,7 @@ The shared backend choices are:
 
 Interactive OAuth is available in `kit tui`, `kit serve`, and the stdio-only `kit acp` command. The one-shot `kit prompt` command can report `authentication_unavailable` or `interactive MCP authentication requires the tui, serve, or acp command`; it can still restore previously persisted credentials. An OAuth flow binds a loopback callback, expires after 10 minutes, and may report `OAuth callback timed out`.
 
-A typical login flow is to start a long-lived client, let the agent use `tool_search`, open the URL returned by `auth`, and search again after the browser callback completes:
+A typical login flow is to start a long-lived client, let the agent use `tool_search`, and open the URL returned by `auth`. After the browser callback completes, Kit connects the server and automatically resumes the originating ACP session:
 
 ```sh
 kit tui --root /path/to/project --mcp-config /path/to/mcp.json
@@ -82,7 +82,7 @@ The following are fixed runtime limits, not configurable policy controls:
 - Shell timeout: 120 seconds by default; accepted values are 1 through 3600 seconds. Timeout reports `shell command timed out`. Captured stdout and stderr are each limited to 4 MiB and end with `[output truncated]` when exceeded.
 - Subagents: nesting depth is two and at most 120 live subagent sessions are retained per main session. Errors include `subagent depth limit (2) reached` and `live subagent session limit (120) reached`. Reuse completed sessions or release unneeded ones with `close` instead of creating unbounded children.
 - ACP children: startup handshake and `session/fork` waits are 30 seconds. Cancellation allows 5 seconds to settle before Kit tears down the child. Captured ACP updates are limited to 64 updates and 64 KiB; the returned `updates.truncated` flag reports loss.
-- MCP: initial server connection uses a 20-second timeout. OAuth authorization expires after 10 minutes. `tool_search` returns at most a bounded set of matching tools per server; search with a more specific product or capability term.
+- MCP: lazy server initialization uses a 20-second connection timeout. OAuth authorization expires after 10 minutes. `tool_search` returns at most a bounded set of matching tools per server; search with a configured server name, capability-rich description, or specific product term. Use the exact query `mcp` to initialize all servers.
 - A2A outbound calls have no Kit request deadline, but remain interruptible. Inbound A2A requests must contain a text part or fail with `A2A request must contain a text part`.
 - Session IDs are 1–128 ASCII letters, digits, `-`, or `_`. A stale subagent value fails with `stale subagent generation ...`; always pass the latest returned value to `prompt` or `fork`. An uncertain failed subagent turn retires that child because it may already have changed durable state.
 
@@ -116,8 +116,8 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 ### MCP tools are missing or authentication fails
 
 1. Confirm an explicit MCP configuration was supplied; Kit does not auto-discover MCP server config.
-2. Search for `mcp` with `tool_search` and inspect exact statuses: `authenticated`, `authentication_required`, `authentication_unavailable`, `pending`, or `error`. An `error` result includes the server's startup diagnostic. Invoke only tool names returned by the search.
-3. For `authentication_required`, call `auth` with the exact server name in a `kit tui`, `kit serve`, or `kit acp` session, open its URL, complete the browser flow within 10 minutes, then search again.
+2. Search for the configured server name or description with `tool_search`; use the exact query `mcp` to initialize all servers. Inspect statuses: `authenticated`, `authentication_required`, `authentication_unavailable`, `pending`, or `error`. An `error` result includes the lazy-initialization diagnostic. Invoke only tool names returned by the search.
+3. For `authentication_required`, call `auth` with the exact server name in a `kit tui`, `kit serve`, or `kit acp` session, open its URL, and complete the browser flow within 10 minutes. Kit connects the server and resumes the originating ACP session automatically.
 4. For `authentication_unavailable`, use a long-lived command or configure persistent credentials there for later one-shot use.
 5. For file-store errors such as `OAuth credential directory must be a real directory, not a symlink`, `OAuth credential path must be a regular file`, or `OAuth credential file is accessible by other users`, correct ownership, path type, and permissions rather than weakening the checks.
 6. If a server has status `error`, relay its diagnostic to the user, test the configured stdio command or remote URL independently, and check the 20-second connection limit. Treat server diagnostics as potentially sensitive.

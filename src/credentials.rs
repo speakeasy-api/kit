@@ -3,7 +3,8 @@ use std::{
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use keyring::{Entry, Error as KeyringError};
@@ -12,8 +13,11 @@ use zeroize::Zeroizing;
 const KEYCHAIN_SERVICE: &str = "com.danielkov.kit.credentials";
 const MCP_KEYCHAIN_SERVICE: &str = "com.danielkov.kit.mcp.oauth";
 const OPENAI_KEYCHAIN_SERVICE: &str = "dev.kit.openai";
+const REFRESH_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 static MEMORY: LazyLock<Mutex<HashMap<String, Zeroizing<Vec<u8>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static MEMORY_REFRESH_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 #[derive(Clone, Debug, Default)]
 pub enum CredentialStorage {
@@ -41,6 +45,22 @@ impl CredentialStorage {
 
     pub(crate) fn is_persistent(&self) -> bool {
         !matches!(self, Self::Memory)
+    }
+
+    pub(crate) async fn lock_refresh(&self) -> Result<CredentialRefreshLock, CredentialStoreError> {
+        let path = match self {
+            Self::Memory => {
+                return Ok(CredentialRefreshLock {
+                    _file: None,
+                    _memory: Some(Arc::clone(&MEMORY_REFRESH_LOCK).lock_owned().await),
+                });
+            }
+            Self::Keychain => keychain_refresh_lock_path()?,
+            Self::Filesystem(directory) => directory.join(".refresh.lock"),
+        };
+        tokio::task::spawn_blocking(move || acquire_refresh_lock(&path))
+            .await
+            .map_err(|value| error(format!("credential refresh lock task failed: {value}")))?
     }
 
     pub fn cli_name(&self) -> &'static str {
@@ -122,6 +142,13 @@ impl CredentialEntry {
 }
 
 #[derive(Debug)]
+pub(crate) struct CredentialRefreshLock {
+    // Dropping either guard releases its process-wide or operating-system lock.
+    _file: Option<fs::File>,
+    _memory: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+#[derive(Debug)]
 pub(crate) struct CredentialStoreError(String);
 
 impl std::fmt::Display for CredentialStoreError {
@@ -131,6 +158,161 @@ impl std::fmt::Display for CredentialStoreError {
 }
 
 impl std::error::Error for CredentialStoreError {}
+
+fn keychain_refresh_lock_path() -> Result<PathBuf, CredentialStoreError> {
+    os_user_data_dir()
+        .map(|directory| directory.join(".kit-auth/mcp-oauth-refresh.lock"))
+        .ok_or_else(|| error("the OS user directory is unavailable for the OAuth refresh lock"))
+}
+
+#[cfg(unix)]
+fn os_user_data_dir() -> Option<PathBuf> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: all pointers refer to live writable storage for the duration of getpwuid_r.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: getpwuid_r initialized entry and pw_dir points into buffer.
+    let home = unsafe { CStr::from_ptr(entry.assume_init().pw_dir) };
+    (!home.to_bytes().is_empty())
+        .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())))
+}
+
+#[cfg(windows)]
+fn os_user_data_dir() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
+    };
+
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: SHGetKnownFolderPath initializes raw on success; CoTaskMemFree releases it.
+    let status =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, std::ptr::null_mut(), &mut raw) };
+    if status < 0 || raw.is_null() {
+        return None;
+    }
+    let mut length = 0;
+    // SAFETY: raw is a NUL-terminated string returned by SHGetKnownFolderPath.
+    while unsafe { *raw.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the preceding scan established this initialized UTF-16 slice.
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(raw, length)
+    }));
+    // SAFETY: raw was allocated by SHGetKnownFolderPath.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Some(path)
+}
+
+fn acquire_refresh_lock(path: &Path) -> Result<CredentialRefreshLock, CredentialStoreError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| error("credential refresh lock has no directory"))?;
+    prepare_directory(directory, true)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    set_private_mode(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself instead of following it.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path).map_err(|value| {
+        context(
+            &format!("could not open refresh lock {}", path.display()),
+            value,
+        )
+    })?;
+    let metadata = file.metadata().map_err(|value| {
+        context(
+            &format!("could not inspect refresh lock {}", path.display()),
+            value,
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(error(format!(
+            "OAuth refresh lock must be a regular file: {}",
+            path.display()
+        )));
+    }
+    check_private_file(path, &metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(error(format!(
+                "OAuth refresh lock is owned by another user: {}",
+                path.display()
+            )));
+        }
+    }
+    let deadline = Instant::now() + REFRESH_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(error(format!(
+                    "timed out waiting for OAuth refresh lock {}",
+                    path.display()
+                )));
+            }
+            Err(fs::TryLockError::Error(value)) => {
+                return Err(context(
+                    &format!("could not lock OAuth refresh {}", path.display()),
+                    value,
+                ));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path_metadata = fs::symlink_metadata(path).map_err(|value| {
+            context(
+                &format!("could not verify OAuth refresh lock {}", path.display()),
+                value,
+            )
+        })?;
+        if path_metadata.file_type().is_symlink()
+            || path_metadata.dev() != metadata.dev()
+            || path_metadata.ino() != metadata.ino()
+        {
+            return Err(error(format!(
+                "OAuth refresh lock path changed while locking: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(CredentialRefreshLock {
+        _file: Some(file),
+        _memory: None,
+    })
+}
 
 fn namespaced_key(namespace: &str, identity: &str) -> String {
     // Preserve the existing MCP file names while namespacing all other records.
@@ -286,6 +468,16 @@ fn prepare_directory(path: &Path, create: bool) -> Result<bool, CredentialStoreE
             path.display()
         )));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(error(format!(
+                "OAuth credential directory is owned by another user: {}",
+                path.display()
+            )));
+        }
+    }
     if create {
         make_directory_private(path)?;
     }
@@ -334,7 +526,9 @@ fn context(prefix: &str, value: impl std::fmt::Display) -> CredentialStoreError 
 
 #[cfg(test)]
 mod tests {
-    use super::CredentialStorage;
+    use std::{sync::mpsc, time::Duration};
+
+    use super::{CredentialStorage, acquire_refresh_lock};
 
     #[test]
     fn memory_is_shared_across_clones_and_namespaced() {
@@ -349,6 +543,47 @@ mod tests {
         assert!(other.load().unwrap().is_none());
         assert!(same.delete().unwrap());
         assert!(first.load().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keychain_refresh_lock_uses_the_os_account_home() {
+        let path = super::keychain_refresh_lock_path().unwrap();
+        assert!(path.starts_with(super::os_user_data_dir().unwrap()));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("mcp-oauth-refresh.lock")
+        );
+    }
+
+    #[test]
+    fn refresh_lock_serializes_independent_open_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".refresh.lock");
+        let first = acquire_refresh_lock(&path).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let second = acquire_refresh_lock(&path).unwrap();
+            sender.send(second).unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        let second = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(second);
+        thread.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_lock_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        let path = directory.path().join(".refresh.lock");
+        symlink(target, &path).unwrap();
+        assert!(acquire_refresh_lock(&path).is_err());
     }
 
     #[test]

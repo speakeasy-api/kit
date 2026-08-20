@@ -351,7 +351,7 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    /// Connects the explicitly configured MCP servers before the runtime is served.
+    /// Parses and registers explicitly configured MCP servers for lazy connection.
     pub async fn with_mcp_config(
         runtime: Arc<Self>,
         path: Option<&Path>,
@@ -383,6 +383,10 @@ impl Runtime {
             runtime.max_subagent_depth,
         );
         Ok(Arc::new(runtime))
+    }
+
+    pub(crate) fn subscribe_mcp(&self, session_id: String) -> crate::tools::mcp::McpSubscription {
+        self.mcp.subscribe(session_id)
     }
 
     pub const fn max_subagent_depth(&self) -> usize {

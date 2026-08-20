@@ -309,7 +309,7 @@ mod tests {
     const DOCUMENTS: &[Document<'_>] = &[
         Document {
             path: "docs/user/mcp.md",
-            content: "# MCP setup\n\nConnect configured servers.\n\n## OAuth failures\n\nIf authentication expires, call auth and open the returned URL.",
+            content: "# MCP setup\n\nThe config reloads before tool_search and auth. Servers connect lazily when tool_search matches their configured name or capability-rich description; use mcp to initialize all.\n\n## OAuth failures\n\nIf authentication expires, call auth and open the returned URL. The originating ACP session resumes when the callback completes.",
         },
         Document {
             path: "docs/user/sessions.md",

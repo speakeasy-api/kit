@@ -6,6 +6,28 @@ use crate::credentials::{CredentialEntry, CredentialStorage, CredentialStoreErro
 
 const NAMESPACE: &str = "mcp-oauth";
 
+pub(super) async fn migrate_legacy(
+    storage: &CredentialStorage,
+    legacy_identity: &str,
+    identity: &str,
+) -> Result<(), AuthError> {
+    if legacy_identity == identity {
+        return Ok(());
+    }
+    let legacy = storage.entry(NAMESPACE, legacy_identity);
+    let current = storage.entry(NAMESPACE, identity);
+    blocking(move || {
+        if let Some(bytes) = legacy.load()? {
+            if current.load()?.is_none() {
+                current.save(&bytes)?;
+            }
+            legacy.delete()?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 pub(super) fn configure(
     storage: &CredentialStorage,
     manager: &mut AuthorizationManager,
@@ -82,6 +104,25 @@ mod tests {
 
     use super::{McpCredentialStore, Source};
     use crate::credentials::CredentialStorage;
+
+    #[tokio::test]
+    async fn legacy_identity_migration_is_idempotent_and_preserves_current_credentials() {
+        let storage = CredentialStorage::Memory;
+        let legacy = storage.entry("mcp-oauth", "legacy-identity");
+        let current = storage.entry("mcp-oauth", "scoped-identity");
+        legacy.save(b"legacy").unwrap();
+        super::migrate_legacy(&storage, "legacy-identity", "scoped-identity")
+            .await
+            .unwrap();
+        assert_eq!(current.load().unwrap().unwrap().as_slice(), b"legacy");
+        assert!(legacy.load().unwrap().is_none());
+
+        current.save(b"current").unwrap();
+        super::migrate_legacy(&storage, "legacy-identity", "scoped-identity")
+            .await
+            .unwrap();
+        assert_eq!(current.load().unwrap().unwrap().as_slice(), b"current");
+    }
 
     #[tokio::test]
     async fn adapter_round_trips_through_shared_memory() {
