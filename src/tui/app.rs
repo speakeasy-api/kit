@@ -13,7 +13,7 @@ use std::ffi::OsStr;
 use std::process::{Command, Stdio};
 
 use agentkit_acp::{ToolCallStatus, ToolKind};
-use agentkit_core::{Item, ItemKind, Part, ToolOutput};
+use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -96,10 +96,31 @@ pub struct ModelDialog {
     pub save_defaults: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    Audio,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub path: PathBuf,
+    pub placeholder: String,
+    pub mime_type: &'static str,
+    pub kind: AttachmentKind,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmittedPrompt {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
 pub enum Action {
     None,
     Redraw,
-    Submit(String),
+    Submit(SubmittedPrompt),
     Compact(Option<String>),
     New(Option<String>),
     SelectModel {
@@ -261,6 +282,8 @@ pub struct App {
     pub session_id: Option<String>,
     pub blocks: Vec<Block>,
     pub editor: Editor,
+    pub attachments: Vec<Attachment>,
+    next_attachment: usize,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
     next_turn_id: u64,
@@ -444,6 +467,24 @@ fn is_compaction_summary(item: &Item) -> bool {
         == Some(true)
 }
 
+fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
+    let kind = match media.modality {
+        Modality::Image => "Image",
+        Modality::Audio => "Audio",
+        Modality::Video => "Video",
+        Modality::Binary => "Media",
+    };
+    match &media.data {
+        DataRef::Uri(uri) if safe_media_uri(uri) => format!("[{kind} #{index}]({uri})"),
+        _ => format!("[{kind} #{index}]"),
+    }
+}
+
+fn safe_media_uri(uri: &str) -> bool {
+    uri.len() <= 2_048
+        && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
+}
+
 fn persisted_output(output: &ToolOutput) -> Vec<String> {
     let text = match output {
         ToolOutput::Text(text) => text.clone(),
@@ -451,7 +492,30 @@ fn persisted_output(output: &ToolOutput) -> Vec<String> {
             serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
         }
         ToolOutput::Parts(parts) => {
-            serde_json::to_string_pretty(parts).unwrap_or_else(|_| format!("{} parts", parts.len()))
+            let mut next_media = 0;
+            let mut next_file = 0;
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(text.text.clone()),
+                    Part::Media(media) => {
+                        next_media += 1;
+                        Some(media_label(media, next_media))
+                    }
+                    Part::File(file) => {
+                        next_file += 1;
+                        Some(match &file.data {
+                            DataRef::Uri(uri) if safe_media_uri(uri) => {
+                                format!("[File #{}]({uri})", next_file)
+                            }
+                            _ => format!("[File #{}]", next_file),
+                        })
+                    }
+                    Part::Structured(value) => Some(value.value.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
         ToolOutput::Files(files) => format!("{} files", files.len()),
     };
@@ -470,6 +534,8 @@ impl App {
             session_id: None,
             blocks: Vec::new(),
             editor: Editor::default(),
+            attachments: Vec::new(),
+            next_attachment: 0,
             phase: Phase::Idle,
             turn_started: None,
             next_turn_id: 0,
@@ -515,15 +581,20 @@ impl App {
                 }
                 ItemKind::System | ItemKind::Developer | ItemKind::Context => continue,
                 ItemKind::User | ItemKind::Notification => {
+                    let mut next_media = 0;
                     let text = item
                         .parts
                         .iter()
                         .filter_map(|part| match part {
-                            Part::Text(text) => Some(text.text.as_str()),
+                            Part::Text(text) => Some(text.text.clone()),
+                            Part::Media(media) => {
+                                next_media += 1;
+                                Some(media_label(media, next_media))
+                            }
                             _ => None,
                         })
                         .collect::<Vec<_>>()
-                        .join("");
+                        .join("\n");
                     if !text.is_empty() {
                         if item.kind == ItemKind::User {
                             self.latest_agent_source.clear();
@@ -534,11 +605,17 @@ impl App {
                     }
                 }
                 ItemKind::Assistant => {
+                    let mut next_media = 0;
                     for part in &item.parts {
                         match part {
                             Part::Text(text) if !text.text.is_empty() => {
                                 self.latest_agent_source.push_str(&text.text);
                                 self.blocks.push(Block::Agent(text.text.clone()))
+                            }
+                            Part::Media(media) => {
+                                next_media += 1;
+                                self.blocks
+                                    .push(Block::Agent(media_label(media, next_media)));
                             }
                             Part::Reasoning(reasoning) if reasoning.summary.is_some() => {
                                 self.blocks.push(Block::Thought {
@@ -869,6 +946,7 @@ impl App {
     pub fn start_session(&mut self, session_id: String) {
         self.session_id = Some(session_id);
         self.blocks.clear();
+        self.clear_attachments();
         self.latest_agent_source.clear();
         self.phase = Phase::Idle;
         self.turn_started = None;
@@ -939,6 +1017,50 @@ impl App {
     pub fn scroll_to_bottom(&mut self) {
         self.follow = true;
         self.scroll = usize::MAX;
+    }
+
+    pub fn attach(
+        &mut self,
+        path: PathBuf,
+        mime_type: &'static str,
+        kind: AttachmentKind,
+        size: u64,
+    ) {
+        self.next_attachment += 1;
+        let label = match kind {
+            AttachmentKind::Image => "Image",
+            AttachmentKind::Audio => "Audio",
+        };
+        let placeholder = format!("[{label} #{}]", self.next_attachment);
+        if self
+            .editor
+            .text()
+            .chars()
+            .last()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            self.editor.insert_char(' ');
+        }
+        self.editor.insert_str(&placeholder);
+        self.attachments.push(Attachment {
+            path,
+            placeholder,
+            mime_type,
+            kind,
+            size,
+        });
+        self.toast(format!("attached {label} #{}", self.next_attachment));
+    }
+
+    pub fn clear_attachments(&mut self) {
+        self.attachments.clear();
+        self.next_attachment = 0;
+    }
+
+    pub fn prune_attachments(&mut self) {
+        let prompt = self.editor.text();
+        self.attachments
+            .retain(|attachment| prompt.contains(&attachment.placeholder));
     }
 
     /// Inserts pasted text into the prompt.
@@ -1141,7 +1263,15 @@ impl App {
                         }
                         Action::None
                     }
-                    Parsed::Prompt(prompt) => Action::Submit(prompt.to_string()),
+                    Parsed::Prompt(prompt) => Action::Submit(SubmittedPrompt {
+                        text: prompt.to_string(),
+                        attachments: self
+                            .attachments
+                            .iter()
+                            .filter(|attachment| prompt.contains(&attachment.placeholder))
+                            .cloned()
+                            .collect(),
+                    }),
                 };
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
@@ -1331,10 +1461,10 @@ mod tests {
     };
 
     use agentkit_acp::{ToolCallStatus, ToolKind};
-    use agentkit_core::{Item, ItemKind, MetadataMap};
+    use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    use super::{Action, App, Block, Phase, Update};
+    use super::{Action, App, AttachmentKind, Block, Phase, Update};
     use crate::{events::RuntimeEvent, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1430,6 +1560,54 @@ mod tests {
         assert!(
             matches!(app.blocks.first(), Some(Block::Notice(text)) if text == "context compacted")
         );
+    }
+
+    #[test]
+    fn restored_media_uses_safe_links_and_never_exposes_data_urls() {
+        let transcript = vec![
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("inspect these"),
+                    Part::Media(MediaPart::new(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::Uri("file:///tmp/image.png".into()),
+                    )),
+                    Part::Media(MediaPart::new(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::Uri("data:image/png;base64,c2VjcmV0".into()),
+                    )),
+                ],
+            ),
+            Item::new(
+                ItemKind::Assistant,
+                vec![
+                    Part::text("done"),
+                    Part::Media(MediaPart::new(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::Uri("https://example.com/result.png".into()),
+                    )),
+                ],
+            ),
+        ];
+        let mut app = app();
+
+        app.restore_transcript("session".into(), &transcript);
+
+        assert!(matches!(
+            &app.blocks[0],
+            Block::User(text)
+                if text == "inspect these\n[Image #1](file:///tmp/image.png)\n[Image #2]"
+                    && !text.contains("data:")
+        ));
+        assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "done"));
+        assert!(matches!(
+            &app.blocks[2],
+            Block::Agent(text) if text == "[Image #1](https://example.com/result.png)"
+        ));
     }
 
     #[test]
@@ -1613,6 +1791,41 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_attachment_placeholder_omits_it_from_submission() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.submit();
+        app.paste("describe without it");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+
+        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected the prompt to be sent");
+        };
+
+        assert!(prompt.attachments.is_empty());
+    }
+
+    #[test]
+    fn switching_sessions_clears_pending_attachments() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        app.start_session("fresh".into());
+
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
     fn a_return_after_a_pause_still_sends() {
         let mut app = app();
         app.paste("first line");
@@ -1620,7 +1833,7 @@ mod tests {
         let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
             panic!("expected the prompt to be sent");
         };
-        assert_eq!(prompt, "first line");
+        assert_eq!(prompt.text, "first line");
     }
 
     #[test]
@@ -1653,7 +1866,7 @@ mod tests {
         let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
             panic!("expected a model prompt");
         };
-        assert_eq!(prompt, "/newer keep this");
+        assert_eq!(prompt.text, "/newer keep this");
     }
 
     #[test]

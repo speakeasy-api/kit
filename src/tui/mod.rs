@@ -16,7 +16,7 @@ mod ui;
 mod wrap;
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -56,12 +56,15 @@ use crate::{
     tools::mcp::CredentialStorage,
 };
 
-use app::{Action, App, ModelChoice, Update};
+use app::{Action, App, Attachment, AttachmentKind, ModelChoice, SubmittedPrompt, Update};
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
 /// Terminal events applied per frame, so a paste lands in one redraw.
 const MAX_BURST: usize = 4_096;
+const MAX_ATTACHMENTS: usize = 8;
+const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// Output lines kept per tool call; the fold shows the count either way.
 const MAX_OUTPUT_LINES: usize = 5_000;
 /// How long the agent gets to answer the ACP handshake before the client gives
@@ -357,17 +360,22 @@ pub async fn run(
                             match action {
                                 Action::Quit => return Ok(()),
                                 Action::Submit(prompt) => {
-                                    let turn_id = app.push_user(prompt.clone());
+                                    let blocks = match prompt_blocks(&prompt) {
+                                        Ok(blocks) => blocks,
+                                        Err(error) => {
+                                            app.note(error);
+                                            continue;
+                                        }
+                                    };
+                                    let turn_id = app.push_user(prompt.text);
+                                    app.clear_attachments();
                                     let connection = connection.clone();
                                     let session = session_id.clone();
                                     let updates = updates_tx.clone();
                                     turn = Some(tokio::spawn(async move {
                                         let outcome = connection
                                             .send_request(agentkit_acp::PromptRequest::new(
-                                                session,
-                                                vec![ContentBlock::Text(
-                                                    agentkit_acp::TextContent::new(prompt),
-                                                )],
+                                                session, blocks,
                                             ))
                                             .block_task()
                                             .await;
@@ -678,11 +686,142 @@ fn handle(app: &mut App, event: Event) -> Action {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
-            app.paste(&text);
+            if let Some(attachments) = attachments_from_paste(&app.root, &text) {
+                app.prune_attachments();
+                let pending_bytes = app
+                    .attachments
+                    .iter()
+                    .chain(&attachments)
+                    .try_fold(0_u64, |total, attachment| {
+                        total.checked_add(attachment.size)
+                    });
+                if app.attachments.len() + attachments.len() > MAX_ATTACHMENTS {
+                    app.note(format!(
+                        "at most {MAX_ATTACHMENTS} attachments can be pending"
+                    ));
+                } else if pending_bytes.is_none_or(|total| total > MAX_TOTAL_ATTACHMENT_BYTES) {
+                    app.note("attachments exceed the 20 MiB total limit");
+                } else {
+                    for attachment in attachments {
+                        app.attach(
+                            attachment.path,
+                            attachment.mime_type,
+                            attachment.kind,
+                            attachment.size,
+                        );
+                    }
+                }
+            } else {
+                app.paste(&text);
+            }
             Action::None
         }
         _ => Action::None,
     }
+}
+
+fn attachments_from_paste(root: &Path, text: &str) -> Option<Vec<Attachment>> {
+    let direct = text.trim();
+    let candidates = if media_attachment(root, direct).is_some() {
+        vec![direct.to_string()]
+    } else {
+        shlex::split(direct)?
+    };
+    if candidates.is_empty() || candidates.len() > MAX_ATTACHMENTS {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .map(|candidate| media_attachment(root, &candidate))
+        .collect()
+}
+
+fn media_attachment(root: &Path, value: &str) -> Option<Attachment> {
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let path = path.canonicalize().ok()?;
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_ATTACHMENT_BYTES {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let (kind, mime_type) = match extension.as_str() {
+        "png" => (AttachmentKind::Image, "image/png"),
+        "jpg" | "jpeg" => (AttachmentKind::Image, "image/jpeg"),
+        "gif" => (AttachmentKind::Image, "image/gif"),
+        "webp" => (AttachmentKind::Image, "image/webp"),
+        "wav" => (AttachmentKind::Audio, "audio/wav"),
+        "mp3" => (AttachmentKind::Audio, "audio/mpeg"),
+        _ => return None,
+    };
+    Some(Attachment {
+        path,
+        placeholder: String::new(),
+        mime_type,
+        kind,
+        size: metadata.len(),
+    })
+}
+
+fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> {
+    let mut total = 0_u64;
+    let mut media = Vec::with_capacity(prompt.attachments.len());
+    for attachment in &prompt.attachments {
+        let bytes = std::fs::read(&attachment.path)
+            .map_err(|error| format!("could not read {}: {error}", attachment.path.display()))?;
+        if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "{} exceeds the 10 MiB limit",
+                attachment.path.display()
+            ));
+        }
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| "attachment size overflow".to_string())?;
+        if total > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err("attachments exceed the 20 MiB total limit".into());
+        }
+        media.push((attachment, bytes));
+    }
+
+    let mut model_text = prompt.text.clone();
+    for attachment in &prompt.attachments {
+        if !attachment.placeholder.is_empty()
+            && let Ok(uri) = url::Url::from_file_path(&attachment.path)
+        {
+            model_text = model_text.replace(
+                &attachment.placeholder,
+                &format!(
+                    "[{}]({uri})",
+                    attachment.placeholder.trim_matches(['[', ']'])
+                ),
+            );
+        }
+    }
+    let mut blocks = vec![ContentBlock::Text(agentkit_acp::TextContent::new(
+        model_text,
+    ))];
+    for (attachment, bytes) in media {
+        let data = STANDARD.encode(bytes);
+        blocks.push(match attachment.kind {
+            AttachmentKind::Image => {
+                let uri = url::Url::from_file_path(&attachment.path)
+                    .ok()
+                    .map(|uri| uri.to_string());
+                ContentBlock::Image(
+                    agentkit_acp::ImageContent::new(data, attachment.mime_type).uri(uri),
+                )
+            }
+            AttachmentKind::Audio => {
+                ContentBlock::Audio(agentkit_acp::AudioContent::new(data, attachment.mime_type))
+            }
+        });
+    }
+    Ok(blocks)
 }
 
 fn enter() -> std::io::Result<DefaultTerminal> {
@@ -786,7 +925,7 @@ fn durable_session_id(session_id: &agentkit_acp::SessionId) -> Result<String, St
 /// Maps one ACP session notification onto client updates.
 fn translate(notification: SessionNotification) -> Vec<Update> {
     match notification.update {
-        SessionUpdate::AgentMessageChunk(chunk) => text_of(chunk.content)
+        SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
             .map(Update::Text)
             .into_iter()
             .collect(),
@@ -834,6 +973,29 @@ fn text_of(content: ContentBlock) -> Option<String> {
     }
 }
 
+fn message_of(content: ContentBlock) -> Option<String> {
+    match content {
+        ContentBlock::Text(text) => Some(text.text),
+        ContentBlock::Image(image) => Some(
+            image
+                .uri
+                .filter(|uri| safe_media_uri(uri))
+                .map_or_else(|| "[Image]".to_string(), |uri| format!("[Image]({uri})")),
+        ),
+        ContentBlock::Audio(_) => Some("[Audio]".into()),
+        ContentBlock::ResourceLink(link) => {
+            safe_media_uri(link.uri.as_ref()).then(|| format!("[{}]({})", link.name, link.uri))
+        }
+        ContentBlock::Resource(_) => Some("[Media resource]".into()),
+        _ => None,
+    }
+}
+
+fn safe_media_uri(uri: &str) -> bool {
+    uri.len() <= 2_048
+        && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
+}
+
 /// The Runlet program inside a `compose` call's input, when there is one.
 fn script_of(input: &Value) -> Option<String> {
     input
@@ -848,7 +1010,7 @@ fn output_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
     for entry in content.unwrap_or_default() {
         match entry {
             ToolCallContent::Content(content) => {
-                if let Some(text) = text_of(content.content.clone()) {
+                if let Some(text) = message_of(content.content.clone()) {
                     output.extend(readable(&text));
                 }
             }
@@ -886,12 +1048,176 @@ fn readable(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use agentkit_acp::{SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption};
+    use std::path::PathBuf;
+
+    use agentkit_acp::{
+        ContentBlock, SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption,
+    };
+    use crossterm::event::Event;
 
     use super::{
-        ModelChoice, current_model_choice, durable_session_id, osc52, readable,
+        MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
+        durable_session_id, handle, message_of, osc52, prompt_blocks, readable,
         save_model_defaults_to,
     };
+    use crate::tui::app::{App, SubmittedPrompt};
+
+    #[test]
+    fn dropped_shell_escaped_image_path_becomes_an_attachment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Screenshot 2026.png");
+        std::fs::write(&path, b"png").unwrap();
+        let pasted = path.display().to_string().replace(' ', "\\ ");
+
+        let attachments = attachments_from_paste(directory.path(), &pasted).unwrap();
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].path, path.canonicalize().unwrap());
+        assert_eq!(attachments[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn multiple_dropped_paths_become_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first image.png");
+        let second = directory.path().join("second.mp3");
+        std::fs::write(&first, b"png").unwrap();
+        std::fs::write(&second, b"mp3").unwrap();
+        let pasted = format!("\"{}\" \"{}\"", first.display(), second.display());
+
+        let attachments = attachments_from_paste(directory.path(), &pasted).unwrap();
+
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(attachments[1].mime_type, "audio/mpeg");
+    }
+
+    #[test]
+    fn mixed_text_and_path_remains_ordinary_paste() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+
+        assert!(
+            attachments_from_paste(directory.path(), &format!("describe {}", path.display()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_attachment_limit_applies_across_pastes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut app = App::new(
+            directory.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+
+        for _ in 0..MAX_ATTACHMENTS {
+            handle(&mut app, Event::Paste(path.display().to_string()));
+        }
+        handle(&mut app, Event::Paste(path.display().to_string()));
+
+        assert_eq!(app.attachments.len(), MAX_ATTACHMENTS);
+    }
+
+    #[test]
+    fn image_attachment_is_resolved_into_an_acp_prompt_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut attachment = attachments_from_paste(directory.path(), path.to_str().unwrap())
+            .unwrap()
+            .remove(0);
+        attachment.placeholder = "[Image #1]".into();
+        let prompt = SubmittedPrompt {
+            text: "describe [Image #1]".into(),
+            attachments: vec![attachment],
+        };
+
+        let blocks = prompt_blocks(&prompt).unwrap();
+
+        let agentkit_acp::ContentBlock::Text(text) = &blocks[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.text.starts_with("describe [Image #1](file://"));
+        let agentkit_acp::ContentBlock::Image(image) = &blocks[1] else {
+            panic!("expected image block");
+        };
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.data, "cG5n");
+        assert!(
+            image
+                .uri
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("file://"))
+        );
+    }
+
+    #[test]
+    fn audio_attachment_is_resolved_into_an_acp_prompt_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.wav");
+        std::fs::write(&path, b"wav").unwrap();
+        let mut attachment = attachments_from_paste(directory.path(), path.to_str().unwrap())
+            .unwrap()
+            .remove(0);
+        attachment.placeholder = "[Audio #1]".into();
+
+        let blocks = prompt_blocks(&SubmittedPrompt {
+            text: "transcribe [Audio #1]".into(),
+            attachments: vec![attachment],
+        })
+        .unwrap();
+
+        let ContentBlock::Audio(audio) = &blocks[1] else {
+            panic!("expected audio block");
+        };
+        assert_eq!(audio.mime_type, "audio/wav");
+        assert_eq!(audio.data, "d2F2");
+    }
+
+    #[test]
+    fn prompt_rechecks_actual_total_attachment_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut attachments = Vec::new();
+        for index in 0..3 {
+            let path = directory.path().join(format!("{index}.png"));
+            std::fs::write(&path, b"small").unwrap();
+            let mut attachment = attachments_from_paste(directory.path(), path.to_str().unwrap())
+                .unwrap()
+                .remove(0);
+            attachment.placeholder = format!("[Image #{}]", index + 1);
+            attachments.push(attachment);
+            std::fs::write(path, vec![0_u8; 8 * 1024 * 1024]).unwrap();
+        }
+
+        let error = prompt_blocks(&SubmittedPrompt {
+            text: "images".into(),
+            attachments,
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "attachments exceed the 20 MiB total limit");
+    }
+
+    #[test]
+    fn rendered_image_never_exposes_a_data_url() {
+        let content = ContentBlock::Image(
+            agentkit_acp::ImageContent::new("c2VjcmV0", "image/png")
+                .uri(Some("data:image/png;base64,c2VjcmV0".into())),
+        );
+
+        assert_eq!(message_of(content).as_deref(), Some("[Image]"));
+    }
+
+    #[test]
+    fn ordinary_paste_is_not_treated_as_an_attachment() {
+        assert!(attachments_from_paste(PathBuf::from(".").as_path(), "hello world").is_none());
+    }
 
     #[test]
     fn saves_defaults_by_parsing_and_reserializing_valid_toml() {

@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.53"
+version = "0.1.54"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -45,6 +45,7 @@ rmcp = { version = "=3.1.4", default-features = false, features = ["auth", "clie
 runlet = "=0.3.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+shlex = "=2.0.1"
 sha2 = "=0.11.0"
 subtle = "=2.6.1"
 toml = "=1.1.4"

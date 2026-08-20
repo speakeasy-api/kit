@@ -3,7 +3,9 @@ use std::{
     time::Duration,
 };
 
-use agentkit_core::{Part, ToolOutput, TurnCancellation, Usage};
+use agentkit_core::{
+    DataRef, Delta, Modality, Part, PartId, PartKind, ToolOutput, TurnCancellation, Usage,
+};
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
@@ -392,6 +394,8 @@ impl ModelSession for KitSession {
                 .map(|inner| OpenRouterKitTurn {
                     inner,
                     context_window: session.context_window,
+                    media_part: None,
+                    next_media: 0,
                 })
                 .map(KitTurn::OpenRouter),
         }
@@ -420,6 +424,8 @@ pub enum KitTurn {
 pub struct OpenRouterKitTurn {
     inner: OpenRouterTurn,
     context_window: Option<u64>,
+    media_part: Option<PartId>,
+    next_media: usize,
 }
 
 #[async_trait]
@@ -432,6 +438,9 @@ impl ModelTurn for KitTurn {
             Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await,
             Self::OpenRouter(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await?;
+                if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
+                    rewrite_openrouter_media(delta, &mut turn.media_part, &mut turn.next_media);
+                }
                 if let Some(context_window) = turn.context_window {
                     match &mut event {
                         Some(ModelTurnEvent::Usage(usage)) => {
@@ -454,6 +463,51 @@ impl ModelTurn for KitTurn {
             }
         }
     }
+}
+
+fn rewrite_openrouter_media(
+    delta: &mut Delta,
+    media_part: &mut Option<PartId>,
+    next_media: &mut usize,
+) {
+    match delta {
+        Delta::BeginPart { part_id, kind } if *kind == PartKind::Media => {
+            *media_part = Some(part_id.clone());
+            *kind = PartKind::Text;
+        }
+        Delta::CommitPart {
+            part: Part::Media(media),
+        } => {
+            *next_media += 1;
+            let label = media_label(media, *next_media);
+            let part_id = media_part
+                .take()
+                .unwrap_or_else(|| PartId::new(format!("media-{next_media}")));
+            *delta = Delta::AppendText {
+                part_id,
+                chunk: label,
+            };
+        }
+        _ => {}
+    }
+}
+
+fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
+    let kind = match media.modality {
+        Modality::Image => "Image",
+        Modality::Audio => "Audio",
+        Modality::Video => "Video",
+        Modality::Binary => "Media",
+    };
+    match &media.data {
+        DataRef::Uri(uri) if safe_media_uri(uri) => format!("[{kind} #{index}]({uri})"),
+        _ => format!("[{kind} #{index}]"),
+    }
+}
+
+fn safe_media_uri(uri: &str) -> bool {
+    uri.len() <= 2_048
+        && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
 }
 
 fn add_context_window(usage: &mut Usage, context_window: u64) {
@@ -631,8 +685,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agentkit_core::{
-        Item, ItemKind, MetadataMap, Part, SessionId, TokenUsage, ToolCallId, ToolOutput,
-        ToolResultPart, TurnId, Usage,
+        DataRef, Delta, Item, ItemKind, MediaPart, MetadataMap, Modality, Part, PartId, PartKind,
+        SessionId, TokenUsage, ToolCallId, ToolOutput, ToolResultPart, TurnId, Usage,
     };
     use agentkit_loop::{LoopError, ModelAdapter, ModelSession, SessionConfig, TurnRequest};
     use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
@@ -641,8 +695,62 @@ mod tests {
     use super::{
         KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterKitSession, ProviderKind,
         SelectableAdapter, SelectableSession, add_context_window, catalog_models_url,
-        expose_background_call_ids, models_url, parse_context_window,
+        expose_background_call_ids, models_url, parse_context_window, rewrite_openrouter_media,
     };
+
+    #[test]
+    fn openrouter_media_delta_becomes_a_portable_placeholder() {
+        let part_id = PartId::new("generated-image");
+        let mut active = None;
+        let mut next = 0;
+        let mut begin = Delta::BeginPart {
+            part_id: part_id.clone(),
+            kind: PartKind::Media,
+        };
+        rewrite_openrouter_media(&mut begin, &mut active, &mut next);
+        assert!(matches!(
+            begin,
+            Delta::BeginPart {
+                kind: PartKind::Text,
+                ..
+            }
+        ));
+
+        let mut commit = Delta::CommitPart {
+            part: Part::Media(MediaPart::new(
+                Modality::Image,
+                "image/png",
+                DataRef::Uri("https://example.com/image.png".into()),
+            )),
+        };
+        rewrite_openrouter_media(&mut commit, &mut active, &mut next);
+
+        assert!(matches!(
+            commit,
+            Delta::AppendText { part_id: id, chunk }
+                if id == part_id && chunk == "[Image #1](https://example.com/image.png)"
+        ));
+    }
+
+    #[test]
+    fn openrouter_media_placeholder_does_not_expose_data_urls() {
+        let mut active = None;
+        let mut next = 0;
+        let mut commit = Delta::CommitPart {
+            part: Part::Media(MediaPart::new(
+                Modality::Image,
+                "image/png",
+                DataRef::Uri("data:image/png;base64,c2VjcmV0".into()),
+            )),
+        };
+
+        rewrite_openrouter_media(&mut commit, &mut active, &mut next);
+
+        assert!(matches!(
+            commit,
+            Delta::AppendText { chunk, .. } if chunk == "[Image #1]"
+        ));
+    }
 
     #[test]
     fn detached_results_tell_the_model_their_call_id() {

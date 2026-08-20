@@ -6,14 +6,15 @@ use std::{
 };
 
 use agentkit_core::{
-    Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind, ReasoningPart,
-    TextPart, TokenUsage, ToolCallPart, ToolOutput, Usage,
+    DataRef, Delta, FinishReason, Item, ItemKind, MediaPart, MetadataMap, Modality, Part, PartId,
+    PartKind, ReasoningPart, TextPart, TokenUsage, ToolCallPart, ToolOutput, Usage,
 };
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
     PromptCacheMode, PromptCacheStrategy, SessionConfig, TurnRequest,
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
 use serde_json::{Value, json};
@@ -29,15 +30,19 @@ const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.0";
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 1_000;
-const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+// TUI attachments allow 20 MiB raw; base64 and JSON add roughly one third.
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
+// Image-generation results arrive as one base64 field in one SSE event.
+const MAX_EVENT_BYTES: usize = MAX_STREAM_BYTES;
+const MAX_FIELD_BYTES: usize = 1024 * 1024;
 const MAX_ITEMS: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 const PROVIDER_REQUEST_DIGEST: &str = "kit.model_call.request_digest";
 const PROVIDER_FINISH_REASONS_METADATA: &str = "agentkit.provider_finish_reasons";
+const GENERATED_IMAGE_METADATA: &str = "openai.subscription.generated_image.v1";
 pub(crate) const CONTINUATION_METADATA: &str = "openai.subscription.v1";
 const CONTINUATION_SCHEMA_VERSION: u64 = 1;
 
@@ -473,6 +478,7 @@ pub struct OpenAiSubscriptionTurn {
     session_id: String,
     context_windows: Arc<HashMap<String, u64>>,
     tool_call: bool,
+    next_media: usize,
     stream_ended: bool,
     pending_failure: Option<ResponseFailure>,
 }
@@ -552,6 +558,7 @@ impl OpenAiSubscriptionTurn {
             session_id,
             context_windows,
             tool_call: false,
+            next_media: 0,
             stream_ended: false,
             pending_failure: None,
         }
@@ -559,7 +566,7 @@ impl OpenAiSubscriptionTurn {
 
     fn consume_frame(&mut self, frame: &[u8]) -> Result<(), LoopError> {
         if frame.len() > MAX_EVENT_BYTES {
-            return Err(protocol("SSE event exceeds 1 MiB"));
+            return Err(protocol("SSE event exceeds the canonical limit"));
         }
         let text = std::str::from_utf8(frame).map_err(|_| protocol("SSE event is not UTF-8"))?;
         let text = Zeroizing::new(text.replace("\r\n", "\n").replace('\r', "\n"));
@@ -777,6 +784,68 @@ impl OpenAiSubscriptionTurn {
                 self.push_output(
                     output_index,
                     Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)]),
+                );
+            }
+            Some("image_generation_call") => {
+                let item_id = bounded_id(item.get("id"))?;
+                let status = bounded_nonempty_string(item, "status")?;
+                if status != "completed" {
+                    return Err(protocol("image generation did not complete"));
+                }
+                let result = item
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .filter(|result| !result.is_empty() && result.len() <= MAX_EVENT_BYTES)
+                    .ok_or_else(|| {
+                        protocol("generated image result is outside canonical bounds")
+                    })?;
+                let bytes = STANDARD
+                    .decode(result)
+                    .map_err(|_| protocol("generated image result is not valid base64"))?;
+                if bytes.is_empty() {
+                    return Err(protocol("generated image result is empty"));
+                }
+                let revised_prompt = item
+                    .get("revised_prompt")
+                    .filter(|value| !value.is_null())
+                    .map(|_| bounded_string(item, "revised_prompt"))
+                    .transpose()?;
+                let mut metadata = continuation_metadata(
+                    &self.binding,
+                    &self.requested_model,
+                    &self.session_id,
+                    item_id,
+                    output_index,
+                    "image_generation_call",
+                    None,
+                );
+                metadata.insert(
+                    GENERATED_IMAGE_METADATA.to_owned(),
+                    json!({
+                        "item_id": item_id,
+                        "status": status,
+                        "revised_prompt": revised_prompt,
+                    }),
+                );
+                let media =
+                    MediaPart::new(Modality::Image, "image/png", DataRef::InlineBytes(bytes))
+                        .with_metadata(metadata);
+                self.next_media += 1;
+                let placeholder = format!("[Image #{}]", self.next_media);
+                let placeholder_id = PartId::new(format!("generated-image-{output_index}"));
+                self.queued
+                    .push_back(ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: placeholder_id.clone(),
+                        kind: PartKind::Text,
+                    }));
+                self.queued
+                    .push_back(ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: placeholder_id,
+                        chunk: placeholder,
+                    }));
+                self.push_output(
+                    output_index,
+                    Item::new(ItemKind::Assistant, vec![Part::Media(media)]),
                 );
             }
             Some("reasoning") => {
@@ -1014,6 +1083,9 @@ impl OpenAiSubscriptionTurn {
             let metadata = match part {
                 Part::Reasoning(part) => &mut part.metadata,
                 Part::ToolCall(part) => &mut part.metadata,
+                Part::Media(part) if part.metadata.contains_key(GENERATED_IMAGE_METADATA) => {
+                    &mut part.metadata
+                }
                 _ => continue,
             };
             let continuation = metadata
@@ -1190,7 +1262,7 @@ impl ModelTurn for OpenAiSubscriptionTurn {
                 }
             }
             if self.buffer.len() > MAX_EVENT_BYTES {
-                return Err(protocol("SSE event exceeds 1 MiB"));
+                return Err(protocol("SSE event exceeds the canonical limit"));
             }
         }
     }
@@ -1301,7 +1373,25 @@ fn map_item(
                     }));
                 }
             }
-            Part::Media(_) | Part::File(_) | Part::Custom(_) => return Err(LoopError::Unsupported("openai-subscription transcript contains unsupported content".to_owned())),
+            Part::Media(media) => {
+                if let Some(generated) = generated_image_item(media, continuation)? {
+                    if role != "assistant" {
+                        return Err(protocol(
+                            "generated image metadata appeared outside assistant output",
+                        ));
+                    }
+                    messages.push(generated);
+                } else {
+                    if role == "assistant" || role == "tool" {
+                        return Err(LoopError::Unsupported(
+                            "openai-subscription assistant/tool message contains unsupported media"
+                                .to_owned(),
+                        ));
+                    }
+                    content.push(media_input(media)?);
+                }
+            }
+            Part::File(_) | Part::Custom(_) => return Err(LoopError::Unsupported("openai-subscription transcript contains unsupported content".to_owned())),
         }
     }
     if !content.is_empty() && role != "tool" {
@@ -1310,11 +1400,182 @@ fn map_item(
     Ok(messages)
 }
 
-fn tool_output(output: &ToolOutput) -> Result<String, LoopError> {
+fn media_input(media: &MediaPart) -> Result<Value, LoopError> {
+    let expected_prefix = match media.modality {
+        Modality::Image => "image/",
+        Modality::Audio => "audio/",
+        Modality::Video => {
+            return Err(LoopError::Unsupported(
+                "openai-subscription does not support video input".to_owned(),
+            ));
+        }
+        Modality::Binary => {
+            return Err(LoopError::Unsupported(
+                "openai-subscription does not support binary media input".to_owned(),
+            ));
+        }
+    };
+    if !media.mime_type.starts_with(expected_prefix)
+        || media.mime_type.contains(['\r', '\n', ';', ','])
+    {
+        return Err(LoopError::Unsupported(
+            "openai-subscription media has an invalid MIME type".to_owned(),
+        ));
+    }
+    let data_url = media_data_url(media)?;
+    Ok(match media.modality {
+        Modality::Image => json!({
+            "type": "input_image",
+            "image_url": data_url,
+            "detail": "high",
+        }),
+        Modality::Audio => json!({"type": "input_audio", "audio_url": data_url}),
+        Modality::Video | Modality::Binary => unreachable!("rejected above"),
+    })
+}
+
+fn media_data_url(media: &MediaPart) -> Result<String, LoopError> {
+    match &media.data {
+        DataRef::InlineBytes(bytes) => Ok(format!(
+            "data:{};base64,{}",
+            media.mime_type,
+            STANDARD.encode(bytes)
+        )),
+        DataRef::InlineText(text) => {
+            if text.starts_with("data:") {
+                validate_data_url(text, &media.mime_type)?;
+                Ok(text.clone())
+            } else {
+                STANDARD.decode(text).map_err(|_| {
+                    LoopError::Unsupported(
+                        "openai-subscription inline media is not valid base64".to_owned(),
+                    )
+                })?;
+                Ok(format!("data:{};base64,{text}", media.mime_type))
+            }
+        }
+        DataRef::Uri(uri) if uri.starts_with("data:") => {
+            validate_data_url(uri, &media.mime_type)?;
+            Ok(uri.clone())
+        }
+        DataRef::Uri(uri)
+            if media.modality == Modality::Image
+                && uri.len() <= MAX_TEXT_BYTES
+                && url::Url::parse(uri)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
+        {
+            Ok(uri.clone())
+        }
+        DataRef::Uri(_) => Err(LoopError::Unsupported(
+            "openai-subscription cannot read this media URI; provide inline bytes".to_owned(),
+        )),
+        DataRef::Handle(_) => Err(LoopError::Unsupported(
+            "openai-subscription cannot resolve media handles; provide inline bytes".to_owned(),
+        )),
+    }
+}
+
+fn validate_data_url(value: &str, mime_type: &str) -> Result<(), LoopError> {
+    let payload = value
+        .strip_prefix(&format!("data:{mime_type};base64,"))
+        .filter(|payload| !payload.is_empty())
+        .ok_or_else(|| {
+            LoopError::Unsupported(
+                "openai-subscription media data URL is not canonical base64".to_owned(),
+            )
+        })?;
+    STANDARD.decode(payload).map_err(|_| {
+        LoopError::Unsupported("openai-subscription media data URL is not valid base64".to_owned())
+    })?;
+    Ok(())
+}
+
+fn generated_image_item(
+    media: &MediaPart,
+    continuation: Option<&ContinuationContext<'_>>,
+) -> Result<Option<Value>, LoopError> {
+    let Some(metadata) = media.metadata.get(GENERATED_IMAGE_METADATA) else {
+        return Ok(None);
+    };
+    let metadata = metadata
+        .as_object()
+        .filter(|metadata| (2..=3).contains(&metadata.len()))
+        .ok_or_else(|| protocol("generated image metadata is malformed"))?;
+    let item_id = bounded_id(metadata.get("item_id"))?;
+    if metadata.get("status").and_then(Value::as_str) != Some("completed")
+        || media.modality != Modality::Image
+        || media.mime_type != "image/png"
+    {
+        return Err(protocol("generated image metadata is invalid"));
+    }
+    let Some(continuation) = continuation else {
+        return Ok(None);
+    };
+    if continuation_item(&media.metadata, "image_generation_call", continuation)?.is_none() {
+        return Ok(None);
+    }
+    let revised_prompt = metadata
+        .get("revised_prompt")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| value.len() <= MAX_TEXT_BYTES)
+                .ok_or_else(|| protocol("generated image revised prompt is invalid"))
+        })
+        .transpose()?;
+    let result = match &media.data {
+        DataRef::InlineBytes(bytes) if !bytes.is_empty() => STANDARD.encode(bytes),
+        DataRef::InlineText(text) if !text.is_empty() && !text.starts_with("data:") => {
+            STANDARD
+                .decode(text)
+                .map_err(|_| protocol("persisted generated image result is not valid base64"))?;
+            text.clone()
+        }
+        DataRef::InlineText(text) => {
+            validate_data_url(text, "image/png")?;
+            text.split_once(',')
+                .map(|(_, payload)| payload.to_owned())
+                .ok_or_else(|| protocol("persisted generated image data URL is malformed"))?
+        }
+        DataRef::Uri(_) | DataRef::Handle(_) | DataRef::InlineBytes(_) => {
+            return Err(LoopError::Unsupported(
+                "openai-subscription cannot replay generated image without inline bytes".to_owned(),
+            ));
+        }
+    };
+    Ok(Some(json!({
+        "id": item_id,
+        "type": "image_generation_call",
+        "status": "completed",
+        "revised_prompt": revised_prompt,
+        "result": result,
+    })))
+}
+
+fn tool_output(output: &ToolOutput) -> Result<Value, LoopError> {
     match output {
-        ToolOutput::Text(value) => Ok(value.clone()),
-        ToolOutput::Structured(value) => {
-            serde_json::to_string(value).map_err(|_| protocol("tool output encoding failed"))
+        ToolOutput::Text(value) => Ok(Value::String(value.clone())),
+        ToolOutput::Structured(value) => serde_json::to_string(value)
+            .map(Value::String)
+            .map_err(|_| protocol("tool output encoding failed")),
+        ToolOutput::Parts(parts) if parts.iter().any(|part| matches!(part, Part::Media(_))) => {
+            parts
+                .iter()
+                .map(|part| match part {
+                    Part::Text(text) => Ok(json!({"type": "input_text", "text": text.text})),
+                    Part::Structured(value) => Ok(json!({
+                        "type": "input_text",
+                        "text": serde_json::to_string(&value.value)
+                            .map_err(|_| protocol("tool output encoding failed"))?,
+                    })),
+                    Part::Media(media) => media_input(media),
+                    _ => Err(LoopError::Unsupported(
+                        "openai-subscription tool output contains unsupported content".to_owned(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array)
         }
         ToolOutput::Parts(parts) => parts
             .iter()
@@ -1327,7 +1588,7 @@ fn tool_output(output: &ToolOutput) -> Result<String, LoopError> {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(|parts| parts.join("\n")),
+            .map(|parts| Value::String(parts.join("\n"))),
         ToolOutput::Files(_) => Err(LoopError::Unsupported(
             "openai-subscription file tool output is not supported".to_owned(),
         )),
@@ -1619,6 +1880,11 @@ fn zeroize_encrypted_content(value: &mut Value) {
             if let Some(Value::String(encrypted)) = object.get_mut("encrypted_content") {
                 encrypted.zeroize();
             }
+            if object.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                && let Some(Value::String(result)) = object.get_mut("result")
+            {
+                result.zeroize();
+            }
             for nested in object.values_mut() {
                 zeroize_encrypted_content(nested);
             }
@@ -1656,7 +1922,7 @@ fn bounded_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, LoopErro
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| value.len() <= MAX_EVENT_BYTES)
+        .filter(|value| value.len() <= MAX_FIELD_BYTES)
         .ok_or_else(|| protocol(&format!("Responses {field} is missing or outside bounds")))
 }
 
@@ -1933,16 +2199,20 @@ fn protocol(message: &str) -> LoopError {
 mod usage_tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    use agentkit_core::{CancellationController, Delta, Part, PartKind};
+    use agentkit_core::{
+        CancellationController, DataRef, Delta, Item, ItemKind, MediaPart, Modality, Part,
+        PartKind, ToolOutput,
+    };
     use agentkit_loop::{LoopError, ModelSession, ModelTurn, ModelTurnEvent};
     use bytes::Bytes;
     use futures_util::stream;
     use serde_json::json;
 
     use super::{
-        CONTINUATION_METADATA, MAX_RETRY_AFTER, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
-        PROVIDER_FINISH_REASONS_METADATA, SubscriptionConfig, classify_response_failure,
-        classify_top_level_error, parse_context_windows, parse_usage, set_provider_finish_reasons,
+        CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRY_AFTER,
+        OpenAiSubscriptionSession, OpenAiSubscriptionTurn, PROVIDER_FINISH_REASONS_METADATA,
+        SubscriptionConfig, classify_response_failure, classify_top_level_error, map_item,
+        parse_context_windows, parse_usage, set_provider_finish_reasons, tool_output,
     };
 
     #[test]
@@ -2098,6 +2368,203 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
 
         assert_eq!(turn.turn_state.as_deref(), Some("sticky-state"));
         assert_eq!(turn.response_model.as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn request_maps_inline_image_and_audio_to_codex_content_items() {
+        let item = Item::new(
+            ItemKind::User,
+            vec![
+                Part::Media(MediaPart::new(
+                    Modality::Image,
+                    "image/png",
+                    DataRef::InlineBytes(vec![1, 2, 3]),
+                )),
+                Part::Media(MediaPart::new(
+                    Modality::Audio,
+                    "audio/wav",
+                    DataRef::InlineText("data:audio/wav;base64,BAUG".to_owned()),
+                )),
+            ],
+        );
+
+        let mapped = map_item(&item, None).unwrap();
+
+        assert_eq!(
+            mapped,
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AQID",
+                        "detail": "high"
+                    },
+                    {
+                        "type": "input_audio",
+                        "audio_url": "data:audio/wav;base64,BAUG"
+                    }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn tool_output_maps_media_to_structured_codex_content() {
+        let output = ToolOutput::Parts(vec![
+            Part::text("waveform"),
+            Part::Media(MediaPart::new(
+                Modality::Audio,
+                "audio/wav",
+                DataRef::InlineBytes(vec![1, 2, 3]),
+            )),
+        ]);
+
+        assert_eq!(
+            tool_output(&output).unwrap(),
+            json!([
+                {"type": "input_text", "text": "waveform"},
+                {
+                    "type": "input_audio",
+                    "audio_url": "data:audio/wav;base64,AQID"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn request_rejects_video_and_unreadable_media_uris_without_exposing_data() {
+        let video = Item::new(
+            ItemKind::User,
+            vec![Part::Media(MediaPart::new(
+                Modality::Video,
+                "video/mp4",
+                DataRef::InlineText("sensitive-base64".to_owned()),
+            ))],
+        );
+        let video_error = map_item(&video, None).unwrap_err().to_string();
+        assert!(video_error.contains("does not support video"));
+        assert!(!video_error.contains("sensitive-base64"));
+
+        let local = Item::new(
+            ItemKind::User,
+            vec![Part::Media(MediaPart::new(
+                Modality::Image,
+                "image/png",
+                DataRef::Uri("file:///secret/image.png".to_owned()),
+            ))],
+        );
+        let uri_error = map_item(&local, None).unwrap_err().to_string();
+        assert!(uri_error.contains("provide inline bytes"));
+        assert!(!uri_error.contains("/secret/image.png"));
+    }
+
+    #[test]
+    fn generated_image_streams_placeholder_persists_media_and_replays() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "image-1"}
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "image-1",
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "revised_prompt": "a blue square",
+                    "result": "AQID"
+                }
+            }),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "response-1"}
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            turn.queued.front(),
+            Some(ModelTurnEvent::Delta(Delta::BeginPart {
+                kind: PartKind::Text,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            turn.queued.get(1),
+            Some(ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }))
+                if chunk == "[Image #1]" && !chunk.contains("AQID")
+        ));
+        let output = turn
+            .queued
+            .iter()
+            .find_map(|event| match event {
+                ModelTurnEvent::Finished(result) => Some(&result.output_items),
+                _ => None,
+            })
+            .expect("expected finished output");
+        let Part::Media(media) = &output[0].parts[0] else {
+            panic!("expected persisted generated image media");
+        };
+        assert_eq!(media.mime_type, "image/png");
+        assert_eq!(media.data, DataRef::InlineBytes(vec![1, 2, 3]));
+        assert_eq!(
+            media.metadata[GENERATED_IMAGE_METADATA]["revised_prompt"],
+            json!("a blue square")
+        );
+        assert_eq!(
+            media.metadata[CONTINUATION_METADATA]["response_id"],
+            json!("response-1")
+        );
+
+        let binding = super::auth::CredentialBinding {
+            account_id: "test-account".to_owned(),
+            generation: "test-generation".to_owned(),
+        };
+        let continuation = ContinuationContext {
+            model: "gpt-5.4",
+            binding: &binding,
+            session_id: "s",
+        };
+        assert_eq!(
+            map_item(&output[0], Some(&continuation)).unwrap(),
+            vec![json!({
+                "id": "image-1",
+                "type": "image_generation_call",
+                "status": "completed",
+                "revised_prompt": "a blue square",
+                "result": "AQID"
+            })]
+        );
+
+        let other_binding = super::auth::CredentialBinding {
+            account_id: "other-account".to_owned(),
+            generation: "test-generation".to_owned(),
+        };
+        let mismatched = ContinuationContext {
+            model: "gpt-5.4",
+            binding: &other_binding,
+            session_id: "s",
+        };
+        assert!(map_item(&output[0], Some(&mismatched)).is_err());
     }
 
     #[test]
