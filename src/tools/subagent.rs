@@ -471,10 +471,12 @@ pub struct SubagentsTool {
     manager: Subagents,
     spec: ToolSpec,
 }
+type CancelBackground = Arc<dyn Fn(&str, bool) -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub struct CloseTool {
     manager: Subagents,
-    cancel_background: Arc<dyn Fn(&str, bool) -> bool + Send + Sync>,
+    cancel_background: CancelBackground,
     spec: ToolSpec,
 }
 

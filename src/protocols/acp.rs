@@ -158,16 +158,16 @@ impl Server {
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let catalog = model_catalog(&current).await;
         let options = model_options(&current, &catalog);
-        tokio::spawn(session_actor(
-            acp_session_id.clone(),
-            Arc::clone(&self.integration),
-            driver.driver,
-            driver.tasks,
-            driver.adapter,
+        tokio::spawn(session_actor(SessionActor {
+            session_id: acp_session_id.clone(),
+            integration: Arc::clone(&self.integration),
+            driver: driver.driver,
+            tasks: driver.tasks,
+            adapter: driver.adapter,
             catalog,
-            rx,
+            commands: rx,
             turn_states,
-        ));
+        }));
         Ok(NewSessionResponse::new(acp_session_id).config_options(Some(options)))
     }
 
@@ -265,16 +265,28 @@ impl Server {
     }
 }
 
-async fn session_actor<S: ModelSession>(
+struct SessionActor<S: ModelSession> {
     session_id: agentkit_acp::SessionId,
     integration: Arc<AcpIntegration>,
-    mut driver: LoopDriver<S>,
+    driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
-    mut commands: mpsc::Receiver<Command>,
+    commands: mpsc::Receiver<Command>,
     turn_states: mpsc::UnboundedSender<TurnStateNotification>,
-) {
+}
+
+async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
+    let SessionActor {
+        session_id,
+        integration,
+        mut driver,
+        tasks,
+        adapter,
+        catalog,
+        mut commands,
+        turn_states,
+    } = actor;
     let mut next_autonomous_turn_id = 0_u64;
     loop {
         tokio::select! {
@@ -983,16 +995,17 @@ mod tests {
             .unwrap();
         let (commands_tx, commands_rx) = mpsc::channel(8);
         let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
-        let actor = tokio::spawn(session_actor(
-            acp_session_id.clone(),
-            Arc::clone(&integration),
+        let actor = tokio::spawn(session_actor(SessionActor {
+            session_id: acp_session_id.clone(),
+            integration: Arc::clone(&integration),
             driver,
             tasks,
-            SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap(),
-            Vec::new(),
-            commands_rx,
-            turn_states_tx,
-        ));
+            adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
+                .unwrap(),
+            catalog: Vec::new(),
+            commands: commands_rx,
+            turn_states: turn_states_tx,
+        }));
 
         let (reply_tx, reply_rx) = oneshot::channel();
         commands_tx
