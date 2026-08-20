@@ -500,6 +500,16 @@ paste arrives as a key burst, and a return inside such a burst is read as a
 line break rather than a send. Either way the whole paste is applied in one
 redraw.
 
+Dragging local PNG, JPEG, GIF, WebP, WAV, or MP3 files into the terminal adds
+them as `[Image #N]` or `[Audio #N]` prompt attachments. Kit recognizes a drop
+only when every pasted token is a supported file; otherwise it preserves the
+whole paste as text. A prompt can contain at most 8 attachments, 10 MiB each
+and 20 MiB total. Kit sends the bytes through OpenRouter or OpenAI subscription
+while retaining canonical local `file://` links in model-facing text. Model
+modality support varies. Video, terminal image rendering, and audio playback are
+not supported, and Kit never displays base64 or `data:` URLs. See
+[the TUI guide](docs/user/tui-and-sessions.md#attach-local-images-and-audio).
+
 ## Deliberate limits
 
 The root is a working directory, not a sandbox. Shell commands can access the

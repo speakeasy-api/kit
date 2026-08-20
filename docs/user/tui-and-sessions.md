@@ -45,6 +45,18 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 
 Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
 
+### Attach local images and audio
+
+Drag one or more supported local media files into the terminal while editing a prompt. Terminals deliver a drop as pasted, shell-escaped paths rather than as a dedicated file-drop event. Kit treats the paste as attachments only when every parsed token resolves to a supported regular file. Mixed text and paths, unsupported files, invalid shell quoting, missing files, and ambiguous input remain ordinary pasted text. There is no `/attach` command.
+
+Supported files are PNG, JPEG, GIF, WebP, WAV, and MP3. Up to 8 attachments can be pending, each file can be at most 10 MiB, and their combined size can be at most 20 MiB. Kit checks the actual file sizes again when the prompt is submitted.
+
+An accepted file appears in the editor as `[Image #N]` or `[Audio #N]`. Add surrounding prompt text normally, or delete a placeholder to omit that file from submission. A new session clears pending attachments. If Kit cannot read or validate the files when constructing the request, it shows a notice and retains the pending attachment records. Restore or re-enter the prompt placeholders before retrying.
+
+The model-facing prompt retains canonical `file://` Markdown links, while Kit also reads and sends the file bytes because remote providers cannot access local files. Image and audio acceptance remains model-dependent. Kit supports these request shapes through OpenRouter and OpenAI subscription; an individual model can still reject a modality it does not support. Video is not supported.
+
+Assistant- and tool-produced media appears as portable Markdown placeholders or links. Kit does not render images in the terminal or play audio. Only bounded `file://`, `http://`, and `https://` links are displayed; base64 and `data:` URLs are never copied into terminal text or Markdown links.
+
 ### Interrupt a running turn or quit
 
 Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes. Sending another prompt while work is active is refused with `a turn is already running — esc interrupts it`.
