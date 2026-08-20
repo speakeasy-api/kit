@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: scripts/release-local.sh vVERSION" >&2
+if [[ $# -ne 0 ]]; then
+  echo "Usage: scripts/release-local.sh" >&2
   exit 2
 fi
 
@@ -12,9 +12,9 @@ done
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$root"
-tag=$1
-version=${tag#v}
-cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+[[ -n $version ]] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
+tag="v$version"
 branch=$(git symbolic-ref --quiet --short HEAD) || { echo "release from a branch, not detached HEAD" >&2; exit 1; }
 commit=$(git rev-parse HEAD)
 releases_repo=${KIT_RELEASES_REPO:-danielkov/kit-releases}
@@ -24,7 +24,6 @@ macos="$out_dir/kit-$tag-aarch64-apple-darwin.tar.gz"
 linux="$out_dir/kit-$tag-x86_64-unknown-linux-gnu.tar.gz"
 sums="$out_dir/SHA256SUMS"
 
-[[ $tag == "v$cargo_version" ]] || { echo "expected v$cargo_version, got $tag" >&2; exit 1; }
 [[ -z $(git status --porcelain) ]] || { echo "working tree must be clean" >&2; exit 1; }
 ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null || { echo "local tag already exists: $tag" >&2; exit 1; }
 ! git ls-remote --exit-code --tags "$remote" "refs/tags/$tag" >/dev/null 2>&1 || { echo "remote tag already exists: $tag" >&2; exit 1; }

@@ -72,7 +72,7 @@ Update `Cargo.toml` and `Cargo.lock` to the new version, commit every intended
 release change, and run the local orchestrator from a clean working tree:
 
 ```sh
-scripts/release-local.sh v0.1.32
+scripts/release-local.sh
 ```
 
 The script runs format, Clippy, and tests; signs and notarizes macOS; builds
