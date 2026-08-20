@@ -116,6 +116,8 @@ and automatic compaction rather than guessing a window.
 
 ## Configuration
 
+Run `kit init` to create `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when they do not exist. The generated setup selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. Existing files are left unchanged.
+
 Kit loads optional defaults from `~/.kit/config.toml`. Command-line values take
 precedence, and omitted values that are not configured retain Kit's built-in
 defaults (`root = "."`, `provider = "openai-subscription"`,

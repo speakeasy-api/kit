@@ -2,6 +2,8 @@
 
 Kit is a directory-rooted coding-agent runtime. Choose a project directory as the runtime root, authenticate the model provider, and then use the installed `kit` binary interactively, for one prompt, or as an ACP/A2A server. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line reference.
 
+Run `kit init` to write the recommended `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when those files do not exist. It selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. The command leaves existing files unchanged.
+
 ## Install and verify the `kit` binary
 
 Install the latest packaged release with mise, then verify that the executable is on `PATH`:
@@ -110,7 +112,7 @@ kit acp --root /path/to/project
 
 ## Configure `~/.kit/config.toml`
 
-At startup, every command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. The file is strict TOML: unknown keys, invalid values, an unreadable file, and invalid syntax are errors rather than ignored settings.
+At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. The file is strict TOML: unknown keys, invalid values, an unreadable file, and invalid syntax are errors rather than ignored settings.
 
 A representative configuration is:
 

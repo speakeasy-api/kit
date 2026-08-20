@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    env, fs, io,
+    env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -296,6 +297,8 @@ enum AuthAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Write the recommended configuration to ~/.kit/config.toml.
+    Init,
     /// Manage provider authentication without starting a runtime.
     Auth {
         #[command(subcommand)]
@@ -395,6 +398,43 @@ enum Command {
     },
 }
 
+fn initial_config(home: &Path) -> String {
+    let kit_dir = home.join(".kit");
+    let mcp_config = toml::Value::String(kit_dir.join("mcp.json").to_string_lossy().into());
+    let credential_dir = toml::Value::String(kit_dir.join("credentials").to_string_lossy().into());
+    format!(
+        "model = \"gpt-5.6-sol\"\nmcp_config = {mcp_config}\ncredential_store = \"file\"\ncredential_dir = {credential_dir}\n"
+    )
+}
+
+fn write_if_missing(path: &Path, contents: &[u8]) -> io::Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file.write_all(contents),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn init_config(home: &Path) -> io::Result<PathBuf> {
+    let kit_dir = home.join(".kit");
+    fs::create_dir_all(&kit_dir)?;
+    write_if_missing(&kit_dir.join("mcp.json"), b"{\n  \"mcpServers\": {}\n}\n")?;
+    let path = kit_dir.join("config.toml");
+    write_if_missing(&path, initial_config(home).as_bytes())?;
+    Ok(path)
+}
+
+fn init_default_config() -> io::Result<PathBuf> {
+    let home = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| io::Error::other("HOME is not set; cannot initialize global config"))?;
+    init_config(Path::new(&home))
+}
+
 fn validate_auth_storage(action: &AuthAction, storage: &CredentialStorage) -> io::Result<()> {
     if matches!(action, AuthAction::Login { .. }) && matches!(storage, CredentialStorage::Memory) {
         return Err(io::Error::other(
@@ -431,6 +471,14 @@ async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if matches!(&cli.command, Command::Init) {
+        init_default_config()?;
+        println!(
+            "Kit {}\n\nlog in with your openai account or set OPENROUTER_API_KEY to get started",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
     let config = Config::load_default()?;
     let telemetry_settings = config.telemetry_settings(
         &cli.telemetry,
@@ -449,6 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     match cli.command {
+        Command::Init => unreachable!("init returns before loading runtime config"),
         Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
         Command::Serve {
             root,
@@ -619,7 +668,7 @@ mod tests {
 
     use super::{
         AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
-        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, validate_auth_storage,
+        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, init_config, validate_auth_storage,
     };
 
     #[test]
@@ -949,6 +998,36 @@ harness = "acp.beta"
         assert_eq!(cli.telemetry.otel_capture_message_content, Some(true));
         assert_eq!(cli.telemetry.otel_message_content_max_messages, Some(12));
         assert_eq!(cli.telemetry.otel_message_content_max_bytes, Some(4096));
+    }
+
+    #[test]
+    fn init_writes_recommended_global_config() {
+        let home = tempfile::tempdir().unwrap();
+        let path = init_config(home.path()).unwrap();
+        let kit_dir = home.path().join(".kit");
+        assert_eq!(path, kit_dir.join("config.toml"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!(
+                "model = \"gpt-5.6-sol\"\nmcp_config = \"{}\"\ncredential_store = \"file\"\ncredential_dir = \"{}\"\n",
+                kit_dir.join("mcp.json").display(),
+                kit_dir.join("credentials").display(),
+            )
+        );
+        let mcp_path = kit_dir.join("mcp.json");
+        assert_eq!(
+            fs::read_to_string(&mcp_path).unwrap(),
+            "{\n  \"mcpServers\": {}\n}\n"
+        );
+        fs::write(&path, "existing config\n").unwrap();
+        fs::write(&mcp_path, "existing mcp config\n").unwrap();
+        init_config(home.path()).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "existing config\n");
+        assert_eq!(
+            fs::read_to_string(mcp_path).unwrap(),
+            "existing mcp config\n"
+        );
+        assert!(Cli::try_parse_from(["kit", "init"]).is_ok());
     }
 
     #[test]
