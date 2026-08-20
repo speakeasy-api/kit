@@ -307,7 +307,7 @@ return { main: second.output, alternative: branch.output, active, closed }
 The optional `harness` argument overrides the user's configured harness preference
 with the selected value. Default to omitting it.
 
-`subagents({})` lists the current reusable handles, including idle completed sessions, and `close(handle)` or `close({ id: handle.id })` explicitly terminates one. Closing removes the handle from the parent registry and releases its capacity. For native-fork siblings sharing a process, the harness must advertise ACP `session/close`; otherwise Kit reports that it cannot close only one sibling. All retained subagents are terminated when their owning parent session closes. A parent session can retain at most 120 subagents.
+`subagents({})` lists the current reusable handles, including idle completed sessions, and reports an initial turn still in progress as `{ id, status: "starting" }`. Starting entries can be closed by ID but cannot be prompted or forked until the initial `subagent` call returns a complete handle. `close(handle)` or `close({ id: handle.id })` explicitly terminates one. Closing removes the handle from the parent registry and releases its capacity. For native-fork siblings sharing a process, the harness must advertise ACP `session/close`; otherwise Kit reports that it cannot close only one sibling. All retained subagents are terminated when their owning parent session closes. A parent session can retain at most 120 subagents.
 
 Each turn-producing call returns `{ id, output, generation }`. By default, `output` remains the
 agent's text. When a turn also emits non-text agent content, tool calls, tool-call

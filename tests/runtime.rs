@@ -36,7 +36,7 @@ fn runtime_is_rooted_and_exposes_only_compose() {
         "`subagent`: Start a parent-owned configured ACP harness",
         "`prompt`: Re-prompt the same completed ACP subagent session",
         "`fork`: Fork a completed ACP subagent session",
-        "`subagents`: List the active reusable subagent session handles",
+        "`subagents`: List active subagent sessions owned by this parent",
         "`close`: Close an active subagent",
         "`a2a`: Send a text task",
         "`tool_search`: Search configured MCP server names",
