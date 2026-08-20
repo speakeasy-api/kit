@@ -79,17 +79,14 @@ enum CredentialStoreKind {
     File,
 }
 
-const LATEST_CONFIG_VERSION: i64 = 1;
-
 struct ConfigMigration {
-    from_version: i64,
     apply: fn(&mut toml::Table),
 }
 
-// Unversioned files are version 0. Add one migration for every schema change so
-// typed deserialization only ever sees the latest config shape.
+// Migrations are shape-driven and must be idempotent because hand-written config
+// files do not carry a schema version. Add one migration for every schema change
+// so typed deserialization only ever sees the latest config shape.
 const CONFIG_MIGRATIONS: &[ConfigMigration] = &[ConfigMigration {
-    from_version: 0,
     apply: migrate_credentials_to_shared_store,
 }];
 
@@ -104,36 +101,16 @@ fn migrate_credentials_to_shared_store(config: &mut toml::Table) {
     }
 }
 
-fn migrate_config(mut config: toml::Table) -> Result<toml::Table, String> {
-    let mut version = match config.get("config_version") {
-        Some(toml::Value::Integer(version)) if *version >= 0 => *version,
-        Some(_) => return Err("config_version must be a non-negative integer".into()),
-        None => 0,
-    };
-
-    while version < LATEST_CONFIG_VERSION {
-        let migration = CONFIG_MIGRATIONS
-            .iter()
-            .find(|migration| migration.from_version == version)
-            .ok_or_else(|| format!("no config migration exists for version {version}"))?;
+fn migrate_config(mut config: toml::Table) -> toml::Table {
+    for migration in CONFIG_MIGRATIONS {
         (migration.apply)(&mut config);
-        version += 1;
-        config.insert("config_version".into(), toml::Value::Integer(version));
     }
-
-    if version > LATEST_CONFIG_VERSION {
-        return Err(format!(
-            "unsupported config version {version}; this Kit supports up to {LATEST_CONFIG_VERSION}"
-        ));
-    }
-    Ok(config)
+    config
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    #[serde(default, rename = "config_version")]
-    _config_version: i64,
     root: Option<PathBuf>,
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
@@ -173,7 +150,7 @@ impl Config {
         };
         let parsed = toml::from_str(&contents)
             .map_err(|error| format!("could not parse TOML: {error}"))
-            .and_then(migrate_config)
+            .map(migrate_config)
             .and_then(|config| {
                 toml::Value::Table(config)
                     .try_into()
@@ -566,7 +543,6 @@ mod tests {
         fs::write(
             &path,
             r#"
-config_version = 1
 root = "/configured/root"
 model = "configured-model"
 provider = "openrouter"
@@ -636,7 +612,6 @@ mcp_credential_dir = "/legacy/credentials"
         .unwrap();
 
         let config = Config::load(&path).unwrap();
-        assert_eq!(config._config_version, 1);
         assert_eq!(config.credential_store, Some(CredentialStoreKind::File));
         assert_eq!(
             config.credential_dir.as_deref(),
@@ -659,16 +634,6 @@ credential_store = "keychain"
 
         let config = Config::load(&path).unwrap();
         assert_eq!(config.credential_store, Some(CredentialStoreKind::Keychain));
-    }
-
-    #[test]
-    fn unsupported_config_versions_are_reported() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(&path, "config_version = 2\n").unwrap();
-
-        let error = Config::load(&path).unwrap_err();
-        assert!(error.to_string().contains("unsupported config version 2"));
     }
 
     #[test]
