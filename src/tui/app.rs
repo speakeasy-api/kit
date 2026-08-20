@@ -58,6 +58,10 @@ pub enum Update {
     Runtime(RuntimeEvent),
     /// A diagnostic line from the agent process.
     Log(String),
+    /// An autonomous turn started after a background result arrived.
+    AutonomousTurnStarted(u64),
+    /// An autonomous turn ended.
+    AutonomousTurnEnded { id: u64, error: Option<String> },
     /// A specific submitted turn ended. `None` identifies a process-wide failure.
     TurnEnded {
         id: Option<u64>,
@@ -253,6 +257,7 @@ pub struct App {
     pub turn_started: Option<Instant>,
     next_turn_id: u64,
     active_turn_id: Option<u64>,
+    active_autonomous_turn_id: Option<u64>,
     /// The previous assistant stream ended; the next text starts a new block.
     agent_stream_sealed: bool,
     /// Exact source bytes in the latest assistant stream, before TUI rendering.
@@ -461,6 +466,7 @@ impl App {
             turn_started: None,
             next_turn_id: 0,
             active_turn_id: None,
+            active_autonomous_turn_id: None,
             agent_stream_sealed: false,
             latest_agent_source: String::new(),
             compacting: false,
@@ -717,6 +723,32 @@ impl App {
                     self.logs.drain(..self.logs.len() - 500);
                 }
             }
+            Update::AutonomousTurnStarted(id) => {
+                if self.active_turn_id.is_none() {
+                    self.active_autonomous_turn_id = Some(id);
+                    self.agent_stream_sealed = true;
+                    self.phase = Phase::Working;
+                    self.turn_started = Some(Instant::now());
+                    self.follow = true;
+                    self.scroll = usize::MAX;
+                }
+            }
+            Update::AutonomousTurnEnded { id, error } => {
+                if self.active_autonomous_turn_id != Some(id) || self.active_turn_id.is_some() {
+                    return;
+                }
+                self.close_thought();
+                self.agent_stream_sealed = true;
+                let interrupted = self.phase == Phase::Cancelling;
+                self.phase = Phase::Idle;
+                self.turn_started = None;
+                self.active_autonomous_turn_id = None;
+                match (interrupted, error) {
+                    (true, _) => self.note("turn interrupted"),
+                    (false, Some(error)) => self.blocks.push(Block::Error(error)),
+                    (false, None) => {}
+                }
+            }
             Update::TurnEnded { id, error } => {
                 if id.is_some() && id != self.active_turn_id {
                     return;
@@ -727,6 +759,7 @@ impl App {
                 self.phase = Phase::Idle;
                 self.turn_started = None;
                 self.active_turn_id = None;
+                self.active_autonomous_turn_id = None;
                 self.compacting = false;
                 for block in &mut self.blocks {
                     if let Block::Tool(call) = block
@@ -831,6 +864,7 @@ impl App {
         self.phase = Phase::Idle;
         self.turn_started = None;
         self.active_turn_id = None;
+        self.active_autonomous_turn_id = None;
         self.compacting = false;
         self.usage = None;
         self.scroll = usize::MAX;
@@ -856,6 +890,7 @@ impl App {
     fn begin_turn(&mut self) -> u64 {
         self.next_turn_id = self.next_turn_id.wrapping_add(1);
         self.active_turn_id = Some(self.next_turn_id);
+        self.active_autonomous_turn_id = None;
         self.agent_stream_sealed = true;
         self.phase = Phase::Working;
         self.turn_started = Some(Instant::now());
@@ -1290,7 +1325,7 @@ mod tests {
     use agentkit_core::{Item, ItemKind, MetadataMap};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    use super::{Action, App, Block, Update};
+    use super::{Action, App, Block, Phase, Update};
     use crate::{events::RuntimeEvent, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1449,6 +1484,24 @@ mod tests {
 
         assert!(app.working());
         assert_eq!(app.active_turn_id, Some(second));
+    }
+
+    #[test]
+    fn autonomous_turn_is_visible_and_cancellable() {
+        let mut app = app();
+
+        app.apply(Update::AutonomousTurnStarted(7));
+
+        assert!(app.working());
+        assert!(matches!(app.request_cancel(), Action::Cancel));
+        assert!(app.phase == Phase::Cancelling);
+
+        app.apply(Update::AutonomousTurnEnded { id: 7, error: None });
+
+        assert!(!app.working());
+        assert!(
+            matches!(app.blocks.last(), Some(Block::Notice(text)) if text == "turn interrupted")
+        );
     }
 
     #[test]

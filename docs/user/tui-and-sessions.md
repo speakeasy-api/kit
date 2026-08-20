@@ -34,6 +34,7 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 | `Shift+Up` / `Shift+Down`, `PageUp` / `PageDown`, mouse wheel | Scroll the transcript |
 | `Ctrl+Home` / `Ctrl+End` | Jump to transcript top / bottom |
 | `Ctrl+G` / `Ctrl+L` / `Ctrl+T` | Toggle the runtime graph / agent log / reasoning |
+| `Ctrl+K` | Kill the selected running background tool call; otherwise delete to the end of the editor line |
 | `Ctrl+O`, or click a tool card | Fold or unfold raw tool output |
 | `Ctrl+Y` | Copy the latest agent response as original Markdown |
 | Click a fenced code block | Copy its contents without the backticks or language label |
@@ -49,6 +50,8 @@ Pasted text is inserted rather than sent. Bracketed paste is used when available
 Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes. Sending another prompt while work is active is refused with `a turn is already running — esc interrupts it`.
 
 If a turn does not stop, press `Ctrl+C` again while Kit is cancelling to leave the TUI and terminate its agent child. On normal exit during a turn, Kit first requests cancellation and briefly allows the turn to unwind so tool outcomes can be persisted, then closes the session and releases its lock.
+
+Interrupting a turn does not stop detached background calls. Select a running background tool card and press `Ctrl+K` to kill only that call; the selected title is accented and shows `^k kill`. When a background result starts an autonomous agent continuation, the TUI displays it as an active turn, and `Esc` or `Ctrl+C` interrupts it normally.
 
 At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
 

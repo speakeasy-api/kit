@@ -340,7 +340,16 @@ impl Runtime {
             .with(Observed::new(PromptTool::new(subagents.clone())))
             .with(Observed::new(ForkTool::new(subagents.clone(), depth)))
             .with(Observed::new(SubagentsTool::new(subagents.clone())))
-            .with(Observed::new(CloseTool::new(subagents)))
+            .with(Observed::new(CloseTool::new(subagents, {
+                let background_jobs = background_jobs.clone();
+                move |call_id, allow_pending| {
+                    if allow_pending {
+                        background_jobs.cancel(call_id)
+                    } else {
+                        background_jobs.cancel_running(call_id)
+                    }
+                }
+            })))
             .with(Observed::new(A2aTool::new()))
             .with(Observed::new(ToolSearch::new(self.mcp.clone())))
             .with(Observed::new(AuthTool::new(self.mcp.clone())))
@@ -640,6 +649,18 @@ struct BackgroundJobState {
 pub(crate) struct BackgroundJobs(Arc<Mutex<BackgroundJobState>>);
 
 impl BackgroundJobs {
+    fn cancel_running(&self, call_id: &str) -> bool {
+        let call_id = agentkit_core::ToolCallId::new(call_id);
+        let Ok(jobs) = self.0.lock() else {
+            return false;
+        };
+        let Some(controller) = jobs.running.get(&call_id) else {
+            return false;
+        };
+        controller.interrupt();
+        true
+    }
+
     pub fn cancel(&self, call_id: &str) -> bool {
         let call_id = agentkit_core::ToolCallId::new(call_id);
         let Ok(mut jobs) = self.0.lock() else {

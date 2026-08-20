@@ -114,8 +114,8 @@ fn compose_background_values_select_agentkit_task_routes() {
     }
 }
 
-#[test]
-fn detached_compose_uses_job_specific_cancellation() {
+#[tokio::test]
+async fn close_tool_can_cancel_a_detached_compose() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let compose = runtime.compose(0);
@@ -152,7 +152,23 @@ fn detached_compose_uses_job_specific_cancellation() {
     );
     let cancellation = context.cancellation.clone().expect("job cancellation");
     assert!(!cancellation.is_cancelled());
-    assert!(compose.backgroundable.background_jobs.cancel("call"));
+
+    let close = ToolSource::get(&compose.compose, &ToolName::new("close"))
+        .expect("close tool is registered");
+    close
+        .invoke(
+            ToolRequest::new(
+                ToolCallId::new("close-call"),
+                ToolName::new("close"),
+                json!({ "call_id": "call" }),
+                session_id,
+                turn_id,
+            ),
+            &mut context,
+        )
+        .await
+        .unwrap();
+
     assert!(cancellation.is_cancelled());
     compose.backgroundable.finish_background(true, &call_id);
 }

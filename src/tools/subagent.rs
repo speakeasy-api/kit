@@ -474,6 +474,7 @@ pub struct SubagentsTool {
 #[derive(Clone)]
 pub struct CloseTool {
     manager: Subagents,
+    cancel_background: Arc<dyn Fn(&str, bool) -> bool + Send + Sync>,
     spec: ToolSpec,
 }
 
@@ -484,17 +485,25 @@ struct SubagentId {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackgroundCallId {
+    call_id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum CloseInput {
     Handle(SubagentValue),
     Id(SubagentId),
+    BackgroundCall(BackgroundCallId),
 }
 
 impl CloseInput {
-    fn id(self) -> String {
+    fn target(self) -> (String, bool) {
         match self {
-            Self::Handle(value) => value.id,
-            Self::Id(value) => value.id,
+            Self::Handle(value) => (value.id, false),
+            Self::Id(value) => (value.id, false),
+            Self::BackgroundCall(value) => (value.call_id, true),
         }
     }
 }
@@ -507,6 +516,9 @@ fn continuation_schema() -> serde_json::Value {
 }
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
+}
+fn call_id_schema() -> serde_json::Value {
+    json!({"type":"object","properties":{"call_id":{"type":"string"}},"required":["call_id"],"additionalProperties":false})
 }
 
 impl SubagentTool {
@@ -549,8 +561,21 @@ impl SubagentsTool {
     }
 }
 impl CloseTool {
-    pub fn new(manager: Subagents) -> Self {
-        Self { manager, spec: ToolSpec::new(ToolName::new("close"), "Close an active subagent by its complete handle or by an object containing its id. The handle becomes unusable and its capacity is released.", json!({"oneOf":[value_schema(), id_schema()]})).with_output_schema(id_schema()).with_annotations(ToolAnnotations::new()) }
+    pub fn new(
+        manager: Subagents,
+        cancel_background: impl Fn(&str, bool) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            manager,
+            cancel_background: Arc::new(cancel_background),
+            spec: ToolSpec::new(
+                ToolName::new("close"),
+                "Close an active subagent by its complete handle or `{ id }`, or cancel a background tool call with `{ call_id }`. Closed subagent handles become unusable and their capacity is released.",
+                json!({"oneOf":[value_schema(), id_schema(), call_id_schema()]}),
+            )
+            .with_output_schema(id_schema())
+            .with_annotations(ToolAnnotations::new()),
+        }
     }
 }
 
@@ -645,13 +670,15 @@ impl Tool for CloseTool {
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let id = serde_json::from_value::<CloseInput>(request.input.clone())
+        let (id, background_call) = serde_json::from_value::<CloseInput>(request.input.clone())
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?
-            .id();
-        self.manager
-            .close(&id, &cancellation(context))
-            .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            .target();
+        if !(self.cancel_background)(&id, background_call) {
+            self.manager
+                .close(&id, &cancellation(context))
+                .await
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        }
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::structured(json!({ "id": id })),
@@ -947,16 +974,26 @@ mod tests {
     }
 
     #[test]
-    fn close_input_accepts_a_handle_or_an_id() {
+    fn close_input_accepts_a_handle_subagent_id_or_background_call_id() {
         let handle = json!({"id": "child", "output": "done", "generation": 1});
         let id = json!({"id": "child"});
+        let call_id = json!({"call_id": "call_123"});
         assert_eq!(
-            serde_json::from_value::<CloseInput>(handle).unwrap().id(),
+            serde_json::from_value::<CloseInput>(handle)
+                .unwrap()
+                .target()
+                .0,
             "child"
         );
         assert_eq!(
-            serde_json::from_value::<CloseInput>(id).unwrap().id(),
+            serde_json::from_value::<CloseInput>(id).unwrap().target().0,
             "child"
+        );
+        assert_eq!(
+            serde_json::from_value::<CloseInput>(call_id)
+                .unwrap()
+                .target(),
+            ("call_123".into(), true)
         );
         assert!(
             serde_json::from_value::<CloseInput>(json!({"id": "child", "extra": true})).is_err()

@@ -30,7 +30,9 @@ Retries repeat the body. Do not retry a write unless repeating it is safe or the
 
 `background` is an optional argument on the outer `compose` tool call, not a Runlet expression. `true` starts the program in the background, a positive integer keeps it in the foreground for that many seconds before detaching it, and `false` or omission keeps it in the foreground. Delays are limited to integers from 1 through 86,400 seconds. Invalid values fail as tool input.
 
-Background calls no longer hold their originating turn open. The TUI keeps every running call visible; select a tool card to inspect its runtime graph. Completion or failure is delivered back to the owning session, and completion wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
+Background calls no longer hold their originating turn open, and interrupting that turn does not stop them. When a call detaches, the model receives its tool-call ID and can stop it with `close({ call_id: "call_..." })`. Cancellation is delivered through the same result lifecycle as completion, as a failed result reporting that tool execution was cancelled.
+
+The TUI keeps every running call visible; select a tool card to inspect its runtime graph. Completion or failure is delivered back to the owning session and wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
 
 ## Ordering, dependencies, and concurrency
 

@@ -52,7 +52,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
     events::{self, EVENTS_ENV},
-    protocols::acp::CancelBackgroundRequest,
+    protocols::acp::{CancelBackgroundRequest, TurnStateNotification},
     tools::mcp::CredentialStorage,
 };
 
@@ -245,6 +245,24 @@ pub async fn run(
                     let _ = notifications.send(update);
                 }
                 Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            {
+                let turn_states = updates_tx.clone();
+                async move |notification: TurnStateNotification, _cx| {
+                    let update = if notification.active {
+                        Update::AutonomousTurnStarted(notification.turn_id)
+                    } else {
+                        Update::AutonomousTurnEnded {
+                            id: notification.turn_id,
+                            error: notification.error,
+                        }
+                    };
+                    let _ = turn_states.send(update);
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_notification!(),
         )

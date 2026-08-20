@@ -282,9 +282,13 @@ top-level `background` argument. `background: true` starts it in the background;
 it if it is still running. `false` or omission keeps normal foreground behavior.
 The delay must be an integer from 1 through 86,400 seconds.
 
-Detached calls remain visible and selectable in the TUI runtime graph, and their
-result is delivered to the session when ready. They are scoped to the live Kit
-session/process; closing it does not create durable external jobs.
+Detached calls remain visible and selectable in the TUI runtime graph. Interrupting
+the originating turn does not stop them. The model receives each detached call's ID
+and can cancel it with `close({ call_id: "call_..." })`; the selected running
+background call can also be killed with `Ctrl+K` in the TUI. Completion and
+cancellation are delivered through the normal background-result lifecycle. Detached
+calls are scoped to the live Kit session/process; closing it does not create durable
+external jobs.
 
 ## Reusable subagents
 

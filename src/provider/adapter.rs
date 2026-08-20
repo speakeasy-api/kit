@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use agentkit_core::{TurnCancellation, Usage};
+use agentkit_core::{Part, ToolOutput, TurnCancellation, Usage};
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
@@ -193,13 +193,33 @@ impl ModelAdapter for SelectableAdapter {
     }
 }
 
+fn expose_background_call_ids(request: &mut TurnRequest) {
+    const DETACHED: &str = "is now running in the background";
+    for item in &mut request.transcript {
+        for part in &mut item.parts {
+            let Part::ToolResult(result) = part else {
+                continue;
+            };
+            let ToolOutput::Text(text) = &mut result.output else {
+                continue;
+            };
+            if text.contains(DETACHED) {
+                *text = format!(
+                    "Tool call ID: {} is running in the background.\nIt runs until result or failure is delivered.",
+                    result.call_id
+                );
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ModelSession for SelectableSession {
     type Turn = KitTurn;
 
     async fn begin_turn(
         &mut self,
-        request: TurnRequest,
+        mut request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
         let selected = self
@@ -218,6 +238,7 @@ impl ModelSession for SelectableSession {
             .await?;
             self.active = selected;
         }
+        expose_background_call_ids(&mut request);
         self.inner.begin_turn(request, cancellation).await
     }
 
@@ -580,13 +601,53 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use agentkit_core::{TokenUsage, Usage};
+    use agentkit_core::{
+        Item, ItemKind, MetadataMap, Part, SessionId, TokenUsage, ToolCallId, ToolOutput,
+        ToolResultPart, TurnId, Usage,
+    };
+    use agentkit_loop::TurnRequest;
     use serde_json::json;
 
     use super::{
         ModelSelection, OPENROUTER_MODELS_URL, ProviderKind, SelectableAdapter, add_context_window,
-        catalog_models_url, models_url, parse_context_window,
+        catalog_models_url, expose_background_call_ids, models_url, parse_context_window,
     };
+
+    #[test]
+    fn detached_results_tell_the_model_their_call_id() {
+        let mut request = TurnRequest {
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn"),
+            transcript: vec![Item {
+                id: None,
+                kind: ItemKind::Tool,
+                parts: vec![Part::ToolResult(ToolResultPart::success(
+                    ToolCallId::new("call_background"),
+                    ToolOutput::Text("Tool compose is now running in the background. The result will be delivered when it completes.".into()),
+                ))],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            }],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        };
+
+        expose_background_call_ids(&mut request);
+
+        let Part::ToolResult(result) = &request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        let ToolOutput::Text(text) = &result.output else {
+            panic!("expected text output");
+        };
+        assert_eq!(
+            text,
+            "Tool call ID: call_background is running in the background.\nIt runs until result or failure is delivered."
+        );
+    }
 
     #[test]
     fn model_selection_ids_round_trip_and_switch_atomically() {

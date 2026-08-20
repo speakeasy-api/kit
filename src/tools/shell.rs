@@ -236,14 +236,18 @@ mod tests {
         ));
         isolate_process_tree(&mut command);
         let mut child = command.spawn().unwrap();
-        while !pid_file.exists() {
-            tokio::task::yield_now().await;
-        }
-        let descendant: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let descendant = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = contents.trim().parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shell did not report its descendant PID");
 
         kill_process_tree(&mut child).await;
 

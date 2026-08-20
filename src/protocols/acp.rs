@@ -45,6 +45,17 @@ pub(crate) struct CancelBackgroundResponse {
     pub cancelled: bool,
 }
 
+/// Kit-private ACP notification that keeps the bundled TUI synchronized with
+/// turns started autonomously by background task results.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[notification(method = "kit/turn/state")]
+pub(crate) struct TurnStateNotification {
+    pub session_id: agentkit_acp::SessionId,
+    pub turn_id: u64,
+    pub active: bool,
+    pub error: Option<String>,
+}
+
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(error.to_string())
 }
@@ -105,7 +116,9 @@ impl Server {
         let agentkit_session_id = AgentkitSessionId::new(acp_session_id.to_string());
         let cancellation = CancellationController::new();
         let (client, messages) = AcpClientHandle::channel();
-        tokio::spawn(drain_client_messages(messages, connection));
+        tokio::spawn(drain_client_messages(messages, connection.clone()));
+        let (turn_states, turn_state_messages) = mpsc::unbounded_channel();
+        tokio::spawn(drain_turn_states(turn_state_messages, connection));
 
         let mut metadata = MetadataMap::new();
         metadata.insert("acp.cwd".into(), json!(request.cwd));
@@ -153,6 +166,7 @@ impl Server {
             driver.adapter,
             catalog,
             rx,
+            turn_states,
         ));
         Ok(NewSessionResponse::new(acp_session_id).config_options(Some(options)))
     }
@@ -259,7 +273,9 @@ async fn session_actor<S: ModelSession>(
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
     mut commands: mpsc::Receiver<Command>,
+    turn_states: mpsc::UnboundedSender<TurnStateNotification>,
 ) {
+    let mut next_autonomous_turn_id = 0_u64;
     loop {
         tokio::select! {
             // A queued cancel or close wins over a simultaneously-ready task
@@ -293,11 +309,27 @@ async fn session_actor<S: ModelSession>(
                 Some(TaskEvent::Completed(snapshot, _))
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background =>
                 {
-                    if let Err(error) = drive_autonomous(
+                    next_autonomous_turn_id = next_autonomous_turn_id.wrapping_add(1);
+                    let turn_id = next_autonomous_turn_id;
+                    let _ = turn_states.send(TurnStateNotification {
+                        session_id: session_id.clone(),
+                        turn_id,
+                        active: true,
+                        error: None,
+                    });
+                    let result = drive_autonomous(
                         &session_id,
                         &integration,
                         &mut driver,
-                    ).await {
+                    ).await;
+                    let error = result.as_ref().err().map(ToString::to_string);
+                    let _ = turn_states.send(TurnStateNotification {
+                        session_id: session_id.clone(),
+                        turn_id,
+                        active: false,
+                        error,
+                    });
+                    if let Err(error) = result {
                         eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
                     }
                 }
@@ -587,6 +619,15 @@ fn capabilities() -> agentkit_acp::AgentCapabilities {
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
         )
+}
+
+async fn drain_turn_states(
+    mut states: mpsc::UnboundedReceiver<TurnStateNotification>,
+    connection: ConnectionTo<Client>,
+) {
+    while let Some(state) = states.recv().await {
+        let _ = connection.send_notification(state);
+    }
 }
 
 async fn drain_client_messages(
@@ -941,6 +982,7 @@ mod tests {
             .await
             .unwrap();
         let (commands_tx, commands_rx) = mpsc::channel(8);
+        let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
         let actor = tokio::spawn(session_actor(
             acp_session_id.clone(),
             Arc::clone(&integration),
@@ -949,13 +991,14 @@ mod tests {
             SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap(),
             Vec::new(),
             commands_rx,
+            turn_states_tx,
         ));
 
         let (reply_tx, reply_rx) = oneshot::channel();
         commands_tx
             .send(Command::Prompt {
                 request: PromptRequest::new(
-                    acp_session_id,
+                    acp_session_id.clone(),
                     vec![agentkit_acp::ContentBlock::Text(
                         agentkit_acp::TextContent::new("start one background call"),
                     )],
@@ -993,6 +1036,12 @@ mod tests {
         .await
         .expect("completion did not produce an unsolicited agent update");
         assert_eq!(notification.session_id.to_string(), "actor-session");
+        let started = turn_states_rx.recv().await.expect("missing turn start");
+        let ended = turn_states_rx.recv().await.expect("missing turn end");
+        assert!(started.active);
+        assert!(!ended.active);
+        assert_eq!(started.turn_id, ended.turn_id);
+        assert_eq!(started.session_id, acp_session_id);
         assert_eq!(turns.load(Ordering::SeqCst), 2);
         assert_eq!(
             user_items_seen.load(Ordering::SeqCst),
