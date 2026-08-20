@@ -204,6 +204,7 @@ impl AcpHarnesses {
         if let Some(path) = config.credential_storage.directory() {
             command.arg("--credential-dir").arg(path);
         }
+        config.telemetry.append_cli_args(&mut command);
         Ok(command)
     }
 }
@@ -255,6 +256,7 @@ pub(crate) struct ChildConfig {
     pub provider: crate::ProviderKind,
     pub mcp_config: Option<PathBuf>,
     pub credential_storage: CredentialStorage,
+    pub telemetry: crate::telemetry::Settings,
     pub harnesses: AcpHarnesses,
     pub default_harness: String,
 }
@@ -932,6 +934,7 @@ mod tests {
             provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
+            telemetry: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
             default_harness: "acp.broken".into(),
         };
@@ -981,6 +984,7 @@ mod tests {
             provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
+            telemetry: Default::default(),
             harnesses: harnesses.clone(),
             default_harness: "acp.other".into(),
         };
@@ -1015,6 +1019,13 @@ mod tests {
             provider: crate::ProviderKind::OpenRouter,
             mcp_config: None,
             credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
+            telemetry: crate::telemetry::Settings::try_new(
+                Some("http://collector:4317".into()),
+                false,
+                12,
+                4096,
+            )
+            .unwrap(),
             harnesses: harnesses.clone(),
             default_harness: BUILTIN_HARNESS.into(),
         };
@@ -1054,6 +1065,22 @@ mod tests {
             pair[0] == "--credential-dir"
                 && pair[1] == root.path().join("credentials").to_string_lossy()
         }));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--otel-endpoint", "http://collector:4317"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--otel-capture-message-content", "false"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--otel-message-content-max-messages", "12"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--otel-message-content-max-bytes", "4096"] })
+        );
         assert_eq!(command.as_std().get_current_dir(), Some(root.path()));
     }
 
@@ -1075,6 +1102,7 @@ mod tests {
             provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
+            telemetry: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
             default_harness: "acp.broken".into(),
         };
@@ -1130,6 +1158,7 @@ mod tests {
             provider: Default::default(),
             mcp_config: None,
             credential_storage: Default::default(),
+            telemetry: Default::default(),
             harnesses,
             default_harness: "acp.mock".into(),
         };

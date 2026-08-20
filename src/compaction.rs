@@ -8,7 +8,7 @@ use agentkit_compaction::{
 use agentkit_core::{FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, Timestamp};
 use agentkit_loop::{
     Agent, AgentEvent, LoopCtx, LoopError, LoopInterrupt, LoopMutator, LoopStep, ModelAdapter,
-    MutationPoint, SessionConfig, TranscriptCursor,
+    MutationPoint, SessionConfig, TelemetryConfig, TranscriptCursor,
 };
 use async_trait::async_trait;
 use std::time::Instant;
@@ -46,6 +46,7 @@ fn manual_message(item: &Item) -> Option<&str> {
 /// remains disabled rather than guessing at a safe limit.
 pub fn automatic<M>(
     adapter: M,
+    telemetry: TelemetryConfig,
     persistence: Option<SessionObserver>,
     session_id: impl Into<SessionId>,
 ) -> Result<AutomaticCompactor, String>
@@ -54,6 +55,7 @@ where
 {
     let backend = KitCompactionBackend {
         adapter,
+        telemetry,
         session_id: session_id.into(),
     };
     let inner = StrategyCompactor::new(
@@ -74,6 +76,7 @@ where
 
 struct KitCompactionBackend<M> {
     adapter: M,
+    telemetry: TelemetryConfig,
     session_id: SessionId,
 }
 
@@ -98,16 +101,19 @@ where
         // the durable state in a coding session.
         let rendered = serde_json::to_string_pretty(&request.items)
             .map_err(|error| CompactionError::Failed(error.to_string()))?;
-        let mut builder = Agent::builder().model(self.adapter.clone()).input(vec![
-            Item::text(
-                ItemKind::System,
-                "Compress the supplied transcript into a durable context note for a coding \
+        let mut builder = Agent::builder()
+            .model(self.adapter.clone())
+            .input(vec![
+                Item::text(
+                    ItemKind::System,
+                    "Compress the supplied transcript into a durable context note for a coding \
                  agent that will not see the original messages. Preserve requirements, exact \
                  paths and symbols, decisions, edits, command results, failures, and unfinished \
                  work. Drop chatter and chain-of-thought. Return only the context note.",
-            ),
-            Item::text(ItemKind::User, rendered),
-        ]);
+                ),
+                Item::text(ItemKind::User, rendered),
+            ])
+            .telemetry(self.telemetry);
         if let Some(cancellation) = &cancellation {
             builder = builder.cancellation(cancellation.handle().clone());
         }

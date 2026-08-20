@@ -37,6 +37,7 @@ const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 const PROVIDER_REQUEST_DIGEST: &str = "kit.model_call.request_digest";
+const PROVIDER_FINISH_REASONS_METADATA: &str = "agentkit.provider_finish_reasons";
 pub(crate) const CONTINUATION_METADATA: &str = "openai.subscription.v1";
 const CONTINUATION_SCHEMA_VERSION: u64 = 1;
 
@@ -309,6 +310,10 @@ impl ModelSession for OpenAiSubscriptionSession {
 
     fn model_name(&self) -> Option<&str> {
         Some(&self.config.model)
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("openai-subscription")
     }
 }
 
@@ -868,7 +873,9 @@ impl OpenAiSubscriptionTurn {
         {
             self.queued.push_back(ModelTurnEvent::ToolCall(call));
         }
-        let metadata = model_metadata(self.header_model.as_deref(), self.response_model.as_deref());
+        let mut metadata =
+            model_metadata(self.header_model.as_deref(), self.response_model.as_deref());
+        set_provider_finish_reasons(&mut metadata, ["completed"]);
         self.queued
             .push_back(ModelTurnEvent::Finished(ModelTurnResult {
                 finish_reason: if self.tool_call {
@@ -924,7 +931,9 @@ impl OpenAiSubscriptionTurn {
             _ => return Err(protocol("unsupported response.incomplete reason")),
         };
         self.completed = true;
-        let metadata = model_metadata(self.header_model.as_deref(), self.response_model.as_deref());
+        let mut metadata =
+            model_metadata(self.header_model.as_deref(), self.response_model.as_deref());
+        set_provider_finish_reasons(&mut metadata, [reason]);
         self.queued
             .push_back(ModelTurnEvent::Finished(ModelTurnResult {
                 finish_reason,
@@ -1885,6 +1894,23 @@ fn retriable_status_code(status: u64) -> bool {
     status == 408 || status == 409 || status == 429 || (500..=599).contains(&status)
 }
 
+fn set_provider_finish_reasons<'a>(
+    metadata: &mut MetadataMap,
+    reasons: impl IntoIterator<Item = &'a str>,
+) {
+    let reasons = reasons
+        .into_iter()
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| Value::String(reason.to_owned()))
+        .collect::<Vec<_>>();
+    if !reasons.is_empty() {
+        metadata.insert(
+            PROVIDER_FINISH_REASONS_METADATA.to_owned(),
+            Value::Array(reasons),
+        );
+    }
+}
+
 fn model_metadata(header: Option<&str>, observed: Option<&str>) -> MetadataMap {
     let mut metadata = MetadataMap::new();
     if let Some(observed) = observed {
@@ -1905,18 +1931,118 @@ fn protocol(message: &str) -> LoopError {
 
 #[cfg(test)]
 mod usage_tests {
-    use std::time::Duration;
+    use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use agentkit_core::{CancellationController, Delta, Part, PartKind};
-    use agentkit_loop::{LoopError, ModelTurn, ModelTurnEvent};
+    use agentkit_loop::{LoopError, ModelSession, ModelTurn, ModelTurnEvent};
     use bytes::Bytes;
     use futures_util::stream;
     use serde_json::json;
 
     use super::{
-        CONTINUATION_METADATA, MAX_RETRY_AFTER, OpenAiSubscriptionTurn, classify_response_failure,
-        classify_top_level_error, parse_context_windows, parse_usage,
+        CONTINUATION_METADATA, MAX_RETRY_AFTER, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
+        PROVIDER_FINISH_REASONS_METADATA, SubscriptionConfig, classify_response_failure,
+        classify_top_level_error, parse_context_windows, parse_usage, set_provider_finish_reasons,
     };
+
+    #[test]
+    fn subscription_session_reports_initial_provider_identity() {
+        let session = OpenAiSubscriptionSession {
+            config: SubscriptionConfig::new("gpt-5.4".into()).unwrap(),
+            client: reqwest::Client::new(),
+            session_id: "provider-identity-test".into(),
+            binding: super::auth::CredentialBinding {
+                account_id: "test-account".into(),
+                generation: "test-generation".into(),
+            },
+            context_windows: Arc::new(HashMap::new()),
+        };
+
+        assert_eq!(session.provider_name(), Some("openai-subscription"));
+    }
+
+    #[test]
+    fn provider_finish_reasons_filter_empty_values() {
+        let mut metadata = Default::default();
+
+        set_provider_finish_reasons(&mut metadata, ["", "completed", ""]);
+
+        assert_eq!(
+            metadata[PROVIDER_FINISH_REASONS_METADATA],
+            json!(["completed"])
+        );
+    }
+
+    #[test]
+    fn completed_and_incomplete_responses_keep_native_finish_reasons() {
+        let mut completed = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        completed
+            .consume_value(
+                "response.created",
+                &json!({"type": "response.created", "response": {}}),
+            )
+            .unwrap();
+        completed
+            .consume_value(
+                "response.completed",
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "response-completed"}
+                }),
+            )
+            .unwrap();
+        let completed = completed
+            .queued
+            .iter()
+            .find_map(|event| match event {
+                ModelTurnEvent::Finished(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            completed.metadata[PROVIDER_FINISH_REASONS_METADATA],
+            json!(["completed"])
+        );
+
+        for (reason, expected) in [
+            ("max_output_tokens", agentkit_core::FinishReason::MaxTokens),
+            ("content_filter", agentkit_core::FinishReason::Blocked),
+        ] {
+            let mut incomplete =
+                OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+            incomplete
+                .consume_value(
+                    "response.created",
+                    &json!({"type": "response.created", "response": {}}),
+                )
+                .unwrap();
+            incomplete
+                .consume_value(
+                    "response.incomplete",
+                    &json!({
+                        "type": "response.incomplete",
+                        "response": {
+                            "id": "response-incomplete",
+                            "incomplete_details": {"reason": reason}
+                        }
+                    }),
+                )
+                .unwrap();
+            let incomplete = incomplete
+                .queued
+                .iter()
+                .find_map(|event| match event {
+                    ModelTurnEvent::Finished(result) => Some(result),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(incomplete.finish_reason, expected);
+            assert_eq!(
+                incomplete.metadata[PROVIDER_FINISH_REASONS_METADATA],
+                json!([reason])
+            );
+        }
+    }
 
     #[test]
     fn responses_keepalive_and_unknown_events_are_ignored() {

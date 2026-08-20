@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use agent_client_protocol::{Client, ConnectionTo, Handled};
 use agentkit_acp::{
@@ -80,11 +74,32 @@ struct SessionHandle {
     background_jobs: BackgroundJobs,
 }
 
+/// Owns an ACP integration binding for an in-flight request or live actor.
+/// Dropping either owner must release the durable identity.
+struct SessionBindingGuard {
+    integration: Arc<AcpIntegration>,
+    session_id: agentkit_acp::SessionId,
+}
+
+impl SessionBindingGuard {
+    fn new(integration: Arc<AcpIntegration>, session_id: agentkit_acp::SessionId) -> Self {
+        Self {
+            integration,
+            session_id,
+        }
+    }
+}
+
+impl Drop for SessionBindingGuard {
+    fn drop(&mut self) {
+        let _ = self.integration.unbind_session(&self.session_id);
+    }
+}
+
 struct Server {
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     sessions: Mutex<HashMap<agentkit_acp::SessionId, SessionHandle>>,
-    next_session: AtomicU64,
 }
 
 impl Server {
@@ -93,7 +108,6 @@ impl Server {
             runtime,
             integration: Arc::new(integration),
             sessions: Mutex::new(HashMap::new()),
-            next_session: AtomicU64::new(1),
         }
     }
 
@@ -111,9 +125,11 @@ impl Server {
         request: NewSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<NewSessionResponse, AcpRuntimeError> {
-        let id = self.next_session.fetch_add(1, Ordering::Relaxed);
-        let acp_session_id = agentkit_acp::SessionId::new(format!("session-{id}"));
-        let agentkit_session_id = AgentkitSessionId::new(acp_session_id.to_string());
+        // Claim the durable identity before binding ACP so every layer uses
+        // the same id and any bind failure releases the configured selection.
+        let mut claim = self.runtime.claim_session()?;
+        let session_id = agentkit_acp::SessionId::new(claim.id());
+        let agentkit_session_id = AgentkitSessionId::new(claim.id());
         let cancellation = CancellationController::new();
         let (client, messages) = AcpClientHandle::channel();
         tokio::spawn(drain_client_messages(messages, connection.clone()));
@@ -126,49 +142,53 @@ impl Server {
             "acp.additional_directories".into(),
             json!(request.additional_directories),
         );
-        let binding =
-            AcpSessionBinding::new(acp_session_id.clone(), agentkit_session_id.clone(), client)
-                .cancellation(cancellation)
-                .workspace(request.cwd.clone(), request.additional_directories.clone())
-                .metadata(metadata.clone());
+        let binding = AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client)
+            .cancellation(cancellation)
+            .workspace(request.cwd.clone(), request.additional_directories.clone())
+            .metadata(metadata.clone());
         let handle = self.integration.bind_session(binding)?;
+        let binding = SessionBindingGuard::new(Arc::clone(&self.integration), session_id.clone());
         let context = AcpDriverContext {
-            acp_session_id: acp_session_id.clone(),
-            agentkit_session_id,
             cwd: request.cwd,
             additional_directories: request.additional_directories,
             integration: Arc::clone(&self.integration),
             cancellation: handle.cancellation_handle(),
         };
-        let driver = match self.runtime.start_acp_driver(context).await {
-            Ok(driver) => driver,
-            Err(error) => {
-                let _ = self.integration.unbind_session(&acp_session_id);
-                return Err(error);
-            }
-        };
-        let (tx, rx) = mpsc::channel(8);
-        self.sessions.lock().await.insert(
-            acp_session_id.clone(),
-            SessionHandle {
-                commands: tx,
-                background_jobs: driver.background_jobs.clone(),
-            },
-        );
+        let driver = self.runtime.start_acp_driver(context, &mut claim).await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let catalog = model_catalog(&current).await;
         let options = model_options(&current, &catalog);
-        tokio::spawn(session_actor(SessionActor {
-            session_id: acp_session_id.clone(),
+        let background_jobs = driver.background_jobs.clone();
+        let (tx, rx) = mpsc::channel(8);
+        let actor = SessionActor {
+            session_id: session_id.clone(),
             integration: Arc::clone(&self.integration),
+            binding,
             driver: driver.driver,
             tasks: driver.tasks,
             adapter: driver.adapter,
             catalog,
             commands: rx,
             turn_states,
-        }));
-        Ok(NewSessionResponse::new(acp_session_id).config_options(Some(options)))
+        };
+
+        // Hold the map lock across the synchronous commit/publication boundary.
+        // Once the claim commits there are no remaining cancellation points.
+        let mut sessions = self.sessions.lock().await;
+        claim.commit()?;
+        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
+            session_id: session_id.to_string(),
+        });
+        sessions.insert(
+            session_id.clone(),
+            SessionHandle {
+                commands: tx,
+                background_jobs,
+            },
+        );
+        tokio::spawn(session_actor(actor));
+        drop(sessions);
+        Ok(NewSessionResponse::new(session_id).config_options(Some(options)))
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, AcpRuntimeError> {
@@ -221,18 +241,12 @@ impl Server {
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
         let (tx, rx) = oneshot::channel();
-        let closed = async {
-            sender
-                .commands
-                .send(Command::Close { reply: tx })
-                .await
-                .map_err(|_| AcpRuntimeError::ClientClosed)?;
-            rx.await.map_err(|_| AcpRuntimeError::ClientClosed)
-        }
-        .await;
-        let unbound = self.integration.unbind_session(&request.session_id);
-        closed?;
-        unbound?;
+        sender
+            .commands
+            .send(Command::Close { reply: tx })
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?;
         Ok(CloseSessionResponse::new())
     }
 
@@ -268,6 +282,7 @@ impl Server {
 struct SessionActor<S: ModelSession> {
     session_id: agentkit_acp::SessionId,
     integration: Arc<AcpIntegration>,
+    binding: SessionBindingGuard,
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
     adapter: SelectableAdapter,
@@ -280,6 +295,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
         session_id,
         integration,
+        binding,
         mut driver,
         tasks,
         adapter,
@@ -287,6 +303,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         mut commands,
         turn_states,
     } = actor;
+    let mut binding = Some(binding);
     let mut next_autonomous_turn_id = 0_u64;
     loop {
         tokio::select! {
@@ -307,6 +324,9 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 }
                 Some(Command::Close { reply }) => {
                     clean_up_session(&session_id, &mut driver, &tasks).await;
+                    // A close acknowledgement means the actor-owned binding is
+                    // already gone, so callers can immediately reuse the id.
+                    drop(binding.take());
                     let _ = reply.send(());
                     break;
                 }
@@ -673,7 +693,7 @@ async fn drain_client_messages(
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::atomic::{AtomicBool, AtomicUsize},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use agent_client_protocol::{Channel, schema::ProtocolVersion};
@@ -696,6 +716,42 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn dropping_an_in_flight_binding_guard_releases_the_durable_identity() {
+        let integration = Arc::new(
+            AcpIntegration::builder()
+                .name("binding-guard-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+        );
+        let session_id = agentkit_acp::SessionId::new("s-binding-guard");
+        let agentkit_session_id = AgentkitSessionId::new("s-binding-guard");
+        let (client, _messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                agentkit_session_id.clone(),
+                client,
+            ))
+            .unwrap();
+
+        drop(SessionBindingGuard::new(
+            Arc::clone(&integration),
+            session_id.clone(),
+        ));
+
+        let (client, _messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                agentkit_session_id,
+                client,
+            ))
+            .expect("dropped request left the durable identity bound");
+        integration.unbind_session(&session_id).unwrap();
+    }
 
     struct ScriptAdapter {
         turns: Arc<AtomicUsize>,
@@ -873,8 +929,8 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let acp_session_id = agentkit_acp::SessionId::new("cancel-session");
-        let agentkit_session_id = AgentkitSessionId::new("cancel-loop");
+        let acp_session_id = agentkit_acp::SessionId::new("s-cancel-session");
+        let agentkit_session_id = AgentkitSessionId::new("s-cancel-session");
         let (client, mut messages) = AcpClientHandle::channel();
         integration
             .bind_session(AcpSessionBinding::new(
@@ -930,8 +986,8 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let acp_session_id = agentkit_acp::SessionId::new("actor-session");
-        let agentkit_session_id = AgentkitSessionId::new("actor-loop");
+        let acp_session_id = agentkit_acp::SessionId::new("s-actor-session");
+        let agentkit_session_id = AgentkitSessionId::new("s-actor-session");
         let (client, mut messages) = AcpClientHandle::channel();
         let cancellation = CancellationController::new();
         integration
@@ -998,6 +1054,7 @@ mod tests {
         let actor = tokio::spawn(session_actor(SessionActor {
             session_id: acp_session_id.clone(),
             integration: Arc::clone(&integration),
+            binding: SessionBindingGuard::new(Arc::clone(&integration), acp_session_id.clone()),
             driver,
             tasks,
             adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
@@ -1048,7 +1105,7 @@ mod tests {
         })
         .await
         .expect("completion did not produce an unsolicited agent update");
-        assert_eq!(notification.session_id.to_string(), "actor-session");
+        assert_eq!(notification.session_id.to_string(), "s-actor-session");
         let started = turn_states_rx.recv().await.expect("missing turn start");
         let ended = turn_states_rx.recv().await.expect("missing turn end");
         assert!(started.active);
@@ -1071,6 +1128,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let (client, _messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                acp_session_id.clone(),
+                AgentkitSessionId::new(acp_session_id.to_string()),
+                client,
+            ))
+            .expect("actor exit left the durable identity bound");
+        integration.unbind_session(&acp_session_id).unwrap();
         timeout(Duration::from_secs(1), actor)
             .await
             .unwrap()

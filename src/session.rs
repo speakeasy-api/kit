@@ -51,8 +51,33 @@ struct Writer {
 struct SessionLock {
     path: PathBuf,
     token: String,
-    // Retaining the OS lock closes the token check/write race.
-    _file: File,
+    // Retaining the OS lock closes the token check/write race. The option lets
+    // Drop close the handle before removing the path on Windows.
+    file: Option<File>,
+}
+
+/// Removes an incompletely bootstrapped new transcript unless opening commits.
+struct CreatedTranscript {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl CreatedTranscript {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for CreatedTranscript {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Generates a path-safe id that remains unique across Kit processes.
@@ -135,6 +160,7 @@ pub(crate) fn remove_stale_lock_in(directory: &Path, session_id: &str) -> Result
     };
     file.try_lock()
         .map_err(|_| "session lock is still held by a live Kit instance".to_string())?;
+    drop(file);
     fs::remove_file(&path).map_err(|error| format!("could not remove stale session lock: {error}"))
 }
 
@@ -212,12 +238,17 @@ fn open_with_initial_timestamps_in(
     } else {
         (Vec::new(), 0)
     };
-    let file = OpenOptions::new()
-        .read(true)
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.read(true).append(true);
+    if resume {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    let file = options
         .open(&path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let mut created = (!resume).then(|| CreatedTranscript::new(path.clone()));
     let mut writer = Writer {
         session_id: session_id.into(),
         generation,
@@ -247,6 +278,9 @@ fn open_with_initial_timestamps_in(
     // to its own call.
     for item in crate::transcript::repair_unanswered_tool_calls(&mut transcript) {
         writer.append(&item)?;
+    }
+    if let Some(created) = created.take() {
+        created.keep();
     }
     Ok(OpenSession {
         transcript,
@@ -407,6 +441,18 @@ impl std::fmt::Display for LockError {
 
 impl SessionLock {
     fn acquire(path: PathBuf, force: bool) -> Result<Self, String> {
+        Self::acquire_with(path, force, |file, token| {
+            file.set_len(0)
+                .and_then(|_| file.write_all(token.as_bytes()))
+                .and_then(|_| file.sync_all())
+        })
+    }
+
+    fn acquire_with(
+        path: PathBuf,
+        force: bool,
+        initialize: impl FnOnce(&mut File, &str) -> io::Result<()>,
+    ) -> Result<Self, String> {
         let token = format!("{}:{}:{}", std::process::id(), new_id(), SCHEMA_VERSION);
         let mut options = OpenOptions::new();
         options.read(true).write(true);
@@ -422,20 +468,26 @@ impl SessionLock {
                 format!("could not acquire session lock {}: {error}", path.display())
             }
         })?;
-        file.try_lock().map_err(|_| {
-            format!(
+        if file.try_lock().is_err() {
+            if !force {
+                remove_failed_lock(&path, file);
+            }
+            return Err(format!(
                 "session is actively locked by another Kit instance ({})",
                 path.display()
-            )
-        })?;
-        file.set_len(0)
-            .and_then(|_| file.write_all(token.as_bytes()))
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("could not write session lock: {error}"))?;
+            ));
+        }
+        if let Err(error) = initialize(&mut file, &token) {
+            // The OS lock proves this process owns mutation authority even for
+            // a forced stale-lock takeover. Close before removing so a failed
+            // token write cannot leave a corrupted path on Windows.
+            remove_failed_lock(&path, file);
+            return Err(format!("could not write session lock: {error}"));
+        }
         Ok(Self {
             path,
             token,
-            _file: file,
+            file: Some(file),
         })
     }
 
@@ -457,9 +509,15 @@ impl SessionLock {
     }
 }
 
+fn remove_failed_lock(path: &Path, file: File) {
+    drop(file);
+    let _ = fs::remove_file(path);
+}
+
 impl Drop for SessionLock {
     fn drop(&mut self) {
         if self.check().is_ok() {
+            drop(self.file.take());
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -600,7 +658,7 @@ fn lock_path(directory: &Path, session_id: &str) -> PathBuf {
     directory.join(format!("{session_id}.lock"))
 }
 
-fn validate_id(value: &str) -> Result<(), String> {
+pub(crate) fn validate_id(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 128
         || !value
@@ -662,6 +720,70 @@ mod tests {
 
     fn transcript_path(root: &Path, session_id: &str) -> PathBuf {
         super::transcript_path(&session_directory(root), session_id)
+    }
+
+    #[test]
+    fn generated_ids_are_valid_unique_and_durable() {
+        let first = new_id();
+        let second = new_id();
+        assert!(first.starts_with("s-"));
+        assert!(second.starts_with("s-"));
+        assert_ne!(first, second);
+        assert!(first.len() <= 128);
+        validate_id(&first).unwrap();
+        validate_id(&second).unwrap();
+    }
+
+    #[test]
+    fn incomplete_new_transcript_is_removed_but_committed_transcript_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let failed = root.path().join("failed.jsonl");
+        fs::write(&failed, "partial").unwrap();
+        drop(CreatedTranscript::new(failed.clone()));
+        assert!(!failed.exists());
+
+        let committed = root.path().join("committed.jsonl");
+        fs::write(&committed, "complete").unwrap();
+        CreatedTranscript::new(committed.clone()).keep();
+        assert!(committed.exists());
+    }
+
+    #[test]
+    fn failed_lock_token_initialization_removes_new_lock_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("failed.lock");
+        let error = SessionLock::acquire_with(path.clone(), false, |_, _| {
+            Err(io::Error::other("injected token failure"))
+        })
+        .err()
+        .expect("injected token initialization unexpectedly succeeded");
+        assert!(error.contains("injected token failure"));
+        assert!(!path.exists(), "failed initialization left a lock path");
+
+        drop(SessionLock::acquire(path.clone(), false).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_forced_lock_token_initialization_removes_corrupted_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("failed-force.lock");
+        fs::write(&path, "stale owner").unwrap();
+
+        let error = SessionLock::acquire_with(path.clone(), true, |file, _| {
+            file.set_len(0)?;
+            Err(io::Error::other("injected forced token failure"))
+        })
+        .err()
+        .expect("injected forced initialization unexpectedly succeeded");
+
+        assert!(error.contains("injected forced token failure"));
+        assert!(
+            !path.exists(),
+            "failed forced initialization left a lock path"
+        );
+        drop(SessionLock::acquire(path.clone(), false).unwrap());
+        assert!(!path.exists());
     }
 
     #[test]

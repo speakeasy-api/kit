@@ -189,7 +189,10 @@ impl ModelAdapter for SelectableAdapter {
     }
 
     fn provider_name(&self) -> Option<&str> {
-        Some("kit-selectable")
+        self.selection
+            .lock()
+            .ok()
+            .map(|selection| selection.provider.as_str())
     }
 }
 
@@ -228,15 +231,15 @@ impl ModelSession for SelectableSession {
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("model selection lock is poisoned".into()))?;
         if selected != self.active {
-            self.inner = KitAdapter::new_with_credentials(
+            let replacement = KitAdapter::new_with_credentials(
                 selected.provider,
                 selected.model.clone(),
                 self.credential_storage.clone(),
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
-            .await?;
-            self.active = selected;
+            .await;
+            self.replace_active(selected, replacement)?;
         }
         expose_background_call_ids(&mut request);
         self.inner.begin_turn(request, cancellation).await
@@ -244,6 +247,23 @@ impl ModelSession for SelectableSession {
 
     fn model_name(&self) -> Option<&str> {
         Some(&self.active.model)
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some(self.active.provider.as_str())
+    }
+}
+
+impl SelectableSession {
+    fn replace_active(
+        &mut self,
+        selected: ModelSelection,
+        replacement: Result<KitSession, LoopError>,
+    ) -> Result<(), LoopError> {
+        let replacement = replacement?;
+        self.inner = replacement;
+        self.active = selected;
+        Ok(())
     }
 }
 
@@ -381,6 +401,13 @@ impl ModelSession for KitSession {
         match self {
             Self::OpenAiSubscription(session) => session.model_name(),
             Self::OpenRouter(session) => session.inner.model_name(),
+        }
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        match self {
+            Self::OpenAiSubscription(session) => session.provider_name(),
+            Self::OpenRouter(session) => session.inner.provider_name(),
         }
     }
 }
@@ -601,16 +628,20 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use agentkit_core::{
         Item, ItemKind, MetadataMap, Part, SessionId, TokenUsage, ToolCallId, ToolOutput,
         ToolResultPart, TurnId, Usage,
     };
-    use agentkit_loop::TurnRequest;
+    use agentkit_loop::{LoopError, ModelAdapter, ModelSession, SessionConfig, TurnRequest};
+    use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
     use serde_json::json;
 
     use super::{
-        ModelSelection, OPENROUTER_MODELS_URL, ProviderKind, SelectableAdapter, add_context_window,
-        catalog_models_url, expose_background_call_ids, models_url, parse_context_window,
+        KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterKitSession, ProviderKind,
+        SelectableAdapter, SelectableSession, add_context_window, catalog_models_url,
+        expose_background_call_ids, models_url, parse_context_window,
     };
 
     #[test]
@@ -647,6 +678,80 @@ mod tests {
             text,
             "Tool call ID: call_background is running in the background.\nIt runs until result or failure is delivered."
         );
+    }
+
+    #[test]
+    fn selectable_adapter_reports_its_concrete_initial_provider() {
+        let adapter = SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+
+        assert_eq!(adapter.provider_name(), Some("openai-subscription"));
+    }
+
+    async fn openrouter_session(model: &str) -> KitSession {
+        let adapter = OpenRouterAdapter::new(OpenRouterConfig::new("test-key", model)).unwrap();
+        let inner = adapter
+            .start_session(SessionConfig::new("provider-identity-test"))
+            .await
+            .unwrap();
+        KitSession::OpenRouter(OpenRouterKitSession {
+            inner,
+            context_window: None,
+        })
+    }
+
+    fn selectable_session(active: ModelSelection, inner: KitSession) -> SelectableSession {
+        SelectableSession {
+            selection: Arc::new(Mutex::new(active.clone())),
+            credential_storage: Default::default(),
+            config: SessionConfig::new("provider-identity-test"),
+            active,
+            inner,
+        }
+    }
+
+    #[tokio::test]
+    async fn kit_session_delegates_initial_provider_identity() {
+        let session = openrouter_session("test/initial").await;
+
+        assert_eq!(session.provider_name(), Some("openrouter"));
+    }
+
+    #[tokio::test]
+    async fn successful_session_replacement_updates_canonical_provider_identity() {
+        let initial = ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4");
+        let mut session = selectable_session(initial, openrouter_session("test/initial").await);
+        assert_eq!(session.provider_name(), Some("openai-subscription"));
+
+        let selected = ModelSelection::new(ProviderKind::OpenRouter, "test/replacement");
+        session
+            .replace_active(
+                selected.clone(),
+                Ok(openrouter_session(&selected.model).await),
+            )
+            .unwrap();
+
+        assert_eq!(session.provider_name(), Some("openrouter"));
+        assert_eq!(session.model_name(), Some("test/replacement"));
+    }
+
+    #[tokio::test]
+    async fn failed_session_replacement_preserves_canonical_provider_identity() {
+        let initial = ModelSelection::new(ProviderKind::OpenRouter, "test/initial");
+        let mut session =
+            selectable_session(initial.clone(), openrouter_session(&initial.model).await);
+        let selected = ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4");
+
+        assert!(
+            session
+                .replace_active(
+                    selected,
+                    Err(LoopError::Provider("replacement failed".into())),
+                )
+                .is_err()
+        );
+
+        assert_eq!(session.provider_name(), Some("openrouter"));
+        assert_eq!(session.model_name(), Some("test/initial"));
     }
 
     #[test]

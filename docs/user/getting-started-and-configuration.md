@@ -119,6 +119,10 @@ root = "/path/to/project"
 provider = "openai-subscription" # or "openrouter"
 model = "gpt-5.4"
 a2a = "127.0.0.1:7331"
+otel_endpoint = "http://localhost:4317"
+otel_capture_message_content = false
+otel_message_content_max_messages = 64
+otel_message_content_max_bytes = 16384
 
 mcp_config = "/path/to/mcp.json"
 credential_store = "file" # "memory", "keychain", or "file"
@@ -133,7 +137,7 @@ permissions = "deny" # "deny" or "cancel"
 harness = "acp.review"
 ```
 
-`root`, `provider`, `model`, and credential settings apply to all four runtime commands. `a2a` applies to `serve` and `tui`. `credential_store` selects one backend for OpenAI and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`root`, `provider`, `model`, and credential settings apply to all four runtime commands. `a2a` applies to `serve` and `tui`. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 ### Configuration precedence and built-in defaults
 
@@ -142,6 +146,33 @@ For settings exposed by a command, precedence is:
 1. command-line options, such as `--root`, `--provider`, or `--model`;
 2. values in `~/.kit/config.toml`;
 3. built-in defaults.
+
+The OpenTelemetry endpoint follows the same CLI-over-TOML precedence, then falls
+back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. If none
+is set, trace export is disabled. Message capture is disabled by default because
+structured prompts, tool arguments, outputs, file content, and compaction summaries
+can contain secrets. Kit resolves `--otel-capture-message-content BOOL`, the TOML
+`otel_capture_message_content` value, and
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` in that order. The environment
+value must be `true` or `false` (case-insensitive). CLI or TOML can bound capture
+with `otel_message_content_max_messages` (1–1024, default 64) and
+`otel_message_content_max_bytes` (1–1048576, default 16384) per input or output
+attribute. Enabling capture configures both the `gen_ai.input.messages` and
+`gen_ai.output.messages` structured message arrays. Input capture keeps the newest
+bounded tail, while output capture keeps the bounded head. If source content exceeds
+the byte budget, Kit emits a structured truncation entry instead of partial content;
+the arrays remain valid JSON and truncation does not split UTF-8. Capture applies to
+main agents, ACP sessions, nested in-process agents, and compaction summarizer prompts
+and outputs. Kit forwards all resolved values, including an explicit false, to its
+TUI server and nested `acp.kit` children. Kit's OTLP subscriber exports only AgentKit
+loop and MCP semantic targets; dependency spans and source location, thread, tracing
+target, and span busy/idle metadata are omitted. For example:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 kit prompt "Summarize this project"
+kit prompt --otel-endpoint http://localhost:4317 "Summarize this project"
+kit prompt --otel-capture-message-content true --otel-message-content-max-messages 32 "Summarize this project"
+```
 
 The main built-in defaults are:
 

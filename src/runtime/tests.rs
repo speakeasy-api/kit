@@ -22,21 +22,87 @@ fn configured_session_is_consumed_only_after_successful_start() {
     };
     let mut selection = SessionSelection {
         configured: Some(request),
-        claimed: false,
+        configured_claimed: false,
+        generated_retries: Default::default(),
     };
 
     let (first, configured) = selection.claim();
     assert_eq!(first.id, "selected");
     assert!(configured);
-    selection.finish(configured, false, true);
+    selection.finish(&first, configured, false, true);
     let (retry, configured) = selection.claim();
     assert_eq!(retry.id, "selected");
     assert!(
         retry.resume,
         "a transcript opened before failure is resumed"
     );
-    selection.finish(configured, true, false);
+    selection.finish(&retry, configured, true, false);
     assert!(selection.configured.is_none());
+}
+
+#[test]
+fn dropped_configured_session_claim_is_retriable_and_resumes_after_open() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::with_session(
+        root.path(),
+        "gpt-5.4",
+        SessionRequest {
+            id: "selected".into(),
+            resume: false,
+            force: false,
+        },
+    )
+    .unwrap();
+
+    let mut failed = runtime.claim_session().unwrap();
+    assert_eq!(failed.id(), "selected");
+    failed.mark_opened();
+    drop(failed);
+
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), "selected");
+    assert!(retry.request.resume);
+    retry.commit().unwrap();
+
+    let generated = runtime.claim_session().unwrap();
+    assert!(generated.id().starts_with("s-"));
+}
+
+#[test]
+fn dropped_generated_session_claim_retries_opened_transcript_with_same_id() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open(
+        root.path(),
+        &session_id,
+        false,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.mark_opened();
+    drop(opened);
+    drop(failed);
+
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+    assert!(retry.request.resume);
+    let reopened = crate::session::open(
+        root.path(),
+        retry.id(),
+        true,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    drop(reopened);
+    retry.commit().unwrap();
+
+    let next = runtime.claim_session().unwrap();
+    assert_ne!(next.id(), session_id);
 }
 
 #[tokio::test]

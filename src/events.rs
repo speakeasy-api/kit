@@ -37,7 +37,7 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     /// A persisted ACP session was opened by the child runtime.
-    SessionStarted { acp_session_id: String, id: String },
+    SessionStarted { session_id: String },
     /// A nested tool call started running.
     ChildStarted {
         call: String,
@@ -183,6 +183,17 @@ mod tests {
         let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
         let parsed = parse(&line).expect("event round trips");
         assert_eq!(parsed.parent_call(), Some("call-1"));
+    }
+
+    #[test]
+    fn session_started_carries_one_durable_identity() {
+        let event = RuntimeEvent::SessionStarted {
+            session_id: "s-123-4-5".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({"event": "session_started", "session_id": "s-123-4-5"})
+        );
     }
 
     #[test]

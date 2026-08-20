@@ -11,8 +11,29 @@ use serde::Deserialize;
 #[derive(Parser)]
 #[command(version, about = "Lean directory-rooted coding agent runtime")]
 struct Cli {
+    #[command(flatten)]
+    telemetry: TelemetryArgs,
     #[command(subcommand)]
     command: Command,
+}
+
+const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const OTEL_CAPTURE_MESSAGE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
+
+#[derive(Args)]
+struct TelemetryArgs {
+    /// OTLP/gRPC collector endpoint for OpenTelemetry trace export.
+    #[arg(long, global = true)]
+    otel_endpoint: Option<String>,
+    /// Capture structured GenAI input and output messages in exported spans.
+    #[arg(long, global = true, value_name = "BOOL", action = clap::ArgAction::Set)]
+    otel_capture_message_content: Option<bool>,
+    /// Maximum captured messages per GenAI input or output attribute.
+    #[arg(long, global = true)]
+    otel_message_content_max_messages: Option<usize>,
+    /// Maximum captured UTF-8 bytes per GenAI input or output attribute.
+    #[arg(long, global = true)]
+    otel_message_content_max_bytes: Option<usize>,
 }
 
 #[derive(Args)]
@@ -115,6 +136,10 @@ struct Config {
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
     a2a: Option<String>,
+    otel_endpoint: Option<String>,
+    otel_capture_message_content: Option<bool>,
+    otel_message_content_max_messages: Option<usize>,
+    otel_message_content_max_bytes: Option<usize>,
     mcp_config: Option<PathBuf>,
     credential_store: Option<CredentialStoreKind>,
     credential_dir: Option<PathBuf>,
@@ -184,6 +209,46 @@ impl Config {
         value.or_else(|| self.a2a.clone())
     }
 
+    fn otel_endpoint(&self, value: Option<String>, environment: Option<String>) -> Option<String> {
+        value
+            .or_else(|| self.otel_endpoint.clone())
+            .or(environment)
+            .filter(|endpoint| !endpoint.is_empty())
+    }
+
+    fn telemetry_settings(
+        &self,
+        args: &TelemetryArgs,
+        endpoint_environment: Option<String>,
+        capture_environment: Option<String>,
+    ) -> io::Result<kit::telemetry::Settings> {
+        let capture_message_content = if let Some(value) = args.otel_capture_message_content {
+            value
+        } else if let Some(value) = self.otel_capture_message_content {
+            value
+        } else {
+            capture_environment
+                .map(|value| parse_otel_boolean(OTEL_CAPTURE_MESSAGE_CONTENT_ENV, &value))
+                .transpose()?
+                .unwrap_or(false)
+        };
+        let max_messages = args
+            .otel_message_content_max_messages
+            .or(self.otel_message_content_max_messages)
+            .unwrap_or(kit::telemetry::DEFAULT_MESSAGE_CONTENT_MAX_MESSAGES);
+        let max_bytes = args
+            .otel_message_content_max_bytes
+            .or(self.otel_message_content_max_bytes)
+            .unwrap_or(kit::telemetry::DEFAULT_MESSAGE_CONTENT_MAX_BYTES);
+        kit::telemetry::Settings::try_new(
+            self.otel_endpoint(args.otel_endpoint.clone(), endpoint_environment),
+            capture_message_content,
+            max_messages,
+            max_bytes,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    }
+
     fn harnesses(&self) -> Result<(kit::AcpHarnesses, String), String> {
         let harnesses = kit::AcpHarnesses::new(self.acp.clone())?;
         let selected = self
@@ -195,6 +260,17 @@ impl Config {
             return Err(format!("unknown subagent ACP harness {selected:?}"));
         }
         Ok((harnesses, selected))
+    }
+}
+
+fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be true or false, got {value:?}"),
+        )),
     }
 }
 
@@ -356,6 +432,12 @@ async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let config = Config::load_default()?;
+    let telemetry_settings = config.telemetry_settings(
+        &cli.telemetry,
+        env::var(OTEL_ENDPOINT_ENV).ok(),
+        env::var(OTEL_CAPTURE_MESSAGE_CONTENT_ENV).ok(),
+    )?;
+    let _telemetry = kit::telemetry::init(&telemetry_settings)?;
     if let Command::Auth {
         action,
         credentials,
@@ -398,6 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     credential_storage.clone(),
                 )?,
             };
+            let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -441,6 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     credential_storage.clone(),
                 )?,
             };
+            let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -478,6 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 credential_storage.clone(),
             )?;
+            let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -515,6 +600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 a2a.as_deref(),
                 mcp.config_path(&config),
                 &credential_storage,
+                &telemetry_settings,
                 resume.as_deref(),
                 force,
             )
@@ -533,7 +619,7 @@ mod tests {
 
     use super::{
         AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
-        validate_auth_storage,
+        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, validate_auth_storage,
     };
 
     #[test]
@@ -547,6 +633,10 @@ root = "/configured/root"
 model = "configured-model"
 provider = "openrouter"
 a2a = "127.0.0.1:7331"
+otel_endpoint = "http://configured:4317"
+otel_capture_message_content = true
+otel_message_content_max_messages = 20
+otel_message_content_max_bytes = 200
 mcp_config = "/configured/mcp.json"
 credential_store = "file"
 credential_dir = "/configured/credentials"
@@ -568,6 +658,43 @@ credential_dir = "/configured/credentials"
             kit::ProviderKind::OpenAiSubscription
         );
         assert_eq!(config.a2a(None).as_deref(), Some("127.0.0.1:7331"));
+        assert_eq!(
+            config.otel_endpoint(None, Some("http://environment:4317".into())),
+            Some("http://configured:4317".into())
+        );
+        assert_eq!(
+            config.otel_endpoint(
+                Some("http://cli:4317".into()),
+                Some("http://environment:4317".into())
+            ),
+            Some("http://cli:4317".into())
+        );
+        let cli = Cli::try_parse_from([
+            "kit",
+            "prompt",
+            "--otel-capture-message-content",
+            "false",
+            "--otel-message-content-max-messages",
+            "5",
+            "--otel-message-content-max-bytes",
+            "100",
+            "hello",
+        ])
+        .unwrap();
+        let telemetry = config
+            .telemetry_settings(
+                &cli.telemetry,
+                Some("http://environment:4317".into()),
+                Some("invalid-but-overridden".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            telemetry.endpoint.as_deref(),
+            Some("http://configured:4317")
+        );
+        assert!(!telemetry.capture_message_content);
+        assert_eq!(telemetry.message_content_max_messages, 5);
+        assert_eq!(telemetry.message_content_max_bytes, 100);
 
         let mcp = McpArgs {
             mcp_config: None,
@@ -644,6 +771,93 @@ credential_store = "keychain"
         assert_eq!(config.model(None), "gpt-5.4");
         assert_eq!(config.provider(None), kit::ProviderKind::OpenAiSubscription);
         assert_eq!(config.a2a(None), None);
+        assert_eq!(
+            config.otel_endpoint(None, Some("http://environment:4317".into())),
+            Some("http://environment:4317".into())
+        );
+    }
+
+    #[test]
+    fn endpoint_precedence_allows_each_higher_priority_source_to_disable_export() {
+        let environment = Some("http://environment:4317".into());
+        let configured: Config =
+            toml::from_str("otel_endpoint = 'http://configured:4317'").unwrap();
+        assert_eq!(
+            configured
+                .otel_endpoint(None, environment.clone())
+                .as_deref(),
+            Some("http://configured:4317")
+        );
+        assert_eq!(
+            configured
+                .otel_endpoint(Some("http://cli:4317".into()), environment.clone())
+                .as_deref(),
+            Some("http://cli:4317")
+        );
+        assert_eq!(
+            Config::default()
+                .otel_endpoint(None, environment.clone())
+                .as_deref(),
+            Some("http://environment:4317")
+        );
+        let disabled_cli =
+            Cli::try_parse_from(["kit", "--otel-endpoint", "", "prompt", "hello"]).unwrap();
+        assert_eq!(
+            configured
+                .telemetry_settings(&disabled_cli.telemetry, environment.clone(), None)
+                .unwrap()
+                .endpoint,
+            None
+        );
+
+        let configured_disabled: Config = toml::from_str("otel_endpoint = ''").unwrap();
+        assert_eq!(configured_disabled.otel_endpoint(None, environment), None);
+        assert_eq!(Config::default().otel_endpoint(None, None), None);
+    }
+
+    #[test]
+    fn telemetry_environment_is_strict_and_settings_are_bounded() {
+        let config = Config::default();
+        let cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
+        let enabled = config
+            .telemetry_settings(&cli.telemetry, None, Some("TrUe".into()))
+            .unwrap();
+        assert!(enabled.capture_message_content);
+        let error = config
+            .telemetry_settings(&cli.telemetry, None, Some("yes".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains(OTEL_CAPTURE_MESSAGE_CONTENT_ENV));
+
+        let invalid = Cli::try_parse_from([
+            "kit",
+            "prompt",
+            "--otel-message-content-max-messages",
+            "0",
+            "hello",
+        ])
+        .unwrap();
+        assert!(
+            config
+                .telemetry_settings(&invalid.telemetry, None, None)
+                .is_err()
+        );
+
+        let configured_false: Config =
+            toml::from_str("otel_capture_message_content = false").unwrap();
+        let disabled = configured_false
+            .telemetry_settings(&cli.telemetry, None, Some("true".into()))
+            .unwrap();
+        assert!(!disabled.capture_message_content);
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "prompt",
+                "--otel-capture-message-content",
+                "yes",
+                "hello",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -710,6 +924,31 @@ harness = "acp.beta"
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn otel_endpoint_is_a_global_command_line_option() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "prompt",
+            "--otel-endpoint",
+            "http://collector:4317",
+            "--otel-capture-message-content",
+            "true",
+            "--otel-message-content-max-messages",
+            "12",
+            "--otel-message-content-max-bytes",
+            "4096",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.telemetry.otel_endpoint.as_deref(),
+            Some("http://collector:4317")
+        );
+        assert_eq!(cli.telemetry.otel_capture_message_content, Some(true));
+        assert_eq!(cli.telemetry.otel_message_content_max_messages, Some(12));
+        assert_eq!(cli.telemetry.otel_message_content_max_bytes, Some(4096));
     }
 
     #[test]

@@ -126,6 +126,10 @@ root = "/path/to/project"
 provider = "openai-subscription" # or openrouter
 model = "gpt-5.4"
 a2a = "127.0.0.1:7331"
+otel_endpoint = "http://localhost:4317"
+otel_capture_message_content = false
+otel_message_content_max_messages = 64
+otel_message_content_max_bytes = 16384
 mcp_config = "/path/to/mcp.json"
 credential_store = "file" # memory, keychain, or file
 credential_dir = "/path/to/private/credentials"
@@ -145,7 +149,27 @@ harness = "acp.review"
 ```
 
 `root`, `provider`, `model`, and credential settings apply to every command. `a2a` applies to
-`serve` and `tui`. ACP profiles are trusted, strict `command`/`args` argv
+`serve` and `tui`. `otel_endpoint` enables OTLP/gRPC trace export for AgentKit's
+GenAI spans. Use a collector endpoint such as `http://localhost:4317` without a
+`/v1/traces` suffix. The endpoint can also be set with `--otel-endpoint` or
+`OTEL_EXPORTER_OTLP_ENDPOINT`; CLI values take precedence over TOML, which takes
+precedence over the environment. Message capture is off by default because prompts,
+tool arguments, outputs, file content, and compaction summaries can contain secrets.
+Kit resolves `--otel-capture-message-content BOOL`,
+`otel_capture_message_content`, and
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` in that order and requires the
+environment value to be `true` or `false`. The message and byte bounds can be set by
+CLI or TOML and default to 64 messages and 16384 UTF-8 bytes per input or output
+attribute. Enabling capture configures both the `gen_ai.input.messages` and
+`gen_ai.output.messages` structured message arrays. Input capture keeps the newest
+bounded tail; output capture keeps the bounded head. Content that exceeds the byte
+budget is represented by a structured truncation entry, so each array remains valid
+JSON and truncation never splits UTF-8. Capture applies to main agents, ACP sessions,
+nested in-process agents, and compaction summarizer prompts and outputs. Kit forwards
+the fully resolved settings, including an explicit false, to its TUI server and
+nested `acp.kit` children. The OTLP subscriber exports only AgentKit loop/MCP
+semantic targets and omits source location, thread, tracing target, and span
+busy/idle metadata. ACP profiles are trusted, strict `command`/`args` argv
 configurations: Kit does not invoke a shell and always sets the child cwd to the
 runtime root. Multiple names may be configured. `[subagent].harness` selects the
 default; references must use the fully qualified `acp.<name>` form. When

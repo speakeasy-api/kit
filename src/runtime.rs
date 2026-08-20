@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
@@ -12,7 +12,7 @@ use std::{
 use agentkit_acp::{AcpIntegration, AcpRuntimeError};
 use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
-    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part, SessionId,
+    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
 };
 use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
@@ -53,16 +53,20 @@ pub struct SessionRequest {
 #[derive(Default)]
 struct SessionSelection {
     configured: Option<SessionRequest>,
-    claimed: bool,
+    configured_claimed: bool,
+    generated_retries: VecDeque<SessionRequest>,
 }
 
 impl SessionSelection {
     fn claim(&mut self) -> (SessionRequest, bool) {
-        if !self.claimed
+        if !self.configured_claimed
             && let Some(request) = self.configured.clone()
         {
-            self.claimed = true;
+            self.configured_claimed = true;
             return (request, true);
+        }
+        if let Some(request) = self.generated_retries.pop_front() {
+            return (request, false);
         }
         (
             SessionRequest {
@@ -74,7 +78,13 @@ impl SessionSelection {
         )
     }
 
-    fn finish(&mut self, configured: bool, succeeded: bool, opened_new: bool) {
+    fn finish(
+        &mut self,
+        request: &SessionRequest,
+        configured: bool,
+        succeeded: bool,
+        opened_new: bool,
+    ) {
         if configured {
             if succeeded {
                 self.configured.take();
@@ -83,18 +93,58 @@ impl SessionSelection {
                 // must resume it rather than trying to create the same file.
                 request.resume = true;
             }
-            self.claimed = false;
+            self.configured_claimed = false;
+        } else if !succeeded && (request.resume || opened_new) {
+            let mut request = request.clone();
+            request.resume = true;
+            self.generated_retries.push_back(request);
         }
     }
 }
 
 pub(crate) struct AcpDriverContext {
-    pub acp_session_id: agentkit_acp::SessionId,
-    pub agentkit_session_id: SessionId,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub integration: Arc<AcpIntegration>,
     pub cancellation: CancellationHandle,
+}
+
+pub(crate) struct SessionClaim {
+    runtime: Arc<Runtime>,
+    request: SessionRequest,
+    configured: bool,
+    opened_new: bool,
+    committed: bool,
+}
+
+impl SessionClaim {
+    pub(crate) fn id(&self) -> &str {
+        &self.request.id
+    }
+
+    fn mark_opened(&mut self) {
+        self.opened_new = !self.request.resume;
+    }
+
+    pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
+        self.runtime
+            .session
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
+            .finish(&self.request, self.configured, true, self.opened_new);
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for SessionClaim {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Ok(mut selection) = self.runtime.session.lock()
+        {
+            selection.finish(&self.request, self.configured, false, self.opened_new);
+        }
+    }
 }
 
 pub(crate) struct AcpDriver {
@@ -110,6 +160,7 @@ pub struct Runtime {
     provider: ProviderKind,
     model: String,
     credential_storage: crate::credentials::CredentialStorage,
+    telemetry: crate::telemetry::Settings,
     max_subagent_depth: usize,
     base_depth: usize,
     subagents: Subagents,
@@ -164,6 +215,7 @@ impl Runtime {
                 provider,
                 mcp_config: None,
                 credential_storage: credential_storage.clone(),
+                telemetry: Default::default(),
                 harnesses: AcpHarnesses::default(),
                 default_harness: BUILTIN_HARNESS.into(),
             },
@@ -175,6 +227,7 @@ impl Runtime {
             provider,
             model,
             credential_storage,
+            telemetry: Default::default(),
             max_subagent_depth,
             base_depth: 0,
             subagents,
@@ -261,6 +314,7 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
             "could not configure ACP harnesses after runtime was shared".to_string()
         })?;
+        let telemetry = runtime.subagents.child_config().telemetry;
         runtime.subagents = Subagents::new(
             ChildConfig {
                 root: runtime.root.clone(),
@@ -268,8 +322,29 @@ impl Runtime {
                 provider: runtime.provider,
                 mcp_config: None,
                 credential_storage: runtime.credential_storage.clone(),
+                telemetry,
                 harnesses,
                 default_harness,
+            },
+            runtime.max_subagent_depth,
+        );
+        Ok(Arc::new(runtime))
+    }
+
+    /// Propagates the host-resolved telemetry settings to nested Kit children.
+    pub fn with_telemetry(
+        runtime: Arc<Self>,
+        telemetry: crate::telemetry::Settings,
+    ) -> Result<Arc<Self>, String> {
+        telemetry.agentkit_config()?;
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure telemetry after runtime was shared".to_string())?;
+        runtime.telemetry = telemetry.clone();
+        let previous = runtime.subagents.child_config();
+        runtime.subagents = Subagents::new(
+            ChildConfig {
+                telemetry,
+                ..previous
             },
             runtime.max_subagent_depth,
         );
@@ -301,6 +376,7 @@ impl Runtime {
                 provider: runtime.provider,
                 mcp_config: Some(path.to_path_buf()),
                 credential_storage,
+                telemetry: previous.telemetry,
                 harnesses: previous.harnesses,
                 default_harness: previous.default_harness,
             },
@@ -316,6 +392,12 @@ impl Runtime {
     /// Returns the depth inherited by this runtime process.
     pub const fn base_depth(&self) -> usize {
         self.base_depth
+    }
+
+    fn agentkit_telemetry(&self) -> agentkit_loop::TelemetryConfig {
+        self.telemetry
+            .agentkit_config()
+            .expect("runtime telemetry settings are validated before storage")
     }
 
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
@@ -395,12 +477,14 @@ impl Runtime {
         )?;
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
+            self.agentkit_telemetry(),
             Some(opened.observer.clone()),
             format!("compaction-{}", crate::session::new_id()),
         )?;
         let subagents = self.subagents.fresh();
         let agent = Agent::builder()
             .model(self.adapter.clone())
+            .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with(0, subagents))
             .task_manager(background_task_manager())
             .mutator(compactor)
@@ -454,6 +538,7 @@ impl Runtime {
             .map_err(LoopError::InvalidState)?;
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
+            self.agentkit_telemetry(),
             None,
             format!("compaction-{session}"),
         )
@@ -461,6 +546,7 @@ impl Runtime {
         let subagents = self.subagents.fresh();
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
+            .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with(depth, subagents))
             .task_manager(background_task_manager())
             .mutator(compactor)
@@ -476,9 +562,25 @@ impl Runtime {
         drive(&mut driver).await
     }
 
+    pub(crate) fn claim_session(self: &Arc<Self>) -> Result<SessionClaim, AcpRuntimeError> {
+        let (request, configured) = self
+            .session
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
+            .claim();
+        Ok(SessionClaim {
+            runtime: Arc::clone(self),
+            request,
+            configured,
+            opened_new: false,
+            committed: false,
+        })
+    }
+
     pub(crate) async fn start_acp_driver(
         self: &Arc<Self>,
         context: AcpDriverContext,
+        claim: &mut SessionClaim,
     ) -> Result<AcpDriver, AcpRuntimeError> {
         let cwd = context
             .cwd
@@ -490,88 +592,71 @@ impl Runtime {
                 self.root.display()
             )));
         }
-        let (request, configured) = self
-            .session
-            .lock()
-            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
-            .claim();
-        let acp_session_id = context.acp_session_id.to_string();
-        let mut opened_new = false;
-        let result = async {
-            let initial = if request.resume {
-                vec![Item::text(
-                    ItemKind::System,
-                    self.system_prompt(self.base_depth),
-                )]
-            } else {
-                self.initial_transcript(self.base_depth)
-                    .await
-                    .map_err(AcpRuntimeError::Loop)?
-            };
-            let opened = crate::session::open(
-                &self.root,
-                &request.id,
-                request.resume,
-                request.force,
-                initial,
-            )
-            .map_err(AcpRuntimeError::Loop)?;
-            opened_new = !request.resume;
-            // Every ACP route owns its model selection. Changing one session
-            // cannot redirect another session served by the same runtime.
-            let adapter = SelectableAdapter::new_with_credentials(
-                self.provider,
-                self.model.clone(),
-                self.credential_storage.clone(),
-            )
-            .map_err(AcpRuntimeError::Loop)?;
-            let compactor = crate::compaction::automatic(
-                adapter.clone(),
-                Some(opened.observer.clone()),
-                format!("compaction-{}", crate::session::new_id()),
-            )
-            .map_err(AcpRuntimeError::Loop)?;
-            let subagents = self.subagents.fresh();
-            let task_manager = background_task_manager();
-            let tasks = task_manager.handle();
-            let background_jobs = BackgroundJobs::default();
-            let driver = Agent::builder()
-                .model(adapter.clone())
-                .add_tool_source(self.compose_with_jobs(
-                    self.base_depth,
-                    subagents,
-                    background_jobs.clone(),
-                ))
-                .task_manager(task_manager)
-                .mutator(compactor)
-                .observer(context.integration.as_ref().clone())
-                .transcript_observer(opened.observer)
-                .transcript(opened.transcript)
-                .cancellation(context.cancellation)
-                .build()
-                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
-                // ACP routes observer events by its own bound AgentKit id. The
-                // persisted id names storage; it must not replace that routing key.
-                .start(SessionConfig::new(context.agentkit_session_id).without_cache())
+        let request = &claim.request;
+        let session_id = request.id.clone();
+        let initial = if request.resume {
+            vec![Item::text(
+                ItemKind::System,
+                self.system_prompt(self.base_depth),
+            )]
+        } else {
+            self.initial_transcript(self.base_depth)
                 .await
-                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
-            Ok(AcpDriver {
-                driver,
-                tasks,
-                background_jobs,
-                adapter,
-            })
-        }
-        .await;
-        self.session
-            .lock()
-            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
-            .finish(configured, result.is_ok(), opened_new);
-        let driver = result?;
-        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
-            acp_session_id,
-            id: request.id,
-        });
+                .map_err(AcpRuntimeError::Loop)?
+        };
+        let opened = crate::session::open(
+            &self.root,
+            &request.id,
+            request.resume,
+            request.force,
+            initial,
+        )
+        .map_err(AcpRuntimeError::Loop)?;
+        claim.mark_opened();
+        // Every ACP route owns its model selection. Changing one session
+        // cannot redirect another session served by the same runtime.
+        let adapter = SelectableAdapter::new_with_credentials(
+            self.provider,
+            self.model.clone(),
+            self.credential_storage.clone(),
+        )
+        .map_err(AcpRuntimeError::Loop)?;
+        let compactor = crate::compaction::automatic(
+            adapter.clone(),
+            self.agentkit_telemetry(),
+            Some(opened.observer.clone()),
+            format!("compaction-{}", crate::session::new_id()),
+        )
+        .map_err(AcpRuntimeError::Loop)?;
+        let subagents = self.subagents.fresh();
+        let task_manager = background_task_manager();
+        let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
+        let driver = Agent::builder()
+            .model(adapter.clone())
+            .telemetry(self.agentkit_telemetry())
+            .add_tool_source(self.compose_with_jobs(
+                self.base_depth,
+                subagents,
+                background_jobs.clone(),
+            ))
+            .task_manager(task_manager)
+            .mutator(compactor)
+            .observer(context.integration.as_ref().clone())
+            .transcript_observer(opened.observer)
+            .transcript(opened.transcript)
+            .cancellation(context.cancellation)
+            .build()
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+            .start(SessionConfig::new(session_id.clone()).without_cache())
+            .await
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        let driver = AcpDriver {
+            driver,
+            tasks,
+            background_jobs,
+            adapter,
+        };
         Ok(driver)
     }
 

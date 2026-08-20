@@ -67,8 +67,6 @@ const MAX_OUTPUT_LINES: usize = 5_000;
 /// How long the agent gets to answer the ACP handshake before the client gives
 /// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
 const HANDSHAKE: Duration = Duration::from_secs(30);
-/// Maximum time to correlate a new ACP route with its persisted transcript.
-const SESSION_EVENT_WAIT: Duration = Duration::from_secs(5);
 /// Grace for the agent's last diagnostics to arrive once it has exited.
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
@@ -132,6 +130,7 @@ pub async fn run(
     a2a: Option<&str>,
     mcp_config: Option<&Path>,
     credential_storage: &CredentialStorage,
+    telemetry: &crate::telemetry::Settings,
     resume: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -158,6 +157,7 @@ pub async fn run(
     if let Some(path) = mcp_config {
         command.arg("--mcp-config").arg(path);
     }
+    telemetry.append_cli_args(&mut command);
     command
         .arg("--credential-store")
         .arg(credential_storage.cli_name());
@@ -298,9 +298,12 @@ pub async fn run(
                 }
             };
             let mut session_id = session.session_id.clone();
+            let active_session_id = durable_session_id(&session_id).map_err(|error| {
+                agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
+            })?;
             // The server has acquired the mutation lock during NewSession, so
             // this read is the exact stable snapshot it preloaded into the model.
-            let restored = crate::session::load(&root, &persisted_session_id).map_err(|error| {
+            let restored = crate::session::load(&root, &active_session_id).map_err(|error| {
                 agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
             })?;
 
@@ -314,7 +317,10 @@ pub async fn run(
                 a2a,
             );
             app.set_model_choices(initial_choices);
-            app.restore_transcript(persisted_session_id, &restored);
+            if let Ok(mut active) = transition_session.lock() {
+                *active = active_session_id.clone();
+            }
+            app.restore_transcript(active_session_id, &restored);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             // The turn in flight, if any: leaving is not allowed to abandon it.
@@ -421,31 +427,11 @@ pub async fn run(
                                         .block_task()
                                         .await?;
                                     session_id = session.session_id;
-                                    let expected_acp_session_id = session_id.to_string();
-                                    // Session events share one ordered stderr stream. Apply
-                                    // everything from the old session before clearing it, then
-                                    // wait only for the persisted id bound to this ACP route.
-                                    let persisted_id = tokio::select! {
-                                        result = wait_for_started_session(
-                                            &mut updates_rx,
-                                            &mut app,
-                                            &expected_acp_session_id,
-                                            SESSION_EVENT_WAIT,
-                                        ) => result.map_err(|error| {
-                                            let detail = match error {
-                                                SessionEventError::Closed =>
-                                                    "runtime event stream closed during /new".to_string(),
-                                                SessionEventError::TimedOut => format!(
-                                                    "runtime did not report the new persisted session within {} seconds",
-                                                    SESSION_EVENT_WAIT.as_secs(),
-                                                ),
-                                            };
-                                            agent_client_protocol::Error::into_internal_error(
-                                                std::io::Error::other(detail),
-                                            )
-                                        })?,
-                                        () = stop.requested() => return Ok(()),
-                                    };
+                                    let persisted_id = durable_session_id(&session_id).map_err(|error| {
+                                        agent_client_protocol::Error::into_internal_error(
+                                            std::io::Error::other(error),
+                                        )
+                                    })?;
                                     if let Ok(mut active) = transition_session.lock() {
                                         *active = persisted_id.clone();
                                     }
@@ -791,42 +777,10 @@ fn leave(terminal: DefaultTerminal) {
     ratatui::restore();
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SessionEventError {
-    Closed,
-    TimedOut,
-}
-
-async fn wait_for_started_session(
-    updates: &mut mpsc::UnboundedReceiver<Update>,
-    app: &mut App,
-    expected_acp_session_id: &str,
-    wait: Duration,
-) -> Result<String, SessionEventError> {
-    tokio::time::timeout(wait, async {
-        loop {
-            let update = updates.recv().await.ok_or(SessionEventError::Closed)?;
-            if let Some(id) = started_session(&update, expected_acp_session_id) {
-                return Ok(id.to_string());
-            }
-            app.apply(update);
-        }
-    })
-    .await
-    .map_err(|_| SessionEventError::TimedOut)?
-}
-
-/// Returns the persisted id only when a session event belongs to the ACP
-/// route just returned by `session/new`.
-fn started_session<'a>(update: &'a Update, expected_acp_session_id: &str) -> Option<&'a str> {
-    match update {
-        Update::Runtime(events::RuntimeEvent::SessionStarted { acp_session_id, id })
-            if acp_session_id == expected_acp_session_id =>
-        {
-            Some(id)
-        }
-        _ => None,
-    }
+fn durable_session_id(session_id: &agentkit_acp::SessionId) -> Result<String, String> {
+    let session_id = session_id.to_string();
+    crate::session::validate_id(&session_id)?;
+    Ok(session_id)
 }
 
 /// Maps one ACP session notification onto client updates.
@@ -932,17 +886,11 @@ fn readable(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
-
     use agentkit_acp::{SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption};
 
     use super::{
-        ModelChoice, SessionEventError, current_model_choice, osc52, readable,
-        save_model_defaults_to, started_session, wait_for_started_session,
-    };
-    use crate::{
-        events::RuntimeEvent,
-        tui::app::{App, Update},
+        ModelChoice, current_model_choice, durable_session_id, osc52, readable,
+        save_model_defaults_to,
     };
 
     #[test]
@@ -1009,61 +957,43 @@ a = [still text]
     }
 
     #[test]
-    fn correlates_persisted_sessions_with_the_new_acp_route() {
-        let update = Update::Runtime(RuntimeEvent::SessionStarted {
-            acp_session_id: "session-2".into(),
-            id: "persisted-2".into(),
-        });
-        assert_eq!(started_session(&update, "session-2"), Some("persisted-2"));
-        assert_eq!(started_session(&update, "session-1"), None);
+    fn forwards_all_resolved_telemetry_settings_to_the_tui_child() {
+        let settings = crate::telemetry::Settings::try_new(
+            Some("http://collector:4317".into()),
+            false,
+            12,
+            4096,
+        )
+        .unwrap();
+        let mut command = tokio::process::Command::new("kit");
+        settings.append_cli_args(&mut command);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--otel-endpoint",
+                "http://collector:4317",
+                "--otel-capture-message-content",
+                "false",
+                "--otel-message-content-max-messages",
+                "12",
+                "--otel-message-content-max-bytes",
+                "4096",
+            ]
+        );
     }
 
-    #[tokio::test]
-    async fn new_session_wait_is_correlated_bounded_and_detects_stream_failure() {
-        let app = || {
-            App::new(
-                PathBuf::from("/tmp"),
-                "provider".into(),
-                "model".into(),
-                "a2a".into(),
-            )
-        };
-        let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(Update::Runtime(RuntimeEvent::SessionStarted {
-            acp_session_id: "other".into(),
-            id: "wrong".into(),
-        }))
-        .unwrap();
-        tx.send(Update::Runtime(RuntimeEvent::SessionStarted {
-            acp_session_id: "expected".into(),
-            id: "right".into(),
-        }))
-        .unwrap();
+    #[test]
+    fn uses_the_validated_acp_id_as_the_durable_session_id() {
         assert_eq!(
-            wait_for_started_session(&mut updates, &mut app(), "expected", Duration::from_secs(1),)
-                .await,
-            Ok("right".into())
+            durable_session_id(&agentkit_acp::SessionId::new("s-123-4-5")).unwrap(),
+            "s-123-4-5"
         );
-
-        let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
-        drop(tx);
-        assert_eq!(
-            wait_for_started_session(&mut updates, &mut app(), "expected", Duration::from_secs(1),)
-                .await,
-            Err(SessionEventError::Closed)
-        );
-
-        let (_tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
-        assert_eq!(
-            wait_for_started_session(
-                &mut updates,
-                &mut app(),
-                "expected",
-                Duration::from_millis(1),
-            )
-            .await,
-            Err(SessionEventError::TimedOut)
-        );
+        assert!(durable_session_id(&agentkit_acp::SessionId::new("bad/id")).is_err());
     }
 
     #[test]
