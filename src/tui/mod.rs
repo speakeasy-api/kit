@@ -52,6 +52,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
     events::{self, EVENTS_ENV},
+    protocols::acp::CancelBackgroundRequest,
     tools::mcp::CredentialStorage,
 };
 
@@ -210,9 +211,10 @@ pub async fn run(
         }
         // Stderr closing means the agent process is gone; stop any spinner
         // waiting on a turn that can no longer finish.
-        let _ = diagnostics.send(Update::TurnEnded(Some(
-            "the agent process exited — press ctrl+c to leave".into(),
-        )));
+        let _ = diagnostics.send(Update::TurnEnded {
+            id: None,
+            error: Some("the agent process exited — press ctrl+c to leave".into()),
+        });
     });
 
     // The child is watched from its own task, which also owns it: aborting that
@@ -331,7 +333,7 @@ pub async fn run(
                             match action {
                                 Action::Quit => return Ok(()),
                                 Action::Submit(prompt) => {
-                                    app.push_user(prompt.clone());
+                                    let turn_id = app.push_user(prompt.clone());
                                     let connection = connection.clone();
                                     let session = session_id.clone();
                                     let updates = updates_tx.clone();
@@ -345,21 +347,24 @@ pub async fn run(
                                             ))
                                             .block_task()
                                             .await;
-                                        let _ = updates.send(Update::TurnEnded(match outcome {
-                                            Ok(_) => None,
-                                            Err(error) => Some(error.to_string()),
-                                        }));
+                                        let _ = updates.send(Update::TurnEnded {
+                                            id: Some(turn_id),
+                                            error: match outcome {
+                                                Ok(_) => None,
+                                                Err(error) => Some(error.to_string()),
+                                            },
+                                        });
                                     }));
                                 }
                                 Action::Compact(next_prompt) => {
                                     let control = crate::compaction::manual_prompt(
                                         next_prompt.as_deref(),
                                     );
-                                    if let Some(prompt) = next_prompt {
-                                        app.push_user(prompt);
+                                    let turn_id = if let Some(prompt) = next_prompt {
+                                        app.push_user(prompt)
                                     } else {
-                                        app.begin_compaction();
-                                    }
+                                        app.begin_compaction()
+                                    };
                                     let connection = connection.clone();
                                     let session = session_id.clone();
                                     let updates = updates_tx.clone();
@@ -373,10 +378,13 @@ pub async fn run(
                                             ))
                                             .block_task()
                                             .await;
-                                        let _ = updates.send(Update::TurnEnded(match outcome {
-                                            Ok(_) => None,
-                                            Err(error) => Some(error.to_string()),
-                                        }));
+                                        let _ = updates.send(Update::TurnEnded {
+                                            id: Some(turn_id),
+                                            error: match outcome {
+                                                Ok(_) => None,
+                                                Err(error) => Some(error.to_string()),
+                                            },
+                                        });
                                     }));
                                 }
                                 Action::New(first_prompt) => {
@@ -430,7 +438,7 @@ pub async fn run(
                                     }
                                     app.set_model_choices(model_choices(session.config_options.as_deref()));
                                     if let Some(prompt) = first_prompt {
-                                        app.push_user(prompt.clone());
+                                        let turn_id = app.push_user(prompt.clone());
                                         let connection = connection.clone();
                                         let session = session_id.clone();
                                         let updates = updates_tx.clone();
@@ -444,10 +452,13 @@ pub async fn run(
                                                 ))
                                                 .block_task()
                                                 .await;
-                                            let _ = updates.send(Update::TurnEnded(match outcome {
-                                                Ok(_) => None,
-                                                Err(error) => Some(error.to_string()),
-                                            }));
+                                            let _ = updates.send(Update::TurnEnded {
+                                                id: Some(turn_id),
+                                                error: match outcome {
+                                                    Ok(_) => None,
+                                                    Err(error) => Some(error.to_string()),
+                                                },
+                                            });
                                         }));
                                     }
                                 }
@@ -482,6 +493,20 @@ pub async fn run(
                                     let _ = connection.send_notification(
                                         CancelNotification::new(session_id.clone()),
                                     );
+                                }
+                                Action::CancelBackground(call_id) => {
+                                    let response = connection
+                                        .send_request(CancelBackgroundRequest {
+                                            session_id: session_id.clone(),
+                                            call_id: call_id.clone(),
+                                        })
+                                        .block_task()
+                                        .await;
+                                    if let Err(error) = response {
+                                        app.note(format!(
+                                            "could not cancel background call: {}", error.message
+                                        ));
+                                    }
                                 }
                                 Action::None | Action::Redraw => {}
                             }

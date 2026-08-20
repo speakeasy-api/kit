@@ -21,15 +21,29 @@ use agentkit_core::{
 };
 use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
     provider::{ModelGroup, ModelSelection, SelectableAdapter, model_catalog},
-    runtime::{AcpDriverContext, Runtime},
+    runtime::{AcpDriverContext, BackgroundJobs, Runtime},
 };
 
 const MODEL_CONFIG_ID: &str = "model";
+
+/// Kit-private ACP extension used by the bundled TUI to stop one detached call.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
+pub(crate) struct CancelBackgroundRequest {
+    pub session_id: agentkit_acp::SessionId,
+    pub call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+pub(crate) struct CancelBackgroundResponse {
+    pub cancelled: bool,
+}
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(error.to_string())
@@ -50,10 +64,15 @@ enum Command {
     },
 }
 
+struct SessionHandle {
+    commands: mpsc::Sender<Command>,
+    background_jobs: BackgroundJobs,
+}
+
 struct Server {
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
-    sessions: Mutex<HashMap<agentkit_acp::SessionId, mpsc::Sender<Command>>>,
+    sessions: Mutex<HashMap<agentkit_acp::SessionId, SessionHandle>>,
     next_session: AtomicU64,
 }
 
@@ -116,10 +135,13 @@ impl Server {
             }
         };
         let (tx, rx) = mpsc::channel(8);
-        self.sessions
-            .lock()
-            .await
-            .insert(acp_session_id.clone(), tx);
+        self.sessions.lock().await.insert(
+            acp_session_id.clone(),
+            SessionHandle {
+                commands: tx,
+                background_jobs: driver.background_jobs.clone(),
+            },
+        );
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let catalog = model_catalog(&current).await;
         let options = model_options(&current, &catalog);
@@ -187,6 +209,7 @@ impl Server {
         let (tx, rx) = oneshot::channel();
         let closed = async {
             sender
+                .commands
                 .send(Command::Close { reply: tx })
                 .await
                 .map_err(|_| AcpRuntimeError::ClientClosed)?;
@@ -207,8 +230,24 @@ impl Server {
             .lock()
             .await
             .get(session_id)
-            .cloned()
+            .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
+    }
+
+    async fn cancel_background(
+        &self,
+        request: CancelBackgroundRequest,
+    ) -> Result<CancelBackgroundResponse, AcpRuntimeError> {
+        let background_jobs = self
+            .sessions
+            .lock()
+            .await
+            .get(&request.session_id)
+            .map(|session| session.background_jobs.clone())
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        Ok(CancelBackgroundResponse {
+            cancelled: background_jobs.cancel(&request.call_id),
+        })
     }
 }
 
@@ -486,6 +525,21 @@ async fn serve_transport(
                     cx.spawn(async move {
                         responder
                             .respond_with_result(state.set_config(request).await.map_err(sdk_error))
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: CancelBackgroundRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.cancel_background(request).await.map_err(sdk_error),
+                        )
                     })?;
                     Ok(())
                 }

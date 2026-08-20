@@ -542,6 +542,9 @@ fn plural(word: &str, count: usize) -> String {
 }
 
 fn tool_header(app: &App, call: &ToolCall) -> Vec<Span<'static>> {
+    let active = app
+        .focus_call()
+        .is_some_and(|focused| focused.id == call.id);
     let (glyph, style) = match call.status {
         _ if call.running() => (
             theme::pulse(theme::Pulse::Tool, app.tick).to_string(),
@@ -552,7 +555,10 @@ fn tool_header(app: &App, call: &ToolCall) -> Vec<Span<'static>> {
     };
     let mut spans = vec![
         Span::styled(format!("{glyph} "), style),
-        Span::styled(call.title.clone(), theme::bold(theme::TEXT)),
+        Span::styled(
+            call.title.clone(),
+            theme::bold(if active { theme::ACCENT } else { theme::TEXT }),
+        ),
         Span::styled(kind_label(call.kind).to_string(), theme::faint()),
         Span::styled(
             format!("  {}", theme::duration(call.elapsed())),
@@ -561,6 +567,9 @@ fn tool_header(app: &App, call: &ToolCall) -> Vec<Span<'static>> {
     ];
     if call.backgrounded && call.running() {
         spans.push(Span::styled("  · background", theme::accent()));
+        if active {
+            spans.push(Span::styled(" · ^k kill", theme::accent()));
+        }
     }
     let running = call.running_children();
     if running > 0 {
@@ -1119,6 +1128,49 @@ mod tests {
     }
 
     #[test]
+    fn only_the_graphs_active_call_shows_the_kill_hint() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        for id in ["first", "second"] {
+            app.apply(Update::ToolStarted {
+                id: id.into(),
+                title: format!("compose {id}"),
+                kind: ToolKind::Other,
+                script: Some("return 1".into()),
+                backgrounded: true,
+            });
+        }
+        fn headers(app: &App) -> Vec<String> {
+            app.blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Tool(call) => Some(
+                        super::tool_header(app, call)
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let initial = headers(&app);
+        assert!(!initial[0].contains("^k kill"));
+        assert!(initial[1].contains("^k kill"));
+
+        app.focused_call_id = Some("first".into());
+        app.graph_pinned = Some(false);
+        let selected = headers(&app);
+        assert!(selected[0].contains("^k kill"));
+        assert!(!selected[1].contains("^k kill"));
+    }
+
+    #[test]
     fn scrolls_back_through_a_long_transcript_with_the_log_pane_open() {
         let mut app = sample();
         app.apply(Update::ToolUpdated {
@@ -1128,14 +1180,20 @@ mod tests {
             output: vec!["exit code 1".into()],
             backgrounded: false,
         });
-        app.apply(Update::TurnEnded(Some("model refused the request".into())));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: Some("model refused the request".into()),
+        });
         app.apply(Update::Log("warn: retrying provider request".into()));
         app.show_logs = true;
         for index in 0..12 {
             app.push_user(format!("follow-up number {index}"));
             app.apply(Update::Text(format!("answer number {index}")));
         }
-        app.apply(Update::TurnEnded(None));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: None,
+        });
         let _ = render(&mut app, 100, 24);
         app.scroll_by(-6);
         let frame = render(&mut app, 100, 24);

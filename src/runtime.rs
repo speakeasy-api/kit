@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
@@ -99,6 +100,7 @@ pub(crate) struct AcpDriverContext {
 pub(crate) struct AcpDriver {
     pub driver: LoopDriver<SelectableSession>,
     pub tasks: TaskManagerHandle,
+    pub background_jobs: BackgroundJobs,
     pub adapter: SelectableAdapter,
 }
 
@@ -321,6 +323,15 @@ impl Runtime {
     }
 
     fn compose_with(&self, depth: usize, subagents: Subagents) -> ComposeOnly {
+        self.compose_with_jobs(depth, subagents, BackgroundJobs::default())
+    }
+
+    fn compose_with_jobs(
+        &self,
+        depth: usize,
+        subagents: Subagents,
+        background_jobs: BackgroundJobs,
+    ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
@@ -343,7 +354,7 @@ impl Runtime {
             .with_config(ComposeConfig::new().with_max_nested_tool_calls(128))
             .with_backend(HiddenRunletBackend(child_specs));
         ComposeOnly {
-            backgroundable: BackgroundableCompose::new(compose.clone()),
+            backgroundable: BackgroundableCompose::new(compose.clone(), background_jobs),
             compose,
         }
     }
@@ -514,9 +525,14 @@ impl Runtime {
             let subagents = self.subagents.fresh();
             let task_manager = background_task_manager();
             let tasks = task_manager.handle();
+            let background_jobs = BackgroundJobs::default();
             let driver = Agent::builder()
                 .model(adapter.clone())
-                .add_tool_source(self.compose_with(self.base_depth, subagents))
+                .add_tool_source(self.compose_with_jobs(
+                    self.base_depth,
+                    subagents,
+                    background_jobs.clone(),
+                ))
                 .task_manager(task_manager)
                 .mutator(compactor)
                 .observer(context.integration.as_ref().clone())
@@ -533,6 +549,7 @@ impl Runtime {
             Ok(AcpDriver {
                 driver,
                 tasks,
+                background_jobs,
                 adapter,
             })
         }
@@ -613,16 +630,48 @@ impl ToolSource for ComposeOnly {
     }
 }
 
+#[derive(Default)]
+struct BackgroundJobState {
+    running: HashMap<agentkit_core::ToolCallId, CancellationController>,
+    pending_cancellations: std::collections::HashSet<agentkit_core::ToolCallId>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct BackgroundJobs(Arc<Mutex<BackgroundJobState>>);
+
+impl BackgroundJobs {
+    pub fn cancel(&self, call_id: &str) -> bool {
+        let call_id = agentkit_core::ToolCallId::new(call_id);
+        let Ok(mut jobs) = self.0.lock() else {
+            return false;
+        };
+        if let Some(controller) = jobs.running.get(&call_id) {
+            controller.interrupt();
+        } else {
+            // ACP can expose the call just before its execution future registers.
+            // Remember the request so registration and cancellation are atomic
+            // from the user's perspective.
+            jobs.pending_cancellations.insert(call_id);
+        }
+        true
+    }
+}
+
 #[derive(Clone)]
 struct BackgroundableCompose {
     inner: ComposeTool,
     spec: ToolSpec,
+    background_jobs: BackgroundJobs,
 }
 
 impl BackgroundableCompose {
-    fn new(inner: ComposeTool) -> Self {
+    fn new(inner: ComposeTool, background_jobs: BackgroundJobs) -> Self {
         let spec = backgroundable_spec(inner.spec().clone());
-        Self { inner, spec }
+        Self {
+            inner,
+            spec,
+            background_jobs,
+        }
     }
 
     fn sanitized(mut request: ToolRequest) -> Result<ToolRequest, ToolError> {
@@ -667,7 +716,13 @@ impl Tool for BackgroundableCompose {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        self.inner.invoke(Self::sanitized(request)?, ctx).await
+        let background = background_requested(&request);
+        let call_id = request.call_id.clone();
+        let request = Self::sanitized(request)?;
+        let cancellation = self.begin_background(background, &call_id, ctx);
+        let result = self.inner.invoke(request, ctx).await;
+        self.finish_background(cancellation, &call_id);
+        result
     }
 
     async fn invoke_outcome(
@@ -675,11 +730,57 @@ impl Tool for BackgroundableCompose {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        match Self::sanitized(request) {
-            Ok(request) => self.inner.invoke_outcome(request, ctx).await,
-            Err(error) => ToolExecutionOutcome::Failed(error),
+        let background = background_requested(&request);
+        let call_id = request.call_id.clone();
+        let request = match Self::sanitized(request) {
+            Ok(request) => request,
+            Err(error) => return ToolExecutionOutcome::Failed(error),
+        };
+        let cancellation = self.begin_background(background, &call_id, ctx);
+        let result = self.inner.invoke_outcome(request, ctx).await;
+        self.finish_background(cancellation, &call_id);
+        result
+    }
+}
+
+impl BackgroundableCompose {
+    fn begin_background(
+        &self,
+        background: bool,
+        call_id: &agentkit_core::ToolCallId,
+        ctx: &mut ToolContext<'_>,
+    ) -> bool {
+        if !background {
+            return false;
+        }
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        ctx.cancellation = Some(cancellation.clone());
+        if let Some(scope) = &mut ctx.execution_scope {
+            scope.cancellation = Some(cancellation);
+        }
+        if let Ok(mut jobs) = self.background_jobs.0.lock() {
+            if jobs.pending_cancellations.remove(call_id) {
+                controller.interrupt();
+            }
+            jobs.running.insert(call_id.clone(), controller);
+        }
+        true
+    }
+
+    fn finish_background(&self, background: bool, call_id: &agentkit_core::ToolCallId) {
+        if background && let Ok(mut jobs) = self.background_jobs.0.lock() {
+            jobs.running.remove(call_id);
+            jobs.pending_cancellations.remove(call_id);
         }
     }
+}
+
+fn background_requested(request: &ToolRequest) -> bool {
+    matches!(
+        request.input.get("background"),
+        Some(Value::Bool(true) | Value::Number(_))
+    )
 }
 
 fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {

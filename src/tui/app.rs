@@ -58,8 +58,11 @@ pub enum Update {
     Runtime(RuntimeEvent),
     /// A diagnostic line from the agent process.
     Log(String),
-    /// The turn ended, with an error message when it failed.
-    TurnEnded(Option<String>),
+    /// A specific submitted turn ended. `None` identifies a process-wide failure.
+    TurnEnded {
+        id: Option<u64>,
+        error: Option<String>,
+    },
 }
 
 /// Latest provider-reported occupancy of the main model's context window.
@@ -101,6 +104,7 @@ pub enum Action {
     },
     Copy(String),
     Cancel,
+    CancelBackground(String),
     Quit,
 }
 
@@ -247,6 +251,8 @@ pub struct App {
     pub editor: Editor,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
+    next_turn_id: u64,
+    active_turn_id: Option<u64>,
     /// The previous assistant stream ended; the next text starts a new block.
     agent_stream_sealed: bool,
     /// Exact source bytes in the latest assistant stream, before TUI rendering.
@@ -453,6 +459,8 @@ impl App {
             editor: Editor::default(),
             phase: Phase::Idle,
             turn_started: None,
+            next_turn_id: 0,
+            active_turn_id: None,
             agent_stream_sealed: false,
             latest_agent_source: String::new(),
             compacting: false,
@@ -709,12 +717,16 @@ impl App {
                     self.logs.drain(..self.logs.len() - 500);
                 }
             }
-            Update::TurnEnded(error) => {
+            Update::TurnEnded { id, error } => {
+                if id.is_some() && id != self.active_turn_id {
+                    return;
+                }
                 self.close_thought();
                 self.agent_stream_sealed = true;
                 let interrupted = self.phase == Phase::Cancelling;
                 self.phase = Phase::Idle;
                 self.turn_started = None;
+                self.active_turn_id = None;
                 self.compacting = false;
                 for block in &mut self.blocks {
                     if let Block::Tool(call) = block
@@ -818,6 +830,7 @@ impl App {
         self.latest_agent_source.clear();
         self.phase = Phase::Idle;
         self.turn_started = None;
+        self.active_turn_id = None;
         self.compacting = false;
         self.usage = None;
         self.scroll = usize::MAX;
@@ -828,24 +841,27 @@ impl App {
         self.row_code.clear();
     }
 
-    pub fn push_user(&mut self, prompt: String) {
+    pub fn push_user(&mut self, prompt: String) -> u64 {
         self.blocks.push(Block::User(prompt));
-        self.begin_turn();
+        self.begin_turn()
     }
 
     /// Starts a command-only compaction turn without adding the internal
     /// control prompt to the visible transcript.
-    pub fn begin_compaction(&mut self) {
+    pub fn begin_compaction(&mut self) -> u64 {
         self.compacting = true;
-        self.begin_turn();
+        self.begin_turn()
     }
 
-    fn begin_turn(&mut self) {
+    fn begin_turn(&mut self) -> u64 {
+        self.next_turn_id = self.next_turn_id.wrapping_add(1);
+        self.active_turn_id = Some(self.next_turn_id);
         self.agent_stream_sealed = true;
         self.phase = Phase::Working;
         self.turn_started = Some(Instant::now());
         self.follow = true;
         self.scroll = usize::MAX;
+        self.next_turn_id
     }
 
     /// Folds a tool call's raw output open or shut.
@@ -1019,6 +1035,18 @@ impl App {
                 }
                 self.editor.clear();
                 self.toast("prompt cleared — ctrl+c again to quit");
+            }
+            KeyCode::Char('k')
+                if control
+                    && self
+                        .focus_call()
+                        .is_some_and(|call| call.backgrounded && call.running()) =>
+            {
+                return Action::CancelBackground(
+                    self.focus_call()
+                        .map(|call| call.id.clone())
+                        .unwrap_or_default(),
+                );
             }
             KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
             KeyCode::Char('y') if control => {
@@ -1337,7 +1365,10 @@ mod tests {
     fn turn_end_clears_compaction_state() {
         let mut app = app();
         app.compacting = true;
-        app.apply(Update::TurnEnded(None));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: None,
+        });
         assert!(!app.compacting);
     }
 
@@ -1390,12 +1421,34 @@ mod tests {
     fn closes_running_calls_when_the_turn_ends() {
         let mut app = app();
         compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-        app.apply(Update::TurnEnded(None));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: None,
+        });
         let Some(Block::Tool(call)) = app.blocks.last() else {
             panic!("expected a tool block");
         };
         assert_eq!(call.status, ToolCallStatus::Completed);
         assert!(!app.working());
+    }
+
+    #[test]
+    fn stale_turn_end_cannot_finish_a_newer_turn() {
+        let mut app = app();
+        let first = app.push_user("first".into());
+        app.apply(Update::TurnEnded {
+            id: Some(first),
+            error: None,
+        });
+        let second = app.push_user("second".into());
+
+        app.apply(Update::TurnEnded {
+            id: Some(first),
+            error: None,
+        });
+
+        assert!(app.working());
+        assert_eq!(app.active_turn_id, Some(second));
     }
 
     #[test]
@@ -1416,7 +1469,10 @@ mod tests {
             backgrounded: true,
         });
 
-        app.apply(Update::TurnEnded(None));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: None,
+        });
 
         let running = app
             .blocks
@@ -1429,6 +1485,26 @@ mod tests {
             Some("background-2")
         );
         assert!(!app.working());
+    }
+
+    #[test]
+    fn control_k_kills_the_focused_background_call() {
+        let mut app = app();
+        app.apply(Update::ToolStarted {
+            id: "background".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some("return 1".into()),
+            backgrounded: true,
+        });
+        app.graph_pinned = Some(false);
+
+        let action = app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL));
+
+        assert!(matches!(
+            action,
+            Action::CancelBackground(id) if id == "background"
+        ));
     }
 
     #[test]
@@ -1602,7 +1678,10 @@ mod tests {
     fn copies_only_agent_text_after_the_latest_user_message() {
         let mut app = app();
         app.apply(Update::Text("old".into()));
-        app.apply(Update::TurnEnded(None));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: None,
+        });
         app.push_user("next".into());
         app.apply(Update::Text("new".into()));
 
@@ -1625,7 +1704,10 @@ mod tests {
     fn autonomous_text_starts_a_new_block_after_turn_end() {
         let mut app = app();
         app.apply(Update::Text("Started.".into()));
-        app.apply(Update::TurnEnded(None));
+        app.apply(Update::TurnEnded {
+            id: None,
+            error: None,
+        });
         app.apply(Update::Text("RAVENS_".into()));
         app.apply(Update::Text("HARBOR_INEVITABLE".into()));
 

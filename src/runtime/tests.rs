@@ -114,6 +114,100 @@ fn compose_background_values_select_agentkit_task_routes() {
     }
 }
 
+#[test]
+fn detached_compose_uses_job_specific_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let executor: Arc<dyn ToolExecutor> =
+        Arc::new(BasicToolExecutor::new(Vec::<Arc<dyn ToolSource>>::new()));
+    let permissions = Arc::new(AllowAllPermissions);
+    let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+    let session_id = SessionId::new("session");
+    let turn_id = TurnId::new("turn");
+    let owned = OwnedToolContext {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        metadata: MetadataMap::new(),
+        permissions: permissions.clone(),
+        resources: resources.clone(),
+        cancellation: None,
+        execution_scope: Some(ToolExecutionScope {
+            executor,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            permissions,
+            resources,
+            cancellation: None,
+        }),
+        approved_request: None,
+    };
+    let call_id = ToolCallId::new("call");
+    let mut context = owned.borrowed();
+
+    assert!(
+        compose
+            .backgroundable
+            .begin_background(true, &call_id, &mut context)
+    );
+    let cancellation = context.cancellation.clone().expect("job cancellation");
+    assert!(!cancellation.is_cancelled());
+    assert!(compose.backgroundable.background_jobs.cancel("call"));
+    assert!(cancellation.is_cancelled());
+    compose.backgroundable.finish_background(true, &call_id);
+}
+
+#[tokio::test]
+async fn cancelling_background_compose_finishes_through_its_normal_result() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let executor: Arc<dyn ToolExecutor> =
+        Arc::new(BasicToolExecutor::new(Vec::<Arc<dyn ToolSource>>::new()));
+    let permissions = Arc::new(AllowAllPermissions);
+    let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+    let session_id = SessionId::new("session");
+    let turn_id = TurnId::new("turn");
+    let owned = OwnedToolContext {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        metadata: MetadataMap::new(),
+        permissions: permissions.clone(),
+        resources: resources.clone(),
+        cancellation: None,
+        execution_scope: Some(ToolExecutionScope {
+            executor,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            permissions,
+            resources,
+            cancellation: None,
+        }),
+        approved_request: None,
+    };
+    let request = ToolRequest::new(
+        ToolCallId::new("call"),
+        ToolName::new("compose"),
+        json!({
+            "script": "return shell({ command: \"sleep 30\", timeout_seconds: 60 })",
+            "background": true
+        }),
+        session_id,
+        turn_id,
+    );
+    let mut context = owned.borrowed();
+    let cancel = async {
+        assert!(compose.backgroundable.background_jobs.cancel("call"));
+    };
+
+    let (outcome, ()) = tokio::join!(
+        compose.backgroundable.invoke_outcome(request, &mut context),
+        cancel
+    );
+
+    assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
+}
+
 #[tokio::test]
 async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispatch() {
     let root = tempfile::tempdir().unwrap();
