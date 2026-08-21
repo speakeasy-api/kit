@@ -21,8 +21,8 @@ use agentkit_tool_compose::{
 };
 use agentkit_tool_skills::SkillRegistry;
 use agentkit_tools_core::{
-    PermissionRequest, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolName, ToolRegistry,
-    ToolRequest, ToolResult, ToolSource, ToolSpec,
+    PermissionRequest, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolName, ToolRequest,
+    ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -168,7 +168,9 @@ pub struct Runtime {
     /// Later ACP sessions receive their own persisted ids.
     session: Mutex<SessionSelection>,
     mcp: crate::tools::mcp::McpRuntime,
-    skills: ToolRegistry,
+    skills: Arc<SkillRegistry>,
+    skill_package_roots: Vec<PathBuf>,
+    skill_directories: Vec<PathBuf>,
 }
 
 impl Runtime {
@@ -234,6 +236,8 @@ impl Runtime {
             session: Mutex::new(SessionSelection::default()),
             mcp: crate::tools::mcp::empty(),
             skills,
+            skill_package_roots: Vec::new(),
+            skill_directories: Vec::new(),
         }))
     }
 
@@ -358,6 +362,8 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure plugins after runtime was shared".to_string())?;
         runtime.skills = build_skill_tools(&runtime.root, &package_roots, &skill_directories);
+        runtime.skill_package_roots = package_roots;
+        runtime.skill_directories = skill_directories;
         Ok(Arc::new(runtime))
     }
 
@@ -424,8 +430,21 @@ impl Runtime {
         self.compose_with(depth, self.subagents.fresh())
     }
 
+    fn fresh_skills(&self) -> Arc<SkillRegistry> {
+        build_skill_tools(
+            &self.root,
+            &self.skill_package_roots,
+            &self.skill_directories,
+        )
+    }
+
     fn compose_with(&self, depth: usize, subagents: Subagents) -> ComposeOnly {
-        self.compose_with_jobs(depth, subagents, BackgroundJobs::default())
+        self.compose_with_jobs(
+            depth,
+            subagents,
+            BackgroundJobs::default(),
+            Arc::clone(&self.skills),
+        )
     }
 
     fn compose_with_jobs(
@@ -433,6 +452,7 @@ impl Runtime {
         depth: usize,
         subagents: Subagents,
         background_jobs: BackgroundJobs,
+        skills: Arc<SkillRegistry>,
     ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(DocsTool::new()))
@@ -456,7 +476,8 @@ impl Runtime {
             .with(Observed::new(ToolSearch::new(self.mcp.clone())))
             .with(Observed::new(AuthTool::new(self.mcp.clone())))
             .with(Observed::new(McpTool::new(self.mcp.catalog())));
-        if let Some(skill_tool) = self.skills.get(&ToolName::new("activate_skill")) {
+        let skill_tools = skills.tool_registry();
+        if let Some(skill_tool) = skill_tools.get(&ToolName::new("activate_skill")) {
             children.register(observe_shared(skill_tool));
         }
         let child_specs = children.specs();
@@ -495,17 +516,24 @@ impl Runtime {
             request.force,
             initial,
         )?;
+        let skills = self.fresh_skills();
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
+            Arc::clone(&skills),
             format!("compaction-{}", crate::session::new_id()),
         )?;
         let subagents = self.subagents.fresh();
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with(0, subagents))
+            .add_tool_source(self.compose_with_jobs(
+                0,
+                subagents,
+                BackgroundJobs::default(),
+                skills,
+            ))
             .task_manager(background_task_manager())
             .mutator(compactor)
             .transcript_observer(opened.observer)
@@ -556,10 +584,12 @@ impl Runtime {
             .initial_transcript(depth)
             .await
             .map_err(LoopError::InvalidState)?;
+        let skills = self.fresh_skills();
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
             self.agentkit_telemetry(),
             None,
+            Arc::clone(&skills),
             format!("compaction-{session}"),
         )
         .map_err(LoopError::InvalidState)?;
@@ -567,7 +597,12 @@ impl Runtime {
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with(depth, subagents))
+            .add_tool_source(self.compose_with_jobs(
+                depth,
+                subagents,
+                BackgroundJobs::default(),
+                skills,
+            ))
             .task_manager(background_task_manager())
             .mutator(compactor)
             .transcript(transcript)
@@ -641,10 +676,12 @@ impl Runtime {
             self.credential_storage.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
+        let skills = self.fresh_skills();
         let compactor = crate::compaction::automatic(
             adapter.clone(),
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
+            Arc::clone(&skills),
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;
@@ -659,6 +696,7 @@ impl Runtime {
                 self.base_depth,
                 subagents,
                 background_jobs.clone(),
+                skills,
             ))
             .task_manager(task_manager)
             .mutator(compactor)
@@ -692,10 +730,10 @@ impl Runtime {
                 "Keep tool output lean: use targeted paths, ranges, filters, and bounded `head`/`tail` output. Do not dump whole trees, generated files, long successful build logs, credential files, or environment contents.\n\n",
                 "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",
                 "express required ordering with data dependencies or `after`, and use `fold` only for reductions or genuinely sequential chains. ",
-                "Parallelize independent work deliberately. Background long-running compose work when keeping the session responsive or doing other independent work meanwhile is more useful than waiting; it also suits one-shot triggers. ",
+                "Parallelize independent work deliberately. Prefer one compose program whenever the remaining tool graph is known: keep intermediate results inside it when they can directly drive downstream work, and return only the bare minimum information necessary to plan the next turn or provide the final answer. ",
+                "Background long-running compose work when keeping the session responsive or doing other independent work meanwhile is more useful than waiting; it also suits one-shot triggers. ",
                 "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
                 "Keep work foregrounded when the next step needs its immediate result, and do not treat backgrounding as durable job execution.\n\n",
-                "When several subagents need the same context, first complete one context-loading subagent, then fork it into parallel branches. ",
                 "When work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
                 "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n",
                 "Current subagent depth: {depth}/{}."
@@ -712,7 +750,7 @@ fn build_skill_tools(
     root: &Path,
     package_roots: &[PathBuf],
     skill_directories: &[PathBuf],
-) -> ToolRegistry {
+) -> Arc<SkillRegistry> {
     let default_roots = default_skill_roots(root);
     let canonical_defaults = default_roots
         .iter()
@@ -728,8 +766,8 @@ fn build_skill_tools(
         .collect::<Vec<_>>();
     let mut roots = default_roots;
     roots.extend(skill_directories.iter().cloned());
-    SkillRegistry::from_paths(roots)
-        .with_filter(move |skill: &agentkit_tool_skills::Skill| {
+    Arc::new(SkillRegistry::from_paths(roots).with_filter(
+        move |skill: &agentkit_tool_skills::Skill| {
             let Ok(base) = skill.base_dir.canonicalize() else {
                 return false;
             };
@@ -746,8 +784,8 @@ fn build_skill_tools(
                 && canonical_package_roots
                     .iter()
                     .any(|package| location.starts_with(package))
-        })
-        .tool_registry()
+        },
+    ))
 }
 
 fn default_skill_roots(root: &Path) -> Vec<PathBuf> {

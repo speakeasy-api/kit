@@ -20,7 +20,7 @@ use crossterm::event::{
 };
 use ratatui::text::Line;
 
-use crate::events::RuntimeEvent;
+use crate::{compaction::is_compaction_summary, events::RuntimeEvent};
 
 use super::{
     command::{Parsed, parse},
@@ -480,13 +480,6 @@ fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
     let mut all_tokens = model_tokens(&choice.provider);
     all_tokens.extend(candidate_tokens);
     ordered_token_score(&all_tokens, &query_tokens).map(|score| ModelScore { tier: 4, ..score })
-}
-
-fn is_compaction_summary(item: &Item) -> bool {
-    item.metadata
-        .get("kit.compaction.summary")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
 }
 
 fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
@@ -1792,7 +1785,10 @@ mod tests {
     #[test]
     fn restores_only_tagged_developer_items_as_compaction_markers() {
         let mut metadata = MetadataMap::new();
-        metadata.insert("kit.compaction.summary".into(), true.into());
+        metadata.insert(
+            crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
+            true.into(),
+        );
         let transcript = vec![
             Item::text(ItemKind::Developer, "ordinary instruction"),
             Item::text(ItemKind::Developer, "summary").with_metadata(metadata),

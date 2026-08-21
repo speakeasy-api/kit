@@ -52,8 +52,8 @@ Protocol source attribution and reproduced upstream licenses are in
 Every TUI conversation is persisted as an append-only, versioned JSONL transcript
 under `~/.kit/sessions`. Sessions from the legacy `<root>/.kit/sessions` location
 remain resumable and are copied to the global location on resume. When reported
-context use reaches 80% of the model's window, Kit automatically summarizes mutable
-history while preserving bootstrap instructions and the latest user request; the
+context use reaches 80% of the model's window, Kit automatically checkpoints older
+history while preserving bootstrap instructions and a tool-safe recent tail; the
 replacement is persisted for resume.
 The session id is shown in the header. Resume it with:
 

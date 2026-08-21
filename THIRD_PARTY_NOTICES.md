@@ -18,6 +18,8 @@ commit-addressed source files. Kit does not distribute or invoke either upstream
 
 - Repository: https://github.com/anomalyco/opencode
 - Commit: `fe82a1b6ca4f535beb973b0867017e3f639f85ed`
-- File: `packages/opencode/src/plugin/openai/codex.ts`
+- Files: `packages/opencode/src/plugin/openai/codex.ts` and, at commit
+  `1b937c860b6fd8a83e69f916b1236515aa17ea0d`,
+  `packages/core/src/session/compaction.ts`
 - License: MIT, reproduced in `third_party/licenses/OPENCODE-MIT.txt`
 - Copyright: Copyright (c) 2025 opencode

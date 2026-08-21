@@ -169,7 +169,8 @@ fn plugin_skills_join_the_catalog_without_broadening_discovery() {
 
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let runtime = Runtime::with_plugin_skills(runtime, vec![plugin], vec![plugin_skill]).unwrap();
-    let tool = ToolSource::get(&runtime.skills, &ToolName::new("activate_skill")).unwrap();
+    let skills = runtime.skills.tool_registry();
+    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
     let spec = tool.current_spec().unwrap();
     let catalog = spec.input_schema.to_string();
     assert!(catalog.contains("project-skill"));
@@ -199,7 +200,8 @@ fn plugin_skill_symlink_retargeting_fails_closed() {
     std::fs::remove_file(skill.join("SKILL.md")).unwrap();
     symlink(replacement, skill.join("SKILL.md")).unwrap();
 
-    let tool = ToolSource::get(&runtime.skills, &ToolName::new("activate_skill")).unwrap();
+    let skills = runtime.skills.tool_registry();
+    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
     let catalog = tool
         .current_spec()
         .map(|spec| spec.description)
@@ -229,10 +231,87 @@ fn project_skills_take_precedence_over_plugin_skills() {
     let runtime =
         Runtime::with_plugin_skills(runtime, vec![root.path().to_path_buf()], vec![plugin_skill])
             .unwrap();
-    let tool = ToolSource::get(&runtime.skills, &ToolName::new("activate_skill")).unwrap();
+    let skills = runtime.skills.tool_registry();
+    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
     let catalog = tool.current_spec().unwrap().description;
     assert!(catalog.contains("Project version."));
     assert!(!catalog.contains("Plugin version."));
+}
+
+#[tokio::test]
+async fn session_skill_registries_reset_independently() {
+    let root = tempfile::tempdir().unwrap();
+    write_skill(
+        &root.path().join(".agents/skills/reusable"),
+        "reusable",
+        "Reusable skill.",
+        "full instructions",
+    );
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let registry = runtime.fresh_skills();
+    let other_registry = runtime.fresh_skills();
+    let skills = registry.tool_registry();
+    let other_skills = other_registry.tool_registry();
+    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
+    let other_tool = ToolSource::get(&other_skills, &ToolName::new("activate_skill")).unwrap();
+    let permissions = Arc::new(AllowAllPermissions);
+    let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+    let owned = OwnedToolContext {
+        session_id: SessionId::new("session"),
+        turn_id: TurnId::new("turn"),
+        metadata: MetadataMap::new(),
+        permissions,
+        resources,
+        cancellation: None,
+        execution_scope: None,
+        approved_request: None,
+    };
+    let request = |call_id| {
+        ToolRequest::new(
+            ToolCallId::new(call_id),
+            ToolName::new("activate_skill"),
+            json!({ "name": "reusable" }),
+            SessionId::new("session"),
+            TurnId::new("turn"),
+        )
+    };
+    let mut context = owned.borrowed();
+
+    let first = tool.invoke(request("first"), &mut context).await.unwrap();
+    assert!(
+        matches!(first.result.output, ToolOutput::Text(ref text) if text.contains("full instructions"))
+    );
+    let duplicate = tool
+        .invoke(request("duplicate"), &mut context)
+        .await
+        .unwrap();
+    let other_first = other_tool
+        .invoke(request("other-first"), &mut context)
+        .await
+        .unwrap();
+    assert!(
+        matches!(duplicate.result.output, ToolOutput::Text(ref text) if text == "Skill already read.")
+    );
+    assert!(
+        matches!(other_first.result.output, ToolOutput::Text(ref text) if text.contains("full instructions"))
+    );
+
+    registry.reset_activations();
+
+    let reactivated = tool
+        .invoke(request("reactivated"), &mut context)
+        .await
+        .unwrap();
+    assert!(
+        matches!(reactivated.result.output, ToolOutput::Text(ref text) if text.contains("full instructions"))
+    );
+    let other_duplicate = other_tool
+        .invoke(request("other-duplicate"), &mut context)
+        .await
+        .unwrap();
+    assert!(
+        matches!(other_duplicate.result.output, ToolOutput::Text(ref text) if text == "Skill already read.")
+    );
 }
 
 #[test]
@@ -485,7 +564,11 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
     assert!(prompt.contains("keeping the session responsive or doing other independent work"));
     assert!(prompt.contains("it also suits one-shot triggers"));
-    assert!(prompt.contains("first complete one context-loading subagent, then fork it"));
+    assert!(
+        prompt.contains("Prefer one compose program whenever the remaining tool graph is known")
+    );
+    assert!(prompt.contains("keep intermediate results inside it"));
+    assert!(prompt.contains("return only the bare minimum information necessary"));
     assert!(prompt.contains("start fresh subagents from concise summaries"));
     assert!(prompt.contains("close subagents when no longer needed"));
 }
