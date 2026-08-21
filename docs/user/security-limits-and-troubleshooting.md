@@ -79,7 +79,7 @@ Use `kit tui --help` for credential-store options. If nested Kit agents need the
 
 The following are fixed runtime limits, not configurable policy controls:
 
-- Shell timeout: 120 seconds by default; accepted values are 1 through 3600 seconds. Timeout reports `shell command timed out`. Captured stdout and stderr are each limited to 4 MiB and end with `[output truncated]` when exceeded.
+- Shell timeout: 120 seconds by default; accepted values are 1 through 3600 seconds. Timeout reports `shell command timed out`. Stdout and stderr above 8 KiB spill in full to `~/.kit/artifacts`; model-visible results contain bounded head-and-tail previews and artifact paths.
 - Subagents: nesting depth is two and at most 120 live subagent sessions are retained per main session. Errors include `subagent depth limit (2) reached` and `live subagent session limit (120) reached`. Reuse completed sessions or release unneeded ones with `close` instead of creating unbounded children.
 - ACP children: startup handshake and `session/fork` waits are 30 seconds. Cancellation allows 5 seconds to settle before Kit tears down the child. Captured ACP updates are limited to 64 updates and 64 KiB; the returned `updates.truncated` flag reports loss.
 - MCP: lazy server initialization uses a 20-second connection timeout. OAuth authorization expires after 10 minutes. `tool_search` returns at most a bounded set of matching tools per server; search with a configured server name, capability-rich description, or specific product term. Use the exact query `mcp` to initialize all servers.
@@ -100,7 +100,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 ### A shell or edit tool fails
 
 1. For `shell command timed out`, reduce the task, diagnose a blocked subprocess, or intentionally raise `timeout_seconds` within 1–3600. An interrupt kills Kit's child command but still inspect for partial side effects.
-2. For `[output truncated]`, redirect verbose output to a file in the root and inspect a small relevant range instead of increasing output.
+2. When a result reports `shell output spilled`, inspect a small relevant range from its artifact instead of returning the full artifact to model context.
 3. For `path must be non-empty`, provide either a path relative to the runtime root or an absolute path.
 4. For a hunk mismatch or ambiguity, reread the file and provide more unique exact context.
 

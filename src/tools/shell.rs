@@ -1,4 +1,9 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use agentkit_core::{ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
@@ -7,9 +12,12 @@ use agentkit_tools_core::{
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 
-const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
 
 #[derive(Clone)]
 pub struct ShellTool {
@@ -40,7 +48,9 @@ impl ShellTool {
                     "exit_code": {"type": ["integer", "null"]},
                     "success": {"type": "boolean"},
                     "stdout": {"type": "string"},
-                    "stderr": {"type": "string"}
+                    "stderr": {"type": "string"},
+                    "stdout_artifact": {"type": "string"},
+                    "stderr_artifact": {"type": "string"}
                 },
                 "required": ["exit_code", "success", "stdout", "stderr"],
                 "additionalProperties": false
@@ -95,8 +105,17 @@ impl Tool for ShellTool {
             .stderr
             .take()
             .ok_or_else(|| ToolError::Internal("shell stderr was not piped".into()))?;
-        let mut stdout_task = tokio::spawn(read_bounded(stdout));
-        let mut stderr_task = tokio::spawn(read_bounded(stderr));
+        let artifact_directory = self.artifact_directory(
+            context
+                .capability
+                .session_id
+                .map_or("unscoped", |session| session.0.as_str()),
+            &request.call_id.0,
+        );
+        let mut stdout_task =
+            tokio::spawn(read_capped(stdout, artifact_directory.join("stdout.log")));
+        let mut stderr_task =
+            tokio::spawn(read_capped(stderr, artifact_directory.join("stderr.log")));
         let execution = async {
             let status = child
                 .wait()
@@ -133,21 +152,45 @@ impl Tool for ShellTool {
                 kill_process_tree(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                let _ = tokio::fs::remove_dir_all(&artifact_directory).await;
                 return Err(match outcome {
                     Some(_) => ToolError::ExecutionFailed("shell command timed out".into()),
                     None => ToolError::Cancelled,
                 });
             }
         };
+        let mut output = json!({
+            "exit_code": status.code(),
+            "success": status.success(),
+            "stdout": stdout.preview,
+            "stderr": stderr.preview
+        });
+        if let Some(path) = stdout.artifact {
+            output["stdout_artifact"] = json!(path.display().to_string());
+        }
+        if let Some(path) = stderr.artifact {
+            output["stderr_artifact"] = json!(path.display().to_string());
+        }
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
-            ToolOutput::structured(json!({
-                "exit_code": status.code(),
-                "success": status.success(),
-                "stdout": stdout,
-                "stderr": stderr
-            })),
+            ToolOutput::structured(output),
         )))
+    }
+}
+
+impl ShellTool {
+    fn artifact_directory(&self, session_id: &str, call_id: &str) -> PathBuf {
+        let root = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .map_or_else(
+                || self.root.join(".kit/artifacts"),
+                |home| home.join(".kit/artifacts"),
+            );
+        root.join(safe_component(session_id))
+            .join(safe_component(call_id))
     }
 }
 
@@ -182,24 +225,148 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
 }
 
-async fn read_bounded(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
-    let mut kept = Vec::new();
+struct CapturedOutput {
+    preview: String,
+    artifact: Option<PathBuf>,
+}
+
+async fn read_capped(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    mut artifact_path: PathBuf,
+) -> std::io::Result<CapturedOutput> {
+    let mut small = Vec::new();
+    let mut head = Vec::with_capacity(MAX_MODEL_OUTPUT_BYTES / 2);
+    let mut tail = VecDeque::with_capacity(MAX_MODEL_OUTPUT_BYTES / 2);
+    let mut artifact = None;
+    let mut total = 0_u64;
     let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(kept.len());
-        kept.extend_from_slice(&buffer[..read.min(remaining)]);
-        truncated |= read > remaining;
+        let chunk = &buffer[..read];
+        total = total.saturating_add(read as u64);
+        retain_preview(&mut head, &mut tail, chunk);
+        if artifact.is_none() && small.len() + read <= MAX_MODEL_OUTPUT_BYTES {
+            small.extend_from_slice(chunk);
+            continue;
+        }
+        if artifact.is_none() {
+            let (mut file, path) = create_artifact(&artifact_path).await?;
+            artifact_path = path;
+            file.write_all(&small).await?;
+            artifact = Some(file);
+            small.clear();
+        }
+        if let Some(file) = &mut artifact {
+            file.write_all(chunk).await?;
+        }
     }
-    let mut output = String::from_utf8_lossy(&kept).into_owned();
-    if truncated {
-        output.push_str("\n[output truncated]");
+    let Some(mut artifact) = artifact else {
+        return Ok(CapturedOutput {
+            preview: String::from_utf8_lossy(&small).into_owned(),
+            artifact: None,
+        });
+    };
+    artifact.flush().await?;
+    drop(artifact);
+    let marker = format!("\n...[shell output spilled: {total} bytes; see artifact field]...\n");
+    let remaining = MAX_MODEL_OUTPUT_BYTES.saturating_sub(marker.len());
+    let head_budget = remaining / 2;
+    let tail_budget = remaining - head_budget;
+    let preview = format!(
+        "{}{}{}",
+        lossy_prefix(&head, head_budget),
+        marker,
+        lossy_suffix(tail.make_contiguous(), tail_budget)
+    );
+    Ok(CapturedOutput {
+        preview,
+        artifact: Some(artifact_path),
+    })
+}
+
+async fn create_artifact(path: &Path) -> std::io::Result<(tokio::fs::File, PathBuf)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
     }
-    Ok(output)
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("log");
+    for attempt in 0..1000 {
+        let candidate = if attempt == 0 {
+            path.to_path_buf()
+        } else {
+            path.with_file_name(format!("{stem}-{attempt}.{extension}"))
+        };
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate).await {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no available artifact filename under {}", parent.display()),
+    ))
+}
+
+fn retain_preview(head: &mut Vec<u8>, tail: &mut VecDeque<u8>, chunk: &[u8]) {
+    let half = MAX_MODEL_OUTPUT_BYTES / 2;
+    let missing = half.saturating_sub(head.len());
+    head.extend_from_slice(&chunk[..chunk.len().min(missing)]);
+    tail.extend(chunk);
+    if tail.len() > half {
+        tail.drain(..tail.len() - half);
+    }
+}
+
+fn lossy_prefix(bytes: &[u8], budget: usize) -> String {
+    let mut value = String::from_utf8_lossy(bytes).into_owned();
+    while value.len() > budget || !value.is_char_boundary(value.len().min(budget)) {
+        value.pop();
+    }
+    value
+}
+
+fn lossy_suffix(bytes: &[u8], budget: usize) -> String {
+    let value = String::from_utf8_lossy(bytes);
+    if value.len() <= budget {
+        return value.into_owned();
+    }
+    let mut start = value.len() - budget;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_owned()
+}
+
+fn safe_component(value: &str) -> String {
+    let prefix = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(48)
+        .collect::<String>();
+    let hash = blake3::hash(value.as_bytes()).to_hex().to_string();
+    format!(
+        "{}-{}",
+        if prefix.is_empty() { "id" } else { &prefix },
+        &hash[..12]
+    )
 }
 
 #[cfg(unix)]
@@ -224,7 +391,67 @@ const fn default_timeout() -> u64 {
 mod tests {
     use std::time::Duration;
 
-    use super::{isolate_process_tree, kill_process_tree, shell_command};
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::{
+        MAX_MODEL_OUTPUT_BYTES, isolate_process_tree, kill_process_tree, read_capped, shell_command,
+    };
+
+    #[tokio::test]
+    async fn oversized_output_spills_to_an_artifact_and_returns_a_bounded_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("stdout.log");
+        let data = [vec![b'A'; 10 * 1024], vec![b'Z'; 10 * 1024]].concat();
+        let (mut writer, reader) = tokio::io::duplex(data.len() + 1);
+        writer.write_all(&data).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let captured = read_capped(reader, artifact.clone()).await.unwrap();
+
+        assert_eq!(std::fs::read(&artifact).unwrap(), data);
+        assert_eq!(captured.artifact.as_deref(), Some(artifact.as_path()));
+        assert!(captured.preview.len() <= MAX_MODEL_OUTPUT_BYTES);
+        assert!(captured.preview.starts_with("AAAA"));
+        assert!(captured.preview.ends_with("ZZZZ"));
+        assert!(
+            captured
+                .preview
+                .contains("shell output spilled: 20480 bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn small_output_stays_inline_without_an_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("stdout.log");
+        let (mut writer, reader) = tokio::io::duplex(32);
+        writer.write_all(b"small output").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let captured = read_capped(reader, artifact.clone()).await.unwrap();
+
+        assert_eq!(captured.preview, "small output");
+        assert!(captured.artifact.is_none());
+        assert!(!artifact.exists());
+    }
+
+    #[tokio::test]
+    async fn spilling_does_not_overwrite_an_existing_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = directory.path().join("stdout.log");
+        std::fs::write(&artifact, b"existing").unwrap();
+        let data = vec![b'X'; MAX_MODEL_OUTPUT_BYTES + 1];
+        let (mut writer, reader) = tokio::io::duplex(data.len() + 1);
+        writer.write_all(&data).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let captured = read_capped(reader, artifact.clone()).await.unwrap();
+
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"existing");
+        let spilled = captured.artifact.unwrap();
+        assert_eq!(spilled.file_name().unwrap(), "stdout-1.log");
+        assert_eq!(std::fs::read(spilled).unwrap(), data);
+    }
 
     #[tokio::test]
     async fn cancellation_kills_shell_descendants() {

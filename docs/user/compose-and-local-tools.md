@@ -73,12 +73,12 @@ Activation progressively discloses the skill's full `SKILL.md` body, directory, 
 A normally completed command returns:
 
 ```text
-{ exit_code, success, stdout, stderr }
+{ exit_code, success, stdout, stderr, stdout_artifact?, stderr_artifact? }
 ```
 
 A non-zero exit is still a completed tool result: inspect `success`, `exit_code`, and `stderr`. An exit caused by a signal may have `exit_code: null`. A timeout fails the tool with `shell command timed out`; cancellation of the Kit turn also stops waiting and attempts to kill the spawned command.
 
-Stdout and stderr are captured separately. Each is retained up to 4 MiB; additional bytes are discarded and the retained string ends with `[output truncated]`. Redirect large output to a project file and inspect only the relevant slice.
+Stdout and stderr are captured separately. Streams up to 8 KiB remain inline. Larger streams are written in full under `~/.kit/artifacts/<session>/<call>/`; the result contains a bounded head-and-tail preview and the corresponding `stdout_artifact` or `stderr_artifact` path. Narrow commands before reading an artifact back into model context.
 
 The runtime root is a working directory, not an operating-system security boundary. A shell command can use absolute paths, `..`, the network, and any credentials or files allowed to the Kit process. Quote untrusted values, inspect destructive commands before running them, and avoid putting secrets into command text or returned output. There is no automatic rollback for shell side effects.
 
@@ -125,7 +125,7 @@ Start with the smallest failing Runlet and identify its failure stage:
 - **Invalid hidden tool input:** compare the call with the schema shown in the current `compose` description. For example, `shell({ timeout_seconds: 1 })` is invalid because `command` is required; an empty command or invalid timeout reports `command and timeout_seconds are outside bounds`.
 - **Tool execution failure:** inspect the exact message. For shell non-zero exits, inspect the returned fields instead; for `edit`, re-read the path and correct a missing or ambiguous anchor; for `a2a`, verify the endpoint and connectivity.
 - **Unexpected overlap or stale input:** source order is not an ordering guarantee. Add a consumed value dependency or an `after prerequisite { ... }` block.
-- **Too much output or work:** look for `[output truncated]`, narrow shell output, bound loops, and split work before reaching the 128 nested child-call limit.
+- **Too much output or work:** look for `shell output spilled`, inspect only a focused artifact range, narrow shell output, bound loops, and split work before reaching the 128 nested child-call limit.
 - **Interrupted turn:** cancellation propagates to running `shell` and `a2a` calls. Re-inspect project state before retrying because earlier effectful calls may already have completed.
 
 For a Kit-specific error, ask the agent to search the bundled version-matched docs with the exact error text. For command-line syntax, use `kit --help` or `kit <command> --help`.

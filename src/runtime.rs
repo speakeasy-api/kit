@@ -688,7 +688,8 @@ impl Runtime {
         format!(
             concat!(
                 "You are a coding agent using Kit version {} as your harness, rooted at {}. ",
-                "Make minimal changes, inspect before editing, and run the smallest useful check.\n\n",
+                "Make minimal changes, inspect before editing, and run the smallest useful check. ",
+                "Keep tool output lean: use targeted paths, ranges, filters, and bounded `head`/`tail` output. Do not dump whole trees, generated files, long successful build logs, credential files, or environment contents.\n\n",
                 "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",
                 "express required ordering with data dependencies or `after`, and use `fold` only for reductions or genuinely sequential chains. ",
                 "Parallelize independent work deliberately. Background long-running compose work when keeping the session responsive or doing other independent work meanwhile is more useful than waiting; it also suits one-shot triggers. ",

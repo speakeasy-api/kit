@@ -479,6 +479,8 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let prompt = runtime.system_prompt(0);
+    assert!(prompt.contains("Keep tool output lean"));
+    assert!(prompt.contains("Do not dump whole trees"));
     assert!(prompt.contains("Use compose as a dependency graph"));
     assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
     assert!(prompt.contains("keeping the session responsive or doing other independent work"));

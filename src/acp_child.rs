@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -329,22 +328,62 @@ impl ChildOutput {
             self.updates_truncated = true;
             return;
         }
-        let remaining = MAX_CAPTURED_UPDATE_BYTES - self.update_bytes;
-        let mut encoded = vec![0; remaining];
-        let mut writer = Cursor::new(encoded.as_mut_slice());
-        if serde_json::to_writer(&mut writer, &update).is_err() {
+        let Ok(mut value) = serde_json::to_value(&update) else {
+            self.updates_truncated = true;
+            return;
+        };
+        if matches!(update, SessionUpdate::ToolCallUpdate(_)) {
+            deduplicate_tool_output(&mut value);
+        }
+        let Ok(encoded) = serde_json::to_vec(&value) else {
+            self.updates_truncated = true;
+            return;
+        };
+        if self.update_bytes + encoded.len() > MAX_CAPTURED_UPDATE_BYTES {
             self.updates_truncated = true;
             return;
         }
-        let length = writer.position() as usize;
-        encoded.truncate(length);
-        match serde_json::from_slice(&encoded) {
-            Ok(value) => {
-                self.updates.push(value);
-                self.update_bytes += length;
-            }
-            Err(_) => self.updates_truncated = true,
+        self.update_bytes += encoded.len();
+        self.updates.push(value);
+    }
+}
+
+fn deduplicate_tool_output(update: &mut Value) {
+    let Some(object) = update.as_object_mut() else {
+        return;
+    };
+    let Some(raw_output) = object.get("rawOutput") else {
+        return;
+    };
+    let Some(content) = object.get("content") else {
+        return;
+    };
+    if rendered_text_only(content).is_some_and(|text| {
+        serde_json::from_str::<Value>(text).is_ok_and(|value| value == *raw_output)
+    }) {
+        object.remove("content");
+    }
+}
+
+fn rendered_text_only(value: &Value) -> Option<&str> {
+    match value {
+        Value::Array(values) if values.len() == 1 => rendered_text_only(&values[0]),
+        Value::Object(object)
+            if object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "content")) =>
+        {
+            rendered_text_only(object.get("content")?)
         }
+        Value::Object(object)
+            if object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "text"))
+                && object.get("type").is_none_or(|value| value == "text") =>
+        {
+            object.get("text")?.as_str()
+        }
+        _ => None,
     }
 }
 
@@ -848,6 +887,63 @@ mod tests {
         assert_eq!(output.updates[1]["sessionUpdate"], "tool_call");
         assert_eq!(output.updates[2]["sessionUpdate"], "plan");
         assert!(!output.updates_truncated);
+    }
+
+    #[test]
+    fn captured_tool_updates_drop_content_that_duplicates_raw_output() {
+        let raw = json!({"exit_code": 0, "stdout": "done", "stderr": "", "success": true});
+        let mut output = ChildOutput::default();
+        output.record(update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": "completed",
+            "content": [{
+                "type": "content",
+                "content": {"type": "text", "text": serde_json::to_string(&raw).unwrap()}
+            }],
+            "rawOutput": raw
+        })));
+
+        assert_eq!(output.updates.len(), 1);
+        assert!(output.updates[0].get("content").is_none());
+        assert_eq!(output.updates[0]["rawOutput"]["stdout"], "done");
+    }
+
+    #[test]
+    fn captured_tool_updates_keep_distinct_content_and_raw_output() {
+        let mut output = ChildOutput::default();
+        output.record(update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "content": [{
+                "type": "content",
+                "content": {"type": "text", "text": "short summary"}
+            }],
+            "rawOutput": {"stdout": "full output"}
+        })));
+
+        assert!(output.updates[0].get("content").is_some());
+        assert!(output.updates[0].get("rawOutput").is_some());
+    }
+
+    #[test]
+    fn captured_tool_updates_keep_other_content_beside_a_duplicate_text_block() {
+        let raw = json!({"stdout": "full output"});
+        let mut output = ChildOutput::default();
+        output.record(update(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "content": [
+                {
+                    "type": "content",
+                    "content": {"type": "text", "text": serde_json::to_string(&raw).unwrap()}
+                },
+                {"type": "diff", "path": "src/lib.rs", "newText": "changed"}
+            ],
+            "rawOutput": raw
+        })));
+
+        assert!(output.updates[0].get("content").is_some());
     }
 
     #[test]

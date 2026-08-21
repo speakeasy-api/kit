@@ -60,7 +60,7 @@ Without `output_schema`, `output` is text. A turn that emits selected non-text a
 }
 ```
 
-Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 KiB of serialized update data per turn. Excess or oversized updates are omitted and set `updates.truncated` to `true`. Kit does not expose child thoughts, user-message echoes, usage, modes, commands, configuration, or session metadata through this value.
+Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 KiB of serialized update data per turn. Excess or oversized updates are omitted and set `updates.truncated` to `true`. When an ACP tool update's rendered content is only a JSON copy of its structured `rawOutput`, Kit retains only `rawOutput` in the parent-visible update. Kit does not expose child thoughts, user-message echoes, usage, modes, commands, configuration, or session metadata through this value.
 
 ## Choose the built-in `acp.kit` harness
 
