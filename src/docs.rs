@@ -309,7 +309,7 @@ mod tests {
     const DOCUMENTS: &[Document<'_>] = &[
         Document {
             path: "docs/user/mcp.md",
-            content: "# MCP setup\n\nThe config reloads before tool_search and auth. Servers connect lazily when tool_search matches their configured name or capability-rich description; use mcp to initialize all.\n\n## OAuth failures\n\nIf authentication expires, call auth and open the returned URL. The originating ACP session resumes when the callback completes.",
+            content: "# MCP setup\n\nThe config reloads before tool_search and auth. Servers connect lazily when tool_search matches their configured name or capability-rich description; use mcp to initialize all. Remote Streamable HTTP servers infer OAuth from a WWW-Authenticate Bearer challenge, so an explicit auth block is optional and only supplies client or scope overrides. Stdio servers do not use OAuth.\n\n## OAuth failures\n\nIf a server reports authentication_required, call auth and open the returned URL. The originating ACP session resumes when the callback completes. One-shot prompt preserves authentication_required status but cannot launch interactive authentication.",
         },
         Document {
             path: "docs/user/sessions.md",
@@ -406,6 +406,7 @@ mod tests {
         assert_eq!(
             paths,
             vec![
+                "docs/user/agent-plugins.md",
                 "docs/user/compose-and-local-tools.md",
                 "docs/user/getting-started-and-configuration.md",
                 "docs/user/mcp.md",

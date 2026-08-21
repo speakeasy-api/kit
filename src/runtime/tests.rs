@@ -132,6 +132,109 @@ async fn loads_all_agents_md_files_outermost_first() {
     assert!(text[1].contains("inner guidance"));
 }
 
+fn write_skill(directory: &std::path::Path, name: &str, description: &str, body: &str) {
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn plugin_skills_join_the_catalog_without_broadening_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    let project_skill = root.path().join(".agents/skills/project-skill");
+    write_skill(
+        &project_skill,
+        "project-skill",
+        "Project skill.",
+        "project body",
+    );
+
+    let plugin = root.path().join("plugin");
+    let plugin_skill = plugin.join("skills/plugin-skill");
+    write_skill(
+        &plugin_skill,
+        "plugin-skill",
+        "Plugin skill.",
+        "plugin body",
+    );
+    write_skill(
+        &plugin_skill.join("nested-skill"),
+        "nested-skill",
+        "Nested skill.",
+        "nested body",
+    );
+
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime = Runtime::with_plugin_skills(runtime, vec![plugin], vec![plugin_skill]).unwrap();
+    let tool = ToolSource::get(&runtime.skills, &ToolName::new("activate_skill")).unwrap();
+    let spec = tool.current_spec().unwrap();
+    let catalog = spec.input_schema.to_string();
+    assert!(catalog.contains("project-skill"));
+    assert!(catalog.contains("plugin-skill"));
+    assert!(!catalog.contains("nested-skill"));
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_skill_symlink_retargeting_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let plugin = root.path().join("plugin");
+    let skill = plugin.join("skills/plugin-skill");
+    write_skill(&skill, "plugin-skill", "Plugin skill.", "safe body");
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime = Runtime::with_plugin_skills(runtime, vec![plugin], vec![skill.clone()]).unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    let replacement = outside.path().join("SKILL.md");
+    std::fs::write(
+        &replacement,
+        "---\nname: plugin-skill\ndescription: Replaced skill.\n---\noutside body\n",
+    )
+    .unwrap();
+    std::fs::remove_file(skill.join("SKILL.md")).unwrap();
+    symlink(replacement, skill.join("SKILL.md")).unwrap();
+
+    let tool = ToolSource::get(&runtime.skills, &ToolName::new("activate_skill")).unwrap();
+    let catalog = tool
+        .current_spec()
+        .map(|spec| spec.description)
+        .unwrap_or_default();
+    assert!(!catalog.contains("plugin-skill"));
+    assert!(!catalog.contains("Replaced skill."));
+}
+
+#[test]
+fn project_skills_take_precedence_over_plugin_skills() {
+    let root = tempfile::tempdir().unwrap();
+    write_skill(
+        &root.path().join(".agents/skills/shared-skill"),
+        "shared-skill",
+        "Project version.",
+        "project body",
+    );
+    let plugin_skill = root.path().join("skills/shared-skill");
+    write_skill(
+        &plugin_skill,
+        "shared-skill",
+        "Plugin version.",
+        "plugin body",
+    );
+
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime =
+        Runtime::with_plugin_skills(runtime, vec![root.path().to_path_buf()], vec![plugin_skill])
+            .unwrap();
+    let tool = ToolSource::get(&runtime.skills, &ToolName::new("activate_skill")).unwrap();
+    let catalog = tool.current_spec().unwrap().description;
+    assert!(catalog.contains("Project version."));
+    assert!(!catalog.contains("Plugin version."));
+}
+
 #[test]
 fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     let root = tempfile::tempdir().unwrap();

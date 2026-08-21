@@ -123,6 +123,15 @@ fn migrate_credentials_to_shared_store(config: &mut toml::Table) {
     }
 }
 
+fn absolute_parent(path: &Path) -> io::Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    Ok(path.parent().unwrap_or(Path::new(".")).to_path_buf())
+}
+
 fn migrate_config(mut config: toml::Table) -> toml::Table {
     for migration in CONFIG_MIGRATIONS {
         (migration.apply)(&mut config);
@@ -142,11 +151,15 @@ struct Config {
     otel_message_content_max_messages: Option<usize>,
     otel_message_content_max_bytes: Option<usize>,
     mcp_config: Option<PathBuf>,
+    #[serde(default)]
+    plugins: BTreeMap<String, kit::plugins::PluginConfig>,
     credential_store: Option<CredentialStoreKind>,
     credential_dir: Option<PathBuf>,
     #[serde(default)]
     acp: BTreeMap<String, kit::AcpHarnessProfile>,
     subagent: Option<SubagentConfig>,
+    #[serde(skip)]
+    config_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,9 +177,15 @@ impl Config {
     }
 
     fn load(path: &Path) -> io::Result<Self> {
+        let config_dir = absolute_parent(path)?;
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    config_dir,
+                    ..Self::default()
+                });
+            }
             Err(error) => {
                 return Err(io::Error::new(
                     error.kind(),
@@ -182,12 +201,27 @@ impl Config {
                     .try_into()
                     .map_err(|error| format!("could not parse config: {error}"))
             });
-        parsed.map_err(|error| {
+        let mut config: Self = parsed.map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid config {}: {error}", path.display()),
             )
-        })
+        })?;
+        config.config_dir = config_dir;
+        Ok(config)
+    }
+
+    async fn resolve_plugins(
+        &self,
+        runtime_root: &Path,
+    ) -> Result<kit::plugins::ResolvedPlugins, String> {
+        kit::plugins::resolve(
+            &self.plugins,
+            runtime_root,
+            &self.config_dir.join("plugin-cache"),
+            &self.config_dir.join("plugin-data"),
+        )
+        .await
     }
 
     fn root(&self, value: Option<PathBuf>) -> PathBuf {
@@ -403,7 +437,7 @@ fn initial_config(home: &Path) -> String {
     let mcp_config = toml::Value::String(kit_dir.join("mcp.json").to_string_lossy().into());
     let credential_dir = toml::Value::String(kit_dir.join("credentials").to_string_lossy().into());
     format!(
-        "model = \"gpt-5.6-sol\"\nmcp_config = {mcp_config}\ncredential_store = \"file\"\ncredential_dir = {credential_dir}\n"
+        "model = \"gpt-5.6-sol\"\nmcp_config = {mcp_config}\ncredential_store = \"file\"\ncredential_dir = {credential_dir}\n\n[plugins]\n"
     )
 }
 
@@ -514,27 +548,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let provider = config.provider(provider);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
                 Some(id) => kit::Runtime::with_session_provider_and_credentials(
-                    root,
+                    &root,
                     model,
                     provider,
                     kit::runtime::SessionRequest { id, resume, force },
                     credential_storage.clone(),
                 )?,
                 None => kit::Runtime::new_with_provider_and_credentials(
-                    root,
+                    &root,
                     model,
                     provider,
                     credential_storage.clone(),
                 )?,
             };
+            let runtime = kit::Runtime::with_plugin_skills(
+                runtime,
+                plugins.package_roots,
+                plugins.skill_directories,
+            )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
                 runtime,
                 mcp.config_path(&config),
+                plugins.mcp_plugins,
                 true,
                 credential_storage,
             )
@@ -558,21 +599,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model = config.model(model);
             let provider = config.provider(provider);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
                 Some(id) => kit::Runtime::with_session_provider_and_credentials(
-                    root,
+                    &root,
                     model,
                     provider,
                     kit::runtime::SessionRequest { id, resume, force },
                     credential_storage.clone(),
                 )?,
                 None => kit::Runtime::new_with_provider_and_credentials(
-                    root,
+                    &root,
                     model,
                     provider,
                     credential_storage.clone(),
                 )?,
             };
+            let runtime = kit::Runtime::with_plugin_skills(
+                runtime,
+                plugins.package_roots,
+                plugins.skill_directories,
+            )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -580,6 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let runtime = kit::Runtime::with_mcp_config(
                 runtime,
                 mcp.config_path(&config),
+                plugins.mcp_plugins,
                 true,
                 credential_storage,
             )
@@ -599,9 +647,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model = config.model(model);
             let provider = config.provider(provider);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let plugins = config.resolve_plugins(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
             let runtime = kit::Runtime::with_session_provider_and_credentials(
-                root,
+                &root,
                 model,
                 provider,
                 kit::runtime::SessionRequest {
@@ -611,12 +660,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 credential_storage.clone(),
             )?;
+            let runtime = kit::Runtime::with_plugin_skills(
+                runtime,
+                plugins.package_roots,
+                plugins.skill_directories,
+            )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
                 runtime,
                 mcp.config_path(&config),
+                plugins.mcp_plugins,
                 false,
                 credential_storage,
             )
@@ -642,6 +697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let provider = config.provider(provider);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
+            config.resolve_plugins(&root).await?;
             kit::tui::run(
                 &root,
                 &model,
@@ -910,6 +966,43 @@ credential_store = "keychain"
     }
 
     #[test]
+    fn plugin_configuration_is_typed_and_strict() {
+        let configured: Config = toml::from_str(&format!(
+            r#"
+[plugins.local-plugin]
+source = "path"
+path = "./plugins/local"
+
+[plugins.remote-plugin]
+source = "archive"
+url = "https://example.com/plugin.tar.gz"
+sha256 = "{}"
+subdir = "packages/plugin"
+"#,
+            "ab".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(configured.plugins.len(), 2);
+        assert!(matches!(
+            configured.plugins["local-plugin"],
+            kit::plugins::PluginConfig::Path { .. }
+        ));
+        assert!(matches!(
+            configured.plugins["remote-plugin"],
+            kit::plugins::PluginConfig::Archive { .. }
+        ));
+        assert!(Config::default().plugins.is_empty());
+
+        for invalid in [
+            "[plugins.bad]\nsource = 'git'\nurl = 'https://example.com/repo'",
+            "[plugins.bad]\nsource = 'archive'\nurl = 'https://example.com/plugin.zip'",
+            "[plugins.bad]\nsource = 'path'\npath = '.'\nunknown = true",
+        ] {
+            assert!(toml::from_str::<Config>(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn file_credentials_require_an_explicit_directory() {
         let missing = McpArgs {
             mcp_config: None,
@@ -1009,7 +1102,7 @@ harness = "acp.beta"
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             format!(
-                "model = \"gpt-5.6-sol\"\nmcp_config = \"{}\"\ncredential_store = \"file\"\ncredential_dir = \"{}\"\n",
+                "model = \"gpt-5.6-sol\"\nmcp_config = \"{}\"\ncredential_store = \"file\"\ncredential_dir = \"{}\"\n\n[plugins]\n",
                 kit_dir.join("mcp.json").display(),
                 kit_dir.join("credentials").display(),
             )

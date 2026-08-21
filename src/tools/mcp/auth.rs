@@ -34,6 +34,17 @@ enum Kind {
     Oauth,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            _kind: Kind::Oauth,
+            client_id: None,
+            client_metadata_url: None,
+            scopes: Vec::new(),
+        }
+    }
+}
+
 pub struct PendingAuthorization {
     pub url: String,
     listener: TcpListener,
@@ -45,6 +56,7 @@ pub async fn begin(
     config: &Config,
     credential_storage: &CredentialStorage,
     required_scope: Option<&str>,
+    www_authenticate: Option<&str>,
 ) -> Result<PendingAuthorization, String> {
     let migration_lock = credential_storage
         .lock_refresh()
@@ -54,7 +66,7 @@ pub async fn begin(
     drop(migration_lock);
     let mut manager = manager(resource_url, config, credential_storage).await?;
     let metadata = manager
-        .resolve_metadata()
+        .resolve_metadata_from_challenge(www_authenticate)
         .await
         .map_err(|error| format!("OAuth discovery failed: {error}"))?;
     manager.set_metadata(metadata.metadata);
@@ -326,7 +338,10 @@ async fn respond(stream: &mut TcpStream, success: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_query_param, parse_request_target};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{Config, begin, credential_identity, has_query_param, parse_request_target};
+    use crate::tools::mcp::CredentialStorage;
 
     #[test]
     fn callback_accepts_only_get_requests_with_targets() {
@@ -338,5 +353,69 @@ mod tests {
         assert!(parse_request_target(b"GET\r\n\r\n").is_err());
         assert!(has_query_param("/callback?code=x&state=y", "state"));
         assert!(!has_query_param("/callback?junk", "state"));
+    }
+
+    #[test]
+    fn inferred_oauth_uses_the_default_persistent_identity() {
+        let explicit: Config = serde_json::from_str(r#"{"type":"oauth"}"#).unwrap();
+        assert_eq!(
+            credential_identity("https://mcp.example/mcp", &Config::default()),
+            credential_identity("https://mcp.example/mcp", &explicit)
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_setup_discovers_metadata_from_the_recorded_challenge() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..read]).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let body = if path == "/resource-metadata" {
+                    format!(
+                        r#"{{"resource":"{server_base}/mcp","authorization_servers":["{server_base}"]}}"#
+                    )
+                } else {
+                    format!(
+                        r#"{{"issuer":"{server_base}","authorization_endpoint":"{server_base}/authorize","token_endpoint":"{server_base}/token","response_types_supported":["code"],"code_challenge_methods_supported":["S256"]}}"#
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let config = Config {
+            client_id: Some("kit-client".into()),
+            ..Config::default()
+        };
+        let challenge = format!(
+            r#"Bearer resource_metadata="{base}/resource-metadata", scope="challenge.scope""#
+        );
+
+        let pending = begin(
+            &format!("{base}/mcp"),
+            &config,
+            &CredentialStorage::Memory,
+            None,
+            Some(&challenge),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let url = url::Url::parse(&pending.url).unwrap();
+        assert_eq!(url.path(), "/authorize");
+        assert!(
+            url.query_pairs()
+                .any(|(name, value)| name == "scope" && value.contains("challenge.scope"))
+        );
     }
 }

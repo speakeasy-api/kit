@@ -10,7 +10,7 @@ It exposes:
 - one model-visible tool: `compose`, backed by released Runlet
 - hidden compose children for bundled Kit documentation, shell commands, hunk edits, reusable ACP subagents, A2A calls, Agent Skills, and MCP discovery/authentication
 - `AGENTS.md` instructions loaded from the runtime root and its ancestors
-- Agent Skills discovered from `<root>/.agents/skills` and `~/.agents/skills`, with project skills taking precedence
+- Agent Skills discovered from `<root>/.agents/skills`, `~/.agents/skills`, and validated local or checksum-pinned archive [Agent Plugins](docs/user/agent-plugins.md)
 - OpenAI subscription access through Kit's native ChatGPT OAuth login
 - OpenRouter through AgentKit's OpenRouter provider adapter
 
@@ -248,11 +248,16 @@ cancels the request. `permissions = "cancel"` always cancels. Kit never selects
 an allow option: ACP permission requests contain no trustworthy, machine-verifiable
 scope that could safely support unattended approval.
 
+## Agent Plugins
+
+Kit loads validated Agent Plugin packages from local directories and SHA-256-pinned ZIP, tar.gz, or tar URLs. Plugin skills join the existing `activate_skill` catalog, and supported plugin MCP declarations work without an explicit MCP JSON file. Kit runs plugin `stdio` servers and connects `streamable-http` servers; deprecated `sse` entries are skipped with a stderr diagnostic. An explicit `--mcp-config` or `mcp_config` file overlays plugins by server name and remains live-reloadable. See [Agent Plugins](docs/user/agent-plugins.md) for placeholders, data directories, collisions, precedence, and security details.
+
 ## MCP
 
-Point Kit at an explicit JSON configuration, either with `--mcp-config` or the
-`mcp_config` TOML key. Kit never discovers or executes MCP server configuration
-automatically:
+MCP servers can come from configured Agent Plugins, an explicit JSON file supplied
+with `--mcp-config` or `mcp_config`, or both. Kit does not scan for other MCP
+configuration automatically, and plugin-only operation needs no MCP JSON file. An
+explicit file uses this format:
 
 ```json
 {
@@ -260,8 +265,7 @@ automatically:
     "local": { "command": "my-mcp-server", "args": ["--stdio"] },
     "linear": {
       "url": "https://mcp.example.com/mcp",
-      "description": "Issues and project management",
-      "auth": { "type": "oauth", "scopes": [] }
+      "description": "Issues and project management"
     }
   }
 }
@@ -271,19 +275,23 @@ automatically:
 cargo run -- tui --root /path/to/project --mcp-config /path/to/mcp.json
 ```
 
-Kit validates and registers MCP configuration at startup, reloads it before each
-`tool_search` and `auth` call, and connects servers lazily when search matches their
-configured name or description. Added, changed, and removed servers become visible
-to live sessions without a restart. Before
+Kit validates and registers the combined MCP configuration at startup, reloads an
+explicit file before each `tool_search` and `auth` call, and connects servers lazily
+when search matches their configured name or description. Explicit entries override
+same-named plugin entries. Added and changed explicit entries become visible without
+a restart; removing an override restores the plugin server. Duplicate supported
+server names across plugins are startup errors. Before
 connection, tool metadata is unavailable, so descriptions should include concrete
 capabilities and likely search terms. The exact query `mcp` initializes all servers.
-Protected remote servers report `authentication_required`; the agent calls `auth`
-only when needed and gives the returned URL to the user. Completing that browser
-flow updates the catalog and notifies the originating ACP session, which resumes
-automatically without requiring a manual follow-up search. Interactive OAuth is available in `tui`, `serve`, and `acp`, but not the
-one-shot `prompt` command.
-Static `bearerToken` and custom `headers` remain available for non-interactive
-HTTP servers.
+Protected remote servers report `authentication_required` from their HTTP Bearer
+challenge; this applies to plugin and config-declared Streamable HTTP servers.
+Explicit OAuth configuration is optional and only supplies client or scope overrides.
+The agent calls `auth` only when needed and gives the returned URL to the user.
+Completing that browser flow updates the catalog and notifies the originating ACP
+session, which resumes automatically without requiring a manual follow-up search.
+Interactive OAuth is available in `tui`, `serve`, and `acp`, but not the one-shot
+`prompt` command. Static `bearerToken` and `Authorization` headers remain
+authoritative and are never silently replaced with inferred OAuth.
 
 ## Compose ordering
 
@@ -393,8 +401,10 @@ unsupported error. A stale generation is rejected, which makes concurrent reuse
 explicit in the Runlet dataflow. The pinned Runlet/AgentKit bridge exposes
 one JSON argument per hidden tool, so `prompt` and `fork` use the small object
 form above instead of two positional arguments. Built-in Kit children inherit
-root, provider, model, MCP configuration, credential storage, cancellation, and nesting
-depth; generic profiles receive standard ACP initialization/new-session/prompt
+root, provider, model, explicit MCP configuration, credential storage, cancellation,
+and nesting depth, and reload configured plugins from the same global Kit config.
+Generic profiles do not inherit Kit plugin declarations or MCP configuration; they
+receive standard ACP initialization/new-session/prompt
 traffic and run with the root as cwd. Sessions remain reusable only for the
 lifetime of the parent Kit process. Built-in Kit transcripts remain on disk
 afterward; persistence for generic harnesses is agent-defined. A max-token stop

@@ -19,6 +19,7 @@ use agentkit_mcp::{
     McpServerConfig, McpServerId, McpServerManager, McpServerOptions, McpTransportBinding,
     StdioTransportConfig, StreamableHttpTransportConfig,
 };
+use agentkit_plugins::PluginMcpTransport;
 use agentkit_tools_core::{
     CatalogReader, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolName, ToolRequest,
     ToolResult, ToolSource, ToolSpec,
@@ -30,6 +31,11 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+type EventRoutes = Arc<std::sync::Mutex<BTreeMap<String, (u64, mpsc::UnboundedSender<McpEvent>)>>>;
+type PreparedServers = BTreeMap<String, PreparedServer>;
+type ServerFingerprints = BTreeMap<String, Vec<u8>>;
+type PreparedConfiguration = (PreparedServers, ServerFingerprints);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +92,7 @@ struct Inner {
     reload_flight: Arc<Semaphore>,
     initialization: Mutex<()>,
     auth_setup: Mutex<()>,
-    event_routes: Arc<std::sync::Mutex<BTreeMap<String, (u64, mpsc::UnboundedSender<McpEvent>)>>>,
+    event_routes: EventRoutes,
     next_event_route: AtomicU64,
     interactive_oauth_enabled: bool,
 }
@@ -96,6 +102,7 @@ struct ServerRecord {
     description: String,
     url: Option<String>,
     oauth: Option<auth::Config>,
+    static_authorization: bool,
     fingerprint: Vec<u8>,
     status: ServerStatus,
 }
@@ -104,8 +111,11 @@ struct ReloadState {
     path: Option<PathBuf>,
     raw: Vec<u8>,
     entries: BTreeMap<String, Vec<u8>>,
+    plugins: BTreeMap<String, PreparedServer>,
+    plugin_entries: BTreeMap<String, Vec<u8>>,
 }
 
+#[derive(Clone)]
 struct PreparedServer {
     config: McpServerConfig,
     record: ServerRecord,
@@ -148,7 +158,7 @@ pub(crate) struct McpEvent {
 pub(crate) struct McpSubscription {
     session_id: String,
     generation: u64,
-    routes: Arc<std::sync::Mutex<BTreeMap<String, (u64, mpsc::UnboundedSender<McpEvent>)>>>,
+    routes: EventRoutes,
     receiver: mpsc::UnboundedReceiver<McpEvent>,
 }
 
@@ -209,10 +219,7 @@ fn challenge_requires_interactive_authorization(challenge: &MetadataMap) -> bool
         || challenge.get("insufficient_scope").and_then(Value::as_bool) == Some(true)
 }
 
-fn prepare_config(
-    bytes: &[u8],
-    path: &Path,
-) -> Result<(BTreeMap<String, PreparedServer>, BTreeMap<String, Vec<u8>>), String> {
+fn prepare_config(bytes: &[u8], path: &Path) -> Result<PreparedConfiguration, String> {
     let config: Config = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
     let value: Value = serde_json::from_slice(bytes)
@@ -268,6 +275,7 @@ fn prepare_server(
                     description: server.description.unwrap_or_else(|| id.to_string()),
                     url: None,
                     oauth: None,
+                    static_authorization: false,
                     fingerprint,
                     status: ServerStatus::Uninitialized,
                 },
@@ -277,12 +285,17 @@ fn prepare_server(
             if server.url.trim().is_empty() {
                 return Err(format!("MCP server {id} has an empty URL"));
             }
-            if server.auth.is_some() && server.bearer_token.is_some() {
+            let authorization_header = server
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization"));
+            if server.auth.is_some() && (server.bearer_token.is_some() || authorization_header) {
                 return Err(format!(
-                    "MCP server {id} cannot use both OAuth and bearerToken"
+                    "MCP server {id} cannot use both OAuth and static authorization"
                 ));
             }
             let mut transport = StreamableHttpTransportConfig::new(server.url.clone());
+            let static_authorization = server.bearer_token.is_some() || authorization_header;
             if let Some(token) = server.bearer_token {
                 transport = transport.with_bearer_token(token);
             }
@@ -297,6 +310,7 @@ fn prepare_server(
                     description: server.description.unwrap_or_else(|| id.to_string()),
                     url: Some(server.url),
                     oauth: server.auth,
+                    static_authorization,
                     fingerprint,
                     status: ServerStatus::Uninitialized,
                 },
@@ -305,15 +319,240 @@ fn prepare_server(
     }
 }
 
+fn plugin_text(path: &Path, field: &str, alias: &str) -> Result<String, String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "plugin {alias:?} has a non-UTF-8 {field} path: {}",
+            path.display()
+        )
+    })
+}
+
+fn expand_plugin_value(value: &str, root: &str, data: &str) -> String {
+    const ROOT: &str = "${PLUGIN_ROOT}";
+    const DATA: &str = "${PLUGIN_DATA}";
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(index) = [remaining.find(ROOT), remaining.find(DATA)]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        output.push_str(&remaining[..index]);
+        remaining = &remaining[index..];
+        if remaining.starts_with(ROOT) {
+            output.push_str(root);
+            remaining = &remaining[ROOT.len()..];
+        } else {
+            output.push_str(data);
+            remaining = &remaining[DATA.len()..];
+        }
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn contained_plugin_path(path: PathBuf, root: &Path, context: &str) -> Result<PathBuf, String> {
+    let mut ancestor = path.clone();
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor
+                    .file_name()
+                    .ok_or_else(|| format!("plugin MCP {context} path has no existing ancestor"))?;
+                suffix.push(component.to_os_string());
+                ancestor.pop();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect plugin MCP {context} path {}: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    let mut resolved = ancestor.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve plugin MCP {context} path {}: {error}",
+            ancestor.display()
+        )
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "plugin MCP {context} path resolves outside {}",
+            root.display()
+        ));
+    }
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn prepare_plugins(
+    plugins: &[crate::plugins::ResolvedPluginMcp],
+) -> Result<PreparedConfiguration, String> {
+    let mut prepared = BTreeMap::new();
+    let mut entries = BTreeMap::new();
+    let mut owners = BTreeMap::<String, String>::new();
+    for plugin in plugins {
+        let root = plugin_text(&plugin.root, "root", &plugin.alias)?;
+        let data = plugin_text(&plugin.data_dir, "data", &plugin.alias)?;
+        for server in &plugin.servers {
+            if matches!(server.transport, PluginMcpTransport::Sse { .. }) {
+                eprintln!(
+                    "plugin {}: MCP server {:?} uses unsupported SSE transport; skipping",
+                    plugin.alias, server.name
+                );
+                continue;
+            }
+            if let Some(owner) = owners.insert(server.name.clone(), plugin.alias.clone()) {
+                return Err(format!(
+                    "MCP server {:?} is declared by both plugins {owner:?} and {:?}",
+                    server.name, plugin.alias
+                ));
+            }
+            let description = format!("{} plugin MCP server", plugin.manifest_name);
+            let fingerprint =
+                format!("plugin:{}:{:?}", plugin.alias, server.transport).into_bytes();
+            let (binding, url, static_authorization) = match &server.transport {
+                PluginMcpTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    cwd,
+                } => {
+                    let command = if let Some(command) = command.strip_prefix("./") {
+                        let command = contained_plugin_path(
+                            plugin.root.join(command),
+                            &plugin.root,
+                            "command",
+                        )?;
+                        plugin_text(&command, "command", &plugin.alias)?
+                    } else {
+                        command.clone()
+                    };
+                    let mut transport = StdioTransportConfig::new(command);
+                    transport.args = args
+                        .iter()
+                        .map(|value| expand_plugin_value(value, &root, &data))
+                        .collect();
+                    transport.env = env
+                        .iter()
+                        .map(|(name, value)| {
+                            (name.clone(), expand_plugin_value(value, &root, &data))
+                        })
+                        .chain([
+                            ("PLUGIN_ROOT".to_owned(), root.clone()),
+                            ("PLUGIN_DATA".to_owned(), data.clone()),
+                        ])
+                        .collect();
+                    transport.cwd = match cwd.as_deref() {
+                        Some("${PLUGIN_ROOT}") => Some(plugin.root.clone()),
+                        Some("${PLUGIN_DATA}") => Some(plugin.data_dir.clone()),
+                        Some(cwd) if cwd.starts_with("${PLUGIN_ROOT}/") => {
+                            Some(contained_plugin_path(
+                                plugin.root.join(&cwd["${PLUGIN_ROOT}/".len()..]),
+                                &plugin.root,
+                                "cwd",
+                            )?)
+                        }
+                        Some(cwd) if cwd.starts_with("${PLUGIN_DATA}/") => {
+                            let directory = contained_plugin_path(
+                                plugin.data_dir.join(&cwd["${PLUGIN_DATA}/".len()..]),
+                                &plugin.data_dir,
+                                "data cwd",
+                            )?;
+                            std::fs::create_dir_all(&directory).map_err(|error| {
+                                format!(
+                                    "could not create cwd for plugin {:?} MCP server {:?} at {}: {error}",
+                                    plugin.alias, server.name, directory.display()
+                                )
+                            })?;
+                            Some(directory.canonicalize().map_err(|error| {
+                                format!(
+                                    "could not resolve cwd for plugin {:?} MCP server {:?}: {error}",
+                                    plugin.alias, server.name
+                                )
+                            })?)
+                        }
+                        Some(cwd) if cwd.starts_with("./") => Some(contained_plugin_path(
+                            plugin.root.join(&cwd[2..]),
+                            &plugin.root,
+                            "cwd",
+                        )?),
+                        Some(cwd) => {
+                            return Err(format!(
+                                "plugin {:?} MCP server {:?} has unsupported cwd {cwd:?}",
+                                plugin.alias, server.name
+                            ));
+                        }
+                        None => None,
+                    };
+                    (McpTransportBinding::Stdio(transport), None, false)
+                }
+                PluginMcpTransport::StreamableHttp { url, headers } => {
+                    let mut transport = StreamableHttpTransportConfig::new(url.clone());
+                    for (name, value) in headers {
+                        transport = transport
+                            .with_header(name.as_str(), value.as_str())
+                            .map_err(|error| {
+                                format!("invalid plugin MCP config for {}: {error}", server.name)
+                            })?;
+                    }
+                    (
+                        McpTransportBinding::StreamableHttp(transport),
+                        Some(url.clone()),
+                        headers
+                            .keys()
+                            .any(|name| name.eq_ignore_ascii_case("authorization")),
+                    )
+                }
+                PluginMcpTransport::Sse { .. } => unreachable!("SSE was skipped above"),
+            };
+            entries.insert(server.name.clone(), fingerprint.clone());
+            prepared.insert(
+                server.name.clone(),
+                PreparedServer {
+                    config: McpServerConfig::new(server.name.clone(), binding),
+                    record: ServerRecord {
+                        description,
+                        url,
+                        oauth: None,
+                        static_authorization,
+                        fingerprint,
+                        status: ServerStatus::Uninitialized,
+                    },
+                },
+            );
+        }
+    }
+    Ok((prepared, entries))
+}
+
 pub async fn connect(
-    path: &Path,
+    path: Option<&Path>,
+    plugins: &[crate::plugins::ResolvedPluginMcp],
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| format!("could not read MCP config {}: {error}", path.display()))?;
-    let (prepared, entries) = prepare_config(&bytes, path)?;
+    let (plugin_prepared, plugin_entries) = prepare_plugins(plugins)?;
+    let (bytes, explicit_prepared, explicit_entries) = match path {
+        Some(path) => {
+            let bytes = tokio::fs::read(path).await.map_err(|error| {
+                format!("could not read MCP config {}: {error}", path.display())
+            })?;
+            let (prepared, entries) = prepare_config(&bytes, path)?;
+            (bytes, prepared, entries)
+        }
+        None => (Vec::new(), BTreeMap::new(), BTreeMap::new()),
+    };
+    let mut prepared = plugin_prepared.clone();
+    prepared.extend(explicit_prepared);
+    let mut entries = plugin_entries.clone();
+    entries.extend(explicit_entries);
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let mut manager = McpServerManager::new();
     let mut records = BTreeMap::new();
@@ -341,9 +580,11 @@ pub async fn connect(
         BTreeMap::new(),
         credential_storage,
         ReloadState {
-            path: Some(path.to_path_buf()),
+            path: path.map(Path::to_path_buf),
             raw: bytes,
             entries,
+            plugins: plugin_prepared,
+            plugin_entries,
         },
         interactive_oauth_enabled,
     ))
@@ -454,8 +695,13 @@ impl McpRuntime {
             return Ok(());
         }
 
-        // Validate and prepare every transport before changing live state.
-        let (mut prepared, entries) = prepare_config(&bytes, &path)?;
+        // Validate explicit transports before changing live state, then layer
+        // them over the immutable plugin baseline.
+        let (explicit_prepared, explicit_entries) = prepare_config(&bytes, &path)?;
+        let mut prepared = state.plugins.clone();
+        prepared.extend(explicit_prepared);
+        let mut entries = state.plugin_entries.clone();
+        entries.extend(explicit_entries);
         let changed = state
             .entries
             .keys()
@@ -517,74 +763,70 @@ impl McpRuntime {
             return;
         }
 
-        if let (Some(resource_url), Some(oauth)) = (record.url, record.oauth) {
-            if !self.inner.credential_storage.is_persistent() {
-                self.set_status(name, ServerStatus::AuthenticationRequired)
-                    .await;
-                return;
-            }
+        if let Some(resource_url) = record.url.as_deref()
+            && !record.static_authorization
+            && self.inner.credential_storage.is_persistent()
+        {
+            let oauth = record.oauth.clone().unwrap_or_default();
             let restored =
-                match auth::restore(&resource_url, &oauth, &self.inner.credential_storage).await {
+                match auth::restore(resource_url, &oauth, &self.inner.credential_storage).await {
                     Ok(restored) => restored,
                     Err(error) => {
                         self.set_status(name, ServerStatus::Error(error)).await;
                         return;
                     }
                 };
-            let Some((token, oauth_manager)) = restored else {
-                self.set_status(name, ServerStatus::AuthenticationRequired)
-                    .await;
-                return;
-            };
-            let request = connect_auth_request(name);
-            let mut credentials = MetadataMap::new();
-            credentials.insert("access_token".into(), Value::String(token));
-            let result = {
-                let mut manager = self.inner.manager.lock().await;
-                match manager
-                    .resolve_auth(AuthResolution::provided(request, credentials))
+            if let Some((token, oauth_manager)) = restored {
+                let request = connect_auth_request(name);
+                let mut credentials = MetadataMap::new();
+                credentials.insert("access_token".into(), Value::String(token));
+                let result = {
+                    let mut manager = self.inner.manager.lock().await;
+                    match manager
+                        .resolve_auth(AuthResolution::provided(request, credentials))
+                        .await
+                    {
+                        Ok(()) => manager.connect_server(&McpServerId::new(name)).await,
+                        Err(error) => {
+                            self.set_status(
+                                name,
+                                ServerStatus::Error(format!(
+                                    "could not restore MCP credentials for {name}: {error}"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                };
+                self.inner
+                    .oauth_managers
+                    .lock()
                     .await
-                {
-                    Ok(()) => manager.connect_server(&McpServerId::new(name)).await,
+                    .insert(name.to_string(), oauth_manager);
+                match result {
+                    Ok(_) => self.set_status(name, ServerStatus::Connected).await,
+                    Err(McpError::AuthRequired(request)) => {
+                        self.inner
+                            .challenges
+                            .lock()
+                            .await
+                            .insert(name.to_string(), *request);
+                        self.set_status(name, ServerStatus::AuthenticationRequired)
+                            .await;
+                    }
                     Err(error) => {
                         self.set_status(
                             name,
                             ServerStatus::Error(format!(
-                                "could not restore MCP credentials for {name}: {error}"
+                                "could not connect MCP server {name} with stored credentials: {error}"
                             )),
                         )
                         .await;
-                        return;
                     }
                 }
-            };
-            self.inner
-                .oauth_managers
-                .lock()
-                .await
-                .insert(name.to_string(), oauth_manager);
-            match result {
-                Ok(_) => self.set_status(name, ServerStatus::Connected).await,
-                Err(McpError::AuthRequired(request)) => {
-                    self.inner
-                        .challenges
-                        .lock()
-                        .await
-                        .insert(name.to_string(), *request);
-                    self.set_status(name, ServerStatus::AuthenticationRequired)
-                        .await;
-                }
-                Err(error) => {
-                    self.set_status(
-                        name,
-                        ServerStatus::Error(format!(
-                            "could not connect MCP server {name} with stored credentials: {error}"
-                        )),
-                    )
-                    .await;
-                }
+                return;
             }
-            return;
         }
 
         let result = self
@@ -596,6 +838,24 @@ impl McpRuntime {
             .await;
         match result {
             Ok(_) => self.set_status(name, ServerStatus::Connected).await,
+            Err(McpError::AuthRequired(_)) if record.static_authorization => {
+                self.set_status(
+                    name,
+                    ServerStatus::Error(format!(
+                        "MCP server {name} rejected its configured static authorization"
+                    )),
+                )
+                .await;
+            }
+            Err(McpError::AuthRequired(request)) => {
+                self.inner
+                    .challenges
+                    .lock()
+                    .await
+                    .insert(name.to_string(), *request);
+                self.set_status(name, ServerStatus::AuthenticationRequired)
+                    .await;
+            }
             Err(error) => {
                 self.set_status(
                     name,
@@ -667,14 +927,7 @@ impl McpRuntime {
                 ));
             }
             if server_matches || !tools.is_empty() {
-                let status = if record.oauth.is_some()
-                    && !self.inner.interactive_oauth_enabled
-                    && matches!(record.status, ServerStatus::AuthenticationRequired)
-                {
-                    "authentication_unavailable"
-                } else {
-                    record.status.as_str()
-                };
+                let status = record.status.as_str();
                 let mut group = json!({
                     "name": name,
                     "description": record.description,
@@ -720,12 +973,16 @@ impl McpRuntime {
             .get(name)
             .cloned()
             .ok_or_else(|| ToolError::InvalidInput(format!("unknown MCP server: {name}")))?;
-        let oauth = record.oauth.ok_or_else(|| {
-            ToolError::InvalidInput(format!("MCP server {name} is not configured for OAuth"))
-        })?;
         let resource_url = record
             .url
+            .clone()
             .ok_or_else(|| ToolError::InvalidInput(format!("MCP server {name} is not remote")))?;
+        if record.static_authorization {
+            return Err(ToolError::InvalidInput(format!(
+                "MCP server {name} uses static authorization; update or remove that credential before starting OAuth"
+            )));
+        }
+        let oauth = record.oauth.clone().unwrap_or_default();
 
         let challenge = { self.inner.challenges.lock().await.get(name).cloned() };
         let request = match challenge {
@@ -759,6 +1016,11 @@ impl McpRuntime {
             .get("required_scope")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let www_authenticate = request
+            .challenge
+            .get("www_authenticate")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if !challenge_requires_interactive_authorization(&request.challenge)
             && let Some(mut manager) = self.inner.oauth_managers.lock().await.remove(name)
             && let Ok(token) = auth::refresh(&mut manager, &self.inner.credential_storage).await
@@ -781,6 +1043,7 @@ impl McpRuntime {
             &oauth,
             &self.inner.credential_storage,
             required_scope.as_deref(),
+            www_authenticate.as_deref(),
         )
         .await
         .map_err(ToolError::Unavailable)?;
@@ -1152,6 +1415,8 @@ pub fn empty() -> McpRuntime {
             path: None,
             raw: Vec::new(),
             entries: BTreeMap::new(),
+            plugins: BTreeMap::new(),
+            plugin_entries: BTreeMap::new(),
         },
         true,
     )
@@ -1364,12 +1629,16 @@ fn spec_values(specs: Vec<ToolSpec>, limit: usize) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use agentkit_core::MetadataMap;
+    use agentkit_mcp::McpTransportBinding;
+    use agentkit_plugins::{PluginMcpServer, PluginMcpTransport};
     use agentkit_tools_core::{ToolName, ToolSpec};
     use serde_json::{Value, json};
 
     use super::{
-        Config, CredentialStorage, challenge_requires_interactive_authorization, search_specs,
+        Config, CredentialStorage, challenge_requires_interactive_authorization, prepare_plugins,
+        search_specs,
     };
+    use crate::plugins::ResolvedPluginMcp;
 
     fn spec(name: &str, description: &str) -> ToolSpec {
         ToolSpec::new(ToolName::new(name), description, json!({"type": "object"}))
@@ -1434,8 +1703,228 @@ mod tests {
         );
     }
 
+    async fn bearer_challenge_server(
+        requests: usize,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (address, server)
+    }
+
+    fn plugin(
+        alias: &str,
+        root: &std::path::Path,
+        servers: Vec<PluginMcpServer>,
+    ) -> ResolvedPluginMcp {
+        let root = root.canonicalize().unwrap();
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        ResolvedPluginMcp {
+            alias: alias.into(),
+            manifest_name: format!("{alias}-manifest"),
+            root,
+            data_dir,
+            servers,
+        }
+    }
+
+    #[test]
+    fn plugin_mcp_expands_stdio_paths_and_skips_sse() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![
+                PluginMcpServer {
+                    name: "local".into(),
+                    transport: PluginMcpTransport::Stdio {
+                        command: "./bin/server".into(),
+                        args: vec!["${PLUGIN_DATA}/db".into()],
+                        env: std::collections::BTreeMap::from([(
+                            "ROOT_COPY".into(),
+                            "${PLUGIN_ROOT}".into(),
+                        )]),
+                        cwd: Some("${PLUGIN_DATA}/work".into()),
+                    },
+                },
+                PluginMcpServer {
+                    name: "legacy".into(),
+                    transport: PluginMcpTransport::Sse {
+                        url: "https://example.com/sse".into(),
+                        headers: Default::default(),
+                    },
+                },
+            ],
+        );
+        let (prepared, _) = prepare_plugins(&[plugin]).unwrap();
+        assert!(!prepared.contains_key("legacy"));
+        let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(transport.command, root.join("bin/server").to_str().unwrap());
+        assert_eq!(transport.args, [root.join("data/db").to_str().unwrap()]);
+        assert_eq!(
+            transport.cwd.as_deref(),
+            Some(root.join("data/work").as_path())
+        );
+        assert!(
+            transport
+                .env
+                .contains(&("PLUGIN_ROOT".into(), root.to_str().unwrap().into()))
+        );
+        assert!(
+            transport
+                .env
+                .contains(&("ROOT_COPY".into(), root.to_str().unwrap().into()))
+        );
+    }
+
+    #[test]
+    fn plugin_mcp_preserves_transport_defaults_and_http_literals() {
+        assert_eq!(
+            super::expand_plugin_value(
+                "${PLUGIN_ROOT}:${PLUGIN_DATA}",
+                "/tmp/${PLUGIN_DATA}/root",
+                "/tmp/${PLUGIN_ROOT}/data",
+            ),
+            "/tmp/${PLUGIN_DATA}/root:/tmp/${PLUGIN_ROOT}/data"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![
+                PluginMcpServer {
+                    name: "local".into(),
+                    transport: PluginMcpTransport::Stdio {
+                        command: "server".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                        cwd: None,
+                    },
+                },
+                PluginMcpServer {
+                    name: "remote".into(),
+                    transport: PluginMcpTransport::StreamableHttp {
+                        url: "https://example.com/mcp".into(),
+                        headers: std::collections::BTreeMap::from([(
+                            "x-path".into(),
+                            "${PLUGIN_ROOT}".into(),
+                        )]),
+                    },
+                },
+            ],
+        );
+        let (prepared, _) = prepare_plugins(&[plugin]).unwrap();
+        let McpTransportBinding::Stdio(stdio) = &prepared["local"].config.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(stdio.cwd, None);
+        let McpTransportBinding::StreamableHttp(http) = &prepared["remote"].config.transport else {
+            panic!("expected HTTP transport");
+        };
+        assert_eq!(http.url, "https://example.com/mcp");
+        assert_eq!(http.headers[0].1.to_str().unwrap(), "${PLUGIN_ROOT}");
+    }
+
+    #[test]
+    fn duplicate_plugin_mcp_names_are_rejected() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let server = || PluginMcpServer {
+            name: "shared".into(),
+            transport: PluginMcpTransport::StreamableHttp {
+                url: "https://example.com/mcp".into(),
+                headers: Default::default(),
+            },
+        };
+        let error = match prepare_plugins(&[
+            plugin("first", first.path(), vec![server()]),
+            plugin("second", second.path(), vec![server()]),
+        ]) {
+            Ok(_) => panic!("duplicate plugin MCP names were accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("both plugins \"first\" and \"second\""),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
-    async fn search_groups_lazy_oauth_servers_without_authenticating() {
+    async fn explicit_reload_removal_restores_plugin_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"shared":{"command":"explicit","description":"Explicit"}}}"#,
+        )
+        .unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "shared".into(),
+                transport: PluginMcpTransport::StreamableHttp {
+                    url: "https://example.com/mcp".into(),
+                    headers: Default::default(),
+                },
+            }],
+        );
+        let runtime = super::connect(Some(&path), &[plugin], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "Explicit"
+        );
+
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        let record = runtime.inner.servers.read().await["shared"].clone();
+        assert_eq!(record.description, "tools-manifest plugin MCP server");
+        assert_eq!(record.url.as_deref(), Some("https://example.com/mcp"));
+    }
+
+    #[tokio::test]
+    async fn plugin_only_mcp_configuration_is_registered() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "remote".into(),
+                transport: PluginMcpTransport::StreamableHttp {
+                    url: "https://example.com/mcp".into(),
+                    headers: Default::default(),
+                },
+            }],
+        );
+        let runtime = super::connect(None, &[plugin], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        assert!(runtime.inner.servers.read().await.contains_key("remote"));
+    }
+
+    #[tokio::test]
+    async fn explicit_oauth_overrides_do_not_skip_the_initial_connection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
         std::fs::write(
@@ -1443,28 +1932,15 @@ mod tests {
             r#"{"mcpServers":{"linear":{"url":"https://unused.invalid/mcp","description":"Issues and project management","auth":{"type":"oauth","scopes":[]}}}}"#,
         )
         .unwrap();
-        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
             .await
             .unwrap();
-        assert_eq!(
-            runtime.search("issues").await.unwrap(),
-            json!({"servers":[{
-                "name":"linear",
-                "description":"Issues and project management",
-                "status":"authentication_required",
-                "tools":[]
-            }]})
-        );
+        let results = runtime.search("issues").await.unwrap();
+        assert_eq!(results["servers"][0]["name"], "linear");
+        assert_eq!(results["servers"][0]["status"], "error");
         assert_eq!(
             runtime.search("calendar").await.unwrap(),
             json!({"servers":[]})
-        );
-        let one_shot = super::connect(&path, false, CredentialStorage::Memory)
-            .await
-            .unwrap();
-        assert_eq!(
-            one_shot.search("linear").await.unwrap()["servers"][0]["status"],
-            "authentication_unavailable"
         );
     }
 
@@ -1473,7 +1949,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
         std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
-        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
             .await
             .unwrap();
 
@@ -1485,15 +1961,13 @@ mod tests {
 
         let results = runtime.search("issue").await.unwrap();
         assert_eq!(results["servers"][0]["name"], "linear");
-        assert_eq!(results["servers"][0]["status"], "authentication_required");
+        assert_eq!(results["servers"][0]["status"], "error");
         let error = runtime
             .authorize("local", "session".into())
             .await
             .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("MCP server local is not configured for OAuth"),
+            error.to_string().contains("MCP server local is not remote"),
             "added server should be found by auth lookup: {error}"
         );
     }
@@ -1504,7 +1978,7 @@ mod tests {
         let path = directory.path().join("mcp.json");
         let valid = r#"{"mcpServers":{"linear":{"url":"https://unused.invalid/mcp","description":"Issue tracking","auth":{"type":"oauth"}}}}"#;
         std::fs::write(&path, valid).unwrap();
-        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
             .await
             .unwrap();
 
@@ -1519,7 +1993,7 @@ mod tests {
         std::fs::write(&path, valid).unwrap();
         let results = runtime.search("linear").await.unwrap();
         assert_eq!(results["servers"][0]["name"], "linear");
-        assert_eq!(results["servers"][0]["status"], "authentication_required");
+        assert_eq!(results["servers"][0]["status"], "error");
     }
 
     #[tokio::test]
@@ -1561,22 +2035,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_auth_failure_is_searchable_without_failing_startup() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            let bytes_read = stream.read(&mut request).await.unwrap();
-            assert!(bytes_read > 0);
-            stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-        });
+        let (address, mut server) = bearer_challenge_server(1).await;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
         std::fs::write(
@@ -1585,7 +2044,7 @@ mod tests {
         )
         .unwrap();
 
-        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+        let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
             .await
             .expect("registration should not contact the server");
         assert!(
@@ -1603,12 +2062,81 @@ mod tests {
         let results = runtime.search("remote").await.unwrap();
         server.await.unwrap();
         assert_eq!(results["servers"][0]["name"], "remote");
-        assert_eq!(results["servers"][0]["status"], "error");
-        assert!(
-            results["servers"][0]["error"]
-                .as_str()
+        assert_eq!(results["servers"][0]["status"], "authentication_required");
+        let challenge = runtime.inner.challenges.lock().await["remote"].clone();
+        assert_eq!(
+            challenge
+                .challenge
+                .get("www_authenticate")
+                .and_then(Value::as_str),
+            Some("Bearer")
+        );
+    }
+
+    #[tokio::test]
+    async fn static_authorization_is_not_replaced_by_reactive_oauth() {
+        let (address, server) = bearer_challenge_server(3).await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"mcpServers":{{"token":{{"url":"http://{address}/token","bearerToken":"static"}},"header":{{"url":"http://{address}/header","headers":{{"aUtHoRiZaTiOn":"Basic static"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "plugin-header".into(),
+                transport: PluginMcpTransport::StreamableHttp {
+                    url: format!("http://{address}/plugin"),
+                    headers: std::collections::BTreeMap::from([(
+                        "Authorization".into(),
+                        "Bearer static".into(),
+                    )]),
+                },
+            }],
+        );
+        let runtime = super::connect(Some(&path), &[plugin], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+
+        let results = runtime.search("mcp").await.unwrap();
+        server.await.unwrap();
+        for name in ["header", "plugin-header", "token"] {
+            let result = results["servers"]
+                .as_array()
                 .unwrap()
-                .contains("auth required")
+                .iter()
+                .find(|result| result["name"] == name)
+                .unwrap();
+            assert_eq!(result["status"], "error");
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rejected its configured static authorization")
+            );
+            let error = runtime.authorize(name, "session".into()).await.unwrap_err();
+            assert!(error.to_string().contains("uses static authorization"));
+        }
+    }
+
+    #[test]
+    fn explicit_oauth_cannot_coexist_with_an_authorization_header() {
+        let path = std::path::Path::new("mcp.json");
+        let error = match super::prepare_config(
+            br#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","headers":{"AUTHORIZATION":"Bearer static"},"auth":{"type":"oauth"}}}}"#,
+            path,
+        ) {
+            Ok(_) => panic!("OAuth and static authorization were accepted together"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("cannot use both OAuth and static authorization"),
+            "{error}"
         );
     }
 
@@ -1621,7 +2149,7 @@ mod tests {
             r#"{"mcpServers":{"broken":{"command":"kit-command-that-does-not-exist","description":"Broken test server"},"linear":{"url":"https://unused.invalid/mcp","auth":{"type":"oauth"}}}}"#,
         )
         .unwrap();
-        let runtime = super::connect(&path, true, CredentialStorage::Memory)
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
             .await
             .expect("connection failure should not prevent startup");
         assert!(
@@ -1641,6 +2169,6 @@ mod tests {
                 .contains("could not connect MCP server broken")
         );
         assert_eq!(results["servers"][1]["name"], "linear");
-        assert_eq!(results["servers"][1]["status"], "authentication_required");
+        assert_eq!(results["servers"][1]["status"], "error");
     }
 }

@@ -55,7 +55,7 @@ Persisted session transcripts are append-only JSONL records under `~/.kit/sessio
 
 ## Credentials and secret-handling risks
 
-Kit can expose credentials through the authority of its process even when it does not print them. Shell commands and ACP harnesses normally inherit the process environment. Local MCP servers are executable code. Remote MCP tools receive invoked arguments, and explicit MCP configuration may contain a plain `bearerToken`. Keep config files and environment variables private, use narrowly scoped accounts, and do not ask the model to echo tokens for diagnosis.
+Kit can expose credentials through the authority of its process even when it does not print them. Shell commands and ACP harnesses normally inherit the process environment. Local MCP servers, including plugin stdio servers, are executable code. Plugin stdio servers receive absolute `PLUGIN_ROOT` and `PLUGIN_DATA` paths and can read or modify anything allowed by the Kit process. Remote MCP tools receive invoked arguments, and explicit MCP configuration may contain a plain `bearerToken`. Keep config files and environment variables private, use narrowly scoped accounts, and do not ask the model to echo tokens for diagnosis.
 
 OpenAI and MCP use one credential backend selected with `--credential-store` or `credential_store`. The default is `memory`. `kit auth login openai` uses PKCE, state, and nonce on fixed loopback callback ports 1455 and 1457 and verifies RS256 tokens against OpenAI's pinned JWKS endpoint. Standalone OpenAI login rejects `memory`; select persistent `keychain` or `file` storage and use the same selection for runtime commands. Token values are redacted from diagnostics and zeroized where practical. The synchronization lock file contains no credentials. `kit auth logout openai` revokes before deletion and retains the credential when revocation fails; `--local-only` deliberately skips revocation and should be used only when remote revocation cannot be completed.
 
@@ -65,7 +65,7 @@ The shared backend choices are:
 - `keychain`: persistent operating-system storage through macOS Keychain, Windows Credential Manager, or Secret Service on Linux and other Unix systems.
 - `file`: persistent but **not encrypted**. It requires `--credential-dir` or `credential_dir`. On Unix, Kit creates the credential directory with mode `0700` and files with mode `0600`, rejects symlinked storage directories and non-regular paths, and rejects credential files accessible by other users.
 
-Interactive OAuth is available in `kit tui`, `kit serve`, and the stdio-only `kit acp` command. The one-shot `kit prompt` command can report `authentication_unavailable` or `interactive MCP authentication requires the tui, serve, or acp command`; it can still restore previously persisted credentials. An OAuth flow binds a loopback callback, expires after 10 minutes, and may report `OAuth callback timed out`.
+Interactive OAuth is available in `kit tui`, `kit serve`, and the stdio-only `kit acp` command. The one-shot `kit prompt` command preserves a remote server's `authentication_required` status but reports `interactive MCP authentication requires the tui, serve, or acp command` if `auth` is called; it can still restore previously persisted credentials. An OAuth flow binds a loopback callback, expires after 10 minutes, and may report `OAuth callback timed out`.
 
 A typical login flow is to start a long-lived client, let the agent use `tool_search`, and open the URL returned by `auth`. After the browser callback completes, Kit connects the server and automatically resumes the originating ACP session:
 
@@ -115,12 +115,13 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 
 ### MCP tools are missing or authentication fails
 
-1. Confirm an explicit MCP configuration was supplied; Kit does not auto-discover MCP server config.
-2. Search for the configured server name or description with `tool_search`; use the exact query `mcp` to initialize all servers. Inspect statuses: `authenticated`, `authentication_required`, `authentication_unavailable`, `pending`, or `error`. An `error` result includes the lazy-initialization diagnostic. Invoke only tool names returned by the search.
-3. For `authentication_required`, call `auth` with the exact server name in a `kit tui`, `kit serve`, or `kit acp` session, open its URL, and complete the browser flow within 10 minutes. Kit connects the server and resumes the originating ACP session automatically.
-4. For `authentication_unavailable`, use a long-lived command or configure persistent credentials there for later one-shot use.
+1. Confirm that the server comes from a configured, valid Agent Plugin or from the selected explicit MCP file. Plugin-only operation needs no file, but Kit does not scan for unconfigured plugins or other MCP files. An SSE plugin server is skipped with a diagnostic; use `streamable-http` instead. A duplicate supported server name across two plugins stops startup, while an explicit same-named entry intentionally overrides a plugin server.
+2. Search for the configured server name or description with `tool_search`; use the exact query `mcp` to initialize all servers. Inspect statuses: `authenticated`, `authentication_required`, `pending`, or `error`. An `error` result includes the lazy-initialization diagnostic. Invoke only tool names returned by the search.
+3. For `authentication_required`, call `auth` with the exact server name in a `kit tui`, `kit serve`, or `kit acp` session, open its URL, and complete the browser flow within 10 minutes. Kit connects the server and resumes the originating ACP session automatically. If a configured `bearerToken` or `Authorization` header is rejected, Kit reports an error instead and does not replace that static credential with inferred OAuth; update or remove it first.
+4. In one-shot `kit prompt`, use a long-lived command to authenticate or configure persistent credentials there for later one-shot use.
 5. For file-store errors such as `OAuth credential directory must be a real directory, not a symlink`, `OAuth credential path must be a regular file`, or `OAuth credential file is accessible by other users`, correct ownership, path type, and permissions rather than weakening the checks.
-6. If a server has status `error`, relay its diagnostic to the user, test the configured stdio command or remote URL independently, and check the 20-second connection limit. Treat server diagnostics as potentially sensitive.
+6. If an explicit override was removed, the plugin server with that name is restored on the next `tool_search` or `auth`. If the file is invalid, repair it first; Kit retains the last valid combined configuration.
+7. If a server has status `error`, relay its diagnostic to the user, test the configured stdio command or remote URL independently, and check the 20-second connection limit. Treat server diagnostics as potentially sensitive.
 
 ### A session cannot be resumed
 

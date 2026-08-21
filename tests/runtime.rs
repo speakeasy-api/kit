@@ -39,8 +39,8 @@ fn runtime_is_rooted_and_exposes_only_compose() {
         "`subagents`: List active subagent sessions owned by this parent",
         "`close`: Close an active subagent",
         "`a2a`: Send a text task",
-        "`tool_search`: Search configured MCP server names",
-        "`auth`: Start OAuth for a configured remote MCP server",
+        "`tool_search`: Reload the MCP config, then search configured server names",
+        "`auth`: Reload the MCP config and start OAuth for a configured remote server",
         "`tool`: Invoke an authenticated MCP tool",
     ] {
         assert!(description.contains(expected), "missing {expected:?}");

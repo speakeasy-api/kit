@@ -200,7 +200,7 @@ impl Runtime {
                 root.display()
             ));
         }
-        let skills = SkillRegistry::from_paths(default_skill_roots(&root)).tool_registry();
+        let skills = build_skill_tools(&root, &[], &[]);
         let model = model.into();
         let adapter = SelectableAdapter::new_with_credentials(
             provider,
@@ -314,17 +314,12 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
             "could not configure ACP harnesses after runtime was shared".to_string()
         })?;
-        let telemetry = runtime.subagents.child_config().telemetry;
+        let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
-                root: runtime.root.clone(),
-                model: runtime.model.clone(),
-                provider: runtime.provider,
-                mcp_config: None,
-                credential_storage: runtime.credential_storage.clone(),
-                telemetry,
                 harnesses,
                 default_harness,
+                ..previous
             },
             runtime.max_subagent_depth,
         );
@@ -351,19 +346,40 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    /// Parses and registers explicitly configured MCP servers for lazy connection.
+    /// Adds validated Agent Plugin skills to the existing project and user catalog.
+    pub fn with_plugin_skills(
+        runtime: Arc<Self>,
+        package_roots: Vec<PathBuf>,
+        skill_directories: Vec<PathBuf>,
+    ) -> Result<Arc<Self>, String> {
+        if package_roots.is_empty() {
+            return Ok(runtime);
+        }
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure plugins after runtime was shared".to_string())?;
+        runtime.skills = build_skill_tools(&runtime.root, &package_roots, &skill_directories);
+        Ok(Arc::new(runtime))
+    }
+
+    /// Registers validated plugin MCP servers and overlays an optional explicit
+    /// MCP file for lazy connection.
     pub async fn with_mcp_config(
         runtime: Arc<Self>,
         path: Option<&Path>,
+        plugin_mcps: Vec<crate::plugins::ResolvedPluginMcp>,
         interactive_oauth_enabled: bool,
         credential_storage: crate::tools::mcp::CredentialStorage,
     ) -> Result<Arc<Self>, String> {
-        let Some(path) = path else {
+        if path.is_none() && plugin_mcps.is_empty() {
             return Ok(runtime);
-        };
-        let mcp =
-            crate::tools::mcp::connect(path, interactive_oauth_enabled, credential_storage.clone())
-                .await?;
+        }
+        let mcp = crate::tools::mcp::connect(
+            path,
+            &plugin_mcps,
+            interactive_oauth_enabled,
+            credential_storage.clone(),
+        )
+        .await?;
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
         runtime.mcp = mcp;
@@ -374,7 +390,7 @@ impl Runtime {
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
                 provider: runtime.provider,
-                mcp_config: Some(path.to_path_buf()),
+                mcp_config: path.map(Path::to_path_buf),
                 credential_storage,
                 telemetry: previous.telemetry,
                 harnesses: previous.harnesses,
@@ -689,6 +705,48 @@ impl Runtime {
             depth = depth
         )
     }
+}
+
+fn build_skill_tools(
+    root: &Path,
+    package_roots: &[PathBuf],
+    skill_directories: &[PathBuf],
+) -> ToolRegistry {
+    let default_roots = default_skill_roots(root);
+    let canonical_defaults = default_roots
+        .iter()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect::<Vec<_>>();
+    let canonical_package_roots = package_roots
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    let canonical_plugin_skills = skill_directories
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect::<Vec<_>>();
+    let mut roots = default_roots;
+    roots.extend(skill_directories.iter().cloned());
+    SkillRegistry::from_paths(roots)
+        .with_filter(move |skill: &agentkit_tool_skills::Skill| {
+            let Ok(base) = skill.base_dir.canonicalize() else {
+                return false;
+            };
+            if canonical_defaults
+                .iter()
+                .any(|directory| base.starts_with(directory))
+            {
+                return true;
+            }
+            let Ok(location) = skill.location.canonicalize() else {
+                return false;
+            };
+            canonical_plugin_skills.contains(&base)
+                && canonical_package_roots
+                    .iter()
+                    .any(|package| location.starts_with(package))
+        })
+        .tool_registry()
 }
 
 fn default_skill_roots(root: &Path) -> Vec<PathBuf> {

@@ -126,6 +126,7 @@ otel_capture_message_content = false
 otel_message_content_max_messages = 64
 otel_message_content_max_bytes = 16384
 
+# Optional: explicit MCP servers overlay any same-named plugin servers.
 mcp_config = "/path/to/mcp.json"
 credential_store = "file" # "memory", "keychain", or "file"
 credential_dir = "/path/to/private/credentials"
@@ -137,9 +138,18 @@ permissions = "deny" # "deny" or "cancel"
 
 [subagent]
 harness = "acp.review"
+
+[plugins.local-plugin]
+source = "path"
+path = "./plugins/local-plugin"
+
+[plugins.remote-plugin]
+source = "archive"
+url = "https://example.com/plugin.tar.gz"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-`root`, `provider`, `model`, and credential settings apply to all four runtime commands. `a2a` applies to `serve` and `tui`. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`root`, `provider`, `model`, and credential settings apply to all four runtime commands. `a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. If `mcp_config` is also set, its same-named entries override plugin servers, and live removal of an override restores the plugin server. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 ### Configuration precedence and built-in defaults
 
@@ -197,7 +207,7 @@ If startup reports `could not load AGENTS.md context`, inspect the `AGENTS.md` f
 
 ## Agent Skills
 
-Kit discovers [Agent Skills](https://agentskills.io/) recursively from `<root>/.agents/skills` and `~/.agents/skills`. Project skills are searched first and override user skills with the same name. Each skill lives in a directory containing `SKILL.md`; its frontmatter must include a `name` using lowercase letters, digits, and hyphens that matches the directory name and a non-empty `description`.
+Kit discovers [Agent Skills](https://agentskills.io/) recursively from `<root>/.agents/skills` and `~/.agents/skills`. Validated [Agent Plugins](agent-plugins.md) can add exact skill directories and supported MCP servers from local packages or checksum-pinned archives. Collision precedence for skills is project skills, user skills, then plugins in lexical alias order. Project skills therefore override user and plugin skills with the same name. Each skill lives in a directory containing `SKILL.md`; its frontmatter must include a `name` using lowercase letters, digits, and hyphens that matches the directory name and a non-empty `description`.
 
 ```markdown
 ---
