@@ -394,12 +394,18 @@ fn extract_tar(reader: impl Read, destination: &Path) -> Result<(), String> {
         if count > MAX_ARCHIVE_ENTRIES {
             return Err("plugin archive contains too many entries".into());
         }
+        let kind = entry.header().entry_type();
+        if kind == tar::EntryType::XGlobalHeader {
+            if entry.size() > MAX_FILE_BYTES {
+                return Err("plugin archive metadata exceeds size limits".into());
+            }
+            continue;
+        }
         let path = validate_archive_path(&entry.path().map_err(|error| error.to_string())?)?;
         if !paths.insert(path.clone()) {
             return Err(format!("duplicate plugin archive path {}", path.display()));
         }
         let output = destination.join(&path);
-        let kind = entry.header().entry_type();
         if kind.is_dir() {
             fs::create_dir_all(&output).map_err(|error| error.to_string())?;
         } else if kind.is_file() {
@@ -573,6 +579,36 @@ mod tests {
             builder.finish().unwrap();
         }
         bytes
+    }
+
+    #[test]
+    fn extracts_tar_with_global_pax_header() {
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut pax = tar::Header::new_gnu();
+            pax.set_entry_type(tar::EntryType::XGlobalHeader);
+            pax.set_size(0);
+            pax.set_mode(0o644);
+            pax.set_cksum();
+            builder
+                .append_data(&mut pax, "pax_global_header", io::empty())
+                .unwrap();
+
+            let body = b"{}";
+            let mut file = tar::Header::new_gnu();
+            file.set_size(body.len() as u64);
+            file.set_mode(0o644);
+            file.set_cksum();
+            builder
+                .append_data(&mut file, "plugin/plugin.json", body.as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let destination = tempfile::tempdir().unwrap();
+        extract_archive(&bytes, destination.path()).unwrap();
+        assert!(destination.path().join("plugin/plugin.json").is_file());
     }
 
     #[test]
