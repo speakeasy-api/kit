@@ -2,6 +2,7 @@
 
 use std::{
     cmp::Reverse,
+    collections::BTreeSet,
     ops::Range,
     path::PathBuf,
     time::{Duration, Instant},
@@ -17,6 +18,7 @@ use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::text::Line;
 
 use crate::events::RuntimeEvent;
 
@@ -81,6 +83,12 @@ pub struct CodeHit {
     pub block: usize,
     pub range: Range<usize>,
 }
+
+pub(super) type CachedTranscriptRow = (
+    Line<'static>,
+    (Option<String>, Option<CodeHit>),
+    Vec<LinkHit>,
+);
 
 /// What the event loop should do after a key press.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +272,11 @@ pub enum Block {
     Error(String),
 }
 
+pub(super) struct CachedTranscriptBlock {
+    pub revision: u64,
+    pub rows: Vec<CachedTranscriptRow>,
+}
+
 /// What the client is doing right now.
 #[derive(PartialEq, Eq)]
 pub enum Phase {
@@ -281,6 +294,15 @@ pub struct App {
     pub a2a: String,
     pub session_id: Option<String>,
     pub blocks: Vec<Block>,
+    pub(super) transcript_cache: Vec<Option<CachedTranscriptBlock>>,
+    pub(super) transcript_revisions: Vec<u64>,
+    pub(super) transcript_dirty: BTreeSet<usize>,
+    pub(super) transcript_dynamic: BTreeSet<usize>,
+    pub(super) transcript_thoughts: BTreeSet<usize>,
+    pub(super) transcript_prefixes: Vec<usize>,
+    pub(super) transcript_cache_width: usize,
+    next_transcript_revision: u64,
+    transcript_focus_index: Option<usize>,
     pub editor: Editor,
     pub attachments: Vec<Attachment>,
     next_attachment: usize,
@@ -310,11 +332,11 @@ pub struct App {
     pub total_lines: usize,
     /// Prompt field width from the last frame, for row-wise cursor movement.
     pub prompt_width: usize,
-    /// Which tool call owns each rendered transcript row, and where that area
+    /// Which tool call owns each visible transcript row, and where that area
     /// started, so a click can be mapped back to a card.
     pub row_calls: Vec<Option<String>>,
     pub row_links: Vec<Vec<LinkHit>>,
-    /// Exact fenced-code content owned by each rendered transcript row.
+    /// Exact fenced-code content owned by each visible transcript row.
     pub row_code: Vec<Option<CodeHit>>,
     pub transcript_top: usize,
     pub transcript_left: usize,
@@ -533,6 +555,15 @@ impl App {
             a2a,
             session_id: None,
             blocks: Vec::new(),
+            transcript_cache: Vec::new(),
+            transcript_revisions: Vec::new(),
+            transcript_dirty: BTreeSet::new(),
+            transcript_dynamic: BTreeSet::new(),
+            transcript_thoughts: BTreeSet::new(),
+            transcript_prefixes: vec![0],
+            transcript_cache_width: 0,
+            next_transcript_revision: 0,
+            transcript_focus_index: None,
             editor: Editor::default(),
             attachments: Vec::new(),
             next_attachment: 0,
@@ -571,13 +602,171 @@ impl App {
         self.phase != Phase::Idle
     }
 
+    fn push_block(&mut self, block: Block) {
+        let index = self.blocks.len();
+        let thought = matches!(block, Block::Thought { .. });
+        let dynamic = Self::block_is_dynamic(&block);
+        let tool_id = match &block {
+            Block::Tool(call) => Some(call.id.clone()),
+            _ => None,
+        };
+        self.blocks.push(block);
+        self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
+        self.transcript_revisions
+            .push(self.next_transcript_revision);
+        self.transcript_cache.push(None);
+        self.transcript_prefixes
+            .push(self.transcript_prefixes.last().copied().unwrap_or(0));
+        self.transcript_dirty.insert(index);
+        if thought {
+            self.transcript_thoughts.insert(index);
+        }
+        if dynamic {
+            self.transcript_dynamic.insert(index);
+        }
+        if tool_id.as_deref() == self.focused_call_id.as_deref()
+            || tool_id.is_some() && self.focused_call_id.is_none()
+        {
+            self.set_focus_index(Some(index));
+        }
+    }
+
+    fn block_is_dynamic(block: &Block) -> bool {
+        match block {
+            Block::Thought { millis, .. } => millis.is_none(),
+            Block::Tool(call) => call.running() || call.running_children() > 0,
+            _ => false,
+        }
+    }
+
+    fn reclassify_dynamic(&mut self, index: usize) {
+        if self.blocks.get(index).is_some_and(Self::block_is_dynamic) {
+            self.transcript_dynamic.insert(index);
+        } else {
+            self.transcript_dynamic.remove(&index);
+        }
+    }
+
+    fn mark_block_dirty(&mut self, index: usize) {
+        if let Some(revision) = self.transcript_revisions.get_mut(index) {
+            self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
+            *revision = self.next_transcript_revision;
+            self.transcript_dirty.insert(index);
+        }
+    }
+
+    /// Aligns cache bookkeeping for tests and other direct transcript setup.
+    pub(super) fn sync_transcript_cache(&mut self) {
+        self.transcript_cache.truncate(self.blocks.len());
+        self.transcript_revisions.truncate(self.blocks.len());
+        self.transcript_dirty
+            .retain(|index| *index < self.blocks.len());
+        self.transcript_dynamic
+            .retain(|index| *index < self.blocks.len());
+        self.transcript_thoughts
+            .retain(|index| *index < self.blocks.len());
+        while self.transcript_revisions.len() < self.blocks.len() {
+            let index = self.transcript_revisions.len();
+            self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
+            self.transcript_revisions
+                .push(self.next_transcript_revision);
+            self.transcript_cache.push(None);
+            self.transcript_dirty.insert(index);
+            if matches!(self.blocks[index], Block::Thought { .. }) {
+                self.transcript_thoughts.insert(index);
+            }
+            if Self::block_is_dynamic(&self.blocks[index]) {
+                self.transcript_dynamic.insert(index);
+            }
+            if matches!(self.blocks[index], Block::Tool(_))
+                && (self.focused_call_id.is_none()
+                    || matches!(
+                        &self.blocks[index],
+                        Block::Tool(call) if Some(call.id.as_str()) == self.focused_call_id.as_deref()
+                    ))
+            {
+                self.set_focus_index(Some(index));
+            }
+        }
+        if let Some(id) = &self.focused_call_id
+            && !self.transcript_focus_index.is_some_and(
+                |index| matches!(&self.blocks[index], Block::Tool(call) if &call.id == id),
+            )
+        {
+            let focus = self
+                .blocks
+                .iter()
+                .rposition(|block| matches!(block, Block::Tool(call) if &call.id == id));
+            self.set_focus_index(focus);
+        }
+        self.transcript_prefixes
+            .resize(self.blocks.len().saturating_add(1), 0);
+    }
+
+    fn set_focus_index(&mut self, index: Option<usize>) {
+        let old = self.transcript_focus_index;
+        if old == index {
+            return;
+        }
+        self.transcript_focus_index = index;
+        if let Some(old) = old {
+            self.mark_block_dirty(old);
+        }
+        if let Some(index) = index {
+            self.mark_block_dirty(index);
+        }
+    }
+
+    fn prepare_focused_call(&mut self, id: String) {
+        self.focused_call_id = Some(id);
+        self.set_focus_index(None);
+    }
+
+    fn focus_call_by_id(&mut self, id: String) {
+        let index = self
+            .blocks
+            .iter()
+            .rposition(|block| matches!(block, Block::Tool(call) if call.id == id));
+        self.focused_call_id = Some(id);
+        self.set_focus_index(index);
+    }
+
+    pub(super) fn transcript_call_is_focused(&self, index: usize) -> bool {
+        self.transcript_focus_index == Some(index)
+    }
+
+    fn toggle_thoughts(&mut self) {
+        self.show_thoughts = !self.show_thoughts;
+        let thoughts: Vec<_> = self.transcript_thoughts.iter().copied().collect();
+        for index in thoughts {
+            self.mark_block_dirty(index);
+        }
+    }
+
+    /// Whether the periodic animation clock can change anything on screen.
+    pub fn needs_redraw_tick(&self) -> bool {
+        self.working() || !self.transcript_dynamic.is_empty() || self.toast.is_some()
+    }
+
+    /// Advances animations and removes an expired toast on its final redraw.
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(4))
+        {
+            self.toast = None;
+        }
+    }
+
     /// Rebuilds the visible history from the same Items preloaded into the model.
     pub fn restore_transcript(&mut self, session_id: String, transcript: &[Item]) {
         self.session_id = Some(session_id);
         for item in transcript {
             match item.kind {
                 ItemKind::Developer if is_compaction_summary(item) => {
-                    self.blocks.push(Block::Notice("context compacted".into()));
+                    self.push_block(Block::Notice("context compacted".into()));
                 }
                 ItemKind::System | ItemKind::Developer | ItemKind::Context => continue,
                 ItemKind::User | ItemKind::Notification => {
@@ -598,9 +787,9 @@ impl App {
                     if !text.is_empty() {
                         if item.kind == ItemKind::User {
                             self.latest_agent_source.clear();
-                            self.blocks.push(Block::User(text));
+                            self.push_block(Block::User(text));
                         } else {
-                            self.blocks.push(Block::Notice(text));
+                            self.push_block(Block::Notice(text));
                         }
                     }
                 }
@@ -610,21 +799,19 @@ impl App {
                         match part {
                             Part::Text(text) if !text.text.is_empty() => {
                                 self.latest_agent_source.push_str(&text.text);
-                                self.blocks.push(Block::Agent(text.text.clone()))
+                                self.push_block(Block::Agent(text.text.clone()))
                             }
                             Part::Media(media) => {
                                 next_media += 1;
-                                self.blocks
-                                    .push(Block::Agent(media_label(media, next_media)));
+                                self.push_block(Block::Agent(media_label(media, next_media)));
                             }
-                            Part::Reasoning(reasoning) if reasoning.summary.is_some() => {
-                                self.blocks.push(Block::Thought {
+                            Part::Reasoning(reasoning) if reasoning.summary.is_some() => self
+                                .push_block(Block::Thought {
                                     text: reasoning.summary.clone().unwrap_or_default(),
                                     started: Instant::now(),
                                     millis: Some(0),
-                                })
-                            }
-                            Part::ToolCall(call) => self.blocks.push(Block::Tool(ToolCall {
+                                }),
+                            Part::ToolCall(call) => self.push_block(Block::Tool(ToolCall {
                                 id: call.id.to_string(),
                                 title: call.name.clone(),
                                 kind: ToolKind::Other,
@@ -667,26 +854,32 @@ impl App {
     /// The tool call the graph pane should show: the running one, else the
     /// most recent, so a finished program stays readable.
     pub fn focus_call(&self) -> Option<&ToolCall> {
-        if let Some(id) = &self.focused_call_id
-            && let Some(call) = self.blocks.iter().find_map(|block| match block {
-                Block::Tool(call) if &call.id == id => Some(call),
-                _ => None,
-            })
+        if let Some(index) = self.transcript_focus_index
+            && let Some(Block::Tool(call)) = self.blocks.get(index)
+            && self
+                .focused_call_id
+                .as_ref()
+                .is_none_or(|id| id == &call.id)
         {
             return Some(call);
         }
-        let calls = self.blocks.iter().rev().filter_map(|block| match block {
-            Block::Tool(call) => Some(call),
-            _ => None,
-        });
-        let mut latest = None;
-        for call in calls {
-            if call.running() {
+        // Public transcript fields are used by tests for direct setup. Normal
+        // production mutations keep the index above aligned.
+        if self.transcript_revisions.len() != self.blocks.len() || self.focused_call_id.is_some() {
+            if let Some(id) = &self.focused_call_id
+                && let Some(call) = self.blocks.iter().rev().find_map(|block| match block {
+                    Block::Tool(call) if &call.id == id => Some(call),
+                    _ => None,
+                })
+            {
                 return Some(call);
             }
-            latest = latest.or(Some(call));
+            return self.blocks.iter().rev().find_map(|block| match block {
+                Block::Tool(call) => Some(call),
+                _ => None,
+            });
         }
-        latest
+        None
     }
 
     pub fn show_graph(&self) -> bool {
@@ -721,13 +914,16 @@ impl App {
                 if self.agent_stream_sealed {
                     self.latest_agent_source.clear();
                     self.latest_agent_source.push_str(&text);
-                    self.blocks.push(Block::Agent(text));
+                    self.push_block(Block::Agent(text));
                     self.agent_stream_sealed = false;
                 } else {
                     self.latest_agent_source.push_str(&text);
                     match self.blocks.last_mut() {
-                        Some(Block::Agent(existing)) => existing.push_str(&text),
-                        _ => self.blocks.push(Block::Agent(text)),
+                        Some(Block::Agent(existing)) => {
+                            existing.push_str(&text);
+                            self.mark_block_dirty(self.blocks.len() - 1);
+                        }
+                        _ => self.push_block(Block::Agent(text)),
                     }
                 }
             }
@@ -736,8 +932,11 @@ impl App {
                     text: existing,
                     millis: None,
                     ..
-                }) => existing.push_str(&text),
-                _ => self.blocks.push(Block::Thought {
+                }) => {
+                    existing.push_str(&text);
+                    self.mark_block_dirty(self.blocks.len() - 1);
+                }
+                _ => self.push_block(Block::Thought {
                     text,
                     started: Instant::now(),
                     millis: None,
@@ -751,8 +950,8 @@ impl App {
                 backgrounded,
             } => {
                 self.close_thought();
-                self.focused_call_id = Some(id.clone());
-                self.blocks.push(Block::Tool(ToolCall {
+                self.prepare_focused_call(id.clone());
+                self.push_block(Block::Tool(ToolCall {
                     id,
                     title,
                     kind,
@@ -798,6 +997,9 @@ impl App {
                 // detached call without a new ACP prompt/TurnEnded pair. Seal
                 // the current stream so that output starts a new agent block.
                 self.agent_stream_sealed |= completed_background;
+                if let Some(index) = self.call_index(&id) {
+                    self.reclassify_dynamic(index);
+                }
             }
             Update::Usage { used, size } => {
                 self.usage = Some(ContextUsage { used, size });
@@ -831,7 +1033,7 @@ impl App {
                 self.active_autonomous_turn_id = None;
                 match (interrupted, error) {
                     (true, _) => self.note("turn interrupted"),
-                    (false, Some(error)) => self.blocks.push(Block::Error(error)),
+                    (false, Some(error)) => self.push_block(Block::Error(error)),
                     (false, None) => {}
                 }
             }
@@ -847,18 +1049,25 @@ impl App {
                 self.active_turn_id = None;
                 self.active_autonomous_turn_id = None;
                 self.compacting = false;
-                for block in &mut self.blocks {
+                let mut finished = Vec::new();
+                for (index, block) in self.blocks.iter_mut().enumerate() {
                     if let Block::Tool(call) = block
                         && call.running()
                         && !call.backgrounded
                     {
                         call.status = ToolCallStatus::Completed;
                         call.finished = Some(Instant::now());
+                        call.finish_running_children();
+                        finished.push(index);
                     }
+                }
+                for index in finished {
+                    self.mark_block_dirty(index);
+                    self.reclassify_dynamic(index);
                 }
                 match (interrupted, error) {
                     (true, _) => self.note("turn interrupted"),
-                    (false, Some(error)) => self.blocks.push(Block::Error(error)),
+                    (false, Some(error)) => self.push_block(Block::Error(error)),
                     (false, None) => {}
                 }
             }
@@ -895,6 +1104,7 @@ impl App {
                 None => return,
             },
         };
+        let owner_id = call.id.clone();
         match event {
             RuntimeEvent::ChildStarted {
                 call: child_call,
@@ -913,20 +1123,36 @@ impl App {
             | RuntimeEvent::CompactionStarted { .. }
             | RuntimeEvent::CompactionFinished { .. } => unreachable!("handled above"),
         }
+        if let Some(index) = self.call_index(&owner_id) {
+            self.reclassify_dynamic(index);
+        }
+    }
+
+    fn call_index(&self, id: &str) -> Option<usize> {
+        self.blocks
+            .iter()
+            .rposition(|block| matches!(block, Block::Tool(call) if call.id == id))
     }
 
     fn call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
-        self.blocks.iter_mut().rev().find_map(|block| match block {
-            Block::Tool(call) if call.id == id => Some(call),
-            _ => None,
-        })
+        let index = self.call_index(id)?;
+        self.mark_block_dirty(index);
+        match &mut self.blocks[index] {
+            Block::Tool(call) => Some(call),
+            _ => unreachable!(),
+        }
     }
 
     fn running_call_mut(&mut self) -> Option<&mut ToolCall> {
-        self.blocks.iter_mut().rev().find_map(|block| match block {
-            Block::Tool(call) if call.running() => Some(call),
-            _ => None,
-        })
+        let index = self
+            .blocks
+            .iter()
+            .rposition(|block| matches!(block, Block::Tool(call) if call.running()))?;
+        self.mark_block_dirty(index);
+        match &mut self.blocks[index] {
+            Block::Tool(call) => Some(call),
+            _ => unreachable!(),
+        }
     }
 
     fn close_thought(&mut self) {
@@ -937,6 +1163,9 @@ impl App {
         }) = self.blocks.last_mut()
         {
             *millis = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            let index = self.blocks.len() - 1;
+            self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
         }
     }
 
@@ -946,6 +1175,15 @@ impl App {
     pub fn start_session(&mut self, session_id: String) {
         self.session_id = Some(session_id);
         self.blocks.clear();
+        self.transcript_cache.clear();
+        self.transcript_revisions.clear();
+        self.transcript_dirty.clear();
+        self.transcript_dynamic.clear();
+        self.transcript_thoughts.clear();
+        self.transcript_prefixes.clear();
+        self.transcript_prefixes.push(0);
+        self.transcript_cache_width = 0;
+        self.transcript_focus_index = None;
         self.clear_attachments();
         self.latest_agent_source.clear();
         self.phase = Phase::Idle;
@@ -957,13 +1195,18 @@ impl App {
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
+        self.viewport = 0;
+        self.total_lines = 0;
+        self.transcript_top = 0;
+        self.transcript_left = 0;
+        self.transcript_width = 0;
         self.row_calls.clear();
         self.row_links.clear();
         self.row_code.clear();
     }
 
     pub fn push_user(&mut self, prompt: String) -> u64 {
-        self.blocks.push(Block::User(prompt));
+        self.push_block(Block::User(prompt));
         self.begin_turn()
     }
 
@@ -1004,7 +1247,7 @@ impl App {
     }
 
     pub fn note(&mut self, text: impl Into<String>) {
-        self.blocks.push(Block::Notice(text.into()));
+        self.push_block(Block::Notice(text.into()));
     }
 
     pub fn scroll_by(&mut self, lines: isize) {
@@ -1296,7 +1539,7 @@ impl App {
             }
             KeyCode::Char('l') if control => self.show_logs = !self.show_logs,
             KeyCode::Char('o') if control => self.toggle_last_output(),
-            KeyCode::Char('t') if control => self.show_thoughts = !self.show_thoughts,
+            KeyCode::Char('t') if control => self.toggle_thoughts(),
             KeyCode::Left if line => self.editor.move_line_start(),
             KeyCode::Right if line => self.editor.move_line_end(),
             KeyCode::Left if alt => self.editor.move_word_left(),
@@ -1366,6 +1609,9 @@ impl App {
 
     /// Copies code, opens links, or folds tool output at the clicked row.
     fn click(&mut self, column: usize, row: usize) -> Action {
+        if self.scroll == usize::MAX {
+            return Action::None;
+        }
         let Some(offset) = row.checked_sub(self.transcript_top) else {
             return Action::None;
         };
@@ -1380,9 +1626,8 @@ impl App {
             return Action::None;
         }
         let code = self
-            .scroll
-            .checked_add(offset)
-            .and_then(|row| self.row_code.get(row))
+            .row_code
+            .get(offset)
             .and_then(Option::as_ref)
             .and_then(|hit| self.blocks.get(hit.block).map(|block| (block, hit)))
             .and_then(|(block, hit)| match block {
@@ -1394,13 +1639,8 @@ impl App {
             self.toast("copied code block");
             return Action::Copy(code);
         }
-        if let Some(Some(id)) = self
-            .scroll
-            .checked_add(offset)
-            .and_then(|row| self.row_calls.get(row))
-            .cloned()
-        {
-            self.focused_call_id = Some(id.clone());
+        if let Some(Some(id)) = self.row_calls.get(offset).cloned() {
+            self.focus_call_by_id(id.clone());
             self.graph_pinned = Some(true);
             self.toggle_output(&id);
         }
@@ -1408,9 +1648,12 @@ impl App {
     }
 
     fn clicked_link(&self, column: usize, offset: usize) -> Option<String> {
+        if self.scroll == usize::MAX {
+            return None;
+        }
         let column = column.checked_sub(self.transcript_left)?;
         self.row_links
-            .get(self.scroll.checked_add(offset)?)?
+            .get(offset)?
             .iter()
             .find(|link| column >= link.start && column < link.end)
             .map(|link| link.url.clone())
@@ -1910,18 +2153,15 @@ mod tests {
     }
 
     #[test]
-    fn maps_clicked_link_columns_after_scrolling() {
+    fn maps_clicked_link_columns_in_the_visible_viewport() {
         let mut app = app();
         app.transcript_left = 4;
-        app.scroll = 1;
-        app.row_links = vec![
-            Vec::new(),
-            vec![LinkHit {
-                start: 2,
-                end: 8,
-                url: "https://example.com".into(),
-            }],
-        ];
+        app.scroll = 20;
+        app.row_links = vec![vec![LinkHit {
+            start: 2,
+            end: 8,
+            url: "https://example.com".into(),
+        }]];
 
         assert_eq!(
             app.clicked_link(7, 0).as_deref(),
@@ -2126,6 +2366,41 @@ mod tests {
             app.toast_text(),
             Some("no model matches \"completely unknown\"")
         );
+    }
+
+    #[test]
+    fn redraw_ticks_only_while_time_dependent_ui_is_visible() {
+        let mut app = app();
+        assert!(!app.needs_redraw_tick());
+
+        app.phase = Phase::Working;
+        assert!(app.needs_redraw_tick());
+        app.phase = Phase::Idle;
+
+        app.apply(Update::ToolStarted {
+            id: "background".into(),
+            title: "shell".into(),
+            kind: ToolKind::Execute,
+            script: None,
+            backgrounded: true,
+        });
+        app.phase = Phase::Idle;
+        assert!(app.needs_redraw_tick());
+
+        app.apply(Update::ToolUpdated {
+            id: "background".into(),
+            status: Some(ToolCallStatus::Completed),
+            script: None,
+            output: Vec::new(),
+            backgrounded: true,
+        });
+        assert!(!app.needs_redraw_tick());
+
+        app.toast = Some(("done".into(), Instant::now() - Duration::from_secs(5)));
+        assert!(app.needs_redraw_tick());
+        app.tick();
+        assert!(app.toast.is_none());
+        assert!(!app.needs_redraw_tick());
     }
 
     #[test]

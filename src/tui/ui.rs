@@ -15,8 +15,15 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZED_TRANSCRIPT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFRESHED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static VISITED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use super::{
-    app::{App, Block, Child, CodeHit, Phase, ToolCall},
+    app::{App, Block, CachedTranscriptBlock, Child, CodeHit, Phase, ToolCall},
     command, markdown,
     plan::PlanKind,
     theme,
@@ -285,17 +292,24 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
 
-    let lines = wrap_linked_tagged(&transcript_lines(app), inner.width.max(1) as usize);
-    let total = lines.len();
+    let width = inner.width.max(1) as usize;
+    refresh_transcript_cache(app, width);
+    let working_rows = if app.working() {
+        wrap_linked_tagged(
+            &[(LinkedLine::plain(working_line(app)), (None, None))],
+            width,
+        )
+    } else {
+        Vec::new()
+    };
+    let transcript_rows = app.transcript_prefixes.last().copied().unwrap_or(0);
+    let total = transcript_rows + usize::from(!working_rows.is_empty()) + working_rows.len();
     let height = inner.height as usize;
     app.total_lines = total;
     app.viewport = height;
     app.transcript_top = inner.y as usize;
     app.transcript_left = inner.x as usize;
     app.transcript_width = inner.width as usize;
-    app.row_calls = lines.iter().map(|(_, (call, _), _)| call.clone()).collect();
-    app.row_code = lines.iter().map(|(_, (_, code), _)| code.clone()).collect();
-    app.row_links = lines.iter().map(|(_, _, links)| links.clone()).collect();
     let bottom = total.saturating_sub(height);
     let offset = if app.follow {
         bottom
@@ -304,12 +318,68 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     app.scroll = offset;
 
-    let visible: Vec<Line<'static>> = lines
-        .into_iter()
-        .skip(offset)
-        .take(height)
-        .map(|(line, _, _)| line)
-        .collect();
+    app.row_calls.clear();
+    app.row_code.clear();
+    app.row_links.clear();
+    app.row_calls.reserve(height);
+    app.row_code.reserve(height);
+    app.row_links.reserve(height);
+    let mut visible = Vec::with_capacity(height);
+    let end = offset.saturating_add(height);
+    let separator = (Line::default(), (None, None), Vec::new());
+    let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
+        #[cfg(test)]
+        MATERIALIZED_TRANSCRIPT_ROWS.with(|count| count.set(count.get() + 1));
+        visible.push(row.0.clone());
+        app.row_calls.push(row.1.0.clone());
+        app.row_code.push(row.1.1.clone());
+        app.row_links.push(row.2.clone());
+    };
+    if offset < transcript_rows && !app.blocks.is_empty() {
+        let mut block_index = app
+            .transcript_prefixes
+            .partition_point(|prefix| *prefix <= offset)
+            .saturating_sub(1)
+            .min(app.blocks.len() - 1);
+        while block_index < app.blocks.len() {
+            #[cfg(test)]
+            VISITED_TRANSCRIPT_BLOCKS.with(|count| count.set(count.get() + 1));
+            let span_start = app.transcript_prefixes[block_index];
+            if span_start >= end {
+                break;
+            }
+            let separator_rows = usize::from(span_start > 0);
+            if separator_rows > 0 && offset <= span_start && span_start < end {
+                materialize(&separator);
+            }
+            let content_start = span_start + separator_rows;
+            if let Some(block) = &app.transcript_cache[block_index] {
+                let first_row = offset.saturating_sub(content_start);
+                for (row_index, row) in block.rows.iter().enumerate().skip(first_row) {
+                    let absolute = content_start + row_index;
+                    if absolute >= end {
+                        break;
+                    }
+                    materialize(row);
+                }
+            }
+            block_index += 1;
+        }
+    }
+    if !working_rows.is_empty() && transcript_rows < end {
+        let separator_row = transcript_rows;
+        if offset <= separator_row && separator_row < end {
+            materialize(&separator);
+        }
+        let content_start = separator_row + 1;
+        let first_row = offset.saturating_sub(content_start);
+        for (row_index, row) in working_rows.iter().enumerate().skip(first_row) {
+            if content_start + row_index >= end {
+                break;
+            }
+            materialize(row);
+        }
+    }
     frame.render_widget(Paragraph::new(visible), inner);
     if total > height {
         let mut state = ScrollbarState::new(bottom).position(offset);
@@ -358,60 +428,120 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
 
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
-fn transcript_lines(app: &App) -> Vec<TaggedTranscriptLine> {
-    let mut lines = Vec::new();
-    for (block_index, block) in app.blocks.iter().enumerate() {
-        if !lines.is_empty() {
-            lines.push((LinkedLine::plain(Line::default()), (None, None)));
-        }
-        let (block_lines, call) = match block {
-            Block::User(text) => (uncopyable(plain_lines(user_lines(text))), None),
-            Block::Agent(text) => (markdown::render_copyable(text), None),
-            Block::Thought {
-                text,
-                started,
-                millis,
-            } => (
-                uncopyable(plain_lines(thought_lines(
-                    app,
-                    text,
-                    started.elapsed().as_millis(),
-                    *millis,
-                ))),
-                None,
-            ),
-            Block::Tool(call) => (
-                uncopyable(plain_lines(tool_lines(app, call))),
-                Some(call.id.clone()),
-            ),
-            Block::Notice(text) => (
-                uncopyable(plain_lines(vec![Line::from(Span::styled(
-                    format!("· {text}"),
-                    theme::faint(),
-                ))])),
-                None,
-            ),
-            Block::Error(text) => (
-                uncopyable(plain_lines(vec![Line::from(vec![
-                    Span::styled("✗ ", theme::bold(theme::ERROR)),
-                    Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
-                ])])),
-                None,
-            ),
+fn refresh_transcript_cache(app: &mut App, width: usize) {
+    if app.transcript_revisions.len() != app.blocks.len()
+        || app.transcript_cache.len() != app.blocks.len()
+        || app.transcript_prefixes.len() != app.blocks.len() + 1
+    {
+        app.sync_transcript_cache();
+    }
+    let width_changed = app.transcript_cache_width != width;
+    if width_changed {
+        app.transcript_cache_width = width;
+        app.transcript_dirty.extend(0..app.blocks.len());
+    }
+    app.transcript_dirty
+        .extend(app.transcript_dynamic.iter().copied());
+    let dirty = std::mem::take(&mut app.transcript_dirty);
+    let show_graph = !dirty.is_empty() && app.show_graph();
+    let mut first_changed_count = app.blocks.len();
+    for block_index in dirty {
+        #[cfg(test)]
+        REFRESHED_TRANSCRIPT_BLOCKS.with(|count| count.set(count.get() + 1));
+        let dynamic = match &app.blocks[block_index] {
+            Block::Thought { millis, .. } => millis.is_none(),
+            Block::Tool(call) => call.running() || call.running_children() > 0,
+            _ => false,
         };
-        lines.extend(block_lines.into_iter().map(|(line, code)| {
+        let revision = app.transcript_revisions[block_index];
+        if !width_changed
+            && !dynamic
+            && app.transcript_cache[block_index]
+                .as_ref()
+                .is_some_and(|cached| cached.revision == revision)
+        {
+            continue;
+        }
+        let missing = app.transcript_cache[block_index].is_none();
+        let old_count = app.transcript_cache[block_index]
+            .as_ref()
+            .map_or(0, |cached| cached.rows.len());
+        let rows = wrap_linked_tagged(&transcript_block_lines(app, block_index, show_graph), width);
+        if missing || rows.len() != old_count {
+            first_changed_count = first_changed_count.min(block_index);
+        }
+        app.transcript_cache[block_index] = Some(CachedTranscriptBlock { revision, rows });
+        if dynamic {
+            app.transcript_dynamic.insert(block_index);
+        } else {
+            app.transcript_dynamic.remove(&block_index);
+        }
+    }
+    for index in first_changed_count..app.blocks.len() {
+        let rows = app.transcript_cache[index]
+            .as_ref()
+            .map_or(0, |cached| cached.rows.len());
+        app.transcript_prefixes[index + 1] =
+            app.transcript_prefixes[index] + rows + usize::from(app.transcript_prefixes[index] > 0);
+    }
+}
+
+fn transcript_block_lines(
+    app: &App,
+    block_index: usize,
+    show_graph: bool,
+) -> Vec<TaggedTranscriptLine> {
+    let block = &app.blocks[block_index];
+    let (block_lines, call) = match block {
+        Block::User(text) => (uncopyable(plain_lines(user_lines(text))), None),
+        Block::Agent(text) => (markdown::render_copyable(text), None),
+        Block::Thought {
+            text,
+            started,
+            millis,
+        } => (
+            uncopyable(plain_lines(thought_lines(
+                app,
+                text,
+                started.elapsed().as_millis(),
+                *millis,
+            ))),
+            None,
+        ),
+        Block::Tool(call) => (
+            uncopyable(plain_lines(tool_lines(
+                app,
+                call,
+                show_graph,
+                app.transcript_call_is_focused(block_index),
+            ))),
+            Some(call.id.clone()),
+        ),
+        Block::Notice(text) => (
+            uncopyable(plain_lines(vec![Line::from(Span::styled(
+                format!("· {text}"),
+                theme::faint(),
+            ))])),
+            None,
+        ),
+        Block::Error(text) => (
+            uncopyable(plain_lines(vec![Line::from(vec![
+                Span::styled("✗ ", theme::bold(theme::ERROR)),
+                Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
+            ])])),
+            None,
+        ),
+    };
+    block_lines
+        .into_iter()
+        .map(|(line, code)| {
             let code = code.map(|range| CodeHit {
                 block: block_index,
                 range,
             });
             (line, (call.clone(), code))
-        }));
-    }
-    if app.working() {
-        lines.push((LinkedLine::plain(Line::default()), (None, None)));
-        lines.push((LinkedLine::plain(working_line(app)), (None, None)));
-    }
-    lines
+        })
+        .collect()
 }
 
 fn uncopyable(lines: Vec<LinkedLine>) -> Vec<(LinkedLine, Option<Range<usize>>)> {
@@ -468,13 +598,12 @@ fn thought_lines(
         .collect()
 }
 
-fn tool_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(tool_header(app, call))];
+fn tool_lines(app: &App, call: &ToolCall, show_graph: bool, active: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(tool_header(app, call, active))];
     if call.running() {
         // The live detail belongs in the graph pane, which is open while a
         // call runs; repeating it here would just churn the transcript.
-        if !app.show_graph()
-            && let Some(child) = call.children.iter().rev().find(|child| child.running())
+        if !show_graph && let Some(child) = call.children.iter().rev().find(|child| child.running())
         {
             lines.push(Line::from(vec![
                 Span::styled("   ↳ ", theme::faint()),
@@ -541,10 +670,7 @@ fn plural(word: &str, count: usize) -> String {
     }
 }
 
-fn tool_header(app: &App, call: &ToolCall) -> Vec<Span<'static>> {
-    let active = app
-        .focus_call()
-        .is_some_and(|focused| focused.id == call.id);
+fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
     let (glyph, style) = match call.status {
         _ if call.running() => (
             theme::pulse(theme::Pulse::Tool, app.tick).to_string(),
@@ -920,7 +1046,7 @@ mod tests {
 
     use super::{
         MAX_PROMPT_ROWS, ModelDialogRow, draw, graph_lines, model_dialog_rows,
-        model_dialog_viewport, prompt_lines,
+        model_dialog_viewport, prompt_lines, refresh_transcript_cache,
     };
     use crate::{
         events::RuntimeEvent,
@@ -1149,10 +1275,15 @@ mod tests {
                 .iter()
                 .filter_map(|block| match block {
                     Block::Tool(call) => Some(
-                        super::tool_header(app, call)
-                            .iter()
-                            .map(|span| span.content.as_ref())
-                            .collect::<String>(),
+                        super::tool_header(
+                            app,
+                            call,
+                            app.focus_call()
+                                .is_some_and(|focused| focused.id == call.id),
+                        )
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>(),
                     ),
                     _ => None,
                 })
@@ -1367,6 +1498,117 @@ mod tests {
         assert_eq!(highlighted, "/new");
         assert_eq!(lines[0].spans[0].content, "/n");
         assert_eq!(lines[1].spans[0].content, "ew");
+    }
+
+    #[test]
+    fn dynamic_cache_entries_refresh_until_the_block_finishes() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.apply(Update::Thought("still thinking".into()));
+
+        refresh_transcript_cache(&mut app, 40);
+        let first_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
+        refresh_transcript_cache(&mut app, 40);
+        assert_ne!(
+            app.transcript_cache[0].as_ref().unwrap().rows.as_ptr(),
+            first_rows
+        );
+
+        app.apply(Update::Text("done".into()));
+        refresh_transcript_cache(&mut app, 40);
+        assert!(!app.transcript_dynamic.contains(&0));
+        let stable_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
+        refresh_transcript_cache(&mut app, 40);
+        assert_eq!(
+            app.transcript_cache[0].as_ref().unwrap().rows.as_ptr(),
+            stable_rows
+        );
+    }
+
+    #[test]
+    fn materializes_click_metadata_only_for_visible_rows() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        for index in 0..30 {
+            app.blocks.push(Block::User(format!("old row {index}")));
+        }
+        app.blocks.push(Block::Agent(
+            "[visible link](https://example.com/target)".into(),
+        ));
+
+        super::MATERIALIZED_TRANSCRIPT_ROWS.with(|count| count.set(0));
+        super::VISITED_TRANSCRIPT_BLOCKS.with(|count| count.set(0));
+        let _ = render(&mut app, 50, 10);
+
+        super::MATERIALIZED_TRANSCRIPT_ROWS.with(|count| assert_eq!(count.get(), app.viewport));
+        super::VISITED_TRANSCRIPT_BLOCKS.with(|count| {
+            assert!(count.get() <= app.viewport);
+            assert!(count.get() < app.blocks.len());
+        });
+        assert_eq!(app.row_links.len(), app.viewport);
+        assert_eq!(app.row_calls.len(), app.viewport);
+        assert_eq!(app.row_code.len(), app.viewport);
+        assert!(
+            app.row_links
+                .iter()
+                .flatten()
+                .any(|hit| hit.url == "https://example.com/target")
+        );
+    }
+
+    #[test]
+    fn tail_mutation_does_not_inspect_or_rebuild_unchanged_history() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        for index in 0..100 {
+            app.blocks.push(Block::Agent(format!("history {index}")));
+        }
+        refresh_transcript_cache(&mut app, 12);
+        let history_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
+        let history_revision = app.transcript_cache[0].as_ref().unwrap().revision;
+        let tail_rows = app.transcript_cache[99].as_ref().unwrap().rows.as_ptr();
+
+        super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| count.set(0));
+        app.apply(Update::Text(" changed".into()));
+        refresh_transcript_cache(&mut app, 12);
+
+        super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| assert_eq!(count.get(), 1));
+        let history = app.transcript_cache[0].as_ref().unwrap();
+        assert_eq!(history.rows.as_ptr(), history_rows);
+        assert_eq!(history.revision, history_revision);
+        assert_ne!(
+            app.transcript_cache[99].as_ref().unwrap().rows.as_ptr(),
+            tail_rows
+        );
+    }
+
+    #[test]
+    fn transcript_width_change_rebuilds_cached_rows() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.blocks
+            .push(Block::Agent("alpha beta gamma delta epsilon".into()));
+        refresh_transcript_cache(&mut app, 12);
+        let narrow_rows = app.transcript_cache[0].as_ref().unwrap().rows.len();
+        refresh_transcript_cache(&mut app, 40);
+        assert_eq!(app.transcript_cache_width, 40);
+        assert!(app.transcript_cache[0].as_ref().unwrap().rows.len() < narrow_rows);
     }
 
     #[test]

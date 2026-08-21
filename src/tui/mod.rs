@@ -41,7 +41,7 @@ use crossterm::{
     execute,
     style::Print,
 };
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
 use serde_json::Value;
 use tokio::{
@@ -326,6 +326,7 @@ pub async fn run(
             app.restore_transcript(active_session_id, &restored);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // The turn in flight, if any: leaving is not allowed to abandon it.
             let mut turn: Option<tokio::task::JoinHandle<()>> = None;
             let mut stop =
@@ -352,9 +353,15 @@ pub async fn run(
                                 if !matches!(action, Action::None) {
                                     break;
                                 }
-                                match events.next().now_or_never() {
-                                    Some(buffered) => next = buffered,
-                                    None => break,
+                                // `EventStream::next().now_or_never()` polls with a noop
+                                // waker. If no event is ready, crossterm's background reader
+                                // retains that waker and cannot wake this select loop when the
+                                // next key arrives. Check synchronously before polling the
+                                // stream so an empty burst cannot make the TUI unresponsive.
+                                if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+                                    next = events.next().await;
+                                } else {
+                                    break;
                                 }
                             }
                             match action {
@@ -532,7 +539,7 @@ pub async fn run(
                             }
                             None => return Ok(()),
                         },
-                        _ = ticker.tick() => app.tick = app.tick.wrapping_add(1),
+                        _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
                         () = stop.requested() => return Ok(()),
                     }
                 }
