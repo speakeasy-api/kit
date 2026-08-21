@@ -731,9 +731,10 @@ impl Runtime {
                 "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",
                 "express required ordering with data dependencies or `after`, and use `fold` only for reductions or genuinely sequential chains. ",
                 "Parallelize independent work deliberately. Prefer one compose program whenever the remaining tool graph is known: keep intermediate results inside it when they can directly drive downstream work, and return only the bare minimum information necessary to plan the next turn or provide the final answer. ",
-                "Background long-running compose work when keeping the session responsive or doing other independent work meanwhile is more useful than waiting; it also suits one-shot triggers. ",
+                "Background long-running compose work when it can run across a turn boundary; it also suits one-shot triggers. ",
                 "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
-                "Keep work foregrounded when the next step needs its immediate result, and do not treat backgrounding as durable job execution.\n\n",
+                "After detaching, continue any independent work, including launching more detached work. When the remaining work depends on background results, yield; yielding continues the task with those results, so the user's answer need not be completed first. ",
+                "Keep work foregrounded when the next step needs its result in the current turn, and do not treat backgrounding as durable job execution.\n\n",
                 "When work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
                 "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n",
                 "Current subagent depth: {depth}/{}."

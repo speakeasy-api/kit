@@ -562,8 +562,13 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     assert!(prompt.contains("Do not dump whole trees"));
     assert!(prompt.contains("Use compose as a dependency graph"));
     assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
-    assert!(prompt.contains("keeping the session responsive or doing other independent work"));
+    assert!(prompt.contains("when it can run across a turn boundary"));
     assert!(prompt.contains("it also suits one-shot triggers"));
+    assert!(prompt.contains("including launching more detached work"));
+    assert!(prompt.contains("When the remaining work depends on background results, yield"));
+    assert!(prompt.contains("yielding continues the task with those results"));
+    assert!(prompt.contains("the user's answer need not be completed first"));
+    assert!(prompt.contains("the next step needs its result in the current turn"));
     assert!(
         prompt.contains("Prefer one compose program whenever the remaining tool graph is known")
     );
