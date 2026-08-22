@@ -227,7 +227,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         |name| name.to_string_lossy().into_owned(),
     );
     let mut spans = vec![
-        Span::styled(" kit ", theme::bold(theme::ACCENT)),
+        Span::styled(" kit ", theme::bold(theme::accent_color())),
         Span::styled("▏ ", theme::faint()),
         Span::styled(root, theme::text()),
         Span::styled("  ·  ", theme::faint()),
@@ -398,7 +398,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn welcome() -> Paragraph<'static> {
     let lines = vec![
         Line::default(),
-        Line::from(Span::styled("kit", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("kit", theme::bold(theme::accent_color()))),
         Line::from(Span::styled(
             "a directory-rooted coding agent",
             theme::dim(),
@@ -526,8 +526,8 @@ fn transcript_block_lines(
         ),
         Block::Error(text) => (
             uncopyable(plain_lines(vec![Line::from(vec![
-                Span::styled("✗ ", theme::bold(theme::ERROR)),
-                Span::styled(text.clone(), Style::default().fg(theme::ERROR)),
+                Span::styled("✗ ", theme::bold(theme::error_color())),
+                Span::styled(text.clone(), Style::default().fg(theme::error_color())),
             ])])),
             None,
         ),
@@ -559,9 +559,9 @@ fn user_lines(text: &str) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled(
                     if index == 0 { "› " } else { "  " },
-                    theme::bold(theme::USER),
+                    theme::bold(theme::user_color()),
                 ),
-                Span::styled(line.to_string(), theme::bold(theme::USER)),
+                Span::styled(line.to_string(), theme::bold(theme::user_color())),
             ])
         })
         .collect()
@@ -674,16 +674,20 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
     let (glyph, style) = match call.status {
         _ if call.running() => (
             theme::pulse(theme::Pulse::Tool, app.tick).to_string(),
-            theme::bold(theme::RUNNING),
+            theme::bold(theme::running_color()),
         ),
-        ToolCallStatus::Failed => ("✗".into(), theme::bold(theme::ERROR)),
-        _ => ("✓".into(), theme::bold(theme::SUCCESS)),
+        ToolCallStatus::Failed => ("✗".into(), theme::bold(theme::error_color())),
+        _ => ("✓".into(), theme::bold(theme::success_color())),
     };
     let mut spans = vec![
         Span::styled(format!("{glyph} "), style),
         Span::styled(
             call.title.clone(),
-            theme::bold(if active { theme::ACCENT } else { theme::TEXT }),
+            theme::bold(if active {
+                theme::accent_color()
+            } else {
+                theme::text_color()
+            }),
         ),
         Span::styled(kind_label(call.kind).to_string(), theme::faint()),
         Span::styled(
@@ -701,7 +705,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
     if running > 0 {
         spans.push(Span::styled(
             format!("  · {running} in flight"),
-            Style::default().fg(theme::RUNNING),
+            Style::default().fg(theme::running_color()),
         ));
     } else if !call.children.is_empty() {
         spans.push(Span::styled(
@@ -732,12 +736,12 @@ fn child_spans(app: &App, child: &Child, indent: &str) -> Vec<Span<'static>> {
     let (glyph, style) = if child.running() {
         (
             theme::pulse(theme::Pulse::Child, app.tick).to_string(),
-            Style::default().fg(theme::RUNNING),
+            Style::default().fg(theme::running_color()),
         )
     } else if child.ok {
-        ("✓".into(), Style::default().fg(theme::SUCCESS))
+        ("✓".into(), Style::default().fg(theme::success_color()))
     } else {
-        ("✗".into(), Style::default().fg(theme::ERROR))
+        ("✗".into(), Style::default().fg(theme::error_color()))
     };
     let detail = if child.running() || child.result.is_empty() {
         child.summary.clone()
@@ -765,7 +769,7 @@ fn working_line(app: &App) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{} ", theme::pulse(theme::Pulse::Turn, app.tick)),
-            theme::bold(theme::ACCENT),
+            theme::bold(theme::accent_color()),
         ),
         Span::styled(label.to_string(), theme::accent()),
         Span::styled(
@@ -801,7 +805,7 @@ fn draw_graph(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn graph_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
-        Span::styled(call.title.clone(), theme::bold(theme::TEXT)),
+        Span::styled(call.title.clone(), theme::bold(theme::text_color())),
         Span::styled(
             format!("  {}", theme::duration(call.elapsed())),
             theme::dim(),
@@ -878,13 +882,13 @@ fn graph_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
 
 fn node_style(kind: PlanKind, attached: &[&Child]) -> Style {
     if attached.iter().any(|child| child.running()) {
-        return theme::bold(theme::RUNNING);
+        return theme::bold(theme::running_color());
     }
     if attached.iter().any(|child| !child.ok) {
-        return Style::default().fg(theme::ERROR);
+        return Style::default().fg(theme::error_color());
     }
     if !attached.is_empty() {
-        return Style::default().fg(theme::SUCCESS);
+        return Style::default().fg(theme::success_color());
     }
     match kind {
         PlanKind::Call => theme::dim(),
@@ -925,7 +929,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let border = if app.working() {
         theme::faint()
     } else {
-        Style::default().fg(theme::ACCENT)
+        Style::default().fg(theme::accent_color())
     };
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
@@ -936,7 +940,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let [gutter, field] =
         Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
     frame.render_widget(
-        Paragraph::new(Span::styled("›", theme::bold(theme::ACCENT))),
+        Paragraph::new(Span::styled("›", theme::bold(theme::accent_color()))),
         gutter,
     );
 
@@ -989,16 +993,20 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
                 theme::bar(),
             ),
-            Span::styled("stopping", Style::default().fg(theme::WARN)),
+            Span::styled("stopping", Style::default().fg(theme::warn_color())),
         ],
         Phase::Working => vec![
             Span::styled(
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
-                Style::default().fg(theme::ACCENT).bg(theme::BAR_BG),
+                Style::default()
+                    .fg(theme::accent_color())
+                    .bg(theme::bar_bg()),
             ),
             Span::styled(
                 format!("working {}", theme::duration(app.elapsed())),
-                Style::default().fg(theme::ACCENT).bg(theme::BAR_BG),
+                Style::default()
+                    .fg(theme::accent_color())
+                    .bg(theme::bar_bg()),
             ),
         ],
     };
@@ -1006,7 +1014,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         left.push(Span::styled("  ", theme::bar()));
         left.push(Span::styled(
             toast.to_string(),
-            Style::default().fg(theme::WARN).bg(theme::BAR_BG),
+            Style::default().fg(theme::warn_color()).bg(theme::bar_bg()),
         ));
     }
     let hints = "⏎ send   ⇧⏎ newline   ^g graph   ^l log   ^c quit ";
@@ -1099,6 +1107,90 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `sample()` with every clock stopped.
+    ///
+    /// The contrast comparison renders the transcript twice, once per palette,
+    /// and reads the two frames cell against cell. A duration still counting
+    /// up between the two renders would widen a card's label in one of them
+    /// and shift every cell after it.
+    fn frozen() -> App {
+        use std::time::Duration;
+
+        let mut app = sample();
+        app.turn_started = None;
+        app.tick = 0;
+        app.toast = None;
+        for block in &mut app.blocks {
+            let Block::Tool(call) = block else { continue };
+            call.status = agentkit_acp::ToolCallStatus::Completed;
+            call.finished = Some(call.started + Duration::from_millis(120));
+            for (index, child) in call.children.iter_mut().enumerate() {
+                child.millis = Some(40 * (index as u64 + 1));
+            }
+        }
+        app
+    }
+
+    /// Every colour the client picks on a light terminal must read at least
+    /// as well as the colour it picks for the same cell on a dark one. A dark
+    /// palette on a light terminal is what makes the transcript vanish: its
+    /// colours all sit a few shades from white.
+    #[test]
+    fn a_light_terminal_reads_as_well_as_a_dark_one() {
+        use ratatui::style::Color;
+
+        use crate::tui::theme::{self, Appearance, contrast};
+
+        // What the terminal itself paints where the client sets no colour.
+        fn ink(appearance: Appearance, paper: Color) -> Vec<(String, f64)> {
+            theme::set(appearance);
+            let mut app = frozen();
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+            terminal
+                .draw(|frame| draw(frame, &mut app))
+                .expect("draw succeeds");
+            let buffer = terminal.backend().buffer().clone();
+            theme::set(Appearance::Dark);
+            (0..buffer.area.height)
+                .flat_map(|row| (0..buffer.area.width).map(move |column| (column, row)))
+                .map(|cell| {
+                    let cell = &buffer[cell];
+                    let background = match cell.bg {
+                        Color::Reset => paper,
+                        background => background,
+                    };
+                    let contrast = match cell.fg {
+                        _ if cell.symbol().trim().is_empty() => f64::INFINITY,
+                        Color::Reset => f64::INFINITY,
+                        foreground => contrast(foreground, background),
+                    };
+                    (cell.symbol().to_string(), contrast)
+                })
+                .collect()
+        }
+
+        let light = ink(Appearance::Light, Color::Rgb(255, 255, 255));
+        let dark = ink(Appearance::Dark, Color::Rgb(0, 0, 0));
+        assert_eq!(light.len(), dark.len());
+        assert!(
+            light.iter().any(|(_, contrast)| contrast.is_finite()),
+            "the frame draws no colour at all"
+        );
+        // Deliberately quiet chrome — faint text on the status bar — reads low
+        // in either palette, so each cell is held to whichever is weaker: the
+        // legibility floor, or what the dark palette already settled for.
+        for ((symbol, light), (drawn, dark)) in light.into_iter().zip(dark) {
+            // Both frames are drawn from the same stopped clock, so a cell
+            // holding different text means the comparison has slipped.
+            assert_eq!(symbol, drawn, "the two frames drew different text");
+            let wanted = dark.min(4.5);
+            assert!(
+                light + 0.01 >= wanted,
+                "{symbol:?} reads at {light:.2}:1 on a light terminal, short of {wanted:.2}:1"
+            );
+        }
     }
 
     #[test]

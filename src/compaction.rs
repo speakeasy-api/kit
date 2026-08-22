@@ -1029,7 +1029,10 @@ mod tests {
         let before = vec![call.clone(), result.clone()];
 
         assert!(!removed_skill_instructions(&before, &before));
-        assert!(removed_skill_instructions(&before, &[call.clone()]));
+        assert!(removed_skill_instructions(
+            &before,
+            std::slice::from_ref(&call)
+        ));
 
         let truncated = vec![call, compact_tool_outputs(result)];
         assert!(removed_skill_instructions(&before, &truncated));

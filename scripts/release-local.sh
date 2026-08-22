@@ -39,9 +39,19 @@ cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 
-"$root/scripts/notarize-release.sh" "$tag"
+"$root/scripts/notarize-release.sh" "$tag" &
+macos_pid=$!
+"$root/scripts/build-linux-release.sh" "$tag" &
+linux_pid=$!
+cleanup_builds() {
+  kill "$macos_pid" "$linux_pid" 2>/dev/null || true
+}
+trap cleanup_builds EXIT
+
+wait "$macos_pid"
 test "$(cat "$out_dir/source-commit.txt")" = "$commit"
-"$root/scripts/build-linux-release.sh" "$tag"
+wait "$linux_pid"
+trap - EXIT
 
 (
   cd "$out_dir"

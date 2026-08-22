@@ -487,14 +487,16 @@ impl ChildSession {
         let actor_tx = tx.clone();
         let mut task = tokio::spawn(async move {
             run(
-                config,
-                harness,
-                persisted,
-                model,
-                depth,
+                RunConfig {
+                    config,
+                    harness,
+                    persisted,
+                    model,
+                    depth,
+                    context: actor_context,
+                },
                 &mut rx,
                 ready_tx,
-                actor_context,
             )
             .await
         });
@@ -652,16 +654,28 @@ impl ChildSession {
     }
 }
 
-async fn run(
+struct RunConfig {
     config: ChildConfig,
     harness: String,
     persisted: Option<(String, bool)>,
     model: Option<String>,
     depth: usize,
+    context: LaunchContext,
+}
+
+async fn run(
+    run_config: RunConfig,
     rx: &mut mpsc::Receiver<Request>,
     ready: oneshot::Sender<Result<Ready, String>>,
-    context: LaunchContext,
 ) -> Result<(), String> {
+    let RunConfig {
+        config,
+        harness,
+        persisted,
+        model,
+        depth,
+        context,
+    } = run_config;
     let permission_policy = config.harnesses.permission_policy(&harness)?;
     let mut command = config.harnesses.spawn(
         &harness,

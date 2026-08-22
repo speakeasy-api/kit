@@ -832,6 +832,9 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
 }
 
 fn enter() -> std::io::Result<DefaultTerminal> {
+    // Asked before the alternate screen is entered: the query needs the
+    // terminal's own input stream, which the event loop owns from here on.
+    theme::detect();
     let terminal = ratatui::try_init()?;
     let mut stdout = std::io::stdout();
     // Bracketed paste is what keeps pasted text out of the key stream: without

@@ -131,6 +131,14 @@ This repair does not hide general JSONL damage. Errors including `invalid transc
 
 While a session is open, Kit can reconstruct a transcript path deleted from disk using its still-open file and can reacquire a missing lock only if no other owner won the lock. It fails closed if another process owns recovery authority. After an abnormal TUI shutdown, restarting with `--resume` should be the first recovery attempt; add `--force` only after confirming the remaining lock is stale.
 
+### Colours on light and dark terminals
+
+The TUI draws on the terminal's own background, so it asks the terminal for that background over OSC 11 at startup and picks a dark or light palette to match. Terminals that do not answer within 100 ms fall back to `COLORFGBG`, and then to the dark palette.
+
+Windows builds do not query the terminal at all: they use `KIT_THEME` if it is set, and the dark palette otherwise.
+
+Set `KIT_THEME=light` or `KIT_THEME=dark` to override the detection — useful under multiplexers or remote sessions that report the wrong background, or answer for a different terminal than the one in front of you. Any other value, including unset, keeps automatic detection.
+
 ### TUI startup and terminal recovery
 
 The TUI runs a `kit serve` child. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.

@@ -140,13 +140,13 @@ fn block_line(raw: &str, trimmed: &str) -> LinkedLine {
         return plain_line(Line::from(Span::styled("─".repeat(40), theme::faint())));
     }
     if let Some(heading) = trimmed.strip_prefix("### ") {
-        return heading_line(indent, heading, theme::bold(theme::TEXT));
+        return heading_line(indent, heading, theme::bold(theme::text_color()));
     }
     if let Some(heading) = trimmed.strip_prefix("## ") {
-        return heading_line(indent, heading, theme::bold(theme::ACCENT));
+        return heading_line(indent, heading, theme::bold(theme::accent_color()));
     }
     if let Some(heading) = trimmed.strip_prefix("# ") {
-        return heading_line(indent, heading, theme::bold(theme::ACCENT));
+        return heading_line(indent, heading, theme::bold(theme::accent_color()));
     }
     if let Some(quoted) = trimmed.strip_prefix("> ") {
         let mut spans = vec![plain_span(format!("{indent}▏ "), theme::faint())];
