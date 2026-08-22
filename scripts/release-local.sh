@@ -9,6 +9,10 @@ fi
 for command in cargo gh git mise shasum; do
   command -v "$command" >/dev/null || { echo "missing required command: $command" >&2; exit 1; }
 done
+if ! docker info >/dev/null 2>&1; then
+  echo "container runtime unreachable; start it (e.g. podman machine start) and retry" >&2
+  exit 1
+fi
 
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$root"
