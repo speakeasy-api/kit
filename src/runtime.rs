@@ -515,7 +515,7 @@ impl Runtime {
             .with(Observed::new(A2aTool::new()))
             .with(Observed::new(ToolSearch::new(self.mcp.clone())))
             .with(Observed::new(AuthTool::new(self.mcp.clone())))
-            .with(Observed::new(McpTool::new(self.mcp.catalog())));
+            .with(Observed::new(McpTool::new(self.mcp.clone())));
         let skill_tools = skills.tool_registry();
         if let Some(skill_tool) = skill_tools.get(&ToolName::new("activate_skill")) {
             children.register(observe_shared(skill_tool));

@@ -48,6 +48,8 @@ The equivalent home configuration is:
 mcp_config = "/path/to/mcp.json"
 ```
 
+Server names must have unambiguous tool prefixes. Do not configure names where one name plus `_` prefixes another, such as `foo` and `foo_bar`; Kit rejects that configuration because both can produce the same model-visible MCP tool name.
+
 ### Local stdio transport
 
 A stdio server requires a non-empty `command`. Optional fields are `args` (an array of strings), `env` (a string-to-string object), `cwd`, and `description`. Kit starts and connects a configured stdio server only when a search matches its name or description, or when the exact query `mcp` initializes all servers. Treat `command`, `args`, `cwd`, and environment values as executable configuration, and review the file before using it.
@@ -100,7 +102,7 @@ MCP tools are model-visible through three meta-tools rather than as an unrestric
 3. When the user completes OAuth, Kit stores the credentials, connects the server, and sends a notification to the originating ACP session. The agent resumes automatically and can search or call the newly available tools; no manual post-authentication search is required.
 4. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema.
 
-A connected server reports `authenticated`, including servers that do not need OAuth. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other lazy initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
+A connected server reports `authenticated`, including servers that do not need OAuth. If an already-connected OAuth server rejects a tool call with a Bearer challenge, Kit first refreshes the existing credentials and replays that tool call once. A missing or failed refresh, a request for additional scopes, or a rejected replay falls back to the explicit `auth` workflow. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other lazy initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
 
 ## Interactive OAuth availability
 
@@ -149,7 +151,7 @@ credential_store = "file"
 credential_dir = "/path/to/private/credentials"
 ```
 
-Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials when a matching search initializes the server; either path may refresh access tokens. This also works for the inferred default OAuth identity of a remote server with no `auth` block. Reuse the same backend, directory, and MCP server identity across commands. Kit serializes MCP token refreshes across processes that share a credential backend, and reloads credentials after taking the lock so rotating refresh tokens are not reused.
+Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAuth credentials when a matching search initializes the server; either path may refresh access tokens. This also works for the inferred default OAuth identity of a remote server with no `auth` block. Reuse the same backend, directory, and MCP server identity across commands. Kit serializes MCP token refreshes across processes that share a credential backend, reloads credentials after taking the lock, and reuses a token that another waiter already refreshed so rotating refresh tokens are not consumed twice.
 
 ## Security guidance
 
@@ -175,7 +177,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 - **`OAuth discovery failed` / `OAuth client registration failed`**: verify the server's `WWW-Authenticate` challenge and OAuth metadata and whether it supports dynamic registration. If it requires a registered client, add an optional `auth.clientId` override.
 - **`could not bind OAuth callback`**: permit Kit to bind a loopback port. **`OAuth callback timed out`** means the browser flow was not completed within 10 minutes; call `auth` again.
 - **Authentication completed but the agent did not resume**: wait for the callback to finish and keep the originating ACP session open. Kit sends that session a success or failure notification after the connection attempt; failures are also written as `MCP authentication for <server> failed: ...` on stderr. A manual `tool_search` can inspect current status but is not required for the normal flow.
-- **Stored credentials no longer work**: authenticate again in a long-lived runtime. Processes sharing a persistent backend serialize refreshes; if credentials were changed externally, restart or authenticate again.
+- **Stored credentials no longer work**: Kit automatically refreshes and replays one rejected OAuth tool call when possible. If that attempt fails or the replay is rejected, authenticate again in a long-lived runtime. Processes sharing a persistent backend serialize refreshes; if credentials were changed externally, restart or authenticate again.
 
 ### Credential-store errors
 

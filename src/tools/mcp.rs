@@ -31,8 +31,15 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// These messages are part of the pinned agentkit-mcp 0.10.6 adapter contract.
+// Revalidate them before upgrading that dependency.
+const AGENTKIT_REPLAY_REJECTED: &str = "MCP auth challenge unresolved after retry";
+const AGENTKIT_RESPONDER_FAILED: &str = "auth responder failed:";
+const AGENTKIT_APPLY_AUTH_FAILED: &str = "applying auth resolution failed:";
 
 type EventRoutes = Arc<std::sync::Mutex<BTreeMap<String, (u64, mpsc::UnboundedSender<McpEvent>)>>>;
+type OAuthSessions = Arc<Mutex<BTreeMap<String, Arc<OAuthSession>>>>;
+type ActiveReplays = Arc<Mutex<BTreeMap<String, u64>>>;
 type PreparedServers = BTreeMap<String, PreparedServer>;
 type ServerFingerprints = BTreeMap<String, Vec<u8>>;
 type PreparedConfiguration = (PreparedServers, ServerFingerprints);
@@ -86,12 +93,14 @@ struct Inner {
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
     challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
     pending: Mutex<BTreeMap<String, PendingRecord>>,
-    oauth_managers: Mutex<BTreeMap<String, AuthorizationManager>>,
+    oauth_sessions: OAuthSessions,
+    active_replays: ActiveReplays,
     credential_storage: CredentialStorage,
     reload: Mutex<ReloadState>,
     reload_flight: Arc<Semaphore>,
     initialization: Mutex<()>,
     auth_setup: Mutex<()>,
+    operations: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     event_routes: EventRoutes,
     next_event_route: AtomicU64,
     interactive_oauth_enabled: bool,
@@ -150,6 +159,145 @@ struct PendingRecord {
     abort: tokio::task::AbortHandle,
 }
 
+struct OAuthSession {
+    manager: Mutex<AuthorizationManager>,
+    tokens: std::sync::Mutex<OAuthSessionTokens>,
+}
+
+struct OAuthSessionTokens {
+    applied: String,
+    pending: Option<PendingRefresh>,
+    next_generation: u64,
+}
+
+enum PendingRefresh {
+    Refreshing { generation: u64, cancelled: bool },
+    Ready { generation: u64, token: String },
+}
+
+enum OpportunisticRefresh {
+    Apply { token: String, generation: u64 },
+    Coalesced,
+}
+
+impl OAuthSession {
+    fn new(manager: AuthorizationManager, access_token: String) -> Self {
+        Self {
+            manager: Mutex::new(manager),
+            tokens: std::sync::Mutex::new(OAuthSessionTokens {
+                applied: access_token,
+                pending: None,
+                next_generation: 0,
+            }),
+        }
+    }
+
+    async fn refresh(&self, credential_storage: &CredentialStorage) -> Result<String, String> {
+        let rejected_token = self
+            .tokens
+            .lock()
+            .expect("OAuth session tokens are poisoned")
+            .applied
+            .clone();
+        let mut manager = self.manager.lock().await;
+        let token = auth::refresh(&mut manager, credential_storage, &rejected_token)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tokens = self
+            .tokens
+            .lock()
+            .expect("OAuth session tokens are poisoned");
+        tokens.applied = token.clone();
+        tokens.pending = None;
+        Ok(token)
+    }
+
+    async fn opportunistic_refresh(
+        self: &Arc<Self>,
+        credential_storage: &CredentialStorage,
+    ) -> Result<OpportunisticRefresh, String> {
+        let (observed_token, generation) = {
+            let mut tokens = self
+                .tokens
+                .lock()
+                .expect("OAuth session tokens are poisoned");
+            if tokens.pending.is_some() {
+                return Ok(OpportunisticRefresh::Coalesced);
+            }
+            tokens.next_generation = tokens.next_generation.wrapping_add(1);
+            let generation = tokens.next_generation;
+            let observed_token = tokens.applied.clone();
+            tokens.pending = Some(PendingRefresh::Refreshing {
+                generation,
+                cancelled: false,
+            });
+            (observed_token, generation)
+        };
+        let session = Arc::clone(self);
+        let credential_storage = credential_storage.clone();
+        tokio::spawn(async move {
+            let result = {
+                let mut manager = session.manager.lock().await;
+                auth::refresh(&mut manager, &credential_storage, &observed_token)
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+            let mut tokens = session
+                .tokens
+                .lock()
+                .expect("OAuth session tokens are poisoned");
+            let cancelled = match tokens.pending {
+                Some(PendingRefresh::Refreshing {
+                    generation: current,
+                    cancelled,
+                }) if current == generation => cancelled,
+                _ => return Err("MCP credential refresh was superseded".into()),
+            };
+            if cancelled {
+                tokens.pending = None;
+                return Err("MCP credential refresh was cancelled".into());
+            }
+            match result {
+                Ok(token) => {
+                    tokens.pending = Some(PendingRefresh::Ready {
+                        generation,
+                        token: token.clone(),
+                    });
+                    Ok(OpportunisticRefresh::Apply { token, generation })
+                }
+                Err(error) => {
+                    tokens.pending = None;
+                    Err(error)
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("MCP credential refresh task failed: {error}"))?
+    }
+
+    fn finish_replay(&self, commit: bool) -> Option<u64> {
+        let mut tokens = self
+            .tokens
+            .lock()
+            .expect("OAuth session tokens are poisoned");
+        match tokens.pending.take()? {
+            PendingRefresh::Ready { generation, token } => {
+                if commit {
+                    tokens.applied = token;
+                }
+                Some(generation)
+            }
+            PendingRefresh::Refreshing { generation, .. } => {
+                tokens.pending = Some(PendingRefresh::Refreshing {
+                    generation,
+                    cancelled: true,
+                });
+                Some(generation)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct McpEvent {
     pub message: String,
@@ -183,15 +331,111 @@ impl Drop for McpSubscription {
 struct AuthRecorder {
     challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
+    oauth_sessions: OAuthSessions,
+    active_replays: ActiveReplays,
+    credential_storage: CredentialStorage,
 }
 
 #[async_trait]
 impl McpAuthResponder for AuthRecorder {
     async fn resolve(&self, request: AuthRequest) -> Result<AuthResolution, McpError> {
         let server = request.server_id().unwrap_or("unknown").to_string();
-        self.challenges.lock().await.insert(server.clone(), request);
-        if let Some(record) = self.servers.write().await.get_mut(&server) {
-            record.status = ServerStatus::AuthenticationRequired;
+        let record = self.servers.read().await.get(&server).cloned();
+        let refreshable = record
+            .as_ref()
+            .is_some_and(|record| can_opportunistically_refresh(&request, record));
+
+        let session = if refreshable {
+            self.oauth_sessions.lock().await.get(&server).cloned()
+        } else {
+            None
+        };
+        if let Some(session) = session {
+            let refresh = session
+                .opportunistic_refresh(&self.credential_storage)
+                .await;
+            if matches!(refresh, Ok(OpportunisticRefresh::Coalesced)) {
+                return Err(McpError::AuthResolution(format!(
+                    "MCP credentials for {server} were refreshed by another request; retry the tool call"
+                )));
+            }
+            if let Ok(OpportunisticRefresh::Apply { token, generation }) = refresh {
+                let current_session = self
+                    .oauth_sessions
+                    .lock()
+                    .await
+                    .get(&server)
+                    .is_some_and(|current| Arc::ptr_eq(current, &session));
+                let current_server = match record.as_ref() {
+                    Some(record) => self
+                        .servers
+                        .read()
+                        .await
+                        .get(&server)
+                        .is_some_and(|current| current.fingerprint == record.fingerprint),
+                    None => false,
+                };
+                if current_session && current_server {
+                    self.challenges
+                        .lock()
+                        .await
+                        .insert(server.clone(), request.clone());
+                    let still_current =
+                        self.servers
+                            .read()
+                            .await
+                            .get(&server)
+                            .is_some_and(|current| {
+                                record
+                                    .as_ref()
+                                    .is_some_and(|record| current.fingerprint == record.fingerprint)
+                            });
+                    if still_current {
+                        self.active_replays
+                            .lock()
+                            .await
+                            .insert(server.clone(), generation);
+                        let mut credentials = MetadataMap::new();
+                        credentials.insert("access_token".into(), Value::String(token));
+                        return Ok(AuthResolution::provided(request, credentials));
+                    }
+                    let mut challenges = self.challenges.lock().await;
+                    if challenges.get(&server) == Some(&request) {
+                        challenges.remove(&server);
+                    }
+                }
+            }
+        }
+
+        let current_server = match record.as_ref() {
+            Some(record) => self
+                .servers
+                .read()
+                .await
+                .get(&server)
+                .is_some_and(|current| current.fingerprint == record.fingerprint),
+            None => false,
+        };
+        if current_server {
+            self.challenges
+                .lock()
+                .await
+                .insert(server.clone(), request.clone());
+            let updated = if let (Some(original), Some(current)) =
+                (record.as_ref(), self.servers.write().await.get_mut(&server))
+                && current.fingerprint == original.fingerprint
+            {
+                current.status = ServerStatus::AuthenticationRequired;
+                true
+            } else {
+                false
+            };
+            if !updated {
+                let mut challenges = self.challenges.lock().await;
+                if challenges.get(&server) == Some(&request) {
+                    challenges.remove(&server);
+                }
+            }
         }
         Err(McpError::AuthResolution(format!(
             "authentication required for MCP server {server}; call auth with that server name"
@@ -217,6 +461,27 @@ fn challenge_requires_interactive_authorization(challenge: &MetadataMap) -> bool
         .and_then(Value::as_str)
         .is_some()
         || challenge.get("insufficient_scope").and_then(Value::as_bool) == Some(true)
+}
+
+fn agentkit_replay_rejected(error: &str) -> bool {
+    error.contains(AGENTKIT_REPLAY_REJECTED)
+}
+
+fn agentkit_auth_not_applied(error: &str) -> bool {
+    error.contains(AGENTKIT_RESPONDER_FAILED) || error.contains(AGENTKIT_APPLY_AUTH_FAILED)
+}
+
+fn serializes_tool_calls(record: &ServerRecord) -> bool {
+    record.url.is_some() && !record.static_authorization
+}
+
+fn can_opportunistically_refresh(request: &AuthRequest, record: &ServerRecord) -> bool {
+    record.url.is_some()
+        && !record.static_authorization
+        && matches!(record.status, ServerStatus::Connected)
+        && matches!(&request.operation, AuthOperation::McpToolCall { .. })
+        && request.challenge.get("flow_kind").and_then(Value::as_str) == Some("http_bearer")
+        && !challenge_requires_interactive_authorization(&request.challenge)
 }
 
 fn prepare_config(bytes: &[u8], path: &Path) -> Result<PreparedConfiguration, String> {
@@ -253,6 +518,20 @@ fn prepare_config(bytes: &[u8], path: &Path) -> Result<PreparedConfiguration, St
         );
     }
     Ok((prepared, entries))
+}
+
+fn validate_server_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<(), String> {
+    let names = names.collect::<Vec<_>>();
+    for (index, name) in names.iter().enumerate() {
+        for other in &names[index + 1..] {
+            if name.starts_with(&format!("{other}_")) || other.starts_with(&format!("{name}_")) {
+                return Err(format!(
+                    "MCP server names {name:?} and {other:?} produce ambiguous tool names"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prepare_server(
@@ -553,6 +832,7 @@ pub async fn connect(
     prepared.extend(explicit_prepared);
     let mut entries = plugin_entries.clone();
     entries.extend(explicit_entries);
+    validate_server_names(prepared.keys())?;
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let mut manager = McpServerManager::new();
     let mut records = BTreeMap::new();
@@ -567,17 +847,22 @@ pub async fn connect(
     }
 
     let servers = Arc::new(RwLock::new(records));
+    let oauth_sessions = Arc::new(Mutex::new(BTreeMap::new()));
+    let active_replays = Arc::new(Mutex::new(BTreeMap::new()));
     manager.set_handler_config(McpHandlerConfig::new().with_auth_responder(Arc::new(
         AuthRecorder {
             challenges: Arc::clone(&challenges),
             servers: Arc::clone(&servers),
+            oauth_sessions: Arc::clone(&oauth_sessions),
+            active_replays: Arc::clone(&active_replays),
+            credential_storage: credential_storage.clone(),
         },
     )));
     Ok(McpRuntime::new(
         manager,
         servers,
         challenges,
-        BTreeMap::new(),
+        (oauth_sessions, active_replays),
         credential_storage,
         ReloadState {
             path: path.map(Path::to_path_buf),
@@ -595,12 +880,13 @@ impl McpRuntime {
         manager: McpServerManager,
         servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
         challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
-        oauth_managers: BTreeMap<String, AuthorizationManager>,
+        oauth: (OAuthSessions, ActiveReplays),
         credential_storage: CredentialStorage,
         reload: ReloadState,
         interactive_oauth_enabled: bool,
     ) -> Self {
         let catalog = manager.source();
+        let (oauth_sessions, active_replays) = oauth;
         Self {
             inner: Arc::new(Inner {
                 manager: Mutex::new(manager),
@@ -608,12 +894,14 @@ impl McpRuntime {
                 servers,
                 challenges,
                 pending: Mutex::new(BTreeMap::new()),
-                oauth_managers: Mutex::new(oauth_managers),
+                oauth_sessions,
+                active_replays,
                 credential_storage,
                 reload: Mutex::new(reload),
                 reload_flight: Arc::new(Semaphore::new(1)),
                 initialization: Mutex::new(()),
                 auth_setup: Mutex::new(()),
+                operations: Mutex::new(BTreeMap::new()),
                 event_routes: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
                 next_event_route: AtomicU64::new(0),
                 interactive_oauth_enabled,
@@ -623,6 +911,80 @@ impl McpRuntime {
 
     pub fn catalog(&self) -> CatalogReader {
         self.inner.catalog.clone()
+    }
+
+    async fn operation_gate(&self, server: &str) -> Arc<Mutex<()>> {
+        self.inner
+            .operations
+            .lock()
+            .await
+            .entry(server.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn server_for_tool(&self, tool: &str) -> Option<(String, Vec<u8>, bool)> {
+        self.inner
+            .servers
+            .read()
+            .await
+            .iter()
+            .filter(|(server, _)| tool.starts_with(&format!("mcp_{server}_")))
+            .max_by_key(|(server, _)| server.len())
+            .map(|(server, record)| {
+                (
+                    server.clone(),
+                    record.fingerprint.clone(),
+                    serializes_tool_calls(record),
+                )
+            })
+    }
+
+    async fn finish_tool_call(
+        &self,
+        server: &str,
+        fingerprint: &[u8],
+        generation: u64,
+        authenticated: bool,
+        force_interactive: bool,
+    ) {
+        let current_replay = {
+            let mut active_replays = self.inner.active_replays.lock().await;
+            if active_replays.get(server) == Some(&generation) {
+                active_replays.remove(server);
+                true
+            } else {
+                false
+            }
+        };
+        if !current_replay {
+            return;
+        }
+        let challenged = self.inner.challenges.lock().await.contains_key(server);
+        if !challenged {
+            return;
+        }
+        let mut servers = self.inner.servers.write().await;
+        let Some(record) = servers
+            .get_mut(server)
+            .filter(|record| record.fingerprint == fingerprint)
+        else {
+            return;
+        };
+        record.status = if authenticated {
+            ServerStatus::Connected
+        } else {
+            ServerStatus::AuthenticationRequired
+        };
+        drop(servers);
+        let mut challenges = self.inner.challenges.lock().await;
+        if authenticated {
+            challenges.remove(server);
+        } else if force_interactive && let Some(challenge) = challenges.get_mut(server) {
+            challenge
+                .challenge
+                .insert("insufficient_scope".into(), Value::Bool(true));
+        }
     }
 
     pub(crate) fn subscribe(&self, session_id: String) -> McpSubscription {
@@ -684,7 +1046,6 @@ impl McpRuntime {
 
     async fn reload_config_inner(&self) -> Result<(), String> {
         let mut state = self.inner.reload.lock().await;
-        let _initialization = self.inner.initialization.lock().await;
         let Some(path) = state.path.clone() else {
             return Ok(());
         };
@@ -702,6 +1063,7 @@ impl McpRuntime {
         prepared.extend(explicit_prepared);
         let mut entries = state.plugin_entries.clone();
         entries.extend(explicit_entries);
+        validate_server_names(prepared.keys())?;
         let changed = state
             .entries
             .keys()
@@ -712,6 +1074,35 @@ impl McpRuntime {
         if changed.is_empty() {
             state.raw = bytes;
             return Ok(());
+        }
+        drop(state);
+        let gates = {
+            let mut operations = self.inner.operations.lock().await;
+            changed
+                .iter()
+                .map(|name| {
+                    operations
+                        .entry(name.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut operation_guards = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            operation_guards.push(
+                tokio::time::timeout(CONNECT_TIMEOUT, gate.lock())
+                    .await
+                    .map_err(|_| "timed out waiting for an in-flight MCP operation".to_string())?,
+            );
+        }
+        let mut state = self.inner.reload.lock().await;
+        let _initialization = self.inner.initialization.lock().await;
+        let current_bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|error| format!("could not reread MCP config {}: {error}", path.display()))?;
+        if current_bytes != bytes {
+            return Err("MCP config changed while reload was waiting; retry the operation".into());
         }
 
         {
@@ -740,13 +1131,15 @@ impl McpRuntime {
         {
             let mut challenges = self.inner.challenges.lock().await;
             let mut pending = self.inner.pending.lock().await;
-            let mut oauth_managers = self.inner.oauth_managers.lock().await;
+            let mut oauth_sessions = self.inner.oauth_sessions.lock().await;
+            let mut active_replays = self.inner.active_replays.lock().await;
             for name in &changed {
                 challenges.remove(name);
                 if let Some(pending) = pending.remove(name) {
                     pending.abort.abort();
                 }
-                oauth_managers.remove(name);
+                oauth_sessions.remove(name);
+                active_replays.remove(name);
             }
         }
         state.raw = bytes;
@@ -779,7 +1172,7 @@ impl McpRuntime {
             if let Some((token, oauth_manager)) = restored {
                 let request = connect_auth_request(name);
                 let mut credentials = MetadataMap::new();
-                credentials.insert("access_token".into(), Value::String(token));
+                credentials.insert("access_token".into(), Value::String(token.clone()));
                 let result = {
                     let mut manager = self.inner.manager.lock().await;
                     match manager
@@ -799,11 +1192,10 @@ impl McpRuntime {
                         }
                     }
                 };
-                self.inner
-                    .oauth_managers
-                    .lock()
-                    .await
-                    .insert(name.to_string(), oauth_manager);
+                self.inner.oauth_sessions.lock().await.insert(
+                    name.to_string(),
+                    Arc::new(OAuthSession::new(oauth_manager, token)),
+                );
                 match result {
                     Ok(_) => self.set_status(name, ServerStatus::Connected).await,
                     Err(McpError::AuthRequired(request)) => {
@@ -945,14 +1337,22 @@ impl McpRuntime {
 
     async fn authorize(&self, name: &str, session_id: String) -> Result<Value, ToolError> {
         self.reload_config().await.map_err(ToolError::Unavailable)?;
+        let operation = self.operation_gate(name).await;
+        let _operation = tokio::time::timeout(CONNECT_TIMEOUT, operation.lock())
+            .await
+            .map_err(|_| {
+                ToolError::Unavailable(format!(
+                    "timed out waiting for an in-flight MCP operation on {name}"
+                ))
+            })?;
         if !self.inner.interactive_oauth_enabled {
             return Err(ToolError::Unavailable(
                 "interactive MCP authentication requires the tui, serve, or acp command".into(),
             ));
         }
+        let _reload = self.inner.reload.lock().await;
         self.initialize_server(name).await;
         let _setup = self.inner.auth_setup.lock().await;
-        let _reload = self.inner.reload.lock().await;
         if let Some(pending) = self.inner.pending.lock().await.get(name).cloned() {
             let remaining = pending
                 .expires
@@ -1021,23 +1421,18 @@ impl McpRuntime {
             .get("www_authenticate")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let oauth_manager = if challenge_requires_interactive_authorization(&request.challenge) {
+        let oauth_session = if challenge_requires_interactive_authorization(&request.challenge) {
             None
         } else {
-            self.inner.oauth_managers.lock().await.remove(name)
+            self.inner.oauth_sessions.lock().await.get(name).cloned()
         };
-        if let Some(mut manager) = oauth_manager
-            && let Ok(token) = auth::refresh(&mut manager, &self.inner.credential_storage).await
+        if let Some(session) = oauth_session
+            && let Ok(token) = session.refresh(&self.inner.credential_storage).await
             && self
                 .apply_credentials(name, request.clone(), token)
                 .await
                 .is_ok()
         {
-            self.inner
-                .oauth_managers
-                .lock()
-                .await
-                .insert(name.to_string(), manager);
             self.inner.challenges.lock().await.remove(name);
             self.set_status(name, ServerStatus::Connected).await;
             return Ok(json!({"server":name,"status":"authenticated"}));
@@ -1100,6 +1495,8 @@ impl McpRuntime {
         event_generation: Option<u64>,
     ) {
         let finished = auth::finish(pending).await;
+        let operation = self.operation_gate(&server).await;
+        let _operation = operation.lock().await;
         let _reload = self.inner.reload.lock().await;
         let current = self
             .inner
@@ -1113,8 +1510,9 @@ impl McpRuntime {
         }
         let result = async {
             let (token, oauth_manager) = finished?;
-            self.apply_credentials(&server, request, token).await?;
-            Ok::<_, String>(oauth_manager)
+            self.apply_credentials(&server, request, token.clone())
+                .await?;
+            Ok::<_, String>((oauth_manager, token))
         }
         .await;
         let mut pending = self.inner.pending.lock().await;
@@ -1138,12 +1536,12 @@ impl McpRuntime {
         )
         .await;
         match result {
-            Ok(manager) => {
+            Ok((manager, token)) => {
                 self.inner
-                    .oauth_managers
+                    .oauth_sessions
                     .lock()
                     .await
-                    .insert(server.clone(), manager);
+                    .insert(server.clone(), Arc::new(OAuthSession::new(manager, token)));
                 self.publish_to(
                     &session_id,
                     event_generation,
@@ -1296,16 +1694,62 @@ impl Tool for AuthTool {
     }
 }
 
+struct ReplayCleanup {
+    session: Option<Arc<OAuthSession>>,
+    target: Option<(McpRuntime, String, Vec<u8>)>,
+}
+
+impl ReplayCleanup {
+    fn new(
+        session: Option<Arc<OAuthSession>>,
+        runtime: McpRuntime,
+        target: Option<(String, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            session,
+            target: target.map(|(server, fingerprint)| (runtime, server, fingerprint)),
+        }
+    }
+
+    fn finish(mut self, commit: bool) -> Option<u64> {
+        self.target = None;
+        self.session
+            .take()
+            .and_then(|session| session.finish_replay(commit))
+    }
+}
+
+impl Drop for ReplayCleanup {
+    fn drop(&mut self) {
+        let generation = self
+            .session
+            .take()
+            .and_then(|session| session.finish_replay(false));
+        if let Some(generation) = generation
+            && let Some((runtime, server, fingerprint)) = self.target.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                runtime
+                    .finish_tool_call(&server, &fingerprint, generation, true, false)
+                    .await;
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct McpTool {
+    runtime: McpRuntime,
     catalog: CatalogReader,
     spec: ToolSpec,
 }
 
 impl McpTool {
-    pub fn new(catalog: CatalogReader) -> Self {
+    pub fn new(runtime: McpRuntime) -> Self {
         Self {
-            catalog,
+            catalog: runtime.catalog(),
+            runtime,
             spec: ToolSpec::new(
                 ToolName::new("tool"),
                 "Invoke an authenticated MCP tool returned by tool_search.",
@@ -1343,6 +1787,41 @@ impl McpTool {
                 "args must be an object".into(),
             ));
         };
+        let initial_server = self.runtime.server_for_tool(name).await;
+        let server_name = initial_server.as_ref().map(|(server, _, _)| server.clone());
+        let operation = match initial_server.as_ref() {
+            Some((server, _, true)) => Some(self.runtime.operation_gate(server).await),
+            _ => None,
+        };
+        let _operation = match operation.as_ref() {
+            Some(operation) => Some(operation.lock().await),
+            None => None,
+        };
+        let server = self
+            .runtime
+            .server_for_tool(name)
+            .await
+            .filter(|(server, _, _)| {
+                server_name
+                    .as_ref()
+                    .is_some_and(|expected| server == expected)
+            })
+            .map(|(server, fingerprint, _)| (server, fingerprint));
+        let replay = ReplayCleanup::new(
+            match server.as_ref() {
+                Some((server, _)) => self
+                    .runtime
+                    .inner
+                    .oauth_sessions
+                    .lock()
+                    .await
+                    .get(server)
+                    .cloned(),
+                None => None,
+            },
+            self.runtime.clone(),
+            server.clone(),
+        );
         let name = ToolName::new(name);
         if self.catalog.get(&name).is_none() {
             return ToolExecutionOutcome::Failed(ToolError::InvalidInput(format!(
@@ -1355,7 +1834,7 @@ impl McpTool {
                 "tool requires an execution scope".into(),
             ));
         };
-        scope
+        let outcome = scope
             .execute_child(
                 ToolRequest::new(
                     request.call_id,
@@ -1366,7 +1845,39 @@ impl McpTool {
                 )
                 .with_metadata(request.metadata),
             )
-            .await
+            .await;
+        let succeeded = matches!(outcome, ToolExecutionOutcome::Completed(_));
+        let error = match &outcome {
+            ToolExecutionOutcome::FailedBeforeInvocation(error)
+            | ToolExecutionOutcome::Failed(error) => Some(error.to_string()),
+            _ => None,
+        };
+        let replay_rejected = error.as_deref().is_some_and(agentkit_replay_rejected);
+        let auth_not_applied = error.as_deref().is_some_and(agentkit_auth_not_applied);
+        let reached_server = succeeded || error.is_some() && !auth_not_applied;
+        let interrupted = matches!(outcome, ToolExecutionOutcome::Interrupted(_));
+        let replay_generation = replay.finish(reached_server);
+        if let Some(generation) = replay_generation
+            && let Some((server, fingerprint)) = server
+        {
+            self.runtime
+                .finish_tool_call(
+                    &server,
+                    &fingerprint,
+                    generation,
+                    interrupted || reached_server && !replay_rejected,
+                    replay_rejected,
+                )
+                .await;
+        }
+        if replay_rejected {
+            ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(
+                "MCP credentials were rejected after refresh; call auth with that server name"
+                    .into(),
+            ))
+        } else {
+            outcome
+        }
     }
 }
 
@@ -1403,18 +1914,24 @@ impl Tool for McpTool {
 pub fn empty() -> McpRuntime {
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let servers = Arc::new(RwLock::new(BTreeMap::new()));
+    let oauth_sessions = Arc::new(Mutex::new(BTreeMap::new()));
+    let active_replays = Arc::new(Mutex::new(BTreeMap::new()));
+    let credential_storage = CredentialStorage::Memory;
     let manager = McpServerManager::new().with_handler_config(
         McpHandlerConfig::new().with_auth_responder(Arc::new(AuthRecorder {
             challenges: Arc::clone(&challenges),
             servers: Arc::clone(&servers),
+            oauth_sessions: Arc::clone(&oauth_sessions),
+            active_replays: Arc::clone(&active_replays),
+            credential_storage: credential_storage.clone(),
         })),
     );
     McpRuntime::new(
         manager,
         servers,
         challenges,
-        BTreeMap::new(),
-        CredentialStorage::Memory,
+        (oauth_sessions, active_replays),
+        credential_storage,
         ReloadState {
             path: None,
             raw: Vec::new(),
@@ -1632,15 +2149,29 @@ fn spec_values(specs: Vec<ToolSpec>, limit: usize) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
     use agentkit_core::MetadataMap;
-    use agentkit_mcp::McpTransportBinding;
+    use agentkit_mcp::{
+        AuthOperation, AuthRequest, AuthResolution, McpAuthResponder, McpTransportBinding,
+    };
     use agentkit_plugins::{PluginMcpServer, PluginMcpTransport};
     use agentkit_tools_core::{ToolName, ToolSpec};
+    use rmcp::transport::auth::{
+        AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
+        OAuthTokenResponse, StoredCredentials,
+    };
     use serde_json::{Value, json};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::{Mutex, RwLock, oneshot},
+    };
 
     use super::{
-        Config, CredentialStorage, challenge_requires_interactive_authorization, prepare_plugins,
-        search_specs,
+        AuthRecorder, Config, CredentialStorage, OAuthSession, OpportunisticRefresh, ReplayCleanup,
+        ServerRecord, ServerStatus, agentkit_auth_not_applied, agentkit_replay_rejected,
+        can_opportunistically_refresh, challenge_requires_interactive_authorization,
+        prepare_plugins, search_specs, serializes_tool_calls, validate_server_names,
     };
     use crate::plugins::ResolvedPluginMcp;
 
@@ -1655,6 +2186,89 @@ mod tests {
             .collect()
     }
 
+    fn connected_oauth_record() -> ServerRecord {
+        ServerRecord {
+            description: "Remote".into(),
+            url: Some("https://example.com/mcp".into()),
+            oauth: None,
+            static_authorization: false,
+            fingerprint: vec![1],
+            status: ServerStatus::Connected,
+        }
+    }
+
+    fn tool_auth_request() -> AuthRequest {
+        AuthRequest {
+            id: "mcp:remote:tools/call".into(),
+            provider: "mcp.remote".into(),
+            operation: AuthOperation::McpToolCall {
+                server_id: "remote".into(),
+                tool_name: "write".into(),
+                input: json!({"value": 1}),
+                metadata: MetadataMap::new(),
+            },
+            challenge: MetadataMap::from_iter([(
+                "flow_kind".into(),
+                Value::String("http_bearer".into()),
+            )]),
+        }
+    }
+
+    async fn refreshable_oauth_session() -> (
+        Arc<OAuthSession>,
+        tokio::task::JoinHandle<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let _ = request_seen_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let body = r#"{"access_token":"new-access","token_type":"Bearer","refresh_token":"new-refresh","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let store = InMemoryCredentialStore::new();
+        let token: OAuthTokenResponse = serde_json::from_value(json!({
+            "access_token": "old-access",
+            "token_type": "Bearer",
+            "refresh_token": "old-refresh",
+            "expires_in": 3600
+        }))
+        .unwrap();
+        store
+            .save(StoredCredentials::new(
+                "client".into(),
+                Some(token),
+                Vec::new(),
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut manager = AuthorizationManager::new(&format!("http://{address}/mcp"))
+            .await
+            .unwrap();
+        let metadata: AuthorizationMetadata = serde_json::from_value(json!({
+            "authorization_endpoint": format!("http://{address}/authorize"),
+            "token_endpoint": format!("http://{address}/token")
+        }))
+        .unwrap();
+        manager.set_metadata(metadata);
+        manager.set_credential_store(store);
+        (
+            Arc::new(OAuthSession::new(manager, "old-access".into())),
+            server,
+            request_seen_rx,
+        )
+    }
+
     #[test]
     fn insufficient_scope_without_required_scope_requires_interactive_authorization() {
         let mut challenge = MetadataMap::new();
@@ -1662,6 +2276,357 @@ mod tests {
 
         challenge.insert("insufficient_scope".into(), Value::Bool(true));
         assert!(challenge_requires_interactive_authorization(&challenge));
+    }
+
+    #[test]
+    fn opportunistic_refresh_requires_a_plain_connected_oauth_tool_challenge() {
+        let record = connected_oauth_record();
+        let mut request = tool_auth_request();
+        assert!(can_opportunistically_refresh(&request, &record));
+
+        request
+            .challenge
+            .insert("insufficient_scope".into(), Value::Bool(true));
+        assert!(!can_opportunistically_refresh(&request, &record));
+
+        let mut static_record = record;
+        static_record.static_authorization = true;
+        assert!(!can_opportunistically_refresh(
+            &tool_auth_request(),
+            &static_record
+        ));
+    }
+
+    #[test]
+    fn only_remote_non_static_servers_serialize_tool_calls() {
+        let mut record = connected_oauth_record();
+        assert!(serializes_tool_calls(&record));
+        record.static_authorization = true;
+        assert!(!serializes_tool_calls(&record));
+        record.static_authorization = false;
+        record.url = None;
+        assert!(!serializes_tool_calls(&record));
+    }
+
+    #[test]
+    fn pinned_agentkit_auth_errors_are_classified() {
+        assert!(agentkit_replay_rejected(
+            "MCP auth challenge unresolved after retry: request"
+        ));
+        assert!(agentkit_auth_not_applied("auth responder failed: nope"));
+        assert!(agentkit_auth_not_applied(
+            "applying auth resolution failed: nope"
+        ));
+        assert!(!agentkit_auth_not_applied("tool application error"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_tool_challenges_trigger_one_refresh_and_one_replay() {
+        let challenges = Arc::new(Mutex::new(BTreeMap::new()));
+        let servers = Arc::new(RwLock::new(BTreeMap::from([(
+            "remote".into(),
+            connected_oauth_record(),
+        )])));
+        let (session, refresh_server, _request_seen) = refreshable_oauth_session().await;
+        let oauth_sessions = Arc::new(Mutex::new(BTreeMap::from([(
+            "remote".into(),
+            Arc::clone(&session),
+        )])));
+        let recorder = AuthRecorder {
+            challenges: Arc::clone(&challenges),
+            servers: Arc::clone(&servers),
+            oauth_sessions,
+            active_replays: Arc::new(Mutex::new(BTreeMap::new())),
+            credential_storage: CredentialStorage::Memory,
+        };
+
+        let (first, second) = tokio::join!(
+            recorder.resolve(tool_auth_request()),
+            recorder.resolve(tool_auth_request())
+        );
+        refresh_server.await.unwrap();
+        let mut provided = 0;
+        let mut coalesced = 0;
+        for result in [first, second] {
+            match result {
+                Ok(AuthResolution::Provided { credentials, .. }) => {
+                    assert_eq!(credentials["access_token"], "new-access");
+                    provided += 1;
+                }
+                Err(error) if error.to_string().contains("refreshed by another request") => {
+                    coalesced += 1;
+                }
+                other => panic!("unexpected opportunistic refresh result: {other:?}"),
+            }
+        }
+        assert_eq!((provided, coalesced), (1, 1));
+        let delayed = recorder.resolve(tool_auth_request()).await.unwrap_err();
+        assert!(delayed.to_string().contains("refreshed by another request"));
+        assert!(matches!(
+            servers.read().await["remote"].status,
+            ServerStatus::Connected
+        ));
+        assert!(challenges.lock().await.contains_key("remote"));
+        assert!(session.finish_replay(true).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_replay_reuses_the_refreshed_token() {
+        let runtime = super::empty();
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("remote".into(), connected_oauth_record());
+        runtime
+            .inner
+            .challenges
+            .lock()
+            .await
+            .insert("remote".into(), tool_auth_request());
+        let (session, refresh_server, _request_seen) = refreshable_oauth_session().await;
+        let refresh = session
+            .opportunistic_refresh(&CredentialStorage::Memory)
+            .await
+            .unwrap();
+        refresh_server.await.unwrap();
+        let OpportunisticRefresh::Apply { token, generation } = refresh else {
+            panic!("opportunistic refresh was unexpectedly coalesced");
+        };
+        assert_eq!(token, "new-access");
+        runtime
+            .inner
+            .active_replays
+            .lock()
+            .await
+            .insert("remote".into(), generation);
+
+        drop(ReplayCleanup::new(
+            Some(Arc::clone(&session)),
+            runtime.clone(),
+            Some(("remote".into(), vec![1])),
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Connected
+        ));
+        assert!(!runtime.inner.challenges.lock().await.contains_key("remote"));
+        assert_eq!(
+            session.refresh(&CredentialStorage::Memory).await.unwrap(),
+            "new-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_continues_after_the_calling_future_is_cancelled() {
+        let (session, refresh_server, request_seen) = refreshable_oauth_session().await;
+        let refreshing = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                session
+                    .opportunistic_refresh(&CredentialStorage::Memory)
+                    .await
+            })
+        };
+        request_seen.await.unwrap();
+        refreshing.abort();
+        match refreshing.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("refresh caller was not cancelled"),
+        }
+        assert!(session.finish_replay(false).is_some());
+        refresh_server.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if session
+                    .tokens
+                    .lock()
+                    .expect("OAuth session tokens are poisoned")
+                    .pending
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session.refresh(&CredentialStorage::Memory).await.unwrap(),
+            "new-access"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_replay_cleanup_does_not_clear_a_newer_challenge() {
+        let runtime = super::empty();
+        let mut record = connected_oauth_record();
+        record.status = ServerStatus::AuthenticationRequired;
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("remote".into(), record);
+        let mut challenge = tool_auth_request();
+        challenge
+            .challenge
+            .insert("insufficient_scope".into(), Value::Bool(true));
+        runtime
+            .inner
+            .challenges
+            .lock()
+            .await
+            .insert("remote".into(), challenge);
+        let (session, refresh_server, _request_seen) = refreshable_oauth_session().await;
+        let refresh = session
+            .opportunistic_refresh(&CredentialStorage::Memory)
+            .await
+            .unwrap();
+        refresh_server.await.unwrap();
+        let OpportunisticRefresh::Apply { generation, .. } = refresh else {
+            panic!("opportunistic refresh was unexpectedly coalesced");
+        };
+        runtime
+            .inner
+            .active_replays
+            .lock()
+            .await
+            .insert("remote".into(), generation.wrapping_add(1));
+
+        drop(ReplayCleanup::new(
+            Some(session),
+            runtime.clone(),
+            Some(("remote".into(), vec![1])),
+        ));
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::AuthenticationRequired
+        ));
+        assert_eq!(
+            runtime.inner.challenges.lock().await["remote"]
+                .challenge
+                .get("insufficient_scope"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_gates_only_serialize_the_same_server() {
+        let runtime = super::empty();
+        let first = runtime.operation_gate("first").await;
+        let same = runtime.operation_gate("first").await;
+        let other = runtime.operation_gate("other").await;
+        let _held = first.lock().await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), other.lock())
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), same.lock())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_replay_preserves_interactive_auth_recovery() {
+        let runtime = super::empty();
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("remote".into(), connected_oauth_record());
+        runtime
+            .inner
+            .challenges
+            .lock()
+            .await
+            .insert("remote".into(), tool_auth_request());
+        runtime
+            .inner
+            .active_replays
+            .lock()
+            .await
+            .insert("remote".into(), 1);
+
+        runtime
+            .finish_tool_call("remote", &[1], 1, false, true)
+            .await;
+
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::AuthenticationRequired
+        ));
+        assert_eq!(
+            runtime.inner.challenges.lock().await["remote"]
+                .challenge
+                .get("insufficient_scope"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_hold_runtime_locks_while_waiting_for_a_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let gate = runtime.operation_gate("local").await;
+        let held = gate.lock().await;
+        std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"unused"}}}"#).unwrap();
+        let reloading = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.reload_config().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                runtime.inner.reload.lock()
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                runtime.inner.initialization.lock()
+            )
+            .await
+            .is_ok()
+        );
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"local":{"command":"new-command"}}}"#,
+        )
+        .unwrap();
+        drop(held);
+        let error = reloading.await.unwrap().unwrap_err();
+        assert!(error.contains("changed while reload was waiting"));
+        runtime.reload_config().await.unwrap();
+    }
+
+    #[test]
+    fn overlapping_server_names_are_rejected() {
+        let names = BTreeMap::from([("foo".to_string(), ()), ("foo_bar".to_string(), ())]);
+        assert!(
+            validate_server_names(names.keys())
+                .unwrap_err()
+                .contains("ambiguous tool names")
+        );
     }
 
     #[test]

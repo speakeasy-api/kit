@@ -150,12 +150,17 @@ pub async fn restore(
 pub async fn refresh(
     manager: &mut AuthorizationManager,
     credential_storage: &CredentialStorage,
+    rejected_access_token: &str,
 ) -> Result<String, AuthError> {
     let _refresh_lock = credential_storage.lock_refresh().await.map_err(|error| {
         AuthError::InternalError(format!("could not lock MCP credential refresh: {error}"))
     })?;
     if !manager.initialize_from_store().await? {
         return Err(AuthError::AuthorizationRequired);
+    }
+    let current_access_token = manager.get_access_token().await?;
+    if current_access_token != rejected_access_token {
+        return Ok(current_access_token);
     }
     manager.refresh_token().await?;
     manager.get_access_token().await
@@ -338,9 +343,16 @@ async fn respond(stream: &mut TcpStream, success: bool) {
 
 #[cfg(test)]
 mod tests {
+    use rmcp::transport::auth::{
+        AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
+        OAuthTokenResponse, StoredCredentials,
+    };
+    use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{Config, begin, credential_identity, has_query_param, parse_request_target};
+    use super::{
+        Config, begin, credential_identity, has_query_param, parse_request_target, refresh,
+    };
     use crate::tools::mcp::CredentialStorage;
 
     #[test]
@@ -361,6 +373,69 @@ mod tests {
         assert_eq!(
             credential_identity("https://mcp.example/mcp", &Config::default()),
             credential_identity("https://mcp.example/mcp", &explicit)
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_reuses_a_token_advanced_by_another_waiter() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"access_token":"new-access","token_type":"Bearer","refresh_token":"new-refresh","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let store = InMemoryCredentialStore::new();
+        let token: OAuthTokenResponse = serde_json::from_value(json!({
+            "access_token": "old-access",
+            "token_type": "Bearer",
+            "refresh_token": "old-refresh",
+            "expires_in": 3600
+        }))
+        .unwrap();
+        store
+            .save(StoredCredentials::new(
+                "client".into(),
+                Some(token),
+                Vec::new(),
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut manager = AuthorizationManager::new(&format!("http://{address}/mcp"))
+            .await
+            .unwrap();
+        let metadata: AuthorizationMetadata = serde_json::from_value(json!({
+            "authorization_endpoint": format!("http://{address}/authorize"),
+            "token_endpoint": format!("http://{address}/token")
+        }))
+        .unwrap();
+        manager.set_metadata(metadata.clone());
+        manager.set_credential_store(store.clone());
+        let mut waiting_manager = AuthorizationManager::new(&format!("http://{address}/mcp"))
+            .await
+            .unwrap();
+        waiting_manager.set_metadata(metadata);
+        waiting_manager.set_credential_store(store);
+
+        let storage = CredentialStorage::Memory;
+        assert_eq!(
+            refresh(&mut manager, &storage, "old-access").await.unwrap(),
+            "new-access"
+        );
+        server.await.unwrap();
+        assert_eq!(
+            refresh(&mut waiting_manager, &storage, "old-access")
+                .await
+                .unwrap(),
+            "new-access"
         );
     }
 
