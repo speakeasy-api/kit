@@ -1021,8 +1021,12 @@ impl McpRuntime {
             .get("www_authenticate")
             .and_then(Value::as_str)
             .map(str::to_string);
-        if !challenge_requires_interactive_authorization(&request.challenge)
-            && let Some(mut manager) = self.inner.oauth_managers.lock().await.remove(name)
+        let oauth_manager = if challenge_requires_interactive_authorization(&request.challenge) {
+            None
+        } else {
+            self.inner.oauth_managers.lock().await.remove(name)
+        };
+        if let Some(mut manager) = oauth_manager
             && let Ok(token) = auth::refresh(&mut manager, &self.inner.credential_storage).await
             && self
                 .apply_credentials(name, request.clone(), token)
