@@ -166,6 +166,8 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct SubagentConfig {
     harness: String,
+    #[serde(default)]
+    harnesses: BTreeMap<String, kit::SubagentHarnessPolicy>,
 }
 
 impl Config {
@@ -285,7 +287,12 @@ impl Config {
     }
 
     fn harnesses(&self) -> Result<(kit::AcpHarnesses, String), String> {
-        let harnesses = kit::AcpHarnesses::new(self.acp.clone())?;
+        let policies = self
+            .subagent
+            .as_ref()
+            .map(|value| value.harnesses.clone())
+            .unwrap_or_default();
+        let harnesses = kit::AcpHarnesses::new(self.acp.clone())?.with_model_policies(policies)?;
         let selected = self
             .subagent
             .as_ref()
@@ -1161,6 +1168,50 @@ harness = "acp.beta"
         );
         assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
+    }
+
+    #[test]
+    fn subagent_model_policies_are_scoped_and_validated_per_harness() {
+        let configured: Config = toml::from_str(
+            r#"
+[subagent]
+harness = "acp.kit"
+
+[subagent.harnesses."acp.kit"]
+allow_model_overrides = ["sonnet"]
+
+[subagent.harnesses."acp.kit".models]
+review = "sonnet"
+"#,
+        )
+        .unwrap();
+        configured.harnesses().unwrap();
+        let policy = &configured.subagent.unwrap().harnesses["acp.kit"];
+        assert_eq!(policy.models["review"], "sonnet");
+        assert_eq!(
+            policy.allow_model_overrides.as_deref(),
+            Some(["sonnet".to_string()].as_slice())
+        );
+
+        let invalid: Config = toml::from_str(
+            r#"
+[subagent]
+harness = "acp.kit"
+
+[subagent.harnesses."acp.kit"]
+allow_model_overrides = ["sonnet"]
+
+[subagent.harnesses."acp.kit".models]
+review = "opus"
+"#,
+        )
+        .unwrap();
+        assert!(
+            invalid
+                .harnesses()
+                .unwrap_err()
+                .contains("not in allow_model_overrides")
+        );
     }
 
     #[test]

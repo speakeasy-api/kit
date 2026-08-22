@@ -13,6 +13,8 @@ pub mod tools;
 pub mod transcript;
 pub mod tui;
 
-pub use acp_child::{AcpHarnessProfile, AcpHarnesses, AcpPermissionPolicy, BUILTIN_HARNESS};
+pub use acp_child::{
+    AcpHarnessProfile, AcpHarnesses, AcpPermissionPolicy, BUILTIN_HARNESS, SubagentHarnessPolicy,
+};
 pub use provider::ProviderKind;
 pub use runtime::Runtime;

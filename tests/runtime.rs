@@ -103,13 +103,21 @@ async fn subagent_selects_an_advertised_acp_model() {
             permissions: Default::default(),
         },
     )]))
+    .unwrap()
+    .with_model_policies(BTreeMap::from([(
+        "acp.review".into(),
+        kit::SubagentHarnessPolicy {
+            models: BTreeMap::from([("review".into(), "mock/requested".into())]),
+            allow_model_overrides: Some(vec!["mock/requested".into()]),
+        },
+    )]))
     .unwrap();
     let runtime =
         kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.review".into()).unwrap();
 
     let outcome = execute_compose(
         &runtime,
-        r#"child = subagent({ harness: "acp.review", model: "mock/requested", prompt: "MOCK_SELECTED_MODEL" })
+        r#"child = subagent({ harness: "acp.review", model: "review", prompt: "MOCK_SELECTED_MODEL" })
 branch = fork({ subagent: child, prompt: "MOCK_SELECTED_MODEL" })
 return { child: child.output, branch: branch.output }"#,
     )
@@ -125,6 +133,16 @@ return { child: child.output, branch: branch.output }"#,
             "branch": "mock/requested"
         }))
     );
+
+    let outcome = execute_compose(
+        &runtime,
+        r#"return subagent({ model: "mock/default", prompt: "never runs" })"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Failed(error) = outcome else {
+        panic!("disallowed model override unexpectedly succeeded: {outcome:?}");
+    };
+    assert!(format!("{error:?}").contains("is not allowed for ACP harness"));
 
     let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
         "review".into(),

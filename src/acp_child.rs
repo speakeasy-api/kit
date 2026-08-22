@@ -59,9 +59,21 @@ pub struct AcpHarnessProfile {
     pub permissions: AcpPermissionPolicy,
 }
 
+/// Model aliases and explicit-override policy for one subagent harness.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentHarnessPolicy {
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+    pub allow_model_overrides: Option<Vec<String>>,
+}
+
 /// Validated named ACP harness profiles. `acp.kit` is always Kit; its launch base may be overridden.
 #[derive(Clone, Debug, Default)]
-pub struct AcpHarnesses(Arc<BTreeMap<String, AcpHarnessProfile>>);
+pub struct AcpHarnesses {
+    profiles: Arc<BTreeMap<String, AcpHarnessProfile>>,
+    model_policies: Arc<BTreeMap<String, SubagentHarnessPolicy>>,
+}
 
 impl AcpHarnesses {
     pub fn new(profiles: BTreeMap<String, AcpHarnessProfile>) -> Result<Self, String> {
@@ -76,12 +88,15 @@ impl AcpHarnesses {
                 return Err(format!("ACP harness {name:?} has an empty command"));
             }
         }
-        Ok(Self(Arc::new(profiles)))
+        Ok(Self {
+            profiles: Arc::new(profiles),
+            model_policies: Arc::default(),
+        })
     }
 
     pub fn contains(&self, reference: &str) -> bool {
         self.profile_name(reference)
-            .is_some_and(|name| name == "kit" || self.0.contains_key(name))
+            .is_some_and(|name| name == "kit" || self.profiles.contains_key(name))
     }
 
     pub fn is_kit(&self, reference: &str) -> bool {
@@ -91,12 +106,71 @@ impl AcpHarnesses {
     pub fn references(&self) -> Vec<String> {
         std::iter::once(BUILTIN_HARNESS.to_string())
             .chain(
-                self.0
+                self.profiles
                     .keys()
                     .filter(|name| name.as_str() != "kit")
                     .map(|name| format!("acp.{name}")),
             )
             .collect()
+    }
+
+    pub fn with_model_policies(
+        mut self,
+        policies: BTreeMap<String, SubagentHarnessPolicy>,
+    ) -> Result<Self, String> {
+        for (harness, policy) in &policies {
+            if !self.contains(harness) {
+                return Err(format!("unknown subagent model policy harness {harness:?}"));
+            }
+            for (alias, model) in &policy.models {
+                if alias.trim().is_empty() {
+                    return Err(format!(
+                        "subagent model aliases for {harness:?} must be non-empty"
+                    ));
+                }
+                if model.trim().is_empty() {
+                    return Err(format!(
+                        "subagent model alias {alias:?} for {harness:?} has an empty value"
+                    ));
+                }
+                if let Some(allowed) = &policy.allow_model_overrides
+                    && !allowed.contains(model)
+                {
+                    return Err(format!(
+                        "subagent model alias {alias:?} resolves to {model:?}, which is not in allow_model_overrides for {harness:?}"
+                    ));
+                }
+            }
+            if policy
+                .allow_model_overrides
+                .as_ref()
+                .is_some_and(|allowed| allowed.iter().any(|model| model.trim().is_empty()))
+            {
+                return Err(format!(
+                    "allow_model_overrides for {harness:?} must not contain empty values"
+                ));
+            }
+        }
+        self.model_policies = Arc::new(policies);
+        Ok(self)
+    }
+
+    pub(crate) fn resolve_model(&self, harness: &str, requested: &str) -> Result<String, String> {
+        let Some(policy) = self.model_policies.get(harness) else {
+            return Ok(requested.to_owned());
+        };
+        let resolved = policy
+            .models
+            .get(requested)
+            .map_or(requested, String::as_str);
+        if let Some(allowed) = &policy.allow_model_overrides
+            && !allowed.iter().any(|model| model == resolved)
+        {
+            return Err(format!(
+                "model override {requested:?} resolves to {resolved:?}, which is not allowed for ACP harness {harness:?}"
+            ));
+        }
+        Ok(resolved.to_owned())
     }
 
     fn profile_name<'a>(&self, reference: &'a str) -> Option<&'a str> {
@@ -105,7 +179,7 @@ impl AcpHarnesses {
     }
 
     fn launch_context(&self, reference: &str) -> LaunchContext {
-        let source = if reference == BUILTIN_HARNESS && !self.0.contains_key("kit") {
+        let source = if reference == BUILTIN_HARNESS && !self.profiles.contains_key("kit") {
             "built-in current executable"
         } else if reference == BUILTIN_HARNESS {
             "configured acp.kit profile"
@@ -124,11 +198,11 @@ impl AcpHarnesses {
         })?;
         if name == "kit" {
             Ok(self
-                .0
+                .profiles
                 .get(name)
                 .map_or(AcpPermissionPolicy::Deny, |profile| profile.permissions))
         } else {
-            self.0
+            self.profiles
                 .get(name)
                 .map(|profile| profile.permissions)
                 .ok_or_else(|| format!("unknown ACP harness {reference:?}"))
@@ -149,7 +223,7 @@ impl AcpHarnesses {
             self.kit_command(config, persisted, depth)?
         } else {
             let profile = self
-                .0
+                .profiles
                 .get(name)
                 .ok_or_else(|| format!("unknown ACP harness {reference:?}"))?;
             let mut command = Command::new(&profile.command);
@@ -170,7 +244,7 @@ impl AcpHarnesses {
         persisted: Option<(&str, bool)>,
         depth: usize,
     ) -> Result<Command, String> {
-        let mut command = if let Some(profile) = self.0.get("kit") {
+        let mut command = if let Some(profile) = self.profiles.get("kit") {
             let mut command = Command::new(&profile.command);
             command.args(&profile.args);
             command
@@ -1378,6 +1452,47 @@ mod tests {
             started.elapsed() >= Duration::from_millis(750),
             "one logical session was not serialized: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn model_policies_resolve_aliases_and_only_restrict_explicit_overrides() {
+        let unrestricted = AcpHarnesses::default()
+            .with_model_policies(BTreeMap::from([(
+                BUILTIN_HARNESS.into(),
+                SubagentHarnessPolicy {
+                    models: BTreeMap::from([("review".into(), "provider:model-a".into())]),
+                    allow_model_overrides: None,
+                },
+            )]))
+            .unwrap();
+        assert_eq!(
+            unrestricted
+                .resolve_model(BUILTIN_HARNESS, "review")
+                .unwrap(),
+            "provider:model-a"
+        );
+        assert_eq!(
+            unrestricted
+                .resolve_model(BUILTIN_HARNESS, "provider:model-b")
+                .unwrap(),
+            "provider:model-b"
+        );
+
+        let disabled = AcpHarnesses::default()
+            .with_model_policies(BTreeMap::from([(
+                BUILTIN_HARNESS.into(),
+                SubagentHarnessPolicy {
+                    models: BTreeMap::new(),
+                    allow_model_overrides: Some(Vec::new()),
+                },
+            )]))
+            .unwrap();
+        assert!(
+            disabled
+                .resolve_model(BUILTIN_HARNESS, "provider:model-a")
+                .unwrap_err()
+                .contains("is not allowed")
         );
     }
 

@@ -23,7 +23,7 @@ Each successful turn returns a session value with `id`, `output`, and `generatio
 
 Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
 
-The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects the exact model value ID advertised by that harness through its ACP session configuration; for `acp.kit`, an ID can look like `openai-subscription:gpt-5.4-mini`. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
+The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
 
 ## Require structured JSON output with `output_schema`
 
@@ -97,6 +97,26 @@ harness = "acp.review"
 References use the fully qualified `acp.<name>` form. Profile names must be non-empty and contain neither whitespace nor dots. `command` must be non-empty; use an executable on `PATH` or an absolute path. Kit does not perform a generic agent's login or ACP authentication flow, so authenticate and configure that agent before starting Kit. Generic session persistence beyond the parent process is agent-defined. Per-subagent model selection works for generic agents such as Codex, Claude, or Cursor only when their ACP adapter advertises and implements the selectable `model` session option.
 
 An unknown selection fails with `unknown ACP harness "acp.name"` or `unknown subagent ACP harness "acp.name"`. Invalid references may report `ACP harness references must use acp.<name>`.
+
+## Configure model aliases and allowed overrides per harness
+
+Model namespaces differ between ACP harnesses. Configure aliases and explicit-override policy under the fully qualified harness reference:
+
+```toml
+[subagent]
+harness = "acp.review"
+
+[subagent.harnesses."acp.review"]
+allow_model_overrides = ["provider:model-a", "provider:model-b"]
+
+[subagent.harnesses."acp.review".models]
+review = "provider:model-a"
+fast = "provider:model-b"
+```
+
+A call may use either a configured alias or an exact model ID. Aliases are scoped to one harness, resolve before ACP startup, and are then checked against that harness's `allow_model_overrides`. Kit rejects configuration when an alias resolves outside its harness's allowlist.
+
+Omitting `allow_model_overrides` allows all explicit model selections accepted by the harness. An empty list disables all explicit model overrides for that harness. The allowlist applies only when `subagent.model` is present; it does not inspect or restrict the harness's inherited or default model. Configured aliases indicate available routing choices, not recommendations. Agents should omit `harness` and `model` unless the user or active workflow explicitly requests an exact override or configured alias.
 
 ## Fork capability and transcript fallback
 
