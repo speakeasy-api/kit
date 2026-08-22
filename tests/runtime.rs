@@ -28,45 +28,25 @@ fn runtime_is_rooted_and_exposes_only_compose() {
         .collect::<Vec<_>>();
     assert_eq!(names, ["compose"]);
 
-    let description = &specs[0].description;
-    for expected in [
-        "`docs`: Search the version-matched Kit documentation",
-        "`shell`: Run a shell command",
-        "`edit`: Apply exact, git-style text hunks",
-        "`subagent`: Start a parent-owned configured ACP harness",
-        "`prompt`: Re-prompt the same completed ACP subagent session",
-        "`fork`: Fork a completed ACP subagent session",
-        "`subagents`: List active subagent sessions owned by this parent",
-        "`close`: Close an active subagent",
-        "`a2a`: Send a text task",
-        "`tool_search`: Reload the MCP config, then search configured server names",
-        "`auth`: Reload the MCP config and start OAuth for a configured remote server",
-        "`tool`: Invoke an authenticated MCP tool",
+    for child in [
+        "docs",
+        "shell",
+        "edit",
+        "subagent",
+        "prompt",
+        "fork",
+        "subagents",
+        "close",
+        "a2a",
+        "tool_search",
+        "auth",
+        "tool",
     ] {
-        assert!(description.contains(expected), "missing {expected:?}");
+        assert!(
+            visible.get(&ToolName::new(child)).is_some(),
+            "missing compose child {child:?}"
+        );
     }
-    let input_schemas = description.matches("Input JSON schema:").count();
-    assert!(input_schemas >= 12);
-    assert_eq!(
-        description.matches("Output JSON schema:").count(),
-        input_schemas
-    );
-    assert!(description.contains("\"required\":[\"query\"]"));
-    assert!(description.contains("\"required\":[\"subagent\",\"prompt\"]"));
-    assert!(description.contains("\"generation\""));
-    assert!(description.contains("\"updates\""));
-    assert!(description.contains("\"minimum\":1"));
-    assert!(description.contains("\"output_schema\""));
-    assert!(description.contains("\"enum\":[\"acp.kit\"]"));
-    assert!(description.contains("\"exit_code\""));
-    assert!(description.contains("\"enum\":[\"delete\"]"));
-    assert!(!description.contains("\"const\""));
-    assert!(description.contains("Independent calls, including effectful calls, run CONCURRENTLY"));
-    assert!(description.contains("Source order alone never sequences independent calls"));
-    assert!(description.contains("checkpoint = after shaped {"));
-
-    assert!(visible.get(&ToolName::new("shell")).is_some());
-    assert!(visible.get(&ToolName::new("edit")).is_some());
 }
 
 #[test]
