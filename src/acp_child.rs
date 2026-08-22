@@ -261,6 +261,12 @@ impl AcpHarnesses {
             .arg(&config.model)
             .arg("--provider")
             .arg(config.provider.as_str())
+            .arg("--reasoning-effort")
+            .arg(
+                config
+                    .reasoning_effort
+                    .map_or("default", crate::ReasoningEffort::as_str),
+            )
             .arg("--session-id")
             .arg(id)
             .arg("--subagent-depth")
@@ -302,6 +308,7 @@ pub(crate) fn serve_command(
     root: &Path,
     model: &str,
     provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
     session_id: &str,
     resume: bool,
 ) -> std::io::Result<Command> {
@@ -314,6 +321,8 @@ pub(crate) fn serve_command(
         .arg(model)
         .arg("--provider")
         .arg(provider.as_str())
+        .arg("--reasoning-effort")
+        .arg(reasoning_effort.map_or("default", crate::ReasoningEffort::as_str))
         .arg("--session-id")
         .arg(session_id);
     if resume {
@@ -327,6 +336,7 @@ pub(crate) struct ChildConfig {
     pub root: PathBuf,
     pub model: String,
     pub provider: crate::ProviderKind,
+    pub reasoning_effort: Option<crate::ReasoningEffort>,
     pub mcp_config: Option<PathBuf>,
     pub credential_storage: CredentialStorage,
     pub telemetry: crate::telemetry::Settings,
@@ -1008,6 +1018,29 @@ mod tests {
     }
 
     #[test]
+    fn tui_serve_command_forwards_resolved_reasoning_effort() {
+        let root = tempfile::tempdir().unwrap();
+        let command = serve_command(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            Some(crate::ReasoningEffort::Medium),
+            "session",
+            true,
+        )
+        .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--reasoning-effort", "medium"])
+        );
+    }
+
+    #[test]
     fn captures_text_separately_from_safe_rich_updates() {
         let mut output = ChildOutput::default();
         output.record(update(json!({
@@ -1179,6 +1212,7 @@ mod tests {
             root: root.path().into(),
             model: "unused".into(),
             provider: Default::default(),
+            reasoning_effort: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1230,6 +1264,7 @@ mod tests {
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
+            reasoning_effort: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1265,6 +1300,7 @@ mod tests {
             root: root.path().to_path_buf(),
             model: "test-model".into(),
             provider: crate::ProviderKind::OpenRouter,
+            reasoning_effort: Some(crate::ReasoningEffort::High),
             mcp_config: None,
             credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
             telemetry: crate::telemetry::Settings::try_new(
@@ -1294,6 +1330,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--provider", "openrouter"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--reasoning-effort", "high"])
         );
         assert!(
             args.windows(2)
@@ -1348,6 +1388,7 @@ mod tests {
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
+            reasoning_effort: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1405,6 +1446,7 @@ mod tests {
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
+            reasoning_effort: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),

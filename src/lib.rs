@@ -16,5 +16,5 @@ pub mod tui;
 pub use acp_child::{
     AcpHarnessProfile, AcpHarnesses, AcpPermissionPolicy, BUILTIN_HARNESS, SubagentHarnessPolicy,
 };
-pub use provider::ProviderKind;
+pub use provider::{ProviderKind, ReasoningEffort};
 pub use runtime::Runtime;

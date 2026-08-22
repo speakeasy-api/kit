@@ -14,6 +14,28 @@ use super::{
 };
 
 #[test]
+fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new_with_provider_credentials_and_effort(
+        root.path(),
+        "test-model",
+        crate::ProviderKind::OpenRouter,
+        Default::default(),
+        Some(crate::ReasoningEffort::High),
+    )
+    .unwrap();
+
+    assert_eq!(
+        runtime.adapter.reasoning_effort().unwrap(),
+        Some(crate::ReasoningEffort::High)
+    );
+    assert_eq!(
+        runtime.subagents.child_config().reasoning_effort,
+        Some(crate::ReasoningEffort::High)
+    );
+}
+
+#[test]
 fn configured_session_is_consumed_only_after_successful_start() {
     let request = SessionRequest {
         id: "selected".into(),

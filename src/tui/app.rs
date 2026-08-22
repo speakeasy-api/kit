@@ -104,6 +104,17 @@ pub struct ModelDialog {
     pub save_defaults: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffortChoice {
+    pub id: String,
+    pub name: String,
+}
+
+pub struct EffortDialog {
+    pub selected: usize,
+    pub save_defaults: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentKind {
     Image,
@@ -133,6 +144,10 @@ pub enum Action {
     New(Option<String>),
     SelectModel {
         choice: ModelChoice,
+        save_defaults: bool,
+    },
+    SelectEffort {
+        effort: String,
         save_defaults: bool,
     },
     Copy(String),
@@ -291,6 +306,9 @@ pub struct App {
     pub model: String,
     pub model_choices: Vec<ModelChoice>,
     pub model_dialog: Option<ModelDialog>,
+    pub reasoning_effort: String,
+    pub effort_choices: Vec<EffortChoice>,
+    pub effort_dialog: Option<EffortDialog>,
     pub a2a: String,
     pub session_id: Option<String>,
     pub blocks: Vec<Block>,
@@ -545,6 +563,9 @@ impl App {
             model,
             model_choices: Vec::new(),
             model_dialog: None,
+            reasoning_effort: "default".into(),
+            effort_choices: Vec::new(),
+            effort_dialog: None,
             a2a,
             session_id: None,
             blocks: Vec::new(),
@@ -1316,6 +1337,11 @@ impl App {
         self.model_choices = choices;
     }
 
+    pub fn set_effort(&mut self, current: String, choices: Vec<EffortChoice>) {
+        self.reasoning_effort = current;
+        self.effort_choices = choices;
+    }
+
     pub fn selected_model_choices(&self) -> Vec<&ModelChoice> {
         let Some(dialog) = &self.model_dialog else {
             return Vec::new();
@@ -1400,6 +1426,48 @@ impl App {
         Action::None
     }
 
+    fn handle_effort_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => self.effort_dialog = None,
+            KeyCode::Tab => {
+                if let Some(dialog) = &mut self.effort_dialog {
+                    dialog.save_defaults = !dialog.save_defaults;
+                }
+            }
+            KeyCode::Up => {
+                if let Some(dialog) = &mut self.effort_dialog {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dialog) = &mut self.effort_dialog {
+                    dialog.selected =
+                        (dialog.selected + 1).min(self.effort_choices.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self
+                    .effort_dialog
+                    .as_ref()
+                    .map_or(0, |dialog| dialog.selected);
+                let save_defaults = self
+                    .effort_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.save_defaults);
+                if let Some(choice) = self.effort_choices.get(selected) {
+                    let effort = choice.id.clone();
+                    self.effort_dialog = None;
+                    return Action::SelectEffort {
+                        effort,
+                        save_defaults,
+                    };
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
@@ -1407,6 +1475,9 @@ impl App {
         }
         if self.model_dialog.is_some() {
             return self.handle_model_key(key);
+        }
+        if self.effort_dialog.is_some() {
+            return self.handle_effort_key(key);
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
         // the arrival gap is the only thing separating it from typing.
@@ -1494,6 +1565,33 @@ impl App {
                             self.model_dialog = Some(ModelDialog {
                                 query: String::new(),
                                 selected: 0,
+                                save_defaults: false,
+                            });
+                        }
+                        Action::None
+                    }
+                    Parsed::Effort { value: Some(value) } => {
+                        if self.effort_choices.iter().any(|choice| choice.id == value) {
+                            Action::SelectEffort {
+                                effort: value.to_string(),
+                                save_defaults: false,
+                            }
+                        } else {
+                            self.toast(format!("unknown reasoning effort {value:?}"));
+                            Action::None
+                        }
+                    }
+                    Parsed::Effort { value: None } => {
+                        if self.effort_choices.is_empty() {
+                            self.toast("reasoning effort is not available");
+                        } else {
+                            let selected = self
+                                .effort_choices
+                                .iter()
+                                .position(|choice| choice.id == self.reasoning_effort)
+                                .unwrap_or(0);
+                            self.effort_dialog = Some(EffortDialog {
+                                selected,
                                 save_defaults: false,
                             });
                         }
@@ -2309,6 +2407,49 @@ mod tests {
             model_choice("anthropic", "claude-3-7-sonnet"),
             model_choice("openrouter", "anthropic/claude-sonnet-4"),
         ]
+    }
+
+    #[test]
+    fn effort_command_selects_directly_and_dialog_keys_toggle_and_select() {
+        let mut app = app();
+        app.set_effort(
+            "medium".into(),
+            ["default", "low", "medium", "high"]
+                .into_iter()
+                .map(|id| super::EffortChoice {
+                    id: id.into(),
+                    name: id.into(),
+                })
+                .collect(),
+        );
+        app.editor.insert_str("/effort high");
+        let Action::SelectEffort {
+            effort,
+            save_defaults,
+        } = app.handle_key(press(KeyCode::Enter))
+        else {
+            panic!("expected effort selection");
+        };
+        assert_eq!(effort, "high");
+        assert!(!save_defaults);
+
+        app.editor.insert_str("/effort");
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Down));
+        let Action::SelectEffort {
+            effort,
+            save_defaults,
+        } = app.handle_key(press(KeyCode::Enter))
+        else {
+            panic!("expected dialog effort selection");
+        };
+        assert_eq!(effort, "high");
+        assert!(save_defaults);
     }
 
     #[test]

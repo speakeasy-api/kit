@@ -101,6 +101,25 @@ enum CredentialStoreKind {
     File,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum ReasoningEffortArg {
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffortArg {
+    const fn resolved(self) -> Option<kit::ReasoningEffort> {
+        match self {
+            Self::Default => None,
+            Self::Low => Some(kit::ReasoningEffort::Low),
+            Self::Medium => Some(kit::ReasoningEffort::Medium),
+            Self::High => Some(kit::ReasoningEffort::High),
+        }
+    }
+}
+
 struct ConfigMigration {
     apply: fn(&mut toml::Table),
 }
@@ -145,6 +164,7 @@ struct Config {
     root: Option<PathBuf>,
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
+    reasoning_effort: Option<kit::ReasoningEffort>,
     a2a: Option<String>,
     otel_endpoint: Option<String>,
     otel_capture_message_content: Option<bool>,
@@ -240,6 +260,10 @@ impl Config {
 
     fn provider(&self, value: Option<kit::ProviderKind>) -> kit::ProviderKind {
         value.or(self.provider).unwrap_or_default()
+    }
+
+    fn reasoning_effort(&self, value: Option<ReasoningEffortArg>) -> Option<kit::ReasoningEffort> {
+        value.map_or(self.reasoning_effort, ReasoningEffortArg::resolved)
     }
 
     fn a2a(&self, value: Option<String>) -> Option<String> {
@@ -358,6 +382,9 @@ enum Command {
         /// Model provider (defaults to config or `openai-subscription`).
         #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
+        /// Reasoning effort (defaults to config or provider default).
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffortArg>,
         /// A2A listen address. An available loopback port is selected when omitted.
         #[arg(long)]
         a2a: Option<String>,
@@ -381,6 +408,8 @@ enum Command {
         model: Option<String>,
         #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffortArg>,
         #[command(flatten)]
         mcp: McpArgs,
         #[arg(long)]
@@ -403,6 +432,8 @@ enum Command {
         /// Model provider (defaults to config or `openai-subscription`).
         #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffortArg>,
         #[command(flatten)]
         mcp: McpArgs,
         /// Resume this persisted session id.
@@ -425,6 +456,8 @@ enum Command {
         /// Model provider (defaults to config or `openai-subscription`).
         #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffortArg>,
         /// A2A listen address. An available loopback port is selected when omitted.
         #[arg(long)]
         a2a: Option<String>,
@@ -544,6 +577,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             model,
             provider,
+            reasoning_effort,
             a2a,
             mcp,
             session_id,
@@ -553,22 +587,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
+            let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session_provider_and_credentials(
+                Some(id) => kit::Runtime::with_session_provider_credentials_and_effort(
                     &root,
                     model,
                     provider,
                     kit::runtime::SessionRequest { id, resume, force },
                     credential_storage.clone(),
+                    reasoning_effort,
                 )?,
-                None => kit::Runtime::new_with_provider_and_credentials(
+                None => kit::Runtime::new_with_provider_credentials_and_effort(
                     &root,
                     model,
                     provider,
                     credential_storage.clone(),
+                    reasoning_effort,
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_skills(
@@ -596,6 +633,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             model,
             provider,
+            reasoning_effort,
             mcp,
             session_id,
             resume,
@@ -605,21 +643,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
+            let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let credential_storage = mcp.credentials.storage(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session_provider_and_credentials(
+                Some(id) => kit::Runtime::with_session_provider_credentials_and_effort(
                     &root,
                     model,
                     provider,
                     kit::runtime::SessionRequest { id, resume, force },
                     credential_storage.clone(),
+                    reasoning_effort,
                 )?,
-                None => kit::Runtime::new_with_provider_and_credentials(
+                None => kit::Runtime::new_with_provider_credentials_and_effort(
                     &root,
                     model,
                     provider,
                     credential_storage.clone(),
+                    reasoning_effort,
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_skills(
@@ -645,6 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             model,
             provider,
+            reasoning_effort,
             mcp,
             resume,
             force,
@@ -653,10 +695,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
+            let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let credential_storage = mcp.credentials.storage(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
-            let runtime = kit::Runtime::with_session_provider_and_credentials(
+            let runtime = kit::Runtime::with_session_provider_credentials_and_effort(
                 &root,
                 model,
                 provider,
@@ -666,6 +709,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     force,
                 },
                 credential_storage.clone(),
+                reasoning_effort,
             )?;
             let runtime = kit::Runtime::with_plugin_skills(
                 runtime,
@@ -691,6 +735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             model,
             provider,
+            reasoning_effort,
             a2a,
             mcp,
             resume,
@@ -702,13 +747,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
+            let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             config.resolve_plugins(&root).await?;
-            kit::tui::run(
+            kit::tui::run_with_reasoning_effort(
                 &root,
                 &model,
                 provider,
+                reasoning_effort,
                 a2a.as_deref(),
                 mcp.config_path(&config),
                 &credential_storage,
@@ -731,7 +778,7 @@ mod tests {
 
     use super::{
         AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
-        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, init_config, validate_auth_storage,
+        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, init_config, validate_auth_storage,
     };
 
     #[test]
@@ -744,6 +791,7 @@ mod tests {
 root = "/configured/root"
 model = "configured-model"
 provider = "openrouter"
+reasoning_effort = "medium"
 a2a = "127.0.0.1:7331"
 otel_endpoint = "http://configured:4317"
 otel_capture_message_content = true
@@ -768,6 +816,18 @@ credential_dir = "/configured/credentials"
         assert_eq!(
             config.provider(Some(kit::ProviderKind::OpenAiSubscription)),
             kit::ProviderKind::OpenAiSubscription
+        );
+        assert_eq!(
+            config.reasoning_effort(None),
+            Some(kit::ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            config.reasoning_effort(Some(ReasoningEffortArg::High)),
+            Some(kit::ReasoningEffort::High)
+        );
+        assert_eq!(
+            config.reasoning_effort(Some(ReasoningEffortArg::Default)),
+            None
         );
         assert_eq!(config.a2a(None).as_deref(), Some("127.0.0.1:7331"));
         assert_eq!(
@@ -882,6 +942,7 @@ credential_store = "keychain"
         assert_eq!(config.root(None), PathBuf::from("."));
         assert_eq!(config.model(None), "gpt-5.4");
         assert_eq!(config.provider(None), kit::ProviderKind::OpenAiSubscription);
+        assert_eq!(config.reasoning_effort(None), None);
         assert_eq!(config.a2a(None), None);
         assert_eq!(
             config.otel_endpoint(None, Some("http://environment:4317".into())),
@@ -1167,6 +1228,14 @@ harness = "acp.beta"
             Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "openrouter",]).is_ok()
         );
         assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
+        for command in ["serve", "acp", "tui"] {
+            assert!(Cli::try_parse_from(["kit", command, "--reasoning-effort", "high"]).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "--reasoning-effort", "default", "hello",])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["kit", "acp", "--reasoning-effort", "extreme"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
     }
 

@@ -56,7 +56,9 @@ use crate::{
     tools::mcp::CredentialStorage,
 };
 
-use app::{Action, App, Attachment, AttachmentKind, ModelChoice, SubmittedPrompt, Update};
+use app::{
+    Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
+};
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
@@ -90,6 +92,43 @@ fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<Model
     model_choices(options)
         .into_iter()
         .find(|choice| choice.id == current)
+}
+
+fn effort_state(options: Option<&[SessionConfigOption]>) -> Option<(String, Vec<EffortChoice>)> {
+    let SessionConfigOption {
+        kind: SessionConfigKind::Select(select),
+        ..
+    } = options?
+        .iter()
+        .find(|option| option.id.to_string() == "reasoning_effort")?
+    else {
+        return None;
+    };
+    let choices = match &select.options {
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .map(|option| EffortChoice {
+                id: option.value.to_string(),
+                name: option.name.clone(),
+            })
+            .collect(),
+        _ => return None,
+    };
+    Some((select.current_value.to_string(), choices))
+}
+
+fn refresh_config_state(app: &mut App, options: Option<&[SessionConfigOption]>) {
+    if let Some(choice) = current_model_choice(options) {
+        app.provider = choice.provider;
+        app.model = choice.model;
+    }
+    app.set_model_choices(model_choices(options));
+    if let Some((current, choices)) = effort_state(options) {
+        app.set_effort(current, choices);
+    } else {
+        app.set_effort("default".into(), Vec::new());
+    }
 }
 
 fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
@@ -137,6 +176,34 @@ pub async fn run(
     resume: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_reasoning_effort(
+        root,
+        model,
+        provider,
+        None,
+        a2a,
+        mcp_config,
+        credential_storage,
+        telemetry,
+        resume,
+        force,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reasoning_effort(
+    root: &Path,
+    model: &str,
+    provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
+    credential_storage: &CredentialStorage,
+    telemetry: &crate::telemetry::Settings,
+    resume: Option<&str>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
     // the same path the agent accepts.
@@ -151,6 +218,7 @@ pub async fn run(
         root,
         model,
         provider,
+        reasoning_effort,
         &persisted_session_id,
         resume.is_some(),
     )?;
@@ -312,14 +380,13 @@ pub async fn run(
 
             let mut terminal =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
-            let initial_choices = model_choices(session.config_options.as_deref());
             let mut app = App::new(
                 root.clone(),
                 provider.as_str().to_string(),
                 model,
                 a2a,
             );
-            app.set_model_choices(initial_choices);
+            refresh_config_state(&mut app, session.config_options.as_deref());
             if let Ok(mut active) = transition_session.lock() {
                 *active = active_session_id.clone();
             }
@@ -451,11 +518,10 @@ pub async fn run(
                                         *active = persisted_id.clone();
                                     }
                                     app.start_session(persisted_id);
-                                    if let Some(choice) = current_model_choice(session.config_options.as_deref()) {
-                                        app.provider = choice.provider;
-                                        app.model = choice.model;
-                                    }
-                                    app.set_model_choices(model_choices(session.config_options.as_deref()));
+                                    refresh_config_state(
+                                        &mut app,
+                                        session.config_options.as_deref(),
+                                    );
                                     if let Some(prompt) = first_prompt {
                                         let turn_id = app.push_user(prompt.clone());
                                         let connection = connection.clone();
@@ -489,10 +555,11 @@ pub async fn run(
                                     ).block_task().await;
                                     match response {
                                         Ok(response) => {
-                                            app.provider = choice.provider.clone();
-                                            app.model = choice.model.clone();
                                             app.usage = None;
-                                            app.set_model_choices(model_choices(Some(&response.config_options)));
+                                            refresh_config_state(
+                                                &mut app,
+                                                Some(&response.config_options),
+                                            );
                                             app.note(format!("model changed to {} via {}", choice.model, choice.provider));
                                             if save_defaults {
                                                 match save_model_defaults(&choice) {
@@ -502,6 +569,41 @@ pub async fn run(
                                             }
                                         }
                                         Err(error) => app.note(format!("model change failed: {}", error.message)),
+                                    }
+                                }
+                                Action::SelectEffort { effort, save_defaults } => {
+                                    let response = connection
+                                        .send_request(SetSessionConfigOptionRequest::new(
+                                            session_id.clone(),
+                                            "reasoning_effort",
+                                            effort.as_str(),
+                                        ))
+                                        .block_task()
+                                        .await;
+                                    match response {
+                                        Ok(response) => {
+                                            refresh_config_state(
+                                                &mut app,
+                                                Some(&response.config_options),
+                                            );
+                                            app.note(format!(
+                                                "reasoning effort changed to {effort}"
+                                            ));
+                                            if save_defaults {
+                                                match save_effort_default(&effort) {
+                                                    Ok(()) => app.note(
+                                                        "saved reasoning effort default to ~/.kit/config.toml",
+                                                    ),
+                                                    Err(error) => app.note(format!(
+                                                        "reasoning effort changed, but default was not saved: {error}"
+                                                    )),
+                                                }
+                                            }
+                                        }
+                                        Err(error) => app.note(format!(
+                                            "reasoning effort change failed: {}",
+                                            error.message
+                                        )),
                                     }
                                 }
                                 Action::Copy(text) => {
@@ -584,6 +686,29 @@ pub async fn run(
     Ok(())
 }
 
+fn save_effort_default(effort: &str) -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "HOME is unset; cannot save defaults".to_string())?;
+    save_effort_default_to(
+        &std::path::PathBuf::from(home).join(".kit/config.toml"),
+        effort,
+    )
+}
+
+fn save_effort_default_to(path: &Path, effort: &str) -> Result<(), String> {
+    update_config(path, |root| {
+        if effort == "default" {
+            root.remove("reasoning_effort");
+        } else {
+            root.insert(
+                "reasoning_effort".into(),
+                toml::Value::String(effort.to_string()),
+            );
+        }
+    })
+}
+
 fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -595,6 +720,19 @@ fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
 }
 
 fn save_model_defaults_to(path: &Path, choice: &ModelChoice) -> Result<(), String> {
+    update_config(path, |root| {
+        root.insert(
+            "provider".into(),
+            toml::Value::String(choice.provider.clone()),
+        );
+        root.insert("model".into(), toml::Value::String(choice.model.clone()));
+    })
+}
+
+fn update_config(
+    path: &Path,
+    update: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
+) -> Result<(), String> {
     use std::io::Write as _;
 
     let contents = match std::fs::read_to_string(path) {
@@ -611,11 +749,7 @@ fn save_model_defaults_to(path: &Path, choice: &ModelChoice) -> Result<(), Strin
     let root = config
         .as_table_mut()
         .ok_or_else(|| format!("invalid {}: root must be a table", path.display()))?;
-    root.insert(
-        "provider".into(),
-        toml::Value::String(choice.provider.clone()),
-    );
-    root.insert("model".into(), toml::Value::String(choice.model.clone()));
+    update(root);
     let output = toml::to_string_pretty(&config)
         .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
     let parent = path
@@ -1067,8 +1201,8 @@ mod tests {
 
     use super::{
         MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
-        durable_session_id, handle, message_of, osc52, prompt_blocks, readable,
-        save_model_defaults_to,
+        durable_session_id, effort_state, handle, message_of, osc52, prompt_blocks, readable,
+        refresh_config_state, save_effort_default_to, save_model_defaults_to,
     };
     use crate::tui::app::{App, SubmittedPrompt};
 
@@ -1260,6 +1394,95 @@ a = [still text]
         assert_eq!(saved["model"].as_str(), Some("anthropic/claude-sonnet-4"));
         assert_eq!(saved["message"].as_str(), Some("a = [still text]\n"));
         assert_eq!(saved["custom"]["quoted.key"].as_str(), Some("preserved"));
+    }
+
+    #[test]
+    fn saves_and_removes_reasoning_effort_without_losing_other_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "model = \"kept\"\n[custom]\nvalue = 7\n").unwrap();
+
+        save_effort_default_to(&path, "high").unwrap();
+        let saved =
+            toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(saved["custom"]["value"].as_integer(), Some(7));
+
+        save_effort_default_to(&path, "default").unwrap();
+        let saved =
+            toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("reasoning_effort").is_none());
+        assert_eq!(saved["model"].as_str(), Some("kept"));
+    }
+
+    #[test]
+    fn reads_advertised_reasoning_effort_state() {
+        let options = vec![SessionConfigOption::select(
+            "reasoning_effort",
+            "Reasoning effort",
+            "medium",
+            vec![SessionConfigSelectGroup::new(
+                "reasoning-effort",
+                "Reasoning effort",
+                vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("medium", "Medium"),
+                ],
+            )],
+        )];
+
+        let (current, choices) = effort_state(Some(&options)).unwrap();
+        assert_eq!(current, "medium");
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "medium"]
+        );
+    }
+
+    #[test]
+    fn refreshes_model_and_effort_from_one_config_snapshot() {
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "openrouter:new-model",
+                vec![SessionConfigSelectGroup::new(
+                    "openrouter",
+                    "OpenRouter",
+                    vec![SessionConfigSelectOption::new(
+                        "openrouter:new-model",
+                        "new-model",
+                    )],
+                )],
+            ),
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning effort",
+                "high",
+                vec![SessionConfigSelectGroup::new(
+                    "reasoning-effort",
+                    "Reasoning effort",
+                    vec![SessionConfigSelectOption::new("high", "High")],
+                )],
+            ),
+        ];
+        let mut app = App::new(
+            PathBuf::from("."),
+            "old-provider".into(),
+            "old-model".into(),
+            "a2a".into(),
+        );
+
+        refresh_config_state(&mut app, Some(&options));
+
+        assert_eq!(app.provider, "openrouter");
+        assert_eq!(app.model, "new-model");
+        assert_eq!(app.reasoning_effort, "high");
+        assert_eq!(app.model_choices.len(), 1);
+        assert_eq!(app.effort_choices.len(), 1);
     }
 
     #[test]

@@ -69,16 +69,21 @@ At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly
 
 ## Start a new session and compact from the TUI
 
-The TUI recognizes two exact leading slash-command tokens:
+The TUI recognizes exact leading slash-command tokens:
 
 ```text
 /new
 /new Start by reviewing the tests
 /compact
 /compact Continue with the migration
+/model
+/effort
+/effort high
 ```
 
 `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt.
+
+`/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
 `/compact` requests compaction without starting an ordinary model turn. Used alone, it ends after compaction. Text following `/compact` is retained as the latest user message and starts the next turn after compaction. Commands are recognized only at the start of the input and only as exact tokens; `/newer`, a space before `/new`, and unknown slash commands are sent to the model unchanged.
 

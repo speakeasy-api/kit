@@ -159,6 +159,7 @@ pub struct Runtime {
     adapter: SelectableAdapter,
     provider: ProviderKind,
     model: String,
+    reasoning_effort: Option<crate::provider::ReasoningEffort>,
     credential_storage: crate::credentials::CredentialStorage,
     telemetry: crate::telemetry::Settings,
     max_subagent_depth: usize,
@@ -192,6 +193,22 @@ impl Runtime {
         provider: ProviderKind,
         credential_storage: crate::credentials::CredentialStorage,
     ) -> Result<Arc<Self>, String> {
+        Self::new_with_provider_credentials_and_effort(
+            root,
+            model,
+            provider,
+            credential_storage,
+            None,
+        )
+    }
+
+    pub fn new_with_provider_credentials_and_effort(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<crate::provider::ReasoningEffort>,
+    ) -> Result<Arc<Self>, String> {
         let root = root
             .as_ref()
             .canonicalize()
@@ -204,10 +221,11 @@ impl Runtime {
         }
         let skills = build_skill_tools(&root, &[], &[]);
         let model = model.into();
-        let adapter = SelectableAdapter::new_with_credentials(
+        let adapter = SelectableAdapter::new_with_credentials_and_effort(
             provider,
             model.clone(),
             credential_storage.clone(),
+            reasoning_effort,
         )?;
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
@@ -215,6 +233,7 @@ impl Runtime {
                 root: root.clone(),
                 model: model.clone(),
                 provider,
+                reasoning_effort,
                 mcp_config: None,
                 credential_storage: credential_storage.clone(),
                 telemetry: Default::default(),
@@ -228,6 +247,7 @@ impl Runtime {
             adapter,
             provider,
             model,
+            reasoning_effort,
             credential_storage,
             telemetry: Default::default(),
             max_subagent_depth,
@@ -273,11 +293,30 @@ impl Runtime {
         session: SessionRequest,
         credential_storage: crate::credentials::CredentialStorage,
     ) -> Result<Arc<Self>, String> {
-        let mut runtime = Arc::try_unwrap(Self::new_with_provider_and_credentials(
+        Self::with_session_provider_credentials_and_effort(
+            root,
+            model,
+            provider,
+            session,
+            credential_storage,
+            None,
+        )
+    }
+
+    pub fn with_session_provider_credentials_and_effort(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        session: SessionRequest,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<crate::provider::ReasoningEffort>,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(Self::new_with_provider_credentials_and_effort(
             root,
             model,
             provider,
             credential_storage,
+            reasoning_effort,
         )?)
         .map_err(|_| "could not configure runtime session".to_string())?;
         runtime
@@ -396,6 +435,7 @@ impl Runtime {
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
                 provider: runtime.provider,
+                reasoning_effort: runtime.reasoning_effort,
                 mcp_config: path.map(Path::to_path_buf),
                 credential_storage,
                 telemetry: previous.telemetry,
@@ -670,10 +710,11 @@ impl Runtime {
         claim.mark_opened();
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
-        let adapter = SelectableAdapter::new_with_credentials(
+        let adapter = SelectableAdapter::new_with_credentials_and_effort(
             self.provider,
             self.model.clone(),
             self.credential_storage.clone(),
+            self.reasoning_effort,
         )
         .map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();

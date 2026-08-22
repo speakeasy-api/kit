@@ -120,6 +120,7 @@ A representative configuration is:
 root = "/path/to/project"
 provider = "openai-subscription" # or "openrouter"
 model = "gpt-5.4"
+reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
 otel_endpoint = "http://localhost:4317"
 otel_capture_message_content = false
@@ -205,7 +206,7 @@ The main built-in defaults are:
 | `serve`/`tui` A2A address | an available loopback port |
 | subagent harness | `acp.kit` |
 
-For example, with `model = "gpt-5.4"` in TOML, `kit prompt --model anthropic/claude-sonnet-4 ...` uses the CLI model. Omitting both CLI and TOML model selections uses `gpt-5.4`. Environment variables used by a provider supply credentials or provider adapter settings; they do not change this CLI-over-TOML model precedence.
+For example, with `model = "gpt-5.4"` in TOML, `kit prompt --model anthropic/claude-sonnet-4 ...` uses the CLI model. Omitting both CLI and TOML model selections uses `gpt-5.4`. The same CLI-over-TOML rule applies to `reasoning_effort` on `serve`, `acp`, `prompt`, and `tui`. Use `--reasoning-effort default` to override a configured value and leave effort unset. This preserves provider defaults, including `OPENROUTER_REASONING_EFFORT`. Environment variables used by a provider supply credentials or provider adapter settings; they do not change CLI-over-TOML precedence.
 
 ## Project instructions from `AGENTS.md`
 

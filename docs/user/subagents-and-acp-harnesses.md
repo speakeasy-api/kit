@@ -74,7 +74,9 @@ command = "kit"
 args = ["acp"]
 ```
 
-Kit appends its required runtime, persistent-session, resume, MCP, credential, and inherited-depth arguments after those base arguments. Use installed-binary commands such as `kit --help` and `kit acp --help` to inspect the current command interface rather than relying on an exhaustive flag list here.
+Kit appends its required runtime, resolved reasoning-effort, persistent-session, resume, MCP, credential, and inherited-depth arguments after those base arguments. Use installed-binary commands such as `kit --help` and `kit acp --help` to inspect the current command interface rather than relying on an exhaustive flag list here.
+
+Kit's ACP server also advertises a separate reasoning-effort session selector with `Default`, `Low`, `Medium`, and `High` values. Changes take effect on the next turn without changing the selected model. `Default` leaves the effort unset, preserving provider defaults and `OPENROUTER_REASONING_EFFORT` when OpenRouter supplies one. Set the startup default with top-level `reasoning_effort` or `--reasoning-effort`; the bundled TUI exposes the same selector through `/effort`. Built-in `acp.kit` children inherit the startup value resolved from CLI and TOML, while generic ACP harnesses keep their own behavior.
 
 Built-in subagent transcripts are durable on disk, but their reusable parent-owned values exist only for the lifetime of the owning parent session. Closing that main session drops its subagent manager, which closes every child actor and terminates the retained child processes. A later Kit process cannot pass an old value to `prompt` or `fork`.
 

@@ -4,8 +4,8 @@ mod credentials;
 mod openai_auth;
 
 pub use adapter::{
-    KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, SelectableAdapter,
-    SelectableSession, model_catalog,
+    KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
+    SelectableAdapter, SelectableSession, model_catalog,
 };
 pub use chatgpt::{
     OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,

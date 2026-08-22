@@ -127,6 +127,7 @@ defaults (`root = "."`, `provider = "openai-subscription"`,
 root = "/path/to/project"
 provider = "openai-subscription" # or openrouter
 model = "gpt-5.4"
+reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
 otel_endpoint = "http://localhost:4317"
 otel_capture_message_content = false
@@ -150,7 +151,7 @@ args = ["acp"]
 harness = "acp.review"
 ```
 
-`root`, `provider`, `model`, and credential settings apply to every command. `a2a` applies to
+`root`, `provider`, `model`, and `reasoning_effort` apply to runtime commands. Credential settings also apply to authentication commands. `--reasoning-effort low|medium|high` overrides TOML; `--reasoning-effort default` removes Kit's explicit selection and preserves provider defaults (including `OPENROUTER_REASONING_EFFORT`). `a2a` applies to
 `serve` and `tui`. `otel_endpoint` enables OTLP/gRPC trace export for AgentKit's
 GenAI spans. Use a collector endpoint such as `http://localhost:4317` without a
 `/v1/traces` suffix. The endpoint can also be set with `--otel-endpoint` or
@@ -177,7 +178,7 @@ runtime root. Multiple names may be configured. `[subagent].harness` selects the
 default; references must use the fully qualified `acp.<name>` form. When
 omitted, `acp.kit` runs the current executable with `acp` as its base argv. An
 explicit `[acp.kit]` overrides that executable/base argv. In both cases Kit then
-appends root, provider, model, persistent session, resume, MCP, credential, and inherited
+appends root, provider, model, the resolved reasoning effort, persistent session, resume, MCP, credential, and inherited
 depth flags, and the profile remains eligible for isolated Kit transcript fork
 fallback. Other profiles remain literal generic ACP argv. Configured child
 processes inherit Kit's environment unchanged in this release.
@@ -480,6 +481,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | `⏎` | send |
 | `/new` | start a fresh persisted session (`/new prompt` sends its first prompt) |
 | `/compact` | compact context now (`/compact prompt` starts the next turn with `prompt`) |
+| `/effort` | choose `default`, `low`, `medium`, or `high`; Tab toggles saving the default |
 | `/model` | open the searchable provider-grouped model picker |
 | `/model name` | switch immediately to the closest catalog match |
 | `⇧⏎`, `⌥⏎`, `^j` | newline |

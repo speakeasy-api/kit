@@ -20,11 +20,12 @@ use serde_json::json;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
-    provider::{ModelGroup, ModelSelection, SelectableAdapter, model_catalog},
+    provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
     runtime::{AcpDriverContext, BackgroundJobs, Runtime},
 };
 
 const MODEL_CONFIG_ID: &str = "model";
+const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 
 /// Kit-private ACP extension used by the bundled TUI to stop one detached call.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
@@ -60,7 +61,7 @@ enum Command {
         reply: oneshot::Sender<Result<PromptResponse, AcpRuntimeError>>,
     },
     Cancel,
-    SetModel {
+    SetConfig {
         request: SetSessionConfigOptionRequest,
         reply: oneshot::Sender<Result<SetSessionConfigOptionResponse, AcpRuntimeError>>,
     },
@@ -157,8 +158,12 @@ impl Server {
         };
         let driver = self.runtime.start_acp_driver(context, &mut claim).await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
+        let reasoning_effort = driver
+            .adapter
+            .reasoning_effort()
+            .map_err(AcpRuntimeError::Loop)?;
         let catalog = model_catalog(&current).await;
-        let options = model_options(&current, &catalog);
+        let options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
         let (tx, rx) = mpsc::channel(8);
         let actor = SessionActor {
@@ -210,7 +215,7 @@ impl Server {
         let sender = self.sender(&request.session_id).await?;
         let (tx, rx) = oneshot::channel();
         sender
-            .send(Command::SetModel { request, reply: tx })
+            .send(Command::SetConfig { request, reply: tx })
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -322,8 +327,8 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 // The server already interrupted the shared controller; this
                 // marker only establishes its serialized actor position.
                 Some(Command::Cancel) => {}
-                Some(Command::SetModel { request, reply }) => {
-                    let result = set_model(&adapter, &catalog, request);
+                Some(Command::SetConfig { request, reply }) => {
+                    let result = set_config(&adapter, &catalog, request);
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -383,7 +388,11 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     }
 }
 
-fn model_options(current: &ModelSelection, catalog: &[ModelGroup]) -> Vec<SessionConfigOption> {
+fn config_options(
+    current: &ModelSelection,
+    reasoning_effort: Option<ReasoningEffort>,
+    catalog: &[ModelGroup],
+) -> Vec<SessionConfigOption> {
     let groups = catalog
         .iter()
         .map(|group| {
@@ -406,41 +415,74 @@ fn model_options(current: &ModelSelection, catalog: &[ModelGroup]) -> Vec<Sessio
             SessionConfigSelectGroup::new(provider, name, options)
         })
         .collect::<Vec<_>>();
+    let effort_options = [
+        ("default", "Default"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+    ]
+    .into_iter()
+    .map(|(value, name)| SessionConfigSelectOption::new(value, name))
+    .collect();
     vec![
         SessionConfigOption::select(MODEL_CONFIG_ID, "Model", current.id(), groups)
             .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            REASONING_EFFORT_CONFIG_ID,
+            "Reasoning effort",
+            reasoning_effort.map_or("default", ReasoningEffort::as_str),
+            vec![SessionConfigSelectGroup::new(
+                "reasoning-effort",
+                "Reasoning effort",
+                effort_options,
+            )],
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel),
     ]
 }
 
-fn set_model(
+fn set_config(
     adapter: &SelectableAdapter,
     catalog: &[ModelGroup],
     request: SetSessionConfigOptionRequest,
 ) -> Result<SetSessionConfigOptionResponse, AcpRuntimeError> {
-    if request.config_id.to_string() != MODEL_CONFIG_ID {
-        return Err(AcpRuntimeError::Unsupported(
-            "unknown session configuration option".into(),
-        ));
-    }
+    let config_id = request.config_id.to_string();
     let value = request
         .value
         .as_value_id()
-        .ok_or_else(|| AcpRuntimeError::Unsupported("model selection requires an id value".into()))?
+        .ok_or_else(|| AcpRuntimeError::Unsupported("selection requires an id value".into()))?
         .to_string();
-    let selection = ModelSelection::from_id(&value).map_err(AcpRuntimeError::Loop)?;
-    let offered = catalog.iter().any(|group| {
-        group.provider == selection.provider && group.models.contains(&selection.model)
-    });
-    if !offered {
-        return Err(AcpRuntimeError::Unsupported(
-            "model is not in the advertised catalog".into(),
-        ));
+    match config_id.as_str() {
+        MODEL_CONFIG_ID => {
+            let selection = ModelSelection::from_id(&value).map_err(AcpRuntimeError::Loop)?;
+            let offered = catalog.iter().any(|group| {
+                group.provider == selection.provider && group.models.contains(&selection.model)
+            });
+            if !offered {
+                return Err(AcpRuntimeError::Unsupported(
+                    "model is not in the advertised catalog".into(),
+                ));
+            }
+            adapter.select(selection).map_err(AcpRuntimeError::Loop)?;
+        }
+        REASONING_EFFORT_CONFIG_ID => {
+            let effort = ReasoningEffort::from_id(&value).map_err(AcpRuntimeError::Loop)?;
+            adapter
+                .select_reasoning_effort(effort)
+                .map_err(AcpRuntimeError::Loop)?;
+        }
+        _ => {
+            return Err(AcpRuntimeError::Unsupported(
+                "unknown session configuration option".into(),
+            ));
+        }
     }
-    adapter
-        .select(selection.clone())
-        .map_err(AcpRuntimeError::Loop)?;
-    Ok(SetSessionConfigOptionResponse::new(model_options(
-        &selection, catalog,
+    let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
+    let reasoning_effort = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+    Ok(SetSessionConfigOptionResponse::new(config_options(
+        &selection,
+        reasoning_effort,
+        catalog,
     )))
 }
 
@@ -1220,7 +1262,7 @@ mod tests {
             models: vec!["gpt-5.4".into(), "gpt-5.4-mini".into()],
         }];
 
-        let response = set_model(
+        let response = set_config(
             &adapter,
             &catalog,
             SetSessionConfigOptionRequest::new(
@@ -1232,7 +1274,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(adapter.selection().unwrap().model, "gpt-5.4-mini");
-        assert_eq!(response.config_options.len(), 1);
+        assert_eq!(adapter.reasoning_effort().unwrap(), None);
+        assert_eq!(response.config_options.len(), 2);
+    }
+
+    #[test]
+    fn reasoning_effort_config_updates_independently_and_advertises_thought_level() {
+        let adapter =
+            SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+        let catalog = vec![ModelGroup {
+            provider: crate::ProviderKind::OpenAiSubscription,
+            models: vec!["gpt-5.4".into()],
+        }];
+
+        let response = set_config(
+            &adapter,
+            &catalog,
+            SetSessionConfigOptionRequest::new("session", REASONING_EFFORT_CONFIG_ID, "high"),
+        )
+        .unwrap();
+
+        assert_eq!(adapter.selection().unwrap().model, "gpt-5.4");
+        assert_eq!(
+            adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(response.config_options.len(), 2);
+        let options = serde_json::to_value(response.config_options).unwrap();
+        assert_eq!(options[1]["id"], REASONING_EFFORT_CONFIG_ID);
+        assert_eq!(options[1]["category"], "thought_level");
+        assert_eq!(options[1]["currentValue"], "high");
+
+        let response = set_config(
+            &adapter,
+            &catalog,
+            SetSessionConfigOptionRequest::new("session", REASONING_EFFORT_CONFIG_ID, "default"),
+        )
+        .unwrap();
+        assert_eq!(adapter.reasoning_effort().unwrap(), None);
+        let options = serde_json::to_value(response.config_options).unwrap();
+        assert_eq!(options[1]["currentValue"], "default");
     }
 
     #[tokio::test]

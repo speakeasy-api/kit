@@ -86,12 +86,20 @@ pub fn supported_model(model: &str) -> bool {
 #[derive(Clone)]
 pub struct OpenAiSubscriptionAdapter {
     config: SubscriptionConfig,
+    reasoning_effort: Option<super::adapter::ReasoningEffort>,
     client: reqwest::Client,
     context_windows: Arc<tokio::sync::OnceCell<Arc<HashMap<String, u64>>>>,
 }
 
 impl OpenAiSubscriptionAdapter {
     pub fn new(config: SubscriptionConfig) -> Result<Self, String> {
+        Self::new_with_reasoning_effort(config, None)
+    }
+
+    pub(crate) fn new_with_reasoning_effort(
+        config: SubscriptionConfig,
+        reasoning_effort: Option<super::adapter::ReasoningEffort>,
+    ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -101,6 +109,7 @@ impl OpenAiSubscriptionAdapter {
             .map_err(|_| "could not build openai-subscription TLS client".to_owned())?;
         Ok(Self {
             config,
+            reasoning_effort,
             client,
             context_windows: Arc::new(tokio::sync::OnceCell::new()),
         })
@@ -135,6 +144,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             .unwrap_or_default();
         Ok(OpenAiSubscriptionSession {
             config: self.config.clone(),
+            reasoning_effort: self.reasoning_effort,
             client: self.client.clone(),
             session_id,
             binding,
@@ -149,6 +159,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
 
 pub struct OpenAiSubscriptionSession {
     config: SubscriptionConfig,
+    reasoning_effort: Option<super::adapter::ReasoningEffort>,
     client: reqwest::Client,
     session_id: String,
     binding: auth::CredentialBinding,
@@ -175,6 +186,7 @@ impl ModelSession for OpenAiSubscriptionSession {
         let idempotency_key = request_idempotency_key(&request)?;
         let mut body = request_body(
             &self.config.model,
+            self.reasoning_effort,
             &request,
             &self.binding,
             &self.session_id,
@@ -1270,6 +1282,7 @@ impl ModelTurn for OpenAiSubscriptionTurn {
 
 fn request_body(
     model: &str,
+    reasoning_effort: Option<super::adapter::ReasoningEffort>,
     request: &TurnRequest,
     binding: &auth::CredentialBinding,
     session_id: &str,
@@ -1302,9 +1315,13 @@ fn request_body(
             })
         })
         .collect::<Vec<_>>();
+    let mut reasoning = json!({"summary": "auto"});
+    if let Some(reasoning_effort) = reasoning_effort {
+        reasoning["effort"] = json!(reasoning_effort.as_str());
+    }
     let mut body = json!({
         "model": model, "input": input, "tools": tools, "tool_choice": "auto",
-        "parallel_tool_calls": true, "reasoning": {"summary":"auto"}, "store": false,
+        "parallel_tool_calls": true, "reasoning": reasoning, "store": false,
         "stream": true, "include": ["reasoning.encrypted_content"],
     });
     // The codex backend rejects max_output_tokens as an unsupported parameter; the
@@ -2200,8 +2217,8 @@ mod usage_tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
     use agentkit_core::{
-        CancellationController, DataRef, Delta, Item, ItemKind, MediaPart, Modality, Part,
-        PartKind, ToolOutput,
+        CancellationController, DataRef, Delta, Item, ItemKind, MediaPart, MetadataMap, Modality,
+        Part, PartKind, SessionId, ToolOutput, TurnId,
     };
     use agentkit_loop::{LoopError, ModelSession, ModelTurn, ModelTurnEvent};
     use bytes::Bytes;
@@ -2212,13 +2229,46 @@ mod usage_tests {
         CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRY_AFTER,
         OpenAiSubscriptionSession, OpenAiSubscriptionTurn, PROVIDER_FINISH_REASONS_METADATA,
         SubscriptionConfig, classify_response_failure, classify_top_level_error, map_item,
-        parse_context_windows, parse_usage, set_provider_finish_reasons, tool_output,
+        parse_context_windows, parse_usage, request_body, set_provider_finish_reasons, tool_output,
     };
+
+    #[test]
+    fn request_serializes_selected_reasoning_effort_and_omits_default() {
+        let request = agentkit_loop::TurnRequest {
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn"),
+            transcript: Vec::new(),
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        };
+        let binding = super::auth::CredentialBinding {
+            account_id: "account".into(),
+            generation: "generation".into(),
+        };
+
+        let default = request_body("gpt-5.4", None, &request, &binding, "session").unwrap();
+        let high = request_body(
+            "gpt-5.4",
+            Some(super::super::adapter::ReasoningEffort::High),
+            &request,
+            &binding,
+            "session",
+        )
+        .unwrap();
+
+        assert_eq!(default["reasoning"], json!({"summary": "auto"}));
+        assert_eq!(
+            high["reasoning"],
+            json!({"summary": "auto", "effort": "high"})
+        );
+    }
 
     #[test]
     fn subscription_session_reports_initial_provider_identity() {
         let session = OpenAiSubscriptionSession {
             config: SubscriptionConfig::new("gpt-5.4".into()).unwrap(),
+            reasoning_effort: None,
             client: reqwest::Client::new(),
             session_id: "provider-identity-test".into(),
             binding: super::auth::CredentialBinding {

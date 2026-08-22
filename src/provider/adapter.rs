@@ -11,6 +11,7 @@ use agentkit_loop::{
 };
 use agentkit_provider_openrouter::{
     OpenRouterAdapter, OpenRouterConfig, OpenRouterSession, OpenRouterTurn,
+    ReasoningEffort as OpenRouterReasoningEffort,
 };
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -103,10 +104,44 @@ pub struct ModelGroup {
     pub models: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn from_id(value: &str) -> Result<Option<Self>, String> {
+        match value {
+            "default" => Ok(None),
+            "low" => Ok(Some(Self::Low)),
+            "medium" => Ok(Some(Self::Medium)),
+            "high" => Ok(Some(Self::High)),
+            _ => Err("unknown reasoning effort".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionSelection {
+    model: ModelSelection,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
 /// A per-session adapter whose selection is read only when a new model turn begins.
 #[derive(Clone)]
 pub struct SelectableAdapter {
-    selection: Arc<Mutex<ModelSelection>>,
+    selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
 }
 
@@ -120,17 +155,30 @@ impl SelectableAdapter {
         model: impl Into<String>,
         credential_storage: crate::credentials::CredentialStorage,
     ) -> Result<Self, String> {
+        Self::new_with_credentials_and_effort(provider, model, credential_storage, None)
+    }
+
+    pub(crate) fn new_with_credentials_and_effort(
+        provider: ProviderKind,
+        model: impl Into<String>,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Self, String> {
         let selection = ModelSelection::new(provider, model);
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new_with_credentials(
+        KitAdapter::new_with_credentials_and_effort(
             selection.provider,
             selection.model.clone(),
             credential_storage.clone(),
+            reasoning_effort,
         )?;
         Ok(Self {
-            selection: Arc::new(Mutex::new(selection)),
+            selection: Arc::new(Mutex::new(SessionSelection {
+                model: selection,
+                reasoning_effort,
+            })),
             credential_storage,
         })
     }
@@ -138,32 +186,59 @@ impl SelectableAdapter {
     pub fn selection(&self) -> Result<ModelSelection, String> {
         self.selection
             .lock()
-            .map(|value| value.clone())
-            .map_err(|_| "model selection lock is poisoned".into())
+            .map(|value| value.model.clone())
+            .map_err(|_| "session selection lock is poisoned".into())
+    }
+
+    pub fn reasoning_effort(&self) -> Result<Option<ReasoningEffort>, String> {
+        self.selection
+            .lock()
+            .map(|value| value.reasoning_effort)
+            .map_err(|_| "session selection lock is poisoned".into())
     }
 
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new_with_credentials(
+        let reasoning_effort = self.reasoning_effort()?;
+        KitAdapter::new_with_credentials_and_effort(
             selection.provider,
             selection.model.clone(),
             self.credential_storage.clone(),
+            reasoning_effort,
         )?;
-        *self
-            .selection
+        self.selection
             .lock()
-            .map_err(|_| "model selection lock is poisoned")? = selection;
+            .map_err(|_| "session selection lock is poisoned")?
+            .model = selection;
+        Ok(())
+    }
+
+    pub fn select_reasoning_effort(
+        &self,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<(), String> {
+        let model = self.selection()?;
+        KitAdapter::new_with_credentials_and_effort(
+            model.provider,
+            model.model,
+            self.credential_storage.clone(),
+            reasoning_effort,
+        )?;
+        self.selection
+            .lock()
+            .map_err(|_| "session selection lock is poisoned")?
+            .reasoning_effort = reasoning_effort;
         Ok(())
     }
 }
 
 pub struct SelectableSession {
-    selection: Arc<Mutex<ModelSelection>>,
+    selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     config: SessionConfig,
-    active: ModelSelection,
+    active: SessionSelection,
     inner: KitSession,
 }
 
@@ -172,11 +247,16 @@ impl ModelAdapter for SelectableAdapter {
     type Session = SelectableSession;
 
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
-        let active = self.selection().map_err(LoopError::InvalidState)?;
-        let inner = KitAdapter::new_with_credentials(
-            active.provider,
-            active.model.clone(),
+        let active = self
+            .selection
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
+        let inner = KitAdapter::new_with_credentials_and_effort(
+            active.model.provider,
+            active.model.model.clone(),
             self.credential_storage.clone(),
+            active.reasoning_effort,
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
@@ -194,7 +274,7 @@ impl ModelAdapter for SelectableAdapter {
         self.selection
             .lock()
             .ok()
-            .map(|selection| selection.provider.as_str())
+            .map(|selection| selection.model.provider.as_str())
     }
 }
 
@@ -231,12 +311,13 @@ impl ModelSession for SelectableSession {
             .selection
             .lock()
             .map(|value| value.clone())
-            .map_err(|_| LoopError::InvalidState("model selection lock is poisoned".into()))?;
+            .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
         if selected != self.active {
-            let replacement = KitAdapter::new_with_credentials(
-                selected.provider,
-                selected.model.clone(),
+            let replacement = KitAdapter::new_with_credentials_and_effort(
+                selected.model.provider,
+                selected.model.model.clone(),
                 self.credential_storage.clone(),
+                selected.reasoning_effort,
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
@@ -248,18 +329,18 @@ impl ModelSession for SelectableSession {
     }
 
     fn model_name(&self) -> Option<&str> {
-        Some(&self.active.model)
+        Some(&self.active.model.model)
     }
 
     fn provider_name(&self) -> Option<&str> {
-        Some(self.active.provider.as_str())
+        Some(self.active.model.provider.as_str())
     }
 }
 
 impl SelectableSession {
     fn replace_active(
         &mut self,
-        selected: ModelSelection,
+        selected: SessionSelection,
         replacement: Result<KitSession, LoopError>,
     ) -> Result<(), LoopError> {
         let replacement = replacement?;
@@ -294,14 +375,27 @@ impl KitAdapter {
         model: String,
         credential_storage: crate::credentials::CredentialStorage,
     ) -> Result<Self, String> {
+        Self::new_with_credentials_and_effort(provider, model, credential_storage, None)
+    }
+
+    fn new_with_credentials_and_effort(
+        provider: ProviderKind,
+        model: String,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Self, String> {
         match provider {
-            ProviderKind::OpenAiSubscription => OpenAiSubscriptionAdapter::new(
-                SubscriptionConfig::new(model)?.with_credential_storage(credential_storage),
-            )
+            ProviderKind::OpenAiSubscription => {
+                OpenAiSubscriptionAdapter::new_with_reasoning_effort(
+                    SubscriptionConfig::new(model)?.with_credential_storage(credential_storage),
+                    reasoning_effort,
+                )
+            }
             .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
                 let mut config = OpenRouterConfig::from_env().map_err(|error| error.to_string())?;
                 config.model = model.clone();
+                apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
                 let inner = OpenRouterAdapter::new(config).map_err(|error| error.to_string())?;
                 let client = reqwest::Client::builder()
@@ -320,6 +414,19 @@ impl KitAdapter {
                 }))
             }
         }
+    }
+}
+
+fn apply_openrouter_reasoning_effort(
+    config: &mut OpenRouterConfig,
+    reasoning_effort: Option<ReasoningEffort>,
+) {
+    if let Some(reasoning_effort) = reasoning_effort {
+        config.reasoning_effort = Some(match reasoning_effort {
+            ReasoningEffort::Low => OpenRouterReasoningEffort::Low,
+            ReasoningEffort::Medium => OpenRouterReasoningEffort::Medium,
+            ReasoningEffort::High => OpenRouterReasoningEffort::High,
+        });
     }
 }
 
@@ -689,14 +796,35 @@ mod tests {
         SessionId, TokenUsage, ToolCallId, ToolOutput, ToolResultPart, TurnId, Usage,
     };
     use agentkit_loop::{LoopError, ModelAdapter, ModelSession, SessionConfig, TurnRequest};
-    use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
+    use agentkit_provider_openrouter::{
+        OpenRouterAdapter, OpenRouterConfig, ReasoningEffort as OpenRouterReasoningEffort,
+    };
     use serde_json::json;
 
     use super::{
         KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterKitSession, ProviderKind,
-        SelectableAdapter, SelectableSession, add_context_window, catalog_models_url,
+        ReasoningEffort, SelectableAdapter, SelectableSession, SessionSelection,
+        add_context_window, apply_openrouter_reasoning_effort, catalog_models_url,
         expose_background_call_ids, models_url, parse_context_window, rewrite_openrouter_media,
     };
+
+    #[test]
+    fn openrouter_reasoning_effort_preserves_default_and_maps_explicit_value() {
+        let mut config = OpenRouterConfig::new("test-key", "test/model");
+        config.reasoning_effort = Some(OpenRouterReasoningEffort::Custom("env-default".into()));
+
+        apply_openrouter_reasoning_effort(&mut config, None);
+        assert_eq!(
+            config.reasoning_effort,
+            Some(OpenRouterReasoningEffort::Custom("env-default".into()))
+        );
+
+        apply_openrouter_reasoning_effort(&mut config, Some(ReasoningEffort::High));
+        assert_eq!(
+            config.reasoning_effort,
+            Some(OpenRouterReasoningEffort::High)
+        );
+    }
 
     #[test]
     fn openrouter_media_delta_becomes_a_portable_placeholder() {
@@ -808,6 +936,10 @@ mod tests {
     }
 
     fn selectable_session(active: ModelSelection, inner: KitSession) -> SelectableSession {
+        let active = SessionSelection {
+            model: active,
+            reasoning_effort: None,
+        };
         SelectableSession {
             selection: Arc::new(Mutex::new(active.clone())),
             credential_storage: Default::default(),
@@ -833,7 +965,10 @@ mod tests {
         let selected = ModelSelection::new(ProviderKind::OpenRouter, "test/replacement");
         session
             .replace_active(
-                selected.clone(),
+                SessionSelection {
+                    model: selected.clone(),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                },
                 Ok(openrouter_session(&selected.model).await),
             )
             .unwrap();
@@ -852,7 +987,10 @@ mod tests {
         assert!(
             session
                 .replace_active(
-                    selected,
+                    SessionSelection {
+                        model: selected,
+                        reasoning_effort: None,
+                    },
                     Err(LoopError::Provider("replacement failed".into())),
                 )
                 .is_err()

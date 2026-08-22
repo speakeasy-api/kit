@@ -10,6 +10,7 @@ enum Kind {
     Compact,
     New,
     Model,
+    Effort,
 }
 
 struct Spec {
@@ -31,6 +32,10 @@ const COMMANDS: &[Spec] = &[
         token: "/model",
         kind: Kind::Model,
     },
+    Spec {
+        token: "/effort",
+        kind: Kind::Effort,
+    },
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +43,7 @@ pub enum Parsed<'a> {
     Compact { prompt: Option<&'a str> },
     New { prompt: Option<&'a str> },
     Model { query: Option<&'a str> },
+    Effort { value: Option<&'a str> },
     Prompt(&'a str),
 }
 
@@ -63,6 +69,7 @@ pub fn parse(input: &str) -> Parsed<'_> {
         Kind::Compact => Parsed::Compact { prompt },
         Kind::New => Parsed::New { prompt },
         Kind::Model => Parsed::Model { query: prompt },
+        Kind::Effort => Parsed::Effort { value: prompt },
     }
 }
 
@@ -86,6 +93,13 @@ mod tests {
         );
         assert_eq!(parse("/new"), Parsed::New { prompt: None });
         assert_eq!(parse("/model"), Parsed::Model { query: None });
+        assert_eq!(parse("/effort"), Parsed::Effort { value: None });
+        assert_eq!(
+            parse("/effort high"),
+            Parsed::Effort {
+                value: Some("high")
+            }
+        );
         assert_eq!(
             parse("/model   sonnet"),
             Parsed::Model {
@@ -115,5 +129,6 @@ mod tests {
         assert_eq!(known_token("/new prompt"), Some(0..4));
         assert_eq!(known_token("/compact prompt"), Some(0..8));
         assert_eq!(known_token("/model sonnet"), Some(0..6));
+        assert_eq!(known_token("/effort high"), Some(0..7));
     }
 }

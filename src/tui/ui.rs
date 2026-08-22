@@ -69,6 +69,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_status(frame, app, status);
     if app.model_dialog.is_some() {
         draw_model_dialog(frame, app);
+    } else if app.effort_dialog.is_some() {
+        draw_effort_dialog(frame, app);
     }
 }
 
@@ -126,6 +128,52 @@ fn visible_query_tail(query: &str, width: usize) -> &str {
         tail = &tail[index..];
     }
     tail
+}
+
+fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
+    let outer = frame.area();
+    let width = outer.width.min(48);
+    let height = outer.height.min(app.effort_choices.len() as u16 + 3);
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let dialog = app.effort_dialog.as_ref().expect("checked above");
+    let footer = format!(
+        "tab defaults [{}] · enter select · esc close",
+        if dialog.save_defaults { "x" } else { " " }
+    );
+    let panel = Panel::bordered().title(" reasoning effort ");
+    let inner = panel.inner(area);
+    let footer_rows = u16::from(inner.height > 1);
+    let [list, footer_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).areas(inner);
+    let lines = app
+        .effort_choices
+        .iter()
+        .enumerate()
+        .take(list.height as usize)
+        .map(|(index, choice)| {
+            let selected = index == dialog.selected;
+            Line::from(Span::styled(
+                format!("{}{}", if selected { "› " } else { "  " }, choice.name),
+                if selected {
+                    theme::accent()
+                } else {
+                    theme::text()
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(Span::styled(footer, theme::dim())),
+        footer_area,
+    );
 }
 
 fn draw_model_dialog(frame: &mut Frame<'_>, app: &App) {
@@ -232,6 +280,8 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(root, theme::text()),
         Span::styled("  ·  ", theme::faint()),
         Span::styled(format!("{} / {}", app.provider, app.model), theme::dim()),
+        Span::styled("  ·  ", theme::faint()),
+        Span::styled(format!("effort {}", app.reasoning_effort), theme::dim()),
         Span::styled("  ·  ", theme::faint()),
         Span::styled(
             format!(
@@ -1058,7 +1108,7 @@ mod tests {
     };
     use crate::{
         events::RuntimeEvent,
-        tui::app::{Action, App, Block, ModelDialog, Update},
+        tui::app::{Action, App, Block, EffortChoice, EffortDialog, ModelDialog, Update},
     };
 
     fn model_choice(provider: &str, model: &str) -> crate::tui::app::ModelChoice {
@@ -1191,6 +1241,30 @@ mod tests {
                 "{symbol:?} reads at {light:.2}:1 on a light terminal, short of {wanted:.2}:1"
             );
         }
+    }
+
+    #[test]
+    fn effort_dialog_renders_selection_and_default_toggle() {
+        let mut app = sample();
+        app.effort_choices = vec![
+            EffortChoice {
+                id: "default".into(),
+                name: "Default".into(),
+            },
+            EffortChoice {
+                id: "high".into(),
+                name: "High".into(),
+            },
+        ];
+        app.effort_dialog = Some(EffortDialog {
+            selected: 1,
+            save_defaults: true,
+        });
+
+        let frame = render(&mut app, 60, 12);
+        assert!(frame.contains("reasoning effort"), "{frame}");
+        assert!(frame.contains("› High"), "{frame}");
+        assert!(frame.contains("defaults [x]"), "{frame}");
     }
 
     #[test]
