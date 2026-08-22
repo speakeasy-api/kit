@@ -41,16 +41,29 @@ cargo test --locked
 
 "$root/scripts/notarize-release.sh" "$tag" &
 macos_pid=$!
-"$root/scripts/build-linux-release.sh" "$tag" &
-linux_pid=$!
+
+# build-linux-release.sh reads the commit file that notarization writes
+# before its own build, so start it once that file exists.
+for _ in $(seq 1 600); do
+  [[ -f $out_dir/source-commit.txt ]] && break
+  kill -0 "$macos_pid" 2>/dev/null || break
+  sleep 1
+done
+if [[ -f $out_dir/source-commit.txt ]]; then
+  "$root/scripts/build-linux-release.sh" "$tag" &
+  linux_pid=$!
+fi
+
 cleanup_builds() {
-  kill "$macos_pid" "$linux_pid" 2>/dev/null || true
+  kill "$macos_pid" ${linux_pid:+"$linux_pid"} 2>/dev/null || true
 }
 trap cleanup_builds EXIT
 
 wait "$macos_pid"
 test "$(cat "$out_dir/source-commit.txt")" = "$commit"
-wait "$linux_pid"
+if [[ -n ${linux_pid:-} ]]; then
+  wait "$linux_pid"
+fi
 trap - EXIT
 
 (
