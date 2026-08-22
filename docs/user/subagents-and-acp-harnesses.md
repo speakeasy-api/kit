@@ -23,7 +23,7 @@ Each successful turn returns a session value with `id`, `output`, and `generatio
 
 Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
 
-The optional `harness` argument belongs only on `subagent`. It overrides the user's configured harness preference for that new session; omit it normally. `prompt` and `fork` retain the original session's harness.
+The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects the exact model value ID advertised by that harness through its ACP session configuration; for `acp.kit`, an ID can look like `openai-subscription:gpt-5.4-mini`. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
 
 ## Require structured JSON output with `output_schema`
 
@@ -64,7 +64,7 @@ Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 K
 
 ## Choose the built-in `acp.kit` harness
 
-`acp.kit` is always available and is the default when `[subagent].harness` is not configured. By default Kit launches the installed `kit` executable as `kit acp`. A built-in child inherits the runtime root, provider, model, MCP configuration and credential storage, cancellation, and nesting depth. It does not start an A2A listener.
+`acp.kit` is always available and is the default when `[subagent].harness` is not configured. By default Kit launches the installed `kit` executable as `kit acp`. A built-in child inherits the runtime root, provider, model, MCP configuration and credential storage, cancellation, and nesting depth. An explicit `subagent.model` selection overrides the inherited model for that ACP session. It does not start an A2A listener.
 
 You can override only the executable and base arguments while preserving built-in Kit behavior:
 
@@ -94,7 +94,7 @@ permissions = "deny"
 harness = "acp.review"
 ```
 
-References use the fully qualified `acp.<name>` form. Profile names must be non-empty and contain neither whitespace nor dots. `command` must be non-empty; use an executable on `PATH` or an absolute path. Kit does not perform a generic agent's login or ACP authentication flow, so authenticate and configure that agent before starting Kit. Generic session persistence beyond the parent process is agent-defined.
+References use the fully qualified `acp.<name>` form. Profile names must be non-empty and contain neither whitespace nor dots. `command` must be non-empty; use an executable on `PATH` or an absolute path. Kit does not perform a generic agent's login or ACP authentication flow, so authenticate and configure that agent before starting Kit. Generic session persistence beyond the parent process is agent-defined. Per-subagent model selection works for generic agents such as Codex, Claude, or Cursor only when their ACP adapter advertises and implements the selectable `model` session option.
 
 An unknown selection fails with `unknown ACP harness "acp.name"` or `unknown subagent ACP harness "acp.name"`. Invalid references may report `ACP harness references must use acp.<name>`.
 

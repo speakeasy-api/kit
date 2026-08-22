@@ -7,6 +7,9 @@ import time
 write_lock = threading.Lock()
 next_session = 1
 supports_fork = "--no-fork" not in sys.argv
+supports_models = "--models" in sys.argv
+selected_models = {}
+model_ids = ["mock/default", "mock/requested"]
 
 
 def send(message):
@@ -24,6 +27,8 @@ def prompt(request):
     session_id = params["sessionId"]
     text = params["prompt"][0]["text"]
     time.sleep(0.40)
+    if "MOCK_SELECTED_MODEL" in text:
+        text = selected_models.get(session_id, model_ids[0])
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
     if "MOCK_RICH_OUTPUT" in text:
@@ -92,7 +97,20 @@ for line in sys.stdin:
             },
         })
     elif method == "session/new":
-        respond(request["id"], {"sessionId": "base"})
+        selected_models["base"] = model_ids[0]
+        result = {"sessionId": "base"}
+        if supports_models:
+            result["configOptions"] = [{
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": model_ids[0],
+                "options": [
+                    {"value": value, "name": value} for value in model_ids
+                ],
+            }]
+        respond(request["id"], result)
     elif method == "session/fork":
         if not supports_fork:
             send({
@@ -103,9 +121,23 @@ for line in sys.stdin:
             continue
         session_id = f"branch-{next_session}"
         next_session += 1
+        source_id = request["params"]["sessionId"]
+        selected_models[session_id] = selected_models.get(source_id, model_ids[0])
         respond(request["id"], {"sessionId": session_id})
     elif method == "session/prompt":
         threading.Thread(target=prompt, args=(request,), daemon=True).start()
+    elif method == "session/set_config_option":
+        params = request["params"]
+        value = params["value"]
+        if params["configId"] != "model" or value not in model_ids:
+            send({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": -32602, "message": "unknown model"},
+            })
+        else:
+            selected_models[params["sessionId"]] = value
+            respond(request["id"], {"configOptions": []})
     elif method == "session/cancel":
         pass
     elif method == "session/close":

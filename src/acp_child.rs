@@ -15,8 +15,8 @@ use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
     CancelNotification, CloseSessionRequest, ContentBlock, ForkSessionRequest, PermissionOption,
     PermissionOptionKind, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate, StopReason,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agentkit_core::TurnCancellation;
 use serde::Deserialize;
@@ -282,6 +282,7 @@ struct Prompt {
 }
 struct Fork {
     session_id: SessionId,
+    model: Option<String>,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<SessionId, ChildError>>,
 }
@@ -401,6 +402,7 @@ impl ChildSession {
         config: ChildConfig,
         harness: String,
         persisted: Option<(String, bool)>,
+        model: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
     ) -> Result<Self, ChildError> {
@@ -414,6 +416,7 @@ impl ChildSession {
                 config,
                 harness,
                 persisted,
+                model,
                 depth,
                 &mut rx,
                 ready_tx,
@@ -423,7 +426,8 @@ impl ChildSession {
         });
         let result = tokio::select! {
             ready = &mut ready_rx => match ready {
-                Ok(ready) => Ok(ready),
+                Ok(Ok(ready)) => Ok(ready),
+                Ok(Err(error)) => Err(ChildError::Failed(error)),
                 Err(_) => return Err(ChildError::Failed(match task.await {
                     Ok(Ok(())) => "nested agent exited during startup".into(),
                     Ok(Err(error)) => error,
@@ -513,7 +517,11 @@ impl ChildSession {
         }
     }
 
-    pub async fn fork(&self, cancellation: &TurnCancellation) -> Result<Self, ChildError> {
+    pub async fn fork(
+        &self,
+        model: Option<&str>,
+        cancellation: &TurnCancellation,
+    ) -> Result<Self, ChildError> {
         let _serial = tokio::select! {
             serial = self.serial.lock() => serial,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
@@ -527,6 +535,7 @@ impl ChildSession {
         tokio::select! {
             sent = self.tx.send(Request::Fork(Fork {
                 session_id: self.session_id.clone(),
+                model: model.map(str::to_owned),
                 cancellation: cancellation.clone(),
                 reply,
             })) => sent.map_err(|_| ChildError::Failed("nested agent process is no longer running".into()))?,
@@ -573,9 +582,10 @@ async fn run(
     config: ChildConfig,
     harness: String,
     persisted: Option<(String, bool)>,
+    model: Option<String>,
     depth: usize,
     rx: &mut mpsc::Receiver<Request>,
-    ready: oneshot::Sender<Ready>,
+    ready: oneshot::Sender<Result<Ready, String>>,
     context: LaunchContext,
 ) -> Result<(), String> {
     let permission_policy = config.harnesses.permission_policy(&harness)?;
@@ -666,11 +676,26 @@ async fn run(
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
             let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
+            if let Some(model) = model {
+                let selectable = session.config_options.as_deref().unwrap_or_default().iter().any(|option| {
+                    option.id.to_string() == "model" && matches!(option.kind, SessionConfigKind::Select(_))
+                });
+                if !selectable {
+                    let error = format!("ACP harness {harness:?} does not advertise a selectable model session option");
+                    let _ = ready.send(Err(error));
+                    return std::future::pending().await;
+                }
+                if let Err(error) = connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
+                    let error = format!("ACP harness {harness:?} rejected model selection {model:?}: {error}");
+                    let _ = ready.send(Err(error));
+                    return std::future::pending().await;
+                }
+            }
             let sessions = Arc::new(Mutex::new(vec![session.session_id.clone()]));
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = JoinSet::new();
             ready_flag.store(true, Ordering::Release);
-            let _ = ready.send(Ready { session_id: session.session_id, capabilities });
+            let _ = ready.send(Ok(Ready { session_id: session.session_id, capabilities }));
             loop {
                 let request = tokio::select! {
                     request = rx.recv() => match request { Some(request) => request, None => break },
@@ -689,14 +714,52 @@ async fn run(
                                 .block_task();
                             tokio::pin!(request);
                             let result = tokio::select! {
-                                result = &mut request => result
-                                    .map(|response| {
+                                result = &mut request => match result {
+                                    Ok(response) => {
+                                        let session_id = response.session_id;
                                         if let Ok(mut sessions) = sessions.lock() {
-                                            sessions.push(response.session_id.clone());
+                                            sessions.push(session_id.clone());
                                         }
-                                        response.session_id
-                                    })
-                                    .map_err(|error| ChildError::Failed(error.to_string())),
+                                        if let Some(model) = fork.model {
+                                            let selected = match tokio::time::timeout(
+                                                HANDSHAKE,
+                                                connection
+                                                    .send_request(SetSessionConfigOptionRequest::new(
+                                                        session_id.clone(),
+                                                        "model",
+                                                        model.as_str(),
+                                                    ))
+                                                    .block_task(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(_)) => Ok(session_id.clone()),
+                                                Ok(Err(error)) => Err(ChildError::Failed(format!(
+                                                    "ACP harness rejected model selection {model:?} for forked session: {error}"
+                                                ))),
+                                                Err(_) => Err(ChildError::Failed(
+                                                    "ACP harness did not apply the model selection to the forked session within 30 seconds".into(),
+                                                )),
+                                            };
+                                            if selected.is_err() && supports_close {
+                                                let close = connection
+                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .block_task();
+                                                if tokio::time::timeout(CANCEL_SETTLE, close)
+                                                    .await
+                                                    .is_ok_and(|result| result.is_ok())
+                                                    && let Ok(mut sessions) = sessions.lock()
+                                                {
+                                                    sessions.retain(|id| id != &session_id);
+                                                }
+                                            }
+                                            selected
+                                        } else {
+                                            Ok(session_id)
+                                        }
+                                    }
+                                    Err(error) => Err(ChildError::Failed(error.to_string())),
+                                },
                                 () = fork.cancellation.cancelled() => {
                                     let _ = fatal.send(());
                                     Err(ChildError::Cancelled)
@@ -1038,6 +1101,7 @@ mod tests {
             config,
             "acp.broken".into(),
             None,
+            None,
             1,
             TurnCancellation::default(),
         )
@@ -1210,6 +1274,7 @@ mod tests {
                         config,
                         "acp.broken".into(),
                         None,
+                        None,
                         1,
                         TurnCancellation::default(),
                     )
@@ -1262,6 +1327,7 @@ mod tests {
             config,
             "acp.mock".into(),
             None,
+            None,
             1,
             TurnCancellation::default(),
         )
@@ -1274,7 +1340,7 @@ mod tests {
                 .text,
             "standard"
         );
-        let closed = base.fork(&TurnCancellation::default()).await.unwrap();
+        let closed = base.fork(None, &TurnCancellation::default()).await.unwrap();
         closed.close().await.unwrap();
         assert_eq!(
             base.prompt("after sibling close".into(), TurnCancellation::default())
@@ -1284,8 +1350,8 @@ mod tests {
             "after sibling close"
         );
 
-        let first = base.fork(&TurnCancellation::default()).await.unwrap();
-        let second = base.fork(&TurnCancellation::default()).await.unwrap();
+        let first = base.fork(None, &TurnCancellation::default()).await.unwrap();
+        let second = base.fork(None, &TurnCancellation::default()).await.unwrap();
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(
             first.prompt("first".into(), TurnCancellation::default()),
@@ -1299,7 +1365,7 @@ mod tests {
             started.elapsed()
         );
 
-        let same_session = base.fork(&TurnCancellation::default()).await.unwrap();
+        let same_session = base.fork(None, &TurnCancellation::default()).await.unwrap();
         let same_session_clone = same_session.clone();
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(

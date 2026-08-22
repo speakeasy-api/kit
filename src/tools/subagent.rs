@@ -34,6 +34,7 @@ struct State {
     updates: Option<SubagentUpdates>,
     retired: bool,
     harness: String,
+    model: Option<String>,
     kit: bool,
     child: ChildSession,
     _permit: OwnedSemaphorePermit,
@@ -140,6 +141,7 @@ impl Subagents {
         &self,
         prompt: String,
         harness: Option<String>,
+        model: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -159,6 +161,7 @@ impl Subagents {
             self.config.clone(),
             harness.clone(),
             persisted,
+            model.clone(),
             depth + 1,
             cancellation.clone(),
         )
@@ -172,6 +175,7 @@ impl Subagents {
                 updates: None,
                 retired: false,
                 harness,
+                model,
                 kit,
                 child: child.clone(),
                 _permit: permit,
@@ -270,9 +274,10 @@ impl Subagents {
         self.check_generation(&prior, source.generation)?;
         let id = session::new_id();
         let harness = source.harness.clone();
+        let model = source.model.clone();
         let kit = source.kit;
         let child = if source.child.supports_native_fork() {
-            let child = source.child.fork(&cancellation).await?;
+            let child = source.child.fork(model.as_deref(), &cancellation).await?;
             drop(source);
             child
         } else if kit {
@@ -285,6 +290,7 @@ impl Subagents {
                 self.config.clone(),
                 harness.clone(),
                 Some((id.clone(), true)),
+                model.clone(),
                 depth + 1,
                 cancellation.clone(),
             )
@@ -318,6 +324,7 @@ impl Subagents {
                 updates: updates.clone(),
                 retired: false,
                 harness,
+                model,
                 kit,
                 child,
                 _permit: permit,
@@ -580,7 +587,7 @@ fn call_id_schema() -> serde_json::Value {
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. `harness` is an override that selects a value other than the user's configured preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. `harness` and `model` can override the user's configured preferences for the new session.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"ACP model selection ID advertised by the selected harness. Applies only to this new session."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -640,6 +647,7 @@ impl CloseTool {
 struct Input {
     prompt: String,
     harness: Option<String>,
+    model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -762,6 +770,7 @@ impl Tool for SubagentTool {
                 .create(
                     input.prompt,
                     input.harness,
+                    input.model,
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -928,6 +937,7 @@ mod tests {
             updates: None,
             retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            model: None,
             kit: true,
             child: ChildSession::disconnected_for_test(),
             _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
@@ -979,6 +989,7 @@ mod tests {
             updates: None,
             retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            model: None,
             kit: true,
             child: ChildSession::disconnected_for_test(),
             _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
@@ -1138,6 +1149,7 @@ mod tests {
                 .create(
                     "first prompt".into(),
                     None,
+                    None,
                     0,
                     TurnCancellation::default(),
                     None,
@@ -1204,7 +1216,14 @@ mod tests {
             2,
         );
         let prior = manager
-            .create("base".into(), None, 0, TurnCancellation::default(), None)
+            .create(
+                "base".into(),
+                None,
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
             .await
             .unwrap();
 

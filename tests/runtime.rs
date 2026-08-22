@@ -91,6 +91,68 @@ return { found }"#,
 }
 
 #[tokio::test]
+async fn subagent_selects_an_advertised_acp_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "review".into(),
+        kit::AcpHarnessProfile {
+            command: "python3".into(),
+            args: vec![fixture.clone(), "--models".into()],
+            permissions: Default::default(),
+        },
+    )]))
+    .unwrap();
+    let runtime =
+        kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.review".into()).unwrap();
+
+    let outcome = execute_compose(
+        &runtime,
+        r#"child = subagent({ harness: "acp.review", model: "mock/requested", prompt: "MOCK_SELECTED_MODEL" })
+branch = fork({ subagent: child, prompt: "MOCK_SELECTED_MODEL" })
+return { child: child.output, branch: branch.output }"#,
+    )
+    .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("model-selecting subagent failed: {outcome:?}");
+    };
+    assert_eq!(
+        result.result.output,
+        ToolOutput::structured(json!({
+            "child": "mock/requested",
+            "branch": "mock/requested"
+        }))
+    );
+
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "review".into(),
+        kit::AcpHarnessProfile {
+            command: "python3".into(),
+            args: vec![fixture],
+            permissions: Default::default(),
+        },
+    )]))
+    .unwrap();
+    let runtime = kit::Runtime::with_acp_harnesses(
+        kit::Runtime::new(directory.path(), "gpt-5.4").unwrap(),
+        harnesses,
+        "acp.review".into(),
+    )
+    .unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"return subagent({ model: "mock/requested", prompt: "never runs" })"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Failed(error) = outcome else {
+        panic!("unsupported model selection unexpectedly succeeded: {outcome:?}");
+    };
+    assert!(format!("{error:?}").contains("does not advertise a selectable model session option"));
+}
+
+#[tokio::test]
 async fn structured_subagent_output_can_drive_runlet_control_flow() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
