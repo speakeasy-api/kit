@@ -62,24 +62,31 @@ Rules:
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
 - Do not mention compaction or the summary process."#;
 const SUMMARY_UPDATE: &str = r#"The prior checkpoint summarizes everything before the conversation. Merge both into one replacement checkpoint. Anything not carried forward is lost. Preserve objectives, constraints, user directives, decisions, and parallel workstreams unless they are finished and no longer useful. The conversation is newer and wins conflicts. Move resolved or completed work to the correct section, and update Objective and Next Move to the current state."#;
-// The TUI sends this model-invisible control input through ACP. NUL cannot be
-// entered in its editor, so an ordinary user prompt cannot collide with it.
-const MANUAL_PREFIX: &str = "\0kit:compact\0";
+const MANUAL_COMMAND: &str = "/compact";
 
-/// Encodes a manual-compaction request as an ACP text prompt. The mutator
-/// consumes the marker before provider dispatch and retains only `next`.
-pub fn manual_prompt(next: Option<&str>) -> String {
-    format!("{MANUAL_PREFIX}{}", next.unwrap_or_default())
-}
-
-fn manual_message(item: &Item) -> Option<&str> {
-    if item.kind != ItemKind::User || item.parts.len() != 1 {
+/// Recognizes exactly one raw command text part in a user item. Other
+/// parts may carry client-provided context. The mutator consumes the command
+/// before provider dispatch and retains only a trimmed suffix.
+fn manual_message(item: &Item) -> Option<(usize, &str)> {
+    if item.kind != ItemKind::User {
         return None;
     }
-    let Part::Text(text) = &item.parts[0] else {
-        return None;
-    };
-    text.text.strip_prefix(MANUAL_PREFIX)
+    let mut commands = item.parts.iter().enumerate().filter_map(|(index, part)| {
+        let Part::Text(text) = part else {
+            return None;
+        };
+        if text.text == MANUAL_COMMAND {
+            return Some((index, ""));
+        }
+        let suffix = text.text.strip_prefix(MANUAL_COMMAND)?;
+        suffix
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+            .then(|| (index, suffix.trim()))
+    });
+    let command = commands.next()?;
+    commands.next().is_none().then_some(command)
 }
 
 pub(crate) fn is_compaction_summary(item: &Item) -> bool {
@@ -387,7 +394,7 @@ impl CompactionStrategy for SummarizeForContinuation {
                     .transcript
                     .last()
                     .and_then(manual_message)
-                    .map(str::to_string)
+                    .map(|(part_index, suffix)| (part_index, suffix.to_string()))
             })
             .flatten();
         let marker_index = manual.as_ref().map(|_| request.transcript.len() - 1);
@@ -424,9 +431,9 @@ impl CompactionStrategy for SummarizeForContinuation {
                 replacement.push(previous);
             }
             replacement.extend(conversation);
-            if let Some(next) = manual.as_deref().filter(|next| !next.is_empty()) {
+            if let Some((part_index, next)) = manual.as_ref().filter(|(_, next)| !next.is_empty()) {
                 let marker = request.transcript.last().cloned().expect("manual marker");
-                replacement.push(user_message_from_marker(marker, next));
+                replacement.push(user_message_from_marker(marker, *part_index, next));
             }
             return Ok(CompactionResult::new(
                 replacement,
@@ -457,16 +464,19 @@ impl CompactionStrategy for SummarizeForContinuation {
         let mut replacement = bootstrap;
         replacement.extend(summary.items);
         replacement.extend_from_slice(recent);
-        if let Some(next) = manual.filter(|next| !next.is_empty()) {
+        if let Some((part_index, next)) = manual.filter(|(_, next)| !next.is_empty()) {
             let marker = request.transcript.last().cloned().expect("manual marker");
-            replacement.push(user_message_from_marker(marker, &next));
+            replacement.push(user_message_from_marker(marker, part_index, &next));
         }
         Ok(CompactionResult::new(replacement, head.len()))
     }
 }
 
-fn user_message_from_marker(mut marker: Item, message: &str) -> Item {
-    marker.parts = Item::text(ItemKind::User, message).parts;
+fn user_message_from_marker(mut marker: Item, part_index: usize, message: &str) -> Item {
+    let Some(Part::Text(text)) = marker.parts.get_mut(part_index) else {
+        unreachable!("manual command part must remain text");
+    };
+    text.text = message.to_string();
     marker
 }
 
@@ -836,7 +846,7 @@ mod tests {
             Item::text(ItemKind::System, "system"),
             Item::text(ItemKind::User, "old request"),
             Item::text(ItemKind::Assistant, "old answer"),
-            Item::text(ItemKind::User, manual_prompt(None)),
+            Item::text(ItemKind::User, MANUAL_COMMAND),
         ];
         let backend = FixedBackend;
         let mut context = CompactionContext::new().with_backend(&backend);
@@ -863,7 +873,13 @@ mod tests {
         let transcript = vec![
             Item::text(ItemKind::System, "system"),
             Item::text(ItemKind::Assistant, "recent answer"),
-            Item::text(ItemKind::User, manual_prompt(None)),
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("client-provided context"),
+                    Part::text(MANUAL_COMMAND),
+                ],
+            ),
         ];
         let backend = FixedBackend;
         let mut context = CompactionContext::new().with_backend(&backend);
@@ -897,7 +913,13 @@ mod tests {
             Item::text(ItemKind::System, "system"),
             Item::text(ItemKind::User, "old request"),
             Item::text(ItemKind::Assistant, "old answer"),
-            Item::text(ItemKind::User, manual_prompt(Some("next request"))),
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("client-provided context"),
+                    Part::text("/compact   next request  "),
+                ],
+            ),
         ];
         let backend = FixedBackend;
         let mut context = CompactionContext::new().with_backend(&backend);
@@ -911,7 +933,12 @@ mod tests {
 
         let next = result.transcript.last().unwrap();
         assert_eq!(next.kind, ItemKind::User);
-        let Part::Text(text) = &next.parts[0] else {
+        assert_eq!(next.parts.len(), 2);
+        let Part::Text(context) = &next.parts[0] else {
+            panic!("client context should remain text");
+        };
+        assert_eq!(context.text, "client-provided context");
+        let Part::Text(text) = &next.parts[1] else {
             panic!("next message should remain text");
         };
         assert_eq!(text.text, "next request");
@@ -1078,10 +1105,38 @@ mod tests {
     }
 
     #[test]
-    fn manual_prompt_triggers_without_usage() {
+    fn manual_command_requires_an_exact_raw_token() {
         assert_eq!(
-            manual_message(&Item::text(ItemKind::User, manual_prompt(None))),
-            Some("")
+            manual_message(&Item::text(ItemKind::User, MANUAL_COMMAND)),
+            Some((0, ""))
+        );
+        assert_eq!(
+            manual_message(&Item::text(ItemKind::User, "/compact  next request \n")),
+            Some((0, "next request"))
+        );
+        for near_miss in [" /compact", "/compactness", "/compact/now", "/Compact"] {
+            assert_eq!(
+                manual_message(&Item::text(ItemKind::User, near_miss)),
+                None,
+                "{near_miss:?}"
+            );
+        }
+        assert_eq!(
+            manual_message(&Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("client-provided context"),
+                    Part::text("/compact next request"),
+                ],
+            )),
+            Some((1, "next request"))
+        );
+        assert!(
+            manual_message(&Item::new(
+                ItemKind::User,
+                vec![Part::text("/compact"), Part::text("/compact again")],
+            ))
+            .is_none()
         );
     }
 

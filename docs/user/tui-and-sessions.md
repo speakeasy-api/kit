@@ -69,7 +69,7 @@ At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly
 
 ## Start a new session and compact from the TUI
 
-The TUI recognizes exact leading slash-command tokens:
+The TUI handles `/new`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
@@ -85,7 +85,7 @@ The TUI recognizes exact leading slash-command tokens:
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
-`/compact` requests compaction without starting an ordinary model turn. Used alone, it ends after compaction. Text following `/compact` is retained as the latest user message and starts the next turn after compaction. Commands are recognized only at the start of the input and only as exact tokens; `/newer`, a space before `/new`, and unknown slash commands are sent to the model unchanged.
+The ACP server advertises `compact` for every new session. The TUI submits `/compact` unchanged like any other prompt; the runtime consumes exactly one text part beginning with the exact raw token before model dispatch and permits other client-provided context parts. Used alone, it ends after compaction. Whitespace-trimmed text following `/compact` and any other context parts are retained as the latest user message and start the next turn after compaction. Leading whitespace, near-misses such as `/compactness`, prompts containing multiple `/compact` command parts, and unknown slash commands remain ordinary prompts. Local commands win if an advertised command has the same name.
 
 ## Persisted transcripts and session files
 

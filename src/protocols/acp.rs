@@ -3,12 +3,13 @@ use std::{collections::HashMap, sync::Arc};
 use agent_client_protocol::{Client, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
-    AutoDenyResolver, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
+    CloseSessionRequest, CloseSessionResponse, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason,
 };
 use agentkit_core::{
     CancellationController, FinishReason, Item, MetadataMap, SessionId as AgentkitSessionId,
@@ -26,6 +27,15 @@ use crate::{
 
 const MODEL_CONFIG_ID: &str = "model";
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+
+fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
+    SessionNotification::new(
+        session_id,
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AvailableCommand::new("compact", "Compact the session context"),
+        ])),
+    )
+}
 
 /// Kit-private ACP extension used by the bundled TUI to stop one detached call.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
@@ -135,7 +145,7 @@ impl Server {
         let (client, messages) = AcpClientHandle::channel();
         tokio::spawn(drain_client_messages(messages, connection.clone()));
         let (turn_states, turn_state_messages) = mpsc::unbounded_channel();
-        tokio::spawn(drain_turn_states(turn_state_messages, connection));
+        tokio::spawn(drain_turn_states(turn_state_messages, connection.clone()));
 
         let mut metadata = MetadataMap::new();
         metadata.insert("acp.cwd".into(), json!(request.cwd));
@@ -692,12 +702,16 @@ async fn serve_transport(
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
                     cx.spawn(async move {
-                        responder.respond_with_result(
-                            state
-                                .new_session(request, connection)
-                                .await
-                                .map_err(sdk_error),
-                        )
+                        let result = state.new_session(request, connection.clone()).await;
+                        let notification = result
+                            .as_ref()
+                            .ok()
+                            .map(|response| available_commands_update(response.session_id.clone()));
+                        responder.respond_with_result(result.map_err(sdk_error))?;
+                        if let Some(notification) = notification {
+                            connection.send_notification(notification)?;
+                        }
+                        Ok(())
                     })?;
                     Ok(())
                 }
@@ -853,6 +867,22 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn available_commands_advertises_only_compact() {
+        let notification = available_commands_update(agentkit_acp::SessionId::new("session"));
+        let SessionUpdate::AvailableCommandsUpdate(update) = notification.update else {
+            panic!("expected available commands update");
+        };
+        assert_eq!(
+            update
+                .available_commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["compact"]
+        );
+    }
 
     #[test]
     fn dropping_an_in_flight_binding_guard_releases_the_durable_identity() {
