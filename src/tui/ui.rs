@@ -1001,7 +1001,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lines: Vec<Line<'static>> = if app.editor.text().is_empty() {
         vec![Line::from(Span::styled("message kit…", theme::faint()))]
     } else {
-        prompt_lines(rows, app.editor.text())
+        prompt_lines(rows, app.editor.text(), &app.available_commands)
             .into_iter()
             .skip(first)
             .take(height)
@@ -1017,8 +1017,13 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ));
 }
 
-fn prompt_lines(rows: Vec<String>, input: &str) -> Vec<Line<'static>> {
-    let mut highlighted = command::known_token(input).map_or(0, |range| range.len());
+fn prompt_lines(
+    rows: Vec<String>,
+    input: &str,
+    available_commands: &[String],
+) -> Vec<Line<'static>> {
+    let mut highlighted =
+        command::known_token(input, available_commands).map_or(0, |range| range.len());
     rows.into_iter()
         .map(|row| {
             let prefix = highlighted.min(row.len());
@@ -1639,14 +1644,23 @@ mod tests {
 
     #[test]
     fn highlights_only_the_known_new_token() {
-        let known = prompt_lines(vec!["/new prompt".into()], "/new prompt");
+        let known = prompt_lines(vec!["/new prompt".into()], "/new prompt", &[]);
         assert_eq!(known[0].spans[0].content, "/new");
         assert_eq!(known[0].spans[0].style, crate::tui::theme::accent());
         assert_eq!(known[0].spans[1].content, " prompt");
 
-        let unknown = prompt_lines(vec!["/newer prompt".into()], "/newer prompt");
+        let unknown = prompt_lines(vec!["/newer prompt".into()], "/newer prompt", &[]);
         assert_eq!(unknown[0].spans.len(), 1);
         assert_eq!(unknown[0].spans[0].style, crate::tui::theme::text());
+
+        let advertised = vec!["compact".to_string()];
+        let dynamic = prompt_lines(
+            vec!["/compact prompt".into()],
+            "/compact prompt",
+            &advertised,
+        );
+        assert_eq!(dynamic[0].spans[0].content, "/compact");
+        assert_eq!(dynamic[0].spans[0].style, crate::tui::theme::accent());
     }
 
     #[test]
@@ -1654,7 +1668,7 @@ mod tests {
         let mut editor = crate::tui::editor::Editor::default();
         editor.insert_str("/new prompt");
         let (rows, _) = editor.wrapped(2);
-        let lines = prompt_lines(rows, editor.text());
+        let lines = prompt_lines(rows, editor.text(), &[]);
         let highlighted = lines
             .iter()
             .flat_map(|line| &line.spans)

@@ -62,16 +62,10 @@ Rules:
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
 - Do not mention compaction or the summary process."#;
 const SUMMARY_UPDATE: &str = r#"The prior checkpoint summarizes everything before the conversation. Merge both into one replacement checkpoint. Anything not carried forward is lost. Preserve objectives, constraints, user directives, decisions, and parallel workstreams unless they are finished and no longer useful. The conversation is newer and wins conflicts. Move resolved or completed work to the correct section, and update Objective and Next Move to the current state."#;
-// The TUI sends this model-invisible control input through ACP. NUL cannot be
-// entered in its editor, so an ordinary user prompt cannot collide with it.
-const MANUAL_PREFIX: &str = "\0kit:compact\0";
+const MANUAL_COMMAND: &str = "/compact";
 
-/// Encodes a manual-compaction request as an ACP text prompt. The mutator
-/// consumes the marker before provider dispatch and retains only `next`.
-pub fn manual_prompt(next: Option<&str>) -> String {
-    format!("{MANUAL_PREFIX}{}", next.unwrap_or_default())
-}
-
+/// Recognizes the exact raw command in a single text user item. The mutator
+/// consumes it before provider dispatch and retains only a trimmed suffix.
 fn manual_message(item: &Item) -> Option<&str> {
     if item.kind != ItemKind::User || item.parts.len() != 1 {
         return None;
@@ -79,7 +73,15 @@ fn manual_message(item: &Item) -> Option<&str> {
     let Part::Text(text) = &item.parts[0] else {
         return None;
     };
-    text.text.strip_prefix(MANUAL_PREFIX)
+    if text.text == MANUAL_COMMAND {
+        return Some("");
+    }
+    let suffix = text.text.strip_prefix(MANUAL_COMMAND)?;
+    suffix
+        .chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+        .then(|| suffix.trim())
 }
 
 pub(crate) fn is_compaction_summary(item: &Item) -> bool {
@@ -836,7 +838,7 @@ mod tests {
             Item::text(ItemKind::System, "system"),
             Item::text(ItemKind::User, "old request"),
             Item::text(ItemKind::Assistant, "old answer"),
-            Item::text(ItemKind::User, manual_prompt(None)),
+            Item::text(ItemKind::User, MANUAL_COMMAND),
         ];
         let backend = FixedBackend;
         let mut context = CompactionContext::new().with_backend(&backend);
@@ -863,7 +865,7 @@ mod tests {
         let transcript = vec![
             Item::text(ItemKind::System, "system"),
             Item::text(ItemKind::Assistant, "recent answer"),
-            Item::text(ItemKind::User, manual_prompt(None)),
+            Item::text(ItemKind::User, MANUAL_COMMAND),
         ];
         let backend = FixedBackend;
         let mut context = CompactionContext::new().with_backend(&backend);
@@ -897,7 +899,7 @@ mod tests {
             Item::text(ItemKind::System, "system"),
             Item::text(ItemKind::User, "old request"),
             Item::text(ItemKind::Assistant, "old answer"),
-            Item::text(ItemKind::User, manual_prompt(Some("next request"))),
+            Item::text(ItemKind::User, "/compact   next request  "),
         ];
         let backend = FixedBackend;
         let mut context = CompactionContext::new().with_backend(&backend);
@@ -1078,10 +1080,28 @@ mod tests {
     }
 
     #[test]
-    fn manual_prompt_triggers_without_usage() {
+    fn manual_command_requires_an_exact_raw_token() {
         assert_eq!(
-            manual_message(&Item::text(ItemKind::User, manual_prompt(None))),
+            manual_message(&Item::text(ItemKind::User, MANUAL_COMMAND)),
             Some("")
+        );
+        assert_eq!(
+            manual_message(&Item::text(ItemKind::User, "/compact  next request \n")),
+            Some("next request")
+        );
+        for near_miss in [" /compact", "/compactness", "/compact/now", "/Compact"] {
+            assert_eq!(
+                manual_message(&Item::text(ItemKind::User, near_miss)),
+                None,
+                "{near_miss:?}"
+            );
+        }
+        assert!(
+            manual_message(&Item::new(
+                ItemKind::User,
+                vec![Part::text("/compact"), Part::text("next request")],
+            ))
+            .is_none()
         );
     }
 

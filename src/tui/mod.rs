@@ -462,37 +462,6 @@ pub async fn run_with_reasoning_effort(
                                         });
                                     }));
                                 }
-                                Action::Compact(next_prompt) => {
-                                    let control = crate::compaction::manual_prompt(
-                                        next_prompt.as_deref(),
-                                    );
-                                    let turn_id = if let Some(prompt) = next_prompt {
-                                        app.push_user(prompt)
-                                    } else {
-                                        app.begin_compaction()
-                                    };
-                                    let connection = connection.clone();
-                                    let session = session_id.clone();
-                                    let updates = updates_tx.clone();
-                                    turn = Some(tokio::spawn(async move {
-                                        let outcome = connection
-                                            .send_request(agentkit_acp::PromptRequest::new(
-                                                session,
-                                                vec![ContentBlock::Text(
-                                                    agentkit_acp::TextContent::new(control),
-                                                )],
-                                            ))
-                                            .block_task()
-                                            .await;
-                                        let _ = updates.send(Update::TurnEnded {
-                                            id: Some(turn_id),
-                                            error: match outcome {
-                                                Ok(_) => None,
-                                                Err(error) => Some(error.to_string()),
-                                            },
-                                        });
-                                    }));
-                                }
                                 Action::New(first_prompt) => {
                                     // Idle-only key handling guarantees there is no active
                                     // turn to abandon. Await its completed task before closing
@@ -1068,6 +1037,7 @@ fn durable_session_id(session_id: &agentkit_acp::SessionId) -> Result<String, St
 
 /// Maps one ACP session notification onto client updates.
 fn translate(notification: SessionNotification) -> Vec<Update> {
+    let session_id = notification.session_id.to_string();
     match notification.update {
         SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
             .map(Update::Text)
@@ -1102,6 +1072,14 @@ fn translate(notification: SessionNotification) -> Vec<Update> {
                 backgrounded,
             }]
         }
+        SessionUpdate::AvailableCommandsUpdate(update) => vec![Update::AvailableCommands {
+            session_id,
+            commands: update
+                .available_commands
+                .into_iter()
+                .map(|command| command.name)
+                .collect(),
+        }],
         SessionUpdate::UsageUpdate(usage) => vec![Update::Usage {
             used: usage.used,
             size: usage.size,
@@ -1195,16 +1173,33 @@ mod tests {
     use std::path::PathBuf;
 
     use agentkit_acp::{
-        ContentBlock, SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption,
+        AvailableCommand, AvailableCommandsUpdate, ContentBlock, SessionConfigOption,
+        SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
     };
     use crossterm::event::Event;
 
     use super::{
         MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
         durable_session_id, effort_state, handle, message_of, osc52, prompt_blocks, readable,
-        refresh_config_state, save_effort_default_to, save_model_defaults_to,
+        refresh_config_state, save_effort_default_to, save_model_defaults_to, translate,
     };
-    use crate::tui::app::{App, SubmittedPrompt};
+    use crate::tui::app::{App, SubmittedPrompt, Update};
+
+    #[test]
+    fn translates_available_commands_with_their_session() {
+        let updates = translate(SessionNotification::new(
+            "session",
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("compact", "Compact context"),
+            ])),
+        ));
+
+        assert!(matches!(
+            updates.as_slice(),
+            [Update::AvailableCommands { session_id, commands }]
+                if session_id == "session" && commands == &["compact"]
+        ));
+    }
 
     #[test]
     fn dropped_shell_escaped_image_path_becomes_an_attachment() {

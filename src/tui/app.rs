@@ -54,6 +54,11 @@ pub enum Update {
         output: Vec<String>,
         backgrounded: bool,
     },
+    /// Agent-advertised slash commands for one session.
+    AvailableCommands {
+        session_id: String,
+        commands: Vec<String>,
+    },
     /// Context window accounting.
     Usage { used: u64, size: u64 },
     /// A nested tool call started or finished inside a compose run.
@@ -140,7 +145,6 @@ pub enum Action {
     None,
     Redraw,
     Submit(SubmittedPrompt),
-    Compact(Option<String>),
     New(Option<String>),
     SelectModel {
         choice: ModelChoice,
@@ -309,6 +313,7 @@ pub struct App {
     pub reasoning_effort: String,
     pub effort_choices: Vec<EffortChoice>,
     pub effort_dialog: Option<EffortDialog>,
+    pub available_commands: Vec<String>,
     pub a2a: String,
     pub session_id: Option<String>,
     pub blocks: Vec<Block>,
@@ -566,6 +571,7 @@ impl App {
             reasoning_effort: "default".into(),
             effort_choices: Vec::new(),
             effort_dialog: None,
+            available_commands: Vec::new(),
             a2a,
             session_id: None,
             blocks: Vec::new(),
@@ -923,6 +929,14 @@ impl App {
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::A2aAddress(address) => self.a2a = address,
+            Update::AvailableCommands {
+                session_id,
+                commands,
+            } => {
+                if self.session_id.as_deref() == Some(session_id.as_str()) {
+                    self.available_commands = commands;
+                }
+            }
             Update::Text(text) => {
                 self.close_thought();
                 if self.agent_stream_sealed {
@@ -1188,6 +1202,7 @@ impl App {
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
         self.session_id = Some(session_id);
+        self.available_commands.clear();
         self.blocks.clear();
         self.transcript_cache.clear();
         self.transcript_revisions.clear();
@@ -1221,13 +1236,6 @@ impl App {
 
     pub fn push_user(&mut self, prompt: String) -> u64 {
         self.push_block(Block::User(prompt));
-        self.begin_turn()
-    }
-
-    /// Starts a command-only compaction turn without adding the internal
-    /// control prompt to the visible transcript.
-    pub fn begin_compaction(&mut self) -> u64 {
-        self.compacting = true;
         self.begin_turn()
     }
 
@@ -1546,7 +1554,6 @@ impl App {
                 }
                 let input = self.editor.submit();
                 return match parse(&input) {
-                    Parsed::Compact { prompt } => Action::Compact(prompt.map(str::to_string)),
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Model { query: Some(query) } => match self.closest_model(query) {
                         Some(choice) => Action::SelectModel {
@@ -2148,6 +2155,40 @@ mod tests {
     }
 
     #[test]
+    fn available_command_updates_replace_the_session_set_and_clear_on_switch() {
+        let mut app = app();
+        app.start_session("one".into());
+        app.apply(Update::AvailableCommands {
+            session_id: "one".into(),
+            commands: vec!["compact".into(), "review".into()],
+        });
+        app.apply(Update::AvailableCommands {
+            session_id: "one".into(),
+            commands: vec!["compact".into()],
+        });
+        assert_eq!(app.available_commands, ["compact"]);
+
+        app.apply(Update::AvailableCommands {
+            session_id: "stale".into(),
+            commands: vec!["ignored".into()],
+        });
+        assert_eq!(app.available_commands, ["compact"]);
+
+        app.apply(Update::AvailableCommands {
+            session_id: "one".into(),
+            commands: Vec::new(),
+        });
+        assert!(app.available_commands.is_empty());
+        app.apply(Update::AvailableCommands {
+            session_id: "one".into(),
+            commands: vec!["compact".into()],
+        });
+
+        app.start_session("two".into());
+        assert!(app.available_commands.is_empty());
+    }
+
+    #[test]
     fn switching_sessions_clears_pending_attachments() {
         let mut app = app();
         app.attach(
@@ -2174,14 +2215,27 @@ mod tests {
     }
 
     #[test]
-    fn compact_command_carries_an_optional_next_prompt() {
+    fn advertised_compact_command_is_submitted_unchanged() {
         let mut app = app();
+        app.available_commands = vec!["compact".into()];
         app.paste("/compact continue with this");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        let Action::Compact(prompt) = app.handle_key(press(KeyCode::Enter)) else {
-            panic!("expected manual compaction");
+        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected an ordinary prompt");
         };
-        assert_eq!(prompt.as_deref(), Some("continue with this"));
+        assert_eq!(prompt.text, "/compact continue with this");
+    }
+
+    #[test]
+    fn local_commands_win_advertised_name_collisions() {
+        let mut app = app();
+        app.available_commands = vec!["new".into()];
+        app.paste("/new begin fresh");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::New(Some(prompt)) if prompt == "begin fresh"
+        ));
     }
 
     #[test]
