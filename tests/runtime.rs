@@ -83,7 +83,9 @@ return { found }"#,
     };
     assert_eq!(
         result.result.output,
-        ToolOutput::structured(json!({"found": {"servers": []}}))
+        ToolOutput::structured(
+            json!({"found": {"servers": [], "total_matched": 0, "total_returned": 0, "truncated": false}})
+        )
     );
 
     let outcome = execute_compose(&runtime, r#"return tool({ name: "shell", args: {} })"#).await;

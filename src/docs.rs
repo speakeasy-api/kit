@@ -309,7 +309,7 @@ mod tests {
     const DOCUMENTS: &[Document<'_>] = &[
         Document {
             path: "docs/user/mcp.md",
-            content: "# MCP setup\n\nThe config reloads before tool_search and auth. Servers connect lazily when tool_search matches their configured name or capability-rich description; use mcp to initialize all. Remote Streamable HTTP servers infer OAuth from a WWW-Authenticate Bearer challenge, so an explicit auth block is optional and only supplies client or scope overrides. Stdio servers do not use OAuth.\n\n## OAuth failures\n\nIf a server reports authentication_required, call auth and open the returned URL. The originating ACP session resumes when the callback completes. One-shot prompt preserves authentication_required status but cannot launch interactive authentication.",
+            content: "# MCP setup\n\nAll configured servers start connecting in the background at startup using stored credentials only. The config reloads before tool_search and auth, and tool_search waits for any servers that are still uninitialized before searching every connected server's tools globally; the exact query mcp returns a compact server-status list and reports any cap-driven tail omission. Remote Streamable HTTP servers infer OAuth from a WWW-Authenticate Bearer challenge, so an explicit auth block is optional and only supplies client or scope overrides. Stdio servers do not use OAuth.\n\n## OAuth failures\n\nIf a server reports authentication_required, call auth and open the returned URL. The originating ACP session resumes when the callback completes. One-shot prompt preserves authentication_required status but cannot launch interactive authentication.",
         },
         Document {
             path: "docs/user/sessions.md",

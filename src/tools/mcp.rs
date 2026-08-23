@@ -32,6 +32,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore, mpsc, oneshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+const SEARCH_RESULT_LIMIT: usize = 5;
+const SEARCH_MIN_SCORE: u32 = 60;
+const SEARCH_RESULT_BYTE_CAP: usize = 32_768;
+const SEARCH_SERVER_TEXT_BYTE_CAP: usize = 1_024;
 const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3_600;
 // These messages are part of the pinned agentkit-mcp 0.10.6 adapter contract.
 // Revalidate them before upgrading that dependency.
@@ -860,7 +864,7 @@ pub async fn connect(
             credential_storage: credential_storage.clone(),
         },
     )));
-    Ok(McpRuntime::new(
+    let runtime = McpRuntime::new(
         manager,
         servers,
         challenges,
@@ -874,7 +878,9 @@ pub async fn connect(
             plugin_entries,
         },
         interactive_oauth_enabled,
-    ))
+    );
+    runtime.spawn_eager_initialization();
+    Ok(runtime)
 }
 
 impl McpRuntime {
@@ -1149,113 +1155,178 @@ impl McpRuntime {
         Ok(())
     }
 
-    async fn initialize_server(&self, name: &str) {
+    fn spawn_eager_initialization(&self) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.initialize_uninitialized().await;
+        });
+    }
+
+    async fn initialize_uninitialized(&self) {
+        let names = self
+            .inner
+            .servers
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.initialize_servers(&names).await;
+    }
+
+    /// Connects every named server that is still `Uninitialized`: stored
+    /// OAuth credentials are restored in parallel, then all connections
+    /// settle concurrently. Never starts interactive authorization.
+    async fn initialize_servers(&self, names: &[String]) {
         let _initialization = self.inner.initialization.lock().await;
-        let Some(record) = self.inner.servers.read().await.get(name).cloned() else {
-            return;
+        let records = {
+            let servers = self.inner.servers.read().await;
+            names
+                .iter()
+                .filter_map(|name| {
+                    servers
+                        .get(name)
+                        .map(|record| (name.clone(), record.clone()))
+                })
+                .filter(|(_, record)| matches!(record.status, ServerStatus::Uninitialized))
+                .collect::<Vec<_>>()
         };
-        if !matches!(record.status, ServerStatus::Uninitialized) {
+        if records.is_empty() {
             return;
         }
-
-        if let Some(resource_url) = record.url.as_deref()
-            && !record.static_authorization
-            && self.inner.credential_storage.is_persistent()
-        {
-            let oauth = record.oauth.clone().unwrap_or_default();
-            let restored =
-                match auth::restore(resource_url, &oauth, &self.inner.credential_storage).await {
-                    Ok(restored) => restored,
-                    Err(error) => {
-                        self.set_status(name, ServerStatus::Error(error)).await;
-                        return;
+        let restores = futures_util::future::join_all(records.iter().map(|(name, record)| {
+            let credential_storage = self.inner.credential_storage.clone();
+            async move {
+                let restore = match record.url.as_deref() {
+                    Some(resource_url)
+                        if !record.static_authorization && credential_storage.is_persistent() =>
+                    {
+                        let oauth = record.oauth.clone().unwrap_or_default();
+                        Some(auth::restore(resource_url, &oauth, &credential_storage).await)
                     }
+                    _ => None,
                 };
-            if let Some((token, oauth_manager)) = restored {
-                let request = connect_auth_request(name);
-                let mut credentials = MetadataMap::new();
-                credentials.insert("access_token".into(), Value::String(token.clone()));
-                let result = {
-                    let mut manager = self.inner.manager.lock().await;
-                    match manager
-                        .resolve_auth(AuthResolution::provided(request, credentials))
+                (name.clone(), restore)
+            }
+        }))
+        .await;
+
+        let mut connectable = Vec::new();
+        let mut restored = BTreeMap::new();
+        let mut failures = Vec::new();
+        for (name, restore) in restores {
+            match restore {
+                None | Some(Ok(None)) => connectable.push(name),
+                Some(Ok(Some((token, oauth_manager)))) => {
+                    restored.insert(name.clone(), (token, oauth_manager));
+                    connectable.push(name);
+                }
+                Some(Err(error)) => failures.push((name, error)),
+            }
+        }
+
+        let settled = {
+            let mut manager = self.inner.manager.lock().await;
+            let mut to_connect = Vec::new();
+            for name in connectable {
+                if let Some((token, _)) = restored.get(&name) {
+                    let mut credentials = MetadataMap::new();
+                    credentials.insert("access_token".into(), Value::String(token.clone()));
+                    if let Err(error) = manager
+                        .resolve_auth(AuthResolution::provided(
+                            connect_auth_request(&name),
+                            credentials,
+                        ))
                         .await
                     {
-                        Ok(()) => manager.connect_server(&McpServerId::new(name)).await,
-                        Err(error) => {
-                            self.set_status(
-                                name,
-                                ServerStatus::Error(format!(
-                                    "could not restore MCP credentials for {name}: {error}"
-                                )),
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                };
-                self.inner.oauth_sessions.lock().await.insert(
-                    name.to_string(),
-                    Arc::new(OAuthSession::new(oauth_manager, token)),
-                );
-                match result {
-                    Ok(_) => self.set_status(name, ServerStatus::Connected).await,
-                    Err(McpError::AuthRequired(request)) => {
-                        self.inner
-                            .challenges
-                            .lock()
-                            .await
-                            .insert(name.to_string(), *request);
-                        self.set_status(name, ServerStatus::AuthenticationRequired)
-                            .await;
-                    }
-                    Err(error) => {
-                        self.set_status(
-                            name,
-                            ServerStatus::Error(format!(
-                                "could not connect MCP server {name} with stored credentials: {error}"
-                            )),
-                        )
-                        .await;
+                        restored.remove(&name);
+                        failures.push((
+                            name.clone(),
+                            format!("could not restore MCP credentials for {name}: {error}"),
+                        ));
+                        continue;
                     }
                 }
-                return;
+                to_connect.push(name);
+            }
+            manager.connect_servers_settled(to_connect).await
+        };
+
+        let restored_names = restored.keys().cloned().collect::<BTreeSet<_>>();
+        {
+            let mut sessions = self.inner.oauth_sessions.lock().await;
+            for (name, (token, oauth_manager)) in restored {
+                sessions.insert(name, Arc::new(OAuthSession::new(oauth_manager, token)));
             }
         }
 
-        let result = self
-            .inner
-            .manager
-            .lock()
-            .await
-            .connect_server(&McpServerId::new(name))
-            .await;
-        match result {
-            Ok(_) => self.set_status(name, ServerStatus::Connected).await,
-            Err(McpError::AuthRequired(_)) if record.static_authorization => {
-                self.set_status(
-                    name,
-                    ServerStatus::Error(format!(
-                        "MCP server {name} rejected its configured static authorization"
-                    )),
-                )
-                .await;
-            }
-            Err(McpError::AuthRequired(request)) => {
-                self.inner
-                    .challenges
-                    .lock()
-                    .await
-                    .insert(name.to_string(), *request);
-                self.set_status(name, ServerStatus::AuthenticationRequired)
+        let fingerprints = records
+            .iter()
+            .map(|(name, record)| (name.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let (connected, failed) = settled.into_parts();
+        for handle in connected {
+            let name = handle.server_id().to_string();
+            if let Some(record) = fingerprints.get(&name) {
+                self.set_status_checked(&name, &record.fingerprint, ServerStatus::Connected)
                     .await;
             }
-            Err(error) => {
-                self.set_status(
-                    name,
-                    ServerStatus::Error(format!("could not connect MCP server {name}: {error}")),
-                )
-                .await;
+        }
+        for failure in failed {
+            let name = failure.server_id.to_string();
+            let Some(record) = fingerprints.get(&name) else {
+                continue;
+            };
+            match failure.error {
+                McpError::AuthRequired(_) if record.static_authorization => {
+                    self.set_status_checked(
+                        &name,
+                        &record.fingerprint,
+                        ServerStatus::Error(format!(
+                            "MCP server {name} rejected its configured static authorization"
+                        )),
+                    )
+                    .await;
+                }
+                McpError::AuthRequired(request) => {
+                    self.inner
+                        .challenges
+                        .lock()
+                        .await
+                        .insert(name.clone(), *request);
+                    self.set_status_checked(
+                        &name,
+                        &record.fingerprint,
+                        ServerStatus::AuthenticationRequired,
+                    )
+                    .await;
+                }
+                error if restored_names.contains(&name) => {
+                    self.set_status_checked(
+                        &name,
+                        &record.fingerprint,
+                        ServerStatus::Error(format!(
+                            "could not connect MCP server {name} with stored credentials: {error}"
+                        )),
+                    )
+                    .await;
+                }
+                error => {
+                    self.set_status_checked(
+                        &name,
+                        &record.fingerprint,
+                        ServerStatus::Error(format!(
+                            "could not connect MCP server {name}: {error}"
+                        )),
+                    )
+                    .await;
+                }
+            }
+        }
+        for (name, error) in failures {
+            if let Some(record) = fingerprints.get(&name) {
+                self.set_status_checked(&name, &record.fingerprint, ServerStatus::Error(error))
+                    .await;
             }
         }
     }
@@ -1265,76 +1336,19 @@ impl McpRuntime {
             ToolError::InvalidInput("query must contain a letter or number".into())
         })?;
         self.reload_config().await.map_err(ToolError::Unavailable)?;
-        let wildcard = query == "mcp";
-        let configured = self.inner.servers.read().await.clone();
-        for (name, record) in &configured {
-            let server_spec = PreparedSpec::new(ToolSpec::new(
-                ToolName::new(name),
-                &record.description,
-                json!({"type":"object"}),
-            ));
-            if wildcard
-                || score_spec(
-                    &prepared,
-                    &server_spec,
-                    &vec![false; prepared.0.tokens.len()],
-                )
-                .is_some()
-            {
-                self.initialize_server(name).await;
-            }
-        }
+        self.initialize_uninitialized().await;
         let records = self.inner.servers.read().await.clone();
         let manager = self.inner.manager.lock().await;
-        let mut groups = Vec::new();
-
-        for (name, record) in records {
-            let server_spec = PreparedSpec::new(ToolSpec::new(
-                ToolName::new(&name),
-                &record.description,
-                json!({"type":"object"}),
-            ));
-            let server_matches = wildcard
-                || score_spec(
-                    &prepared,
-                    &server_spec,
-                    &vec![false; prepared.0.tokens.len()],
-                )
-                .is_some();
-            let specs = manager
-                .connected_server(&McpServerId::new(&name))
-                .map(|handle| handle.tool_registry().specs())
-                .unwrap_or_default();
-            let mut tools = search_specs(specs.clone(), query)?;
-            if server_matches && tools.len() < 20 {
-                let mut names = tools
-                    .iter()
-                    .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect::<BTreeSet<_>>();
-                tools.extend(spec_values(
-                    specs
-                        .into_iter()
-                        .filter(|spec| names.insert(spec.name.0.clone()))
-                        .collect(),
-                    20 - tools.len(),
-                ));
-            }
-            if server_matches || !tools.is_empty() {
-                let status = record.status.as_str();
-                let mut group = json!({
-                    "name": name,
-                    "description": record.description,
-                    "status": status,
-                    "tools": tools
-                });
-                if let ServerStatus::Error(error) = record.status {
-                    group["error"] = Value::String(error);
-                }
-                groups.push(group);
-            }
-        }
-        Ok(json!({"servers": groups}))
+        let available = records
+            .keys()
+            .filter_map(|name| {
+                manager
+                    .connected_server(&McpServerId::new(name))
+                    .map(|handle| (name.clone(), handle.tool_registry().specs()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        drop(manager);
+        Ok(render_search(&prepared, &records, &available))
     }
 
     async fn authorize(&self, name: &str, session_id: String) -> Result<Value, ToolError> {
@@ -1353,7 +1367,7 @@ impl McpRuntime {
             ));
         }
         let _reload = self.inner.reload.lock().await;
-        self.initialize_server(name).await;
+        self.initialize_servers(&[name.to_string()]).await;
         let _setup = self.inner.auth_setup.lock().await;
         if let Some(pending) = self.inner.pending.lock().await.get(name).cloned() {
             let remaining = pending
@@ -1597,6 +1611,14 @@ impl McpRuntime {
             record.status = status;
         }
     }
+
+    async fn set_status_checked(&self, name: &str, fingerprint: &[u8], status: ServerStatus) {
+        if let Some(record) = self.inner.servers.write().await.get_mut(name)
+            && record.fingerprint == fingerprint
+        {
+            record.status = status;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1611,10 +1633,37 @@ impl ToolSearch {
             runtime,
             spec: ToolSpec::new(
                 ToolName::new("tool_search"),
-                "Reload the MCP config, then search configured server names and descriptions plus discovered tool names. Matching servers connect lazily; use `mcp` to initialize and list all servers. Before first connection, only the configured name and description are searchable.",
-                json!({"type":"object","properties":{"query":{"type":"string","description":"Capability, product, server, or tool keywords. Use `mcp` to list all configured servers."}},"required":["query"],"additionalProperties":false}),
+                "Reload the MCP config, finish connecting any servers still initializing, then rank every connected server's tools globally and return at most 5 precise matches with input schemas, grouped by server with match counts. Strongly matching servers that need authentication or failed to connect are listed without tools. The exact query `mcp` instead returns a compact status list, with omission counts if the response cap excludes tail entries.",
+                json!({"type":"object","properties":{"query":{"type":"string","description":"Capability, product, server, or tool keywords. The exact query `mcp` lists configured server statuses, subject to the reported response cap."}},"required":["query"],"additionalProperties":false}),
             )
-            .with_output_schema(json!({"type":"object","properties":{"servers":{"type":"array","items":{"type":"object"}}},"required":["servers"],"additionalProperties":false})),
+            .with_output_schema(json!({
+                "type":"object",
+                "properties":{
+                    "servers":{"type":"array","items":{
+                        "type":"object",
+                        "properties":{
+                            "name":{"type":"string"},
+                            "description":{"type":"string"},
+                            "status":{"type":"string"},
+                            "error":{"type":"string"},
+                            "available_tool_count":{"type":["integer","null"]},
+                            "matched_tool_count":{"type":"integer"},
+                            "returned_tool_count":{"type":"integer"},
+                            "truncated":{"type":"boolean"},
+                            "tools":{"type":"array","items":{"type":"object"}}
+                        },
+                        "required":["name","description","status","available_tool_count"],
+                        "additionalProperties":false
+                    }},
+                    "total_matched":{"type":"integer"},
+                    "total_returned":{"type":"integer"},
+                    "total_servers":{"type":"integer"},
+                    "returned_servers":{"type":"integer"},
+                    "truncated":{"type":"boolean"}
+                },
+                "required":["servers"],
+                "additionalProperties":false
+            })),
         }
     }
 }
@@ -2200,47 +2249,229 @@ fn score_spec(query: &PreparedQuery, spec: &PreparedSpec, fuzzy: &[bool]) -> Opt
     Some(score)
 }
 
-fn search_specs(specs: Vec<ToolSpec>, query: &str) -> Result<Vec<Value>, ToolError> {
-    let query = PreparedQuery::new(query)
-        .ok_or_else(|| ToolError::InvalidInput("query must contain a letter or number".into()))?;
-    let specs = specs.into_iter().map(PreparedSpec::new).collect::<Vec<_>>();
+/// Returns whether the query matches the spec's name: either the whole
+/// query appears in the name, or a query term hits a name token.
+fn name_matched(query: &PreparedQuery, spec: &PreparedSpec) -> bool {
+    spec.name.normalized.contains(&query.0.normalized)
+        || query
+            .0
+            .tokens
+            .iter()
+            .any(|term| regular_term_score(term, spec) >= 100)
+}
+
+/// Scores a spec against the query with the high-precision gates applied:
+/// the ranked score must reach `SEARCH_MIN_SCORE`, and the spec must either
+/// match every query term or match the query in its name.
+fn matched_score(query: &PreparedQuery, spec: &PreparedSpec, fuzzy: &[bool]) -> Option<u32> {
+    let score = score_spec(query, spec, fuzzy)?;
+    if score < SEARCH_MIN_SCORE {
+        return None;
+    }
+    let full_coverage = query.0.tokens.iter().enumerate().all(|(index, term)| {
+        regular_term_score(term, spec) > 0 || fuzzy[index] && fuzzy_term_score(term, spec) > 0
+    });
+    (full_coverage || name_matched(query, spec)).then_some(score)
+}
+
+fn bounded_server_text(value: &str) -> &str {
+    if value.len() <= SEARCH_SERVER_TEXT_BYTE_CAP {
+        return value;
+    }
+    let mut end = SEARCH_SERVER_TEXT_BYTE_CAP;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// Renders the `tool_search` response from a snapshot of the configured
+/// server records and each connected server's tool specs. The exact query
+/// `mcp` produces the compact server listing; every other query ranks all
+/// connected tools globally and returns at most `SEARCH_RESULT_LIMIT` of
+/// them. Both modes drop tail results until the serialized response fits
+/// `SEARCH_RESULT_BYTE_CAP`.
+fn render_search(
+    query: &PreparedQuery,
+    records: &BTreeMap<String, ServerRecord>,
+    available: &BTreeMap<String, Vec<ToolSpec>>,
+) -> Value {
+    if query.0.normalized == "mcp" {
+        let total_servers = records.len();
+        let mut servers = records
+            .iter()
+            .map(|(name, record)| {
+                let mut entry = json!({
+                    "name": name,
+                    "description": bounded_server_text(&record.description),
+                    "status": record.status.as_str(),
+                    "available_tool_count": available.get(name).map(Vec::len),
+                });
+                if let ServerStatus::Error(error) = &record.status {
+                    entry["error"] = Value::String(bounded_server_text(error).into());
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let response = json!({
+                "returned_servers": servers.len(),
+                "servers": servers,
+                "total_servers": total_servers,
+                "truncated": servers.len() < total_servers,
+            });
+            if serde_json::to_vec(&response)
+                .expect("search results serialize")
+                .len()
+                <= SEARCH_RESULT_BYTE_CAP
+            {
+                return response;
+            }
+            assert!(
+                servers.pop().is_some(),
+                "empty compact search response exceeds byte cap"
+            );
+        }
+    }
+
+    let catalog = available
+        .iter()
+        .flat_map(|(name, specs)| {
+            specs
+                .iter()
+                .map(move |spec| (name.clone(), PreparedSpec::new(spec.clone())))
+        })
+        .collect::<Vec<_>>();
     let fuzzy = query
         .0
         .tokens
         .iter()
-        .map(|term| !specs.iter().any(|spec| regular_term_score(term, spec) > 0))
+        .map(|term| {
+            !catalog
+                .iter()
+                .any(|(_, spec)| regular_term_score(term, spec) > 0)
+        })
         .collect::<Vec<_>>();
-    let mut matches = specs
-        .into_iter()
-        .filter_map(|spec| score_spec(&query, &spec, &fuzzy).map(|score| (score, spec.spec)))
+    let mut candidates = catalog
+        .iter()
+        .filter_map(|(server, spec)| {
+            matched_score(query, spec, &fuzzy).map(|score| (server, spec, score))
+        })
         .collect::<Vec<_>>();
-    matches.sort_by(|(left_score, left), (right_score, right)| {
+    if let Some(top) = candidates.iter().map(|(_, _, score)| *score).max() {
+        candidates.retain(|(_, _, score)| score * 3 >= top);
+    }
+    candidates.sort_by(|(_, left, left_score), (_, right, right_score)| {
         right_score
             .cmp(left_score)
-            .then_with(|| left.name.0.cmp(&right.name.0))
+            .then_with(|| left.spec.name.0.cmp(&right.spec.name.0))
     });
-    Ok(spec_values(
-        matches.into_iter().map(|(_, spec)| spec).collect(),
-        20,
-    ))
-}
 
-fn spec_values(specs: Vec<ToolSpec>, limit: usize) -> Vec<Value> {
-    specs
-        .into_iter()
-        .take(limit)
-        .map(|spec| {
-            let mut value = json!({
-                "name":spec.name.0,
-                "description":spec.description,
-                "input_schema":spec.input_schema
-            });
-            if let Some(output) = spec.output_schema {
-                value["output_schema"] = output;
-            }
-            value
+    let mut matched = BTreeMap::<&str, usize>::new();
+    for (server, _, _) in &candidates {
+        *matched.entry(server.as_str()).or_default() += 1;
+    }
+    // A server without returned tools appears only when non-connected and on
+    // a strong name match, so a description-only hit cannot surface
+    // unrelated auth/error servers. Strong groups are appended after the
+    // returned-tool groups, ordered by score then name.
+    let mut strong_servers = records
+        .iter()
+        .filter(|(_, record)| !matches!(record.status, ServerStatus::Connected))
+        .filter_map(|(name, record)| {
+            let spec = PreparedSpec::new(ToolSpec::new(
+                ToolName::new(name.as_str()),
+                &record.description,
+                json!({"type":"object"}),
+            ));
+            name_matched(query, &spec).then(|| {
+                let score = score_spec(query, &spec, &vec![false; query.0.tokens.len()]);
+                (name.clone(), score.unwrap_or(0))
+            })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    strong_servers.sort_by(|(left, left_score), (right, right_score)| {
+        right_score.cmp(left_score).then_with(|| left.cmp(right))
+    });
+
+    let group_for = |name: &str, tools: Vec<Value>| {
+        let record = &records[name];
+        let matched_count = matched.get(name).copied().unwrap_or(0);
+        let mut group = json!({
+            "name": name,
+            "description": bounded_server_text(&record.description),
+            "status": record.status.as_str(),
+            "available_tool_count": available.get(name).map(Vec::len),
+            "matched_tool_count": matched_count,
+            "returned_tool_count": tools.len(),
+            "truncated": tools.len() < matched_count,
+            "tools": tools,
+        });
+        if let ServerStatus::Error(error) = &record.status {
+            group["error"] = Value::String(bounded_server_text(error).into());
+        }
+        group
+    };
+
+    let mut returned = candidates
+        .iter()
+        .take(SEARCH_RESULT_LIMIT)
+        .collect::<Vec<_>>();
+    let total_strong_servers = strong_servers.len();
+    let mut returned_strong_servers = total_strong_servers;
+    loop {
+        // Group the currently returned tools by server, ordered by each
+        // server's best globally ranked returned candidate.
+        let mut server_order = Vec::<&str>::new();
+        let mut returned_by_server = BTreeMap::<&str, Vec<Value>>::new();
+        for (server, spec, _) in &returned {
+            let tools = match returned_by_server.entry(server.as_str()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    server_order.push(server.as_str());
+                    entry.insert(Vec::new())
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            };
+            tools.push(json!({
+                "name": spec.spec.name.0,
+                "description": spec.spec.description,
+                "input_schema": spec.spec.input_schema,
+            }));
+        }
+        let groups = server_order
+            .iter()
+            .map(|name| {
+                let tools = returned_by_server.remove(name).unwrap_or_default();
+                group_for(name, tools)
+            })
+            .chain(
+                strong_servers[..returned_strong_servers]
+                    .iter()
+                    .map(|(name, _)| group_for(name, Vec::new())),
+            )
+            .collect::<Vec<_>>();
+        let response = json!({
+            "servers": groups,
+            "total_matched": candidates.len(),
+            "total_returned": returned.len(),
+            "truncated": returned.len() < candidates.len()
+                || returned_strong_servers < total_strong_servers,
+        });
+        let serialized = serde_json::to_vec(&response)
+            .expect("search results serialize")
+            .len();
+        if serialized <= SEARCH_RESULT_BYTE_CAP {
+            return response;
+        }
+        if returned_strong_servers > 0 {
+            returned_strong_servers -= 1;
+        } else {
+            assert!(
+                returned.pop().is_some(),
+                "empty search response exceeds byte cap"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2265,10 +2496,10 @@ mod tests {
 
     use super::{
         AuthRecorder, Config, CredentialStorage, McpTool, OAuthSession, OpportunisticRefresh,
-        ReplayCleanup, ServerRecord, ServerStatus, agentkit_auth_not_applied,
-        agentkit_replay_rejected, can_opportunistically_refresh,
-        challenge_requires_interactive_authorization, prepare_plugins, search_specs,
-        serializes_tool_calls, validate_server_names,
+        PreparedQuery, PreparedSpec, ReplayCleanup, ServerRecord, ServerStatus,
+        agentkit_auth_not_applied, agentkit_replay_rejected, can_opportunistically_refresh,
+        challenge_requires_interactive_authorization, matched_score, prepare_plugins,
+        regular_term_score, serializes_tool_calls, validate_server_names,
     };
     use crate::plugins::ResolvedPluginMcp;
 
@@ -2276,10 +2507,20 @@ mod tests {
         ToolSpec::new(ToolName::new(name), description, json!({"type": "object"}))
     }
 
-    fn names(results: &[serde_json::Value]) -> Vec<&str> {
-        results
+    fn matched(query: &str, specs: Vec<ToolSpec>) -> Vec<(String, u32)> {
+        let query = PreparedQuery::new(query).unwrap();
+        let specs = specs.into_iter().map(PreparedSpec::new).collect::<Vec<_>>();
+        let fuzzy = query
+            .0
+            .tokens
             .iter()
-            .map(|result| result["name"].as_str().unwrap())
+            .map(|term| !specs.iter().any(|spec| regular_term_score(term, spec) > 0))
+            .collect::<Vec<_>>();
+        specs
+            .iter()
+            .filter_map(|spec| {
+                matched_score(&query, spec, &fuzzy).map(|score| (spec.spec.name.0.clone(), score))
+            })
             .collect()
     }
 
@@ -2762,28 +3003,303 @@ mod tests {
     }
 
     #[test]
-    fn search_treats_llm_queries_as_ranked_keyword_bags() {
-        let results = search_specs(
+    fn matching_requires_a_name_hit_or_full_term_coverage() {
+        // A partial description hit no longer pulls in unrelated tools: the
+        // query must match the name or cover every term.
+        assert!(
+            matched(
+                "gmail email capabilities",
+                vec![spec("mcp_jira_search", "Search email threads")]
+            )
+            .is_empty()
+        );
+
+        // A name hit passes even when other query terms miss.
+        let results = matched(
+            "gmail send unrelatedterm",
+            vec![spec("mcp_gmail_send_email", "Send an email")],
+        );
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1 >= super::SEARCH_MIN_SCORE);
+
+        // Full term coverage passes without a name hit when the score is
+        // strong enough.
+        let results = matched(
+            "project tracker",
+            vec![spec("mcp_pm_create", "Create issues in a project tracker")],
+        );
+        assert_eq!(results.len(), 1);
+
+        // Tools matching no term are never returned.
+        assert!(matched("gmail", vec![spec("mcp_echo", "Echo text")]).is_empty());
+    }
+
+    fn search_record(description: &str, status: ServerStatus) -> ServerRecord {
+        ServerRecord {
+            description: description.into(),
+            url: None,
+            oauth: None,
+            static_authorization: false,
+            fingerprint: vec![1],
+            status,
+        }
+    }
+
+    fn query(value: &str) -> PreparedQuery {
+        PreparedQuery::new(value).unwrap()
+    }
+
+    #[test]
+    fn unconnected_servers_appear_only_on_a_name_match() {
+        let records = BTreeMap::from([(
+            "linear".to_string(),
+            search_record(
+                "Issues and project management",
+                ServerStatus::AuthenticationRequired,
+            ),
+        )]);
+        let available = BTreeMap::new();
+
+        // Full description coverage is not enough for a server without
+        // returned tools.
+        let response =
+            super::render_search(&query("issues project management"), &records, &available);
+        assert_eq!(response["servers"], json!([]));
+        assert_eq!(response["total_matched"], 0);
+
+        let response = super::render_search(&query("linear"), &records, &available);
+        assert_eq!(response["servers"][0]["name"], "linear");
+        assert_eq!(response["servers"][0]["status"], "authentication_required");
+        assert_eq!(response["servers"][0]["available_tool_count"], Value::Null);
+        assert_eq!(response["servers"][0]["tools"], json!([]));
+    }
+
+    #[test]
+    fn search_returns_at_most_five_tools_globally_with_counts() {
+        let records = BTreeMap::from([(
+            "issues".to_string(),
+            search_record("Issue tracker", ServerStatus::Connected),
+        )]);
+        let specs = (0..8)
+            .map(|index| {
+                spec(
+                    &format!("mcp_issues_tool{index}"),
+                    "Create linear issue records",
+                )
+                .with_output_schema(json!({"type": "object"}))
+            })
+            .collect::<Vec<_>>();
+        let available = BTreeMap::from([("issues".to_string(), specs)]);
+
+        let response = super::render_search(&query("linear issues"), &records, &available);
+        assert_eq!(response["total_matched"], 8);
+        assert_eq!(response["total_returned"], 5);
+        assert_eq!(response["truncated"], true);
+        let group = &response["servers"][0];
+        assert_eq!(group["available_tool_count"], 8);
+        assert_eq!(group["matched_tool_count"], 8);
+        assert_eq!(group["returned_tool_count"], 5);
+        assert_eq!(group["truncated"], true);
+        let tools = group["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 5);
+        assert_eq!(tools[0]["name"], "mcp_issues_tool0");
+        assert!(tools[0].get("input_schema").is_some());
+        assert!(
+            tools[0].get("output_schema").is_none(),
+            "output schemas are omitted from search results"
+        );
+    }
+
+    #[test]
+    fn server_groups_follow_global_rank_and_require_a_returned_tool() {
+        let records = BTreeMap::from([
+            (
+                "alpha".to_string(),
+                search_record("File helpers", ServerStatus::Connected),
+            ),
+            (
+                "omega".to_string(),
+                search_record("More file helpers", ServerStatus::Connected),
+            ),
+            (
+                "zeta".to_string(),
+                search_record("Best file helpers", ServerStatus::Connected),
+            ),
+            (
+                "files-hub".to_string(),
+                search_record("Remote files", ServerStatus::AuthenticationRequired),
+            ),
+        ]);
+        let available = BTreeMap::from([
+            (
+                "alpha".to_string(),
+                (1..=5)
+                    .map(|index| spec(&format!("mcp_alpha_files{index}"), "Work with files"))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "omega".to_string(),
+                vec![spec("mcp_omega_files9", "Work with files")],
+            ),
+            (
+                "zeta".to_string(),
+                vec![spec("mcp_zeta_files", "Work with files")],
+            ),
+        ]);
+
+        let response = super::render_search(&query("files"), &records, &available);
+        let names = response["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        // The exact-name hit on zeta outranks alpha's prefix hits, so group
+        // order follows global rank, not alphabetical order; omega matched
+        // but owns no returned top-5 tool, so it is omitted entirely; the
+        // strong non-connected name match is appended last.
+        assert_eq!(names, ["zeta", "alpha", "files-hub"]);
+        assert_eq!(response["servers"][0]["tools"][0]["name"], "mcp_zeta_files");
+        assert_eq!(response["servers"][1]["matched_tool_count"], 5);
+        assert_eq!(response["servers"][1]["returned_tool_count"], 4);
+        assert_eq!(response["servers"][1]["truncated"], true);
+        assert_eq!(response["servers"][2]["tools"], json!([]));
+        // The omitted server still counts toward the global totals.
+        assert_eq!(response["total_matched"], 7);
+        assert_eq!(response["total_returned"], 5);
+        assert_eq!(response["truncated"], true);
+    }
+
+    #[test]
+    fn oversized_results_drop_the_lowest_ranked_tools() {
+        let records = BTreeMap::from([(
+            "files".to_string(),
+            search_record("File tools", ServerStatus::Connected),
+        )]);
+        let available = BTreeMap::from([(
+            "files".to_string(),
             vec![
-                spec(
-                    "mcp_linear_create_issue",
-                    "Create work in a project management workspace",
+                spec("mcp_files_read", "Read files"),
+                ToolSpec::new(
+                    ToolName::new("mcp_files_write"),
+                    "Write files",
+                    json!({"type": "object", "description": "x".repeat(2 * super::SEARCH_RESULT_BYTE_CAP)}),
                 ),
-                spec("mcp_jira_search", "Search tickets"),
-                spec(
-                    "mcp_generic",
-                    "Project management integrations for Linear and Jira",
-                ),
-                spec("mcp_echo", "Echo text"),
             ],
-            "PROJECT management linear jira",
-        )
-        .unwrap();
-        let names = names(&results);
-        assert_eq!(names[0], "mcp_linear_create_issue");
-        assert!(names[..2].contains(&"mcp_jira_search"));
-        assert_eq!(names.last(), Some(&"mcp_generic"));
-        assert!(!names.contains(&"mcp_echo"));
+        )]);
+
+        let response = super::render_search(&query("files"), &records, &available);
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() <= super::SEARCH_RESULT_BYTE_CAP,
+            "the serialized response respects the byte cap"
+        );
+        assert_eq!(response["total_matched"], 2);
+        assert_eq!(response["total_returned"], 1);
+        assert_eq!(response["truncated"], true);
+        let group = &response["servers"][0];
+        assert_eq!(group["returned_tool_count"], 1);
+        assert_eq!(group["truncated"], true);
+        assert_eq!(group["tools"][0]["name"], "mcp_files_read");
+    }
+
+    #[test]
+    fn oversized_status_only_groups_are_dropped_before_tools() {
+        let huge_text = format!(
+            "{}🦀{}",
+            "x".repeat(super::SEARCH_SERVER_TEXT_BYTE_CAP - 1),
+            "y".repeat(super::SEARCH_SERVER_TEXT_BYTE_CAP)
+        );
+        let mut records = BTreeMap::from([(
+            "files".to_string(),
+            search_record("File tools", ServerStatus::Connected),
+        )]);
+        for index in 0..40 {
+            records.insert(
+                format!("files-status-{index:02}"),
+                search_record(&huge_text, ServerStatus::Error(huge_text.clone())),
+            );
+        }
+        let available = BTreeMap::from([(
+            "files".to_string(),
+            vec![spec("mcp_files_read", "Read files")],
+        )]);
+
+        let response = super::render_search(&query("files"), &records, &available);
+        assert!(serde_json::to_vec(&response).unwrap().len() <= super::SEARCH_RESULT_BYTE_CAP);
+        assert_eq!(response["total_matched"], 1);
+        assert_eq!(response["total_returned"], 1);
+        assert_eq!(response["truncated"], true);
+        assert_eq!(response["servers"][0]["name"], "files");
+        assert_eq!(response["servers"][0]["tools"][0]["name"], "mcp_files_read");
+        let groups = response["servers"].as_array().unwrap();
+        assert!(groups.len() > 1 && groups.len() < records.len());
+        for group in &groups[1..] {
+            let description = group["description"].as_str().unwrap();
+            let error = group["error"].as_str().unwrap();
+            assert_eq!(description.len(), super::SEARCH_SERVER_TEXT_BYTE_CAP - 1);
+            assert_eq!(error.len(), super::SEARCH_SERVER_TEXT_BYTE_CAP - 1);
+            assert!(std::str::from_utf8(description.as_bytes()).is_ok());
+            assert!(std::str::from_utf8(error.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn oversized_compact_listing_reports_tail_omission() {
+        let huge_text = format!(
+            "{}🦀{}",
+            "x".repeat(super::SEARCH_SERVER_TEXT_BYTE_CAP - 1),
+            "y".repeat(super::SEARCH_SERVER_TEXT_BYTE_CAP)
+        );
+        let records = (0..40)
+            .map(|index| {
+                (
+                    format!("server-{index:02}"),
+                    search_record(&huge_text, ServerStatus::Error(huge_text.clone())),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let response = super::render_search(&query("McP"), &records, &BTreeMap::new());
+        assert!(serde_json::to_vec(&response).unwrap().len() <= super::SEARCH_RESULT_BYTE_CAP);
+        assert_eq!(response["total_servers"], records.len());
+        let returned = response["returned_servers"].as_u64().unwrap() as usize;
+        assert!(returned > 0 && returned < records.len());
+        assert_eq!(response["truncated"], true);
+        let servers = response["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), returned);
+        assert_eq!(servers[0]["name"], "server-00");
+        assert_eq!(
+            servers.last().unwrap()["name"],
+            format!("server-{:02}", returned - 1)
+        );
+        for server in servers {
+            let description = server["description"].as_str().unwrap();
+            let error = server["error"].as_str().unwrap();
+            assert_eq!(description.len(), super::SEARCH_SERVER_TEXT_BYTE_CAP - 1);
+            assert_eq!(error.len(), super::SEARCH_SERVER_TEXT_BYTE_CAP - 1);
+            assert!(std::str::from_utf8(description.as_bytes()).is_ok());
+            assert!(std::str::from_utf8(error.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn matching_scores_rank_name_hits_above_description_hits() {
+        let results = matched(
+            "linear",
+            vec![
+                spec("mcp_linear_create_issue", "Create an issue"),
+                spec("mcp_generic_track", "Linear and Jira integrations"),
+            ],
+        );
+        assert_eq!(results.len(), 2);
+        let score = |name: &str| results.iter().find(|(result, _)| result == name).unwrap().1;
+        let name_hit = score("mcp_linear_create_issue");
+        let description_hit = score("mcp_generic_track");
+        assert!(name_hit > description_hit);
+        assert!(
+            description_hit * 3 < name_hit,
+            "the relative gate should drop the description-only hit"
+        );
     }
 
     #[test]
@@ -3036,12 +3552,14 @@ mod tests {
         let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
             .await
             .unwrap();
-        let results = runtime.search("issues").await.unwrap();
+        let results = runtime.search("linear").await.unwrap();
         assert_eq!(results["servers"][0]["name"], "linear");
         assert_eq!(results["servers"][0]["status"], "error");
+        assert_eq!(results["servers"][0]["available_tool_count"], Value::Null);
+        assert_eq!(results["servers"][0]["tools"], json!([]));
         assert_eq!(
             runtime.search("calendar").await.unwrap(),
-            json!({"servers":[]})
+            json!({"servers":[],"total_matched":0,"total_returned":0,"truncated":false})
         );
     }
 
@@ -3060,7 +3578,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = runtime.search("issue").await.unwrap();
+        let results = runtime.search("linear").await.unwrap();
         assert_eq!(results["servers"][0]["name"], "linear");
         assert_eq!(results["servers"][0]["status"], "error");
         let error = runtime
@@ -3136,7 +3654,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_auth_failure_is_searchable_without_failing_startup() {
-        let (address, mut server) = bearer_challenge_server(1).await;
+        let (address, server) = bearer_challenge_server(1).await;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
         std::fs::write(
@@ -3147,13 +3665,26 @@ mod tests {
 
         let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
             .await
-            .expect("registration should not contact the server");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut server)
-                .await
-                .is_err(),
-            "MCP server was contacted during startup"
-        );
+            .expect("an auth challenge should not fail startup");
+        // Eager background initialization contacts the server and settles
+        // before any tool_search is issued.
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("MCP server was not contacted by eager startup initialization")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    runtime.inner.servers.read().await["remote"].status,
+                    ServerStatus::AuthenticationRequired
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("eager initialization did not settle the server status");
         assert!(
             runtime.search("calendar").await.unwrap()["servers"]
                 .as_array()
@@ -3161,9 +3692,9 @@ mod tests {
                 .is_empty()
         );
         let results = runtime.search("remote").await.unwrap();
-        server.await.unwrap();
         assert_eq!(results["servers"][0]["name"], "remote");
         assert_eq!(results["servers"][0]["status"], "authentication_required");
+        assert_eq!(results["servers"][0]["available_tool_count"], Value::Null);
         let challenge = runtime.inner.challenges.lock().await["remote"].clone();
         assert_eq!(
             challenge
@@ -3253,16 +3784,17 @@ mod tests {
         let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
             .await
             .expect("connection failure should not prevent startup");
-        assert!(
-            runtime.search("MCP").await.unwrap()["servers"]
-                .as_array()
-                .unwrap()
-                .is_empty()
+        let results = runtime.search("MCP").await.unwrap();
+        assert_eq!(
+            results,
+            runtime.search("mcp").await.unwrap(),
+            "the whole-query server listing is case-insensitive"
         );
-        let results = runtime.search("mcp").await.unwrap();
         let broken = &results["servers"][0];
         assert_eq!(broken["name"], "broken");
         assert_eq!(broken["status"], "error");
+        assert_eq!(broken["available_tool_count"], Value::Null);
+        assert!(broken.get("tools").is_none(), "the listing is compact");
         assert!(
             broken["error"]
                 .as_str()

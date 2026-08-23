@@ -56,7 +56,7 @@ Archive content is downloaded, checked against `sha256`, validated, and extracte
 
 The cache is local state protected by the permissions of `~/.kit`; it is not a sandbox or a publisher-identity check. Remove a damaged cache entry to force a verified download. The configured checksum proves archive-byte integrity, not who published those bytes.
 
-Resolution or package-validation failures stop startup. Non-fatal package diagnostics are written to stderr with the plugin alias. Supported validated MCP declarations are registered for lazy connection; unsupported SSE declarations produce the skip diagnostic described above.
+Resolution or package-validation failures stop startup. Non-fatal package diagnostics are written to stderr with the plugin alias. Supported validated MCP declarations are registered and begin connecting in the background at startup; unsupported SSE declarations produce the skip diagnostic described above.
 
 Skill collision precedence is project skills, then user skills, then plugins in lexical alias order. Only immediate valid plugin skill directories approved by the package validator are exposed; nested `SKILL.md` files are not recursively added.
 

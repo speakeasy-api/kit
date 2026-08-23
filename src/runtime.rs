@@ -407,7 +407,7 @@ impl Runtime {
     }
 
     /// Registers validated plugin MCP servers and overlays an optional explicit
-    /// MCP file for lazy connection.
+    /// MCP file, then starts connecting all servers in the background.
     pub async fn with_mcp_config(
         runtime: Arc<Self>,
         path: Option<&Path>,

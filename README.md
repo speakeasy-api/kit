@@ -299,14 +299,15 @@ explicit file uses this format:
 cargo run -- tui --root /path/to/project --mcp-config /path/to/mcp.json
 ```
 
-Kit validates and registers the combined MCP configuration at startup, reloads an
-explicit file before each `tool_search` and `auth` call, and connects servers lazily
-when search matches their configured name or description. Explicit entries override
-same-named plugin entries. Added and changed explicit entries become visible without
-a restart; removing an override restores the plugin server. Duplicate supported
-server names across plugins are startup errors. Before
-connection, tool metadata is unavailable, so descriptions should include concrete
-capabilities and likely search terms. The exact query `mcp` initializes all servers.
+Kit validates and registers the combined MCP configuration at startup and begins
+connecting every server in the background with stored credentials only. Interactive
+OAuth never starts implicitly. Kit reloads an explicit file before each `tool_search`
+and `auth` call; searches wait for newly added or changed servers to settle before
+ranking connected tools globally. Explicit entries override same-named plugin entries.
+Removing an override restores the plugin server, and duplicate supported server names
+across plugins are startup errors. Descriptions should name concrete capabilities and
+likely search terms. The exact query `mcp` returns a compact server-status list without
+tool schemas and reports if the 32 KiB response cap omits tail entries.
 Protected remote servers report `authentication_required` from their HTTP Bearer
 challenge; this applies to plugin and config-declared Streamable HTTP servers.
 Explicit OAuth configuration is optional and only supplies client or scope overrides.
