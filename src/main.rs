@@ -159,7 +159,6 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Config {
     root: Option<PathBuf>,
     model: Option<String>,
@@ -183,7 +182,6 @@ struct Config {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SubagentConfig {
     harness: String,
     #[serde(default)]
@@ -1054,12 +1052,13 @@ credential_store = "keychain"
     }
 
     #[test]
-    fn plugin_configuration_is_typed_and_strict() {
+    fn plugin_configuration_is_typed_and_forward_compatible() {
         let configured: Config = toml::from_str(&format!(
             r#"
 [plugins.local-plugin]
 source = "path"
 path = "./plugins/local"
+future_option = true
 
 [plugins.remote-plugin]
 source = "archive"
@@ -1084,7 +1083,6 @@ subdir = "packages/plugin"
         for invalid in [
             "[plugins.bad]\nsource = 'git'\nurl = 'https://example.com/repo'",
             "[plugins.bad]\nsource = 'archive'\nurl = 'https://example.com/plugin.zip'",
-            "[plugins.bad]\nsource = 'path'\npath = '.'\nunknown = true",
         ] {
             assert!(toml::from_str::<Config>(invalid).is_err(), "{invalid}");
         }
@@ -1112,20 +1110,29 @@ subdir = "packages/plugin"
     }
 
     #[test]
-    fn named_acp_profiles_are_strict_and_selectable() {
+    fn named_acp_profiles_ignore_unknown_fields_and_remain_selectable() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
             r#"
+future_option = true
+
 [acp.alpha]
 command = "agent-a"
 args = ["--stdio"]
 permissions = "cancel"
+env = { TOKEN = "secret" }
+
 [acp.beta]
 command = "agent-b"
+
 [subagent]
 harness = "acp.beta"
+future_option = true
+
+[subagent.harnesses."acp.beta"]
+future_option = true
 "#,
         )
         .unwrap();
@@ -1144,9 +1151,6 @@ harness = "acp.beta"
             config.acp["beta"].permissions,
             kit::AcpPermissionPolicy::Deny
         );
-
-        fs::write(&path, "[acp.bad]\ncommand = 'agent'\nenv = {}\n").unwrap();
-        assert!(Config::load(&path).is_err());
 
         fs::write(
             &path,

@@ -141,7 +141,7 @@ kit acp --root /path/to/project
 
 ## Configure `~/.kit/config.toml`
 
-At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. The file is strict TOML: unknown keys, invalid values, an unreadable file, and invalid syntax are errors rather than ignored settings.
+At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.
 
 A representative configuration is:
 
@@ -262,7 +262,7 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 
 ## Troubleshoot startup and configuration
 
-- **`invalid config ...`**: validate TOML spelling and types. The schema rejects unknown fields; provider values are exactly `openai-subscription`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
+- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
 - **`could not read config ...`**: check permissions and that `$HOME/.kit/config.toml` is a readable regular file. Deleting an unwanted config is valid because a missing file falls back to defaults.
 - **`credential_dir is required when credential_store is file`**: add the directory or choose another store.
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.

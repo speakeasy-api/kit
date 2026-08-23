@@ -39,7 +39,7 @@ impl<R: Read> Read for LimitedReader<R> {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "source", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(tag = "source", rename_all = "lowercase")]
 pub enum PluginConfig {
     Path {
         path: PathBuf,
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_strict_plugin_sources() {
+    fn parses_plugin_sources_with_unknown_fields() {
         let path: PluginConfig = toml::from_str("source = 'path'\npath = './plugin'").unwrap();
         assert!(matches!(path, PluginConfig::Path { .. }));
         let archive: PluginConfig = toml::from_str(&format!(
@@ -548,12 +548,10 @@ mod tests {
         ))
         .unwrap();
         assert!(matches!(archive, PluginConfig::Archive { .. }));
-        assert!(
-            toml::from_str::<PluginConfig>(
-                "source = 'path'\npath = '.'\nurl = 'https://example.com'"
-            )
-            .is_err()
-        );
+        assert!(matches!(
+            toml::from_str::<PluginConfig>("source = 'path'\npath = '.'\nfuture_option = true"),
+            Ok(PluginConfig::Path { .. })
+        ));
     }
 
     #[test]

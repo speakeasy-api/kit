@@ -50,7 +50,6 @@ pub enum AcpPermissionPolicy {
 
 /// A trusted argv-only ACP harness profile from `~/.kit/config.toml`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AcpHarnessProfile {
     pub command: String,
     #[serde(default)]
@@ -61,7 +60,6 @@ pub struct AcpHarnessProfile {
 
 /// Model aliases and explicit-override policy for one subagent harness.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct SubagentHarnessPolicy {
     #[serde(default)]
     pub models: BTreeMap<String, String>,
