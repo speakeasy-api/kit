@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use agentkit_adapter_completions::{CompletionsAdapter, CompletionsProvider, CompletionsSession};
 use agentkit_core::{
     DataRef, Delta, Modality, Part, PartId, PartKind, ToolOutput, TurnCancellation, Usage,
 };
@@ -10,8 +11,8 @@ use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use agentkit_provider_openrouter::{
-    OpenRouterAdapter, OpenRouterConfig, OpenRouterSession, OpenRouterTurn,
-    ReasoningEffort as OpenRouterReasoningEffort,
+    OpenRouterAdapter, OpenRouterConfig, OpenRouterProvider, OpenRouterRequestConfig,
+    OpenRouterSession, OpenRouterTurn, ReasoningEffort as OpenRouterReasoningEffort,
 };
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -21,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
-    SubscriptionConfig,
+    SubscriptionConfig, speakeasy_auth,
 };
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
@@ -37,6 +38,9 @@ pub enum ProviderKind {
     #[serde(rename = "openrouter")]
     #[value(name = "openrouter")]
     OpenRouter,
+    #[serde(rename = "speakeasy")]
+    #[value(name = "speakeasy")]
+    Speakeasy,
 }
 
 impl std::str::FromStr for ProviderKind {
@@ -46,6 +50,7 @@ impl std::str::FromStr for ProviderKind {
         match value {
             "openai-subscription" => Ok(Self::OpenAiSubscription),
             "openrouter" => Ok(Self::OpenRouter),
+            "speakeasy" => Ok(Self::Speakeasy),
             _ => Err(format!("unknown model provider {value:?}")),
         }
     }
@@ -56,6 +61,7 @@ impl ProviderKind {
         match self {
             Self::OpenAiSubscription => "openai-subscription",
             Self::OpenRouter => "openrouter",
+            Self::Speakeasy => "speakeasy",
         }
     }
 }
@@ -354,6 +360,7 @@ impl SelectableSession {
 pub enum KitAdapter {
     OpenAiSubscription(OpenAiSubscriptionAdapter),
     OpenRouter(OpenRouterKitAdapter),
+    Speakeasy(SpeakeasyKitAdapter),
 }
 
 #[derive(Clone)]
@@ -363,6 +370,86 @@ pub struct OpenRouterKitAdapter {
     models_url: Option<String>,
     model: String,
     context_window: Arc<tokio::sync::OnceCell<u64>>,
+}
+
+const SPEAKEASY_COMPLETIONS_URL: &str = "https://app.getgram.ai/chat/completions";
+
+#[derive(Clone)]
+pub struct SpeakeasyKitAdapter {
+    provider: SpeakeasyProvider,
+    client: agentkit_http::Http,
+}
+
+#[derive(Clone)]
+struct SpeakeasyProvider {
+    openrouter: OpenRouterProvider,
+    api_key: String,
+    project: String,
+    chat_id: Option<String>,
+}
+
+// Matches Gram's chat.SessionIDToChatID mapping for captured agent sessions.
+fn gram_chat_id(session_id: &str) -> String {
+    uuid::Uuid::parse_str(session_id)
+        .unwrap_or_else(|_| uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, session_id.as_bytes()))
+        .to_string()
+}
+
+impl CompletionsProvider for SpeakeasyProvider {
+    type Config = OpenRouterRequestConfig;
+
+    fn provider_name(&self) -> &str {
+        "Speakeasy"
+    }
+
+    fn endpoint_url(&self) -> &str {
+        self.openrouter.endpoint_url()
+    }
+
+    fn config(&self) -> &Self::Config {
+        self.openrouter.config()
+    }
+
+    fn preprocess_request(
+        &self,
+        builder: agentkit_http::HttpRequestBuilder,
+    ) -> agentkit_http::HttpRequestBuilder {
+        let builder = builder
+            .header("Gram-Key", &self.api_key)
+            .header("Gram-Project", &self.project)
+            .header("X-Gram-Source", "kit")
+            .header("User-Agent", concat!("kit/", env!("CARGO_PKG_VERSION")));
+        match &self.chat_id {
+            Some(chat_id) => builder.header("Gram-Chat-ID", chat_id),
+            None => builder,
+        }
+    }
+
+    fn streaming(&self) -> bool {
+        self.openrouter.streaming()
+    }
+
+    fn apply_stream_options(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+    ) -> Result<(), LoopError> {
+        self.openrouter.apply_stream_options(body)
+    }
+
+    fn apply_prompt_cache(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        request: &TurnRequest,
+    ) -> Result<(), LoopError> {
+        self.openrouter
+            .apply_prompt_cache(body, request)
+            .map_err(|error| match error {
+                LoopError::Provider(message) => {
+                    LoopError::Provider(message.replacen("OpenRouter", "Speakeasy", 1))
+                }
+                error => error,
+            })
+    }
 }
 
 impl KitAdapter {
@@ -413,6 +500,29 @@ impl KitAdapter {
                     context_window: Arc::new(tokio::sync::OnceCell::new()),
                 }))
             }
+            ProviderKind::Speakeasy => {
+                let credentials = speakeasy_auth::load(&credential_storage)?.ok_or_else(|| {
+                    "run `kit auth login speakeasy` before using the Speakeasy provider".to_string()
+                })?;
+                let mut config =
+                    OpenRouterConfig::new("unused", model).with_base_url(SPEAKEASY_COMPLETIONS_URL);
+                apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
+                let provider = SpeakeasyProvider {
+                    openrouter: OpenRouterProvider::from(config),
+                    api_key: credentials.api_key.clone(),
+                    project: credentials.project.clone(),
+                    chat_id: None,
+                };
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|_| "could not build Speakeasy completions client".to_string())?;
+                Ok(Self::Speakeasy(SpeakeasyKitAdapter {
+                    provider,
+                    client: agentkit_http::Http::new(client),
+                }))
+            }
         }
     }
 }
@@ -458,6 +568,19 @@ impl ModelAdapter for KitAdapter {
                     context_window,
                 }))
             }
+            Self::Speakeasy(adapter) => {
+                let mut provider = adapter.provider.clone();
+                provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
+                CompletionsAdapter::with_client(provider, adapter.client.clone())
+                    .start_session(config)
+                    .await
+                    .map(|inner| {
+                        KitSession::Speakeasy(SpeakeasyKitSession {
+                            inner,
+                            context_window: None,
+                        })
+                    })
+            }
         }
     }
 
@@ -465,6 +588,7 @@ impl ModelAdapter for KitAdapter {
         Some(match self {
             Self::OpenAiSubscription(_) => "openai-subscription",
             Self::OpenRouter(_) => "openrouter",
+            Self::Speakeasy(_) => "speakeasy",
         })
     }
 }
@@ -472,10 +596,16 @@ impl ModelAdapter for KitAdapter {
 pub enum KitSession {
     OpenAiSubscription(OpenAiSubscriptionSession),
     OpenRouter(OpenRouterKitSession),
+    Speakeasy(SpeakeasyKitSession),
 }
 
 pub struct OpenRouterKitSession {
     inner: OpenRouterSession,
+    context_window: Option<u64>,
+}
+
+pub struct SpeakeasyKitSession {
+    inner: CompletionsSession<SpeakeasyProvider>,
     context_window: Option<u64>,
 }
 
@@ -505,6 +635,17 @@ impl ModelSession for KitSession {
                     next_media: 0,
                 })
                 .map(KitTurn::OpenRouter),
+            Self::Speakeasy(session) => session
+                .inner
+                .begin_turn(request, cancellation)
+                .await
+                .map(|inner| OpenRouterKitTurn {
+                    inner,
+                    context_window: session.context_window,
+                    media_part: None,
+                    next_media: 0,
+                })
+                .map(KitTurn::Speakeasy),
         }
     }
 
@@ -512,6 +653,7 @@ impl ModelSession for KitSession {
         match self {
             Self::OpenAiSubscription(session) => session.model_name(),
             Self::OpenRouter(session) => session.inner.model_name(),
+            Self::Speakeasy(session) => session.inner.model_name(),
         }
     }
 
@@ -519,6 +661,7 @@ impl ModelSession for KitSession {
         match self {
             Self::OpenAiSubscription(session) => session.provider_name(),
             Self::OpenRouter(session) => session.inner.provider_name(),
+            Self::Speakeasy(_) => Some("speakeasy"),
         }
     }
 }
@@ -526,6 +669,7 @@ impl ModelSession for KitSession {
 pub enum KitTurn {
     OpenAiSubscription(Box<OpenAiSubscriptionTurn>),
     OpenRouter(OpenRouterKitTurn),
+    Speakeasy(OpenRouterKitTurn),
 }
 
 pub struct OpenRouterKitTurn {
@@ -543,7 +687,7 @@ impl ModelTurn for KitTurn {
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         match self {
             Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await,
-            Self::OpenRouter(turn) => {
+            Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await?;
                 if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
                     rewrite_openrouter_media(delta, &mut turn.media_part, &mut turn.next_media);
@@ -707,14 +851,34 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
         None => catalog_models_url(None),
         Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
     };
-    let mut openrouter = match openrouter_url {
-        Some(url) => fetch_model_ids(&url)
+    let public_url = OPENROUTER_MODELS_URL.to_string();
+    let same_catalog = openrouter_url.as_deref() == Some(public_url.as_str());
+    let (mut openrouter, mut speakeasy) = if same_catalog {
+        let models = fetch_model_ids(&public_url)
             .await
-            .unwrap_or_else(|_| openrouter_fallback()),
-        None => openrouter_fallback(),
+            .unwrap_or_else(|_| openrouter_fallback());
+        (models.clone(), models)
+    } else {
+        let openrouter_catalog = async {
+            match openrouter_url {
+                Some(url) => fetch_model_ids(&url)
+                    .await
+                    .unwrap_or_else(|_| openrouter_fallback()),
+                None => openrouter_fallback(),
+            }
+        };
+        let speakeasy_catalog = async {
+            fetch_model_ids(&public_url)
+                .await
+                .unwrap_or_else(|_| openrouter_fallback())
+        };
+        tokio::join!(openrouter_catalog, speakeasy_catalog)
     };
     if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
         openrouter.push(current.model.clone());
+    }
+    if current.provider == ProviderKind::Speakeasy && !speakeasy.contains(&current.model) {
+        speakeasy.push(current.model.clone());
     }
     openrouter.sort();
     openrouter.dedup();
@@ -725,6 +889,15 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
         }
         openrouter.push(current.model.clone());
     }
+    speakeasy.sort();
+    speakeasy.dedup();
+    speakeasy.truncate(MAX_SELECTOR_MODELS);
+    if current.provider == ProviderKind::Speakeasy && !speakeasy.contains(&current.model) {
+        if speakeasy.len() == MAX_SELECTOR_MODELS {
+            speakeasy.pop();
+        }
+        speakeasy.push(current.model.clone());
+    }
     vec![
         ModelGroup {
             provider: ProviderKind::OpenAiSubscription,
@@ -733,6 +906,10 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
         ModelGroup {
             provider: ProviderKind::OpenRouter,
             models: openrouter,
+        },
+        ModelGroup {
+            provider: ProviderKind::Speakeasy,
+            models: speakeasy,
         },
     ]
 }
@@ -789,7 +966,11 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+    };
 
     use agentkit_core::{
         DataRef, Delta, Item, ItemKind, MediaPart, MetadataMap, Modality, Part, PartId, PartKind,
@@ -802,10 +983,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterKitSession, ProviderKind,
-        ReasoningEffort, SelectableAdapter, SelectableSession, SessionSelection,
-        add_context_window, apply_openrouter_reasoning_effort, catalog_models_url,
-        expose_background_call_ids, models_url, parse_context_window, rewrite_openrouter_media,
+        KitAdapter, KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterKitSession,
+        OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
+        SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider, add_context_window,
+        apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
+        gram_chat_id, models_url, parse_context_window, rewrite_openrouter_media,
     };
 
     #[test]
@@ -916,6 +1098,125 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn speakeasy_composes_openrouter_wire_format_with_gram_auth() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers_end = headers_end + 4;
+                let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= headers_end + content_length {
+                    break;
+                }
+            }
+            let response = json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "anthropic/claude-sonnet-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let config = OpenRouterConfig::new(
+            format!("gram_live_{}", "ab".repeat(32)),
+            "anthropic/claude-sonnet-4",
+        )
+        .with_base_url(format!("http://{address}/chat/completions"))
+        .with_streaming(false);
+        let provider = SpeakeasyProvider {
+            openrouter: OpenRouterProvider::from(config),
+            api_key: format!("gram_live_{}", "ab".repeat(32)),
+            project: "kit-test".into(),
+            chat_id: None,
+        };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let adapter = KitAdapter::Speakeasy(SpeakeasyKitAdapter {
+            provider,
+            client: agentkit_http::Http::new(client),
+        });
+        let mut session = adapter
+            .start_session(SessionConfig::new("speakeasy-contract"))
+            .await
+            .unwrap();
+        session
+            .begin_turn(
+                TurnRequest {
+                    session_id: SessionId::new("speakeasy-contract"),
+                    turn_id: TurnId::new("turn"),
+                    transcript: vec![Item::text(ItemKind::User, "hello")],
+                    available_tools: Vec::new(),
+                    cache: None,
+                    metadata: MetadataMap::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let request = server.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.contains("gram-key: gram_live_"));
+        assert!(headers.contains("gram-project: kit-test"));
+        assert!(headers.contains("x-gram-source: kit"));
+        assert!(headers.contains("gram-chat-id: 15f428a5-735e-5088-9e50-5210f6365e50"));
+        assert!(!headers.contains("authorization:"));
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "anthropic/claude-sonnet-4");
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn gram_chat_id_matches_grams_agent_session_mapping() {
+        assert_eq!(
+            gram_chat_id("claude-session-1"),
+            "0b3a60e2-f08b-5ddd-9bcb-f3732f6a3322"
+        );
+        assert_eq!(
+            gram_chat_id("550e8400-e29b-41d4-a716-446655440000"),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
     #[test]
     fn selectable_adapter_reports_its_concrete_initial_provider() {
         let adapter = SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
@@ -1011,6 +1312,12 @@ mod tests {
         assert_eq!(
             adapter.selection().unwrap().id(),
             "openai-subscription:gpt-5.4-mini"
+        );
+        assert_eq!(
+            ModelSelection::from_id("speakeasy:anthropic/claude-sonnet-4")
+                .unwrap()
+                .provider,
+            ProviderKind::Speakeasy
         );
         assert!(ModelSelection::from_id("unknown:model").is_err());
         assert!(ModelSelection::from_id("openrouter:").is_err());

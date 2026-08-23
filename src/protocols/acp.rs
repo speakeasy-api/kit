@@ -417,6 +417,7 @@ fn config_options(
             let name = match group.provider {
                 crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
                 crate::ProviderKind::OpenRouter => "OpenRouter",
+                crate::ProviderKind::Speakeasy => "Speakeasy",
             };
             let options = group
                 .models

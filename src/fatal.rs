@@ -406,7 +406,12 @@ mod tests {
         let records = fs::read_dir(root.path().join("session-1"))
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().is_some_and(|value| value == "json"))
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "json")
+            })
             .count();
         assert_eq!(records, MAX_RECORDS_PER_SESSION);
     }

@@ -13,6 +13,7 @@ It exposes:
 - Agent Skills discovered from `<root>/.agents/skills`, `~/.agents/skills`, and validated local or checksum-pinned archive [Agent Plugins](docs/user/agent-plugins.md)
 - OpenAI subscription access through Kit's native ChatGPT OAuth login
 - OpenRouter through AgentKit's OpenRouter provider adapter
+- Speakeasy AI Control Plane through its OpenRouter-compatible completions endpoint
 
 It intentionally has no general interactive permissions framework, provenance ledger,
 rollback system, control-plane authentication, or web UI.
@@ -114,6 +115,28 @@ Kit also reads the OpenRouter model catalog's
 model or unavailable catalog leaves usage reporting intact but disables the gauge
 and automatic compaction rather than guessing a window.
 
+To sign in with Speakeasy, use the same persistent credential store for login and
+runtime commands:
+
+```sh
+cargo run -- auth login speakeasy --credential-store keychain
+cargo run -- prompt --credential-store keychain \
+  --provider speakeasy --model anthropic/claude-sonnet-4 \
+  --root /path/to/project "Reply with a short project summary"
+```
+
+Login opens `app.getgram.ai`, receives the producer-scoped Gram API key through a
+loopback form POST, verifies its accessible projects, and stores the key and selected
+project. Inference sends them as `Gram-Key` and `Gram-Project` to
+`https://app.getgram.ai/chat/completions`. Kit also maps its durable session ID to
+Gram's deterministic UUIDv5 `Gram-Chat-ID`, so new and resumed conversations appear
+as the same session in AI Control Plane. OpenRouter settings
+and credentials remain isolated. The AI Control Plane does not currently expose a
+public model-catalog endpoint, so the Speakeasy selector uses the OpenRouter catalog
+as a v0 fallback. Models outside Speakeasy's allowlist can be selected but fail at
+runtime. `kit auth logout speakeasy` removes the local key; revoke it remotely in
+the Speakeasy dashboard.
+
 ## Configuration
 
 Run `kit init` to create `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when they do not exist. The generated setup selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. Existing files are left unchanged.
@@ -125,7 +148,7 @@ defaults (`root = "."`, `provider = "openai-subscription"`,
 
 ```toml
 root = "/path/to/project"
-provider = "openai-subscription" # or openrouter
+provider = "openai-subscription" # or openrouter or speakeasy
 model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
@@ -414,15 +437,16 @@ refusal, protocol errors, and other uncertain stops retire the child instead. Pe
 headless child are conservatively cancelled so they cannot hang. Nested built-in
 children use `kit acp` and never start A2A listeners.
 
-OpenAI and MCP use one shared credential backend, selected with
+OpenAI, Speakeasy, and MCP use one shared credential backend, selected with
 `--credential-store` or `credential_store`. The default `memory` backend is
 process-local, so credentials disappear at exit and are not available to the
 TUI server process or nested Kit children. Use persistent storage when those
-processes need the same credentials. Standalone OpenAI login rejects `memory`:
+processes need the same credentials. Standalone provider login rejects `memory`:
 
 ```sh
 # Operating-system credential store
 kit auth login openai --credential-store keychain
+kit auth login speakeasy --credential-store keychain
 kit tui --mcp-config mcp.json --credential-store keychain
 
 # Plain JSON files in an explicit private directory
@@ -433,7 +457,7 @@ kit tui --mcp-config mcp.json --credential-store file \
 ```
 
 The file backend creates a `0700` directory and `0600` credential files on
-Unix, rejects unsafe paths and permissions, and does not encrypt tokens. Persistent OpenAI credentials are restored when Kit starts. MCP credentials are
+Unix, rejects unsafe paths and permissions, and does not encrypt tokens. Persistent OpenAI and Speakeasy credentials are restored when Kit starts. MCP credentials are
 restored and refreshed when a matching search initializes the server, so `prompt`
 can use credentials created earlier by
 `tui` or `serve` without starting an interactive browser flow. MCP refreshes are

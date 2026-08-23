@@ -343,18 +343,19 @@ fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuthProvider {
     Openai,
+    Speakeasy,
 }
 
 #[derive(Subcommand)]
 enum AuthAction {
-    /// Authenticate a ChatGPT subscription in the configured credential store.
+    /// Authenticate a model provider in the configured credential store.
     Login { provider: AuthProvider },
-    /// Show ChatGPT subscription authentication status.
+    /// Show model-provider authentication status.
     Status { provider: AuthProvider },
-    /// Revoke and remove ChatGPT subscription credentials.
+    /// Remove model-provider credentials, revoking them when supported.
     Logout {
         provider: AuthProvider,
-        /// Remove local credentials without revoking the remote refresh token.
+        /// Remove local credentials without attempting remote revocation.
         #[arg(long)]
         local_only: bool,
     },
@@ -512,32 +513,51 @@ fn init_default_config() -> io::Result<PathBuf> {
 fn validate_auth_storage(action: &AuthAction, storage: &CredentialStorage) -> io::Result<()> {
     if matches!(action, AuthAction::Login { .. }) && matches!(storage, CredentialStorage::Memory) {
         return Err(io::Error::other(
-            "OpenAI login cannot use memory credential storage; select --credential-store file --credential-dir <private-directory> or --credential-store keychain",
+            "provider login cannot use memory credential storage; select --credential-store file --credential-dir <private-directory> or --credential-store keychain",
         ));
     }
     Ok(())
 }
 
 async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result<(), io::Error> {
+    enum Execution {
+        OpenAi(kit::provider::OpenAiAuthCommand),
+        Speakeasy(kit::provider::SpeakeasyAuthCommand),
+    }
     let command = match action {
-        AuthAction::Login {
-            provider: AuthProvider::Openai,
-        } => kit::provider::OpenAiAuthCommand::Login,
-        AuthAction::Status {
-            provider: AuthProvider::Openai,
-        } => kit::provider::OpenAiAuthCommand::Status,
+        AuthAction::Login { provider } => match provider {
+            AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Login),
+            AuthProvider::Speakeasy => {
+                Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Login)
+            }
+        },
+        AuthAction::Status { provider } => match provider {
+            AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
+            AuthProvider::Speakeasy => {
+                Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Status)
+            }
+        },
         AuthAction::Logout {
-            provider: AuthProvider::Openai,
+            provider,
             local_only,
-        } => kit::provider::OpenAiAuthCommand::Logout {
-            local_only: *local_only,
+        } => match provider {
+            AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Logout {
+                local_only: *local_only,
+            }),
+            AuthProvider::Speakeasy => {
+                Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Logout {
+                    local_only: *local_only,
+                })
+            }
         },
     };
-    let output =
-        tokio::task::spawn_blocking(move || kit::provider::execute_openai_auth(command, &storage))
-            .await
-            .map_err(io::Error::other)?
-            .map_err(io::Error::other)?;
+    let output = tokio::task::spawn_blocking(move || match command {
+        Execution::OpenAi(command) => kit::provider::execute_openai_auth(command, &storage),
+        Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
     print!("{output}");
     Ok(())
 }
@@ -548,7 +568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(&cli.command, Command::Init) {
         init_default_config()?;
         println!(
-            "Kit {}\n\nlog in with your openai account or set OPENROUTER_API_KEY to get started",
+            "Kit {}\n\nlog in with your OpenAI or Speakeasy account, or set OPENROUTER_API_KEY to get started",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -1206,6 +1226,9 @@ harness = "acp.beta"
             .is_ok()
         );
         assert!(Cli::try_parse_from(["kit", "auth", "status", "openai"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "login", "speakeasy"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "status", "speakeasy"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "speakeasy"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "openai", "--local-only"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "login", "openrouter"]).is_err());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "--local-only"]).is_err());
@@ -1214,18 +1237,21 @@ harness = "acp.beta"
     }
 
     #[test]
-    fn standalone_openai_login_rejects_memory_storage() {
-        let login = AuthAction::Login {
-            provider: AuthProvider::Openai,
-        };
-        assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
-        assert!(validate_auth_storage(&login, &CredentialStorage::Keychain).is_ok());
+    fn standalone_provider_login_rejects_memory_storage() {
+        for provider in [AuthProvider::Openai, AuthProvider::Speakeasy] {
+            let login = AuthAction::Login { provider };
+            assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
+            assert!(validate_auth_storage(&login, &CredentialStorage::Keychain).is_ok());
+        }
     }
 
     #[test]
     fn dedicated_acp_command_exists_and_serve_has_no_no_a2a_escape_hatch() {
         assert!(
             Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "openrouter",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "speakeasy",]).is_ok()
         );
         assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
         for command in ["serve", "acp", "tui"] {

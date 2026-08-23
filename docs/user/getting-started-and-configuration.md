@@ -18,7 +18,7 @@ A version can be pinned with a mise package such as `github:danielkov/kit-releas
 
 ## Choose a provider and authenticate
 
-Kit supports `openai-subscription` and `openrouter`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
+Kit supports `openai-subscription`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
 
 ### ChatGPT subscription with native OpenAI login
 
@@ -64,6 +64,29 @@ kit prompt --provider openrouter \
 ```
 
 Kit uses the CLI or TOML `model`; `OPENROUTER_MODEL` does not override that selection. The adapter also accepts `OPENROUTER_BASE_URL`, `OPENROUTER_APP_NAME`, `OPENROUTER_SITE_URL`, `OPENROUTER_MAX_COMPLETION_TOKENS`, `OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT`. Its model-catalog lookup for the selected model's context length is best-effort, so a catalog failure does not by itself prevent normal provider usage.
+
+### Speakeasy AI Control Plane
+
+Sign in through the Speakeasy dashboard, then use the same persistent credential
+store for runtime commands:
+
+```sh
+kit auth login speakeasy --credential-store keychain
+kit auth status speakeasy --credential-store keychain
+kit prompt --credential-store keychain \
+  --provider speakeasy --model anthropic/claude-sonnet-4 \
+  --root /path/to/project "Reply with a short project summary"
+```
+
+Kit requests a producer-scoped Gram API key through a loopback form POST, verifies
+the key and its accessible projects with `app.getgram.ai`, and stores the key and
+selected project. Runtime requests use `Gram-Key` and `Gram-Project` against
+`https://app.getgram.ai/chat/completions`. Kit deterministically maps its durable
+session ID to `Gram-Chat-ID`, keeping new and resumed conversations together in AI
+Control Plane Agent Sessions. Speakeasy does not currently provide a
+public model catalog, so Kit uses OpenRouter's catalog as a v0 selector fallback; a
+model outside Speakeasy's allowlist can fail at runtime. Logout removes the local
+credential. Revoke the API key remotely in the Speakeasy dashboard.
 
 ## Run common command workflows
 
@@ -124,7 +147,7 @@ A representative configuration is:
 
 ```toml
 root = "/path/to/project"
-provider = "openai-subscription" # or "openrouter"
+provider = "openai-subscription" # or "openrouter" or "speakeasy"
 model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
@@ -164,7 +187,7 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 `root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
 
-`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. If `mcp_config` is also set, its same-named entries override plugin servers, and live removal of an override restores the plugin server. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. If `mcp_config` is also set, its same-named entries override plugin servers, and live removal of an override restores the plugin server. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 ### Configuration precedence and built-in defaults
 
@@ -239,9 +262,9 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 
 ## Troubleshoot startup and configuration
 
-- **`invalid config ...`**: validate TOML spelling and types. The schema rejects unknown fields; provider values are exactly `openai-subscription` and `openrouter`, and credential-store values are `memory`, `keychain`, and `file`.
+- **`invalid config ...`**: validate TOML spelling and types. The schema rejects unknown fields; provider values are exactly `openai-subscription`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
 - **`could not read config ...`**: check permissions and that `$HOME/.kit/config.toml` is a readable regular file. Deleting an unwanted config is valid because a missing file falls back to defaults.
 - **`credential_dir is required when credential_store is file`**: add the directory or choose another store.
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.
 - **Unexpected project or model**: check the command line first, then `~/.kit/config.toml`, then the built-in defaults. Use `kit <command> --help` to confirm which options that command accepts.
-- **Provider authentication failure**: for `openai-subscription`, use the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` for login, status, and runtime commands; standalone login rejects `memory`. Also check that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier.
+- **Provider authentication failure**: for `openai-subscription`, use the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` for login, status, and runtime commands; standalone login rejects `memory`. Also check that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier. For `speakeasy`, use the same persistent credential store for login and runtime commands, and confirm that the stored project can access the selected model.
