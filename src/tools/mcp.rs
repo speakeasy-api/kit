@@ -21,16 +21,18 @@ use agentkit_mcp::{
 };
 use agentkit_plugins::PluginMcpTransport;
 use agentkit_tools_core::{
-    CatalogReader, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolName, ToolRequest,
-    ToolResult, ToolSource, ToolSpec,
+    CatalogReader, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolExecutionScope,
+    ToolName, ToolRequest, ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore, mpsc, oneshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3_600;
 // These messages are part of the pinned agentkit-mcp 0.10.6 adapter contract.
 // Revalidate them before upgrading that dependency.
 const AGENTKIT_REPLAY_REJECTED: &str = "MCP auth challenge unresolved after retry";
@@ -1745,6 +1747,13 @@ pub struct McpTool {
     spec: ToolSpec,
 }
 
+struct ExecutedMcpCall {
+    outcome: ToolExecutionOutcome,
+    replay: ReplayCleanup,
+    server: Option<(String, Vec<u8>)>,
+    _operation: Option<OwnedMutexGuard<()>>,
+}
+
 impl McpTool {
     pub fn new(runtime: McpRuntime) -> Self {
         Self {
@@ -1753,9 +1762,38 @@ impl McpTool {
             spec: ToolSpec::new(
                 ToolName::new("tool"),
                 "Invoke an authenticated MCP tool returned by tool_search.",
-                json!({"type":"object","properties":{"name":{"type":"string"},"args":{"type":"object"}},"required":["name","args"],"additionalProperties":false}),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "args": {"type": "object"},
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_TOOL_TIMEOUT_SECONDS,
+                            "description": "Overrides the default 60-second deadline for this call. Omit unless the tool is expected to return after the default timeout."
+                        }
+                    },
+                    "required": ["name", "args"],
+                    "additionalProperties": false
+                }),
             ),
         }
+    }
+
+    fn timeout(object: &serde_json::Map<String, Value>) -> Result<Duration, ToolError> {
+        let Some(value) = object.get("timeout_seconds") else {
+            return Ok(DEFAULT_TOOL_TIMEOUT);
+        };
+        let Some(seconds) = value
+            .as_u64()
+            .filter(|seconds| (1..=MAX_TOOL_TIMEOUT_SECONDS).contains(seconds))
+        else {
+            return Err(ToolError::InvalidInput(format!(
+                "timeout_seconds must be an integer from 1 to {MAX_TOOL_TIMEOUT_SECONDS}"
+            )));
+        };
+        Ok(Duration::from_secs(seconds))
     }
 
     async fn dispatch(
@@ -1768,12 +1806,19 @@ impl McpTool {
                 "arguments must be an object".into(),
             ));
         };
-        if object.keys().any(|key| key != "name" && key != "args") {
+        if object
+            .keys()
+            .any(|key| key != "name" && key != "args" && key != "timeout_seconds")
+        {
             return ToolExecutionOutcome::Failed(ToolError::InvalidInput(
                 "unknown field in tool arguments".into(),
             ));
         }
-        let Some(name) = object.get("name").and_then(Value::as_str) else {
+        let Some(name) = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             return ToolExecutionOutcome::Failed(ToolError::InvalidInput(
                 "name must be a string".into(),
             ));
@@ -1787,19 +1832,67 @@ impl McpTool {
                 "args must be an object".into(),
             ));
         };
-        let initial_server = self.runtime.server_for_tool(name).await;
+        let timeout = match Self::timeout(object) {
+            Ok(timeout) => timeout,
+            Err(error) => return ToolExecutionOutcome::Failed(error),
+        };
+        let tool_name = ToolName::new(name.clone());
+        if self.catalog.get(&tool_name).is_none() {
+            return ToolExecutionOutcome::Failed(ToolError::InvalidInput(format!(
+                "unknown MCP tool: {}",
+                tool_name.0
+            )));
+        }
+        let Some(scope) = context.execution_scope.clone() else {
+            return ToolExecutionOutcome::Failed(ToolError::Unavailable(
+                "tool requires an execution scope".into(),
+            ));
+        };
+        let timeout_name = name.clone();
+        let call = tokio::time::timeout(
+            timeout,
+            self.dispatch_call(request, scope, name, tool_name, args),
+        );
+        let result = if let Some(cancellation) = context.cancellation.clone() {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return ToolExecutionOutcome::Failed(ToolError::Cancelled);
+                }
+                result = call => result,
+            }
+        } else {
+            call.await
+        };
+        match result {
+            Ok(call) => self.finish_dispatch(call).await,
+            Err(_) => ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(format!(
+                "MCP tool {timeout_name} timed out after {} seconds; inspect remote state before retrying side effects",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
+    async fn dispatch_call(
+        &self,
+        request: ToolRequest,
+        scope: ToolExecutionScope,
+        name: String,
+        tool_name: ToolName,
+        args: Value,
+    ) -> ExecutedMcpCall {
+        let initial_server = self.runtime.server_for_tool(&name).await;
         let server_name = initial_server.as_ref().map(|(server, _, _)| server.clone());
         let operation = match initial_server.as_ref() {
             Some((server, _, true)) => Some(self.runtime.operation_gate(server).await),
             _ => None,
         };
-        let _operation = match operation.as_ref() {
-            Some(operation) => Some(operation.lock().await),
+        let operation = match operation {
+            Some(operation) => Some(operation.lock_owned().await),
             None => None,
         };
         let server = self
             .runtime
-            .server_for_tool(name)
+            .server_for_tool(&name)
             .await
             .filter(|(server, _, _)| {
                 server_name
@@ -1822,23 +1915,11 @@ impl McpTool {
             self.runtime.clone(),
             server.clone(),
         );
-        let name = ToolName::new(name);
-        if self.catalog.get(&name).is_none() {
-            return ToolExecutionOutcome::Failed(ToolError::InvalidInput(format!(
-                "unknown MCP tool: {}",
-                name.0
-            )));
-        }
-        let Some(scope) = context.execution_scope.clone() else {
-            return ToolExecutionOutcome::Failed(ToolError::Unavailable(
-                "tool requires an execution scope".into(),
-            ));
-        };
         let outcome = scope
             .execute_child(
                 ToolRequest::new(
                     request.call_id,
-                    name,
+                    tool_name,
                     args,
                     request.session_id,
                     request.turn_id,
@@ -1846,6 +1927,21 @@ impl McpTool {
                 .with_metadata(request.metadata),
             )
             .await;
+        ExecutedMcpCall {
+            outcome,
+            replay,
+            server,
+            _operation: operation,
+        }
+    }
+
+    async fn finish_dispatch(&self, call: ExecutedMcpCall) -> ToolExecutionOutcome {
+        let ExecutedMcpCall {
+            outcome,
+            replay,
+            server,
+            _operation,
+        } = call;
         let succeeded = matches!(outcome, ToolExecutionOutcome::Completed(_));
         let error = match &outcome {
             ToolExecutionOutcome::FailedBeforeInvocation(error)
@@ -2149,7 +2245,7 @@ fn spec_values(specs: Vec<ToolSpec>, limit: usize) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use agentkit_core::MetadataMap;
     use agentkit_mcp::{
@@ -2168,10 +2264,11 @@ mod tests {
     };
 
     use super::{
-        AuthRecorder, Config, CredentialStorage, OAuthSession, OpportunisticRefresh, ReplayCleanup,
-        ServerRecord, ServerStatus, agentkit_auth_not_applied, agentkit_replay_rejected,
-        can_opportunistically_refresh, challenge_requires_interactive_authorization,
-        prepare_plugins, search_specs, serializes_tool_calls, validate_server_names,
+        AuthRecorder, Config, CredentialStorage, McpTool, OAuthSession, OpportunisticRefresh,
+        ReplayCleanup, ServerRecord, ServerStatus, agentkit_auth_not_applied,
+        agentkit_replay_rejected, can_opportunistically_refresh,
+        challenge_requires_interactive_authorization, prepare_plugins, search_specs,
+        serializes_tool_calls, validate_server_names,
     };
     use crate::plugins::ResolvedPluginMcp;
 
@@ -2267,6 +2364,41 @@ mod tests {
             server,
             request_seen_rx,
         )
+    }
+
+    #[test]
+    fn mcp_tool_timeout_schema_is_optional_and_has_no_schema_default() {
+        let tool = McpTool::new(super::empty());
+        let timeout = &tool.spec.input_schema["properties"]["timeout_seconds"];
+
+        assert_eq!(timeout["minimum"], 1);
+        assert_eq!(timeout["maximum"], 3_600);
+        assert!(timeout.get("default").is_none());
+        assert_eq!(
+            timeout["description"],
+            "Overrides the default 60-second deadline for this call. Omit unless the tool is expected to return after the default timeout."
+        );
+        assert_eq!(tool.spec.input_schema["required"], json!(["name", "args"]));
+    }
+
+    #[test]
+    fn mcp_tool_timeout_defaults_to_sixty_seconds_and_validates_overrides() {
+        let input = json!({"name": "remote", "args": {}});
+        assert_eq!(
+            McpTool::timeout(input.as_object().unwrap()).unwrap(),
+            Duration::from_secs(60)
+        );
+
+        let input = json!({"name": "remote", "args": {}, "timeout_seconds": 300});
+        assert_eq!(
+            McpTool::timeout(input.as_object().unwrap()).unwrap(),
+            Duration::from_secs(300)
+        );
+
+        for timeout in [json!(0), json!(3_601), json!(1.5), json!("60")] {
+            let input = json!({"timeout_seconds": timeout});
+            assert!(McpTool::timeout(input.as_object().unwrap()).is_err());
+        }
     }
 
     #[test]

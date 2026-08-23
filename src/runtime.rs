@@ -497,12 +497,16 @@ impl Runtime {
         let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
-            .with(Observed::new(EditTool::new(self.root.clone())))
-            .with(Observed::new(SubagentTool::new(subagents.clone(), depth)))
-            .with(Observed::new(PromptTool::new(subagents.clone())))
-            .with(Observed::new(ForkTool::new(subagents.clone(), depth)))
-            .with(Observed::new(SubagentsTool::new(subagents.clone())))
-            .with(Observed::new(CloseTool::new(subagents, {
+            .with(Observed::new(EditTool::new(self.root.clone())));
+        if depth < self.max_subagent_depth {
+            children
+                .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))
+                .register(Observed::new(ForkTool::new(subagents.clone(), depth)));
+        }
+        children
+            .register(Observed::new(PromptTool::new(subagents.clone())))
+            .register(Observed::new(SubagentsTool::new(subagents.clone())))
+            .register(Observed::new(CloseTool::new(subagents, {
                 let background_jobs = background_jobs.clone();
                 move |call_id, allow_pending| {
                     if allow_pending {
@@ -512,10 +516,10 @@ impl Runtime {
                     }
                 }
             })))
-            .with(Observed::new(A2aTool::new()))
-            .with(Observed::new(ToolSearch::new(self.mcp.clone())))
-            .with(Observed::new(AuthTool::new(self.mcp.clone())))
-            .with(Observed::new(McpTool::new(self.mcp.clone())));
+            .register(Observed::new(A2aTool::new()))
+            .register(Observed::new(ToolSearch::new(self.mcp.clone())))
+            .register(Observed::new(AuthTool::new(self.mcp.clone())))
+            .register(Observed::new(McpTool::new(self.mcp.clone())));
         let skill_tools = skills.tool_registry();
         if let Some(skill_tool) = skill_tools.get(&ToolName::new("activate_skill")) {
             children.register(observe_shared(skill_tool));
@@ -776,7 +780,7 @@ impl Runtime {
                 "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
                 "After detaching, continue any independent work, including launching more detached work. When the remaining work depends on background results, yield; yielding continues the task with those results, so the user's answer need not be completed first. ",
                 "Keep work foregrounded when the next step needs its result in the current turn, and do not treat backgrounding as durable job execution.\n\n",
-                "When work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
+                "When subagent tools are available and work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
                 "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n",
                 "Current subagent depth: {depth}/{}."
             ),

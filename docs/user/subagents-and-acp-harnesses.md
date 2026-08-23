@@ -146,7 +146,7 @@ Cancelling an outer turn propagates to nested work. For a dispatched prompt, Kit
 
 ## Limits and troubleshooting
 
-Kit currently permits nesting to depth 2 and at most 120 live parent-owned subagent sessions per main session. Starting or forking beyond those bounds reports `subagent depth limit (2) reached` or `live subagent session limit (120) reached`. Use `subagents({})` to inspect retained sessions and `close` to release sessions that are no longer needed. Closed, failed, or explicitly closed children no longer consume capacity.
+Kit currently permits nesting to depth 2 and at most 120 live parent-owned subagent sessions per main session. At the maximum depth, Kit omits `subagent` and `fork` from the compose catalog because neither operation can succeed there; the runtime depth check remains as a fallback. Exceeding the depth or capacity bounds reports `subagent depth limit (2) reached` or `live subagent session limit (120) reached`. Use `subagents({})` to inspect retained sessions and `close` to release sessions that are no longer needed. Closed, failed, or explicitly closed children no longer consume capacity.
 
 ACP startup must complete within 30 seconds. Native `session/fork` must also answer within 30 seconds. Common diagnostics include:
 

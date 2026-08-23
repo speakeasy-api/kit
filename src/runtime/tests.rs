@@ -357,6 +357,33 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
 }
 
 #[test]
+fn maximum_depth_compose_omits_depth_increasing_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let max_depth = runtime.max_subagent_depth();
+
+    let below_maximum = runtime.compose(max_depth - 1);
+    for name in ["subagent", "fork"] {
+        assert!(
+            ToolSource::get(&below_maximum.compose, &ToolName::new(name)).is_some(),
+            "{name} should be available below the maximum depth"
+        );
+    }
+
+    let at_maximum = runtime.compose(max_depth);
+    for name in ["subagent", "fork"] {
+        assert!(
+            ToolSource::get(&at_maximum.compose, &ToolName::new(name)).is_none(),
+            "{name} should not be advertised at the maximum depth"
+        );
+    }
+    assert!(
+        ToolSource::get(&at_maximum.compose, &ToolName::new("prompt")).is_some(),
+        "non-depth-increasing session tools remain available"
+    );
+}
+
+#[test]
 fn compose_background_values_select_agentkit_task_routes() {
     let request = |background| {
         ToolRequest::new(
