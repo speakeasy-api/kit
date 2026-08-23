@@ -11,6 +11,8 @@ use a2a_protocol_types::{
     task::TaskState,
 };
 
+use sha2::{Digest as _, Sha256};
+
 use crate::runtime::Runtime;
 
 struct KitAgent(Arc<Runtime>);
@@ -53,19 +55,49 @@ impl AgentExecutor for KitAgent {
                     emit.status(TaskState::Completed).await?;
                 }
                 Err(error) => {
-                    emit.artifact(
-                        "error",
-                        vec![Part::text(error.to_string())],
-                        None,
-                        Some(true),
-                    )
-                    .await?;
+                    let session_id = a2a_session_id(context);
+                    let rendered = error.to_string();
+                    let rendered = match crate::fatal::record_loop_error(
+                        &session_id,
+                        crate::fatal::Surface::A2a,
+                        &error,
+                    ) {
+                        Ok(Some(path)) => {
+                            eprintln!(
+                                "stored fatal error log for {session_id}: {}",
+                                path.display()
+                            );
+                            rendered
+                        }
+                        Ok(None) => rendered,
+                        Err(log_error) => {
+                            eprintln!(
+                                "could not store fatal error log for {session_id}: {log_error}"
+                            );
+                            rendered
+                        }
+                    };
+                    emit.artifact("error", vec![Part::text(rendered)], None, Some(true))
+                        .await?;
                     emit.status(TaskState::Failed).await?;
                 }
             }
             Ok(())
         })
     }
+}
+
+fn a2a_session_id(context: &RequestContext) -> String {
+    let mut digest = Sha256::new();
+    digest.update(context.task_id.0.as_bytes());
+    digest.update([0]);
+    digest.update(context.context_id.as_bytes());
+    let digest = digest.finalize();
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("a2a-{encoded}")
 }
 
 pub async fn start(

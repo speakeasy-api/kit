@@ -148,7 +148,10 @@ impl Server {
             .cancellation(cancellation)
             .workspace(request.cwd.clone(), request.additional_directories.clone())
             .metadata(metadata.clone());
-        let handle = self.integration.bind_session(binding)?;
+        let handle = self
+            .integration
+            .bind_session(binding)
+            .map_err(|error| record_acp_runtime_failure(&session_id, "session_bind", error))?;
         let binding = SessionBindingGuard::new(Arc::clone(&self.integration), session_id.clone());
         let context = AcpDriverContext {
             cwd: request.cwd,
@@ -156,12 +159,24 @@ impl Server {
             integration: Arc::clone(&self.integration),
             cancellation: handle.cancellation_handle(),
         };
-        let driver = self.runtime.start_acp_driver(context, &mut claim).await?;
-        let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
+        let driver = match self.runtime.start_acp_driver(context, &mut claim).await {
+            Ok(driver) => driver,
+            Err(error) => {
+                return Err(record_acp_runtime_failure(
+                    &session_id,
+                    "session_start",
+                    error,
+                ));
+            }
+        };
+        let current = driver
+            .adapter
+            .selection()
+            .map_err(|error| record_acp_runtime_failure(&session_id, "model_selection", error))?;
         let reasoning_effort = driver
             .adapter
             .reasoning_effort()
-            .map_err(AcpRuntimeError::Loop)?;
+            .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
         let catalog = model_catalog(&current).await;
         let options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
@@ -182,7 +197,9 @@ impl Server {
         // Hold the map lock across the synchronous commit/publication boundary.
         // Once the claim commits there are no remaining cancellation points.
         let mut sessions = self.sessions.lock().await;
-        claim.commit()?;
+        claim
+            .commit()
+            .map_err(|error| record_acp_runtime_failure(&session_id, "session_commit", error))?;
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
             session_id: session_id.to_string(),
         });
@@ -501,6 +518,46 @@ async fn clean_up_session<S: ModelSession>(
     }
 }
 
+fn record_acp_runtime_failure(
+    session_id: &agentkit_acp::SessionId,
+    code: &str,
+    error: impl ToString,
+) -> AcpRuntimeError {
+    let rendered = error.to_string();
+    match crate::fatal::record_runtime_error(
+        &session_id.to_string(),
+        crate::fatal::Surface::Acp,
+        code,
+    ) {
+        Ok(path) => AcpRuntimeError::Loop(format!("{rendered}; fatal log: {}", path.display())),
+        Err(log_error) => {
+            eprintln!("could not store fatal error log for {session_id}: {log_error}");
+            AcpRuntimeError::Loop(rendered)
+        }
+    }
+}
+
+fn record_acp_loop_failure(
+    session_id: &agentkit_acp::SessionId,
+    error: &LoopError,
+) -> AcpRuntimeError {
+    let rendered = error.to_string();
+    match crate::fatal::record_loop_error(
+        &session_id.to_string(),
+        crate::fatal::Surface::Acp,
+        error,
+    ) {
+        Ok(Some(path)) => {
+            AcpRuntimeError::Loop(format!("{rendered}; fatal log: {}", path.display()))
+        }
+        Ok(None) => AcpRuntimeError::Loop(rendered),
+        Err(log_error) => {
+            eprintln!("could not store fatal error log for {session_id}: {log_error}");
+            AcpRuntimeError::Loop(rendered)
+        }
+    }
+}
+
 async fn drive_prompt<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
@@ -510,7 +567,7 @@ async fn drive_prompt<S: ModelSession>(
     let items = integration.input_port().prompt_to_items(&request)?;
     driver
         .submit_input(items)
-        .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        .map_err(|error| record_acp_loop_failure(session_id, &error))?;
     drive_until_pause(session_id, integration, driver, true)
         .await?
         .ok_or_else(|| AcpRuntimeError::Loop("prompt ended without a response".into()))
@@ -564,7 +621,7 @@ async fn drive_until_pause<S: ModelSession>(
                 integration.flush_session_updates(session_id).await?;
                 return Ok(answer_prompt.then(|| PromptResponse::new(StopReason::Cancelled)));
             }
-            Err(error) => return Err(AcpRuntimeError::Loop(error.to_string())),
+            Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
         match step {
             LoopStep::Finished(result) => {

@@ -548,10 +548,18 @@ impl Runtime {
             .configured
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
+        let session_id = request.id.clone();
         let initial = if request.resume {
             vec![Item::text(ItemKind::System, self.system_prompt(0))]
         } else {
-            self.initial_transcript(0).await?
+            self.initial_transcript(0).await.map_err(|error| {
+                record_runtime_failure(
+                    &session_id,
+                    crate::fatal::Surface::Prompt,
+                    "initial_transcript",
+                    error,
+                )
+            })?
         };
         let opened = crate::session::open(
             &self.root,
@@ -559,7 +567,15 @@ impl Runtime {
             request.resume,
             request.force,
             initial,
-        )?;
+        )
+        .map_err(|error| {
+            record_runtime_failure(
+                &session_id,
+                crate::fatal::Surface::Prompt,
+                "session_open",
+                error,
+            )
+        })?;
         let skills = self.fresh_skills();
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
@@ -567,7 +583,15 @@ impl Runtime {
             Some(opened.observer.clone()),
             Arc::clone(&skills),
             format!("compaction-{}", crate::session::new_id()),
-        )?;
+        )
+        .map_err(|error| {
+            record_runtime_failure(
+                &session_id,
+                crate::fatal::Surface::Prompt,
+                "compactor_build",
+                error,
+            )
+        })?;
         let subagents = self.subagents.fresh();
         let agent = Agent::builder()
             .model(self.adapter.clone())
@@ -584,12 +608,35 @@ impl Runtime {
             .transcript(opened.transcript)
             .input(vec![Item::text(ItemKind::User, prompt)])
             .build()
-            .map_err(|error| error.to_string())?;
-        let mut driver = agent
-            .start(SessionConfig::new(request.id).without_cache())
+            .map_err(|error| {
+                record_runtime_failure(
+                    &session_id,
+                    crate::fatal::Surface::Prompt,
+                    "agent_build",
+                    error.to_string(),
+                )
+            })?;
+        let mut driver = match agent
+            .start(SessionConfig::new(session_id.clone()).without_cache())
             .await
-            .map_err(|error| error.to_string())?;
-        drive(&mut driver).await.map_err(|error| error.to_string())
+        {
+            Ok(driver) => driver,
+            Err(error) => {
+                return Err(record_loop_failure(
+                    &session_id,
+                    crate::fatal::Surface::Prompt,
+                    &error,
+                ));
+            }
+        };
+        match drive(&mut driver).await {
+            Ok(output) => Ok(output),
+            Err(error) => Err(record_loop_failure(
+                &session_id,
+                crate::fatal::Surface::Prompt,
+                &error,
+            )),
+        }
     }
 
     pub async fn run_cancelled(
@@ -1125,6 +1172,37 @@ async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<V
         .map_err(|error| format!("could not load AGENTS.md context: {error}"))?;
     transcript.extend(context);
     Ok(transcript)
+}
+
+fn record_runtime_failure(
+    session_id: &str,
+    surface: crate::fatal::Surface,
+    code: &str,
+    rendered: String,
+) -> String {
+    match crate::fatal::record_runtime_error(session_id, surface, code) {
+        Ok(path) => format!("{rendered}; fatal log: {}", path.display()),
+        Err(log_error) => {
+            eprintln!("could not store fatal error log for {session_id}: {log_error}");
+            rendered
+        }
+    }
+}
+
+fn record_loop_failure(
+    session_id: &str,
+    surface: crate::fatal::Surface,
+    error: &LoopError,
+) -> String {
+    let rendered = error.to_string();
+    match crate::fatal::record_loop_error(session_id, surface, error) {
+        Ok(Some(path)) => format!("{rendered}; fatal log: {}", path.display()),
+        Ok(None) => rendered,
+        Err(log_error) => {
+            eprintln!("could not store fatal error log for {session_id}: {log_error}");
+            rendered
+        }
+    }
 }
 
 async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {

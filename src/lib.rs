@@ -3,6 +3,7 @@ pub mod compaction;
 mod credentials;
 pub mod docs;
 pub mod events;
+mod fatal;
 pub mod plugins;
 pub mod protocols;
 pub mod provider;

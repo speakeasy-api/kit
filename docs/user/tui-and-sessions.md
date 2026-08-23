@@ -89,12 +89,15 @@ The TUI recognizes exact leading slash-command tokens:
 
 ## Persisted transcripts and session files
 
-Kit stores durable JSONL transcripts and lock files in:
+Kit stores durable JSONL transcripts, locks, and session-associated fatal error logs in:
 
 ```text
 ~/.kit/sessions/<session-id>.jsonl
 ~/.kit/sessions/<session-id>.lock
+~/.kit/errors/<session-id>/<event-id>.json
 ```
+
+Fatal error records use their own versioned JSON schema and are not transcript content. They contain bounded, allowlisted diagnostics rather than prompts, tool arguments, response bodies, credentials, or URLs. Files are written atomically with owner-only permissions on Unix, and Kit retains the newest 50 records per session. Cancellation is not a fatal error and does not create a record. When persistence succeeds, local prompt and ACP terminal errors include the log path; A2A records stay server-local.
 
 `HOME is unset; cannot locate durable sessions` means Kit cannot determine this directory. Set `HOME` to the intended home directory before starting Kit.
 

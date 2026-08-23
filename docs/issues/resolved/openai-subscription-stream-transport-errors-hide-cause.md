@@ -12,4 +12,10 @@ Kit should retain a safe, bounded classification of the underlying `reqwest::Err
 
 A separate recovery improvement could retry once when the stream fails before Kit has emitted any model event, using the existing idempotency key and turn-state handling. Retrying after output has been observed requires stricter replay semantics and should not be conflated with better diagnostics.
 
-Relevant implementation: `src/provider/chatgpt.rs` (`OpenAiSubscriptionTurn::next_event` and initial turn startup).
+## Resolution
+
+Kit now preserves bounded transport classifications (`timeout`, `connect`, `request`, `body`, and `decode`) without serializing the `reqwest::Error` or its potentially sensitive URL. OpenAI subscription turns retry transient request, HTTP, provider-event, idle-timeout, early-close, and stream-transport failures only before the first model event. All attempts reuse the idempotency key and are bounded by 25 retries and a 10-minute wall-clock budget.
+
+Terminal top-level failures are also recorded under `~/.kit/errors/<session-id>/` with bounded messages, URL redaction, owner-only Unix permissions, atomic creation, and per-session retention. Cancellation does not produce a fatal record.
+
+Relevant implementation: `src/provider/chatgpt.rs` (`OpenAiSubscriptionTurn::next_event` and initial turn startup), `src/fatal.rs`, `src/protocols/acp.rs`, and `src/runtime.rs`.
