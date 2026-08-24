@@ -401,17 +401,19 @@ impl ModelSession for OpenAiSubscriptionSession {
             let response_request_id = crate::fatal::safe_response_request_id(response.headers());
             let mut turn = OpenAiSubscriptionTurn::new_inner(
                 response.bytes_stream(),
-                self.config.model.clone(),
-                response_model,
-                turn_state
-                    .as_ref()
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned),
-                self.binding.clone(),
-                self.session_id.clone(),
-                self.context_windows.clone(),
-                retries.saturating_add(1),
-                response_request_id,
+                OpenAiSubscriptionTurnInit {
+                    requested_model: self.config.model.clone(),
+                    header_model: response_model,
+                    turn_state: turn_state
+                        .as_ref()
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned),
+                    binding: self.binding.clone(),
+                    session_id: self.session_id.clone(),
+                    context_windows: self.context_windows.clone(),
+                    attempt: retries.saturating_add(1),
+                    response_request_id,
+                },
             );
             let elapsed = started.elapsed();
             if elapsed >= RETRY_BUDGET {
@@ -657,6 +659,17 @@ fn parse_context_windows(value: &Value) -> Result<HashMap<String, u64>, LoopErro
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
+struct OpenAiSubscriptionTurnInit {
+    requested_model: String,
+    header_model: Option<String>,
+    turn_state: Option<String>,
+    binding: auth::CredentialBinding,
+    session_id: String,
+    context_windows: Arc<HashMap<String, u64>>,
+    attempt: usize,
+    response_request_id: Option<String>,
+}
+
 pub struct OpenAiSubscriptionTurn {
     stream: ByteStream,
     buffer: Zeroizing<Vec<u8>>,
@@ -720,31 +733,36 @@ impl OpenAiSubscriptionTurn {
     ) -> Self {
         Self::new_inner(
             stream,
-            requested_model,
-            actual_model,
-            None,
-            auth::CredentialBinding {
-                account_id: "test-account".to_owned(),
-                generation: "test-generation".to_owned(),
+            OpenAiSubscriptionTurnInit {
+                requested_model,
+                header_model: actual_model,
+                turn_state: None,
+                binding: auth::CredentialBinding {
+                    account_id: "test-account".to_owned(),
+                    generation: "test-generation".to_owned(),
+                },
+                session_id: "s".to_owned(),
+                context_windows: Arc::new(HashMap::new()),
+                attempt: 1,
+                response_request_id: None,
             },
-            "s".to_owned(),
-            Arc::new(HashMap::new()),
-            1,
-            None,
         )
     }
 
     fn new_inner(
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-        requested_model: String,
-        header_model: Option<String>,
-        turn_state: Option<String>,
-        binding: auth::CredentialBinding,
-        session_id: String,
-        context_windows: Arc<HashMap<String, u64>>,
-        attempt: usize,
-        response_request_id: Option<String>,
+        init: OpenAiSubscriptionTurnInit,
     ) -> Self {
+        let OpenAiSubscriptionTurnInit {
+            requested_model,
+            header_model,
+            turn_state,
+            binding,
+            session_id,
+            context_windows,
+            attempt,
+            response_request_id,
+        } = init;
         Self {
             stream: Box::pin(stream),
             buffer: Zeroizing::new(Vec::new()),
@@ -2565,11 +2583,11 @@ mod usage_tests {
     use super::{
         CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRIES,
         MAX_RETRY_BACKOFF, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
-        PROVIDER_FINISH_REASONS_METADATA, RETRY_BUDGET, SubscriptionConfig,
-        classify_response_failure, classify_top_level_error, map_item, parse_context_windows,
-        parse_usage, request_body, retriable_http_status, retriable_status_code,
-        retriable_transport_error, retry_backoff, retry_failure, set_provider_finish_reasons,
-        tool_output,
+        OpenAiSubscriptionTurnInit, PROVIDER_FINISH_REASONS_METADATA, RETRY_BUDGET,
+        SubscriptionConfig, classify_response_failure, classify_top_level_error, map_item,
+        parse_context_windows, parse_usage, request_body, retriable_http_status,
+        retriable_status_code, retriable_transport_error, retry_backoff, retry_failure,
+        set_provider_finish_reasons, tool_output,
     };
 
     #[test]
@@ -3490,17 +3508,19 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
         let request_id = crate::fatal::safe_response_request_id(response.headers());
         OpenAiSubscriptionTurn::new_inner(
             response.bytes_stream(),
-            "gpt-5.4".into(),
-            None,
-            None,
-            super::auth::CredentialBinding {
-                account_id: "test-account".to_owned(),
-                generation: "test-generation".to_owned(),
+            OpenAiSubscriptionTurnInit {
+                requested_model: "gpt-5.4".into(),
+                header_model: None,
+                turn_state: None,
+                binding: super::auth::CredentialBinding {
+                    account_id: "test-account".to_owned(),
+                    generation: "test-generation".to_owned(),
+                },
+                session_id: "s".to_owned(),
+                context_windows: Arc::new(HashMap::new()),
+                attempt: 1,
+                response_request_id: request_id,
             },
-            "s".to_owned(),
-            Arc::new(HashMap::new()),
-            1,
-            request_id,
         )
     }
 
