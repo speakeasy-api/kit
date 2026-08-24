@@ -97,7 +97,7 @@ Kit stores durable JSONL transcripts, locks, and session-associated fatal error 
 ~/.kit/errors/<session-id>/<event-id>.json
 ```
 
-Fatal error records use their own versioned JSON schema and are not transcript content. They contain bounded, allowlisted diagnostics rather than prompts, tool arguments, response bodies, credentials, or URLs. Files are written atomically with owner-only permissions on Unix, and Kit retains the newest 50 records per session. Cancellation is not a fatal error and does not create a record. When persistence succeeds, local prompt and ACP terminal errors include the log path; A2A records stay server-local.
+Fatal error records use their own versioned JSON schema and are not transcript content. Schema v2 adds optional structured transport diagnostics; schema v1 records remain readable. Transport diagnostics contain only bounded, allowlisted request/stream stage, retry, attempt, the provider's strictly validated `x-request-id` value, reqwest classification, and typed Hyper, HTTP/2, and I/O fields. Unknown or truncated source chains are identified without storing source text. Kit never stores raw error display/debug text, arbitrary headers, prompts, tool arguments, response bodies, credentials, URLs, or peer-controlled HTTP/2 debug text in these records. Files are written atomically with owner-only permissions on Unix, and Kit retains the newest 50 records per session. Cancellation is not a fatal error and does not create a record. When persistence succeeds, local prompt and ACP terminal errors include the log path; A2A records stay server-local.
 
 `HOME is unset; cannot locate durable sessions` means Kit cannot determine this directory. Set `HOME` to the intended home directory before starting Kit.
 

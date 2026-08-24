@@ -52,6 +52,8 @@ const CONTINUATION_SCHEMA_VERSION: u64 = 1;
 pub struct SubscriptionConfig {
     pub model: String,
     pub credential_storage: crate::credentials::CredentialStorage,
+    #[cfg(test)]
+    endpoint: Option<String>,
 }
 
 impl SubscriptionConfig {
@@ -62,6 +64,8 @@ impl SubscriptionConfig {
         Ok(Self {
             model,
             credential_storage: Default::default(),
+            #[cfg(test)]
+            endpoint: None,
         })
     }
 
@@ -74,7 +78,17 @@ impl SubscriptionConfig {
     }
 
     fn endpoint(&self) -> &str {
+        #[cfg(test)]
+        if let Some(endpoint) = &self.endpoint {
+            return endpoint;
+        }
         ENDPOINT
+    }
+
+    #[cfg(test)]
+    fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = Some(endpoint);
+        self
     }
 }
 
@@ -151,6 +165,8 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             session_id,
             binding,
             context_windows,
+            #[cfg(test)]
+            test_credentials: None,
         })
     }
 
@@ -166,6 +182,8 @@ pub struct OpenAiSubscriptionSession {
     session_id: String,
     binding: auth::CredentialBinding,
     context_windows: Arc<HashMap<String, u64>>,
+    #[cfg(test)]
+    test_credentials: Option<auth::TokenRecord>,
 }
 
 #[async_trait]
@@ -253,9 +271,17 @@ impl ModelSession for OpenAiSubscriptionSession {
                     ));
                 }
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) if retriable_transport_error(&error) => {
+                Ok(Err(error))
+                    if retriable_transport_error(crate::fatal::TransportStage::Request, &error) =>
+                {
                     retry_failure(
-                        transport_error("request", &error),
+                        transport_error(
+                            crate::fatal::TransportStage::Request,
+                            &error,
+                            true,
+                            retries.saturating_add(1),
+                            None,
+                        ),
                         None,
                         &mut retries,
                         started,
@@ -273,7 +299,15 @@ impl ModelSession for OpenAiSubscriptionSession {
                         .await?;
                     continue;
                 }
-                Ok(Err(error)) => return Err(transport_error("request", &error)),
+                Ok(Err(error)) => {
+                    return Err(transport_error(
+                        crate::fatal::TransportStage::Request,
+                        &error,
+                        false,
+                        retries.saturating_add(1),
+                        None,
+                    ));
+                }
             };
             if response.status() == reqwest::StatusCode::UNAUTHORIZED && !unauthorized {
                 let elapsed = started.elapsed();
@@ -364,6 +398,7 @@ impl ModelSession for OpenAiSubscriptionSession {
             if turn_state.is_none() {
                 turn_state = response.headers().get(X_CODEX_TURN_STATE).cloned();
             }
+            let response_request_id = crate::fatal::safe_response_request_id(response.headers());
             let mut turn = OpenAiSubscriptionTurn::new_inner(
                 response.bytes_stream(),
                 self.config.model.clone(),
@@ -375,6 +410,8 @@ impl ModelSession for OpenAiSubscriptionSession {
                 self.binding.clone(),
                 self.session_id.clone(),
                 self.context_windows.clone(),
+                retries.saturating_add(1),
+                response_request_id,
             );
             let elapsed = started.elapsed();
             if elapsed >= RETRY_BUDGET {
@@ -506,6 +543,10 @@ impl OpenAiSubscriptionSession {
         rejected: Option<auth::TokenRecord>,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<auth::TokenRecord, LoopError> {
+        #[cfg(test)]
+        if let Some(credentials) = &self.test_credentials {
+            return Ok(credentials.clone());
+        }
         credentials(&self.config, rejected, cancellation).await
     }
 }
@@ -647,6 +688,9 @@ pub struct OpenAiSubscriptionTurn {
     stream_ended: bool,
     pending_failure: Option<ResponseFailure>,
     retryable_transport_failure: bool,
+    model_event_emitted: bool,
+    attempt: usize,
+    response_request_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -685,6 +729,8 @@ impl OpenAiSubscriptionTurn {
             },
             "s".to_owned(),
             Arc::new(HashMap::new()),
+            1,
+            None,
         )
     }
 
@@ -696,6 +742,8 @@ impl OpenAiSubscriptionTurn {
         binding: auth::CredentialBinding,
         session_id: String,
         context_windows: Arc<HashMap<String, u64>>,
+        attempt: usize,
+        response_request_id: Option<String>,
     ) -> Self {
         Self {
             stream: Box::pin(stream),
@@ -728,6 +776,9 @@ impl OpenAiSubscriptionTurn {
             stream_ended: false,
             pending_failure: None,
             retryable_transport_failure: false,
+            model_event_emitted: false,
+            attempt,
+            response_request_id,
         }
     }
 
@@ -1382,6 +1433,7 @@ impl ModelTurn for OpenAiSubscriptionTurn {
                 return Err(LoopError::Cancelled);
             }
             if let Some(event) = self.queued.pop_front() {
+                self.model_event_emitted = true;
                 return Ok(Some(event));
             }
             if let Some(failure) = &self.pending_failure {
@@ -1402,7 +1454,7 @@ impl ModelTurn for OpenAiSubscriptionTurn {
             let next = match next {
                 Ok(next) => next,
                 Err(_) => {
-                    self.retryable_transport_failure = true;
+                    self.retryable_transport_failure = !self.model_event_emitted;
                     return Err(LoopError::Provider(
                         "openai-subscription SSE idle timeout".to_owned(),
                     ));
@@ -1415,14 +1467,22 @@ impl ModelTurn for OpenAiSubscriptionTurn {
                     self.consume_frame(&frame)?;
                     continue;
                 }
-                self.retryable_transport_failure = true;
+                self.retryable_transport_failure = !self.model_event_emitted;
                 return Err(protocol("SSE stream closed before response.completed"));
             };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    self.retryable_transport_failure = retriable_transport_error(&error);
-                    return Err(transport_error("stream", &error));
+                    let retryable = !self.model_event_emitted
+                        && retriable_transport_error(crate::fatal::TransportStage::Stream, &error);
+                    self.retryable_transport_failure = retryable;
+                    return Err(transport_error(
+                        crate::fatal::TransportStage::Stream,
+                        &error,
+                        retryable,
+                        self.attempt,
+                        self.response_request_id.as_deref(),
+                    ));
                 }
             };
             self.total_bytes = self.total_bytes.saturating_add(chunk.len());
@@ -2322,9 +2382,12 @@ fn retry_backoff(idempotency_key: &str, retry_number: usize) -> Duration {
 
 fn retry_exhausted(error: LoopError, attempts: usize, elapsed: Duration) -> LoopError {
     match error {
-        LoopError::Provider(message) => LoopError::Provider(format!(
-            "{message} after {attempts} attempts over {} seconds",
-            elapsed.as_secs()
+        LoopError::Provider(message) => LoopError::Provider(crate::fatal::append_provider_context(
+            message,
+            &format!(
+                " after {attempts} attempts over {} seconds",
+                elapsed.as_secs()
+            ),
         )),
         other => other,
     }
@@ -2353,20 +2416,24 @@ async fn retry_failure(
     sleep_before_retry(Some(delay), cancellation).await
 }
 
-fn retriable_transport_error(error: &reqwest::Error) -> bool {
-    !error.is_decode()
-        && (error.is_timeout() || error.is_connect() || error.is_request() || error.is_body())
+fn retriable_transport_error(stage: crate::fatal::TransportStage, error: &reqwest::Error) -> bool {
+    let transport =
+        error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+    match stage {
+        crate::fatal::TransportStage::Request => !error.is_decode() && transport,
+        // Response::bytes_stream wraps underlying body-frame failures as Decode.
+        crate::fatal::TransportStage::Stream => transport || error.is_decode(),
+    }
 }
 
-fn transport_error(stage: &str, error: &reqwest::Error) -> LoopError {
-    LoopError::Provider(format!(
-        "openai-subscription {stage} transport failed (timeout={}, connect={}, request={}, body={}, decode={})",
-        error.is_timeout(),
-        error.is_connect(),
-        error.is_request(),
-        error.is_body(),
-        error.is_decode()
-    ))
+fn transport_error(
+    stage: crate::fatal::TransportStage,
+    error: &reqwest::Error,
+    retryable: bool,
+    attempt: usize,
+    response_request_id: Option<&str>,
+) -> LoopError {
+    crate::fatal::provider_transport_error(stage, error, retryable, attempt, response_request_id)
 }
 
 async fn sleep_before_retry(
@@ -2491,16 +2558,18 @@ mod usage_tests {
     };
     use agentkit_loop::{LoopError, ModelSession, ModelTurn, ModelTurnEvent};
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{StreamExt as _, stream};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
         CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRIES,
         MAX_RETRY_BACKOFF, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
         PROVIDER_FINISH_REASONS_METADATA, RETRY_BUDGET, SubscriptionConfig,
         classify_response_failure, classify_top_level_error, map_item, parse_context_windows,
-        parse_usage, request_body, retriable_http_status, retriable_status_code, retry_backoff,
-        retry_failure, set_provider_finish_reasons, tool_output,
+        parse_usage, request_body, retriable_http_status, retriable_status_code,
+        retriable_transport_error, retry_backoff, retry_failure, set_provider_finish_reasons,
+        tool_output,
     };
 
     #[test]
@@ -2547,6 +2616,7 @@ mod usage_tests {
                 generation: "test-generation".into(),
             },
             context_windows: Arc::new(HashMap::new()),
+            test_credentials: None,
         };
 
         assert_eq!(session.provider_name(), Some("openai-subscription"));
@@ -3245,6 +3315,265 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         .to_string();
 
         assert!(error.contains("after 26 attempts"), "{error}");
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "client closed before request headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+            assert!(request.len() <= 64 * 1024, "request headers are too large");
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "client closed before request body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request
+    }
+
+    fn request_header(request: &[u8], expected: &str) -> String {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        std::str::from_utf8(&request[..header_end])
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(expected)
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_else(|| panic!("missing {expected} header"))
+    }
+
+    #[tokio::test]
+    async fn begin_turn_resends_after_an_early_stream_failure() {
+        const SUCCESS: &[u8] = br#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1","output_index":0,"content_index":0,"delta":"hello"}
+
+"#;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut idempotency_keys = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                idempotency_keys.push(request_header(&request, "idempotency-key"));
+                if attempt == 0 {
+                    let body = b"event: response.created\ndata: {\"type\":";
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len() + 1024
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    socket.write_all(body).await.unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                SUCCESS.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    socket.write_all(SUCCESS).await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            }
+            idempotency_keys
+        });
+
+        let credentials = super::auth::TokenRecord::for_test("access", "test-account");
+        let binding = credentials.binding().unwrap();
+        let mut session = OpenAiSubscriptionSession {
+            config: SubscriptionConfig::new("gpt-5.4".into())
+                .unwrap()
+                .with_endpoint(format!("http://{address}/responses")),
+            reasoning_effort: None,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            session_id: "stream-retry-test".into(),
+            binding,
+            context_windows: Arc::new(HashMap::new()),
+            test_credentials: Some(credentials),
+        };
+        let request = agentkit_loop::TurnRequest {
+            session_id: SessionId::new("stream-retry-test"),
+            turn_id: TurnId::new("turn-1"),
+            transcript: vec![Item::text(ItemKind::User, "hello")],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        };
+
+        let _turn = session.begin_turn(request, None).await.unwrap();
+        let idempotency_keys = server.await.unwrap();
+        assert_eq!(idempotency_keys.len(), 2);
+        assert!(!idempotency_keys[0].is_empty());
+        assert_eq!(idempotency_keys[0], idempotency_keys[1]);
+    }
+
+    async fn truncated_reqwest_response(body: &'static [u8]) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while request.len() < 8 * 1024 {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let declared = body.len() + 1_024;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nX-Request-Id: req_truncated-1\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(body).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/responses"))
+            .send()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    async fn turn_from_truncated_reqwest_response(body: &'static [u8]) -> OpenAiSubscriptionTurn {
+        let response = truncated_reqwest_response(body).await;
+        let request_id = crate::fatal::safe_response_request_id(response.headers());
+        OpenAiSubscriptionTurn::new_inner(
+            response.bytes_stream(),
+            "gpt-5.4".into(),
+            None,
+            None,
+            super::auth::CredentialBinding {
+                account_id: "test-account".to_owned(),
+                generation: "test-generation".to_owned(),
+            },
+            "s".to_owned(),
+            Arc::new(HashMap::new()),
+            1,
+            request_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn truncated_reqwest_body_is_retryable_only_before_a_model_event() {
+        let mut stream = truncated_reqwest_response(b"incomplete")
+            .await
+            .bytes_stream();
+        let wrapped = loop {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => break error,
+                None => panic!("truncated response ended without reqwest error"),
+            }
+        };
+        assert!(wrapped.is_decode());
+        assert!(!retriable_transport_error(
+            crate::fatal::TransportStage::Request,
+            &wrapped
+        ));
+        assert!(retriable_transport_error(
+            crate::fatal::TransportStage::Stream,
+            &wrapped
+        ));
+
+        let mut early =
+            turn_from_truncated_reqwest_response(b"event: response.created\ndata: {\"type\":")
+                .await;
+        let error = early.next_event(None).await.unwrap_err().to_string();
+        let diagnostics =
+            crate::fatal::transport_diagnostics_json(&error).expect("transport marker");
+        assert!(early.retryable_transport_failure);
+        assert_eq!(diagnostics["stage"], "stream");
+        assert_eq!(diagnostics["retryable"], true);
+        assert_eq!(diagnostics["attempt"], 1);
+        assert_eq!(diagnostics["response_request_id"], "req_truncated-1");
+        assert_eq!(diagnostics["reqwest"]["decode"], true);
+        let sources = diagnostics["source_chain"].as_array().unwrap();
+        assert!(sources.iter().any(|source| source["kind"] == "hyper"));
+        assert!(
+            sources.iter().any(
+                |source| source["kind"] == "io" && source["classification"] == "unexpected_eof"
+            ),
+            "{diagnostics}"
+        );
+
+        let mut late = turn_from_truncated_reqwest_response(
+            br#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1","output_index":0,"content_index":0,"delta":"hello"}
+
+event: response.created
+data: {"# ,
+        )
+        .await;
+        assert!(late.next_event(None).await.unwrap().is_some());
+        let error = loop {
+            match late.next_event(None).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("truncated response completed"),
+                Err(error) => break error.to_string(),
+            }
+        };
+        let diagnostics =
+            crate::fatal::transport_diagnostics_json(&error).expect("transport marker");
+        assert!(!late.retryable_transport_failure);
+        assert_eq!(diagnostics["retryable"], false);
+        assert_eq!(diagnostics["reqwest"]["decode"], true);
     }
 
     #[tokio::test]

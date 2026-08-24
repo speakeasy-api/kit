@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.83"
+version = "0.1.84"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -36,6 +36,7 @@ crossterm = { version = "=0.29.0", features = ["event-stream"] }
 flate2 = "=1.1.9"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
+h2 = "=0.4.17"
 httpdate = "=1.0.3"
 hyper = "=1.11.0"
 hyper-util = { version = "=0.1.20", features = ["server", "http1", "http2", "tokio"] }

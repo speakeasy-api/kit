@@ -1053,7 +1053,7 @@ fn record_acp_loop_failure(
     session_id: &agentkit_acp::SessionId,
     error: &LoopError,
 ) -> AcpRuntimeError {
-    let rendered = error.to_string();
+    let rendered = crate::fatal::render_loop_error(error);
     match crate::fatal::record_loop_error(
         &session_id.to_string(),
         crate::fatal::Surface::Acp,

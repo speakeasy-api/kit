@@ -1311,7 +1311,7 @@ fn record_loop_failure(
     surface: crate::fatal::Surface,
     error: &LoopError,
 ) -> String {
-    let rendered = error.to_string();
+    let rendered = crate::fatal::render_loop_error(error);
     match crate::fatal::record_loop_error(session_id, surface, error) {
         Ok(Some(path)) => format!("{rendered}; fatal log: {}", path.display()),
         Ok(None) => rendered,

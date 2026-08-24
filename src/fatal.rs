@@ -1,4 +1,5 @@
 use std::{
+    error::Error as _,
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
@@ -7,12 +8,17 @@ use std::{
 };
 
 use agentkit_loop::LoopError;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_RECORD_BYTES: usize = 32 * 1024;
 const MAX_RECORDS_PER_SESSION: usize = 50;
+const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const MAX_SOURCE_CHAIN: usize = 8;
+const MAX_RESPONSE_REQUEST_ID_BYTES: usize = 128;
+const DIAGNOSTIC_MARKER: &str = "\n[kit-internal-transport-v1:";
 const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_EVENT: AtomicU64 = AtomicU64::new(1);
 
@@ -44,6 +50,363 @@ struct FatalRecord {
     kind: String,
     code: String,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<TransportDiagnostics>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransportStage {
+    Request,
+    Stream,
+}
+
+impl TransportStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TransportDiagnostics {
+    stage: TransportStage,
+    retryable: bool,
+    attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_request_id: Option<String>,
+    reqwest: ReqwestDiagnostics,
+    source_chain: Vec<TransportSource>,
+    source_chain_unknown: bool,
+    source_chain_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReqwestDiagnostics {
+    timeout: bool,
+    connect: bool,
+    request: bool,
+    body: bool,
+    decode: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TransportSource {
+    Hyper {
+        parse: bool,
+        user: bool,
+        canceled: bool,
+        closed: bool,
+        incomplete_message: bool,
+        body_write_aborted: bool,
+        shutdown: bool,
+        timeout: bool,
+    },
+    H2 {
+        io: bool,
+        go_away: bool,
+        reset: bool,
+        remote: bool,
+        library: bool,
+        reason: H2Reason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        io_error: Option<IoDiagnostics>,
+    },
+    Io {
+        classification: IoClassification,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        os_code: Option<i32>,
+    },
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum H2Reason {
+    None,
+    NoError,
+    ProtocolError,
+    InternalError,
+    FlowControlError,
+    SettingsTimeout,
+    StreamClosed,
+    FrameSizeError,
+    RefusedStream,
+    Cancel,
+    CompressionError,
+    ConnectError,
+    EnhanceYourCalm,
+    InadequateSecurity,
+    Http11Required,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IoDiagnostics {
+    classification: IoClassification,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IoClassification {
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionAborted,
+    NotConnected,
+    BrokenPipe,
+    TimedOut,
+    UnexpectedEof,
+    WouldBlock,
+    Interrupted,
+    Other,
+    Unknown,
+}
+
+pub(crate) fn provider_transport_error(
+    stage: TransportStage,
+    error: &reqwest::Error,
+    retryable: bool,
+    attempt: usize,
+    response_request_id: Option<&str>,
+) -> LoopError {
+    let diagnostics =
+        TransportDiagnostics::capture(stage, error, retryable, attempt, response_request_id);
+    let message = format!(
+        "openai-subscription {} transport failed (timeout={}, connect={}, request={}, body={}, decode={})",
+        stage.as_str(),
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body(),
+        error.is_decode(),
+    );
+    LoopError::Provider(append_diagnostics(message, &diagnostics))
+}
+
+pub(crate) fn safe_response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get("x-request-id")?.to_str().ok()?;
+    if value.is_empty()
+        || value.len() > MAX_RESPONSE_REQUEST_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+pub(crate) fn append_provider_context(message: String, context: &str) -> String {
+    if let Some(marker) = message.find(DIAGNOSTIC_MARKER) {
+        format!("{}{}{}", &message[..marker], context, &message[marker..])
+    } else {
+        format!("{message}{context}")
+    }
+}
+
+pub(crate) fn render_loop_error(error: &LoopError) -> String {
+    match error {
+        LoopError::Provider(message) => {
+            let (message, _) = split_diagnostics(message);
+            format!("provider error: {message}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+impl TransportDiagnostics {
+    fn capture(
+        stage: TransportStage,
+        error: &reqwest::Error,
+        retryable: bool,
+        attempt: usize,
+        response_request_id: Option<&str>,
+    ) -> Self {
+        let mut source_chain = Vec::new();
+        let mut source = error.source();
+        while let Some(current) = source {
+            if source_chain.len() == MAX_SOURCE_CHAIN {
+                break;
+            }
+            let diagnostic = if let Some(error) = current.downcast_ref::<hyper::Error>() {
+                TransportSource::Hyper {
+                    parse: error.is_parse(),
+                    user: error.is_user(),
+                    canceled: error.is_canceled(),
+                    closed: error.is_closed(),
+                    incomplete_message: error.is_incomplete_message(),
+                    body_write_aborted: error.is_body_write_aborted(),
+                    shutdown: error.is_shutdown(),
+                    timeout: error.is_timeout(),
+                }
+            } else if let Some(error) = current.downcast_ref::<h2::Error>() {
+                TransportSource::H2 {
+                    io: error.is_io(),
+                    go_away: error.is_go_away(),
+                    reset: error.is_reset(),
+                    remote: error.is_remote(),
+                    library: error.is_library(),
+                    reason: h2_reason(error.reason()),
+                    io_error: error.get_io().map(io_diagnostics),
+                }
+            } else if let Some(error) = current.downcast_ref::<std::io::Error>() {
+                let io = io_diagnostics(error);
+                TransportSource::Io {
+                    classification: io.classification,
+                    os_code: io.os_code,
+                }
+            } else {
+                TransportSource::Unknown
+            };
+            source_chain.push(diagnostic);
+            source = current.source();
+        }
+        let source_chain_unknown = source_chain
+            .iter()
+            .any(|source| matches!(source, TransportSource::Unknown));
+        Self {
+            stage,
+            retryable,
+            attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
+            response_request_id: response_request_id
+                .filter(|value| valid_response_request_id(value))
+                .map(str::to_owned),
+            reqwest: ReqwestDiagnostics {
+                timeout: error.is_timeout(),
+                connect: error.is_connect(),
+                request: error.is_request(),
+                body: error.is_body(),
+                decode: error.is_decode(),
+            },
+            source_chain,
+            source_chain_unknown,
+            source_chain_truncated: source.is_some(),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.attempt > 0
+            && self.attempt <= 1_000
+            && self.source_chain.len() <= MAX_SOURCE_CHAIN
+            && self
+                .response_request_id
+                .as_deref()
+                .is_none_or(valid_response_request_id)
+            && self.source_chain_unknown
+                == self
+                    .source_chain
+                    .iter()
+                    .any(|source| matches!(source, TransportSource::Unknown))
+            && self.source_chain.iter().all(|source| match source {
+                TransportSource::H2 { io, io_error, .. } => *io == io_error.is_some(),
+                _ => true,
+            })
+    }
+}
+
+fn h2_reason(reason: Option<h2::Reason>) -> H2Reason {
+    match reason {
+        None => H2Reason::None,
+        Some(h2::Reason::NO_ERROR) => H2Reason::NoError,
+        Some(h2::Reason::PROTOCOL_ERROR) => H2Reason::ProtocolError,
+        Some(h2::Reason::INTERNAL_ERROR) => H2Reason::InternalError,
+        Some(h2::Reason::FLOW_CONTROL_ERROR) => H2Reason::FlowControlError,
+        Some(h2::Reason::SETTINGS_TIMEOUT) => H2Reason::SettingsTimeout,
+        Some(h2::Reason::STREAM_CLOSED) => H2Reason::StreamClosed,
+        Some(h2::Reason::FRAME_SIZE_ERROR) => H2Reason::FrameSizeError,
+        Some(h2::Reason::REFUSED_STREAM) => H2Reason::RefusedStream,
+        Some(h2::Reason::CANCEL) => H2Reason::Cancel,
+        Some(h2::Reason::COMPRESSION_ERROR) => H2Reason::CompressionError,
+        Some(h2::Reason::CONNECT_ERROR) => H2Reason::ConnectError,
+        Some(h2::Reason::ENHANCE_YOUR_CALM) => H2Reason::EnhanceYourCalm,
+        Some(h2::Reason::INADEQUATE_SECURITY) => H2Reason::InadequateSecurity,
+        Some(h2::Reason::HTTP_1_1_REQUIRED) => H2Reason::Http11Required,
+        Some(_) => H2Reason::Unknown,
+    }
+}
+
+fn io_diagnostics(error: &std::io::Error) -> IoDiagnostics {
+    use std::io::ErrorKind;
+    let classification = match error.kind() {
+        ErrorKind::ConnectionRefused => IoClassification::ConnectionRefused,
+        ErrorKind::ConnectionReset => IoClassification::ConnectionReset,
+        ErrorKind::ConnectionAborted => IoClassification::ConnectionAborted,
+        ErrorKind::NotConnected => IoClassification::NotConnected,
+        ErrorKind::BrokenPipe => IoClassification::BrokenPipe,
+        ErrorKind::TimedOut => IoClassification::TimedOut,
+        ErrorKind::UnexpectedEof => IoClassification::UnexpectedEof,
+        ErrorKind::WouldBlock => IoClassification::WouldBlock,
+        ErrorKind::Interrupted => IoClassification::Interrupted,
+        ErrorKind::Other => IoClassification::Other,
+        _ => IoClassification::Unknown,
+    };
+    IoDiagnostics {
+        classification,
+        os_code: error.raw_os_error(),
+    }
+}
+
+fn valid_response_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_RESPONSE_REQUEST_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
+    let Ok(encoded) = serde_json::to_vec(diagnostics) else {
+        return message;
+    };
+    if encoded.len() > MAX_DIAGNOSTIC_BYTES {
+        return message;
+    }
+    format!(
+        "{message}{DIAGNOSTIC_MARKER}{}]",
+        URL_SAFE_NO_PAD.encode(encoded)
+    )
+}
+
+fn split_diagnostics(message: &str) -> (&str, Option<TransportDiagnostics>) {
+    let Some(marker) = message.find(DIAGNOSTIC_MARKER) else {
+        return (message, None);
+    };
+    let plain = &message[..marker];
+    let suffix = &message[marker + DIAGNOSTIC_MARKER.len()..];
+    if suffix.contains(DIAGNOSTIC_MARKER) || !suffix.ends_with(']') {
+        return (plain, None);
+    }
+    let encoded = &suffix[..suffix.len() - 1];
+    if encoded.is_empty() || encoded.len() > MAX_DIAGNOSTIC_BYTES.saturating_mul(2) {
+        return (plain, None);
+    }
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return (plain, None);
+    };
+    if decoded.len() > MAX_DIAGNOSTIC_BYTES {
+        return (plain, None);
+    }
+    let Ok(diagnostics) = serde_json::from_slice::<TransportDiagnostics>(&decoded) else {
+        return (plain, None);
+    };
+    if !diagnostics.valid() {
+        return (plain, None);
+    }
+    (plain, Some(diagnostics))
+}
+
+#[cfg(test)]
+pub(crate) fn transport_diagnostics_json(message: &str) -> Option<serde_json::Value> {
+    let (_, diagnostics) = split_diagnostics(message);
+    serde_json::to_value(diagnostics?).ok()
 }
 
 pub(crate) fn record_loop_error(
@@ -51,10 +414,18 @@ pub(crate) fn record_loop_error(
     surface: Surface,
     error: &LoopError,
 ) -> Result<Option<PathBuf>, String> {
-    let Some((kind, code, message)) = classify(error) else {
+    let Some((kind, code, message, diagnostics)) = classify(error) else {
         return Ok(None);
     };
-    write_default(session_id, surface, kind, code, &message).map(Some)
+    write_default(
+        session_id,
+        surface,
+        kind,
+        code,
+        &message,
+        diagnostics.as_ref(),
+    )
+    .map(Some)
 }
 
 pub(crate) fn record_runtime_error(
@@ -68,35 +439,57 @@ pub(crate) fn record_runtime_error(
         "runtime",
         canonical_code(code),
         "runtime failed before the session could continue",
+        None,
     )
 }
 
-fn classify(error: &LoopError) -> Option<(&'static str, &'static str, String)> {
+fn classify(
+    error: &LoopError,
+) -> Option<(
+    &'static str,
+    &'static str,
+    String,
+    Option<TransportDiagnostics>,
+)> {
     match error {
         LoopError::Cancelled => None,
         LoopError::Provider(message) => {
+            let (message, diagnostics) = split_diagnostics(message);
             if message.starts_with("openai-subscription ") {
                 let code = provider_code(message);
-                Some(("provider", code, provider_message(code, message)))
+                Some((
+                    "provider",
+                    code,
+                    provider_message(code, message),
+                    diagnostics,
+                ))
             } else {
                 Some((
                     "provider",
                     "provider_error",
                     "provider request failed".into(),
+                    None,
                 ))
             }
         }
-        LoopError::Tool(_) => Some(("tool", "tool_error", "tool execution failed".into())),
-        LoopError::Mutator(_) => Some(("runtime", "mutator_error", "loop mutator failed".into())),
+        LoopError::Tool(_) => Some(("tool", "tool_error", "tool execution failed".into(), None)),
+        LoopError::Mutator(_) => Some((
+            "runtime",
+            "mutator_error",
+            "loop mutator failed".into(),
+            None,
+        )),
         LoopError::InvalidState(_) => Some((
             "runtime",
             "invalid_state",
             "runtime entered an invalid state".into(),
+            None,
         )),
         LoopError::Unsupported(_) => Some((
             "runtime",
             "unsupported",
             "runtime operation is unsupported".into(),
+            None,
         )),
     }
 }
@@ -187,20 +580,23 @@ fn write_default(
     kind: &str,
     code: &str,
     message: &str,
+    diagnostics: Option<&TransportDiagnostics>,
 ) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| "HOME is unset; cannot store fatal error log".to_owned())?;
-    write_in(
+    write_in_with_diagnostics(
         &PathBuf::from(home).join(".kit/errors"),
         session_id,
         surface,
         kind,
         code,
         message,
+        diagnostics,
     )
 }
 
+#[cfg(test)]
 fn write_in(
     base: &Path,
     session_id: &str,
@@ -208,6 +604,18 @@ fn write_in(
     kind: &str,
     code: &str,
     message: &str,
+) -> Result<PathBuf, String> {
+    write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
+}
+
+fn write_in_with_diagnostics(
+    base: &Path,
+    session_id: &str,
+    surface: Surface,
+    kind: &str,
+    code: &str,
+    message: &str,
+    diagnostics: Option<&TransportDiagnostics>,
 ) -> Result<PathBuf, String> {
     crate::session::validate_id(session_id)?;
     let occurred_at_ms = SystemTime::now()
@@ -229,6 +637,7 @@ fn write_in(
         kind: kind.into(),
         code: canonical_code(code).into(),
         message: bounded(message),
+        diagnostics: diagnostics.filter(|value| value.valid()).cloned(),
     };
     let mut bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("could not encode fatal error log: {error}"))?;
@@ -336,11 +745,60 @@ mod tests {
     use std::fs;
 
     use agentkit_loop::LoopError;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
 
     use super::{
-        FatalRecord, MAX_RECORDS_PER_SESSION, Surface, bounded, classify, event_order,
-        record_loop_error, write_in,
+        DIAGNOSTIC_MARKER, FatalRecord, H2Reason, IoClassification, MAX_DIAGNOSTIC_BYTES,
+        MAX_RECORDS_PER_SESSION, ReqwestDiagnostics, Surface, TransportDiagnostics,
+        TransportSource, TransportStage, append_diagnostics, append_provider_context, bounded,
+        classify, event_order, record_loop_error, render_loop_error, safe_response_request_id,
+        split_diagnostics, write_in, write_in_with_diagnostics,
     };
+
+    fn sample_diagnostics() -> TransportDiagnostics {
+        TransportDiagnostics {
+            stage: TransportStage::Stream,
+            retryable: true,
+            attempt: 2,
+            response_request_id: Some("req_safe-123".to_owned()),
+            reqwest: ReqwestDiagnostics {
+                timeout: false,
+                connect: false,
+                request: false,
+                body: false,
+                decode: true,
+            },
+            source_chain: vec![
+                TransportSource::Hyper {
+                    parse: false,
+                    user: false,
+                    canceled: false,
+                    closed: false,
+                    incomplete_message: true,
+                    body_write_aborted: false,
+                    shutdown: false,
+                    timeout: false,
+                },
+                TransportSource::H2 {
+                    io: false,
+                    go_away: false,
+                    reset: true,
+                    remote: true,
+                    library: false,
+                    reason: H2Reason::Cancel,
+                    io_error: None,
+                },
+                TransportSource::Io {
+                    classification: IoClassification::ConnectionReset,
+                    os_code: Some(54),
+                },
+                TransportSource::Unknown,
+            ],
+            source_chain_unknown: true,
+            source_chain_truncated: true,
+        }
+    }
 
     #[test]
     fn writes_versioned_session_scoped_record() {
@@ -356,15 +814,122 @@ mod tests {
         .unwrap();
         assert_eq!(path.parent().unwrap(), root.path().join("session-1"));
         let record: FatalRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(record.schema_version, 1);
+        assert_eq!(record.schema_version, 2);
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.surface, "prompt");
         assert_eq!(record.code, "stream_transport");
     }
 
     #[test]
+    fn schema_v1_records_remain_readable() {
+        let record: FatalRecord = serde_json::from_value(json!({
+            "schema_version": 1,
+            "event_id": "e-1-2-3",
+            "occurred_at_ms": 1,
+            "kit_version": "0.1.82",
+            "session_id": "session-1",
+            "surface": "prompt",
+            "kind": "provider",
+            "code": "stream_transport",
+            "message": "openai-subscription failed"
+        }))
+        .unwrap();
+
+        assert_eq!(record.schema_version, 1);
+        assert!(record.diagnostics.is_none());
+    }
+
+    #[test]
+    fn structured_transport_diagnostics_are_allowlisted_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let diagnostics = sample_diagnostics();
+        let path = write_in_with_diagnostics(
+            root.path(),
+            "session-1",
+            Surface::Prompt,
+            "provider",
+            "stream_transport",
+            "openai-subscription stream_transport",
+            Some(&diagnostics),
+        )
+        .unwrap();
+        let encoded = fs::read_to_string(path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["diagnostics"]["response_request_id"], "req_safe-123");
+        assert_eq!(value["diagnostics"]["stage"], "stream");
+        assert_eq!(value["diagnostics"]["retryable"], true);
+        assert_eq!(value["diagnostics"]["attempt"], 2);
+        assert_eq!(value["diagnostics"]["source_chain"][0]["kind"], "hyper");
+        assert_eq!(value["diagnostics"]["source_chain"][1]["reason"], "cancel");
+        assert_eq!(value["diagnostics"]["source_chain"][2]["os_code"], 54);
+        assert_eq!(value["diagnostics"]["source_chain"][3]["kind"], "unknown");
+        assert_eq!(value["diagnostics"]["source_chain_truncated"], true);
+        for forbidden in ["https://", "authorization", "credential", "response_body"] {
+            assert!(!encoded.to_ascii_lowercase().contains(forbidden));
+        }
+        assert!(encoded.len() < super::MAX_RECORD_BYTES);
+    }
+
+    #[test]
+    fn diagnostics_marker_is_strict_and_suffix_context_preserves_it() {
+        let base = "openai-subscription stream transport failed".to_owned();
+        let marked = append_diagnostics(base.clone(), &sample_diagnostics());
+        let (plain, diagnostics) = split_diagnostics(&marked);
+        assert_eq!(plain, base);
+        assert!(diagnostics.is_some());
+
+        let (_, code, message, diagnostics) =
+            classify(&LoopError::Provider(marked.clone())).unwrap();
+        assert_eq!(code, "stream_transport");
+        assert!(!message.contains(DIAGNOSTIC_MARKER));
+        assert!(message.len() < 256);
+        assert!(diagnostics.is_some());
+
+        let exhausted = append_provider_context(marked.clone(), " after 3 attempts");
+        let (plain, diagnostics) = split_diagnostics(&exhausted);
+        assert_eq!(plain, format!("{base} after 3 attempts"));
+        assert!(diagnostics.is_some());
+        assert!(exhausted.ends_with(']'));
+
+        for malformed in [
+            format!("{marked} trailing"),
+            format!("{marked}{DIAGNOSTIC_MARKER}e30]"),
+            format!("{base}{DIAGNOSTIC_MARKER}not-base64!]"),
+            format!(
+                "{base}{DIAGNOSTIC_MARKER}{}]",
+                "a".repeat(MAX_DIAGNOSTIC_BYTES * 2 + 1)
+            ),
+        ] {
+            assert!(split_diagnostics(&malformed).1.is_none(), "{malformed}");
+        }
+
+        let mut value = serde_json::to_value(sample_diagnostics()).unwrap();
+        value["peer_debug"] = json!("secret https://example.invalid");
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
+        let unknown = format!("{base}{DIAGNOSTIC_MARKER}{encoded}]");
+        assert!(split_diagnostics(&unknown).1.is_none());
+    }
+
+    #[test]
+    fn response_request_ids_are_strictly_allowlisted() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-request-id", "req_ABC-123:iad".parse().unwrap());
+        assert_eq!(
+            safe_response_request_id(&headers).as_deref(),
+            Some("req_ABC-123:iad")
+        );
+        headers.insert(
+            "x-request-id",
+            "secret https://example.invalid".parse().unwrap(),
+        );
+        assert_eq!(safe_response_request_id(&headers), None);
+    }
+
+    #[test]
     fn provider_records_exclude_response_content_but_keep_transport_flags() {
-        let (_, code, message) = classify(&LoopError::Provider(
+        let (_, code, message, _) = classify(&LoopError::Provider(
             "openai-subscription returned 400: secret prompt https://example.invalid/token".into(),
         ))
         .unwrap();
@@ -372,7 +937,7 @@ mod tests {
         assert_eq!(message, "openai-subscription failed (http_error)");
         assert!(!message.contains("secret"));
 
-        let (_, code, message) = classify(&LoopError::Provider(
+        let (_, code, message, _) = classify(&LoopError::Provider(
             "openai-subscription stream transport failed (timeout=true, connect=false, request=false, body=true, decode=false)".into(),
         ))
         .unwrap();
@@ -402,7 +967,7 @@ mod tests {
             ),
             ("openai-subscription auth worker failed", "credential_error"),
         ] {
-            let (_, code, message) =
+            let (_, code, message, _) =
                 classify(&LoopError::Provider(error.to_owned())).expect("provider error");
             assert_eq!(code, expected_code);
             assert_eq!(
@@ -412,6 +977,20 @@ mod tests {
             assert!(!message.contains("secret"));
             assert!(!message.contains("example.invalid"));
         }
+    }
+
+    #[test]
+    fn public_error_rendering_strips_internal_diagnostics() {
+        let message = append_diagnostics(
+            "openai-subscription stream transport failed".to_owned(),
+            &sample_diagnostics(),
+        );
+        let rendered = render_loop_error(&LoopError::Provider(message));
+        assert_eq!(
+            rendered,
+            "provider error: openai-subscription stream transport failed"
+        );
+        assert!(!rendered.contains("kit-internal-transport"));
     }
 
     #[test]

@@ -57,7 +57,7 @@ impl AgentExecutor for KitAgent {
                 }
                 Err(error) => {
                     let session_id = a2a_session_id(context);
-                    let rendered = error.to_string();
+                    let rendered = crate::fatal::render_loop_error(&error);
                     let rendered = match crate::fatal::record_loop_error(
                         &session_id,
                         crate::fatal::Surface::A2a,
