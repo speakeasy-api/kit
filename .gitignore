@@ -3,4 +3,5 @@
 /.pi-subagents/
 /.kit/
 /.kit-codesign-identity
+/.env
 .DS_Store

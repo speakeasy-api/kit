@@ -48,9 +48,13 @@ mise use github:danielkov/kit-releases@0.1.29-pre
 ## Prepare a signed macOS release locally
 
 Run signing and notarization on a trusted macOS machine so Apple queue delays do
-not consume metered GitHub-hosted macOS runner time. The script reads the App
-Store Connect API key from 1Password, uses the installed Developer ID identity,
-and preserves the exact submitted binary under `dist/notarize/`:
+not consume metered GitHub-hosted macOS runner time. Set
+`KIT_NOTARY_API_KEY_DOCUMENT`, `KIT_NOTARY_API_KEY_VAULT`,
+`KIT_NOTARY_API_KEY_ID`, and `KIT_NOTARY_API_ISSUER_ID` in the ignored repository
+root `.env` file or export them in the release environment. The script loads
+`.env` when present, reads the App Store Connect API key from 1Password, uses the
+installed Developer ID identity, and preserves the exact submitted binary under
+`dist/notarize/`:
 
 ```sh
 caffeinate -i scripts/notarize-release.sh v0.1.29

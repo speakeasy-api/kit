@@ -8,13 +8,15 @@ Usage: scripts/notarize-release.sh vVERSION
 Builds, Developer ID signs, and notarizes the macOS ARM64 release binary on
 this Mac. The exact signed binary is preserved under dist/notarize/vVERSION/.
 
-Configuration can be overridden with:
-  KIT_CODESIGN_IDENTITY
-  KIT_CODESIGN_IDENTIFIER
+Required configuration (`.env` or environment variables):
   KIT_NOTARY_API_KEY_DOCUMENT
   KIT_NOTARY_API_KEY_VAULT
   KIT_NOTARY_API_KEY_ID
   KIT_NOTARY_API_ISSUER_ID
+
+Optional overrides:
+  KIT_CODESIGN_IDENTITY
+  KIT_CODESIGN_IDENTIFIER
 EOF
 }
 
@@ -38,6 +40,11 @@ fi
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$root"
 
+if [[ -f $root/.env ]]; then
+  # shellcheck source=/dev/null
+  source "$root/.env"
+fi
+
 tag=$1
 version=${tag#v}
 cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
@@ -52,10 +59,10 @@ fi
 
 identity=${KIT_CODESIGN_IDENTITY:-Developer ID Application: Inlucent Limited (TAMRUK8SL6)}
 identifier=${KIT_CODESIGN_IDENTIFIER:-com.danielkov.kit}
-api_key_document=${KIT_NOTARY_API_KEY_DOCUMENT:-AuthKey_ZMYQG5BF8G}
-api_key_vault=${KIT_NOTARY_API_KEY_VAULT:-Employee}
-api_key_id=${KIT_NOTARY_API_KEY_ID:-ZMYQG5BF8G}
-api_issuer_id=${KIT_NOTARY_API_ISSUER_ID:-1de533ad-a88e-4de7-a5a4-d04a4722af91}
+api_key_document=${KIT_NOTARY_API_KEY_DOCUMENT:?KIT_NOTARY_API_KEY_DOCUMENT must be set}
+api_key_vault=${KIT_NOTARY_API_KEY_VAULT:?KIT_NOTARY_API_KEY_VAULT must be set}
+api_key_id=${KIT_NOTARY_API_KEY_ID:?KIT_NOTARY_API_KEY_ID must be set}
+api_issuer_id=${KIT_NOTARY_API_ISSUER_ID:?KIT_NOTARY_API_ISSUER_ID must be set}
 target=aarch64-apple-darwin
 commit=$(git rev-parse HEAD)
 out_dir="$root/dist/notarize/$tag"
