@@ -60,7 +60,7 @@ jobs:
 
   macos-arm64:
     needs: verify
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     outputs:
       signed: ${{ steps.signing.outputs.enabled }}
     env:
