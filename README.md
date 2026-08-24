@@ -377,8 +377,11 @@ top-level `background` argument. `background: true` starts it in the background;
 it if it is still running. `false` or omission keeps normal foreground behavior.
 The delay must be an integer from 1 through 86,400 seconds.
 
-Detached calls remain visible and selectable in the TUI runtime graph. Interrupting
-the originating turn does not stop them. The model receives each detached call's ID
+Press `Command+B` in the TUI to move the newest running foreground top-level
+compose call into the background. This shortcut requires a terminal that reports
+the Command key through the Kitty keyboard protocol; there is no control-key equivalent. Detached calls
+remain visible and selectable in the TUI runtime graph. Interrupting the originating
+turn does not stop them. The model receives each detached call's ID
 and can cancel it with `close({ call_id: "call_..." })`; the selected running
 background call can also be killed with `Ctrl+K` in the TUI. Completion and
 cancellation are delivered through the normal background-result lifecycle. Detached
@@ -542,6 +545,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | `/model name` | switch immediately to the closest catalog match |
 | `⇧⏎`, `⌥⏎`, `^j` | newline |
 | `esc` | interrupt the running turn |
+| `⌘b` | move the newest running foreground compose call to the background |
 | `^c` | interrupt, or quit when idle |
 | `⌥←/→`, `^a`/`^e`, `home`/`end` | word and line movement |
 | `⌥⌫`, `^w` | delete the previous word |

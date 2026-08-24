@@ -311,9 +311,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-task-manager"
-version = "0.10.5"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b0ff043a61611fb3b867ac367cfb9beb3a1c71487a15754acb17b2f4d8920fd"
+checksum = "4e5783e77661abcf2739325383c5bb348b83ba8d6c066bebb47b8ba3671ba921"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.85"
+version = "0.1.86"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",

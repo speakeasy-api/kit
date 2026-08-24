@@ -1054,10 +1054,25 @@ impl ToolSource for ComposeOnly {
     }
 }
 
+struct BackgroundJob {
+    controller: CancellationController,
+    foreground_cancellation: Option<agentkit_core::TurnCancellation>,
+    cancellation_relay: Option<tokio::task::AbortHandle>,
+    detached: bool,
+    manual_detach: bool,
+}
+
 #[derive(Default)]
 struct BackgroundJobState {
-    running: HashMap<agentkit_core::ToolCallId, CancellationController>,
+    running: HashMap<agentkit_core::ToolCallId, BackgroundJob>,
     pending_cancellations: std::collections::HashSet<agentkit_core::ToolCallId>,
+    pending_detaches: std::collections::HashSet<agentkit_core::ToolCallId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DetachRegistration {
+    Registered,
+    AlreadyDetached,
 }
 
 #[derive(Clone, Default)]
@@ -1069,10 +1084,10 @@ impl BackgroundJobs {
         let Ok(jobs) = self.0.lock() else {
             return false;
         };
-        let Some(controller) = jobs.running.get(&call_id) else {
+        let Some(job) = jobs.running.get(&call_id) else {
             return false;
         };
-        controller.interrupt();
+        job.controller.interrupt();
         true
     }
 
@@ -1081,8 +1096,8 @@ impl BackgroundJobs {
         let Ok(mut jobs) = self.0.lock() else {
             return false;
         };
-        if let Some(controller) = jobs.running.get(&call_id) {
-            controller.interrupt();
+        if let Some(job) = jobs.running.get(&call_id) {
+            job.controller.interrupt();
         } else {
             // ACP can expose the call just before its execution future registers.
             // Remember the request so registration and cancellation are atomic
@@ -1090,6 +1105,119 @@ impl BackgroundJobs {
             jobs.pending_cancellations.insert(call_id);
         }
         true
+    }
+
+    pub(crate) fn detach(&self, call_id: &str) -> Option<DetachRegistration> {
+        let call_id = agentkit_core::ToolCallId::new(call_id);
+        let Ok(mut jobs) = self.0.lock() else {
+            return None;
+        };
+        if let Some(job) = jobs.running.get_mut(&call_id) {
+            if job.manual_detach {
+                return Some(DetachRegistration::AlreadyDetached);
+            }
+            job.detached = true;
+            job.manual_detach = true;
+            if job
+                .foreground_cancellation
+                .as_ref()
+                .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+            {
+                job.detached = false;
+                job.manual_detach = false;
+                job.controller.interrupt();
+                return None;
+            }
+            return Some(DetachRegistration::Registered);
+        }
+        Some(if jobs.pending_detaches.insert(call_id) {
+            DetachRegistration::Registered
+        } else {
+            DetachRegistration::AlreadyDetached
+        })
+    }
+
+    pub(crate) fn restore_foreground(&self, call_id: &str) {
+        let call_id = agentkit_core::ToolCallId::new(call_id);
+        let Ok(mut jobs) = self.0.lock() else {
+            return;
+        };
+        let Some(job) = jobs.running.get_mut(&call_id) else {
+            jobs.pending_detaches.remove(&call_id);
+            return;
+        };
+        job.manual_detach = false;
+        if job.foreground_cancellation.is_some() {
+            job.detached = false;
+        }
+        if job
+            .foreground_cancellation
+            .as_ref()
+            .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+        {
+            job.controller.interrupt();
+        }
+    }
+
+    fn propagate_foreground_cancellation(&self, call_id: &agentkit_core::ToolCallId) {
+        let Ok(jobs) = self.0.lock() else {
+            return;
+        };
+        if let Some(job) = jobs.running.get(call_id)
+            && !job.detached
+        {
+            job.controller.interrupt();
+        }
+    }
+
+    fn finish(&self, call_id: &agentkit_core::ToolCallId) {
+        if let Ok(mut jobs) = self.0.lock() {
+            if let Some(job) = jobs.running.remove(call_id)
+                && let Some(relay) = job.cancellation_relay
+            {
+                relay.abort();
+            }
+            jobs.pending_cancellations.remove(call_id);
+            jobs.pending_detaches.remove(call_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_foreground_for_test(&self, call_id: &str) {
+        if let Ok(mut jobs) = self.0.lock() {
+            let call_id = agentkit_core::ToolCallId::new(call_id);
+            let manual_detach = jobs.pending_detaches.remove(&call_id);
+            jobs.running.insert(
+                call_id,
+                BackgroundJob {
+                    controller: CancellationController::new(),
+                    foreground_cancellation: None,
+                    cancellation_relay: None,
+                    detached: manual_detach,
+                    manual_detach,
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_detached_for_test(&self, call_id: &str) -> bool {
+        let call_id = agentkit_core::ToolCallId::new(call_id);
+        self.0.lock().is_ok_and(|jobs| {
+            jobs.running.get(&call_id).is_some_and(|job| job.detached)
+                || jobs.pending_detaches.contains(&call_id)
+        })
+    }
+}
+
+struct BackgroundJobGuard {
+    jobs: BackgroundJobs,
+    call_id: agentkit_core::ToolCallId,
+}
+
+impl Drop for BackgroundJobGuard {
+    fn drop(&mut self) {
+        self.jobs.finish(&self.call_id);
     }
 }
 
@@ -1159,8 +1287,8 @@ impl Tool for BackgroundableCompose {
         let artifact_directory =
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
         let request = Self::sanitized(request)?;
-        let cancellation = self.begin_background(background, &call_id, ctx);
-        let result = match self.inner.invoke(request, ctx).await {
+        let _job = self.begin_background(background, &call_id, ctx);
+        match self.inner.invoke(request, ctx).await {
             Ok(mut result) => {
                 match crate::compose_output::guard(&artifact_directory, result.result.output).await
                 {
@@ -1172,9 +1300,7 @@ impl Tool for BackgroundableCompose {
                 }
             }
             Err(error) => Err(error),
-        };
-        self.finish_background(cancellation, &call_id);
-        result
+        }
     }
 
     async fn invoke_outcome(
@@ -1190,8 +1316,8 @@ impl Tool for BackgroundableCompose {
             Ok(request) => request,
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
-        let cancellation = self.begin_background(background, &call_id, ctx);
-        let result = match self.inner.invoke_outcome(request, ctx).await {
+        let _job = self.begin_background(background, &call_id, ctx);
+        match self.inner.invoke_outcome(request, ctx).await {
             ToolExecutionOutcome::Completed(mut result) => {
                 match crate::compose_output::guard(&artifact_directory, result.result.output).await
                 {
@@ -1203,9 +1329,7 @@ impl Tool for BackgroundableCompose {
                 }
             }
             other => other,
-        };
-        self.finish_background(cancellation, &call_id);
-        result
+        }
     }
 }
 
@@ -1215,10 +1339,8 @@ impl BackgroundableCompose {
         background: bool,
         call_id: &agentkit_core::ToolCallId,
         ctx: &mut ToolContext<'_>,
-    ) -> bool {
-        if !background {
-            return false;
-        }
+    ) -> BackgroundJobGuard {
+        let foreground_cancellation = (!background).then(|| ctx.cancellation.clone()).flatten();
         let controller = CancellationController::new();
         let cancellation = controller.handle().checkpoint();
         ctx.cancellation = Some(cancellation.clone());
@@ -1229,15 +1351,43 @@ impl BackgroundableCompose {
             if jobs.pending_cancellations.remove(call_id) {
                 controller.interrupt();
             }
-            jobs.running.insert(call_id.clone(), controller);
+            let manual_detach = jobs.pending_detaches.remove(call_id);
+            let detached = background || manual_detach;
+            if !detached
+                && foreground_cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+            {
+                controller.interrupt();
+            }
+            jobs.running.insert(
+                call_id.clone(),
+                BackgroundJob {
+                    controller,
+                    foreground_cancellation: foreground_cancellation.clone(),
+                    cancellation_relay: None,
+                    detached,
+                    manual_detach,
+                },
+            );
         }
-        true
-    }
-
-    fn finish_background(&self, background: bool, call_id: &agentkit_core::ToolCallId) {
-        if background && let Ok(mut jobs) = self.background_jobs.0.lock() {
-            jobs.running.remove(call_id);
-            jobs.pending_cancellations.remove(call_id);
+        if let Some(cancellation) = foreground_cancellation {
+            let jobs = self.background_jobs.clone();
+            let relay_call_id = call_id.clone();
+            let relay = tokio::spawn(async move {
+                cancellation.cancelled().await;
+                jobs.propagate_foreground_cancellation(&relay_call_id);
+            })
+            .abort_handle();
+            if let Ok(mut jobs) = self.background_jobs.0.lock()
+                && let Some(job) = jobs.running.get_mut(call_id)
+            {
+                job.cancellation_relay = Some(relay);
+            }
+        }
+        BackgroundJobGuard {
+            jobs: self.background_jobs.clone(),
+            call_id: call_id.clone(),
         }
     }
 }

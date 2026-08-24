@@ -25,6 +25,7 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 | `Enter` | Send a non-empty prompt when idle |
 | `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
 | `Esc` | Interrupt a running turn; dismiss a notice when idle |
+| `Command+B` | Move the newest running foreground top-level compose call to the background |
 | `Ctrl+C` | Interrupt a running turn; clear a non-empty idle prompt; quit when idle with an empty prompt |
 | `Ctrl+D` | Quit when the prompt is empty |
 | `Option+Left/Right`, `Ctrl+A`/`Ctrl+E`, `Home`/`End` | Move by word or to the start/end of a line |
@@ -63,7 +64,7 @@ Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interruptin
 
 If a turn does not stop, press `Ctrl+C` again while Kit is cancelling to leave the TUI and terminate its agent child. On normal exit during a turn, Kit first requests cancellation and briefly allows the turn to unwind so tool outcomes can be persisted, then closes the session and releases its lock.
 
-Interrupting a turn does not stop detached background calls. Select a running background tool card and press `Ctrl+K` to kill only that call; the selected title is accented and shows `^k kill`. When a background result starts an autonomous agent continuation, the TUI displays it as an active turn, and `Esc` or `Ctrl+C` interrupts it normally.
+Press `Command+B` to detach the newest running foreground top-level compose call without waiting for it to finish. This shortcut requires a terminal that reports the Command key through the Kitty keyboard protocol; it has no control-key equivalent. Interrupting a turn does not stop detached background calls. Select a running background tool card and press `Ctrl+K` to kill only that call; the selected title is accented and shows `^k kill`. When a background result starts an autonomous agent continuation, the TUI displays it as an active turn, and `Esc` or `Ctrl+C` interrupts it normally.
 
 At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
 

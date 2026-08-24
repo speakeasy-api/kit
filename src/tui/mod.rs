@@ -52,7 +52,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
     events::{self, EVENTS_ENV},
-    protocols::acp::{CancelBackgroundRequest, TurnStateNotification},
+    protocols::acp::{CancelBackgroundRequest, DetachComposeRequest, TurnStateNotification},
     tools::mcp::CredentialStorage,
 };
 
@@ -638,6 +638,24 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     let _ = connection.send_notification(
                                         CancelNotification::new(session_id.clone()),
                                     );
+                                }
+                                Action::DetachCompose(call_id) => {
+                                    match connection
+                                        .send_request(DetachComposeRequest {
+                                            session_id: session_id.clone(),
+                                            call_id,
+                                        })
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(response) if !response.detached => {
+                                            app.note("compose call is no longer running in the foreground");
+                                        }
+                                        Err(error) => app.note(format!(
+                                            "could not background compose call: {}", error.message
+                                        )),
+                                        Ok(_) => {}
+                                    }
                                 }
                                 Action::CancelBackground(call_id) => {
                                     let response = connection

@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.85"
+version = "0.1.86"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -21,7 +21,7 @@ agentkit-mcp = "=0.10.6"
 agentkit-http = "=0.10.5"
 agentkit-plugins = "=0.10.7"
 agentkit-provider-openrouter = "=0.10.7"
-agentkit-task-manager = "=0.10.5"
+agentkit-task-manager = "=0.10.6"
 agentkit-tool-compose = { version = "=0.10.9", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.7"
 agentkit-tools-core = "=0.10.5"
