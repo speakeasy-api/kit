@@ -1,21 +1,26 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
-    AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
-    CloseSessionRequest, CloseSessionResponse, InitializeRequest, InitializeResponse,
+    AudioContent, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
+    BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ImageContent,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason,
+    ResourceLink, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
 };
 use agentkit_core::{
-    CancellationController, FinishReason, Item, MetadataMap, SessionId as AgentkitSessionId,
+    CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
+    Modality, Part, SessionId as AgentkitSessionId, ToolOutput,
 };
 use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -35,6 +40,228 @@ fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNoti
             AvailableCommand::new("compact", "Compact the session context"),
         ])),
     )
+}
+
+fn transcript_replay(
+    session_id: &agentkit_acp::SessionId,
+    transcript: &[Item],
+) -> Vec<SessionNotification> {
+    let mut replay = Vec::new();
+    for item in transcript {
+        for part in &item.parts {
+            let update = match item.kind {
+                ItemKind::User => user_replay_content(part).map(SessionUpdate::UserMessageChunk),
+                ItemKind::Assistant => assistant_replay_update(part),
+                ItemKind::Tool => tool_replay_update(part),
+                ItemKind::Developer if crate::compaction::is_compaction_summary(item) => {
+                    assistant_replay_update(part)
+                }
+                ItemKind::System
+                | ItemKind::Developer
+                | ItemKind::Context
+                | ItemKind::Notification => None,
+            };
+            if let Some(update) = update {
+                replay.push(SessionNotification::new(session_id.clone(), update));
+            }
+        }
+    }
+    replay
+}
+
+fn user_replay_content(part: &Part) -> Option<ContentChunk> {
+    let content = match part {
+        Part::Text(text) => ContentBlock::Text(TextContent::new(text.text.clone())),
+        Part::Media(media) => media_replay_content(media),
+        Part::File(file) => {
+            data_ref_replay_content(file.name.as_deref(), file.mime_type.as_deref(), &file.data)
+        }
+        Part::Structured(_)
+        | Part::Reasoning(_)
+        | Part::ToolCall(_)
+        | Part::ToolResult(_)
+        | Part::Custom(_) => return None,
+    };
+    Some(ContentChunk::new(content))
+}
+
+fn assistant_replay_update(part: &Part) -> Option<SessionUpdate> {
+    match part {
+        Part::Text(text) => Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(text.text.clone())),
+        ))),
+        Part::Reasoning(reasoning) => reasoning.summary.as_ref().map(|summary| {
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(summary.clone()),
+            )))
+        }),
+        Part::ToolCall(call) => Some(SessionUpdate::ToolCall(
+            agentkit_acp::ToolCall::new(
+                agentkit_acp::ToolCallId::new(call.id.to_string()),
+                call.name.clone(),
+            )
+            .status(ToolCallStatus::Pending)
+            .raw_input(call.input.clone()),
+        )),
+        Part::Media(_)
+        | Part::File(_)
+        | Part::Structured(_)
+        | Part::ToolResult(_)
+        | Part::Custom(_) => None,
+    }
+}
+
+fn tool_replay_update(part: &Part) -> Option<SessionUpdate> {
+    let Part::ToolResult(result) = part else {
+        return None;
+    };
+    let status = if result.is_error {
+        ToolCallStatus::Failed
+    } else {
+        ToolCallStatus::Completed
+    };
+    Some(SessionUpdate::ToolCallUpdate(
+        agentkit_acp::ToolCallUpdate::new(
+            agentkit_acp::ToolCallId::new(result.call_id.to_string()),
+            ToolCallUpdateFields::new()
+                .status(status)
+                .raw_output(tool_output_raw(&result.output)),
+        ),
+    ))
+}
+
+fn tool_output_raw(output: &ToolOutput) -> Option<serde_json::Value> {
+    match output {
+        ToolOutput::Text(text) => Some(json!({ "text": text })),
+        ToolOutput::Structured(value) => Some(value.clone()),
+        ToolOutput::Parts(parts) => serde_json::to_value(parts).ok(),
+        ToolOutput::Files(files) => serde_json::to_value(files).ok(),
+    }
+}
+
+fn media_replay_content(media: &MediaPart) -> ContentBlock {
+    match media.modality {
+        Modality::Image
+            if matches!(media.data, DataRef::InlineText(_) | DataRef::InlineBytes(_)) =>
+        {
+            ContentBlock::Image(ImageContent::new(
+                data_ref_base64_payload(&media.data),
+                media.mime_type.clone(),
+            ))
+        }
+        Modality::Audio
+            if matches!(media.data, DataRef::InlineText(_) | DataRef::InlineBytes(_)) =>
+        {
+            ContentBlock::Audio(AudioContent::new(
+                data_ref_base64_payload(&media.data),
+                media.mime_type.clone(),
+            ))
+        }
+        Modality::Image | Modality::Audio | Modality::Video | Modality::Binary => {
+            data_ref_replay_content(None, Some(&media.mime_type), &media.data)
+        }
+    }
+}
+
+fn data_ref_replay_content(
+    name: Option<&str>,
+    mime_type: Option<&str>,
+    data: &DataRef,
+) -> ContentBlock {
+    match data {
+        DataRef::Uri(uri) => {
+            let mut link = ResourceLink::new(name.unwrap_or(uri), uri.clone());
+            if let Some(mime_type) = mime_type {
+                link = link.mime_type(mime_type.to_string());
+            }
+            ContentBlock::ResourceLink(link)
+        }
+        DataRef::Handle(handle) => {
+            let uri = format!("artifact://{handle}");
+            let mut link = ResourceLink::new(name.unwrap_or(&uri), uri.clone());
+            if let Some(mime_type) = mime_type {
+                link = link.mime_type(mime_type.to_string());
+            }
+            ContentBlock::ResourceLink(link)
+        }
+        DataRef::InlineText(text) if mime_type.is_none_or(|mime| mime.starts_with("text/")) => {
+            let mut resource = TextResourceContents::new(
+                text.clone(),
+                format!("agentkit://session-replay/{}", name.unwrap_or("content")),
+            );
+            if let Some(mime_type) = mime_type {
+                resource = resource.mime_type(mime_type.to_string());
+            }
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(resource),
+            ))
+        }
+        _ => {
+            let mut resource = BlobResourceContents::new(
+                data_ref_base64_payload(data),
+                format!("agentkit://session-replay/{}", name.unwrap_or("content")),
+            );
+            if let Some(mime_type) = mime_type {
+                resource = resource.mime_type(mime_type.to_string());
+            }
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::BlobResourceContents(resource),
+            ))
+        }
+    }
+}
+
+fn data_ref_base64_payload(data: &DataRef) -> String {
+    match data {
+        DataRef::InlineText(text) => {
+            data_url_base64_payload(text).unwrap_or_else(|| BASE64.encode(text.as_bytes()))
+        }
+        DataRef::InlineBytes(bytes) => BASE64.encode(bytes),
+        DataRef::Uri(_) | DataRef::Handle(_) => String::new(),
+    }
+}
+
+fn data_url_base64_payload(text: &str) -> Option<String> {
+    let data_url = text.strip_prefix("data:")?;
+    let (metadata, payload) = data_url.split_once(',')?;
+    if metadata
+        .split(';')
+        .any(|segment| segment.eq_ignore_ascii_case("base64"))
+    {
+        Some(payload.to_string())
+    } else {
+        percent_decode(payload).map(|decoded| BASE64.encode(decoded.as_bytes()))
+    }
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hi = *bytes.get(i + 1)?;
+                let lo = *bytes.get(i + 2)?;
+                decoded.push((hex_value(hi)? << 4) | hex_value(lo)?);
+                i += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Kit-private ACP extension used by the bundled TUI to stop one detached call.
@@ -83,6 +310,19 @@ enum Command {
 struct SessionHandle {
     commands: mpsc::Sender<Command>,
     background_jobs: BackgroundJobs,
+}
+
+struct AttachedSession {
+    session_id: agentkit_acp::SessionId,
+    config_options: Vec<SessionConfigOption>,
+    canonical_transcript: Vec<Item>,
+    activation: oneshot::Sender<()>,
+}
+
+struct PreparedLoad {
+    response: LoadSessionResponse,
+    replay: Vec<SessionNotification>,
+    activation: oneshot::Sender<()>,
 }
 
 /// Owns an ACP integration binding for an in-flight request or live actor.
@@ -136,9 +376,59 @@ impl Server {
         request: NewSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<NewSessionResponse, AcpRuntimeError> {
+        // session/new retains the configured-or-generated selection semantics.
+        let claim = self.runtime.claim_session()?;
+        let attached = self
+            .attach_session(
+                request.cwd,
+                request.additional_directories,
+                connection,
+                claim,
+            )
+            .await?;
+        let AttachedSession {
+            session_id,
+            config_options,
+            activation,
+            ..
+        } = attached;
+        let _ = activation.send(());
+        Ok(NewSessionResponse::new(session_id).config_options(Some(config_options)))
+    }
+
+    async fn load_session(
+        self: &Arc<Self>,
+        request: LoadSessionRequest,
+        connection: ConnectionTo<Client>,
+    ) -> Result<PreparedLoad, AcpRuntimeError> {
+        let claim = self
+            .runtime
+            .claim_session_load(&request.session_id.to_string())?;
+        let attached = self
+            .attach_session(
+                request.cwd,
+                request.additional_directories,
+                connection,
+                claim,
+            )
+            .await?;
+        let replay = transcript_replay(&attached.session_id, &attached.canonical_transcript);
+        Ok(PreparedLoad {
+            response: LoadSessionResponse::new().config_options(Some(attached.config_options)),
+            replay,
+            activation: attached.activation,
+        })
+    }
+
+    async fn attach_session(
+        self: &Arc<Self>,
+        cwd: PathBuf,
+        additional_directories: Vec<PathBuf>,
+        connection: ConnectionTo<Client>,
+        mut claim: crate::runtime::SessionClaim,
+    ) -> Result<AttachedSession, AcpRuntimeError> {
         // Claim the durable identity before binding ACP so every layer uses
-        // the same id and any bind failure releases the configured selection.
-        let mut claim = self.runtime.claim_session()?;
+        // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
         let cancellation = CancellationController::new();
@@ -148,24 +438,24 @@ impl Server {
         tokio::spawn(drain_turn_states(turn_state_messages, connection.clone()));
 
         let mut metadata = MetadataMap::new();
-        metadata.insert("acp.cwd".into(), json!(request.cwd));
+        metadata.insert("acp.cwd".into(), json!(cwd));
         metadata.insert(
             "acp.additional_directories".into(),
-            json!(request.additional_directories),
+            json!(additional_directories),
         );
         let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
         let binding = AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client)
             .cancellation(cancellation)
-            .workspace(request.cwd.clone(), request.additional_directories.clone())
-            .metadata(metadata.clone());
+            .workspace(cwd.clone(), additional_directories.clone())
+            .metadata(metadata);
         let handle = self
             .integration
             .bind_session(binding)
             .map_err(|error| record_acp_runtime_failure(&session_id, "session_bind", error))?;
         let binding = SessionBindingGuard::new(Arc::clone(&self.integration), session_id.clone());
         let context = AcpDriverContext {
-            cwd: request.cwd,
-            additional_directories: request.additional_directories,
+            cwd,
+            additional_directories,
             integration: Arc::clone(&self.integration),
             cancellation: handle.cancellation_handle(),
         };
@@ -188,8 +478,9 @@ impl Server {
             .reasoning_effort()
             .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
         let catalog = model_catalog(&current).await;
-        let options = config_options(&current, reasoning_effort, &catalog);
+        let config_options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
+        let canonical_transcript = driver.canonical_transcript;
         let (tx, rx) = mpsc::channel(8);
         let actor = SessionActor {
             session_id: session_id.clone(),
@@ -220,9 +511,23 @@ impl Server {
                 background_jobs,
             },
         );
-        tokio::spawn(session_actor(actor));
+        let cleanup = Arc::downgrade(self);
+        let cleanup_session_id = session_id.clone();
+        let (activation, activated) = oneshot::channel();
+        tokio::spawn(async move {
+            if activated.await.is_ok() {
+                session_actor(actor).await;
+            } else if let Some(server) = cleanup.upgrade() {
+                server.sessions.lock().await.remove(&cleanup_session_id);
+            }
+        });
         drop(sessions);
-        Ok(NewSessionResponse::new(session_id).config_options(Some(options)))
+        Ok(AttachedSession {
+            session_id,
+            config_options,
+            canonical_transcript,
+            activation,
+        })
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, AcpRuntimeError> {
@@ -741,6 +1046,33 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: LoadSessionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    let connection = cx.clone();
+                    let session_id = request.session_id.clone();
+                    cx.spawn(async move {
+                        match state.load_session(request, connection.clone()).await {
+                            Ok(prepared) => {
+                                for notification in prepared.replay {
+                                    connection.send_notification(notification)?;
+                                }
+                                responder.respond(prepared.response)?;
+                                // Once success is reported, retain and activate the session even
+                                // if the optional post-response command update cannot be sent.
+                                let _ = prepared.activation.send(());
+                                connection.send_notification(available_commands_update(session_id))
+                            }
+                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
+                        }
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: PromptRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -808,6 +1140,7 @@ fn component(
 
 fn capabilities() -> agentkit_acp::AgentCapabilities {
     agentkit_acp::AgentCapabilities::new()
+        .load_session(true)
         .prompt_capabilities(
             PromptCapabilities::new()
                 .image(true)
@@ -866,8 +1199,8 @@ mod tests {
 
     use agent_client_protocol::{Channel, schema::ProtocolVersion};
     use agentkit_core::{
-        Delta, Item, ItemKind, Part, PartId, PartKind, ToolCallId, ToolCallPart, ToolOutput,
-        ToolResultPart, TurnCancellation,
+        DataRef, Delta, Item, ItemKind, Modality, Part, PartId, PartKind, ToolCallId, ToolCallPart,
+        ToolOutput, ToolResultPart, TurnCancellation,
     };
     use agentkit_loop::{
         Agent, LoopError, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
@@ -899,6 +1232,110 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["compact"]
         );
+    }
+
+    #[test]
+    fn transcript_replay_preserves_order_and_skips_unrepresentable_history() {
+        let transcript = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("user"),
+                    Part::media(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::inline_bytes([1, 2, 3]),
+                    ),
+                    Part::file(DataRef::uri("file:///tmp/input.txt")),
+                    Part::structured(json!({ "skip": true })),
+                ],
+            ),
+            Item::new(
+                ItemKind::Assistant,
+                vec![
+                    Part::text("agent"),
+                    Part::reasoning("thought"),
+                    Part::ToolCall(ToolCallPart::new(
+                        "call-1",
+                        "read",
+                        json!({ "path": "input.txt" }),
+                    )),
+                    Part::structured(json!({ "skip": true })),
+                ],
+            ),
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "call-1",
+                    ToolOutput::text("done"),
+                ))],
+            ),
+            Item::text(ItemKind::Developer, "developer"),
+            Item::notification("notification"),
+        ];
+
+        let updates = transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript)
+            .into_iter()
+            .map(|notification| notification.update)
+            .collect::<Vec<_>>();
+
+        assert_eq!(updates.len(), 7);
+        assert!(matches!(
+            &updates[0],
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "user")
+        ));
+        assert!(matches!(
+            &updates[1],
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Image(image) if image.data == "AQID")
+        ));
+        assert!(matches!(
+            &updates[2],
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::ResourceLink(link) if link.uri == "file:///tmp/input.txt")
+        ));
+        assert!(matches!(
+            &updates[3],
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "agent")
+        ));
+        assert!(matches!(
+            &updates[4],
+            SessionUpdate::AgentThoughtChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "thought")
+        ));
+        let SessionUpdate::ToolCall(call) = &updates[5] else {
+            panic!("expected pending tool call");
+        };
+        assert_eq!(call.tool_call_id.to_string(), "call-1");
+        assert_eq!(call.status, ToolCallStatus::Pending);
+        assert_eq!(call.raw_input, Some(json!({ "path": "input.txt" })));
+        let SessionUpdate::ToolCallUpdate(update) = &updates[6] else {
+            panic!("expected terminal tool update");
+        };
+        assert_eq!(update.tool_call_id.to_string(), "call-1");
+        assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
+        assert_eq!(update.fields.raw_output, Some(json!({ "text": "done" })));
+    }
+
+    #[test]
+    fn transcript_replay_includes_the_canonical_compaction_summary() {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("kit.compaction.summary".into(), true.into());
+        let transcript = vec![
+            Item::text(ItemKind::Developer, "ordinary developer"),
+            Item::text(ItemKind::Developer, "canonical checkpoint").with_metadata(metadata),
+        ];
+
+        let replay = transcript_replay(&agentkit_acp::SessionId::new("session"), &transcript);
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(
+            &replay[0].update,
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "canonical checkpoint")
+        ));
     }
 
     #[test]
@@ -1422,7 +1859,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kit_server_does_not_advertise_or_handle_session_fork() {
+    async fn close_then_load_replays_before_response_and_returns_config_options() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = crate::session::new_id();
+        let opened = crate::session::open(
+            root.path(),
+            &session_id,
+            false,
+            false,
+            vec![
+                Item::text(ItemKind::System, "system"),
+                Item::text(ItemKind::User, "remember me"),
+                Item::text(ItemKind::Assistant, "remembered"),
+            ],
+        )
+        .unwrap();
+        drop(opened);
+
+        let runtime = Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+        let workspace = root.path().to_path_buf();
+        let cleanup_session_id = session_id.clone();
+
+        agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    let _ = updates_tx.send(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+
+                let first = connection
+                    .send_request(LoadSessionRequest::new(
+                        session_id.clone(),
+                        workspace.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                let first_options = first.config_options.expect("load config options");
+                assert!(!first_options.is_empty());
+                assert!(matches!(
+                    updates_rx.try_recv(),
+                    Ok(SessionUpdate::UserMessageChunk(_))
+                ));
+                assert!(matches!(
+                    updates_rx.try_recv(),
+                    Ok(SessionUpdate::AgentMessageChunk(_))
+                ));
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), updates_rx.recv())
+                        .await
+                        .expect("available commands update timed out"),
+                    Some(SessionUpdate::AvailableCommandsUpdate(_))
+                ));
+
+                connection
+                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+
+                let second = connection
+                    .send_request(LoadSessionRequest::new(
+                        session_id.clone(),
+                        workspace.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(second.config_options, Some(first_options));
+                assert!(matches!(
+                    updates_rx.try_recv(),
+                    Ok(SessionUpdate::UserMessageChunk(_))
+                ));
+                assert!(matches!(
+                    updates_rx.try_recv(),
+                    Ok(SessionUpdate::AgentMessageChunk(_))
+                ));
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), updates_rx.recv())
+                        .await
+                        .expect("available commands update timed out"),
+                    Some(SessionUpdate::AvailableCommandsUpdate(_))
+                ));
+                connection
+                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        server.abort();
+        let _ = server.await;
+        if let Some(home) = std::env::var_os("HOME") {
+            let directory = PathBuf::from(home).join(".kit/sessions");
+            let _ = std::fs::remove_file(directory.join(format!("{cleanup_session_id}.jsonl")));
+            let _ = std::fs::remove_file(directory.join(format!("{cleanup_session_id}.lock")));
+        }
+    }
+
+    #[tokio::test]
+    async fn load_errors_do_not_poison_the_next_new_session() {
+        let root = tempfile::tempdir().unwrap();
+        let selected_id = crate::session::new_id();
+        let active_id = crate::session::new_id();
+        let active = crate::session::open(
+            root.path(),
+            &active_id,
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let runtime = Runtime::with_session_and_provider(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            crate::runtime::SessionRequest {
+                id: selected_id.clone(),
+                resume: false,
+                force: true,
+            },
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        let workspace = root.path().to_path_buf();
+        let requested_selected_id = selected_id.clone();
+        let requested_active_id = active_id.clone();
+
+        agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        "missing-session",
+                        workspace.clone(),
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("unknown session load must fail");
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        requested_active_id,
+                        workspace.clone(),
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("actively locked session load must fail");
+                connection
+                    .send_request(LoadSessionRequest::new(
+                        requested_selected_id.clone(),
+                        workspace.clone(),
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("missing matching configured session must fail to load");
+
+                let created = connection
+                    .send_request(NewSessionRequest::new(workspace))
+                    .block_task()
+                    .await?;
+                assert_eq!(created.session_id.to_string(), requested_selected_id);
+                connection
+                    .send_request(CloseSessionRequest::new(created.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        drop(active);
+        server.abort();
+        let _ = server.await;
+        if let Some(home) = std::env::var_os("HOME") {
+            let directory = PathBuf::from(home).join(".kit/sessions");
+            for id in [selected_id, active_id] {
+                let _ = std::fs::remove_file(directory.join(format!("{id}.jsonl")));
+                let _ = std::fs::remove_file(directory.join(format!("{id}.lock")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kit_server_advertises_only_supported_session_restoration() {
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let (client_transport, agent_transport) = Channel::duplex();
@@ -1435,13 +2076,11 @@ mod tests {
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))
                     .block_task()
                     .await?;
-                assert!(
-                    initialized
-                        .agent_capabilities
-                        .session_capabilities
-                        .fork
-                        .is_none()
-                );
+                assert!(initialized.agent_capabilities.load_session);
+                let sessions = &initialized.agent_capabilities.session_capabilities;
+                assert!(sessions.list.is_none());
+                assert!(sessions.resume.is_none());
+                assert!(sessions.fork.is_none());
 
                 connection
                     .send_request(agentkit_acp::ForkSessionRequest::new(

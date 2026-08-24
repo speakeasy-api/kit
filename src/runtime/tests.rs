@@ -51,14 +51,14 @@ fn configured_session_is_consumed_only_after_successful_start() {
     let (first, configured) = selection.claim();
     assert_eq!(first.id, "selected");
     assert!(configured);
-    selection.finish(&first, configured, false, true);
+    selection.finish_new(&first, configured, false, true);
     let (retry, configured) = selection.claim();
     assert_eq!(retry.id, "selected");
     assert!(
         retry.resume,
         "a transcript opened before failure is resumed"
     );
-    selection.finish(&retry, configured, true, false);
+    selection.finish_new(&retry, configured, true, false);
     assert!(selection.configured.is_none());
 }
 
@@ -125,6 +125,106 @@ fn dropped_generated_session_claim_retries_opened_transcript_with_same_id() {
 
     let next = runtime.claim_session().unwrap();
     assert_ne!(next.id(), session_id);
+}
+
+#[test]
+fn matching_load_reservation_releases_without_mutation_on_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::with_session(
+        root.path(),
+        "gpt-5.4",
+        SessionRequest {
+            id: "selected".into(),
+            resume: false,
+            force: true,
+        },
+    )
+    .unwrap();
+
+    let load = runtime.claim_session_load("selected").unwrap();
+    assert!(load.request.resume);
+    assert!(
+        !load.request.force,
+        "load must never inherit configured --force"
+    );
+
+    let concurrent_new = runtime.claim_session().unwrap();
+    assert_ne!(concurrent_new.id(), "selected");
+    concurrent_new.commit().unwrap();
+    drop(load);
+
+    let selected = runtime.claim_session().unwrap();
+    assert_eq!(selected.id(), "selected");
+    assert!(!selected.request.resume);
+    assert!(selected.request.force);
+}
+
+#[test]
+fn successful_matching_load_consumes_configured_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::with_session(
+        root.path(),
+        "gpt-5.4",
+        SessionRequest {
+            id: "selected".into(),
+            resume: true,
+            force: true,
+        },
+    )
+    .unwrap();
+
+    runtime
+        .claim_session_load("selected")
+        .unwrap()
+        .commit()
+        .unwrap();
+    let next = runtime.claim_session().unwrap();
+    assert_ne!(next.id(), "selected");
+}
+
+#[test]
+fn concurrent_successful_matching_load_consumes_configured_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::with_session(
+        root.path(),
+        "gpt-5.4",
+        SessionRequest {
+            id: "selected".into(),
+            resume: true,
+            force: false,
+        },
+    )
+    .unwrap();
+
+    let reserved = runtime.claim_session_load("selected").unwrap();
+    runtime
+        .claim_session_load("selected")
+        .unwrap()
+        .commit()
+        .unwrap();
+    drop(reserved);
+
+    let next = runtime.claim_session().unwrap();
+    assert_ne!(next.id(), "selected");
+}
+
+#[test]
+fn nonmatching_failed_load_does_not_touch_configured_or_generated_queues() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::with_session(
+        root.path(),
+        "gpt-5.4",
+        SessionRequest {
+            id: "selected".into(),
+            resume: false,
+            force: false,
+        },
+    )
+    .unwrap();
+
+    drop(runtime.claim_session_load("other").unwrap());
+    let next = runtime.claim_session().unwrap();
+    assert_eq!(next.id(), "selected");
 }
 
 #[tokio::test]

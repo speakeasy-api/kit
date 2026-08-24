@@ -105,6 +105,14 @@ Transcript records are versioned and have consecutive generations. Normal items 
 
 Older sessions under `<root>/.kit/sessions` remain readable. The first resume validates and copies a legacy transcript into `~/.kit/sessions`; a live legacy lock produces `legacy session is actively locked by another Kit instance ...; stop it before resuming with this Kit version`. When both locations contain the ID, the global transcript is preferred.
 
+### ACP session loading
+
+ACP clients can restore a closed durable session with `session/load`. Kit advertises only the protocol's top-level `loadSession` capability; it does not advertise `session/resume` or `session/list`. Loading uses the exact requested session ID, resumes its canonical transcript, and returns the same model and reasoning configuration options as `session/new`. The requested workspace must match the Kit server's fixed root, and additional directories are not accepted.
+
+A load never applies the server process's configured `--force` setting. If another live Kit instance owns the session lock, loading fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can load it again.
+
+Before the load response, Kit replays the canonical transcript as ordered ACP updates for representable user text and attachments, assistant text and thoughts, and tool calls and results. Internal instructions, ambient context, notifications, and provider-specific content are not replayed to the client, but remain in the model transcript. Because compaction replaces the canonical transcript, loading a compacted session replays its canonical summary history rather than the superseded pre-compaction items.
+
 ### Session locks, `--resume`, and `--force`
 
 Only one live Kit instance may mutate a session. A normal exit removes its `.lock` file. If opening a session reports:

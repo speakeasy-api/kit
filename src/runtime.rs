@@ -79,7 +79,26 @@ impl SessionSelection {
         )
     }
 
-    fn finish(
+    fn claim_load(&mut self, id: &str) -> (SessionRequest, bool) {
+        let configured = !self.configured_claimed
+            && self
+                .configured
+                .as_ref()
+                .is_some_and(|request| request.id == id);
+        if configured {
+            self.configured_claimed = true;
+        }
+        (
+            SessionRequest {
+                id: id.into(),
+                resume: true,
+                force: false,
+            },
+            configured,
+        )
+    }
+
+    fn finish_new(
         &mut self,
         request: &SessionRequest,
         configured: bool,
@@ -101,6 +120,20 @@ impl SessionSelection {
             self.generated_retries.push_back(request);
         }
     }
+
+    fn finish_load(&mut self, request: &SessionRequest, reserved: bool, succeeded: bool) {
+        if succeeded
+            && self
+                .configured
+                .as_ref()
+                .is_some_and(|configured| configured.id == request.id)
+        {
+            self.configured.take();
+        }
+        if reserved {
+            self.configured_claimed = false;
+        }
+    }
 }
 
 pub(crate) struct AcpDriverContext {
@@ -110,11 +143,16 @@ pub(crate) struct AcpDriverContext {
     pub cancellation: CancellationHandle,
 }
 
+#[derive(Clone, Copy)]
+enum SessionClaimKind {
+    New { configured: bool, opened_new: bool },
+    Load { configured: bool },
+}
+
 pub(crate) struct SessionClaim {
     runtime: Arc<Runtime>,
     request: SessionRequest,
-    configured: bool,
-    opened_new: bool,
+    kind: SessionClaimKind,
     committed: bool,
 }
 
@@ -124,15 +162,25 @@ impl SessionClaim {
     }
 
     fn mark_opened(&mut self) {
-        self.opened_new = !self.request.resume;
+        if let SessionClaimKind::New { opened_new, .. } = &mut self.kind {
+            *opened_new = !self.request.resume;
+        }
     }
 
     pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
-        self.runtime
-            .session
-            .lock()
-            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
-            .finish(&self.request, self.configured, true, self.opened_new);
+        let mut selection =
+            self.runtime.session.lock().map_err(|_| {
+                AcpRuntimeError::Loop("runtime session selection is poisoned".into())
+            })?;
+        match self.kind {
+            SessionClaimKind::New {
+                configured,
+                opened_new,
+            } => selection.finish_new(&self.request, configured, true, opened_new),
+            SessionClaimKind::Load { configured } => {
+                selection.finish_load(&self.request, configured, true)
+            }
+        }
         self.committed = true;
         Ok(())
     }
@@ -143,7 +191,15 @@ impl Drop for SessionClaim {
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
-            selection.finish(&self.request, self.configured, false, self.opened_new);
+            match self.kind {
+                SessionClaimKind::New {
+                    configured,
+                    opened_new,
+                } => selection.finish_new(&self.request, configured, false, opened_new),
+                SessionClaimKind::Load { configured } => {
+                    selection.finish_load(&self.request, configured, false)
+                }
+            }
         }
     }
 }
@@ -153,6 +209,7 @@ pub(crate) struct AcpDriver {
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
     pub adapter: SelectableAdapter,
+    pub canonical_transcript: Vec<Item>,
 }
 
 pub struct Runtime {
@@ -726,8 +783,27 @@ impl Runtime {
         Ok(SessionClaim {
             runtime: Arc::clone(self),
             request,
-            configured,
-            opened_new: false,
+            kind: SessionClaimKind::New {
+                configured,
+                opened_new: false,
+            },
+            committed: false,
+        })
+    }
+
+    pub(crate) fn claim_session_load(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<SessionClaim, AcpRuntimeError> {
+        let (request, configured) = self
+            .session
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?
+            .claim_load(id);
+        Ok(SessionClaim {
+            runtime: Arc::clone(self),
+            request,
+            kind: SessionClaimKind::Load { configured },
             committed: false,
         })
     }
@@ -790,6 +866,7 @@ impl Runtime {
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
+        let canonical_transcript = opened.transcript.clone();
         let driver = Agent::builder()
             .model(adapter.clone())
             .telemetry(self.agentkit_telemetry())
@@ -815,6 +892,7 @@ impl Runtime {
             tasks,
             background_jobs,
             adapter,
+            canonical_transcript,
         };
         Ok(driver)
     }
