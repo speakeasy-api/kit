@@ -9,12 +9,12 @@ Run `kit init` to write the recommended `~/.kit/config.toml` and an empty `~/.ki
 Install the latest packaged release with mise, then verify that the executable is on `PATH`:
 
 ```sh
-mise use -g github:danielkov/kit-releases
+mise use -g github:speakeasy-api/kit
 kit --version
 kit --help
 ```
 
-A version can be pinned with a mise package such as `github:danielkov/kit-releases@0.1.28`. The examples below invoke the installed binary directly; they do not use `cargo run`.
+A version can be pinned with a mise package such as `github:speakeasy-api/kit@0.1.83`. The examples below invoke the installed binary directly; they do not use `cargo run`.
 
 ## Choose a provider and authenticate
 

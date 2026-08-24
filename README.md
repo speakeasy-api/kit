@@ -20,18 +20,17 @@ rollback system, control-plane authentication, or web UI.
 
 ## Install
 
-Prebuilt binaries are published from the public, binary-only
-[`danielkov/kit-releases`](https://github.com/danielkov/kit-releases) repository.
+Source code and prebuilt binaries are published from the public
+[`speakeasy-api/kit`](https://github.com/speakeasy-api/kit) repository.
 Install the latest release with mise:
 
 ```sh
-mise use -g github:danielkov/kit-releases
+mise use -g github:speakeasy-api/kit
 kit --version
 ```
 
 Pin a release by appending its version, for example
-`github:danielkov/kit-releases@0.1.28`. The source repository remains private;
-the release repository contains only packaged executables and checksums.
+`github:speakeasy-api/kit@0.1.83`.
 
 ## Run
 
