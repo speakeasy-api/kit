@@ -13,9 +13,9 @@ env:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
@@ -36,9 +36,9 @@ jobs:
 
   linux-x64:
     needs: verify
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
@@ -60,7 +60,7 @@ jobs:
 
   macos-arm64:
     needs: verify
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     outputs:
       signed: ${{ steps.signing.outputs.enabled }}
     env:
@@ -71,7 +71,7 @@ jobs:
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
@@ -158,7 +158,7 @@ jobs:
 
   publish:
     needs: [linux-x64, macos-arm64]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
     env:

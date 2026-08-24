@@ -8,9 +8,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
