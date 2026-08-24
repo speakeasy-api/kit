@@ -32,6 +32,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::tools::mcp::CredentialStorage;
 
 const HANDSHAKE: Duration = Duration::from_secs(30);
+const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
 const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
@@ -965,17 +966,21 @@ async fn run(
         result = &mut connected => result,
         status = child.wait() => {
             let status = status.map_err(|error| context.error("process status failure", error))?;
-            if !startup_complete.load(Ordering::Acquire) {
+            if !startup_complete.load(Ordering::Acquire) && !status.success() {
                 return Err(pre_handshake_exit(&context, status));
             }
             connected.await
         }
     };
     if !startup_complete.load(Ordering::Acquire) {
-        match child.try_wait() {
-            Ok(Some(status)) => return Err(pre_handshake_exit(&context, status)),
-            Ok(None) => {}
-            Err(error) => return Err(context.error("process status failure", error)),
+        // Transport EOF can win the race with process reaping. Briefly wait for a
+        // failing status so launch failures keep their actionable exit details.
+        match tokio::time::timeout(PRE_HANDSHAKE_EXIT_SETTLE, child.wait()).await {
+            Ok(Ok(status)) if !status.success() => {
+                return Err(pre_handshake_exit(&context, status));
+            }
+            Ok(Err(error)) => return Err(context.error("process status failure", error)),
+            Ok(Ok(_)) | Err(_) => {}
         }
     }
     let _ = child.kill().await;
@@ -1329,7 +1334,11 @@ mod tests {
             "exits".into(),
             AcpHarnessProfile {
                 command: "python3".into(),
-                args: vec!["-c".into(), "raise SystemExit(17)".into()],
+                // Make transport EOF precede process exit to exercise the reaping race.
+                args: vec![
+                    "-c".into(),
+                    "import os, time; os.close(1); time.sleep(0.05); raise SystemExit(17)".into(),
+                ],
                 permissions: AcpPermissionPolicy::Deny,
             },
         )]);
