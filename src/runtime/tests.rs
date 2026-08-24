@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use agentkit_core::{ItemKind, MetadataMap, Part, SessionId, ToolCallId, ToolOutput, TurnId};
+use agentkit_core::{
+    CancellationController, ItemKind, MetadataMap, Part, SessionId, ToolCallId, ToolOutput, TurnId,
+};
 use agentkit_task_manager::RoutingDecision;
 use agentkit_tools_core::{
     AllowAllPermissions, BasicToolExecutor, OwnedToolContext, Tool, ToolExecutionOutcome,
@@ -9,8 +11,8 @@ use agentkit_tools_core::{
 use serde_json::{Value, json};
 
 use super::{
-    BackgroundableCompose, Runtime, SessionRequest, SessionSelection, background_route,
-    load_initial_transcript,
+    BackgroundJobs, BackgroundableCompose, DetachRegistration, Runtime, SessionRequest,
+    SessionSelection, background_route, load_initial_transcript,
 };
 
 #[test]
@@ -582,13 +584,16 @@ async fn close_tool_can_cancel_a_detached_compose() {
     let call_id = ToolCallId::new("call");
     let mut context = owned.borrowed();
 
-    assert!(
-        compose
-            .backgroundable
-            .begin_background(true, &call_id, &mut context)
-    );
+    let job = compose
+        .backgroundable
+        .begin_background(true, &call_id, &mut context);
     let cancellation = context.cancellation.clone().expect("job cancellation");
     assert!(!cancellation.is_cancelled());
+    assert_eq!(
+        compose.backgroundable.background_jobs.detach("call"),
+        Some(DetachRegistration::Registered),
+        "an initially backgroundable call can still be detached immediately",
+    );
 
     let close = ToolSource::get(&compose.compose, &ToolName::new("close"))
         .expect("close tool is registered");
@@ -607,7 +612,94 @@ async fn close_tool_can_cancel_a_detached_compose() {
         .unwrap();
 
     assert!(cancellation.is_cancelled());
-    compose.backgroundable.finish_background(true, &call_id);
+    drop(job);
+}
+
+#[tokio::test]
+async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_killed() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let executor: Arc<dyn ToolExecutor> =
+        Arc::new(BasicToolExecutor::new(Vec::<Arc<dyn ToolSource>>::new()));
+    let permissions = Arc::new(AllowAllPermissions);
+    let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+    let parent = CancellationController::new();
+    let owned = OwnedToolContext {
+        session_id: SessionId::new("session"),
+        turn_id: TurnId::new("turn"),
+        metadata: MetadataMap::new(),
+        permissions: permissions.clone(),
+        resources: resources.clone(),
+        cancellation: Some(parent.handle().checkpoint()),
+        execution_scope: Some(ToolExecutionScope {
+            executor,
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn"),
+            permissions,
+            resources,
+            cancellation: Some(parent.handle().checkpoint()),
+        }),
+        approved_request: None,
+    };
+    let call_id = ToolCallId::new("call");
+    let mut context = owned.borrowed();
+    let job = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context);
+    let cancellation = context.cancellation.clone().expect("compose cancellation");
+
+    assert_eq!(
+        compose.backgroundable.background_jobs.detach("call"),
+        Some(DetachRegistration::Registered)
+    );
+    parent.interrupt();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!cancellation.is_cancelled());
+
+    assert!(compose.backgroundable.background_jobs.cancel("call"));
+    assert!(cancellation.is_cancelled());
+    drop(job);
+    drop(context);
+
+    let already_cancelled_id = ToolCallId::new("already-cancelled");
+    let mut already_cancelled_context = owned.borrowed();
+    let already_cancelled_job = compose.backgroundable.begin_background(
+        false,
+        &already_cancelled_id,
+        &mut already_cancelled_context,
+    );
+    assert!(
+        already_cancelled_context
+            .cancellation
+            .as_ref()
+            .expect("compose cancellation")
+            .is_cancelled()
+    );
+    drop(already_cancelled_job);
+
+    assert_eq!(
+        compose
+            .backgroundable
+            .background_jobs
+            .detach("pending-detach"),
+        Some(DetachRegistration::Registered)
+    );
+    let pending_detach_id = ToolCallId::new("pending-detach");
+    let mut pending_detach_context = owned.borrowed();
+    let pending_detach_job = compose.backgroundable.begin_background(
+        false,
+        &pending_detach_id,
+        &mut pending_detach_context,
+    );
+    assert!(
+        !pending_detach_context
+            .cancellation
+            .as_ref()
+            .expect("compose cancellation")
+            .is_cancelled()
+    );
+    drop(pending_detach_job);
 }
 
 #[tokio::test]
@@ -740,6 +832,37 @@ async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispa
             ToolExecutionOutcome::Failed(_)
         ));
     }
+}
+
+#[test]
+fn pending_detach_is_applied_when_compose_registers() {
+    let jobs = BackgroundJobs::default();
+
+    assert_eq!(
+        jobs.detach("pending-call"),
+        Some(DetachRegistration::Registered)
+    );
+    jobs.register_foreground_for_test("pending-call");
+
+    assert!(jobs.is_detached_for_test("pending-call"));
+}
+
+#[test]
+fn duplicate_detach_does_not_take_rollback_ownership() {
+    let jobs = BackgroundJobs::default();
+    jobs.register_foreground_for_test("duplicate-call");
+
+    assert_eq!(
+        jobs.detach("duplicate-call"),
+        Some(DetachRegistration::Registered)
+    );
+    let duplicate = jobs.detach("duplicate-call");
+    assert_eq!(duplicate, Some(DetachRegistration::AlreadyDetached));
+    if duplicate == Some(DetachRegistration::Registered) {
+        jobs.restore_foreground("duplicate-call");
+    }
+
+    assert!(jobs.is_detached_for_test("duplicate-call"));
 }
 
 #[test]

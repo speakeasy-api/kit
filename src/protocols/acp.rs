@@ -39,7 +39,7 @@ use tokio::{
 
 use crate::{
     provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
-    runtime::{AcpDriverContext, BackgroundJobs, Runtime},
+    runtime::{AcpDriverContext, BackgroundJobs, DetachRegistration, Runtime},
 };
 
 const MODEL_CONFIG_ID: &str = "model";
@@ -289,6 +289,19 @@ pub(crate) struct CancelBackgroundResponse {
     pub cancelled: bool,
 }
 
+/// Kit-private ACP extension used by the bundled TUI to detach one running compose call.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/compose/detach", response = DetachComposeResponse)]
+pub(crate) struct DetachComposeRequest {
+    pub session_id: agentkit_acp::SessionId,
+    pub call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+pub(crate) struct DetachComposeResponse {
+    pub detached: bool,
+}
+
 /// Kit-private ACP notification that keeps the bundled TUI synchronized with
 /// turns started autonomously by background task results.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
@@ -323,6 +336,7 @@ struct SessionHandle {
     token: u64,
     commands: mpsc::Sender<Command>,
     background_jobs: BackgroundJobs,
+    tasks: TaskManagerHandle,
 }
 
 #[derive(Clone)]
@@ -651,6 +665,7 @@ impl Server {
         let catalog = model_catalog(&current).await;
         let config_options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
+        let tasks = driver.tasks.clone();
         let canonical_transcript = driver.canonical_transcript;
         let (tx, rx) = mpsc::channel(8);
         let actor = SessionActor {
@@ -714,6 +729,7 @@ impl Server {
                 token,
                 commands: tx,
                 background_jobs,
+                tasks,
             },
         );
         drop(sessions);
@@ -797,6 +813,22 @@ impl Server {
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
     }
 
+    async fn detach_compose(
+        &self,
+        request: DetachComposeRequest,
+    ) -> Result<DetachComposeResponse, AcpRuntimeError> {
+        let (background_jobs, tasks) = self
+            .sessions
+            .lock()
+            .expect("ACP session map poisoned")
+            .get(&request.session_id)
+            .map(|session| (session.background_jobs.clone(), session.tasks.clone()))
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        Ok(DetachComposeResponse {
+            detached: detach_compose_call(&tasks, &background_jobs, &request.call_id).await,
+        })
+    }
+
     async fn cancel_background(
         &self,
         request: CancelBackgroundRequest,
@@ -811,6 +843,31 @@ impl Server {
         Ok(CancelBackgroundResponse {
             cancelled: background_jobs.cancel(&request.call_id),
         })
+    }
+}
+
+async fn detach_compose_call(
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+    call_id: &str,
+) -> bool {
+    let Some(task) = tasks.list_running().await.into_iter().find(|task| {
+        task.call_id.0 == call_id
+            && task.tool_name == agentkit_tool_compose::COMPOSE_TOOL_NAME
+            && task.kind == agentkit_task_manager::TaskKind::Foreground
+    }) else {
+        return false;
+    };
+    match background_jobs.detach(call_id) {
+        Some(DetachRegistration::AlreadyDetached) => true,
+        Some(DetachRegistration::Registered) => {
+            if tasks.detach(task.id).await.is_err() {
+                background_jobs.restore_foreground(call_id);
+                return false;
+            }
+            true
+        }
+        None => false,
     }
 }
 
@@ -1312,6 +1369,21 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: DetachComposeRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.detach_compose(request).await.map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: CancelBackgroundRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -1752,7 +1824,7 @@ mod tests {
             request: TurnRequest,
             _cancellation: Option<TurnCancellation>,
         ) -> Result<Self::Turn, LoopError> {
-            self.turns.fetch_add(1, Ordering::SeqCst);
+            let turn = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
             self.user_items_seen.store(
                 request
                     .transcript
@@ -1769,12 +1841,12 @@ mod tests {
                     .count(),
                 Ordering::SeqCst,
             );
-            let completed = request.transcript.iter().any(|item| {
+            let called = request.transcript.iter().any(|item| {
                 item.parts
                     .iter()
-                    .any(|part| matches!(part, Part::ToolResult(_)))
+                    .any(|part| matches!(part, Part::ToolCall(_)))
             });
-            let events = if completed {
+            let events = if turn >= 3 {
                 let text = "autonomous background completion";
                 VecDeque::from([
                     ModelTurnEvent::Delta(Delta::BeginPart {
@@ -1794,10 +1866,30 @@ mod tests {
                         metadata: MetadataMap::new(),
                     }),
                 ])
+            } else if called {
+                let text = "compose detached";
+                VecDeque::from([
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: PartId::new("detached"),
+                        kind: PartKind::Text,
+                    }),
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: PartId::new("detached"),
+                        chunk: text.into(),
+                    }),
+                    ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
+                        finish_reason: FinishReason::Completed,
+                        output_items: vec![Item::text(ItemKind::Assistant, text)],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                    }),
+                ])
             } else {
                 let call = ToolCallPart {
                     id: ToolCallId::new("background-call"),
-                    name: "background-test".into(),
+                    name: agentkit_tool_compose::COMPOSE_TOOL_NAME.into(),
                     input: json!({}),
                     metadata: MetadataMap::new(),
                 };
@@ -1921,7 +2013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_background_task_advances_actor_and_emits_unsolicited_update() {
+    async fn foreground_compose_detaches_out_of_band_and_completes_autonomously() {
         let turns = Arc::new(AtomicUsize::new(0));
         let user_items_seen = Arc::new(AtomicUsize::new(0));
         let notification_items_seen = Arc::new(AtomicUsize::new(0));
@@ -1962,19 +2054,14 @@ mod tests {
             }
         });
 
-        let task_manager =
-            AsyncTaskManager::new().routing(|request: &agentkit_tools_core::ToolRequest| {
-                if request.tool_name.0 == "background-test" {
-                    RoutingDecision::Background
-                } else {
-                    RoutingDecision::Foreground
-                }
-            });
+        let task_manager = AsyncTaskManager::new()
+            .routing(|_request: &agentkit_tools_core::ToolRequest| RoutingDecision::Foreground);
         let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
         let tools = ToolRegistry::new().with(BlockingTool {
             spec: ToolSpec {
-                name: ToolName::new("background-test"),
-                description: "controlled background tool".into(),
+                name: ToolName::new(agentkit_tool_compose::COMPOSE_TOOL_NAME),
+                description: "controlled compose tool".into(),
                 input_schema: json!({"type": "object", "additionalProperties": false}),
                 output_schema: None,
                 annotations: ToolAnnotations::default(),
@@ -2007,7 +2094,7 @@ mod tests {
             integration: Arc::clone(&integration),
             binding: SessionBindingGuard::new(Arc::clone(&integration), acp_session_id.clone()),
             driver,
-            tasks,
+            tasks: tasks.clone(),
             adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
                 .unwrap(),
             catalog: Vec::new(),
@@ -2029,21 +2116,35 @@ mod tests {
             })
             .await
             .unwrap();
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(detach_compose_call(&tasks, &background_jobs, "background-call").await);
+        background_jobs.register_foreground_for_test("background-call");
+        assert!(background_jobs.is_detached_for_test("background-call"));
         timeout(Duration::from_secs(1), reply_rx)
             .await
-            .expect("first prompt remained blocked on the background tool")
+            .expect("prompt remained blocked after the out-of-band detach")
             .unwrap()
             .unwrap();
-        assert_eq!(turns.load(Ordering::SeqCst), 1);
-        timeout(Duration::from_secs(1), async {
-            while !entered.load(Ordering::SeqCst) {
+        assert_eq!(turns.load(Ordering::SeqCst), 2);
+
+        release.notify_one();
+        let completed = timeout(Duration::from_secs(1), async {
+            loop {
+                let completed = tasks.list_completed().await;
+                if !completed.is_empty() {
+                    break completed;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("background tool never started");
-
-        release.notify_one();
+        .expect("detached compose did not complete");
+        assert_eq!(
+            completed[0].kind,
+            agentkit_task_manager::TaskKind::Background
+        );
         let notification = timeout(Duration::from_secs(1), async {
             loop {
                 let notification = updates_rx.recv().await.expect("update stream closed");
@@ -2064,7 +2165,7 @@ mod tests {
         assert!(!ended.active);
         assert_eq!(started.turn_id, ended.turn_id);
         assert_eq!(started.session_id, acp_session_id);
-        assert_eq!(turns.load(Ordering::SeqCst), 2);
+        assert_eq!(turns.load(Ordering::SeqCst), 3);
         assert_eq!(
             user_items_seen.load(Ordering::SeqCst),
             1,
@@ -2081,8 +2182,8 @@ mod tests {
         let mcp_ended = turn_states_rx.recv().await.expect("missing MCP turn end");
         assert!(mcp_started.active);
         assert!(!mcp_ended.active);
-        assert_eq!(turns.load(Ordering::SeqCst), 3);
-        assert_eq!(notification_items_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(turns.load(Ordering::SeqCst), 4);
+        assert_eq!(notification_items_seen.load(Ordering::SeqCst), 2);
         assert_eq!(user_items_seen.load(Ordering::SeqCst), 1);
 
         let (close_tx, close_rx) = oneshot::channel();

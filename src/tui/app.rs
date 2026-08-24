@@ -156,6 +156,7 @@ pub enum Action {
     },
     Copy(String),
     Cancel,
+    DetachCompose(String),
     CancelBackground(String),
     Quit,
 }
@@ -902,6 +903,19 @@ impl App {
         None
     }
 
+    fn newest_foreground_compose(&self) -> Option<&ToolCall> {
+        self.blocks.iter().rev().find_map(|block| match block {
+            Block::Tool(call)
+                if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                    && call.running()
+                    && !call.backgrounded =>
+            {
+                Some(call)
+            }
+            _ => None,
+        })
+    }
+
     pub fn show_graph(&self) -> bool {
         match self.graph_pinned {
             Some(pinned) => pinned,
@@ -1501,6 +1515,14 @@ impl App {
         let line = command || control;
 
         match key.code {
+            KeyCode::Char('b') if key.modifiers == KeyModifiers::SUPER => {
+                let Some(call_id) = self.newest_foreground_compose().map(|call| call.id.clone())
+                else {
+                    self.toast("no foreground compose call is running");
+                    return Action::None;
+                };
+                return Action::DetachCompose(call_id);
+            }
             KeyCode::Char('c') if control => {
                 // A turn that will not stop must still be escapable: the second
                 // ctrl+c leaves, which takes the agent process with it.
@@ -2092,6 +2114,46 @@ mod tests {
             Some("background-2")
         );
         assert!(!app.working());
+    }
+
+    #[test]
+    fn command_b_detaches_the_newest_running_foreground_compose_only() {
+        let mut app = app();
+        for (id, title, backgrounded) in [
+            ("older", "compose", false),
+            ("other", "shell", false),
+            ("newest", "compose", false),
+            ("background", "compose", true),
+        ] {
+            app.apply(Update::ToolStarted {
+                id: id.into(),
+                title: title.into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded,
+            });
+        }
+
+        let action = app.handle_key(modified_press(KeyCode::Char('b'), KeyModifiers::SUPER));
+        assert!(matches!(action, Action::DetachCompose(id) if id == "newest"));
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn command_b_reports_when_no_foreground_compose_is_running() {
+        let mut app = app();
+
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('b'), KeyModifiers::SUPER)),
+            Action::None
+        ));
+        assert_eq!(
+            app.toast_text(),
+            Some("no foreground compose call is running")
+        );
     }
 
     #[test]

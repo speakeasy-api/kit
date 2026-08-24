@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.85"
+version = "0.1.86"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -77,6 +77,12 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[patch.crates-io]
+agentkit-capabilities = { git = "https://github.com/danielkov/agentkit.git", rev = "d2391a0" }
+agentkit-core = { git = "https://github.com/danielkov/agentkit.git", rev = "d2391a0" }
+agentkit-task-manager = { git = "https://github.com/danielkov/agentkit.git", rev = "d2391a0" }
+agentkit-tools-core = { git = "https://github.com/danielkov/agentkit.git", rev = "d2391a0" }
 
 [dev-dependencies]
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
