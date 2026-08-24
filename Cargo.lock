@@ -175,7 +175,8 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=d2391a0#d2391a01516a7475ea1e519b10cc9e9745629b09"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7193f4a771e30b61fbabecd90dba9a9bc16bdafc2cf717d086727871e9d0e3cf"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -213,7 +214,8 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=d2391a0#d2391a01516a7475ea1e519b10cc9e9745629b09"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2110778950cdd87cc8ea3f0697c0551eb515ef23841b9c5d255a01974be17798"
 dependencies = [
  "futures-timer",
  "serde",
@@ -309,8 +311,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-task-manager"
-version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=d2391a0#d2391a01516a7475ea1e519b10cc9e9745629b09"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e5783e77661abcf2739325383c5bb348b83ba8d6c066bebb47b8ba3671ba921"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -353,7 +356,8 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=d2391a0#d2391a01516a7475ea1e519b10cc9e9745629b09"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10b9a8af3f09c79fc0707ea87dc377edd40bdf65db11e6ebfb50783f4e8e8ff3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
