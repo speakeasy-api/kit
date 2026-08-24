@@ -29,5 +29,14 @@ and root-path values do not enter the diagnostics.
 
 The observed `acp.kit-dev` timeout followed `cargo clean`, while Cargo was
 rebuilding the entire codebase. It is expected startup pressure, not an
-unexplained harness defect. Configurable timeout, pre-handshake exit status, and
-safe stderr capture remain unresolved; this issue stays open.
+unexplained harness defect.
+
+## Resolution
+
+Startup now also races the ACP connection against the child process and reports a
+distinct `pre-handshake exit` phase with the process exit status. A focused test
+verifies the phase and status while ensuring the command, arguments, and runtime
+root remain absent. The 30-second handshake bound remains fixed, and child stderr
+remains deliberately excluded because it is untrusted and can contain secrets.
+Together with the existing spawn, protocol-failure, and timeout phases, this makes
+launch failures actionable without exposing launch credentials.

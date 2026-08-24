@@ -16,3 +16,12 @@ prevents delegated review and other subagent work.
 The launcher should retain an absolute, verified path to the current executable
 (or surface the attempted path) rather than relying on a relative path or argv
 value that may not resolve from the runtime root.
+
+## Resolution
+
+Closed as an operator-workflow issue. The built-in launcher already uses
+`std::env::current_exe()`, which is independent of the runtime cwd. The failure
+occurred after running `cargo clean` while Kit itself was running from
+`cargo run -- tui`; the live process survived after Cargo removed its executable,
+but it could no longer spawn that path as an ACP child. Use the installed
+`kit tui` executable for normal work instead of a Cargo-owned development binary.

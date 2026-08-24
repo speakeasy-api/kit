@@ -950,8 +950,25 @@ async fn run(
                 }
             }
             Ok(())
-        })
-        .await;
+        });
+    tokio::pin!(connected);
+    let connected = tokio::select! {
+        result = &mut connected => result,
+        status = child.wait() => {
+            let status = status.map_err(|error| context.error("process status failure", error))?;
+            if !startup_complete.load(Ordering::Acquire) {
+                return Err(pre_handshake_exit(&context, status));
+            }
+            connected.await
+        }
+    };
+    if !startup_complete.load(Ordering::Acquire) {
+        match child.try_wait() {
+            Ok(Some(status)) => return Err(pre_handshake_exit(&context, status)),
+            Ok(None) => {}
+            Err(error) => return Err(context.error("process status failure", error)),
+        }
+    }
     let _ = child.kill().await;
     connected.map_err(|error| {
         if startup_complete.load(Ordering::Acquire) {
@@ -965,6 +982,13 @@ async fn run(
             )
         }
     })
+}
+
+fn pre_handshake_exit(context: &LaunchContext, status: std::process::ExitStatus) -> String {
+    context.error(
+        "pre-handshake exit",
+        format!("child exited with {status} before completing the ACP handshake"),
+    )
 }
 
 fn permission_outcome(
@@ -1242,6 +1266,53 @@ mod tests {
         assert!(!error.contains("remote-secret-message"), "{error}");
         assert!(!error.contains("remote-secret-data"), "{error}");
         assert!(!error.contains("token"), "{error}");
+        assert!(!error.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn pre_handshake_exit_includes_status_and_safe_launch_context() {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = BTreeMap::from([(
+            "exits".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec!["-c".into(), "raise SystemExit(17)".into()],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        )]);
+        let config = ChildConfig {
+            root: root.path().into(),
+            model: "unused".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses: AcpHarnesses::new(profiles).unwrap(),
+            default_harness: "acp.exits".into(),
+        };
+
+        let error = match ChildSession::start(
+            config,
+            "acp.exits".into(),
+            None,
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("harness unexpectedly completed its handshake"),
+        };
+
+        assert!(error.contains("pre-handshake exit"), "{error}");
+        assert!(error.contains("17"), "{error}");
+        assert!(error.contains("harness=\"acp.exits\""), "{error}");
+        assert!(error.contains("source=configured ACP profile"), "{error}");
+        assert!(error.contains("cwd=runtime root"), "{error}");
+        assert!(!error.contains("python3"), "{error}");
+        assert!(!error.contains("raise SystemExit"), "{error}");
         assert!(!error.contains(root.path().to_string_lossy().as_ref()));
     }
 
