@@ -12,14 +12,14 @@ description: Use when asked to summarize the current Kit release against the pre
 
    ````markdown
    ```shell
-   mise use -g github:danielkov/kit-releases
+   mise use -g github:speakeasy-api/kit
    kit --version
    ```
 
    To pin this version:
 
    ```shell
-   mise use -g github:danielkov/kit-releases@<version-without-v-prefix>
+   mise use -g github:speakeasy-api/kit@<version-without-v-prefix>
    ```
    ````
 
