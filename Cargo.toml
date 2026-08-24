@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.77"
+version = "0.1.79"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false

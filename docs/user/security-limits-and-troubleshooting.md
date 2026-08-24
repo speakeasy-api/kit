@@ -17,7 +17,7 @@ Kit has no general permissions or interactive approval framework for its own too
 
 ## A2A network exposure and remote-agent trust
 
-`kit serve` always starts A2A HTTP as well as ACP on stdio. When no A2A address is configured, it binds an available loopback address (`127.0.0.1:0`) and prints `A2A listening on ...` to stderr. Use `kit acp` when no HTTP listener is wanted.
+`kit serve` always starts ACP on stdio and an HTTP listener. A2A is enabled by default; `--remote-acp` adds ACP at `/acp`, and `--no-a2a --remote-acp` exposes only remote ACP. When no address is configured, Kit binds an available loopback address (`127.0.0.1:0`). Use `kit acp` when no HTTP listener is wanted.
 
 The A2A server advertises no `security_schemes` or `security_requirements` and performs no authentication or authorization in Kit. Every client that can reach the listener can submit text that runs a fresh Kit agent with the configured root and tools. Consequently:
 
@@ -30,7 +30,8 @@ The `a2a` tool is an outbound client. It sends the supplied prompt as plain A2A 
 Example safe local-only server startup:
 
 ```sh
-kit serve --root /path/to/project --a2a 127.0.0.1:7331
+kit serve --root /path/to/project --http 127.0.0.1:7331
+kit serve --root /path/to/project --remote-acp --server-credential-file /private/token
 ```
 
 Confirm current options with `kit serve --help`.
@@ -79,7 +80,7 @@ Use `kit tui --help` for credential-store options. If nested Kit agents need the
 
 The following are fixed runtime limits, not configurable policy controls:
 
-- Shell timeout: 120 seconds by default; accepted values are 1 through 3600 seconds. Timeout reports `shell command timed out`. Stdout and stderr above 8 KiB spill in full to `~/.kit/artifacts`; model-visible results contain bounded head-and-tail previews and artifact paths.
+- Shell timeout: 120 seconds by default; accepted values are 1 through 3600 seconds. Timeout reports `shell command timed out`. Shell stdout and stderr remain complete inside compose and fail if either stream exceeds the 64 MiB internal safety limit. Final compose results from 8 KiB through the 64 MiB result limit spill at the model-context boundary, which receives a bounded head-and-tail preview and artifact path.
 - Subagents: nesting depth is two and at most 120 live subagent sessions are retained per main session. Errors include `subagent depth limit (2) reached` and `live subagent session limit (120) reached`. Reuse completed sessions or release unneeded ones with `close` instead of creating unbounded children.
 - ACP children: startup handshake and `session/fork` waits are 30 seconds. Cancellation allows 5 seconds to settle before Kit tears down the child. Captured ACP updates are limited to 64 updates and 64 KiB; the returned `updates.truncated` flag reports loss.
 - MCP: background server initialization uses a 20-second connection timeout. Tool calls have a 60-second deadline by default; `timeout_seconds` can override it with a value from 1 through 3600 for a call expected to take longer. OAuth authorization expires after 10 minutes. `tool_search` returns at most 5 tools globally across all servers and caps the serialized response at 32 KiB; search with a configured server name, specific product term, or tool keywords. Use the exact query `mcp` (case-insensitive) for a compact configured-server status list; `total_servers`, `returned_servers`, and `truncated` report any tail entries omitted by the same cap.
@@ -100,7 +101,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 ### A shell or edit tool fails
 
 1. For `shell command timed out`, reduce the task, diagnose a blocked subprocess, or intentionally raise `timeout_seconds` within 1–3600. An interrupt kills Kit's child command but still inspect for partial side effects.
-2. When a result reports `shell output spilled`, inspect a small relevant range from its artifact instead of returning the full artifact to model context.
+2. When a result reports `compose output spilled`, inspect a small relevant range from its artifact instead of returning the full artifact to model context. Internal Runlet consumers receive complete shell output before this boundary guard runs.
 3. For `path must be non-empty`, provide either a path relative to the runtime root or an absolute path.
 4. For a hunk mismatch or ambiguity, reread the file and provide more unique exact context.
 

@@ -1,5 +1,7 @@
 mod acp_child;
+mod artifacts;
 pub mod compaction;
+mod compose_output;
 mod credentials;
 pub mod docs;
 pub mod events;

@@ -42,6 +42,7 @@ mod tests;
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 const MAX_BACKGROUND_AFTER_SECONDS: u64 = 86_400;
+const MAX_COMPOSE_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SessionRequest {
@@ -527,10 +528,18 @@ impl Runtime {
         let child_specs = children.specs();
         let compose = ComposeTool::wrap(children)
             .with_source(self.mcp.catalog().unadvertised())
-            .with_config(ComposeConfig::new().with_max_nested_tool_calls(128))
+            .with_config(
+                ComposeConfig::new()
+                    .with_max_nested_tool_calls(128)
+                    .with_max_result_bytes(MAX_COMPOSE_RESULT_BYTES),
+            )
             .with_backend(HiddenRunletBackend(child_specs));
         ComposeOnly {
-            backgroundable: BackgroundableCompose::new(compose.clone(), background_jobs),
+            backgroundable: BackgroundableCompose::new(
+                compose.clone(),
+                background_jobs,
+                self.root.clone(),
+            ),
             compose,
         }
     }
@@ -962,15 +971,17 @@ struct BackgroundableCompose {
     inner: ComposeTool,
     spec: ToolSpec,
     background_jobs: BackgroundJobs,
+    root: PathBuf,
 }
 
 impl BackgroundableCompose {
-    fn new(inner: ComposeTool, background_jobs: BackgroundJobs) -> Self {
+    fn new(inner: ComposeTool, background_jobs: BackgroundJobs, root: PathBuf) -> Self {
         let spec = backgroundable_spec(inner.spec().clone());
         Self {
             inner,
             spec,
             background_jobs,
+            root,
         }
     }
 
@@ -1018,9 +1029,23 @@ impl Tool for BackgroundableCompose {
     ) -> Result<ToolResult, ToolError> {
         let background = background_requested(&request);
         let call_id = request.call_id.clone();
+        let artifact_directory =
+            crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
         let request = Self::sanitized(request)?;
         let cancellation = self.begin_background(background, &call_id, ctx);
-        let result = self.inner.invoke(request, ctx).await;
+        let result = match self.inner.invoke(request, ctx).await {
+            Ok(mut result) => {
+                match crate::compose_output::guard(&artifact_directory, result.result.output).await
+                {
+                    Ok(output) => {
+                        result.result.output = output;
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
         self.finish_background(cancellation, &call_id);
         result
     }
@@ -1032,12 +1057,26 @@ impl Tool for BackgroundableCompose {
     ) -> ToolExecutionOutcome {
         let background = background_requested(&request);
         let call_id = request.call_id.clone();
+        let artifact_directory =
+            crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
         let request = match Self::sanitized(request) {
             Ok(request) => request,
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
         let cancellation = self.begin_background(background, &call_id, ctx);
-        let result = self.inner.invoke_outcome(request, ctx).await;
+        let result = match self.inner.invoke_outcome(request, ctx).await {
+            ToolExecutionOutcome::Completed(mut result) => {
+                match crate::compose_output::guard(&artifact_directory, result.result.output).await
+                {
+                    Ok(output) => {
+                        result.result.output = output;
+                        ToolExecutionOutcome::Completed(result)
+                    }
+                    Err(error) => ToolExecutionOutcome::Failed(error),
+                }
+            }
+            other => other,
+        };
         self.finish_background(cancellation, &call_id);
         result
     }

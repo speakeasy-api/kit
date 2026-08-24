@@ -357,6 +357,88 @@ async fn compose_dispatches_bundled_docs_search_through_runlet() {
 }
 
 #[tokio::test]
+async fn compose_preserves_large_shell_output_for_internal_consumers() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"result = shell({ command: "python3 -c 'print(\"x\" * 12000, end=\"\")'" })
+written = edit({ op: "add", path: "copied.txt", content: result.stdout })
+return written"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("compose failed: {outcome:?}");
+    };
+    assert_eq!(
+        std::fs::read(directory.path().join("copied.txt")).unwrap(),
+        vec![b'x'; 12000]
+    );
+    assert!(!format!("{:?}", result.result.output).contains("output spilled"));
+}
+
+#[tokio::test]
+async fn compose_spills_large_final_output_only_at_the_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"result = shell({ command: "python3 -c 'print(\"x\" * 12000, end=\"\")'" })
+return { stdout: result.stdout }"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("compose failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(output) = result.result.output else {
+        panic!("compose returned a non-JSON result");
+    };
+    let artifact = output["artifact"].as_str().unwrap();
+    let stored = std::fs::read_to_string(artifact).unwrap();
+
+    assert!(
+        output["preview"]
+            .as_str()
+            .unwrap()
+            .contains("compose output spilled")
+    );
+    assert!(!stored.contains("shell output spilled"));
+    assert_eq!(stored.matches('x').count(), 12000);
+    let _ = std::fs::remove_file(artifact);
+    let _ = std::fs::remove_dir(std::path::Path::new(artifact).parent().unwrap());
+}
+
+#[tokio::test]
+async fn compose_spills_results_above_the_dependency_default_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let outcome = execute_compose(
+        &runtime,
+        r#"result = shell({ command: "printf '%1100000s' '' | tr ' ' x" })
+return { stdout: result.stdout }"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("compose failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(output) = result.result.output else {
+        panic!("compose returned a non-JSON result");
+    };
+    let artifact = output["artifact"].as_str().unwrap();
+
+    assert!(output["original_bytes"].as_u64().unwrap() > 1024 * 1024);
+    assert_eq!(
+        std::fs::read_to_string(artifact)
+            .unwrap()
+            .matches('x')
+            .count(),
+        1_100_000
+    );
+    let _ = std::fs::remove_file(artifact);
+    let _ = std::fs::remove_dir(std::path::Path::new(artifact).parent().unwrap());
+}
+
+#[tokio::test]
 async fn compose_dispatches_hidden_shell_through_runlet() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
