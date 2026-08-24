@@ -103,19 +103,41 @@ local record; if remote revocation is unavailable, credentials are retained. Use
 Kit refreshes expiring credentials proactively and retries one rejected credential
 with a synchronized forced refresh.
 
-To use OpenRouter, set `OPENROUTER_API_KEY`, select the provider, and pass an
-OpenRouter model identifier:
+To use OpenRouter, sign in to the shared credential store or supply an API key,
+then select the provider and pass an OpenRouter model identifier:
 
 ```sh
-OPENROUTER_API_KEY=sk-or-v1-... cargo run -- prompt \
+cargo run -- auth login openrouter --credential-store keychain
+cargo run -- auth status openrouter --credential-store keychain
+cargo run -- prompt --credential-store keychain \
   --provider openrouter --model anthropic/claude-sonnet-4 \
   --root /path/to/project "Reply with a short project summary"
+cargo run -- auth logout openrouter --credential-store keychain
 ```
+
+Runtime and OpenRouter auth status resolve keys in this order: a non-empty global
+`--openrouter-api-key`, a non-empty `OPENROUTER_API_KEY`, then the stored
+`openrouter/default` credential. An empty flag is rejected; an empty environment value
+is treated as absent. The flag is available to `serve`, `acp`, `prompt`, `tui`, and `auth`, but its value is
+present in Kit's initial process argv and can be exposed by shell history or process
+inspection. Prefer the environment or stored credentials. Kit never rewrites its own
+process environment and never adds the key to child argv. It overrides
+`OPENROUTER_API_KEY` only in the TUI's Kit `serve` child and built-in or configured
+`acp.kit` children. Kit removes its resolved OpenRouter key from external ACP child
+environments rather than exposing the credential to arbitrary configured agents.
+
+`kit auth status openrouter` reports whether the active source is the flag,
+environment, or stored credentials without printing the key. Logout removes only the
+stored record and cannot revoke an OpenRouter key automatically. If the flag or
+`OPENROUTER_API_KEY` remains set, logout warns that it is still active; the
+environment value is retained.
 
 Kit uses the selected `--model` or configured `model`; `OPENROUTER_MODEL` does not
 override it. The adapter also honors its optional `OPENROUTER_BASE_URL`,
 `OPENROUTER_APP_NAME`, `OPENROUTER_SITE_URL`, `OPENROUTER_MAX_COMPLETION_TOKENS`,
-`OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT` settings.
+`OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT` settings. Stored OAuth
+credentials are restricted to OpenRouter's canonical API endpoint; custom base URLs
+require an explicit flag or environment key.
 
 Kit also reads the OpenRouter model catalog's
 `context_length` for the selected model, enabling the normal context gauge and
@@ -212,7 +234,9 @@ explicit `[acp.kit]` overrides that executable/base argv. In both cases Kit then
 appends root, provider, model, the resolved reasoning effort, persistent session, resume, MCP, credential, and inherited
 depth flags, and the profile remains eligible for isolated Kit transcript fork
 fallback. Other profiles remain literal generic ACP argv. Configured child
-processes inherit Kit's environment unchanged in this release.
+processes inherit Kit's environment except for resolved OpenRouter credentials:
+`acp.kit` receives the key as a child-only `OPENROUTER_API_KEY` override, while
+generic ACP profiles have `OPENROUTER_API_KEY` removed.
 Missing config files are ignored; unreadable or invalid files and unknown selected
 harness references produce an error rather than being silently discarded.
 
@@ -446,7 +470,7 @@ refusal, protocol errors, and other uncertain stops retire the child instead. Pe
 headless child are conservatively cancelled so they cannot hang. Nested built-in
 children use `kit acp` and never start A2A listeners.
 
-OpenAI, Speakeasy, and MCP use one shared credential backend, selected with
+OpenAI, OpenRouter, Speakeasy, and MCP use one shared credential backend, selected with
 `--credential-store` or `credential_store`. The default `memory` backend is
 process-local, so credentials disappear at exit and are not available to the
 TUI server process or nested Kit children. Use persistent storage when those

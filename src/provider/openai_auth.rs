@@ -1570,7 +1570,7 @@ fn emit_auth_url(url: &str, format: OutputFormat) -> Result<(), AuthError> {
 }
 
 #[cfg(not(windows))]
-fn open_browser_bounded(url: &str) {
+pub(super) fn open_browser_bounded(url: &str) {
     let mut command = Command::new(if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -1595,7 +1595,7 @@ fn open_browser_bounded(url: &str) {
 }
 
 #[cfg(windows)]
-fn open_browser_bounded(url: &str) {
+pub(super) fn open_browser_bounded(url: &str) {
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 

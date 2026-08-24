@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
+    OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn, OpenRouterApiKey,
     SubscriptionConfig, speakeasy_auth,
 };
 
@@ -149,6 +149,7 @@ struct SessionSelection {
 pub struct SelectableAdapter {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
+    openrouter_api_key: Option<OpenRouterApiKey>,
 }
 
 impl SelectableAdapter {
@@ -170,6 +171,22 @@ impl SelectableAdapter {
         credential_storage: crate::credentials::CredentialStorage,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<Self, String> {
+        Self::new_with_credentials_effort_and_openrouter_key(
+            provider,
+            model,
+            credential_storage,
+            reasoning_effort,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_credentials_effort_and_openrouter_key(
+        provider: ProviderKind,
+        model: impl Into<String>,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<ReasoningEffort>,
+        openrouter_api_key: Option<OpenRouterApiKey>,
+    ) -> Result<Self, String> {
         let selection = ModelSelection::new(provider, model);
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
@@ -179,6 +196,7 @@ impl SelectableAdapter {
             selection.model.clone(),
             credential_storage.clone(),
             reasoning_effort,
+            openrouter_api_key.as_ref(),
         )?;
         Ok(Self {
             selection: Arc::new(Mutex::new(SessionSelection {
@@ -186,6 +204,7 @@ impl SelectableAdapter {
                 reasoning_effort,
             })),
             credential_storage,
+            openrouter_api_key,
         })
     }
 
@@ -213,6 +232,7 @@ impl SelectableAdapter {
             selection.model.clone(),
             self.credential_storage.clone(),
             reasoning_effort,
+            self.openrouter_api_key.as_ref(),
         )?;
         self.selection
             .lock()
@@ -231,6 +251,7 @@ impl SelectableAdapter {
             model.model,
             self.credential_storage.clone(),
             reasoning_effort,
+            self.openrouter_api_key.as_ref(),
         )?;
         self.selection
             .lock()
@@ -243,6 +264,7 @@ impl SelectableAdapter {
 pub struct SelectableSession {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
+    openrouter_api_key: Option<OpenRouterApiKey>,
     config: SessionConfig,
     active: SessionSelection,
     inner: KitSession,
@@ -263,6 +285,7 @@ impl ModelAdapter for SelectableAdapter {
             active.model.model.clone(),
             self.credential_storage.clone(),
             active.reasoning_effort,
+            self.openrouter_api_key.as_ref(),
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
@@ -270,6 +293,7 @@ impl ModelAdapter for SelectableAdapter {
         Ok(SelectableSession {
             selection: Arc::clone(&self.selection),
             credential_storage: self.credential_storage.clone(),
+            openrouter_api_key: self.openrouter_api_key.clone(),
             config,
             active,
             inner,
@@ -324,6 +348,7 @@ impl ModelSession for SelectableSession {
                 selected.model.model.clone(),
                 self.credential_storage.clone(),
                 selected.reasoning_effort,
+                self.openrouter_api_key.as_ref(),
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
@@ -462,7 +487,7 @@ impl KitAdapter {
         model: String,
         credential_storage: crate::credentials::CredentialStorage,
     ) -> Result<Self, String> {
-        Self::new_with_credentials_and_effort(provider, model, credential_storage, None)
+        Self::new_with_credentials_and_effort(provider, model, credential_storage, None, None)
     }
 
     fn new_with_credentials_and_effort(
@@ -470,6 +495,7 @@ impl KitAdapter {
         model: String,
         credential_storage: crate::credentials::CredentialStorage,
         reasoning_effort: Option<ReasoningEffort>,
+        openrouter_api_key: Option<&OpenRouterApiKey>,
     ) -> Result<Self, String> {
         match provider {
             ProviderKind::OpenAiSubscription => {
@@ -480,8 +506,12 @@ impl KitAdapter {
             }
             .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
-                let mut config = OpenRouterConfig::from_env().map_err(|error| error.to_string())?;
-                config.model = model.clone();
+                let mut config = openrouter_config_from_env(
+                    model.clone(),
+                    &credential_storage,
+                    openrouter_api_key,
+                    |name| std::env::var(name),
+                )?;
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
                 let inner = OpenRouterAdapter::new(config).map_err(|error| error.to_string())?;
@@ -525,6 +555,99 @@ impl KitAdapter {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedOpenRouterApiKeySource {
+    Explicit,
+    Environment,
+    Stored,
+}
+
+fn openrouter_config_from_env(
+    model: String,
+    credential_storage: &crate::credentials::CredentialStorage,
+    explicit_api_key: Option<&OpenRouterApiKey>,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<OpenRouterConfig, String> {
+    let (api_key, key_source) = match explicit_api_key {
+        Some(api_key) if api_key.as_str().is_empty() => {
+            return Err("--openrouter-api-key cannot be empty".into());
+        }
+        Some(api_key) => (
+            api_key.as_str().to_owned(),
+            ResolvedOpenRouterApiKeySource::Explicit,
+        ),
+        None => match env("OPENROUTER_API_KEY") {
+            Ok(api_key) if !api_key.is_empty() => {
+                (api_key, ResolvedOpenRouterApiKeySource::Environment)
+            }
+            _ => (
+                super::openrouter_auth::load(credential_storage)?
+                    .map(|record| record.api_key.clone())
+                    .ok_or_else(|| {
+                        "set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider".to_string()
+                    })?,
+                ResolvedOpenRouterApiKeySource::Stored,
+            ),
+        },
+    };
+    let env_model = env("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".into());
+    let mut config = OpenRouterConfig::new(api_key, env_model);
+    if let Ok(app_name) = env("OPENROUTER_APP_NAME") {
+        config = config.with_app_name(app_name);
+    }
+    if let Ok(site_url) = env("OPENROUTER_SITE_URL") {
+        config = config.with_site_url(site_url);
+    }
+    if let Ok(base_url) = env("OPENROUTER_BASE_URL") {
+        if key_source == ResolvedOpenRouterApiKeySource::Stored
+            && !equivalent_openrouter_base_urls(&base_url, &config.base_url)
+        {
+            return Err(
+                "stored OpenRouter credentials cannot be used with a noncanonical OPENROUTER_BASE_URL; set OPENROUTER_API_KEY explicitly for custom endpoints"
+                    .into(),
+            );
+        }
+        config = config.with_base_url(base_url);
+    }
+    if let Ok(value) = env("OPENROUTER_MAX_COMPLETION_TOKENS") {
+        let parsed = value
+            .parse::<u32>()
+            .map_err(|_| format!("invalid max tokens: {value}"))?;
+        config = config.with_max_completion_tokens(parsed);
+    }
+    if let Ok(value) = env("OPENROUTER_TEMPERATURE") {
+        let parsed = value
+            .parse::<f32>()
+            .map_err(|_| format!("invalid temperature: {value}"))?;
+        config = config.with_temperature(parsed);
+    }
+    if let Ok(value) = env("OPENROUTER_REASONING_EFFORT") {
+        let effort = match value.as_str() {
+            "minimal" => OpenRouterReasoningEffort::Minimal,
+            "low" => OpenRouterReasoningEffort::Low,
+            "medium" => OpenRouterReasoningEffort::Medium,
+            "high" => OpenRouterReasoningEffort::High,
+            other => OpenRouterReasoningEffort::Custom(other.to_string()),
+        };
+        config = config.with_reasoning_effort(effort);
+    }
+    config.model = model;
+    Ok(config)
+}
+
+fn equivalent_openrouter_base_urls(candidate: &str, canonical: &str) -> bool {
+    normalized_openrouter_base_url(candidate)
+        .zip(normalized_openrouter_base_url(canonical))
+        .is_some_and(|(candidate, canonical)| candidate == canonical)
+}
+
+fn normalized_openrouter_base_url(value: &str) -> Option<url::Url> {
+    let mut url = url::Url::parse(value).ok()?;
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Some(url)
 }
 
 fn apply_openrouter_reasoning_effort(
@@ -967,6 +1090,7 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         net::TcpListener,
         sync::{Arc, Mutex},
@@ -982,12 +1106,15 @@ mod tests {
     };
     use serde_json::json;
 
+    use crate::credentials::CredentialStorage;
+
     use super::{
-        KitAdapter, KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterKitSession,
-        OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
-        SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider, add_context_window,
-        apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
-        gram_chat_id, models_url, parse_context_window, rewrite_openrouter_media,
+        KitAdapter, KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterApiKey,
+        OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter,
+        SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
+        add_context_window, apply_openrouter_reasoning_effort, catalog_models_url,
+        expose_background_call_ids, gram_chat_id, models_url, openrouter_config_from_env,
+        parse_context_window, rewrite_openrouter_media,
     };
 
     #[test]
@@ -1006,6 +1133,142 @@ mod tests {
             config.reasoning_effort,
             Some(OpenRouterReasoningEffort::High)
         );
+    }
+
+    #[test]
+    fn openrouter_key_source_controls_custom_base_url_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+        crate::provider::store_openrouter_test_credentials(&storage);
+
+        let config = openrouter_config_from_env("selected/model".into(), &storage, None, |_| {
+            Err(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+        assert_eq!(config.api_key, "test-openrouter-key");
+        assert_eq!(config.model, "selected/model");
+
+        let canonical_base_url = OpenRouterConfig::new("", "").base_url;
+        let optional = BTreeMap::from([
+            ("OPENROUTER_API_KEY", ""),
+            ("OPENROUTER_MODEL", "ignored/env-model"),
+            ("OPENROUTER_APP_NAME", "env-app"),
+            ("OPENROUTER_SITE_URL", "https://example.com"),
+            ("OPENROUTER_MAX_COMPLETION_TOKENS", "1234"),
+            ("OPENROUTER_TEMPERATURE", "0.25"),
+            ("OPENROUTER_REASONING_EFFORT", "provider-tier"),
+        ]);
+        let config = openrouter_config_from_env("selected/model".into(), &storage, None, |name| {
+            if name == "OPENROUTER_BASE_URL" {
+                return Ok(format!("{canonical_base_url}/"));
+            }
+            optional
+                .get(name)
+                .map(|value| (*value).to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        })
+        .unwrap();
+
+        assert_eq!(config.api_key, "test-openrouter-key");
+        assert_eq!(config.model, "selected/model");
+        assert_eq!(config.base_url, format!("{canonical_base_url}/"));
+        assert_eq!(config.app_name.as_deref(), Some("env-app"));
+        assert_eq!(config.site_url.as_deref(), Some("https://example.com"));
+        assert_eq!(config.max_completion_tokens, Some(1234));
+        assert_eq!(config.temperature, Some(0.25));
+        assert_eq!(
+            config.reasoning_effort,
+            Some(OpenRouterReasoningEffort::Custom("provider-tier".into()))
+        );
+
+        let error =
+            openrouter_config_from_env(
+                "selected/model".into(),
+                &storage,
+                None,
+                |name| match name {
+                    "OPENROUTER_BASE_URL" => Ok("https://example.com/v1".into()),
+                    _ => Err(std::env::VarError::NotPresent),
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("stored OpenRouter credentials"), "{error}");
+        assert!(error.contains("OPENROUTER_API_KEY"), "{error}");
+
+        let config =
+            openrouter_config_from_env(
+                "selected/model".into(),
+                &storage,
+                None,
+                |name| match name {
+                    "OPENROUTER_API_KEY" => Ok("environment-key".into()),
+                    "OPENROUTER_BASE_URL" => Ok("https://example.com/v1".into()),
+                    _ => Err(std::env::VarError::NotPresent),
+                },
+            )
+            .unwrap();
+        assert_eq!(config.api_key, "environment-key");
+        assert_eq!(config.model, "selected/model");
+        assert_eq!(config.base_url, "https://example.com/v1");
+
+        let explicit = OpenRouterApiKey::new("explicit-key");
+        let config = openrouter_config_from_env(
+            "selected/model".into(),
+            &storage,
+            Some(&explicit),
+            |name| match name {
+                "OPENROUTER_API_KEY" => Ok("environment-key".into()),
+                "OPENROUTER_BASE_URL" => Ok("https://proxy.example/v1".into()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .unwrap();
+        assert_eq!(config.api_key, "explicit-key");
+        assert_eq!(config.base_url, "https://proxy.example/v1");
+
+        let empty = OpenRouterApiKey::new("");
+        let error =
+            openrouter_config_from_env("selected/model".into(), &storage, Some(&empty), |_| {
+                Err(std::env::VarError::NotPresent)
+            })
+            .unwrap_err();
+        assert!(error.contains("cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn selectable_adapter_keeps_explicit_key_across_selection_rebuilds() {
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "first/model",
+            CredentialStorage::Memory,
+            None,
+            Some(OpenRouterApiKey::new("lifecycle-secret")),
+        )
+        .unwrap();
+        adapter
+            .select(ModelSelection::new(
+                ProviderKind::OpenRouter,
+                "second/model",
+            ))
+            .unwrap();
+        adapter
+            .select_reasoning_effort(Some(ReasoningEffort::High))
+            .unwrap();
+        let debug = format!("{:?}", adapter.openrouter_api_key);
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("lifecycle-secret"));
+    }
+
+    #[test]
+    fn openrouter_errors_only_when_environment_and_storage_are_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+        let error = openrouter_config_from_env("selected/model".into(), &storage, None, |_| {
+            Err(std::env::VarError::NotPresent)
+        })
+        .unwrap_err();
+        assert!(error.contains("OPENROUTER_API_KEY"));
+        assert!(error.contains("kit auth login openrouter"));
     }
 
     #[test]
@@ -1244,6 +1507,7 @@ mod tests {
         SelectableSession {
             selection: Arc::new(Mutex::new(active.clone())),
             credential_storage: Default::default(),
+            openrouter_api_key: None,
             config: SessionConfig::new("provider-identity-test"),
             active,
             inner,

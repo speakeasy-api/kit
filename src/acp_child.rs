@@ -226,6 +226,7 @@ impl AcpHarnesses {
                 .ok_or_else(|| format!("unknown ACP harness {reference:?}"))?;
             let mut command = Command::new(&profile.command);
             command.args(&profile.args);
+            command.env_remove("OPENROUTER_API_KEY");
             command
         };
         // Every trusted profile is spawned directly (never through a shell)
@@ -282,6 +283,9 @@ impl AcpHarnesses {
             command.arg("--credential-dir").arg(path);
         }
         config.telemetry.append_cli_args(&mut command);
+        if let Some(api_key) = &config.openrouter_api_key {
+            command.env("OPENROUTER_API_KEY", api_key.as_str());
+        }
         Ok(command)
     }
 }
@@ -307,6 +311,7 @@ pub(crate) fn serve_command(
     model: &str,
     provider: crate::ProviderKind,
     reasoning_effort: Option<crate::ReasoningEffort>,
+    openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
     session_id: &str,
     resume: bool,
 ) -> std::io::Result<Command> {
@@ -326,6 +331,9 @@ pub(crate) fn serve_command(
     if resume {
         command.arg("--resume");
     }
+    if let Some(api_key) = openrouter_api_key {
+        command.env("OPENROUTER_API_KEY", api_key.as_str());
+    }
     Ok(command)
 }
 
@@ -335,6 +343,7 @@ pub(crate) struct ChildConfig {
     pub model: String,
     pub provider: crate::ProviderKind,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+    pub openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     pub mcp_config: Option<PathBuf>,
     pub credential_storage: CredentialStorage,
     pub telemetry: crate::telemetry::Settings,
@@ -1047,6 +1056,7 @@ mod tests {
             "test-model",
             crate::ProviderKind::OpenRouter,
             Some(crate::ReasoningEffort::Medium),
+            Some(&crate::provider::OpenRouterApiKey::new("tui-secret")),
             "session",
             true,
         )
@@ -1060,6 +1070,48 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--reasoning-effort", "medium"])
         );
+        assert!(args.iter().all(|arg| arg != "tui-secret"));
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == "OPENROUTER_API_KEY" && value == Some(std::ffi::OsStr::new("tui-secret"))
+        }));
+    }
+
+    #[test]
+    fn openrouter_key_is_removed_from_external_acp_profiles() {
+        let root = tempfile::tempdir().unwrap();
+        let harnesses = AcpHarnesses::new(BTreeMap::from([(
+            "external".into(),
+            AcpHarnessProfile {
+                command: "external-agent".into(),
+                args: Vec::new(),
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        )]))
+        .unwrap();
+        for openrouter_api_key in [
+            Some(crate::provider::OpenRouterApiKey::new("external-secret")),
+            None,
+        ] {
+            let config = ChildConfig {
+                root: root.path().into(),
+                model: "model".into(),
+                provider: crate::ProviderKind::OpenRouter,
+                reasoning_effort: None,
+                openrouter_api_key,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses: harnesses.clone(),
+                default_harness: "acp.external".into(),
+            };
+            let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(name, value)| { name == "OPENROUTER_API_KEY" && value.is_none() })
+            );
+        }
     }
 
     #[test]
@@ -1235,6 +1287,7 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
+            openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1285,6 +1338,7 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
+            openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1334,6 +1388,7 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
+            openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1370,6 +1425,7 @@ mod tests {
             model: "test-model".into(),
             provider: crate::ProviderKind::OpenRouter,
             reasoning_effort: Some(crate::ReasoningEffort::High),
+            openrouter_api_key: Some(crate::provider::OpenRouterApiKey::new("child-secret")),
             mcp_config: None,
             credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
             telemetry: crate::telemetry::Settings::try_new(
@@ -1439,6 +1495,10 @@ mod tests {
                 .any(|pair| { pair == ["--otel-message-content-max-bytes", "4096"] })
         );
         assert_eq!(command.as_std().get_current_dir(), Some(root.path()));
+        assert!(args.iter().all(|arg| arg != "child-secret"));
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == "OPENROUTER_API_KEY" && value == Some(std::ffi::OsStr::new("child-secret"))
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1458,6 +1518,7 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
+            openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1516,6 +1577,7 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
+            openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),

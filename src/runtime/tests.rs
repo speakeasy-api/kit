@@ -16,11 +16,13 @@ use super::{
 #[test]
 fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
     let root = tempfile::tempdir().unwrap();
+    let credentials = crate::credentials::CredentialStorage::Memory;
+    crate::provider::store_openrouter_test_credentials(&credentials);
     let runtime = Runtime::new_with_provider_credentials_and_effort(
         root.path(),
         "test-model",
         crate::ProviderKind::OpenRouter,
-        Default::default(),
+        credentials,
         Some(crate::ReasoningEffort::High),
     )
     .unwrap();
@@ -33,6 +35,44 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
         runtime.subagents.child_config().reasoning_effort,
         Some(crate::ReasoningEffort::High)
     );
+}
+
+#[test]
+fn explicit_openrouter_key_reaches_runtime_adapter_and_kit_children() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+        root.path(),
+        "test-model",
+        crate::ProviderKind::OpenRouter,
+        crate::credentials::CredentialStorage::Memory,
+        None,
+        Some(crate::provider::OpenRouterApiKey::new("runtime-secret")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        runtime.openrouter_api_key.as_ref().map(|key| key.as_str()),
+        Some("runtime-secret")
+    );
+    assert_eq!(
+        runtime
+            .subagents
+            .child_config()
+            .openrouter_api_key
+            .as_ref()
+            .map(|key| key.as_str()),
+        Some("runtime-secret")
+    );
+    runtime
+        .adapter
+        .select(crate::provider::ModelSelection::new(
+            crate::ProviderKind::OpenRouter,
+            "next/model",
+        ))
+        .unwrap();
+    let debug = format!("{:?}", runtime.openrouter_api_key);
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("runtime-secret"));
 }
 
 #[test]

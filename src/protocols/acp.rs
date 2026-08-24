@@ -2191,11 +2191,13 @@ mod tests {
         .unwrap();
         drop(opened);
 
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
         let runtime = Runtime::new_with_provider_credentials_and_effort(
             root.path(),
             "test-model",
             crate::ProviderKind::OpenRouter,
-            Default::default(),
+            credentials,
             None,
         )
         .unwrap();
@@ -2303,11 +2305,13 @@ mod tests {
         .unwrap();
         drop(opened);
 
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
         let runtime = Runtime::new_with_provider_credentials_and_effort(
             root.path(),
             "test-model",
             crate::ProviderKind::OpenRouter,
-            Default::default(),
+            credentials,
             None,
         )
         .unwrap();
@@ -2409,6 +2413,9 @@ mod tests {
             vec![Item::text(ItemKind::System, "system")],
         )
         .unwrap();
+        crate::provider::store_openrouter_test_credentials(
+            &crate::credentials::CredentialStorage::Memory,
+        );
         let runtime = Runtime::with_session_and_provider(
             root.path(),
             "test-model",

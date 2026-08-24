@@ -15,12 +15,37 @@ use serde::Deserialize;
 struct Cli {
     #[command(flatten)]
     telemetry: TelemetryArgs,
+    #[command(flatten)]
+    openrouter: OpenRouterArgs,
     #[command(subcommand)]
     command: Command,
 }
 
 const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTEL_CAPTURE_MESSAGE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
+const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+#[derive(Args)]
+struct OpenRouterArgs {
+    /// OpenRouter API key (prefer the environment or stored credentials to keep it out of argv).
+    #[arg(long, global = true, value_name = "KEY")]
+    openrouter_api_key: Option<kit::provider::OpenRouterApiKey>,
+}
+
+fn resolve_openrouter_api_key(
+    cli: Option<kit::provider::OpenRouterApiKey>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<(
+    kit::provider::OpenRouterApiKey,
+    kit::provider::OpenRouterApiKeySource,
+)> {
+    cli.map(|key| (key, kit::provider::OpenRouterApiKeySource::Flag))
+        .or_else(|| {
+            env(OPENROUTER_API_KEY_ENV)
+                .and_then(kit::provider::OpenRouterApiKey::non_empty)
+                .map(|key| (key, kit::provider::OpenRouterApiKeySource::Environment))
+        })
+}
 
 #[derive(Args)]
 struct TelemetryArgs {
@@ -342,6 +367,7 @@ fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuthProvider {
     Openai,
+    Openrouter,
     Speakeasy,
 }
 
@@ -530,20 +556,34 @@ fn validate_auth_storage(action: &AuthAction, storage: &CredentialStorage) -> io
     Ok(())
 }
 
-async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result<(), io::Error> {
+async fn execute_auth(
+    action: &AuthAction,
+    storage: CredentialStorage,
+    openrouter_api_key: Option<(
+        kit::provider::OpenRouterApiKey,
+        kit::provider::OpenRouterApiKeySource,
+    )>,
+) -> Result<(), io::Error> {
     enum Execution {
         OpenAi(kit::provider::OpenAiAuthCommand),
+        OpenRouter(kit::provider::OpenRouterAuthCommand),
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
     }
     let command = match action {
         AuthAction::Login { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Login),
+            AuthProvider::Openrouter => {
+                Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Login)
+            }
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Login)
             }
         },
         AuthAction::Status { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
+            AuthProvider::Openrouter => {
+                Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Status)
+            }
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Status)
             }
@@ -555,6 +595,11 @@ async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Logout {
                 local_only: *local_only,
             }),
+            AuthProvider::Openrouter => {
+                Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Logout {
+                    local_only: *local_only,
+                })
+            }
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Logout {
                     local_only: *local_only,
@@ -564,6 +609,13 @@ async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result
     };
     let output = tokio::task::spawn_blocking(move || match command {
         Execution::OpenAi(command) => kit::provider::execute_openai_auth(command, &storage),
+        Execution::OpenRouter(command) => kit::provider::execute_openrouter_auth(
+            command,
+            &storage,
+            openrouter_api_key
+                .as_ref()
+                .map(|(key, source)| (key, *source)),
+        ),
         Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
     })
     .await
@@ -660,12 +712,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(&cli.command, Command::Init) {
         init_default_config()?;
         println!(
-            "Kit {}\n\nlog in with your OpenAI or Speakeasy account, or set OPENROUTER_API_KEY to get started",
+            "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
     }
     let config = Config::load_default()?;
+    let openrouter_api_key =
+        resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
+            env::var(name).ok()
+        });
     let telemetry_settings = config.telemetry_settings(
         &cli.telemetry,
         env::var(OTEL_ENDPOINT_ENV).ok(),
@@ -679,7 +735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let storage = credentials.storage(&config)?;
         validate_auth_storage(action, &storage)?;
-        execute_auth(action, storage).await?;
+        execute_auth(action, storage, openrouter_api_key.clone()).await?;
         return Ok(());
     }
     match cli.command {
@@ -708,20 +764,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session_provider_credentials_and_effort(
+                Some(id) => {
+                    kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+                        &root,
+                        model,
+                        provider,
+                        kit::runtime::SessionRequest { id, resume, force },
+                        credential_storage.clone(),
+                        reasoning_effort,
+                        openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                    )?
+                }
+                None => kit::Runtime::new_with_provider_credentials_effort_and_openrouter_key(
                     &root,
                     model,
                     provider,
-                    kit::runtime::SessionRequest { id, resume, force },
                     credential_storage.clone(),
                     reasoning_effort,
-                )?,
-                None => kit::Runtime::new_with_provider_credentials_and_effort(
-                    &root,
-                    model,
-                    provider,
-                    credential_storage.clone(),
-                    reasoning_effort,
+                    openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_skills(
@@ -779,20 +839,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
-                Some(id) => kit::Runtime::with_session_provider_credentials_and_effort(
+                Some(id) => {
+                    kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+                        &root,
+                        model,
+                        provider,
+                        kit::runtime::SessionRequest { id, resume, force },
+                        credential_storage.clone(),
+                        reasoning_effort,
+                        openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                    )?
+                }
+                None => kit::Runtime::new_with_provider_credentials_effort_and_openrouter_key(
                     &root,
                     model,
                     provider,
-                    kit::runtime::SessionRequest { id, resume, force },
                     credential_storage.clone(),
                     reasoning_effort,
-                )?,
-                None => kit::Runtime::new_with_provider_credentials_and_effort(
-                    &root,
-                    model,
-                    provider,
-                    credential_storage.clone(),
-                    reasoning_effort,
+                    openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_skills(
@@ -831,18 +895,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
-            let runtime = kit::Runtime::with_session_provider_credentials_and_effort(
-                &root,
-                model,
-                provider,
-                kit::runtime::SessionRequest {
-                    id: session_id.clone(),
-                    resume: resume.is_some(),
-                    force,
-                },
-                credential_storage.clone(),
-                reasoning_effort,
-            )?;
+            let runtime =
+                kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+                    &root,
+                    model,
+                    provider,
+                    kit::runtime::SessionRequest {
+                        id: session_id.clone(),
+                        resume: resume.is_some(),
+                        force,
+                    },
+                    credential_storage.clone(),
+                    reasoning_effort,
+                    openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                )?;
             let runtime = kit::Runtime::with_plugin_skills(
                 runtime,
                 plugins.package_roots,
@@ -883,7 +949,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             config.resolve_plugins(&root).await?;
-            kit::tui::run_with_reasoning_effort(
+            kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
                 &model,
                 provider,
@@ -892,6 +958,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mcp.config_path(&config),
                 &credential_storage,
                 &telemetry_settings,
+                openrouter_api_key.as_ref().map(|(key, _)| key),
                 resume.as_deref(),
                 force,
             )
@@ -911,7 +978,7 @@ mod tests {
     use super::{
         AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
         OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, init_config,
-        supervise_serve_with_trigger, validate_auth_storage,
+        resolve_openrouter_api_key, supervise_serve_with_trigger, validate_auth_storage,
     };
 
     #[test]
@@ -1301,6 +1368,50 @@ future_option = true
     }
 
     #[test]
+    fn openrouter_key_is_global_redacted_and_uses_cli_then_environment_precedence() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "prompt",
+            "hello",
+            "--openrouter-api-key",
+            "flag-secret",
+        ])
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", cli.openrouter.openrouter_api_key),
+            "Some(OpenRouterApiKey([REDACTED]))"
+        );
+        let (key, source) = resolve_openrouter_api_key(cli.openrouter.openrouter_api_key, |_| {
+            Some("environment-secret".into())
+        })
+        .unwrap();
+        assert_eq!(key.as_str(), "flag-secret");
+        assert_eq!(source, kit::provider::OpenRouterApiKeySource::Flag);
+
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "hello", "--openrouter-api-key", "",]).is_err()
+        );
+        assert!(resolve_openrouter_api_key(None, |_| Some(String::new())).is_none());
+
+        for command in ["serve", "acp", "tui"] {
+            assert!(
+                Cli::try_parse_from(["kit", command, "--openrouter-api-key", "secret"]).is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "auth",
+                "status",
+                "openrouter",
+                "--openrouter-api-key",
+                "secret",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn init_writes_recommended_global_config() {
         let home = tempfile::tempdir().unwrap();
         let path = init_config(home.path()).unwrap();
@@ -1349,7 +1460,9 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "auth", "status", "speakeasy"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "speakeasy"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "openai", "--local-only"]).is_ok());
-        assert!(Cli::try_parse_from(["kit", "auth", "login", "openrouter"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "auth", "login", "openrouter"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "status", "openrouter"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "openrouter"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "--local-only"]).is_err());
         assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err());
@@ -1357,7 +1470,11 @@ future_option = true
 
     #[test]
     fn standalone_provider_login_rejects_memory_storage() {
-        for provider in [AuthProvider::Openai, AuthProvider::Speakeasy] {
+        for provider in [
+            AuthProvider::Openai,
+            AuthProvider::Openrouter,
+            AuthProvider::Speakeasy,
+        ] {
             let login = AuthAction::Login { provider };
             assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
             assert!(validate_auth_storage(&login, &CredentialStorage::Keychain).is_ok());

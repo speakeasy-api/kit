@@ -2,12 +2,62 @@ mod adapter;
 pub mod chatgpt;
 mod credentials;
 mod openai_auth;
+mod openrouter_auth;
 mod speakeasy_auth;
 
 pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,
 };
+
+/// An OpenRouter API key that is redacted in diagnostics and zeroized on drop.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct OpenRouterApiKey(String);
+
+impl OpenRouterApiKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn non_empty(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then(|| Self::new(value))
+    }
+}
+
+impl std::str::FromStr for OpenRouterApiKey {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::non_empty(value.to_owned()).ok_or("OpenRouter API key cannot be empty")
+    }
+}
+
+impl std::fmt::Debug for OpenRouterApiKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OpenRouterApiKey([REDACTED])")
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenRouterApiKeySource {
+    Flag,
+    Environment,
+}
+
+impl OpenRouterApiKeySource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Flag => "--openrouter-api-key",
+            Self::Environment => "OPENROUTER_API_KEY",
+        }
+    }
+}
 pub use chatgpt::{
     OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
     SubscriptionConfig,
@@ -40,6 +90,46 @@ pub fn execute_openai_auth(
     openai_auth::execute(command, storage, openai_auth::OutputFormat::Human, timeout)
         .map(|output| output.stdout)
         .map_err(|error| error.to_string())
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenRouterAuthCommand {
+    Login,
+    Status,
+    Logout { local_only: bool },
+}
+
+#[doc(hidden)]
+pub fn execute_openrouter_auth(
+    command: OpenRouterAuthCommand,
+    storage: &crate::credentials::CredentialStorage,
+    active_key: Option<(&OpenRouterApiKey, OpenRouterApiKeySource)>,
+) -> Result<String, String> {
+    let command = match command {
+        OpenRouterAuthCommand::Login => openrouter_auth::AuthCommand::Login,
+        OpenRouterAuthCommand::Status => openrouter_auth::AuthCommand::Status,
+        OpenRouterAuthCommand::Logout { local_only } => {
+            openrouter_auth::AuthCommand::Logout { local_only }
+        }
+    };
+    let timeout = match command {
+        openrouter_auth::AuthCommand::Login => std::time::Duration::from_secs(300),
+        openrouter_auth::AuthCommand::Status | openrouter_auth::AuthCommand::Logout { .. } => {
+            std::time::Duration::from_secs(30)
+        }
+    };
+    openrouter_auth::execute(
+        command,
+        storage,
+        active_key.map(|(_, source)| source),
+        timeout,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn store_openrouter_test_credentials(storage: &crate::credentials::CredentialStorage) {
+    openrouter_auth::store_test_credentials(storage);
 }
 
 #[doc(hidden)]

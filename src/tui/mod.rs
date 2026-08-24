@@ -226,6 +226,37 @@ pub async fn run_with_reasoning_effort(
     resume: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_reasoning_effort_and_openrouter_key(
+        root,
+        model,
+        provider,
+        reasoning_effort,
+        a2a,
+        mcp_config,
+        credential_storage,
+        telemetry,
+        None,
+        resume,
+        force,
+    )
+    .await
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reasoning_effort_and_openrouter_key(
+    root: &Path,
+    model: &str,
+    provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
+    credential_storage: &CredentialStorage,
+    telemetry: &crate::telemetry::Settings,
+    openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    resume: Option<&str>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
     // the same path the agent accepts.
@@ -241,6 +272,7 @@ pub async fn run_with_reasoning_effort(
         model,
         provider,
         reasoning_effort,
+        openrouter_api_key,
         &persisted_session_id,
         resume.is_some(),
     )?;
