@@ -80,6 +80,28 @@ const FAILURE_LINES: usize = 5;
 /// transcript it owns is closed out before the agent is killed.
 const SETTLE: Duration = Duration::from_secs(3);
 
+#[cfg(unix)]
+fn detach_from_controlling_terminal(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // The ACP backend is headless. A new session prevents it or any nested
+    // agent/tool from opening the TUI's controlling terminal via /dev/tty.
+    // SAFETY: `setsid` is async-signal-safe, and this closure only reports its
+    // errno if it fails.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach_from_controlling_terminal(_command: &mut tokio::process::Command) {}
+
 fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<ModelChoice> {
     let current = options
         .unwrap_or_default()
@@ -238,6 +260,7 @@ pub async fn run_with_reasoning_effort(
     if force {
         command.arg("--force");
     }
+    detach_from_controlling_terminal(&mut command);
     let mut child = command
         .env(EVENTS_ENV, "1")
         .stdin(Stdio::piped())
@@ -1180,10 +1203,26 @@ mod tests {
 
     use super::{
         MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
-        durable_session_id, effort_state, handle, message_of, osc52, prompt_blocks, readable,
-        refresh_config_state, save_effort_default_to, save_model_defaults_to, translate,
+        detach_from_controlling_terminal, durable_session_id, effort_state, handle, message_of,
+        osc52, prompt_blocks, readable, refresh_config_state, save_effort_default_to,
+        save_model_defaults_to, translate,
     };
     use crate::tui::app::{App, SubmittedPrompt, Update};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_backend_starts_in_a_detached_session() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        detach_from_controlling_terminal(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        let pid = i32::try_from(child.id().unwrap()).unwrap();
+        // SAFETY: `pid` belongs to the live child above.
+        assert_eq!(unsafe { libc::getsid(pid) }, pid);
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
 
     #[test]
     fn translates_available_commands_with_their_session() {
