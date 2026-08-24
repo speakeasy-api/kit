@@ -126,14 +126,16 @@ kit prompt --root /path/to/project \
 
 ### ACP and A2A server commands
 
-Use `kit serve` for ACP on stdio plus A2A over HTTP:
+Use `kit serve` for ACP on stdio plus a selectable HTTP protocol surface:
 
 ```sh
-kit serve --root /path/to/project
-kit serve --root /path/to/project --a2a 127.0.0.1:7331
+kit serve --root /path/to/project                         # A2A
+kit serve --root /path/to/project --remote-acp            # A2A and remote ACP
+kit serve --root /path/to/project --remote-acp --no-a2a   # remote ACP only
+kit serve --root /path/to/project --http 127.0.0.1:7331
 ```
 
-Without `--a2a`, `serve` binds an available loopback port and writes `A2A listening on ...` to stderr. Stdout remains reserved for ACP. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener:
+Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP is available at `/acp` over HTTP/SSE or WebSocket. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener:
 
 ```sh
 kit acp --root /path/to/project

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use agent_client_protocol::{Client, ConnectionTo, Handled};
+use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
     AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
@@ -676,14 +676,34 @@ pub async fn serve(runtime: Arc<Runtime>) -> Result<(), AcpRuntimeError> {
 
 async fn serve_transport(
     runtime: Arc<Runtime>,
-    transport: impl agent_client_protocol::ConnectTo<agent_client_protocol::Agent> + 'static,
+    transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
 ) -> Result<(), AcpRuntimeError> {
+    component(runtime)?
+        .connect_to(transport)
+        .await
+        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+}
+
+pub(crate) fn http_router(runtime: Arc<Runtime>) -> axum::Router {
+    agent_client_protocol_http::AcpHttpServer::new(move || {
+        component(Arc::clone(&runtime)).expect("Kit's fixed ACP integration must build")
+    })
+    .with_options(agent_client_protocol_http::ServerOptions {
+        health_endpoint: false,
+        ..Default::default()
+    })
+    .into_router()
+}
+
+fn component(
+    runtime: Arc<Runtime>,
+) -> Result<impl ConnectTo<agent_client_protocol::Client>, AcpRuntimeError> {
     let integration = AcpIntegration::builder()
         .name("kit")
         .approval_resolver(AutoDenyResolver)
         .build()?;
     let state = Arc::new(Server::new(runtime, integration));
-    agent_client_protocol::Agent
+    Ok(agent_client_protocol::Agent
         .builder()
         .name("kit")
         .on_receive_request(
@@ -783,10 +803,7 @@ async fn serve_transport(
                 }
             },
             agent_client_protocol::on_receive_request!(),
-        )
-        .connect_to(transport)
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+        ))
 }
 
 fn capabilities() -> agentkit_acp::AgentCapabilities {

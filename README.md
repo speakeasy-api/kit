@@ -75,18 +75,21 @@ cargo run -- prompt --root /path/to/project "Reply with a short project summary"
 The command prints the model response followed by `session_id: ...` and exits.
 Pass that id to `prompt --resume <session-id>` or `tui --resume <session-id>`.
 
-Run the combined headless ACP/A2A server, or the dedicated stdio-only ACP server:
+Run ACP on stdio with an optional A2A and remote ACP HTTP listener, or use the dedicated stdio-only command:
 
 ```sh
-cargo run -- serve --root /path/to/project
-cargo run -- acp --root /path/to/project
+cargo run -- serve --root /path/to/project                         # A2A HTTP
+cargo run -- serve --root /path/to/project --remote-acp            # A2A + ACP HTTP
+cargo run -- serve --root /path/to/project --remote-acp --no-a2a   # ACP HTTP only
+cargo run -- acp --root /path/to/project                           # no HTTP listener
 ```
 
 Both commands reserve stdout for ACP and send diagnostics to stderr. `serve`
-also chooses an available loopback port for A2A and reports it on stderr; pass
-`--a2a 127.0.0.1:7331` to request a specific address. `acp` never starts an
-HTTP listener. A2A discovery is available from the combined server's Agent Card
-endpoint.
+chooses an available loopback port by default; pass `--a2a 127.0.0.1:7331`
+(or its visible alias `--http`) to request a specific address. Remote ACP uses
+HTTP/SSE or WebSocket at `/acp`, while A2A discovery uses the Agent Card
+endpoint. Add `--server-credential-file /private/token` to require that file's
+single bearer token on every HTTP request. `acp` never starts an HTTP listener.
 
 Inspect or remove the credential with `kit auth status openai` and
 `kit auth logout openai`. Logout revokes the refresh token before deleting the
@@ -174,7 +177,7 @@ args = ["acp"]
 harness = "acp.review"
 ```
 
-`root`, `provider`, `model`, and `reasoning_effort` apply to runtime commands. Credential settings also apply to authentication commands. `--reasoning-effort low|medium|high` overrides TOML; `--reasoning-effort default` removes Kit's explicit selection and preserves provider defaults (including `OPENROUTER_REASONING_EFFORT`). `a2a` applies to
+`root`, `provider`, `model`, and `reasoning_effort` apply to runtime commands. Credential settings also apply to authentication commands. `--reasoning-effort low|medium|high` overrides TOML; `--reasoning-effort default` removes Kit's explicit selection and preserves provider defaults (including `OPENROUTER_REASONING_EFFORT`). `a2a` supplies the shared HTTP listen address for
 `serve` and `tui`. `otel_endpoint` enables OTLP/gRPC trace export for AgentKit's
 GenAI spans. Use a collector endpoint such as `http://localhost:4317` without a
 `/v1/traces` suffix. The endpoint can also be set with `--otel-endpoint` or

@@ -370,7 +370,7 @@ enum Command {
         #[command(flatten)]
         credentials: CredentialArgs,
     },
-    /// Serve the Agent Client Protocol on stdio and A2A over HTTP.
+    /// Serve ACP on stdio with A2A, remote ACP, or both over HTTP.
     Serve {
         /// Runtime root (defaults to config or `.`).
         #[arg(long)]
@@ -384,9 +384,18 @@ enum Command {
         /// Reasoning effort (defaults to config or provider default).
         #[arg(long, value_enum)]
         reasoning_effort: Option<ReasoningEffortArg>,
-        /// A2A listen address. An available loopback port is selected when omitted.
-        #[arg(long)]
+        /// HTTP listen address. An available loopback port is selected when omitted.
+        #[arg(long, visible_alias = "http")]
         a2a: Option<String>,
+        /// Expose ACP over HTTP/SSE and WebSocket at `/acp`.
+        #[arg(long)]
+        remote_acp: bool,
+        /// Do not expose A2A on the HTTP listener.
+        #[arg(long, requires = "remote_acp")]
+        no_a2a: bool,
+        /// Require this file's bearer token on every HTTP request.
+        #[arg(long, value_name = "PATH")]
+        server_credential_file: Option<PathBuf>,
         #[command(flatten)]
         mcp: McpArgs,
         /// Persistent session id selected by the hosting client.
@@ -597,6 +606,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider,
             reasoning_effort,
             a2a,
+            remote_acp,
+            no_a2a,
+            server_credential_file,
             mcp,
             session_id,
             resume,
@@ -643,8 +655,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
             let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
-            let bound = kit::protocols::a2a::start(runtime.clone(), address).await?;
-            eprintln!("A2A listening on {bound}");
+            let serve_a2a = !no_a2a;
+            let bound = kit::protocols::http::start(
+                runtime.clone(),
+                address,
+                serve_a2a,
+                remote_acp,
+                server_credential_file.as_deref(),
+            )
+            .await?;
+            if serve_a2a {
+                eprintln!("A2A listening on {bound}");
+            }
+            if remote_acp {
+                eprintln!("ACP listening on http://{bound}/acp");
+            }
             kit::protocols::acp::serve(runtime).await?;
         }
         Command::Acp {
@@ -1250,7 +1275,7 @@ future_option = true
     }
 
     #[test]
-    fn dedicated_acp_command_exists_and_serve_has_no_no_a2a_escape_hatch() {
+    fn serve_selects_remote_protocols_without_changing_stdio_acp() {
         assert!(
             Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "openrouter",]).is_ok()
         );
@@ -1267,6 +1292,12 @@ future_option = true
         );
         assert!(Cli::try_parse_from(["kit", "acp", "--reasoning-effort", "extreme"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "serve", "--remote-acp"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "serve", "--remote-acp", "--no-a2a"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "serve", "--http", "127.0.0.1:0"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kit", "serve", "--server-credential-file", "token.txt",]).is_ok()
+        );
     }
 
     #[test]

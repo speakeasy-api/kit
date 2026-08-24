@@ -19,11 +19,12 @@ Kit has no general permissions or interactive approval framework for its own too
 
 `kit serve` always starts ACP on stdio and an HTTP listener. A2A is enabled by default; `--remote-acp` adds ACP at `/acp`, and `--no-a2a --remote-acp` exposes only remote ACP. When no address is configured, Kit binds an available loopback address (`127.0.0.1:0`). Use `kit acp` when no HTTP listener is wanted.
 
-The A2A server advertises no `security_schemes` or `security_requirements` and performs no authentication or authorization in Kit. Every client that can reach the listener can submit text that runs a fresh Kit agent with the configured root and tools. Consequently:
+Without `--server-credential-file`, the HTTP listener performs no authentication or authorization, and the A2A Agent Card advertises no security requirements. Every client that can reach the listener can submit work to a Kit agent with the configured root and tools. When a credential file is configured, it must contain one non-empty bearer token, optionally followed by one newline; Kit requires that token on every A2A and remote ACP request and advertises Bearer security in the Agent Card. Consequently:
 
 - Keep the default loopback binding unless remote access is deliberately required.
 - Binding `0.0.0.0`, a LAN address, or another non-loopback interface exposes a coding agent, not just a read-only status endpoint. Put external authentication and network controls in front of it if exposure is intentional.
 - A fixed port can fail because it is already in use. An omitted port avoids selecting a fixed number, but it does not add authentication.
+- Protect the credential file from other users and rotate the token if it is exposed. Kit reads the token when the listener starts; restart `kit serve` after changing it.
 
 The `a2a` tool is an outbound client. It sends the supplied prompt as plain A2A text to the supplied URL and returns the remote task or message. Kit does not add credentials, restrict destinations, or impose a request timeout. Do not send repository secrets, credentials, private code, or untrusted instructions to an A2A URL merely because another agent supplied it. Interrupting the turn cancels Kit's wait, but cannot retract a prompt already delivered or undo remote side effects.
 

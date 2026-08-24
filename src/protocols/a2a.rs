@@ -1,13 +1,14 @@
-use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use a2a_protocol_server::{
-    AgentExecutor, Dispatcher, EventEmitter, JsonRpcDispatcher, RequestHandlerBuilder,
+    AgentExecutor, EventEmitter, JsonRpcDispatcher, RequestHandlerBuilder,
     request_context::RequestContext, streaming::EventQueueWriter,
 };
 use a2a_protocol_types::{
     agent_card::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill},
     error::A2aResult,
     message::Part,
+    security::{HttpAuthSecurityScheme, SecurityRequirement, SecurityScheme, StringList},
     task::TaskState,
 };
 
@@ -100,16 +101,30 @@ fn a2a_session_id(context: &RequestContext) -> String {
     format!("a2a-{encoded}")
 }
 
-pub async fn start(
+pub(crate) fn dispatcher(
     runtime: Arc<Runtime>,
-    address: String,
-) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
-    // Bind exactly once and keep this listener for the server. Selecting an
-    // ephemeral port with one listener and rebinding it with another creates a
-    // TOCTOU window in which another process can claim the advertised port.
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    let bound = listener.local_addr()?;
+    bound: std::net::SocketAddr,
+    authenticated: bool,
+) -> Result<JsonRpcDispatcher, Box<dyn std::error::Error>> {
     let url = format!("http://{bound}");
+    let (security_schemes, security_requirements) = if authenticated {
+        let name = "bearer".to_string();
+        (
+            Some(HashMap::from([(
+                name.clone(),
+                SecurityScheme::Http(HttpAuthSecurityScheme {
+                    scheme: "bearer".into(),
+                    bearer_format: None,
+                    description: Some("Bearer token loaded by the Kit server".into()),
+                }),
+            )])),
+            Some(vec![SecurityRequirement {
+                schemes: HashMap::from([(name, StringList { list: Vec::new() })]),
+            }]),
+        )
+    } else {
+        (None, None)
+    };
     let card = AgentCard {
         url: None,
         name: "Kit".into(),
@@ -137,8 +152,8 @@ pub async fn start(
         provider: None,
         icon_url: None,
         documentation_url: None,
-        security_schemes: None,
-        security_requirements: None,
+        security_schemes,
+        security_requirements,
         signatures: None,
     };
     let handler = Arc::new(
@@ -146,58 +161,5 @@ pub async fn start(
             .with_agent_card(card)
             .build()?,
     );
-    serve_bound(listener, JsonRpcDispatcher::new(handler)).await
-}
-
-async fn serve_bound(
-    listener: tokio::net::TcpListener,
-    dispatcher: impl Dispatcher,
-) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
-    let bound = listener.local_addr()?;
-    let dispatcher = Arc::new(dispatcher);
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(connection) => connection,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            let _ = stream.set_nodelay(true);
-            let dispatcher = Arc::clone(&dispatcher);
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |request| {
-                    let dispatcher = Arc::clone(&dispatcher);
-                    async move { Ok::<_, Infallible>(dispatcher.dispatch(request).await) }
-                });
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection(io, service)
-                .await;
-            });
-        }
-    });
-    Ok(bound)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::start;
-
-    #[tokio::test]
-    async fn port_zero_allocates_a_real_port() {
-        let directory = tempfile::tempdir().unwrap();
-        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
-        let bound = start(runtime, "127.0.0.1:0".into()).await.unwrap();
-        assert_eq!(bound.ip(), std::net::Ipv4Addr::LOCALHOST);
-        assert_ne!(bound.port(), 0);
-        let rebound = tokio::net::TcpListener::bind(bound).await;
-        assert!(
-            matches!(rebound, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse),
-            "the server must retain the listener that selected the ephemeral port"
-        );
-    }
+    Ok(JsonRpcDispatcher::new(handler))
 }
