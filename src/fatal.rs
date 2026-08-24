@@ -112,8 +112,18 @@ fn provider_code(message: &str) -> &'static str {
         "stream_closed"
     } else if message.contains("unauthorized") || message.contains("authentication failed") {
         "authentication"
-    } else if message.contains("after ") && message.contains("attempts") {
+    } else if message.contains("retry budget")
+        || (message.contains("after ") && message.contains("attempts"))
+    {
         "retry_exhausted"
+    } else if message.contains("transient response failed:") {
+        "response_transient"
+    } else if message.contains("response failed:") {
+        "response_failed"
+    } else if message.contains("protocol error:") {
+        "protocol_error"
+    } else if message.contains("auth worker failed") {
+        "credential_error"
     } else if message.contains("HTTP") || message.contains("returned") {
         "http_error"
     } else {
@@ -369,6 +379,39 @@ mod tests {
         assert_eq!(code, "stream_transport");
         assert!(message.contains("timeout=true"));
         assert!(message.contains("body=true"));
+    }
+
+    #[test]
+    fn provider_records_keep_safe_failure_categories() {
+        for (error, expected_code) in [
+            (
+                "openai-subscription transient response failed: error/server_error",
+                "response_transient",
+            ),
+            (
+                "openai-subscription response failed: invalid_request_error/secret_code",
+                "response_failed",
+            ),
+            (
+                "openai-subscription protocol error: secret response at https://example.invalid",
+                "protocol_error",
+            ),
+            (
+                "openai-subscription response exceeded retry budget",
+                "retry_exhausted",
+            ),
+            ("openai-subscription auth worker failed", "credential_error"),
+        ] {
+            let (_, code, message) =
+                classify(&LoopError::Provider(error.to_owned())).expect("provider error");
+            assert_eq!(code, expected_code);
+            assert_eq!(
+                message,
+                format!("openai-subscription failed ({expected_code})")
+            );
+            assert!(!message.contains("secret"));
+            assert!(!message.contains("example.invalid"));
+        }
     }
 
     #[test]
