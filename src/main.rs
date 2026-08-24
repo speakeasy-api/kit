@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -393,6 +394,9 @@ enum Command {
         /// Do not expose A2A on the HTTP listener.
         #[arg(long, requires = "remote_acp")]
         no_a2a: bool,
+        /// Do not serve ACP on stdio. Requires remote ACP over HTTP.
+        #[arg(long, requires = "remote_acp")]
+        no_stdio: bool,
         /// Require this file's bearer token on every HTTP request.
         #[arg(long, value_name = "PATH")]
         server_credential_file: Option<PathBuf>,
@@ -569,6 +573,87 @@ async fn execute_auth(action: &AuthAction, storage: CredentialStorage) -> Result
     Ok(())
 }
 
+async fn termination_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+async fn supervise_serve(
+    runtime: std::sync::Arc<kit::Runtime>,
+    sessions: kit::protocols::acp::SessionRegistry,
+    no_stdio: bool,
+    http: kit::protocols::http::HttpServer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    supervise_serve_with_trigger(runtime, sessions, no_stdio, http, termination_signal()).await
+}
+
+async fn supervise_serve_with_trigger(
+    runtime: std::sync::Arc<kit::Runtime>,
+    sessions: kit::protocols::acp::SessionRegistry,
+    no_stdio: bool,
+    mut http: kit::protocols::http::HttpServer,
+    termination: impl Future<Output = io::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enum Exit {
+        Stdio(Result<(), agentkit_acp::AcpRuntimeError>),
+        Http(io::Result<()>),
+        Signal(io::Result<()>),
+    }
+
+    let exit = {
+        let stdio_sessions = sessions.clone();
+        let stdio = async move {
+            if no_stdio {
+                std::future::pending::<Result<(), agentkit_acp::AcpRuntimeError>>().await
+            } else {
+                kit::protocols::acp::serve_with_registry(runtime, stdio_sessions).await
+            }
+        };
+        tokio::pin!(stdio);
+        tokio::pin!(termination);
+        tokio::select! {
+            result = &mut stdio => Exit::Stdio(result),
+            result = http.join() => Exit::Http(result),
+            result = &mut termination => Exit::Signal(result),
+        }
+    };
+
+    match exit {
+        Exit::Http(result) => {
+            sessions.shutdown().await;
+            result?;
+            Err(io::Error::other("HTTP server stopped unexpectedly").into())
+        }
+        Exit::Stdio(result) => {
+            http.stop_accepting().await;
+            sessions.shutdown().await;
+            http.shutdown_connections();
+            http.join().await?;
+            result?;
+            Ok(())
+        }
+        Exit::Signal(result) => {
+            http.stop_accepting().await;
+            sessions.shutdown().await;
+            http.shutdown_connections();
+            http.join().await?;
+            result?;
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -608,6 +693,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             a2a,
             remote_acp,
             no_a2a,
+            no_stdio,
             server_credential_file,
             mcp,
             session_id,
@@ -656,21 +742,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
             let serve_a2a = !no_a2a;
-            let bound = kit::protocols::http::start(
+            let sessions = kit::protocols::acp::SessionRegistry::new();
+            let http = kit::protocols::http::start_with_registry(
                 runtime.clone(),
                 address,
                 serve_a2a,
                 remote_acp,
                 server_credential_file.as_deref(),
+                sessions.clone(),
             )
             .await?;
+            let bound = http.address();
             if serve_a2a {
                 eprintln!("A2A listening on {bound}");
             }
             if remote_acp {
                 eprintln!("ACP listening on http://{bound}/acp");
             }
-            kit::protocols::acp::serve(runtime).await?;
+            supervise_serve(runtime, sessions, no_stdio, http).await?;
         }
         Command::Acp {
             root,
@@ -814,14 +903,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 
     use clap::Parser as _;
     use kit::tools::CredentialStorage;
 
     use super::{
         AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
-        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, init_config, validate_auth_storage,
+        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, init_config,
+        supervise_serve_with_trigger, validate_auth_storage,
     };
 
     #[test]
@@ -1292,12 +1382,56 @@ future_option = true
         );
         assert!(Cli::try_parse_from(["kit", "acp", "--reasoning-effort", "extreme"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "serve", "--no-stdio"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--remote-acp"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "serve", "--remote-acp", "--no-a2a"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "serve",
+                "--remote-acp",
+                "--no-a2a",
+                "--no-stdio",
+                "--http",
+                "0.0.0.0:8081",
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["kit", "serve", "--http", "127.0.0.1:0"]).is_ok());
         assert!(
             Cli::try_parse_from(["kit", "serve", "--server-credential-file", "token.txt",]).is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn injected_shutdown_stops_no_stdio_supervisor() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let sessions = kit::protocols::acp::SessionRegistry::new();
+        let http = kit::protocols::http::start_with_registry(
+            Arc::clone(&runtime),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        let (trigger, triggered) = tokio::sync::oneshot::channel();
+        trigger.send(()).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise_serve_with_trigger(runtime, sessions, true, http, async move {
+                triggered
+                    .await
+                    .map_err(|_| io::Error::other("test shutdown trigger dropped"))
+            }),
+        )
+        .await
+        .expect("supervisor shutdown timed out")
+        .unwrap();
     }
 
     #[test]

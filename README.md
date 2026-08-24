@@ -81,6 +81,7 @@ Run ACP on stdio with an optional A2A and remote ACP HTTP listener, or use the d
 cargo run -- serve --root /path/to/project                         # A2A HTTP
 cargo run -- serve --root /path/to/project --remote-acp            # A2A + ACP HTTP
 cargo run -- serve --root /path/to/project --remote-acp --no-a2a   # ACP HTTP only
+cargo run -- serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 # ACP daemon
 cargo run -- acp --root /path/to/project                           # no HTTP listener
 ```
 
@@ -89,7 +90,11 @@ chooses an available loopback port by default; pass `--a2a 127.0.0.1:7331`
 (or its visible alias `--http`) to request a specific address. Remote ACP uses
 HTTP/SSE or WebSocket at `/acp`, while A2A discovery uses the Agent Card
 endpoint. Add `--server-credential-file /private/token` to require that file's
-single bearer token on every HTTP request. `acp` never starts an HTTP listener.
+single bearer token on every HTTP request. `--no-stdio` requires `--remote-acp` and keeps
+`serve` running independently of stdin. SIGINT and SIGTERM stop new connections, interrupt
+active ACP sessions, and drain them for up to about five seconds before aborting stragglers.
+`acp` never starts an HTTP listener. Never expose a non-loopback daemon without authentication
+and appropriate network controls.
 
 Inspect or remove the credential with `kit auth status openai` and
 `kit auth logout openai`. Logout revokes the refresh token before deleting the

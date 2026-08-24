@@ -133,9 +133,12 @@ kit serve --root /path/to/project                         # A2A
 kit serve --root /path/to/project --remote-acp            # A2A and remote ACP
 kit serve --root /path/to/project --remote-acp --no-a2a   # remote ACP only
 kit serve --root /path/to/project --http 127.0.0.1:7331
+kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 # daemon
 ```
 
-Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP is available at `/acp` over HTTP/SSE or WebSocket. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener:
+Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP is available at `/acp` over HTTP/SSE or WebSocket. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
+
+Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. A non-loopback daemon must not be exposed without authentication and suitable network controls. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener:
 
 ```sh
 kit acp --root /path/to/project

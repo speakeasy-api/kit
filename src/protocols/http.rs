@@ -1,5 +1,8 @@
 use std::{convert::Infallible, io, path::Path, sync::Arc, time::Duration};
 
+use tokio::{task::JoinSet, time::timeout};
+use tokio_util::sync::CancellationToken;
+
 use axum::{
     Router,
     body::Body,
@@ -58,13 +61,77 @@ impl BearerToken {
     }
 }
 
+pub struct HttpServer {
+    address: std::net::SocketAddr,
+    stop_accepting: CancellationToken,
+    accepts_stopped: CancellationToken,
+    shutdown_connections: CancellationToken,
+    task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+}
+
+impl HttpServer {
+    pub fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    pub async fn stop_accepting(&self) {
+        self.stop_accepting.cancel();
+        self.accepts_stopped.cancelled().await;
+    }
+
+    pub fn shutdown_connections(&self) {
+        self.shutdown_connections.cancel();
+    }
+
+    pub fn shutdown(&self) {
+        self.stop_accepting.cancel();
+        self.shutdown_connections();
+    }
+
+    pub async fn join(&mut self) -> io::Result<()> {
+        let result = self
+            .task
+            .as_mut()
+            .ok_or_else(|| io::Error::other("HTTP server has already been joined"))?
+            .await;
+        self.task.take();
+        result.map_err(|error| io::Error::other(format!("HTTP server task failed: {error}")))?
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        self.stop_accepting.cancel();
+        self.shutdown_connections.cancel();
+    }
+}
+
 pub async fn start(
     runtime: Arc<Runtime>,
     address: String,
     serve_a2a: bool,
     serve_remote_acp: bool,
     credential_file: Option<&Path>,
-) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+) -> Result<HttpServer, Box<dyn std::error::Error>> {
+    start_with_registry(
+        runtime,
+        address,
+        serve_a2a,
+        serve_remote_acp,
+        credential_file,
+        crate::protocols::acp::SessionRegistry::new(),
+    )
+    .await
+}
+
+pub async fn start_with_registry(
+    runtime: Arc<Runtime>,
+    address: String,
+    serve_a2a: bool,
+    serve_remote_acp: bool,
+    credential_file: Option<&Path>,
+    sessions: crate::protocols::acp::SessionRegistry,
+) -> Result<HttpServer, Box<dyn std::error::Error>> {
     if !serve_a2a && !serve_remote_acp {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -80,43 +147,120 @@ pub async fn start(
         .then(|| crate::protocols::a2a::dispatcher(runtime.clone(), bound, credential.is_some()))
         .transpose()?
         .map(Arc::new);
-    let acp = serve_remote_acp.then(|| crate::protocols::acp::http_router(runtime));
-    serve_bound(listener, a2a, acp, credential);
-    Ok(bound)
+    let acp = serve_remote_acp.then(|| crate::protocols::acp::http_router(runtime, sessions));
+    let stop_accepting = CancellationToken::new();
+    let accepts_stopped = CancellationToken::new();
+    let shutdown_connections = CancellationToken::new();
+    let task = tokio::spawn(serve_bound(
+        listener,
+        a2a,
+        acp,
+        credential,
+        stop_accepting.clone(),
+        accepts_stopped.clone(),
+        shutdown_connections.clone(),
+    ));
+    Ok(HttpServer {
+        address: bound,
+        stop_accepting,
+        accepts_stopped,
+        shutdown_connections,
+        task: Some(task),
+    })
 }
 
-fn serve_bound(
+async fn serve_bound(
     listener: tokio::net::TcpListener,
     a2a: Option<Arc<a2a_protocol_server::JsonRpcDispatcher>>,
     acp: Option<Router>,
     credential: Option<BearerToken>,
-) {
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(connection) => connection,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            let _ = stream.set_nodelay(true);
-            let a2a = a2a.clone();
-            let acp = acp.clone();
-            let credential = credential.clone();
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |request| {
-                    dispatch(request, a2a.clone(), acp.clone(), credential.clone())
-                });
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection_with_upgrades(io, service)
-                .await;
-            });
+    stop_accepting: CancellationToken,
+    accepts_stopped: CancellationToken,
+    shutdown_connections: CancellationToken,
+) -> io::Result<()> {
+    struct SignalOnDrop(CancellationToken);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
         }
-    });
+    }
+
+    let accepts_stopped = SignalOnDrop(accepts_stopped);
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop_accepting.cancelled() => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                report_connection(completed.expect("non-empty connection set"));
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
+                    let a2a = a2a.clone();
+                    let acp = acp.clone();
+                    let credential = credential.clone();
+                    connections.spawn(async move {
+                        let service = hyper::service::service_fn(move |request| {
+                            dispatch(request, a2a.clone(), acp.clone(), credential.clone())
+                        });
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                    });
+                }
+                Err(error) => {
+                    eprintln!("HTTP accept failed: {error}");
+                    tokio::select! {
+                        biased;
+                        _ = stop_accepting.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+            }
+        }
+    }
+    drop(listener);
+    drop(accepts_stopped);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_connections.cancelled() => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                report_connection(completed.expect("non-empty connection set"));
+            }
+        }
+    }
+
+    if timeout(Duration::from_secs(1), drain_connections(&mut connections))
+        .await
+        .is_err()
+    {
+        connections.abort_all();
+        while let Some(result) = connections.join_next().await {
+            report_connection(result);
+        }
+    }
+    Ok(())
+}
+
+async fn drain_connections(connections: &mut JoinSet<()>) {
+    while let Some(result) = connections.join_next().await {
+        report_connection(result);
+    }
+}
+
+fn report_connection(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && !error.is_cancelled()
+    {
+        eprintln!("HTTP connection task failed: {error}");
+    }
 }
 
 async fn dispatch(
@@ -203,9 +347,10 @@ mod tests {
         let credential = directory.path().join("token");
         std::fs::write(&credential, "secret-token").unwrap();
         let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
-        let bound = start(runtime, "127.0.0.1:0".into(), true, true, Some(&credential))
+        let mut server = start(runtime, "127.0.0.1:0".into(), true, true, Some(&credential))
             .await
             .unwrap();
+        let bound = server.address();
         assert_ne!(bound.port(), 0);
         assert!(tokio::net::TcpListener::bind(bound).await.is_err());
 
@@ -272,5 +417,46 @@ mod tests {
             handshake.starts_with("HTTP/1.1 101"),
             "unexpected WebSocket handshake: {handshake}"
         );
+        drop(websocket);
+        server.shutdown();
+        server.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_task_panic_is_isolated() {
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async { panic!("connection test panic") });
+        super::report_connection(connections.join_next().await.unwrap());
+
+        connections.spawn(async {});
+        connections.join_next().await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_listener_for_rebind() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let mut server = start(runtime, "127.0.0.1:0".into(), true, false, None)
+            .await
+            .unwrap();
+        let bound = server.address();
+
+        server.shutdown();
+        server.join().await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let rebound = loop {
+            match tokio::net::TcpListener::bind(bound).await {
+                Ok(listener) => break listener,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AddrInUse
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("could not rebind {bound} after shutdown: {error}"),
+            }
+        };
+        drop(rebound);
     }
 }

@@ -17,12 +17,12 @@ Kit has no general permissions or interactive approval framework for its own too
 
 ## A2A network exposure and remote-agent trust
 
-`kit serve` always starts ACP on stdio and an HTTP listener. A2A is enabled by default; `--remote-acp` adds ACP at `/acp`, and `--no-a2a --remote-acp` exposes only remote ACP. When no address is configured, Kit binds an available loopback address (`127.0.0.1:0`). Use `kit acp` when no HTTP listener is wanted.
+`kit serve` starts an HTTP listener and serves ACP on stdio by default. A2A is enabled by default; `--remote-acp` adds ACP at `/acp`, and `--no-a2a --remote-acp` exposes only remote ACP. `--no-stdio` requires `--remote-acp` and makes the foreground server independent of stdin for daemon or service-manager use. When no address is configured, Kit binds an available loopback address (`127.0.0.1:0`). Use `kit acp` when no HTTP listener is wanted.
 
 Without `--server-credential-file`, the HTTP listener performs no authentication or authorization, and the A2A Agent Card advertises no security requirements. Every client that can reach the listener can submit work to a Kit agent with the configured root and tools. When a credential file is configured, it must contain one non-empty bearer token, optionally followed by one newline; Kit requires that token on every A2A and remote ACP request and advertises Bearer security in the Agent Card. Consequently:
 
 - Keep the default loopback binding unless remote access is deliberately required.
-- Binding `0.0.0.0`, a LAN address, or another non-loopback interface exposes a coding agent, not just a read-only status endpoint. Put external authentication and network controls in front of it if exposure is intentional.
+- Binding `0.0.0.0`, a LAN address, or another non-loopback interface exposes a coding agent, not just a read-only status endpoint. Do not run a remotely reachable daemon without `--server-credential-file`; also put appropriate external authentication and network controls in front of it.
 - A fixed port can fail because it is already in use. An omitted port avoids selecting a fixed number, but it does not add authentication.
 - Protect the credential file from other users and rotate the token if it is exposed. Kit reads the token when the listener starts; restart `kit serve` after changing it.
 
@@ -33,7 +33,11 @@ Example safe local-only server startup:
 ```sh
 kit serve --root /path/to/project --http 127.0.0.1:7331
 kit serve --root /path/to/project --remote-acp --server-credential-file /private/token
+kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 \
+  --server-credential-file /private/token
 ```
+
+SIGINT and, on Unix, SIGTERM initiate normal shutdown. Kit stops accepting HTTP connections, closes the shared ACP attachment gate, interrupts all active sessions, and drains their cleanup concurrently under one roughly five-second deadline. Session actors that do not finish are aborted. Signal-triggered shutdown exits successfully; an unexpected listener failure remains an error.
 
 Confirm current options with `kit serve --help`.
 

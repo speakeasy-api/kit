@@ -1,4 +1,12 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
@@ -23,7 +31,11 @@ use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    task::{AbortHandle, JoinSet},
+    time::timeout,
+};
 
 use crate::{
     provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
@@ -308,8 +320,137 @@ enum Command {
 }
 
 struct SessionHandle {
+    token: u64,
     commands: mpsc::Sender<Command>,
     background_jobs: BackgroundJobs,
+}
+
+#[derive(Clone)]
+struct RegisteredSession {
+    token: u64,
+    session_id: agentkit_acp::SessionId,
+    integration: Arc<AcpIntegration>,
+    commands: mpsc::WeakSender<Command>,
+    actor: AbortHandle,
+    completed: watch::Receiver<bool>,
+}
+
+struct RegistryState {
+    accepting: bool,
+    sessions: HashMap<u64, RegisteredSession>,
+}
+
+struct SessionRegistryInner {
+    next_token: AtomicU64,
+    state: Mutex<RegistryState>,
+}
+
+/// Coordinates shutdown across stdio and all connection-scoped HTTP ACP components.
+#[derive(Clone)]
+pub struct SessionRegistry {
+    inner: Arc<SessionRegistryInner>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(SessionRegistryInner {
+                next_token: AtomicU64::new(1),
+                state: Mutex::new(RegistryState {
+                    accepting: true,
+                    sessions: HashMap::new(),
+                }),
+            }),
+        }
+    }
+
+    fn next_token(&self) -> u64 {
+        self.inner.next_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn register(&self, session: RegisteredSession) -> Result<(), ()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        if !state.accepting {
+            return Err(());
+        }
+        state.sessions.insert(session.token, session);
+        Ok(())
+    }
+
+    fn remove(&self, token: u64) {
+        self.inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned")
+            .sessions
+            .remove(&token);
+    }
+
+    fn close_gate_and_snapshot(&self) -> Vec<RegisteredSession> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        state.accepting = false;
+        state.sessions.values().cloned().collect()
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown_with_timeout(Duration::from_secs(5)).await;
+    }
+
+    async fn shutdown_with_timeout(&self, limit: Duration) {
+        let sessions = self.close_gate_and_snapshot();
+        for session in &sessions {
+            let _ = session.integration.interrupt_session(&session.session_id);
+        }
+
+        let mut closing = JoinSet::new();
+        for mut session in sessions.iter().cloned() {
+            let registry = self.clone();
+            closing.spawn(async move {
+                if let Some(commands) = session.commands.upgrade() {
+                    let (reply, acknowledged) = oneshot::channel();
+                    if commands.send(Command::Close { reply }).await.is_ok() {
+                        let _ = acknowledged.await;
+                    }
+                }
+                if !*session.completed.borrow() {
+                    let _ = session.completed.changed().await;
+                }
+                registry.remove(session.token);
+            });
+        }
+
+        if timeout(limit, async {
+            while closing.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            closing.abort_all();
+            for session in &sessions {
+                if !*session.completed.borrow() {
+                    session.actor.abort();
+                }
+            }
+            while closing.join_next().await.is_some() {}
+            for session in sessions {
+                self.remove(session.token);
+            }
+        }
+    }
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 struct AttachedSession {
@@ -347,18 +488,48 @@ impl Drop for SessionBindingGuard {
     }
 }
 
+struct SessionActorGuard {
+    server: Weak<Server>,
+    registry: SessionRegistry,
+    session_id: agentkit_acp::SessionId,
+    token: u64,
+    completed: watch::Sender<bool>,
+}
+
+impl Drop for SessionActorGuard {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.upgrade() {
+            server.remove_session(&self.session_id, self.token);
+        }
+        self.registry.remove(self.token);
+        self.completed.send_replace(true);
+    }
+}
+
 struct Server {
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
+    registry: SessionRegistry,
     sessions: Mutex<HashMap<agentkit_acp::SessionId, SessionHandle>>,
 }
 
 impl Server {
-    fn new(runtime: Arc<Runtime>, integration: AcpIntegration) -> Self {
+    fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
             runtime,
             integration: Arc::new(integration),
+            registry,
             sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn remove_session(&self, session_id: &agentkit_acp::SessionId, token: u64) {
+        let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
+        if sessions
+            .get(session_id)
+            .is_some_and(|session| session.token == token)
+        {
+            sessions.remove(session_id);
         }
     }
 
@@ -494,33 +665,57 @@ impl Server {
             turn_states,
             mcp_events,
         };
+        let token = self.registry.next_token();
+        let (activation, activated) = oneshot::channel();
+        let (completed, completion) = watch::channel(false);
+        let guard = SessionActorGuard {
+            server: Arc::downgrade(self),
+            registry: self.registry.clone(),
+            session_id: session_id.clone(),
+            token,
+            completed,
+        };
+        let actor_task = tokio::spawn(async move {
+            let _guard = guard;
+            if activated.await.is_ok() {
+                session_actor(actor).await;
+            }
+        });
+        let registered = RegisteredSession {
+            token,
+            session_id: session_id.clone(),
+            integration: Arc::clone(&self.integration),
+            commands: tx.downgrade(),
+            actor: actor_task.abort_handle(),
+            completed: completion,
+        };
+        drop(actor_task);
 
-        // Hold the map lock across the synchronous commit/publication boundary.
-        // Once the claim commits there are no remaining cancellation points.
-        let mut sessions = self.sessions.lock().await;
-        claim
-            .commit()
-            .map_err(|error| record_acp_runtime_failure(&session_id, "session_commit", error))?;
+        // Hold the request-scoped map lock across registration, commit, and publication.
+        // Shutdown either closes the gate before this point or snapshots this actor.
+        let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
+        self.registry
+            .register(registered)
+            .map_err(|()| AcpRuntimeError::ClientClosed)?;
+        if let Err(error) = claim.commit() {
+            self.registry.remove(token);
+            return Err(record_acp_runtime_failure(
+                &session_id,
+                "session_commit",
+                error,
+            ));
+        }
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
             session_id: session_id.to_string(),
         });
         sessions.insert(
             session_id.clone(),
             SessionHandle {
+                token,
                 commands: tx,
                 background_jobs,
             },
         );
-        let cleanup = Arc::downgrade(self);
-        let cleanup_session_id = session_id.clone();
-        let (activation, activated) = oneshot::channel();
-        tokio::spawn(async move {
-            if activated.await.is_ok() {
-                session_actor(actor).await;
-            } else if let Some(server) = cleanup.upgrade() {
-                server.sessions.lock().await.remove(&cleanup_session_id);
-            }
-        });
         drop(sessions);
         Ok(AttachedSession {
             session_id,
@@ -573,19 +768,20 @@ impl Server {
         // Closing uses the same out-of-band interrupt, then waits for the
         // actor to reach and acknowledge the serialized close boundary.
         self.integration.interrupt_session(&request.session_id)?;
-        let sender = self
+        let session = self
             .sessions
             .lock()
-            .await
+            .expect("ACP session map poisoned")
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
         let (tx, rx) = oneshot::channel();
-        sender
+        session
             .commands
             .send(Command::Close { reply: tx })
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?;
+        self.registry.remove(session.token);
         Ok(CloseSessionResponse::new())
     }
 
@@ -595,7 +791,7 @@ impl Server {
     ) -> Result<mpsc::Sender<Command>, AcpRuntimeError> {
         self.sessions
             .lock()
-            .await
+            .expect("ACP session map poisoned")
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
@@ -608,7 +804,7 @@ impl Server {
         let background_jobs = self
             .sessions
             .lock()
-            .await
+            .expect("ACP session map poisoned")
             .get(&request.session_id)
             .map(|session| session.background_jobs.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
@@ -979,19 +1175,33 @@ pub async fn serve(runtime: Arc<Runtime>) -> Result<(), AcpRuntimeError> {
     serve_transport(runtime, agent_client_protocol::Stdio::new()).await
 }
 
-async fn serve_transport(
+pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
-    transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
+    registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    component(runtime)?
-        .connect_to(transport)
+    component(runtime, registry)?
+        .connect_to(agent_client_protocol::Stdio::new())
         .await
         .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
 }
 
-pub(crate) fn http_router(runtime: Arc<Runtime>) -> axum::Router {
+async fn serve_transport(
+    runtime: Arc<Runtime>,
+    transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
+) -> Result<(), AcpRuntimeError> {
+    let registry = SessionRegistry::new();
+    let result = component(runtime, registry.clone())?
+        .connect_to(transport)
+        .await
+        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
+    registry.shutdown().await;
+    result
+}
+
+pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
-        component(Arc::clone(&runtime)).expect("Kit's fixed ACP integration must build")
+        component(Arc::clone(&runtime), registry.clone())
+            .expect("Kit's fixed ACP integration must build")
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         health_endpoint: false,
@@ -1002,12 +1212,13 @@ pub(crate) fn http_router(runtime: Arc<Runtime>) -> axum::Router {
 
 fn component(
     runtime: Arc<Runtime>,
+    registry: SessionRegistry,
 ) -> Result<impl ConnectTo<agent_client_protocol::Client>, AcpRuntimeError> {
     let integration = AcpIntegration::builder()
         .name("kit")
         .approval_resolver(AutoDenyResolver)
         .build()?;
-    let state = Arc::new(Server::new(runtime, integration));
+    let state = Arc::new(Server::new(runtime, integration, registry));
     Ok(agent_client_protocol::Agent
         .builder()
         .name("kit")
@@ -1217,6 +1428,110 @@ mod tests {
     };
 
     use super::*;
+
+    struct CompletionOnDrop(watch::Sender<bool>);
+
+    impl Drop for CompletionOnDrop {
+        fn drop(&mut self) {
+            self.0.send_replace(true);
+        }
+    }
+
+    fn shutdown_test_integration() -> Arc<AcpIntegration> {
+        Arc::new(
+            AcpIntegration::builder()
+                .name("shutdown-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_close_and_rejects_new_registration() {
+        let registry = SessionRegistry::new();
+        let integration = shutdown_test_integration();
+        let session_id = agentkit_acp::SessionId::new("close-me");
+        let token = registry.next_token();
+        let (commands, mut received) = mpsc::channel(1);
+        let weak_commands = commands.downgrade();
+        let (completed, completion) = watch::channel(false);
+        let closed = Arc::new(AtomicBool::new(false));
+        let actor_closed = Arc::clone(&closed);
+        let actor = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(completed);
+            if let Some(Command::Close { reply }) = received.recv().await {
+                actor_closed.store(true, Ordering::SeqCst);
+                let _ = reply.send(());
+            }
+        });
+        registry
+            .register(RegisteredSession {
+                token,
+                session_id,
+                integration: Arc::clone(&integration),
+                commands: weak_commands,
+                actor: actor.abort_handle(),
+                completed: completion,
+            })
+            .unwrap();
+        drop(actor);
+
+        registry.shutdown_with_timeout(Duration::from_secs(1)).await;
+        assert!(closed.load(Ordering::SeqCst));
+
+        let late_token = registry.next_token();
+        let (late_commands, _late_received) = mpsc::channel(1);
+        let (late_completed, late_completion) = watch::channel(false);
+        let late_actor = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(late_completed);
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            registry
+                .register(RegisteredSession {
+                    token: late_token,
+                    session_id: agentkit_acp::SessionId::new("too-late"),
+                    integration,
+                    commands: late_commands.downgrade(),
+                    actor: late_actor.abort_handle(),
+                    completed: late_completion,
+                })
+                .is_err()
+        );
+        late_actor.abort();
+        late_actor.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_actor_at_the_shared_deadline() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token();
+        let (commands, _received) = mpsc::channel(1);
+        let (_completed, completion) = watch::channel(false);
+        let actor = tokio::spawn(std::future::pending::<()>());
+        registry
+            .register(RegisteredSession {
+                token,
+                session_id: agentkit_acp::SessionId::new("stuck"),
+                integration: shutdown_test_integration(),
+                commands: commands.downgrade(),
+                actor: actor.abort_handle(),
+                completed: completion,
+            })
+            .unwrap();
+        timeout(
+            Duration::from_secs(1),
+            registry.shutdown_with_timeout(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        let error = timeout(Duration::from_secs(1), actor)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_cancelled());
+    }
 
     #[test]
     fn available_commands_advertises_only_compact() {
@@ -1972,6 +2287,113 @@ mod tests {
             let _ = std::fs::remove_file(directory.join(format!("{cleanup_session_id}.jsonl")));
             let _ = std::fs::remove_file(directory.join(format!("{cleanup_session_id}.lock")));
         }
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_closes_real_session_and_rejects_reattach() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = crate::session::new_id();
+        let opened = crate::session::open(
+            root.path(),
+            &session_id,
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        drop(opened);
+
+        let runtime = Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server_registry = registry.clone();
+        let server_runtime = Arc::clone(&runtime);
+        let server = tokio::spawn(async move {
+            component(server_runtime, server_registry)
+                .unwrap()
+                .connect_to(agent_transport)
+                .await
+        });
+        let workspace = root.path().to_path_buf();
+        let client_session_id = session_id.clone();
+        let (attached, attached_rx) = oneshot::channel();
+        let (proceed, proceed_rx) = oneshot::channel();
+        let client = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .builder()
+                .connect_with(client_transport, async move |connection| {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(
+                            client_session_id.clone(),
+                            workspace.clone(),
+                        ))
+                        .block_task()
+                        .await?;
+                    let _ = attached.send(());
+                    let _ = proceed_rx.await;
+
+                    let rejected = connection
+                        .send_request(LoadSessionRequest::new(client_session_id, workspace))
+                        .block_task()
+                        .await;
+                    assert!(
+                        rejected.is_err(),
+                        "closed registry accepted a new attachment"
+                    );
+                    Ok(())
+                })
+                .await
+        });
+
+        timeout(Duration::from_secs(2), attached_rx)
+            .await
+            .expect("real ACP session did not attach")
+            .unwrap();
+        assert_eq!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .sessions
+                .len(),
+            1
+        );
+
+        registry.shutdown_with_timeout(Duration::from_secs(1)).await;
+        {
+            let state = registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned");
+            assert!(!state.accepting);
+            assert!(state.sessions.is_empty());
+        }
+        proceed.send(()).unwrap();
+        timeout(Duration::from_secs(2), client)
+            .await
+            .expect("ACP client did not observe shutdown")
+            .unwrap()
+            .unwrap();
+
+        let claim = runtime
+            .claim_session_load(&session_id)
+            .expect("shutdown left the durable session identity claimed");
+        drop(claim);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
