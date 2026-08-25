@@ -641,3 +641,7 @@ The root is a working directory, not a sandbox. Shell commands can access the
 host. Edits are atomic per file but multi-file changes are not transactional.
 Subagents are child ACP processes, use the same root as their working directory,
 and are bounded to depth two.
+
+## Reporting Kit issues
+
+Report bugs and feature requests in the [Kit issue tracker](https://github.com/speakeasy-api/kit/issues). Before opening an issue, follow the [reporting guide](docs/user/reporting-kit-issues.md) to include the Kit version and useful reproduction details. Agents must get the user's explicit permission before submitting an issue on their behalf.
