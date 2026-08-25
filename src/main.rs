@@ -365,6 +365,14 @@ fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum AcpProtocolVersion {
+    #[value(name = "1")]
+    V1,
+    #[value(name = "2")]
+    V2,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuthProvider {
     Openai,
     Openrouter,
@@ -440,6 +448,9 @@ enum Command {
     },
     /// Serve only the Agent Client Protocol on stdio.
     Acp {
+        /// ACP wire protocol version.
+        #[arg(long, value_enum, default_value = "1")]
+        protocol_version: AcpProtocolVersion,
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long)]
@@ -817,11 +828,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("A2A listening on {bound}");
             }
             if remote_acp {
-                eprintln!("ACP listening on http://{bound}/acp");
+                eprintln!("ACP v1 listening on http://{bound}/acp");
+                eprintln!("ACP v2 listening on http://{bound}/acp/v2");
             }
             supervise_serve(runtime, sessions, no_stdio, http).await?;
         }
         Command::Acp {
+            protocol_version,
             root,
             model,
             provider,
@@ -876,7 +889,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 credential_storage,
             )
             .await?;
-            kit::protocols::acp::serve(runtime).await?;
+            match protocol_version {
+                AcpProtocolVersion::V1 => kit::protocols::acp::serve(runtime).await?,
+                AcpProtocolVersion::V2 => kit::protocols::acp::v2::serve(runtime).await?,
+            }
         }
         Command::Prompt {
             root,
@@ -1490,6 +1506,8 @@ future_option = true
             Cli::try_parse_from(["kit", "acp", "--root", ".", "--provider", "speakeasy",]).is_ok()
         );
         assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "acp", "--protocol-version", "2"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "acp", "--protocol-version", "3"]).is_err());
         for command in ["serve", "acp", "tui"] {
             assert!(Cli::try_parse_from(["kit", command, "--reasoning-effort", "high"]).is_ok());
         }

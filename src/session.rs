@@ -586,6 +586,45 @@ fn default_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME is unset; cannot locate durable sessions".into())
 }
 
+/// Lists durable transcript ids without acquiring their mutation locks.
+pub(crate) fn list_ids() -> Result<Vec<String>, String> {
+    list_ids_in(&default_directory()?)
+}
+
+pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "could not list session directory {}: {error}",
+                directory.display()
+            ));
+        }
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not read session entry: {error}"))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
+            .is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if validate_id(id).is_ok() {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
 fn preferred_transcript(
     directory: &Path,
     root: &Path,
@@ -1273,6 +1312,18 @@ mod tests {
 
         assert_eq!(stored(root.path()).len(), 3);
         assert!(session_directory(root.path()).join("abc.lock").is_file());
+    }
+
+    #[test]
+    fn list_ids_ignores_non_transcripts_and_sorts_valid_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("zeta.jsonl"), "transcript").unwrap();
+        fs::write(directory.path().join("alpha.jsonl"), "transcript").unwrap();
+        fs::write(directory.path().join("active.lock"), "lock").unwrap();
+        fs::write(directory.path().join("bad id.jsonl"), "invalid").unwrap();
+        fs::create_dir(directory.path().join("nested.jsonl")).unwrap();
+
+        assert_eq!(list_ids_in(directory.path()).unwrap(), ["alpha", "zeta"]);
     }
 
     #[test]

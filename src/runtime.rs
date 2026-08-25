@@ -14,7 +14,9 @@ use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
 };
-use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_loop::{
+    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
+};
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
@@ -136,10 +138,10 @@ impl SessionSelection {
     }
 }
 
-pub(crate) struct AcpDriverContext {
+pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
-    pub integration: Arc<AcpIntegration>,
+    pub integration: Arc<I>,
     pub cancellation: CancellationHandle,
 }
 
@@ -854,11 +856,14 @@ impl Runtime {
         })
     }
 
-    pub(crate) async fn start_acp_driver(
+    pub(crate) async fn start_acp_driver<I>(
         self: &Arc<Self>,
-        context: AcpDriverContext,
+        context: AcpDriverContext<I>,
         claim: &mut SessionClaim,
-    ) -> Result<AcpDriver, AcpRuntimeError> {
+    ) -> Result<AcpDriver, AcpRuntimeError>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
         let cwd = context
             .cwd
             .canonicalize()
