@@ -789,8 +789,11 @@ impl App {
                 ItemKind::Developer if is_compaction_summary(item) => {
                     self.push_block(Block::Notice("context compacted".into()));
                 }
-                ItemKind::System | ItemKind::Developer | ItemKind::Context => continue,
-                ItemKind::User | ItemKind::Notification => {
+                ItemKind::System
+                | ItemKind::Developer
+                | ItemKind::Context
+                | ItemKind::Notification => continue,
+                ItemKind::User => {
                     let mut next_media = 0;
                     let text = item
                         .parts
@@ -1926,6 +1929,22 @@ mod tests {
         assert!(
             matches!(app.blocks.first(), Some(Block::Notice(text)) if text == "context compacted")
         );
+    }
+
+    #[test]
+    fn restored_transcript_hides_internal_notifications() {
+        let transcript = vec![
+            Item::text(ItemKind::User, "run the build"),
+            Item::notification("Background tool call completed: very long raw output"),
+            Item::text(ItemKind::Assistant, "the build passed"),
+        ];
+        let mut app = app();
+
+        app.restore_transcript("session".into(), &transcript);
+
+        assert_eq!(app.blocks.len(), 2);
+        assert!(matches!(&app.blocks[0], Block::User(text) if text == "run the build"));
+        assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "the build passed"));
     }
 
     #[test]
