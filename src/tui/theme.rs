@@ -429,11 +429,30 @@ pub fn pulse(kind: Pulse, tick: usize) -> &'static str {
 /// Human-readable elapsed time, sized to the magnitude.
 pub fn duration(millis: u64) -> String {
     if millis < 1_000 {
-        format!("{millis}ms")
-    } else if millis < 60_000 {
-        format!("{:.1}s", millis as f64 / 1000.0)
+        return format!("{millis}ms");
+    }
+    if millis < 60_000 {
+        return format!("{:.1}s", millis as f64 / 1000.0);
+    }
+
+    let seconds = millis / 1_000;
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    let weeks = days / 7;
+    let seconds = seconds % 60;
+    let minutes = minutes % 60;
+    let hours = hours % 24;
+    let days = days % 7;
+
+    if weeks > 0 {
+        format!("{weeks}w{days}d {hours}h{minutes:02}m{seconds:02}s")
+    } else if days > 0 {
+        format!("{days}d {hours}h{minutes:02}m{seconds:02}s")
+    } else if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
     } else {
-        format!("{}m{:02}s", millis / 60_000, (millis % 60_000) / 1000)
+        format!("{minutes}m{seconds:02}s")
     }
 }
 
@@ -447,6 +466,17 @@ mod tests {
         Appearance, DARK, LIGHT, Palette, appearance_of, contrast, forced, from_colorfgbg,
         palette_of, parse_background,
     };
+
+    #[test]
+    fn formats_turn_durations_through_weeks() {
+        assert_eq!(super::duration(999), "999ms");
+        assert_eq!(super::duration(1_000), "1.0s");
+        assert_eq!(super::duration(60_000), "1m00s");
+        assert_eq!(super::duration(3_600_000), "1h00m00s");
+        assert_eq!(super::duration(86_400_000), "1d 0h00m00s");
+        assert_eq!(super::duration(604_800_000), "1w0d 0h00m00s");
+        assert_eq!(super::duration(788_645_000), "1w2d 3h04m05s");
+    }
 
     fn roles(palette: &'static Palette) -> [(&'static str, Color); 8] {
         [

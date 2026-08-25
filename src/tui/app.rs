@@ -288,6 +288,7 @@ pub enum Block {
         millis: Option<u64>,
     },
     Tool(ToolCall),
+    TurnDuration(u64),
     Notice(String),
     Error(String),
 }
@@ -932,6 +933,12 @@ impl App {
         })
     }
 
+    fn stop_turn_timer(&mut self) -> Option<u64> {
+        self.turn_started
+            .take()
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
     pub fn toast_text(&self) -> Option<&str> {
         self.toast
             .as_ref()
@@ -1073,13 +1080,16 @@ impl App {
                 self.close_thought();
                 self.agent_stream_sealed = true;
                 let interrupted = self.phase == Phase::Cancelling;
+                let turn_millis = self.stop_turn_timer();
                 self.phase = Phase::Idle;
-                self.turn_started = None;
                 self.active_autonomous_turn_id = None;
                 match (interrupted, error) {
                     (true, _) => self.note("turn interrupted"),
                     (false, Some(error)) => self.push_block(Block::Error(error)),
                     (false, None) => {}
+                }
+                if let Some(millis) = turn_millis {
+                    self.push_block(Block::TurnDuration(millis));
                 }
             }
             Update::TurnEnded { id, error } => {
@@ -1089,8 +1099,8 @@ impl App {
                 self.close_thought();
                 self.agent_stream_sealed = true;
                 let interrupted = self.phase == Phase::Cancelling;
+                let turn_millis = self.stop_turn_timer();
                 self.phase = Phase::Idle;
-                self.turn_started = None;
                 self.active_turn_id = None;
                 self.active_autonomous_turn_id = None;
                 self.compacting = false;
@@ -1114,6 +1124,9 @@ impl App {
                     (true, _) => self.note("turn interrupted"),
                     (false, Some(error)) => self.push_block(Block::Error(error)),
                     (false, None) => {}
+                }
+                if let Some(millis) = turn_millis {
+                    self.push_block(Block::TurnDuration(millis));
                 }
             }
         }
@@ -2082,6 +2095,23 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_duration_is_recorded_at_the_end() {
+        let mut app = app();
+        let id = app.push_user("hello".into());
+        app.turn_started = Some(Instant::now() - Duration::from_secs(65));
+
+        app.apply(Update::TurnEnded {
+            id: Some(id),
+            error: None,
+        });
+
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration(millis)) if *millis >= 65_000
+        ));
+    }
+
+    #[test]
     fn autonomous_turn_is_visible_and_cancellable() {
         let mut app = app();
 
@@ -2094,9 +2124,10 @@ mod tests {
         app.apply(Update::AutonomousTurnEnded { id: 7, error: None });
 
         assert!(!app.working());
-        assert!(
-            matches!(app.blocks.last(), Some(Block::Notice(text)) if text == "turn interrupted")
-        );
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [.., Block::Notice(text), Block::TurnDuration(_)] if text == "turn interrupted"
+        ));
     }
 
     #[test]
