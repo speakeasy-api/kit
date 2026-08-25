@@ -1,6 +1,6 @@
 # TUI Interaction, Sessions, and Recovery
 
-Kit's terminal UI is an ACP client backed by a persisted session. It supports prompt editing, turn cancellation, transcript and tool-output navigation, fresh or resumed conversations, and automatic or manual context compaction. The session ID appears in the TUI header. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line options.
+Kit's bundled terminal UI is an ACP v2 client backed by a persisted session. It supports prompt editing, active-turn steering, turn cancellation, transcript and tool-output navigation, fresh or resumed conversations, and automatic or manual context compaction. The session ID appears in the TUI header. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line options.
 
 ## Start or resume the terminal UI
 
@@ -22,7 +22,7 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 
 | Key or input | Action |
 | --- | --- |
-| `Enter` | Send a non-empty prompt when idle |
+| `Enter` | Send a non-empty prompt when idle; steer and finish the current response while active if the agent advertises that capability |
 | `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
 | `Esc` | Interrupt a running turn; dismiss a notice when idle |
 | `Command+B` | Move the newest running foreground top-level compose call to the background |
@@ -46,6 +46,8 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 
 Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
 
+When the session is idle, `Enter` starts a normal prompt. While the agent is active, `Enter` uses ACP v2 `steer` injection with `finish` stream behavior only when the agent advertised both capabilities. An accepted injected user message appears in the transcript as part of the current turn. If steering is unavailable, the editor keeps the message and shows `this agent does not support active steering`. Local commands and agent-advertised session commands are available only while idle.
+
 ### Attach local images and audio
 
 Drag one or more supported local media files into the terminal while editing a prompt. Terminals deliver a drop as pasted, shell-escaped paths rather than as a dedicated file-drop event. Kit treats the paste as attachments only when every parsed token resolves to a supported regular file. Mixed text and paths, unsupported files, invalid shell quoting, missing files, and ambiguous input remain ordinary pasted text. There is no `/attach` command.
@@ -60,7 +62,7 @@ Assistant- and tool-produced media appears as portable Markdown placeholders or 
 
 ### Interrupt a running turn or quit
 
-Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes. Sending another prompt while work is active is refused with `a turn is already running — esc interrupts it`.
+Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes.
 
 If a turn does not stop, press `Ctrl+C` again while Kit is cancelling to leave the TUI and terminate its agent child. On normal exit during a turn, Kit first requests cancellation and briefly allows the turn to unwind so tool outcomes can be persisted, then closes the session and releases its lock.
 
@@ -68,13 +70,15 @@ Press `Command+B` to detach the newest running foreground top-level compose call
 
 At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
 
-## Start a new session and compact from the TUI
+## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/close`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
 /new Start by reviewing the tests
+/resume <session-id>
+/close
 /compact
 /compact Continue with the migration
 /model
@@ -82,7 +86,7 @@ The TUI handles `/new`, `/model`, and `/effort` as exact local slash-command tok
 /effort high
 ```
 
-`/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt.
+These local commands are available only while the session is idle. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
