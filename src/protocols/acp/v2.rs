@@ -18,7 +18,10 @@ use agentkit_acp::{
 use agentkit_core::{
     CancellationController, FinishReason, Item, ItemKind, Part, SessionId, ToolOutput,
 };
-use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
+use agentkit_loop::{
+    AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
+    ObservedEvent,
+};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -107,6 +110,206 @@ impl AcpSessionUpdateSink for ConnectionSink {
 
     async fn flush(&self) -> Result<(), AcpRuntimeError> {
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CurrentReplacementMessages {
+    agent: Option<wire::MessageId>,
+    thought: Option<wire::MessageId>,
+    replacement: Option<ReplacementGeneration>,
+}
+
+struct ReplacementGeneration {
+    id: u64,
+    agent: Option<wire::MessageId>,
+    thought: Option<wire::MessageId>,
+}
+
+impl ReplacementGeneration {
+    fn new() -> Self {
+        static NEXT_REPLACEMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_REPLACEMENT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            agent: None,
+            thought: None,
+        }
+    }
+
+    fn message_id(&mut self, kind: &'static str) -> wire::MessageId {
+        let current = match kind {
+            "agent" => &mut self.agent,
+            "thought" => &mut self.thought,
+            _ => unreachable!("replacement message kind is fixed"),
+        };
+        current
+            .get_or_insert_with(|| {
+                wire::MessageId::new(format!("kit-response-replacement-{}-{kind}", self.id))
+            })
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct ResponseReplacementSink<S> {
+    inner: S,
+    current: Arc<Mutex<CurrentReplacementMessages>>,
+}
+
+impl<S> ResponseReplacementSink<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            current: Arc::new(Mutex::new(CurrentReplacementMessages::default())),
+        }
+    }
+
+    fn rewrite_and_track(&self, notification: &mut wire::UpdateSessionNotification) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match &mut notification.update {
+            wire::SessionUpdate::AgentMessageChunk(chunk) => {
+                if let Some(replacement) = current.replacement.as_mut() {
+                    chunk.message_id = replacement.message_id("agent");
+                }
+                current.agent = Some(chunk.message_id.clone());
+            }
+            wire::SessionUpdate::AgentThoughtChunk(chunk) => {
+                if let Some(replacement) = current.replacement.as_mut() {
+                    chunk.message_id = replacement.message_id("thought");
+                }
+                current.thought = Some(chunk.message_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn reset(&self) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = CurrentReplacementMessages::default();
+    }
+}
+
+impl<S: AcpSessionUpdateSink> ResponseReplacementSink<S> {
+    fn clear_current(&self, session_id: &wire::SessionId) -> Vec<Result<(), AcpRuntimeError>> {
+        let (agent, thought) = {
+            let mut current = self
+                .current
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let agent = current.agent.take();
+            let thought = current.thought.take();
+            current.replacement = Some(ReplacementGeneration::new());
+            (agent, thought)
+        };
+        let mut results = Vec::with_capacity(2);
+        if let Some(message_id) = agent {
+            results.push(self.inner.update(wire::UpdateSessionNotification::new(
+                session_id.clone(),
+                wire::SessionUpdate::AgentMessage(
+                    wire::AgentMessage::new(message_id).content(Vec::new()),
+                ),
+            )));
+        }
+        if let Some(message_id) = thought {
+            results.push(self.inner.update(wire::UpdateSessionNotification::new(
+                session_id.clone(),
+                wire::SessionUpdate::AgentThought(
+                    wire::AgentThought::new(message_id).content(Vec::new()),
+                ),
+            )));
+        }
+        results
+    }
+}
+
+#[async_trait]
+impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S> {
+    fn update(
+        &self,
+        mut notification: wire::UpdateSessionNotification,
+    ) -> Result<(), AcpRuntimeError> {
+        self.rewrite_and_track(&mut notification);
+        self.inner.update(notification)
+    }
+
+    async fn update_acknowledged(
+        &self,
+        mut notification: wire::UpdateSessionNotification,
+    ) -> Result<(), AcpRuntimeError> {
+        self.rewrite_and_track(&mut notification);
+        self.inner.update_acknowledged(notification).await
+    }
+
+    async fn flush(&self) -> Result<(), AcpRuntimeError> {
+        self.inner.flush().await
+    }
+}
+
+#[derive(Clone)]
+struct ResponseReplacementObserver<S> {
+    inner: AcpIntegration,
+    sink: ResponseReplacementSink<S>,
+    session_id: wire::SessionId,
+}
+
+impl<S> ResponseReplacementObserver<S> {
+    fn new(
+        inner: AcpIntegration,
+        sink: ResponseReplacementSink<S>,
+        session_id: wire::SessionId,
+    ) -> Self {
+        Self {
+            inner,
+            sink,
+            session_id,
+        }
+    }
+}
+
+impl<S: AcpSessionUpdateSink> ResponseReplacementObserver<S> {
+    fn clear_current(&self) {
+        for result in self.sink.clear_current(&self.session_id) {
+            if let Err(error) = result {
+                tracing::debug!(%error, "failed to queue ACP v2 session update");
+            }
+        }
+    }
+}
+
+impl<S> LoopObserver for ResponseReplacementObserver<S>
+where
+    S: AcpSessionUpdateSink + Clone,
+{
+    fn handle_event(&self, event: ObservedEvent) {
+        if matches!(
+            &event.event,
+            AgentEvent::ContentDelta(delta) if crate::response_attempt::is_marker(delta)
+        ) {
+            self.clear_current();
+            return;
+        }
+        if matches!(
+            &event.event,
+            AgentEvent::TurnFinished(result)
+                if result.finish_reason == FinishReason::Cancelled
+        ) {
+            self.clear_current();
+        }
+        if matches!(
+            &event.event,
+            AgentEvent::TurnStarted { .. }
+                | AgentEvent::TurnFinished(_)
+                | AgentEvent::ToolExecutionStarted(_)
+                | AgentEvent::ToolResultReceived(_)
+        ) {
+            self.sink.reset();
+        }
+        self.inner.handle_event(event);
     }
 }
 
@@ -346,7 +549,7 @@ impl Server {
     ) -> Result<AttachedSession, AcpRuntimeError> {
         let session_id = wire::SessionId::new(claim.id());
         let cancellation = CancellationController::new();
-        let sink = ConnectionSink(connection);
+        let sink = ResponseReplacementSink::new(ConnectionSink(connection));
         let binding =
             AcpSessionBinding::new(session_id.clone(), SessionId::new(claim.id()), sink.clone())
                 .cancellation(cancellation);
@@ -355,11 +558,17 @@ impl Server {
             integration: Arc::clone(&self.integration),
             session_id: session_id.clone(),
         };
+        let observer = ResponseReplacementObserver::new(
+            self.integration.as_ref().clone(),
+            sink.clone(),
+            session_id.clone(),
+        );
         let context = AcpDriverContext {
             cwd,
             additional_directories,
-            integration: Arc::clone(&self.integration),
+            integration: Arc::new(observer),
             cancellation: handle.cancellation_handle(),
+            response_attempt_replacement: true,
         };
         let driver = self.runtime.start_acp_driver(context, &mut claim).await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
@@ -622,7 +831,7 @@ struct SessionActor<S: ModelSession> {
     handle: AcpSessionHandle,
     busy: Arc<AtomicBool>,
     binding: BindingGuard,
-    sink: ConnectionSink,
+    sink: ResponseReplacementSink<ConnectionSink>,
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
     adapter: SelectableAdapter,
@@ -1517,7 +1726,8 @@ mod tests {
 
     use agentkit_core::{MetadataMap, TurnCancellation};
     use agentkit_loop::{
-        Agent, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig, TurnRequest,
+        Agent, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
+        TurnRequest, TurnResult,
     };
 
     use super::*;
@@ -1551,6 +1761,257 @@ mod tests {
         }
     }
 
+    #[test]
+    fn response_replacement_clears_and_remaps_message_ids_in_new_chunk_order() {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("replacement-session");
+        let loop_session_id = SessionId::new("replacement-loop");
+        let _handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let observer = ResponseReplacementObserver::new(integration, sink, session_id.clone());
+        let emit = |event| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_session_id.clone()),
+                event,
+            });
+        };
+
+        emit(AgentEvent::TurnStarted {
+            session_id: loop_session_id.clone(),
+            turn_id: agentkit_core::TurnId::new("turn-1"),
+        });
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
+            part_id: agentkit_core::PartId::new("message-1"),
+            kind: agentkit_core::PartKind::Text,
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+            part_id: agentkit_core::PartId::new("message-1"),
+            chunk: "old answer".into(),
+        }));
+        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+            unreachable!();
+        };
+        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
+            part_id: agentkit_core::PartId::new("thought-2"),
+            kind: agentkit_core::PartKind::Reasoning,
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+            part_id: agentkit_core::PartId::new("thought-2"),
+            chunk: "new ".into(),
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+            part_id: agentkit_core::PartId::new("thought-2"),
+            chunk: "thought".into(),
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
+            part_id: agentkit_core::PartId::new("message-2"),
+            kind: agentkit_core::PartKind::Text,
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+            part_id: agentkit_core::PartId::new("message-2"),
+            chunk: "new ".into(),
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+            part_id: agentkit_core::PartId::new("message-2"),
+            chunk: "answer".into(),
+        }));
+
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 6);
+        let stale_message_id = match &updates[0].update {
+            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected stale message chunk, got {update:?}"),
+        };
+        assert!(matches!(
+            &updates[1].update,
+            wire::SessionUpdate::AgentMessage(message)
+                if message.message_id == stale_message_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
+        let thought_id = match &updates[2].update {
+            wire::SessionUpdate::AgentThoughtChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected replacement thought chunk, got {update:?}"),
+        };
+        assert!(matches!(
+            &updates[3].update,
+            wire::SessionUpdate::AgentThoughtChunk(chunk) if chunk.message_id == thought_id
+        ));
+        let replacement_message_id = match &updates[4].update {
+            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected replacement message chunk, got {update:?}"),
+        };
+        assert_ne!(replacement_message_id, stale_message_id);
+        assert_ne!(replacement_message_id, thought_id);
+        assert!(matches!(
+            &updates[5].update,
+            wire::SessionUpdate::AgentMessageChunk(chunk)
+                if chunk.message_id == replacement_message_id
+        ));
+        drop(updates);
+
+        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+            unreachable!();
+        };
+        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
+            part_id: agentkit_core::PartId::new("message-3"),
+            kind: agentkit_core::PartKind::Text,
+        }));
+        emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+            part_id: agentkit_core::PartId::new("message-3"),
+            chunk: "third answer".into(),
+        }));
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 9);
+        assert!(matches!(
+            &updates[6].update,
+            wire::SessionUpdate::AgentMessage(message)
+                if message.message_id == replacement_message_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
+        assert!(matches!(
+            &updates[7].update,
+            wire::SessionUpdate::AgentThought(message)
+                if message.message_id == thought_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
+        assert!(matches!(
+            &updates[8].update,
+            wire::SessionUpdate::AgentMessageChunk(chunk)
+                if chunk.message_id != replacement_message_id
+                    && chunk.message_id != stale_message_id
+        ));
+        drop(updates);
+
+        emit(AgentEvent::TurnStarted {
+            session_id: loop_session_id.clone(),
+            turn_id: agentkit_core::TurnId::new("turn-2"),
+        });
+        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+            unreachable!();
+        };
+        emit(AgentEvent::ContentDelta(marker));
+        assert_eq!(recording.updates.lock().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn response_replacement_clears_streamed_messages_when_turn_is_cancelled() {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("cancelled-replacement-session");
+        let loop_session_id = SessionId::new("cancelled-replacement-loop");
+        let _handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let observer = ResponseReplacementObserver::new(integration, sink, session_id);
+        let emit = |event| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_session_id.clone()),
+                event,
+            });
+        };
+        let emit_part = |part_id: &str, kind, chunk: &str| {
+            emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
+                part_id: agentkit_core::PartId::new(part_id),
+                kind,
+            }));
+            emit(AgentEvent::ContentDelta(agentkit_core::Delta::AppendText {
+                part_id: agentkit_core::PartId::new(part_id),
+                chunk: chunk.into(),
+            }));
+        };
+        let finish = |turn_id, finish_reason| {
+            AgentEvent::TurnFinished(TurnResult {
+                turn_id: agentkit_core::TurnId::new(turn_id),
+                finish_reason,
+                items: Vec::new(),
+                usage: None,
+                metadata: MetadataMap::new(),
+            })
+        };
+
+        emit(AgentEvent::TurnStarted {
+            session_id: loop_session_id.clone(),
+            turn_id: agentkit_core::TurnId::new("turn-1"),
+        });
+        emit_part("message-1", agentkit_core::PartKind::Text, "answer");
+        emit_part("thought-1", agentkit_core::PartKind::Reasoning, "thinking");
+        emit(finish("turn-1", FinishReason::Cancelled));
+
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 4);
+        let agent_id = match &updates[0].update {
+            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected agent message chunk, got {update:?}"),
+        };
+        let thought_id = match &updates[1].update {
+            wire::SessionUpdate::AgentThoughtChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected agent thought chunk, got {update:?}"),
+        };
+        assert!(matches!(
+            &updates[2].update,
+            wire::SessionUpdate::AgentMessage(message)
+                if message.message_id == agent_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
+        assert!(matches!(
+            &updates[3].update,
+            wire::SessionUpdate::AgentThought(message)
+                if message.message_id == thought_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
+        drop(updates);
+
+        emit(AgentEvent::TurnStarted {
+            session_id: loop_session_id.clone(),
+            turn_id: agentkit_core::TurnId::new("turn-2"),
+        });
+        emit_part("message-2", agentkit_core::PartKind::Text, "completed");
+        emit(finish("turn-2", FinishReason::Completed));
+        assert_eq!(recording.updates.lock().unwrap().len(), 5);
+
+        emit(AgentEvent::TurnStarted {
+            session_id: loop_session_id.clone(),
+            turn_id: agentkit_core::TurnId::new("turn-3"),
+        });
+        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+            unreachable!();
+        };
+        emit(AgentEvent::ContentDelta(marker));
+        emit_part(
+            "message-3",
+            agentkit_core::PartKind::Text,
+            "partial replacement",
+        );
+        emit(finish("turn-3", FinishReason::Cancelled));
+
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 7);
+        let replacement_id = match &updates[5].update {
+            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected replacement message chunk, got {update:?}"),
+        };
+        assert!(matches!(
+            &updates[6].update,
+            wire::SessionUpdate::AgentMessage(message)
+                if message.message_id == replacement_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
+    }
+
     #[derive(Clone, Copy)]
     enum TestOutcome {
         FinishError,
@@ -1571,6 +2032,72 @@ mod tests {
 
     struct TestTurn {
         event: Option<ModelTurnEvent>,
+    }
+
+    struct MarkerCancellationAdapter {
+        interrupt: AcpSessionHandle,
+    }
+
+    struct MarkerCancellationSession {
+        interrupt: AcpSessionHandle,
+    }
+
+    struct MarkerCancellationTurn {
+        interrupt: AcpSessionHandle,
+        next: u8,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for MarkerCancellationAdapter {
+        type Session = MarkerCancellationSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(MarkerCancellationSession {
+                interrupt: self.interrupt.clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for MarkerCancellationSession {
+        type Turn = MarkerCancellationTurn;
+
+        async fn begin_turn(
+            &mut self,
+            _request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            Ok(MarkerCancellationTurn {
+                interrupt: self.interrupt.clone(),
+                next: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for MarkerCancellationTurn {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            let event = match self.next {
+                0 => ModelTurnEvent::Delta(agentkit_core::Delta::BeginPart {
+                    part_id: agentkit_core::PartId::new("message-1"),
+                    kind: agentkit_core::PartKind::Text,
+                }),
+                1 => ModelTurnEvent::Delta(agentkit_core::Delta::AppendText {
+                    part_id: agentkit_core::PartId::new("message-1"),
+                    chunk: "partial answer".into(),
+                }),
+                2 => {
+                    self.interrupt.interrupt();
+                    crate::response_attempt::marker_event()
+                }
+                _ => return Ok(None),
+            };
+            self.next += 1;
+            Ok(Some(event))
+        }
     }
 
     #[async_trait]
@@ -1690,6 +2217,55 @@ mod tests {
             .await
             .unwrap();
         (driver, turns)
+    }
+
+    #[tokio::test]
+    async fn loop_driver_cancellation_clears_streamed_message_when_marker_is_suppressed() {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("cancelled-marker-session");
+        let loop_session_id = SessionId::new("cancelled-marker-loop");
+        let cancellation = CancellationController::new();
+        let handle = integration
+            .bind_session(
+                AcpSessionBinding::new(session_id.clone(), loop_session_id.clone(), sink.clone())
+                    .cancellation(cancellation),
+            )
+            .unwrap();
+        let observer = ResponseReplacementObserver::new(integration, sink, session_id);
+        let mut driver = Agent::builder()
+            .model(MarkerCancellationAdapter {
+                interrupt: handle.clone(),
+            })
+            .observer(observer)
+            .cancellation(handle.cancellation_handle())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_session_id).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "cancel")])
+            .unwrap();
+
+        let LoopStep::Finished(result) = driver.next().await.unwrap() else {
+            panic!("expected cancelled turn");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        let message_id = match &updates[0].update {
+            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
+            update => panic!("expected partial message chunk, got {update:?}"),
+        };
+        assert!(matches!(
+            &updates[1].update,
+            wire::SessionUpdate::AgentMessage(message)
+                if message.message_id == message_id
+                    && message.content.value().is_some_and(Vec::is_empty)
+        ));
     }
 
     #[test]

@@ -17,18 +17,22 @@ use agentkit_acp::{
     BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ImageContent,
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ResourceLink, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
+    NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities,
+    PromptRequest, PromptResponse, ResourceLink, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use agentkit_core::{
     CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
     Modality, Part, SessionId as AgentkitSessionId, ToolOutput,
 };
-use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
+use agentkit_loop::{
+    AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
+    ObservedEvent,
+};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -560,6 +564,49 @@ struct SessionBindingGuard {
     session_id: agentkit_acp::SessionId,
 }
 
+#[derive(Clone)]
+struct ResponseInterruptionNoticeObserver {
+    inner: AcpIntegration,
+    client: AcpClientHandle,
+    session_id: agentkit_acp::SessionId,
+}
+
+impl ResponseInterruptionNoticeObserver {
+    fn new(
+        inner: AcpIntegration,
+        client: AcpClientHandle,
+        session_id: agentkit_acp::SessionId,
+    ) -> Self {
+        Self {
+            inner,
+            client,
+            session_id,
+        }
+    }
+}
+
+impl LoopObserver for ResponseInterruptionNoticeObserver {
+    fn handle_event(&self, event: ObservedEvent) {
+        if matches!(
+            &event.event,
+            AgentEvent::ContentDelta(delta) if crate::response_attempt::is_marker(delta)
+        ) {
+            let notification = SessionNotification::new(
+                self.session_id.clone(),
+                SessionUpdate::Notice(Notice::new(
+                    NoticeSeverity::Warning,
+                    "Response interrupted; replacement follows",
+                )),
+            );
+            if let Err(error) = self.client.notify_session(notification) {
+                tracing::debug!(%error, "failed to queue ACP v1 interruption notice");
+            }
+            return;
+        }
+        self.inner.handle_event(event);
+    }
+}
+
 impl SessionBindingGuard {
     fn new(integration: Arc<AcpIntegration>, session_id: agentkit_acp::SessionId) -> Self {
         Self {
@@ -702,20 +749,27 @@ impl Server {
             json!(additional_directories),
         );
         let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
-        let binding = AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client)
-            .cancellation(cancellation)
-            .workspace(cwd.clone(), additional_directories.clone())
-            .metadata(metadata);
+        let binding =
+            AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client.clone())
+                .cancellation(cancellation)
+                .workspace(cwd.clone(), additional_directories.clone())
+                .metadata(metadata);
         let handle = self
             .integration
             .bind_session(binding)
             .map_err(|error| record_acp_runtime_failure(&session_id, "session_bind", error))?;
         let binding = SessionBindingGuard::new(Arc::clone(&self.integration), session_id.clone());
+        let observer = ResponseInterruptionNoticeObserver::new(
+            self.integration.as_ref().clone(),
+            client,
+            session_id.clone(),
+        );
         let context = AcpDriverContext {
             cwd,
             additional_directories,
-            integration: Arc::clone(&self.integration),
+            integration: Arc::new(observer),
             cancellation: handle.cancellation_handle(),
+            response_attempt_replacement: true,
         };
         let driver = match self.runtime.start_acp_driver(context, &mut claim).await {
             Ok(driver) => driver,
@@ -1802,6 +1856,68 @@ mod tests {
             SessionUpdate::AgentMessageChunk(chunk)
                 if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "canonical checkpoint")
         ));
+    }
+
+    #[tokio::test]
+    async fn response_interruption_marker_becomes_v1_warning_before_replacement() {
+        let integration = AcpIntegration::builder()
+            .name("response-interruption-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("v1-interruption");
+        let loop_session_id = AgentkitSessionId::new("v1-interruption-loop");
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                client.clone(),
+            ))
+            .unwrap();
+        let observer = ResponseInterruptionNoticeObserver::new(
+            integration.clone(),
+            client,
+            session_id.clone(),
+        );
+        let emit = |event| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_session_id.clone()),
+                event,
+            });
+        };
+        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+            panic!("replacement marker must be a delta");
+        };
+
+        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ContentDelta(Delta::BeginPart {
+            part_id: PartId::new("replacement"),
+            kind: PartKind::Text,
+        }));
+        emit(AgentEvent::ContentDelta(Delta::AppendText {
+            part_id: PartId::new("replacement"),
+            chunk: "fresh response".into(),
+        }));
+
+        let Some(AcpClientMessage::SessionNotification(notice)) = messages.recv().await else {
+            panic!("expected interruption notice");
+        };
+        let SessionUpdate::Notice(notice) = notice.update else {
+            panic!("expected notice before replacement output");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Warning);
+        assert_eq!(notice.title, "Response interrupted; replacement follows");
+
+        let Some(AcpClientMessage::SessionNotification(replacement)) = messages.recv().await else {
+            panic!("expected replacement output");
+        };
+        assert!(matches!(
+            replacement.update,
+            SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "fresh response")
+        ));
+        integration.unbind_session(&session_id).unwrap();
     }
 
     #[test]

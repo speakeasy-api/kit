@@ -33,6 +33,7 @@ const MAX_MODELS: usize = 1_000;
 // TUI attachments allow 20 MiB raw; base64 and JSON add roughly one third.
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WIRE_BYTES: usize = 4 * MAX_STREAM_BYTES;
 // Image-generation results arrive as one base64 field in one SSE event.
 const MAX_EVENT_BYTES: usize = MAX_STREAM_BYTES;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
@@ -161,6 +162,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
         Ok(OpenAiSubscriptionSession {
             config: self.config.clone(),
             reasoning_effort: self.reasoning_effort,
+            response_attempt_replacement: crate::response_attempt::enabled(&config),
             client: self.client.clone(),
             session_id,
             binding,
@@ -178,10 +180,29 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
 pub struct OpenAiSubscriptionSession {
     config: SubscriptionConfig,
     reasoning_effort: Option<super::adapter::ReasoningEffort>,
+    response_attempt_replacement: bool,
     client: reqwest::Client,
     session_id: String,
     binding: auth::CredentialBinding,
     context_windows: Arc<HashMap<String, u64>>,
+    #[cfg(test)]
+    test_credentials: Option<auth::TokenRecord>,
+}
+
+struct OpenAiSubscriptionRequestContext {
+    config: SubscriptionConfig,
+    client: reqwest::Client,
+    binding: auth::CredentialBinding,
+    session_id: String,
+    body_bytes: Zeroizing<Vec<u8>>,
+    idempotency_key: String,
+    started: tokio::time::Instant,
+    retries: usize,
+    credentials: auth::TokenRecord,
+    unauthorized: bool,
+    turn_state: Option<reqwest::header::HeaderValue>,
+    turn_state_from_header: bool,
+    wire_bytes: usize,
     #[cfg(test)]
     test_credentials: Option<auth::TokenRecord>,
 }
@@ -202,8 +223,7 @@ impl ModelSession for OpenAiSubscriptionSession {
             return Err(LoopError::Cancelled);
         }
         let started = tokio::time::Instant::now();
-        let mut retries = 0_usize;
-        let mut credentials = self
+        let credentials = self
             .credentials_with_budget(None, cancellation.clone(), started, 1)
             .await?;
         self.ensure_binding(&credentials)?;
@@ -221,213 +241,57 @@ impl ModelSession for OpenAiSubscriptionSession {
         if body_bytes.len() > MAX_REQUEST_BYTES {
             return Err(protocol("request exceeds 8 MiB"));
         }
-        let mut unauthorized = false;
-        let mut turn_state = None;
+        let mut context = OpenAiSubscriptionRequestContext {
+            config: self.config.clone(),
+            client: self.client.clone(),
+            binding: self.binding.clone(),
+            session_id: self.session_id.clone(),
+            body_bytes,
+            idempotency_key,
+            started,
+            retries: 0,
+            credentials,
+            unauthorized: false,
+            turn_state: None,
+            turn_state_from_header: false,
+            wire_bytes: 0,
+            #[cfg(test)]
+            test_credentials: self.test_credentials.clone(),
+        };
         loop {
-            let elapsed = started.elapsed();
-            if elapsed >= RETRY_BUDGET {
-                return Err(retry_exhausted(
-                    LoopError::Provider("openai-subscription retry budget exhausted".into()),
-                    retries.saturating_add(1),
-                    elapsed,
-                ));
-            }
-            self.ensure_binding(&credentials)?;
-            let mut builder = self
-                .client
-                .post(self.config.endpoint())
-                .bearer_auth(credentials.access_token())
-                .header("originator", "kit")
-                .header("session-id", &self.session_id)
-                .header("Idempotency-Key", &idempotency_key)
-                .header("Accept", "text/event-stream")
-                .header("Content-Type", "application/json");
-            if let Some(account_id) = credentials.account_id() {
-                builder = builder.header("ChatGPT-Account-ID", account_id);
-            }
-            if let Some(value) = turn_state.as_ref() {
-                builder = builder.header(X_CODEX_TURN_STATE, value);
-            }
-            let send = tokio::time::timeout_at(
-                started + RETRY_BUDGET,
-                builder.body(body_bytes.to_vec()).send(),
-            );
-            let response = if let Some(cancel) = cancellation.clone() {
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(LoopError::Cancelled),
-                    response = send => response,
-                }
-            } else {
-                send.await
-            };
-            let response = match response {
-                Err(_) => {
-                    return Err(retry_exhausted(
-                        LoopError::Provider(
-                            "openai-subscription request exceeded retry budget".into(),
-                        ),
-                        retries.saturating_add(1),
-                        started.elapsed(),
-                    ));
-                }
-                Ok(Ok(response)) => response,
-                Ok(Err(error))
-                    if retriable_transport_error(crate::fatal::TransportStage::Request, &error) =>
-                {
-                    retry_failure(
-                        transport_error(
-                            crate::fatal::TransportStage::Request,
-                            &error,
-                            true,
-                            retries.saturating_add(1),
-                            None,
-                        ),
-                        None,
-                        &mut retries,
-                        started,
-                        &idempotency_key,
-                        cancellation.clone(),
-                    )
-                    .await?;
-                    credentials = self
-                        .credentials_with_budget(
-                            None,
-                            cancellation.clone(),
-                            started,
-                            retries.saturating_add(1),
-                        )
-                        .await?;
-                    continue;
-                }
-                Ok(Err(error)) => {
-                    return Err(transport_error(
-                        crate::fatal::TransportStage::Request,
-                        &error,
-                        false,
-                        retries.saturating_add(1),
-                        None,
-                    ));
-                }
-            };
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !unauthorized {
-                let elapsed = started.elapsed();
-                if retries >= MAX_RETRIES || elapsed >= RETRY_BUDGET {
-                    return Err(retry_exhausted(
-                        LoopError::Provider(
-                            "openai-subscription unauthorized before credential refresh".into(),
-                        ),
-                        retries.saturating_add(1),
-                        elapsed,
-                    ));
-                }
-                retries += 1;
-                unauthorized = true;
-                credentials = self
-                    .credentials_with_budget(
-                        Some(credentials),
-                        cancellation.clone(),
-                        started,
-                        retries.saturating_add(1),
-                    )
-                    .await?;
-                self.ensure_binding(&credentials)?;
-                continue;
-            }
-            if retriable_http_status(response.status()) {
-                let status = response.status();
-                let delay = retry_after(response.headers());
-                retry_failure(
-                    LoopError::Provider(format!(
-                        "openai-subscription returned retryable HTTP {status}"
-                    )),
-                    delay,
-                    &mut retries,
-                    started,
-                    &idempotency_key,
-                    cancellation.clone(),
-                )
-                .await?;
-                credentials = self
-                    .credentials_with_budget(
-                        None,
-                        cancellation.clone(),
-                        started,
-                        retries.saturating_add(1),
-                    )
-                    .await?;
-                continue;
-            }
-            let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(LoopError::Provider(
-                    "openai-subscription unauthorized after one refresh".to_owned(),
-                ));
-            }
-            if !status.is_success() {
-                let elapsed = started.elapsed();
-                let detail = if elapsed < RETRY_BUDGET {
-                    failure_body_excerpt(response, cancellation.clone(), started + RETRY_BUDGET)
-                        .await?
-                } else {
-                    String::new()
-                };
-                return Err(LoopError::Provider(format!(
-                    "openai-subscription returned {status}{detail}"
-                )));
-            }
-            // The codex backend omits Content-Type on successful SSE responses, so absence
-            // is accepted; only an explicitly different declared type is rejected. The SSE
-            // parser remains fail-closed on malformed bodies.
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok());
-            if content_type.is_some_and(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .is_none_or(|value| value.trim() != "text/event-stream")
-            }) {
-                return Err(protocol("response is not an SSE stream"));
-            }
+            let response = context.send_response(cancellation.clone()).await?;
             let response_model = response
                 .headers()
                 .get("openai-model")
                 .map(validated_model_header)
                 .transpose()?;
-            if turn_state.is_none() {
-                turn_state = response.headers().get(X_CODEX_TURN_STATE).cloned();
-            }
             let response_request_id = crate::fatal::safe_response_request_id(response.headers());
+            let wire_bytes = context.wire_bytes;
             let mut turn = OpenAiSubscriptionTurn::new_inner(
                 response.bytes_stream(),
                 OpenAiSubscriptionTurnInit {
                     requested_model: self.config.model.clone(),
                     header_model: response_model,
-                    turn_state: turn_state
+                    turn_state: context
+                        .turn_state
                         .as_ref()
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned),
+                    turn_state_from_header: context.turn_state_from_header,
                     binding: self.binding.clone(),
                     session_id: self.session_id.clone(),
                     context_windows: self.context_windows.clone(),
-                    attempt: retries.saturating_add(1),
+                    response_attempt_replacement: self.response_attempt_replacement,
+                    attempt: context.retries.saturating_add(1),
                     response_request_id,
+                    wire_bytes,
+                    attempt_wire_bytes: 0,
+                    request_context: Some(context),
                 },
             );
-            let elapsed = started.elapsed();
-            if elapsed >= RETRY_BUDGET {
-                return Err(retry_exhausted(
-                    LoopError::Provider(
-                        "openai-subscription response exceeded retry budget".into(),
-                    ),
-                    retries.saturating_add(1),
-                    elapsed,
-                ));
-            }
             let first_event = tokio::time::timeout_at(
                 started + RETRY_BUDGET,
-                turn.next_event(cancellation.clone()),
+                turn.next_event_inner(cancellation.clone()),
             )
             .await
             .map_err(|_| {
@@ -435,7 +299,7 @@ impl ModelSession for OpenAiSubscriptionSession {
                     LoopError::Provider(
                         "openai-subscription response exceeded retry budget".into(),
                     ),
-                    retries.saturating_add(1),
+                    turn.attempt,
                     started.elapsed(),
                 )
             })?;
@@ -446,39 +310,29 @@ impl ModelSession for OpenAiSubscriptionSession {
                 }
                 Ok(None) => return Ok(turn),
                 Err(error) => {
-                    if turn_state.is_none() {
-                        turn_state = turn
-                            .turn_state
-                            .as_deref()
-                            .and_then(|value| value.parse().ok());
-                    }
-                    let retry = turn
+                    let retry_after = turn
                         .pending_failure
                         .as_ref()
                         .filter(|failure| failure.retriable)
                         .map(|failure| failure.retry_after)
                         .or_else(|| turn.retryable_transport_failure.then_some(None));
-                    if let Some(delay) = retry {
-                        retry_failure(
-                            error,
-                            delay,
-                            &mut retries,
-                            started,
-                            &idempotency_key,
-                            cancellation.clone(),
-                        )
-                        .await?;
-                        credentials = self
-                            .credentials_with_budget(
-                                None,
-                                cancellation.clone(),
-                                started,
-                                retries.saturating_add(1),
-                            )
-                            .await?;
-                        continue;
+                    let Some(retry_after) = retry_after else {
+                        return Err(error);
+                    };
+                    context = turn
+                        .request_context
+                        .take()
+                        .ok_or_else(|| protocol("stream retry context is unavailable"))?;
+                    context.wire_bytes = turn.wire_bytes;
+                    if let Some(turn_state) = turn.turn_state.as_deref() {
+                        context.turn_state = Some(turn_state.parse().map_err(|_| {
+                            protocol("validated x-codex-turn-state became invalid")
+                        })?);
+                        context.turn_state_from_header = turn.turn_state_from_header;
                     }
-                    return Err(error);
+                    context
+                        .retry_response_failure(error, retry_after, cancellation.clone())
+                        .await?;
                 }
             }
         }
@@ -528,16 +382,7 @@ impl OpenAiSubscriptionSession {
     }
 
     fn ensure_binding(&self, credentials: &auth::TokenRecord) -> Result<(), LoopError> {
-        let binding = credentials
-            .binding()
-            .map_err(|error| LoopError::Provider(error.to_string()))?;
-        if binding == self.binding {
-            Ok(())
-        } else {
-            Err(LoopError::Provider(
-                "OpenAI credential account changed; start a new session".to_owned(),
-            ))
-        }
+        ensure_credential_binding(&self.binding, credentials)
     }
 
     async fn credentials(
@@ -550,6 +395,255 @@ impl OpenAiSubscriptionSession {
             return Ok(credentials.clone());
         }
         credentials(&self.config, rejected, cancellation).await
+    }
+}
+
+impl OpenAiSubscriptionRequestContext {
+    fn ensure_binding(&self, credentials: &auth::TokenRecord) -> Result<(), LoopError> {
+        ensure_credential_binding(&self.binding, credentials)
+    }
+
+    async fn credentials(
+        &self,
+        rejected: Option<auth::TokenRecord>,
+        cancellation: Option<agentkit_core::TurnCancellation>,
+    ) -> Result<auth::TokenRecord, LoopError> {
+        #[cfg(test)]
+        if let Some(credentials) = &self.test_credentials {
+            return Ok(credentials.clone());
+        }
+        credentials(&self.config, rejected, cancellation).await
+    }
+
+    async fn credentials_with_budget(
+        &self,
+        rejected: Option<auth::TokenRecord>,
+        cancellation: Option<agentkit_core::TurnCancellation>,
+    ) -> Result<auth::TokenRecord, LoopError> {
+        let elapsed = self.started.elapsed();
+        if elapsed >= RETRY_BUDGET {
+            return Err(retry_exhausted(
+                LoopError::Provider(
+                    "openai-subscription credential lookup exceeded retry budget".into(),
+                ),
+                self.retries.saturating_add(1),
+                elapsed,
+            ));
+        }
+        tokio::time::timeout_at(
+            self.started + RETRY_BUDGET,
+            self.credentials(rejected, cancellation),
+        )
+        .await
+        .map_err(|_| {
+            retry_exhausted(
+                LoopError::Provider(
+                    "openai-subscription credential lookup exceeded retry budget".into(),
+                ),
+                self.retries.saturating_add(1),
+                self.started.elapsed(),
+            )
+        })?
+    }
+
+    async fn retry_response_failure(
+        &mut self,
+        error: LoopError,
+        retry_after: Option<Duration>,
+        cancellation: Option<agentkit_core::TurnCancellation>,
+    ) -> Result<(), LoopError> {
+        retry_failure(
+            error,
+            retry_after,
+            &mut self.retries,
+            self.started,
+            &self.idempotency_key,
+            cancellation.clone(),
+        )
+        .await?;
+        self.credentials = self.credentials_with_budget(None, cancellation).await?;
+        self.ensure_binding(&self.credentials)
+    }
+
+    async fn send_response(
+        &mut self,
+        cancellation: Option<agentkit_core::TurnCancellation>,
+    ) -> Result<reqwest::Response, LoopError> {
+        loop {
+            let elapsed = self.started.elapsed();
+            if elapsed >= RETRY_BUDGET {
+                return Err(retry_exhausted(
+                    LoopError::Provider("openai-subscription retry budget exhausted".into()),
+                    self.retries.saturating_add(1),
+                    elapsed,
+                ));
+            }
+            self.ensure_binding(&self.credentials)?;
+            let mut builder = self
+                .client
+                .post(self.config.endpoint())
+                .bearer_auth(self.credentials.access_token())
+                .header("originator", "kit")
+                .header("session-id", &self.session_id)
+                .header("Idempotency-Key", &self.idempotency_key)
+                .header("Accept", "text/event-stream")
+                .header("Content-Type", "application/json");
+            if let Some(account_id) = self.credentials.account_id() {
+                builder = builder.header("ChatGPT-Account-ID", account_id);
+            }
+            if let Some(value) = self.turn_state.as_ref() {
+                builder = builder.header(X_CODEX_TURN_STATE, value);
+            }
+            let send = tokio::time::timeout_at(
+                self.started + RETRY_BUDGET,
+                builder.body(self.body_bytes.to_vec()).send(),
+            );
+            let response = if let Some(cancel) = cancellation.clone() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(LoopError::Cancelled),
+                    response = send => response,
+                }
+            } else {
+                send.await
+            };
+            let response = match response {
+                Err(_) => {
+                    return Err(retry_exhausted(
+                        LoopError::Provider(
+                            "openai-subscription request exceeded retry budget".into(),
+                        ),
+                        self.retries.saturating_add(1),
+                        self.started.elapsed(),
+                    ));
+                }
+                Ok(Ok(response)) => response,
+                Ok(Err(error))
+                    if retriable_transport_error(crate::fatal::TransportStage::Request, &error) =>
+                {
+                    self.retry_response_failure(
+                        transport_error(
+                            crate::fatal::TransportStage::Request,
+                            &error,
+                            true,
+                            self.retries.saturating_add(1),
+                            None,
+                        ),
+                        None,
+                        cancellation.clone(),
+                    )
+                    .await?;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    return Err(transport_error(
+                        crate::fatal::TransportStage::Request,
+                        &error,
+                        false,
+                        self.retries.saturating_add(1),
+                        None,
+                    ));
+                }
+            };
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !self.unauthorized {
+                let elapsed = self.started.elapsed();
+                if self.retries >= MAX_RETRIES || elapsed >= RETRY_BUDGET {
+                    return Err(retry_exhausted(
+                        LoopError::Provider(
+                            "openai-subscription unauthorized before credential refresh".into(),
+                        ),
+                        self.retries.saturating_add(1),
+                        elapsed,
+                    ));
+                }
+                self.retries += 1;
+                self.unauthorized = true;
+                let rejected = self.credentials.clone();
+                self.credentials = self
+                    .credentials_with_budget(Some(rejected), cancellation.clone())
+                    .await?;
+                self.ensure_binding(&self.credentials)?;
+                continue;
+            }
+            if retriable_http_status(response.status()) {
+                let status = response.status();
+                let delay = retry_after(response.headers());
+                self.retry_response_failure(
+                    LoopError::Provider(format!(
+                        "openai-subscription returned retryable HTTP {status}"
+                    )),
+                    delay,
+                    cancellation.clone(),
+                )
+                .await?;
+                continue;
+            }
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(LoopError::Provider(
+                    "openai-subscription unauthorized after one refresh".to_owned(),
+                ));
+            }
+            if !status.is_success() {
+                let elapsed = self.started.elapsed();
+                let detail = if elapsed < RETRY_BUDGET {
+                    failure_body_excerpt(
+                        response,
+                        cancellation.clone(),
+                        self.started + RETRY_BUDGET,
+                    )
+                    .await?
+                } else {
+                    String::new()
+                };
+                return Err(LoopError::Provider(format!(
+                    "openai-subscription returned {status}{detail}"
+                )));
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            if content_type.is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_none_or(|value| value.trim() != "text/event-stream")
+            }) {
+                return Err(protocol("response is not an SSE stream"));
+            }
+            let turn_state = validated_turn_state_header(response.headers())?;
+            self.turn_state_from_header = turn_state.is_some();
+            if let Some(turn_state) = turn_state {
+                if self
+                    .turn_state
+                    .as_ref()
+                    .is_some_and(|expected| expected != turn_state)
+                {
+                    return Err(protocol(
+                        "provider changed x-codex-turn-state while routing a retry",
+                    ));
+                }
+                self.turn_state = Some(turn_state);
+            }
+            return Ok(response);
+        }
+    }
+}
+
+fn ensure_credential_binding(
+    expected: &auth::CredentialBinding,
+    credentials: &auth::TokenRecord,
+) -> Result<(), LoopError> {
+    let actual = credentials
+        .binding()
+        .map_err(|error| LoopError::Provider(error.to_string()))?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(LoopError::Provider(
+            "OpenAI credential account changed; start a new session".to_owned(),
+        ))
     }
 }
 
@@ -572,6 +666,7 @@ async fn credentials(
     });
     let result = if let Some(cancel) = cancellation {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => return Err(LoopError::Cancelled),
             result = worker => result,
         }
@@ -663,11 +758,16 @@ struct OpenAiSubscriptionTurnInit {
     requested_model: String,
     header_model: Option<String>,
     turn_state: Option<String>,
+    turn_state_from_header: bool,
     binding: auth::CredentialBinding,
     session_id: String,
     context_windows: Arc<HashMap<String, u64>>,
+    response_attempt_replacement: bool,
     attempt: usize,
     response_request_id: Option<String>,
+    wire_bytes: usize,
+    attempt_wire_bytes: usize,
+    request_context: Option<OpenAiSubscriptionRequestContext>,
 }
 
 pub struct OpenAiSubscriptionTurn {
@@ -686,24 +786,35 @@ pub struct OpenAiSubscriptionTurn {
     created: bool,
     completed: bool,
     sequence: Option<u64>,
-    total_bytes: usize,
+    wire_bytes: usize,
+    attempt_wire_bytes: usize,
     usage: Option<Usage>,
     response_id: Option<String>,
     requested_model: String,
     header_model: Option<String>,
     response_model: Option<String>,
     turn_state: Option<String>,
+    turn_state_from_header: bool,
     binding: auth::CredentialBinding,
     session_id: String,
     context_windows: Arc<HashMap<String, u64>>,
     tool_call: bool,
     next_media: usize,
-    stream_ended: bool,
     pending_failure: Option<ResponseFailure>,
     retryable_transport_failure: bool,
+    response_attempt_replacement: bool,
     model_event_emitted: bool,
+    append_text_emitted: bool,
     attempt: usize,
     response_request_id: Option<String>,
+    request_context: Option<OpenAiSubscriptionRequestContext>,
+    pending_reopen: Option<PendingReopen>,
+}
+
+#[derive(Debug)]
+struct PendingReopen {
+    error: LoopError,
+    retry_after: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -714,8 +825,8 @@ struct ResponseFailure {
 }
 
 impl ResponseFailure {
-    fn error(&self) -> LoopError {
-        LoopError::Provider(self.message.clone())
+    fn into_error(self) -> LoopError {
+        LoopError::Provider(self.message)
     }
 }
 
@@ -737,14 +848,19 @@ impl OpenAiSubscriptionTurn {
                 requested_model,
                 header_model: actual_model,
                 turn_state: None,
+                turn_state_from_header: false,
                 binding: auth::CredentialBinding {
                     account_id: "test-account".to_owned(),
                     generation: "test-generation".to_owned(),
                 },
                 session_id: "s".to_owned(),
                 context_windows: Arc::new(HashMap::new()),
+                response_attempt_replacement: false,
                 attempt: 1,
                 response_request_id: None,
+                wire_bytes: 0,
+                attempt_wire_bytes: 0,
+                request_context: None,
             },
         )
     }
@@ -757,11 +873,16 @@ impl OpenAiSubscriptionTurn {
             requested_model,
             header_model,
             turn_state,
+            turn_state_from_header,
             binding,
             session_id,
             context_windows,
+            response_attempt_replacement,
             attempt,
             response_request_id,
+            wire_bytes,
+            attempt_wire_bytes,
+            request_context,
         } = init;
         Self {
             stream: Box::pin(stream),
@@ -779,25 +900,93 @@ impl OpenAiSubscriptionTurn {
             created: false,
             completed: false,
             sequence: None,
-            total_bytes: 0,
+            wire_bytes,
+            attempt_wire_bytes,
             usage: None,
             response_id: None,
             requested_model,
             header_model,
             response_model: None,
             turn_state,
+            turn_state_from_header,
             binding,
             session_id,
             context_windows,
             tool_call: false,
             next_media: 0,
-            stream_ended: false,
             pending_failure: None,
             retryable_transport_failure: false,
+            response_attempt_replacement,
             model_event_emitted: false,
+            append_text_emitted: false,
             attempt,
             response_request_id,
+            request_context,
+            pending_reopen: None,
         }
+    }
+
+    fn schedule_reopen(
+        &mut self,
+        error: LoopError,
+        retry_after: Option<Duration>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError> {
+        if self.request_context.is_none()
+            || (self.model_event_emitted && !self.response_attempt_replacement)
+        {
+            return Err(error);
+        }
+        let marker_required = self.append_text_emitted;
+        self.pending_reopen = Some(PendingReopen { error, retry_after });
+        Ok(marker_required.then(crate::response_attempt::marker_event))
+    }
+
+    async fn reopen_stream(
+        &mut self,
+        cancellation: Option<agentkit_core::TurnCancellation>,
+    ) -> Result<(), LoopError> {
+        let PendingReopen { error, retry_after } = self
+            .pending_reopen
+            .take()
+            .ok_or_else(|| protocol("stream retry action is unavailable"))?;
+        let mut context = self
+            .request_context
+            .take()
+            .ok_or_else(|| protocol("stream retry context is unavailable"))?;
+        self.retryable_transport_failure = false;
+        context.wire_bytes = self.wire_bytes;
+        if let Some(turn_state) = self.turn_state.as_deref() {
+            context.turn_state = Some(
+                turn_state
+                    .parse()
+                    .map_err(|_| protocol("validated x-codex-turn-state became invalid"))?,
+            );
+        }
+        context
+            .retry_response_failure(error, retry_after, cancellation.clone())
+            .await?;
+        let response = context.send_response(cancellation).await?;
+        let header_model = response
+            .headers()
+            .get("openai-model")
+            .map(validated_model_header)
+            .transpose()?;
+        let turn_state = context
+            .turn_state
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let turn_state_from_header = context.turn_state_from_header;
+        let response_request_id = crate::fatal::safe_response_request_id(response.headers());
+        self.reset_attempt_state();
+        self.header_model = header_model;
+        self.turn_state_from_header = turn_state_from_header;
+        self.turn_state = turn_state;
+        self.attempt = context.retries.saturating_add(1);
+        self.response_request_id = response_request_id;
+        self.stream = Box::pin(response.bytes_stream());
+        self.request_context = Some(context);
+        Ok(())
     }
 
     fn consume_frame(&mut self, frame: &[u8]) -> Result<(), LoopError> {
@@ -862,9 +1051,11 @@ impl OpenAiSubscriptionTurn {
         }
         match kind {
             "response.created" => {
-                if self.created || value.get("response").is_none() {
-                    return Err(protocol("duplicate or malformed response.created"));
+                if self.created {
+                    return Err(protocol("duplicate response.created"));
                 }
+                let id = bounded_id(value.pointer("/response/id"))?;
+                self.response_id = Some(id.to_owned());
                 self.created = true;
                 if let Some(model) = value.pointer("/response/model") {
                     self.observe_model(model)?;
@@ -924,9 +1115,27 @@ impl OpenAiSubscriptionTurn {
                     item,
                 )?;
             }
-            "response.completed" => self.complete(value)?,
-            "response.incomplete" => self.incomplete(value)?,
+            "response.completed" => {
+                let result = self.complete(value);
+                if result.is_err() {
+                    self.clear_retry_state();
+                }
+                result?;
+            }
+            "response.incomplete" => {
+                let result = self.incomplete(value);
+                if result.is_err() {
+                    self.clear_retry_state();
+                }
+                result?;
+            }
             "response.failed" => {
+                if let Some(id) = value.pointer("/response/id") {
+                    let id = bounded_id(Some(id))?;
+                    if self.response_id.as_deref() != Some(id) {
+                        return Err(protocol("response.failed changed the response.created ID"));
+                    }
+                }
                 self.output.retain(|item| {
                     item.parts
                         .iter()
@@ -953,11 +1162,20 @@ impl OpenAiSubscriptionTurn {
                 if let Some(model) = responses_header(value, &["openai-model", "x-openai-model"]) {
                     self.observe_model(&Value::String(model.to_owned()))?;
                 }
-                if self.turn_state.is_none()
-                    && let Some(state) = responses_header(value, &[X_CODEX_TURN_STATE])
-                    && state.parse::<reqwest::header::HeaderValue>().is_ok()
-                {
-                    self.turn_state = Some(state.to_owned());
+                if let Some(state) = responses_turn_state(value)? {
+                    match self.turn_state.as_deref() {
+                        Some(expected) if expected != state => {
+                            return Err(protocol("response metadata changed x-codex-turn-state"));
+                        }
+                        None => self.turn_state = Some(state.to_owned()),
+                        _ => {}
+                    }
+                    if let Some(context) = self.request_context.as_mut() {
+                        context.turn_state =
+                            Some(state.parse().map_err(|_| {
+                                protocol("response metadata turn state is invalid")
+                            })?);
+                    }
                 }
             }
             "keepalive" => {}
@@ -1148,12 +1366,12 @@ impl OpenAiSubscriptionTurn {
             .get("response")
             .and_then(Value::as_object)
             .ok_or_else(|| protocol("response.completed omitted response"))?;
-        let id = response
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 256)
-            .ok_or_else(|| protocol("response.completed omitted response ID"))?;
-        self.response_id = Some(id.to_owned());
+        let id = bounded_id(response.get("id"))?;
+        if self.response_id.as_deref() != Some(id) {
+            return Err(protocol(
+                "response.completed changed the response.created ID",
+            ));
+        }
         self.finalize_continuation_metadata(id)?;
         if let Some(model) = response.get("model") {
             self.observe_model(model)?;
@@ -1197,6 +1415,7 @@ impl OpenAiSubscriptionTurn {
                     .or_else(|| self.response_model.clone()),
                 response_id: self.response_id.clone(),
             }));
+        self.clear_retry_state();
         Ok(())
     }
 
@@ -1206,8 +1425,11 @@ impl OpenAiSubscriptionTurn {
             .get("response")
             .and_then(Value::as_object)
             .ok_or_else(|| protocol("response.incomplete omitted response"))?;
-        if let Some(id) = response.get("id") {
-            self.response_id = Some(bounded_id(Some(id))?.to_owned());
+        let id = bounded_id(response.get("id"))?;
+        if self.response_id.as_deref() != Some(id) {
+            return Err(protocol(
+                "response.incomplete changed the response.created ID",
+            ));
         }
         if let Some(model) = response.get("model") {
             self.observe_model(model)?;
@@ -1251,7 +1473,46 @@ impl OpenAiSubscriptionTurn {
                     .or_else(|| self.response_model.clone()),
                 response_id: self.response_id.clone(),
             }));
+        self.clear_retry_state();
         Ok(())
+    }
+
+    fn clear_retry_state(&mut self) {
+        self.request_context = None;
+    }
+
+    fn reset_attempt_state(&mut self) {
+        self.buffer.zeroize();
+        self.queued.clear();
+        self.output.clear();
+        self.output_indices.clear();
+        self.seen_ids.clear();
+        self.seen_call_ids.clear();
+        self.done_ids.clear();
+        self.item_indices.clear();
+        self.text.clear();
+        self.reasoning.clear();
+        self.reasoning_sections.clear();
+        self.created = false;
+        self.completed = false;
+        self.sequence = None;
+        self.attempt_wire_bytes = 0;
+        self.usage = None;
+        self.response_id = None;
+        self.header_model = None;
+        self.response_model = None;
+        self.tool_call = false;
+        self.next_media = 0;
+        self.pending_failure = None;
+        self.retryable_transport_failure = false;
+        self.model_event_emitted = false;
+        self.append_text_emitted = false;
+        self.response_request_id = None;
+    }
+
+    fn clear_error_state(&mut self) {
+        self.clear_retry_state();
+        self.buffer.zeroize();
     }
 
     fn flush_partial_output(&mut self) {
@@ -1437,13 +1698,34 @@ impl OpenAiSubscriptionTurn {
     }
 }
 
-#[async_trait]
-impl ModelTurn for OpenAiSubscriptionTurn {
-    async fn next_event(
+impl OpenAiSubscriptionTurn {
+    async fn next_event_inner(
         &mut self,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         loop {
+            let marker_required = self.append_text_emitted
+                && self.response_attempt_replacement
+                && self.request_context.is_some()
+                && self
+                    .pending_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.retriable);
+            if marker_required {
+                let failure = self
+                    .pending_failure
+                    .take()
+                    .expect("marker requirement came from a pending failure");
+                let retry_after = failure.retry_after;
+                if let Some(marker) = self.schedule_reopen(failure.into_error(), retry_after)? {
+                    return Ok(Some(marker));
+                }
+                unreachable!("visible output always requires a replacement marker");
+            }
+            if self.pending_reopen.is_some() {
+                self.reopen_stream(cancellation.clone()).await?;
+                continue;
+            }
             if cancellation
                 .as_ref()
                 .is_some_and(|value| value.is_cancelled())
@@ -1452,10 +1734,26 @@ impl ModelTurn for OpenAiSubscriptionTurn {
             }
             if let Some(event) = self.queued.pop_front() {
                 self.model_event_emitted = true;
+                if matches!(&event, ModelTurnEvent::Delta(Delta::AppendText { .. })) {
+                    self.append_text_emitted = true;
+                }
+                if !self.response_attempt_replacement {
+                    self.clear_retry_state();
+                }
                 return Ok(Some(event));
             }
-            if let Some(failure) = &self.pending_failure {
-                return Err(failure.error());
+            if let Some(failure) = self.pending_failure.take() {
+                let retriable = failure.retriable;
+                let retry_after = failure.retry_after;
+                let error = failure.into_error();
+                if !retriable {
+                    return Err(error);
+                }
+                if let Some(marker) = self.schedule_reopen(error, retry_after)? {
+                    return Ok(Some(marker));
+                }
+                self.reopen_stream(cancellation.clone()).await?;
+                continue;
             }
             if self.completed {
                 return Ok(None);
@@ -1463,6 +1761,7 @@ impl ModelTurn for OpenAiSubscriptionTurn {
             let read = tokio::time::timeout(STREAM_IDLE_TIMEOUT, self.stream.next());
             let next = if let Some(cancel) = cancellation.clone() {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => return Err(LoopError::Cancelled),
                     value = read => value,
                 }
@@ -1472,42 +1771,68 @@ impl ModelTurn for OpenAiSubscriptionTurn {
             let next = match next {
                 Ok(next) => next,
                 Err(_) => {
-                    self.retryable_transport_failure = !self.model_event_emitted;
-                    return Err(LoopError::Provider(
-                        "openai-subscription SSE idle timeout".to_owned(),
-                    ));
+                    self.retryable_transport_failure = true;
+                    let error =
+                        LoopError::Provider("openai-subscription SSE idle timeout".to_owned());
+                    if let Some(marker) = self.schedule_reopen(error, None)? {
+                        return Ok(Some(marker));
+                    }
+                    self.reopen_stream(cancellation.clone()).await?;
+                    continue;
                 }
             };
             let Some(chunk) = next else {
-                if !self.stream_ended && !self.buffer.is_empty() {
-                    self.stream_ended = true;
-                    let frame = std::mem::take(&mut self.buffer);
-                    self.consume_frame(&frame)?;
-                    continue;
+                self.retryable_transport_failure = true;
+                let error = protocol("SSE stream closed before response.completed");
+                if let Some(marker) = self.schedule_reopen(error, None)? {
+                    return Ok(Some(marker));
                 }
-                self.retryable_transport_failure = !self.model_event_emitted;
-                return Err(protocol("SSE stream closed before response.completed"));
+                self.reopen_stream(cancellation.clone()).await?;
+                continue;
             };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    let retryable = !self.model_event_emitted
-                        && retriable_transport_error(crate::fatal::TransportStage::Stream, &error);
+                    let retryable =
+                        retriable_transport_error(crate::fatal::TransportStage::Stream, &error);
                     self.retryable_transport_failure = retryable;
-                    return Err(transport_error(
+                    let error = transport_error(
                         crate::fatal::TransportStage::Stream,
                         &error,
                         retryable,
                         self.attempt,
                         self.response_request_id.as_deref(),
-                    ));
+                    );
+                    if !retryable {
+                        return Err(error);
+                    }
+                    if let Some(marker) = self.schedule_reopen(error, None)? {
+                        return Ok(Some(marker));
+                    }
+                    self.reopen_stream(cancellation.clone()).await?;
+                    continue;
                 }
             };
-            self.total_bytes = self.total_bytes.saturating_add(chunk.len());
-            if self.total_bytes > MAX_STREAM_BYTES {
-                return Err(protocol("SSE stream exceeds 16 MiB"));
+            self.attempt_wire_bytes = self
+                .attempt_wire_bytes
+                .checked_add(chunk.len())
+                .ok_or_else(|| protocol("per-attempt SSE wire ingress overflowed"))?;
+            if self.attempt_wire_bytes > MAX_STREAM_BYTES {
+                return Err(protocol("per-attempt SSE wire ingress exceeds 16 MiB"));
             }
-            self.buffer.extend_from_slice(&chunk);
+            self.wire_bytes = self
+                .wire_bytes
+                .checked_add(chunk.len())
+                .ok_or_else(|| protocol("aggregate SSE wire ingress overflowed"))?;
+            if self.wire_bytes > MAX_WIRE_BYTES {
+                return Err(protocol("aggregate SSE wire ingress exceeds 64 MiB"));
+            }
+            zeroizing_extend(
+                &mut self.buffer,
+                &chunk,
+                MAX_EVENT_BYTES,
+                "SSE event exceeds the canonical limit",
+            )?;
             while let Some((end, delimiter)) = frame_end(&self.buffer) {
                 let frame = Zeroizing::new(self.buffer[..end].to_vec());
                 self.buffer.drain(..end + delimiter);
@@ -1515,14 +1840,31 @@ impl ModelTurn for OpenAiSubscriptionTurn {
                     self.consume_frame(&frame)?;
                 }
                 if self.pending_failure.is_some() {
-                    self.buffer.clear();
+                    self.buffer.zeroize();
                     break;
                 }
+            }
+            if self.completed && !self.buffer.is_empty() {
+                return Err(protocol("terminal response was followed by trailing bytes"));
             }
             if self.buffer.len() > MAX_EVENT_BYTES {
                 return Err(protocol("SSE event exceeds the canonical limit"));
             }
         }
+    }
+}
+
+#[async_trait]
+impl ModelTurn for OpenAiSubscriptionTurn {
+    async fn next_event(
+        &mut self,
+        cancellation: Option<agentkit_core::TurnCancellation>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError> {
+        let result = self.next_event_inner(cancellation).await;
+        if result.is_err() {
+            self.clear_error_state();
+        }
+        result
     }
 }
 
@@ -2204,6 +2546,55 @@ fn responses_header<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
         })
 }
 
+fn validated_turn_state_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<reqwest::header::HeaderValue>, LoopError> {
+    let mut state = None;
+    for value in headers.get_all(X_CODEX_TURN_STATE) {
+        if state.as_ref().is_some_and(|expected| expected != value) {
+            return Err(protocol(
+                "provider returned conflicting x-codex-turn-state headers",
+            ));
+        }
+        state = Some(value.clone());
+    }
+    Ok(state)
+}
+
+fn responses_turn_state(value: &Value) -> Result<Option<&str>, LoopError> {
+    let mut state = None;
+    for headers in [value.pointer("/response/headers"), value.get("headers")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+    {
+        for raw in headers.iter().filter_map(|(name, value)| {
+            name.eq_ignore_ascii_case(X_CODEX_TURN_STATE)
+                .then_some(value)
+        }) {
+            let values: Vec<&str> = match raw {
+                Value::String(value) => vec![value],
+                Value::Array(values) if !values.is_empty() => values
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| protocol("response metadata turn state is invalid"))?,
+                _ => return Err(protocol("response metadata turn state is invalid")),
+            };
+            for value in values {
+                value
+                    .parse::<reqwest::header::HeaderValue>()
+                    .map_err(|_| protocol("response metadata turn state is invalid"))?;
+                if state.is_some_and(|expected| expected != value) {
+                    return Err(protocol("response metadata changed x-codex-turn-state"));
+                }
+                state = Some(value);
+            }
+        }
+    }
+    Ok(state)
+}
+
 fn bounded_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, LoopError> {
     value
         .get(field)
@@ -2229,6 +2620,30 @@ fn nonnegative(value: &Value, field: &str) -> Result<u64, LoopError> {
         .get(field)
         .and_then(Value::as_u64)
         .ok_or_else(|| protocol("token usage is missing or invalid"))
+}
+
+fn zeroizing_extend(
+    buffer: &mut Zeroizing<Vec<u8>>,
+    bytes: &[u8],
+    limit: usize,
+    limit_message: &'static str,
+) -> Result<(), LoopError> {
+    let new_len = buffer
+        .len()
+        .checked_add(bytes.len())
+        .filter(|length| *length <= limit)
+        .ok_or_else(|| protocol(limit_message))?;
+    if new_len > buffer.capacity() {
+        // Vec growth can release the old allocation without wiping it. Move the
+        // live prefix ourselves, then zeroize the old allocation before release.
+        let capacity = buffer.capacity().saturating_mul(2).max(new_len).min(limit);
+        let mut replacement = Vec::with_capacity(capacity);
+        replacement.extend_from_slice(buffer);
+        let mut previous = std::mem::replace(&mut **buffer, replacement);
+        previous.zeroize();
+    }
+    buffer.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -2463,6 +2878,7 @@ async fn sleep_before_retry(
     };
     if let Some(cancel) = cancellation {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => Err(LoopError::Cancelled),
             _ = tokio::time::sleep(delay) => Ok(()),
         }
@@ -2582,12 +2998,13 @@ mod usage_tests {
 
     use super::{
         CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRIES,
-        MAX_RETRY_BACKOFF, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
-        OpenAiSubscriptionTurnInit, PROVIDER_FINISH_REASONS_METADATA, RETRY_BUDGET,
-        SubscriptionConfig, classify_response_failure, classify_top_level_error, map_item,
-        parse_context_windows, parse_usage, request_body, retriable_http_status,
-        retriable_status_code, retriable_transport_error, retry_backoff, retry_failure,
-        set_provider_finish_reasons, tool_output,
+        MAX_RETRY_BACKOFF, MAX_STREAM_BYTES, MAX_WIRE_BYTES, OpenAiSubscriptionSession,
+        OpenAiSubscriptionTurn, OpenAiSubscriptionTurnInit, PROVIDER_FINISH_REASONS_METADATA,
+        RETRY_BUDGET, ResponseFailure, SubscriptionConfig, X_CODEX_TURN_STATE,
+        classify_response_failure, classify_top_level_error, map_item, parse_context_windows,
+        parse_usage, request_body, retriable_http_status, retriable_status_code,
+        retriable_transport_error, retry_backoff, retry_failure, set_provider_finish_reasons,
+        sleep_before_retry, tool_output, zeroizing_extend,
     };
 
     #[test]
@@ -2627,6 +3044,7 @@ mod usage_tests {
         let session = OpenAiSubscriptionSession {
             config: SubscriptionConfig::new("gpt-5.4".into()).unwrap(),
             reasoning_effort: None,
+            response_attempt_replacement: false,
             client: reqwest::Client::new(),
             session_id: "provider-identity-test".into(),
             binding: super::auth::CredentialBinding {
@@ -2658,7 +3076,7 @@ mod usage_tests {
         completed
             .consume_value(
                 "response.created",
-                &json!({"type": "response.created", "response": {}}),
+                &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
             )
             .unwrap();
         completed
@@ -2666,7 +3084,7 @@ mod usage_tests {
                 "response.completed",
                 &json!({
                     "type": "response.completed",
-                    "response": {"id": "response-completed"}
+                    "response": {"id": "resp_test_123"}
                 }),
             )
             .unwrap();
@@ -2692,7 +3110,7 @@ mod usage_tests {
             incomplete
                 .consume_value(
                     "response.created",
-                    &json!({"type": "response.created", "response": {}}),
+                    &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
                 )
                 .unwrap();
             incomplete
@@ -2701,7 +3119,7 @@ mod usage_tests {
                     &json!({
                         "type": "response.incomplete",
                         "response": {
-                            "id": "response-incomplete",
+                            "id": "resp_test_123",
                             "incomplete_details": {"reason": reason}
                         }
                     }),
@@ -2735,7 +3153,7 @@ data: {"type":"keepalive","sequence_number":0}
         .unwrap();
         turn.consume_frame(
             br#"event: response.created
-data: {"type":"response.created","sequence_number":1,"response":{}}
+data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_test_123"}}
 "#,
         )
         .unwrap();
@@ -2760,7 +3178,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -2776,7 +3194,45 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         .unwrap();
 
         assert_eq!(turn.turn_state.as_deref(), Some("sticky-state"));
+        assert!(!turn.turn_state_from_header);
         assert_eq!(turn.response_model.as_deref(), Some("gpt-5.4-mini"));
+    }
+
+    #[test]
+    fn response_metadata_turn_state_must_match_existing_identity() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.turn_state = Some("http-state".to_owned());
+        turn.consume_value(
+            "response.created",
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
+        )
+        .unwrap();
+        turn.consume_value(
+            "response.metadata",
+            &json!({
+                "type": "response.metadata",
+                "headers": {"X-Codex-Turn-State": "http-state"}
+            }),
+        )
+        .unwrap();
+
+        let error = turn
+            .consume_value(
+                "response.metadata",
+                &json!({
+                    "type": "response.metadata",
+                    "response": {
+                        "headers": {"x-codex-turn-state": "http-state"}
+                    },
+                    "headers": {"X-Codex-Turn-State": "different-state"}
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("response metadata changed x-codex-turn-state"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2874,7 +3330,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -2905,7 +3361,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
             "response.completed",
             &json!({
                 "type": "response.completed",
-                "response": {"id": "response-1"}
+                "response": {"id": "resp_test_123"}
             }),
         )
         .unwrap();
@@ -2941,7 +3397,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         );
         assert_eq!(
             media.metadata[CONTINUATION_METADATA]["response_id"],
-            json!("response-1")
+            json!("resp_test_123")
         );
 
         let binding = super::auth::CredentialBinding {
@@ -2981,7 +3437,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -3030,7 +3486,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -3074,7 +3530,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -3149,7 +3605,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
             "response.completed",
             &json!({
                 "type": "response.completed",
-                "response": {"id": "response-1", "model": "gpt-5.4"}
+                "response": {"id": "resp_test_123", "model": "gpt-5.4"}
             }),
         )
         .unwrap();
@@ -3162,7 +3618,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         };
         assert_eq!(
             reasoning.metadata[CONTINUATION_METADATA]["response_id"],
-            json!("response-1")
+            json!("resp_test_123")
         );
     }
 
@@ -3171,7 +3627,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -3245,7 +3701,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
         turn.consume_value(
             "response.created",
-            &json!({"type": "response.created", "response": {}}),
+            &json!({"type": "response.created", "response": {"id": "resp_test_123"}}),
         )
         .unwrap();
         turn.consume_value(
@@ -3383,7 +3839,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
     #[tokio::test]
     async fn begin_turn_resends_after_an_early_stream_failure() {
         const SUCCESS: &[u8] = br#"event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_123"}}
 
 event: response.output_item.added
 data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
@@ -3403,7 +3859,7 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
                 let request = read_http_request(&mut socket).await;
                 idempotency_keys.push(request_header(&request, "idempotency-key"));
                 if attempt == 0 {
-                    let body = b"event: response.created\ndata: {\"type\":";
+                    let body = b": ignored first attempt\n\n";
                     socket
                         .write_all(
                             format!(
@@ -3440,6 +3896,7 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
                 .unwrap()
                 .with_endpoint(format!("http://{address}/responses")),
             reasoning_effort: None,
+            response_attempt_replacement: false,
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             session_id: "stream-retry-test".into(),
             binding,
@@ -3460,6 +3917,416 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
         assert_eq!(idempotency_keys.len(), 2);
         assert!(!idempotency_keys[0].is_empty());
         assert_eq!(idempotency_keys[0], idempotency_keys[1]);
+    }
+
+    fn push_sse(body: &mut Vec<u8>, kind: &str, value: serde_json::Value) {
+        body.extend_from_slice(format!("event: {kind}\ndata: {value}\n\n").as_bytes());
+    }
+
+    fn text_attempt(response_id: &str, item_id: &str, text: &str, completed: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_sse(
+            &mut body,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": response_id}
+            }),
+        );
+        push_sse(
+            &mut body,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {"id": item_id}
+            }),
+        );
+        push_sse(
+            &mut body,
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 2,
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text
+            }),
+        );
+        if completed {
+            push_sse(
+                &mut body,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 0,
+                    "item": {
+                        "id": item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}]
+                    }
+                }),
+            );
+            push_sse(
+                &mut body,
+                "response.completed",
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 4,
+                    "response": {"id": response_id, "model": "gpt-5.4"}
+                }),
+            );
+        }
+        body
+    }
+
+    fn failed_text_and_tool_attempt() -> Vec<u8> {
+        let mut body = text_attempt("resp_failed", "text-failed", "discard me", false);
+        push_sse(
+            &mut body,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 3,
+                "output_index": 1,
+                "item": {"id": "tool-failed"}
+            }),
+        );
+        push_sse(
+            &mut body,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 1,
+                "item": {
+                    "id": "tool-failed",
+                    "type": "function_call",
+                    "call_id": "call-failed",
+                    "name": "dangerous_tool",
+                    "arguments": "{}"
+                }
+            }),
+        );
+        body
+    }
+
+    async fn write_sse_response(
+        socket: &mut tokio::net::TcpStream,
+        body: &[u8],
+        declared_length: usize,
+    ) {
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(body).await.unwrap();
+        socket.shutdown().await.unwrap();
+    }
+
+    fn replacement_test_session(
+        address: std::net::SocketAddr,
+        enabled: bool,
+    ) -> OpenAiSubscriptionSession {
+        let credentials = super::auth::TokenRecord::for_test("access", "test-account");
+        let binding = credentials.binding().unwrap();
+        OpenAiSubscriptionSession {
+            config: SubscriptionConfig::new("gpt-5.4".into())
+                .unwrap()
+                .with_endpoint(format!("http://{address}/responses")),
+            reasoning_effort: None,
+            response_attempt_replacement: enabled,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            session_id: "response-replacement-test".into(),
+            binding,
+            context_windows: Arc::new(HashMap::new()),
+            test_credentials: Some(credentials),
+        }
+    }
+
+    fn replacement_test_request() -> agentkit_loop::TurnRequest {
+        agentkit_loop::TurnRequest {
+            session_id: SessionId::new("response-replacement-test"),
+            turn_id: TurnId::new("turn-1"),
+            transcript: vec![Item::text(ItemKind::User, "hello")],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn nondeterministic_response_replacement_is_authoritative_and_ordered() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let failed = failed_text_and_tool_attempt();
+        let replacement = text_attempt("resp_replacement", "text-replacement", "keep me", true);
+        let server = tokio::spawn(async move {
+            let mut keys = Vec::new();
+            for (attempt, body) in [failed, replacement].into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                keys.push(request_header(&request, "idempotency-key"));
+                let declared = body.len() + if attempt == 0 { 1_024 } else { 0 };
+                write_sse_response(&mut socket, &body, declared).await;
+            }
+            keys
+        });
+
+        let mut session = replacement_test_session(address, true);
+        let mut turn = session
+            .begin_turn(replacement_test_request(), None)
+            .await
+            .unwrap();
+        let mut observed = Vec::new();
+        let mut finished = None;
+        while let Some(event) = turn.next_event(None).await.unwrap() {
+            match &event {
+                ModelTurnEvent::ToolCall(call) => {
+                    panic!(
+                        "tool call escaped before replacement completed: {}",
+                        call.name
+                    )
+                }
+                ModelTurnEvent::Finished(result) => finished = Some(result.clone()),
+                _ => {}
+            }
+            observed.push(event);
+        }
+
+        let markers = observed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ModelTurnEvent::Delta(delta) if crate::response_attempt::is_marker(delta) => {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1);
+        let chunks = observed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) => {
+                    Some((index, chunk.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            ["discard me", "keep me"]
+        );
+        assert!(chunks[0].0 < markers[0] && markers[0] < chunks[1].0);
+
+        let finished = finished.expect("replacement must finish");
+        let final_text = finished
+            .output_items
+            .iter()
+            .flat_map(|item| &item.parts)
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(final_text, "keep me");
+        assert!(!final_text.contains("discard me"));
+        assert_eq!(finished.response_id.as_deref(), Some("resp_replacement"));
+
+        let keys = server.await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], keys[1]);
+    }
+
+    #[tokio::test]
+    async fn repeated_response_replacement_emits_one_marker_per_escaped_attempt() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = [
+            text_attempt("resp_one", "item-one", "one", false),
+            text_attempt("resp_two", "item-two", "two", false),
+            text_attempt("resp_three", "item-three", "three", true),
+        ];
+        let server = tokio::spawn(async move {
+            for (index, body) in attempts.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                let declared = body.len() + if index < 2 { 1_024 } else { 0 };
+                write_sse_response(&mut socket, &body, declared).await;
+            }
+        });
+
+        let mut session = replacement_test_session(address, true);
+        let mut turn = session
+            .begin_turn(replacement_test_request(), None)
+            .await
+            .unwrap();
+        let mut order = Vec::new();
+        while let Some(event) = turn.next_event(None).await.unwrap() {
+            match event {
+                ModelTurnEvent::Delta(ref delta) if crate::response_attempt::is_marker(delta) => {
+                    order.push("marker".to_owned());
+                }
+                ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) => order.push(chunk),
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["one", "marker", "two", "marker", "three"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outputless_replacement_failures_keep_retrying_without_extra_markers() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = [
+            text_attempt("resp_visible", "item-visible", "discard", false),
+            Vec::new(),
+            Vec::new(),
+            text_attempt("resp_final", "item-final", "keep", true),
+        ];
+        let server = tokio::spawn(async move {
+            for (index, body) in attempts.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                let declared = body.len() + if index < 3 { 1_024 } else { 0 };
+                write_sse_response(&mut socket, &body, declared).await;
+            }
+        });
+
+        let mut session = replacement_test_session(address, true);
+        let mut turn = session
+            .begin_turn(replacement_test_request(), None)
+            .await
+            .unwrap();
+        let mut order = Vec::new();
+        while let Some(event) = turn.next_event(None).await.unwrap() {
+            match event {
+                ModelTurnEvent::Delta(ref delta) if crate::response_attempt::is_marker(delta) => {
+                    order.push("marker".to_owned());
+                }
+                ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) => order.push(chunk),
+                _ => {}
+            }
+        }
+        assert_eq!(order, ["discard", "marker", "keep"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_turn_state_is_sent_and_retained_across_retries() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut metadata_only = Vec::new();
+        push_sse(
+            &mut metadata_only,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {"id": "resp_metadata"}
+            }),
+        );
+        push_sse(
+            &mut metadata_only,
+            "response.metadata",
+            json!({
+                "type": "response.metadata",
+                "sequence_number": 1,
+                "headers": {"x-codex-turn-state": "metadata-state"}
+            }),
+        );
+        let attempts = [
+            metadata_only,
+            Vec::new(),
+            text_attempt("resp_final", "item-final", "done", true),
+        ];
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (index, body) in attempts.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut socket).await);
+                let declared = body.len() + if index < 2 { 1_024 } else { 0 };
+                write_sse_response(&mut socket, &body, declared).await;
+            }
+            requests
+        });
+
+        let mut session = replacement_test_session(address, true);
+        let mut turn = session
+            .begin_turn(replacement_test_request(), None)
+            .await
+            .unwrap();
+        while turn.next_event(None).await.unwrap().is_some() {}
+
+        let requests = server.await.unwrap();
+        assert_eq!(
+            request_header(&requests[1], X_CODEX_TURN_STATE),
+            "metadata-state"
+        );
+        assert_eq!(
+            request_header(&requests[2], X_CODEX_TURN_STATE),
+            "metadata-state"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_event_failure_is_fatal_without_replacement_capability() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let failed = text_attempt("resp_failed", "item-failed", "visible", false);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            let declared = failed.len() + 1_024;
+            write_sse_response(&mut socket, &failed, declared).await;
+        });
+
+        let mut session = replacement_test_session(address, false);
+        let mut turn = session
+            .begin_turn(replacement_test_request(), None)
+            .await
+            .unwrap();
+        assert!(turn.request_context.is_none());
+        let mut saw_text = false;
+        let error = loop {
+            match turn.next_event(None).await {
+                Ok(Some(ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }))) => {
+                    saw_text |= chunk == "visible";
+                }
+                Ok(Some(ModelTurnEvent::Delta(ref delta))) => {
+                    assert!(!crate::response_attempt::is_marker(delta));
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("truncated attempt unexpectedly completed"),
+                Err(error) => break error,
+            }
+        };
+        assert!(saw_text);
+        assert!(matches!(error, LoopError::Provider(_)));
+        server.await.unwrap();
     }
 
     async fn truncated_reqwest_response(body: &'static [u8]) -> reqwest::Response {
@@ -3512,20 +4379,25 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
                 requested_model: "gpt-5.4".into(),
                 header_model: None,
                 turn_state: None,
+                turn_state_from_header: false,
                 binding: super::auth::CredentialBinding {
                     account_id: "test-account".to_owned(),
                     generation: "test-generation".to_owned(),
                 },
                 session_id: "s".to_owned(),
                 context_windows: Arc::new(HashMap::new()),
+                response_attempt_replacement: false,
                 attempt: 1,
                 response_request_id: request_id,
+                wire_bytes: 0,
+                attempt_wire_bytes: 0,
+                request_context: None,
             },
         )
     }
 
     #[tokio::test]
-    async fn truncated_reqwest_body_is_retryable_only_before_a_model_event() {
+    async fn truncated_reqwest_body_is_retryable_before_and_after_a_model_event() {
         let mut stream = truncated_reqwest_response(b"incomplete")
             .await
             .bytes_stream();
@@ -3569,7 +4441,7 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
 
         let mut late = turn_from_truncated_reqwest_response(
             br#"event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_123"}}
 
 event: response.output_item.added
 data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
@@ -3591,8 +4463,8 @@ data: {"# ,
         };
         let diagnostics =
             crate::fatal::transport_diagnostics_json(&error).expect("transport marker");
-        assert!(!late.retryable_transport_failure);
-        assert_eq!(diagnostics["retryable"], false);
+        assert!(late.retryable_transport_failure);
+        assert_eq!(diagnostics["retryable"], true);
         assert_eq!(diagnostics["reqwest"]["decode"], true);
     }
 
@@ -3670,7 +4542,7 @@ data: {"# ,
     async fn queued_output_precedes_a_terminal_top_level_error() {
         let chunk = Bytes::from_static(
             br#"event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_123"}}
 
 event: response.output_item.added
 data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
@@ -3705,11 +4577,239 @@ data: {"type":"future.event","sequence_number":4}
         assert!(!error.contains("unknown Responses SSE event"));
     }
 
+    #[test]
+    fn terminal_response_id_must_match_response_created() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        turn.consume_value(
+            "response.created",
+            &json!({
+                "type": "response.created",
+                "response": {"id": "resp_stable_123"}
+            }),
+        )
+        .unwrap();
+        let error = turn
+            .consume_value(
+                "response.completed",
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_changed_456"}
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed the response.created ID"), "{error}");
+        assert!(turn.request_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_response_rejects_partial_trailing_bytes_in_the_same_chunk() {
+        for terminal in [
+            r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_test_123"}}
+
+"#,
+            r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_test_123","incomplete_details":{"reason":"max_output_tokens"}}}
+
+"#,
+        ] {
+            let body = format!(
+                "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_test_123\"}}}}\n\n{terminal}partial"
+            );
+            let mut turn = OpenAiSubscriptionTurn::new(
+                stream::iter([Ok::<_, reqwest::Error>(Bytes::from(body))]),
+                "gpt-5.4".into(),
+                None,
+            );
+
+            let error = turn.next_event(None).await.unwrap_err().to_string();
+            assert!(
+                error.contains("terminal response was followed by trailing bytes"),
+                "{error}"
+            );
+            assert!(turn.buffer.is_empty());
+        }
+    }
+
+    #[test]
+    fn zeroizing_extend_grows_geometrically_within_limit() {
+        const CHUNK_BYTES: usize = 8 * 1024;
+        const LIMIT: usize = 64 * 1024;
+
+        let mut buffer = zeroize::Zeroizing::new(Vec::new());
+        let mut previous_capacity = 0;
+        let mut growths = 0;
+        for _ in 0..LIMIT / CHUNK_BYTES {
+            zeroizing_extend(&mut buffer, &[0x5a; CHUNK_BYTES], LIMIT, "test limit").unwrap();
+            let capacity = buffer.capacity();
+            assert!(capacity >= buffer.len());
+            assert!(capacity <= LIMIT);
+            if capacity != previous_capacity {
+                growths += 1;
+                if previous_capacity > 0 {
+                    assert!(capacity >= (previous_capacity * 2).min(LIMIT));
+                }
+                previous_capacity = capacity;
+            }
+        }
+
+        assert!(growths <= 4, "8 KiB chunks caused {growths} reallocations");
+    }
+
+    #[tokio::test]
+    async fn wire_bytes_count_toward_aggregate_limit() {
+        let mut within_limit = OpenAiSubscriptionTurn::new(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"ab"))]),
+            "gpt-5.4".into(),
+            None,
+        );
+        within_limit.wire_bytes = MAX_WIRE_BYTES - 2;
+        let error = within_limit.next_event(None).await.unwrap_err().to_string();
+        assert!(
+            error.contains("SSE stream closed before response.completed"),
+            "{error}"
+        );
+        assert!(!error.contains("aggregate SSE wire ingress"), "{error}");
+
+        let mut turn = OpenAiSubscriptionTurn::new(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"ab"))]),
+            "gpt-5.4".into(),
+            None,
+        );
+        turn.wire_bytes = MAX_WIRE_BYTES - 1;
+        let error = turn.next_event(None).await.unwrap_err().to_string();
+        assert!(
+            error.contains("aggregate SSE wire ingress exceeds 64 MiB"),
+            "{error}"
+        );
+
+        let mut per_attempt = OpenAiSubscriptionTurn::new(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"ab"))]),
+            "gpt-5.4".into(),
+            None,
+        );
+        per_attempt.wire_bytes = 123;
+        per_attempt.attempt_wire_bytes = MAX_STREAM_BYTES - 1;
+        let error = per_attempt.next_event(None).await.unwrap_err().to_string();
+        assert!(
+            error.contains("per-attempt SSE wire ingress exceeds 16 MiB"),
+            "{error}"
+        );
+
+        per_attempt.attempt_wire_bytes = 456;
+        per_attempt.reset_attempt_state();
+        assert_eq!(per_attempt.attempt_wire_bytes, 0);
+        assert_eq!(per_attempt.wire_bytes, 123);
+    }
+
+    #[tokio::test]
+    async fn ready_cancellation_wins_over_zero_retry_sleep() {
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        controller.interrupt();
+        assert!(matches!(
+            sleep_before_retry(Some(Duration::ZERO), Some(cancellation)).await,
+            Err(LoopError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn required_replacement_marker_precedes_cancellation() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        let credentials = super::auth::TokenRecord::for_test("sensitive-access", "test-account");
+        let binding = credentials.binding().unwrap();
+        turn.request_context = Some(super::OpenAiSubscriptionRequestContext {
+            config: SubscriptionConfig::new("gpt-5.4".into()).unwrap(),
+            client: reqwest::Client::new(),
+            binding,
+            session_id: "sensitive-session".to_owned(),
+            body_bytes: zeroize::Zeroizing::new(b"sensitive request body".to_vec()),
+            idempotency_key: "sensitive-idempotency-key".to_owned(),
+            started: tokio::time::Instant::now(),
+            retries: 0,
+            credentials,
+            unauthorized: false,
+            turn_state: None,
+            turn_state_from_header: false,
+            wire_bytes: 0,
+            test_credentials: None,
+        });
+        turn.response_attempt_replacement = true;
+        turn.model_event_emitted = true;
+        turn.append_text_emitted = true;
+        turn.pending_failure = Some(ResponseFailure {
+            message: "retry me".to_owned(),
+            retriable: true,
+            retry_after: Some(Duration::ZERO),
+        });
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        controller.interrupt();
+
+        let marker = turn
+            .next_event(Some(cancellation.clone()))
+            .await
+            .unwrap()
+            .expect("required marker");
+        assert!(matches!(
+            marker,
+            ModelTurnEvent::Delta(ref delta) if crate::response_attempt::is_marker(delta)
+        ));
+        assert!(matches!(
+            turn.next_event(Some(cancellation)).await,
+            Err(LoopError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_reopen_is_not_retryable_before_first_outward_event() {
+        let mut turn = OpenAiSubscriptionTurn::new(stream::empty(), "gpt-5.4".into(), None);
+        let credentials = super::auth::TokenRecord::for_test("sensitive-access", "test-account");
+        let binding = credentials.binding().unwrap();
+        turn.request_context = Some(super::OpenAiSubscriptionRequestContext {
+            config: SubscriptionConfig::new("gpt-5.4".into()).unwrap(),
+            client: reqwest::Client::new(),
+            binding,
+            session_id: "sensitive-session".to_owned(),
+            body_bytes: zeroize::Zeroizing::new(b"sensitive request body".to_vec()),
+            idempotency_key: "sensitive-idempotency-key".to_owned(),
+            started: tokio::time::Instant::now(),
+            retries: 0,
+            credentials,
+            unauthorized: false,
+            turn_state: None,
+            turn_state_from_header: false,
+            wire_bytes: 0,
+            test_credentials: None,
+        });
+        turn.retryable_transport_failure = true;
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        controller.interrupt();
+
+        assert!(
+            turn.schedule_reopen(
+                LoopError::Provider("retryable stream failure".to_owned()),
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(matches!(
+            turn.reopen_stream(Some(cancellation)).await,
+            Err(LoopError::Cancelled)
+        ));
+        assert!(!turn.model_event_emitted);
+        assert!(!turn.retryable_transport_failure);
+        assert!(turn.request_context.is_none());
+    }
+
     #[tokio::test]
     async fn cancellation_wins_over_prefetched_output() {
         let chunk = Bytes::from_static(
             br#"event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_test_123"}}
 
 event: response.output_item.added
 data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"item-1"}}
@@ -3731,12 +4831,39 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
             turn.next_event(Some(cancellation.clone())).await.unwrap(),
             Some(ModelTurnEvent::Delta(_))
         ));
+        let credentials = super::auth::TokenRecord::for_test("sensitive-access", "test-account");
+        let binding = credentials.binding().unwrap();
+        turn.request_context = Some(super::OpenAiSubscriptionRequestContext {
+            config: SubscriptionConfig::new("gpt-5.4".into()).unwrap(),
+            client: reqwest::Client::new(),
+            binding,
+            session_id: "sensitive-session".to_owned(),
+            body_bytes: zeroize::Zeroizing::new(b"sensitive request body".to_vec()),
+            idempotency_key: "sensitive-idempotency-key".to_owned(),
+            started: tokio::time::Instant::now(),
+            retries: 0,
+            credentials,
+            unauthorized: false,
+            turn_state: None,
+            turn_state_from_header: false,
+            wire_bytes: turn.wire_bytes,
+            test_credentials: None,
+        });
+        zeroizing_extend(
+            &mut turn.buffer,
+            b"sensitive partial parser bytes",
+            MAX_STREAM_BYTES,
+            "test limit",
+        )
+        .unwrap();
         controller.interrupt();
 
         assert!(matches!(
             turn.next_event(Some(cancellation)).await,
             Err(LoopError::Cancelled)
         ));
+        assert!(turn.request_context.is_none());
+        assert!(turn.buffer.is_empty());
     }
 
     #[test]
