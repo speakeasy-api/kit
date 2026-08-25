@@ -1,0 +1,13 @@
+# Send only inputs required to compile the Kit binary.
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!build.rs
+!src/
+!src/**
+!docs/
+!docs/user/
+!docs/user/**
+!Dockerfile
+!.dockerignore
