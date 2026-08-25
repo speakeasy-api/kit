@@ -56,15 +56,15 @@ return published
 
 Calls lexically created inside the `after` block start only after `prepared` succeeds. If the prerequisite fails, dependent work does not run. Ordering one call does not make the whole program sequential; unrelated nodes may still overlap. Add explicit data dependencies or `after` edges around every required read-before-write or write-before-write relationship. In particular, do not launch concurrent edits of the same path or let a check race the command that creates its input.
 
-## Activate Agent Skills
+## Load Agent Skills
 
-When valid skills exist under `<root>/.agents/skills` or `~/.agents/skills`, the hidden `activate_skill` tool lists their names and descriptions. If a task matches one, return the activation result through `compose` before proceeding so the instructions enter the model conversation:
+When valid skills exist under `<root>/.agents/skills` or `~/.agents/skills`, the hidden `skill` tool lists their names and descriptions. If a task matches one, return the loaded skill through `compose` before proceeding so the instructions enter the model conversation:
 
 ```text
-return activate_skill({ name: "review" })
+return skill({ name: "review" })
 ```
 
-Activation progressively discloses the skill's full `SKILL.md` body, directory, and resource paths. A hidden child result that is discarded by the Runlet is not separately added to the conversation, so do not call `activate_skill` without returning its value. The available-name schema is captured when the compose source is created; start a new session after changing the installed skill set.
+Loading progressively discloses the skill's full `SKILL.md` body, directory, and resource paths. A hidden child result that is discarded by the Runlet is not separately added to the conversation, so do not call `skill` without returning its value. Skills can be loaded repeatedly. The available-name schema is captured when the compose source is created; start a new session after changing the installed skill set.
 
 ## Run commands with `shell`
 

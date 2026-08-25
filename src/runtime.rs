@@ -627,7 +627,7 @@ impl Runtime {
             .register(Observed::new(AuthTool::new(self.mcp.clone())))
             .register(Observed::new(McpTool::new(self.mcp.clone())));
         let skill_tools = skills.tool_registry();
-        if let Some(skill_tool) = skill_tools.get(&ToolName::new("activate_skill")) {
+        if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
             children.register(observe_shared(skill_tool));
         }
         let child_specs = children.specs();
@@ -695,7 +695,6 @@ impl Runtime {
             self.adapter.clone(),
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
-            Arc::clone(&skills),
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(|error| {
@@ -794,7 +793,6 @@ impl Runtime {
             self.adapter.clone(),
             self.agentkit_telemetry(),
             None,
-            Arc::clone(&skills),
             format!("compaction-{session}"),
         )
         .map_err(LoopError::InvalidState)?;
@@ -907,7 +905,6 @@ impl Runtime {
             adapter.clone(),
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
-            Arc::clone(&skills),
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;

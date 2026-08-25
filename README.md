@@ -349,7 +349,7 @@ scope that could safely support unattended approval.
 
 ## Agent Plugins
 
-Kit loads validated Agent Plugin packages from local directories and SHA-256-pinned ZIP, tar.gz, or tar URLs. Plugin skills join the existing `activate_skill` catalog, and supported plugin MCP declarations work without an explicit MCP JSON file. Kit runs plugin `stdio` servers and connects `streamable-http` servers; deprecated `sse` entries are skipped with a stderr diagnostic. An explicit `--mcp-config` or `mcp_config` file overlays plugins by server name and remains live-reloadable. See [Agent Plugins](docs/user/agent-plugins.md) for placeholders, data directories, collisions, precedence, and security details.
+Kit loads validated Agent Plugin packages from local directories and SHA-256-pinned ZIP, tar.gz, or tar URLs. Plugin skills join the existing `skill` catalog, and supported plugin MCP declarations work without an explicit MCP JSON file. Kit runs plugin `stdio` servers and connects `streamable-http` servers; deprecated `sse` entries are skipped with a stderr diagnostic. An explicit `--mcp-config` or `mcp_config` file overlays plugins by server name and remains live-reloadable. See [Agent Plugins](docs/user/agent-plugins.md) for placeholders, data directories, collisions, precedence, and security details.
 
 ## MCP
 

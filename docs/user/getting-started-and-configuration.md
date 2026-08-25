@@ -261,7 +261,7 @@ description: Review code changes for correctness.
 Review the change and run the smallest relevant checks.
 ```
 
-The `activate_skill` entry in `compose` initially discloses only valid skill names and descriptions. When a task matches, the agent activates the skill before proceeding; activation returns the full Markdown body, skill directory, and paths to supporting resources. Project and user skill files are read with the Kit process's normal host permissions. Invalid or unreadable skills are omitted, and repeated activation of the same skill is deduplicated for a session within the current Kit process.
+The `skill` entry in `compose` initially discloses only valid skill names and descriptions. When a task matches, the agent loads the skill before proceeding; the result contains the full Markdown body, skill directory, and paths to supporting resources. Project and user skill files are read with the Kit process's normal host permissions. Invalid or unreadable skills are omitted, and the same skill can be loaded repeatedly.
 
 The hidden-tool catalog is captured when Kit creates the session's compose source. Restart the session after adding or removing a skill so its advertised schema is refreshed.
 
