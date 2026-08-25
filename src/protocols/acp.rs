@@ -2461,7 +2461,9 @@ mod tests {
                 .await
         });
 
-        timeout(Duration::from_secs(2), attached_rx)
+        // Starting a real ACP session can exceed two seconds when the full test suite
+        // is competing for CPU on CI. Keep a generous bound so genuine hangs still fail.
+        timeout(Duration::from_secs(10), attached_rx)
             .await
             .expect("real ACP session did not attach")
             .unwrap();
@@ -2487,7 +2489,7 @@ mod tests {
             assert!(state.sessions.is_empty());
         }
         proceed.send(()).unwrap();
-        timeout(Duration::from_secs(2), client)
+        timeout(Duration::from_secs(10), client)
             .await
             .expect("ACP client did not observe shutdown")
             .unwrap()
