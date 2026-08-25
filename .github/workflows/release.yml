@@ -210,6 +210,224 @@ jobs:
             --prerelease="$prerelease"
           )
           if [[ $prerelease == false ]]; then
-            edit_args+=(--latest)
+            newest_stable=$(
+              gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+                --json tagName,isDraft,isPrerelease \
+                --jq '.[] | select((.isDraft | not) and (.isPrerelease | not)) | .tagName' \
+                | sort -V | tail -1
+            )
+            if [[ $GITHUB_REF_NAME == "$newest_stable" ]]; then
+              edit_args+=(--latest)
+            fi
           fi
           gh release edit "${edit_args[@]}"
+
+  container-build:
+    name: Build container images (${{ matrix.arch }})
+    needs: publish
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Read container version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push slim image by digest
+        id: slim
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          target: slim
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            REVISION=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Build and push Bookworm image by digest
+        id: bookworm
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          target: bookworm
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            REVISION=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Build and push Alpine image by digest
+        id: alpine
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          target: alpine
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            REVISION=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export image digests
+        env:
+          SLIM_DIGEST: ${{ steps.slim.outputs.digest }}
+          BOOKWORM_DIGEST: ${{ steps.bookworm.outputs.digest }}
+          ALPINE_DIGEST: ${{ steps.alpine.outputs.digest }}
+        shell: bash
+        run: |
+          mkdir -p /tmp/digests/{slim,bookworm,alpine}
+          touch "/tmp/digests/slim/${SLIM_DIGEST#sha256:}"
+          touch "/tmp/digests/bookworm/${BOOKWORM_DIGEST#sha256:}"
+          touch "/tmp/digests/alpine/${ALPINE_DIGEST#sha256:}"
+      - name: Upload image digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: container-digests-${{ matrix.arch }}
+          path: /tmp/digests
+          if-no-files-found: error
+          retention-days: 1
+
+  containers:
+    name: Publish container image manifests
+    needs: [publish, container-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: container-digests-*
+          path: /tmp/digests
+          merge-multiple: true
+      - name: Read release metadata
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF_NAME == *-pre* ]]; then
+            echo "floating=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest_stable=$(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName,isDraft,isPrerelease \
+              --jq '.[] | select((.isDraft | not) and (.isPrerelease | not)) | .tagName' \
+              | sort -V | tail -1
+          )
+          if [[ $GITHUB_REF_NAME == "$newest_stable" ]]; then
+            echo "floating=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "floating=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate slim image metadata
+        id: slim-meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=raw,value=${{ github.ref_name }}-slim
+            type=raw,value=latest,enable=${{ steps.release.outputs.floating == 'true' }}
+            type=raw,value=slim,enable=${{ steps.release.outputs.floating == 'true' }}
+      - name: Publish slim manifest
+        env:
+          METADATA: ${{ steps.slim-meta.outputs.json }}
+        shell: bash
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
+          mapfile -t digests < <(find /tmp/digests/slim -type f -printf "${IMAGE}@sha256:%f\n")
+          args=()
+          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
+          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+
+      - name: Generate Bookworm image metadata
+        id: bookworm-meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }}-bookworm
+            type=raw,value=bookworm,enable=${{ steps.release.outputs.floating == 'true' }}
+      - name: Publish Bookworm manifest
+        env:
+          METADATA: ${{ steps.bookworm-meta.outputs.json }}
+        shell: bash
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
+          mapfile -t digests < <(find /tmp/digests/bookworm -type f -printf "${IMAGE}@sha256:%f\n")
+          args=()
+          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
+          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+
+      - name: Generate Alpine image metadata
+        id: alpine-meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ github.ref_name }}-alpine
+            type=raw,value=alpine,enable=${{ steps.release.outputs.floating == 'true' }}
+      - name: Publish Alpine manifest
+        env:
+          METADATA: ${{ steps.alpine-meta.outputs.json }}
+        shell: bash
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
+          mapfile -t digests < <(find /tmp/digests/alpine -type f -printf "${IMAGE}@sha256:%f\n")
+          args=()
+          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
+          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+
+      - name: Verify container package is public
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          package=${GITHUB_REPOSITORY#*/}
+          visibility=$(
+            gh api "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}" \
+              --jq .visibility
+          )
+          if [[ $visibility != public ]]; then
+            echo "::error::Set the ${package} container package visibility to public, then rerun this workflow."
+            echo "https://github.com/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/settings"
+            exit 1
+          fi

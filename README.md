@@ -32,6 +32,50 @@ kit --version
 Pin a release by appending its version, for example
 `github:speakeasy-api/kit@0.1.83`.
 
+### Container image flavors
+
+The repository Dockerfile builds three user-agnostic runtime flavors. The
+unqualified `default` target aliases `slim`.
+
+```sh
+docker build --target bookworm -t kit:bookworm . # Debian/glibc
+docker build --target slim -t kit:slim .         # Debian slim/glibc (default)
+docker build --target alpine -t kit:alpine .     # Alpine/musl
+docker build -t kit:local .                      # same as slim
+```
+
+Each release publishes public `linux/amd64` and `linux/arm64` images to
+`ghcr.io/speakeasy-api/kit`. Versioned tags include `v<version>`,
+`v<version>-slim`, `v<version>-bookworm`, and `v<version>-alpine`. The newest
+stable release also updates `latest`, `slim`, `bookworm`, and `alpine`;
+prereleases and older stable reruns do not update floating tags. GitHub creates a new GHCR package as private, so an
+organization administrator must set the package visibility to public after its
+first push; the release workflow verifies this setting. For example:
+
+```sh
+docker pull ghcr.io/speakeasy-api/kit:v0.1.87
+```
+
+The Debian flavors share a native glibc build; Alpine uses a separate native musl
+build. All flavors include CA certificates and a POSIX shell, and run as the
+non-root `kit` user with UID and GID `1000` from `/workspace`. Bind-mounted
+workspaces must be writable by that identity.
+
+The base images intentionally omit Git, language toolchains, and project-specific
+utilities. A downstream image can install what it needs by switching to root and
+then restoring the `kit` user:
+
+```dockerfile
+FROM ghcr.io/speakeasy-api/kit:v0.1.87-slim
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+USER kit
+```
+
+Run `docker run --rm kit:local --version` to verify a local build.
+
 ## Run
 
 Authenticate your ChatGPT subscription once, then start the TUI:
