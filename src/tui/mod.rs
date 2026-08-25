@@ -99,6 +99,8 @@ struct DetachComposeResponse {
 /// How long the agent gets to answer the ACP handshake before the client gives
 /// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
 const HANDSHAKE: Duration = Duration::from_secs(30);
+/// Grace for an ACP session to close before the backend is terminated.
+const CLOSE_SESSION: Duration = Duration::from_secs(3);
 /// Grace for the agent's last diagnostics to arrive once it has exited.
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
@@ -466,6 +468,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let active_session_id = durable_session_id(&session_id).map_err(|error| {
                 agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
             })?;
+            // Install every fallible signal handler before changing terminal modes so
+            // an installation failure cannot leave the caller's terminal altered.
+            let mut stop =
+                Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut terminal =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut app = App::new(
@@ -483,8 +489,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut stop =
-                Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
                     terminal
@@ -786,12 +790,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
-            let closed = connection
-                .send_request(CloseSessionRequest::new(session_id))
-                .block_task()
-                .await;
+            let closed = bounded_graceful_close(
+                connection
+                    .send_request(CloseSessionRequest::new(session_id))
+                    .block_task(),
+                stop.requested(),
+                CLOSE_SESSION,
+            )
+            .await;
             result?;
-            closed?;
+            if let Some(closed) = closed {
+                closed?;
+            }
             Ok(())
         })
         .await
@@ -1142,6 +1152,8 @@ fn restore_modes() {
 /// session and returning through the normal exit keeps that from happening.
 struct Stop {
     #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
     #[cfg(unix)]
     hangup: tokio::signal::unix::Signal,
@@ -1152,6 +1164,7 @@ impl Stop {
     fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
             hangup: signal(SignalKind::hangup())?,
         })
@@ -1165,6 +1178,7 @@ impl Stop {
     #[cfg(unix)]
     async fn requested(&mut self) {
         tokio::select! {
+            _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
             _ = self.hangup.recv() => {}
         }
@@ -1173,6 +1187,18 @@ impl Stop {
     #[cfg(not(unix))]
     async fn requested(&mut self) {
         std::future::pending().await
+    }
+}
+
+async fn bounded_graceful_close<T>(
+    close: impl std::future::Future<Output = T>,
+    stop: impl std::future::Future<Output = ()>,
+    grace: Duration,
+) -> Option<T> {
+    tokio::select! {
+        output = close => Some(output),
+        () = stop => None,
+        () = tokio::time::sleep(grace) => None,
     }
 }
 
@@ -1990,9 +2016,31 @@ a = [still text]
 
 #[cfg(test)]
 mod signal_tests {
-    use std::time::Duration;
+    use std::{future, time::Duration};
 
-    use super::Stop;
+    use super::{Stop, bounded_graceful_close};
+
+    #[tokio::test]
+    async fn a_stuck_close_is_bounded() {
+        let closed = bounded_graceful_close(
+            future::pending::<()>(),
+            future::pending(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(closed.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_stop_escapes_a_stuck_close() {
+        let closed = bounded_graceful_close(
+            future::pending::<()>(),
+            future::ready(()),
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(closed.is_none());
+    }
 
     /// A client killed from outside must still reach its restore path, or it
     /// leaves the shell in raw mode with mouse reporting on.

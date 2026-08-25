@@ -18,7 +18,7 @@ use agentkit_acp::{
 use agentkit_core::{
     CancellationController, FinishReason, Item, ItemKind, Part, SessionId, ToolOutput,
 };
-use agentkit_loop::{LoopDriver, LoopInterrupt, LoopStep, ModelSession};
+use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -44,8 +44,40 @@ fn available_commands_update(session_id: wire::SessionId) -> wire::UpdateSession
     )
 }
 
+fn complete_new_session<E>(
+    response: wire::NewSessionResponse,
+    activation: oneshot::Sender<()>,
+    respond: impl FnOnce(wire::NewSessionResponse) -> Result<(), E>,
+    notify: impl FnOnce(wire::UpdateSessionNotification) -> Result<(), E>,
+) -> Result<(), E> {
+    let session_id = response.session_id.clone();
+    respond(response)?;
+    let _ = activation.send(());
+    notify(available_commands_update(session_id))
+}
+
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(error.to_string())
+}
+
+fn map_loop_error(session_id: &wire::SessionId, error: &LoopError) -> AcpRuntimeError {
+    if matches!(error, LoopError::Cancelled) {
+        AcpRuntimeError::Cancelled
+    } else {
+        let session_id = agentkit_acp::SessionId::new(session_id.to_string());
+        super::record_acp_loop_failure(&session_id, error)
+    }
+}
+
+fn loop_error_stop_reason(
+    session_id: &wire::SessionId,
+    error: &LoopError,
+) -> Result<wire::StopReason, AcpRuntimeError> {
+    if matches!(error, LoopError::Cancelled) {
+        Ok(wire::StopReason::Cancelled)
+    } else {
+        Err(map_loop_error(session_id, error))
+    }
 }
 
 fn claim_prompt(busy: &AtomicBool) -> Result<(), AcpRuntimeError> {
@@ -186,7 +218,7 @@ impl Server {
         self: &Arc<Self>,
         request: wire::NewSessionRequest,
         connection: V2ConnectionTo<Client>,
-    ) -> Result<wire::NewSessionResponse, AcpRuntimeError> {
+    ) -> Result<(wire::NewSessionResponse, oneshot::Sender<()>), AcpRuntimeError> {
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
@@ -206,8 +238,10 @@ impl Server {
             activation,
             ..
         } = attached;
-        let _ = activation.send(());
-        Ok(wire::NewSessionResponse::new(session_id).config_options(config_options))
+        Ok((
+            wire::NewSessionResponse::new(session_id).config_options(config_options),
+            activation,
+        ))
     }
 
     async fn resume_session(
@@ -649,31 +683,37 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
             },
             event = mcp_events.recv() => {
-                if let Some(event) = event
-                    && driver.submit_input(vec![Item::notification(event.message)]).is_ok()
-                {
-                    drive_autonomous(
-                        &session_id,
-                        &integration,
-                        &handle,
-                        &busy,
-                        &mut driver,
-                        &sink,
-                    ).await;
+                if let Some(event) = event {
+                    let result = match driver.submit_input(vec![Item::notification(event.message)]) {
+                        Ok(()) => drive_autonomous(
+                            &session_id,
+                            &integration,
+                            &handle,
+                            &busy,
+                            &mut driver,
+                            &sink,
+                        ).await,
+                        Err(error) => Err(map_loop_error(&session_id, &error)),
+                    };
+                    if let Err(error) = result {
+                        eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                    }
                 }
             }
             event = tasks.next_event() => match event {
                 Some(TaskEvent::Completed(snapshot, _))
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background =>
                 {
-                    drive_autonomous(
+                    if let Err(error) = drive_autonomous(
                         &session_id,
                         &integration,
                         &handle,
                         &busy,
                         &mut driver,
                         &sink,
-                    ).await;
+                    ).await {
+                        eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                    }
                 }
                 Some(_) => {}
                 None => break,
@@ -698,7 +738,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
         driver
             .submit_input(items)
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+            .map_err(|error| map_loop_error(session_id, &error))?;
         integration.begin_prompt(session_id)
     });
     let user_message_id = match prepared {
@@ -728,7 +768,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
             session_id,
             wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
         )?;
-        let stop_reason = drive_prompt(driver, handle, cancellation_generation).await;
+        let stop_reason = drive_prompt(session_id, driver, handle, cancellation_generation).await?;
         let _ = integration.flush_session_updates(session_id).await;
         integration.finish_prompt(session_id);
         send_state(
@@ -744,27 +784,22 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
 }
 
 async fn drive_prompt<S: ModelSession + Send + 'static>(
+    session_id: &wire::SessionId,
     driver: &mut LoopDriver<S>,
     handle: &AcpSessionHandle,
     cancellation_generation: u64,
-) -> wire::StopReason {
+) -> Result<wire::StopReason, AcpRuntimeError> {
     let cancellation = handle.cancellation_handle();
     loop {
         let step = match driver.next().await {
             Ok(step) => step,
-            Err(_) if cancellation.is_cancelled_since(cancellation_generation) => {
-                return wire::StopReason::Cancelled;
+            Err(error) => {
+                handle.stop_injection_turn();
+                return loop_error_stop_reason(session_id, &error);
             }
-            Err(_) => match handle.handle_injection_boundary(driver, true).await {
-                Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
-                    continue;
-                }
-                Ok(AcpInjectionBoundary::Stopped) => return wire::StopReason::Cancelled,
-                Ok(AcpInjectionBoundary::Finished) | Err(_) => return error_stop_reason(),
-            },
         };
         if cancellation.is_cancelled_since(cancellation_generation) {
-            return wire::StopReason::Cancelled;
+            return Ok(wire::StopReason::Cancelled);
         }
         match step {
             LoopStep::Finished(result) => {
@@ -775,11 +810,13 @@ async fn drive_prompt<S: ModelSession + Send + 'static>(
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
-                    Ok(AcpInjectionBoundary::Stopped) => return wire::StopReason::Cancelled,
-                    Ok(AcpInjectionBoundary::Finished) => {
-                        return finish_reason_to_stop_reason(&result.finish_reason);
+                    Ok(AcpInjectionBoundary::Stopped) => {
+                        return Ok(wire::StopReason::Cancelled);
                     }
-                    Err(_) => return error_stop_reason(),
+                    Ok(AcpInjectionBoundary::Finished) => {
+                        return Ok(finish_reason_to_stop_reason(&result.finish_reason));
+                    }
+                    Err(_) => return Ok(error_stop_reason()),
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
@@ -787,21 +824,26 @@ async fn drive_prompt<S: ModelSession + Send + 'static>(
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
-                    Ok(AcpInjectionBoundary::Stopped) => return wire::StopReason::Cancelled,
-                    Ok(AcpInjectionBoundary::Finished) => return wire::StopReason::EndTurn,
-                    Err(_) => return error_stop_reason(),
+                    Ok(AcpInjectionBoundary::Stopped) => {
+                        return Ok(wire::StopReason::Cancelled);
+                    }
+                    Ok(AcpInjectionBoundary::Finished) => return Ok(wire::StopReason::EndTurn),
+                    Err(_) => return Ok(error_stop_reason()),
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
                 match handle.handle_injection_boundary(driver, false).await {
-                    Ok(AcpInjectionBoundary::Stopped) => return wire::StopReason::Cancelled,
-                    Err(_) => return error_stop_reason(),
+                    Ok(AcpInjectionBoundary::Stopped) => {
+                        return Ok(wire::StopReason::Cancelled);
+                    }
+                    Err(_) => return Ok(error_stop_reason()),
                     _ => {}
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_)) => {
-                if driver.cancel_pending_approvals().await.is_err() {
-                    return error_stop_reason();
+                if let Err(error) = driver.cancel_pending_approvals().await {
+                    handle.stop_injection_turn();
+                    return loop_error_stop_reason(session_id, &error);
                 }
             }
         }
@@ -815,35 +857,33 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     busy: &AtomicBool,
     driver: &mut LoopDriver<S>,
     sink: &ConnectionSink,
-) {
+) -> Result<(), AcpRuntimeError> {
     if claim_prompt(busy).is_err() {
-        return;
+        return Ok(());
     }
     handle.prepare_injection_turn();
     integration.finish_prompt(session_id);
     let cancellation_generation = handle.cancellation_handle().generation();
     handle.start_injection_turn();
-    if send_state(
-        sink,
-        session_id,
-        wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
-    )
-    .is_err()
-    {
-        handle.stop_injection_turn();
-        busy.store(false, Ordering::Release);
-        return;
+    let result = async {
+        send_state(
+            sink,
+            session_id,
+            wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
+        )?;
+        let stop_reason = drive_prompt(session_id, driver, handle, cancellation_generation).await?;
+        let _ = integration.flush_session_updates(session_id).await;
+        send_state(
+            sink,
+            session_id,
+            wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(stop_reason)),
+        )
     }
-    let stop_reason = drive_prompt(driver, handle, cancellation_generation).await;
-    let _ = integration.flush_session_updates(session_id).await;
+    .await;
     integration.finish_prompt(session_id);
     handle.stop_injection_turn();
-    let _ = send_state(
-        sink,
-        session_id,
-        wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(stop_reason)),
-    );
     busy.store(false, Ordering::Release);
+    result
 }
 
 fn send_state(
@@ -1175,16 +1215,15 @@ pub(crate) fn component(
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
                     cx.spawn(async move {
-                        let result = state.new_session(request, connection.clone()).await;
-                        let notification = result
-                            .as_ref()
-                            .ok()
-                            .map(|response| available_commands_update(response.session_id.clone()));
-                        responder.respond_with_result(result.map_err(sdk_error))?;
-                        if let Some(notification) = notification {
-                            connection.send_notification(notification)?;
+                        match state.new_session(request, connection.clone()).await {
+                            Ok((response, activation)) => complete_new_session(
+                                response,
+                                activation,
+                                |response| responder.respond(response),
+                                |notification| connection.send_notification(notification),
+                            ),
+                            Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                        Ok(())
                     })?;
                     Ok(())
                 }
@@ -1339,6 +1378,56 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn new_session_response_is_enqueued_before_activation_and_notifications() {
+        let (activation, activated) = oneshot::channel();
+        let activated = std::cell::RefCell::new(activated);
+        let events = std::cell::RefCell::new(Vec::new());
+        let response = wire::NewSessionResponse::new(wire::SessionId::new("session"));
+
+        complete_new_session(
+            response,
+            activation,
+            |_| {
+                assert!(matches!(
+                    activated.borrow_mut().try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                events.borrow_mut().push("response");
+                Ok::<(), ()>(())
+            },
+            |_| {
+                assert_eq!(activated.borrow_mut().try_recv(), Ok(()));
+                events.borrow_mut().push("notification");
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(events.into_inner(), ["response", "notification"]);
+    }
+
+    #[test]
+    fn loop_failures_are_fatal_while_cancellation_stays_cancelled() {
+        let session_id = wire::SessionId::new("loop-error-test");
+        let error = LoopError::InvalidState("broken".into());
+
+        let Err(AcpRuntimeError::Loop(rendered)) = loop_error_stop_reason(&session_id, &error)
+        else {
+            panic!("non-cancellation loop errors must fail the turn");
+        };
+        assert!(rendered.starts_with("invalid driver state: broken"));
+        assert!(rendered.contains("fatal log:"));
+        assert!(matches!(
+            map_loop_error(&session_id, &LoopError::Cancelled),
+            AcpRuntimeError::Cancelled
+        ));
+        assert_eq!(
+            loop_error_stop_reason(&session_id, &LoopError::Cancelled).unwrap(),
+            wire::StopReason::Cancelled
+        );
+    }
 
     #[test]
     fn available_commands_advertises_only_compact() {

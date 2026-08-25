@@ -152,13 +152,33 @@ pub(crate) fn clone_completed_in(
 ///
 /// This is the last-resort cleanup path for a hosting client whose server had
 /// to be killed before normal `SessionLock` destruction completed.
-pub fn remove_stale_lock(_root: &Path, session_id: &str) -> Result<(), String> {
-    remove_stale_lock_in(&default_directory()?, session_id)
+pub fn remove_stale_lock(root: &Path, session_id: &str) -> Result<(), String> {
+    remove_stale_lock_in(root, &default_directory()?, session_id)
 }
 
-pub(crate) fn remove_stale_lock_in(directory: &Path, session_id: &str) -> Result<(), String> {
+pub(crate) fn remove_stale_lock_in(
+    root: &Path,
+    directory: &Path,
+    session_id: &str,
+) -> Result<(), String> {
     validate_id(session_id)?;
-    let path = lock_path(directory, session_id);
+    let workspace_root = canonical_workspace(root);
+    let scoped = lock_path(
+        &workspace_storage_directory(directory, &workspace_root),
+        session_id,
+    );
+    let path = if scoped
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
+    {
+        scoped
+    } else if let Some(transcript) =
+        legacy_transcript_for_workspace(directory, &workspace_root, session_id)?
+    {
+        transcript.with_extension("lock")
+    } else {
+        return Ok(());
+    };
     let file = match OpenOptions::new().read(true).write(true).open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -217,25 +237,23 @@ fn open_with_initial_timestamps_in(
         return Err("a new session requires an initial transcript".into());
     }
     let workspace_root = canonical_workspace(root);
-    fs::create_dir_all(directory)
+    let scoped_directory = workspace_storage_directory(directory, &workspace_root);
+    fs::create_dir_all(&scoped_directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
-    let path = transcript_path(directory, session_id);
-    let legacy = legacy_transcript(&workspace_root, session_id);
-    let lock = SessionLock::acquire(lock_path(directory, session_id), force)?;
-    let global_exists = path
+    let path = transcript_path(&scoped_directory, session_id);
+    let legacy = legacy_transcript_for_workspace(directory, &workspace_root, session_id)?;
+    let lock = SessionLock::acquire(lock_path(&scoped_directory, session_id), force)?;
+    let scoped_exists = path
         .try_exists()
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-    let legacy_exists = legacy
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?;
-    if resume && !global_exists {
-        if !legacy_exists {
-            return Err(format!("session {session_id:?} does not exist"));
-        }
-        let _legacy_lock = lock_legacy_for_migration(&legacy)?;
-        read_records(&legacy, session_id)?;
-        copy_new(&legacy, &path)?;
-    } else if !resume && (global_exists || legacy_exists) {
+    if resume && !scoped_exists {
+        let legacy = legacy
+            .as_ref()
+            .ok_or_else(|| format!("session {session_id:?} does not exist"))?;
+        let _legacy_lock = lock_legacy_for_migration(legacy)?;
+        read_records(legacy, session_id)?;
+        copy_new(legacy, &path)?;
+    } else if !resume && (scoped_exists || legacy.is_some()) {
         return Err(format!(
             "session {session_id:?} already exists; use --resume"
         ));
@@ -679,31 +697,33 @@ pub(crate) fn list_ids(root: &Path) -> Result<Vec<String>, String> {
 
 fn list_ids_for_workspace(root: &Path, global_directory: &Path) -> Result<Vec<String>, String> {
     let root = canonical_workspace(root);
+    let scoped_directory = workspace_storage_directory(global_directory, &root);
     let legacy_directory = workspace_directory(&root);
     let mut ids = Vec::new();
+    for id in list_ids_in(&scoped_directory)? {
+        let path = transcript_path(&scoped_directory, &id);
+        read_records(&path, &id)?;
+        ensure_workspace(&path, &id, &root)?;
+        ids.push(id);
+    }
     for id in list_ids_in(global_directory)? {
         let path = transcript_path(global_directory, &id);
         read_records(&path, &id)?;
-        if transcript_workspace(&path, &id)?.as_deref() == Some(root.as_path()) {
+        let legacy = legacy_transcript(&root, &id);
+        let legacy_exists = legacy
+            .try_exists()
+            .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?;
+        let stored_workspace = transcript_workspace(&path, &id)?;
+        if stored_workspace.as_deref() == Some(root.as_path())
+            || stored_workspace.is_none() && legacy_exists
+        {
             ids.push(id);
         }
     }
     for id in list_ids_in(&legacy_directory)? {
-        let global = transcript_path(global_directory, &id);
-        let visible = if global
-            .try_exists()
-            .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
-        {
-            read_records(&global, &id)?;
-            transcript_workspace(&global, &id)?
-                .as_deref()
-                .is_none_or(|stored| stored == root)
-        } else {
-            true
-        };
-        if visible {
-            ids.push(id);
-        }
+        let path = transcript_path(&legacy_directory, &id);
+        read_records(&path, &id)?;
+        ids.push(id);
     }
     ids.sort();
     ids.dedup();
@@ -721,23 +741,19 @@ fn belongs_to_workspace_in(
 ) -> Result<bool, String> {
     validate_id(session_id)?;
     let root = canonical_workspace(root);
-    let global = transcript_path(global_directory, session_id);
-    let legacy = legacy_transcript(&root, session_id);
-    if global
+    let scoped = transcript_path(
+        &workspace_storage_directory(global_directory, &root),
+        session_id,
+    );
+    if scoped
         .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
+        .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
     {
-        read_records(&global, session_id)?;
-        return Ok(match transcript_workspace(&global, session_id)? {
-            Some(stored) => stored == root,
-            None => legacy
-                .try_exists()
-                .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?,
-        });
+        read_records(&scoped, session_id)?;
+        ensure_workspace(&scoped, session_id, &root)?;
+        return Ok(true);
     }
-    legacy
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))
+    Ok(legacy_transcript_for_workspace(global_directory, &root, session_id)?.is_some())
 }
 
 pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
@@ -779,14 +795,42 @@ fn preferred_transcript(
     root: &Path,
     session_id: &str,
 ) -> Result<PathBuf, String> {
-    let global = transcript_path(directory, session_id);
-    if global
+    let scoped = transcript_path(&workspace_storage_directory(directory, root), session_id);
+    if scoped
         .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
+        .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
     {
-        Ok(global)
+        return Ok(scoped);
+    }
+    Ok(legacy_transcript_for_workspace(directory, root, session_id)?.unwrap_or(scoped))
+}
+
+fn legacy_transcript_for_workspace(
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let unscoped = transcript_path(directory, session_id);
+    let legacy = legacy_transcript(root, session_id);
+    let legacy_exists = legacy
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?;
+    if unscoped
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", unscoped.display()))?
+    {
+        read_records(&unscoped, session_id)?;
+        match transcript_workspace(&unscoped, session_id)? {
+            Some(stored) if stored == root => return Ok(Some(unscoped)),
+            None if legacy_exists => return Ok(Some(legacy)),
+            _ => {}
+        }
+    }
+    if legacy_exists {
+        read_records(&legacy, session_id)?;
+        Ok(Some(legacy))
     } else {
-        Ok(legacy_transcript(root, session_id))
+        Ok(None)
     }
 }
 
@@ -832,6 +876,11 @@ fn copy_new(source: &Path, destination: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn workspace_storage_directory(directory: &Path, root: &Path) -> PathBuf {
+    let identity = blake3::hash(root.as_os_str().as_encoded_bytes());
+    directory.join(format!("w-{}", identity.to_hex()))
 }
 
 fn transcript_path(directory: &Path, session_id: &str) -> PathBuf {
@@ -903,11 +952,33 @@ mod tests {
     }
 
     fn remove_stale_lock(root: &Path, session_id: &str) -> Result<(), String> {
-        remove_stale_lock_in(&session_directory(root), session_id)
+        remove_stale_lock_in(&project_root(root), &session_directory(root), session_id)
+    }
+
+    fn scoped_directory(root: &Path) -> PathBuf {
+        workspace_storage_directory(
+            &session_directory(root),
+            &canonical_workspace(&project_root(root)),
+        )
+    }
+
+    fn legacy_directory(root: &Path) -> PathBuf {
+        workspace_directory(&canonical_workspace(&project_root(root)))
     }
 
     fn transcript_path(root: &Path, session_id: &str) -> PathBuf {
-        super::transcript_path(&session_directory(root), session_id)
+        super::transcript_path(&scoped_directory(root), session_id)
+    }
+
+    fn session_lock_path(root: &Path, session_id: &str) -> PathBuf {
+        super::lock_path(&scoped_directory(root), session_id)
+    }
+
+    fn item_text(item: &Item) -> &str {
+        let Some(Part::Text(text)) = item.parts.first() else {
+            panic!("expected text item");
+        };
+        &text.text
     }
 
     #[test]
@@ -1059,7 +1130,7 @@ mod tests {
     #[test]
     fn reads_legacy_null_and_missing_timestamps() {
         let root = tempfile::tempdir().unwrap();
-        let directory = session_directory(root.path());
+        let directory = legacy_directory(root.path());
         fs::create_dir_all(&directory).unwrap();
         let mut missing = serde_json::to_value(Item::text(ItemKind::System, "missing")).unwrap();
         missing.as_object_mut().unwrap().remove("created_at");
@@ -1093,7 +1164,7 @@ mod tests {
     #[test]
     fn cloning_preserves_historical_unknown_timestamps() {
         let root = tempfile::tempdir().unwrap();
-        let directory = session_directory(root.path());
+        let directory = legacy_directory(root.path());
         fs::create_dir_all(&directory).unwrap();
         let lines = [
             serde_json::json!({
@@ -1322,9 +1393,9 @@ mod tests {
             "force must not steal authority from a live owner"
         );
         drop(first);
-        fs::write(session_directory(root.path()).join("abc.lock"), "abandoned").unwrap();
+        fs::write(session_lock_path(root.path(), "abc"), "abandoned").unwrap();
         remove_stale_lock(root.path(), "abc").unwrap();
-        assert!(!session_directory(root.path()).join("abc.lock").exists());
+        assert!(!session_lock_path(root.path(), "abc").exists());
         assert!(
             open(
                 root.path(),
@@ -1434,7 +1505,7 @@ mod tests {
         write(&opened.observer, &Item::text(ItemKind::Assistant, "after"));
         write(&opened.observer, &Item::text(ItemKind::User, "continued"));
 
-        assert!(session_directory(root.path()).join("abc.lock").is_file());
+        assert!(session_lock_path(root.path(), "abc").is_file());
         assert_eq!(stored(root.path()).len(), 4);
         drop(opened);
         assert_eq!(
@@ -1463,7 +1534,7 @@ mod tests {
         write(&opened.observer, &Item::text(ItemKind::Assistant, "after"));
 
         assert_eq!(stored(root.path()).len(), 3);
-        assert!(session_directory(root.path()).join("abc.lock").is_file());
+        assert!(session_lock_path(root.path(), "abc").is_file());
     }
 
     #[test]
@@ -1479,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_metadata_isolates_global_sessions() {
+    fn identical_ids_round_trip_independently_across_workspaces() {
         let storage = tempfile::tempdir().unwrap();
         let roots = tempfile::tempdir().unwrap();
         let first = roots.path().join("first");
@@ -1487,32 +1558,137 @@ mod tests {
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
 
-        let opened = open_in(
+        let first_open = open_in(
             &first,
             storage.path(),
-            "isolated",
+            "shared",
             false,
             false,
-            vec![Item::text(ItemKind::System, "system")],
+            vec![Item::text(ItemKind::System, "first")],
         )
         .unwrap();
-        drop(opened);
+        let second_open = open_in(
+            &second,
+            storage.path(),
+            "shared",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "second")],
+        )
+        .unwrap();
+        write(
+            &first_open.observer,
+            &Item::text(ItemKind::User, "first-only"),
+        );
+        write(
+            &second_open.observer,
+            &Item::text(ItemKind::User, "second-only"),
+        );
 
+        let first_path = super::transcript_path(
+            &workspace_storage_directory(storage.path(), &canonical_workspace(&first)),
+            "shared",
+        );
+        let second_path = super::transcript_path(
+            &workspace_storage_directory(storage.path(), &canonical_workspace(&second)),
+            "shared",
+        );
+        assert_ne!(first_path, second_path);
+        assert!(first_path.with_extension("lock").is_file());
+        assert!(second_path.with_extension("lock").is_file());
+        assert_eq!(
+            item_text(&load_in(&first, storage.path(), "shared").unwrap()[0]),
+            "first"
+        );
+        assert_eq!(
+            item_text(&load_in(&second, storage.path(), "shared").unwrap()[0]),
+            "second"
+        );
+        drop(first_open);
+        drop(second_open);
+
+        let first_resumed =
+            open_in(&first, storage.path(), "shared", true, false, Vec::new()).unwrap();
+        let second_resumed =
+            open_in(&second, storage.path(), "shared", true, false, Vec::new()).unwrap();
+        assert_eq!(item_text(&first_resumed.transcript[1]), "first-only");
+        assert_eq!(item_text(&second_resumed.transcript[1]), "second-only");
         assert_eq!(
             list_ids_for_workspace(&first, storage.path()).unwrap(),
-            ["isolated"]
+            ["shared"]
+        );
+        assert_eq!(
+            list_ids_for_workspace(&second, storage.path()).unwrap(),
+            ["shared"]
+        );
+    }
+
+    #[test]
+    fn unscoped_transcript_migrates_without_blocking_same_id_in_another_workspace() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let item = Item::text(ItemKind::System, "unscoped").with_created_at(Timestamp(7));
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: "legacy-id".into(),
+            generation: 1,
+            workspace_root: Some(canonical_workspace(&first)),
+            item: Some(item.clone()),
+            replacement: None,
+        };
+        let unscoped = super::transcript_path(storage.path(), "legacy-id");
+        fs::write(
+            &unscoped,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_in(&first, storage.path(), "legacy-id").unwrap(),
+            [item]
+        );
+        assert!(load_in(&second, storage.path(), "legacy-id").is_err());
+        assert_eq!(
+            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            ["legacy-id"]
         );
         assert!(
             list_ids_for_workspace(&second, storage.path())
                 .unwrap()
                 .is_empty()
         );
-        assert!(belongs_to_workspace_in(&first, storage.path(), "isolated").unwrap());
-        assert!(!belongs_to_workspace_in(&second, storage.path(), "isolated").unwrap());
-        let error = open_in(&second, storage.path(), "isolated", true, false, Vec::new())
-            .err()
-            .expect("cross-workspace resume must fail");
-        assert!(error.contains("belongs to workspace"));
+        let migrated =
+            open_in(&first, storage.path(), "legacy-id", true, false, Vec::new()).unwrap();
+        drop(migrated);
+        assert!(unscoped.is_file(), "migration must retain the old artifact");
+        let scoped = super::transcript_path(
+            &workspace_storage_directory(storage.path(), &canonical_workspace(&first)),
+            "legacy-id",
+        );
+        assert!(scoped.is_file());
+
+        let second_open = open_in(
+            &second,
+            storage.path(),
+            "legacy-id",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "second")],
+        )
+        .unwrap();
+        assert_eq!(item_text(&second_open.transcript[0]), "second");
+        assert_eq!(
+            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            ["legacy-id"]
+        );
+        assert_eq!(
+            list_ids_for_workspace(&second, storage.path()).unwrap(),
+            ["legacy-id"]
+        );
     }
 
     #[test]
@@ -1545,8 +1721,12 @@ mod tests {
 
         let opened = open_in(&first, storage.path(), "legacy", true, false, Vec::new()).unwrap();
         drop(opened);
+        let migrated = super::transcript_path(
+            &workspace_storage_directory(storage.path(), &canonical_workspace(&first)),
+            "legacy",
+        );
         assert_eq!(
-            transcript_workspace(&storage.path().join("legacy.jsonl"), "legacy").unwrap(),
+            transcript_workspace(&migrated, "legacy").unwrap(),
             Some(canonical_workspace(&first))
         );
         assert!(!belongs_to_workspace_in(&second, storage.path(), "legacy").unwrap());
@@ -1564,12 +1744,8 @@ mod tests {
         )
         .unwrap();
         fs::remove_dir_all(session_directory(root.path())).unwrap();
-        fs::create_dir_all(session_directory(root.path())).unwrap();
-        let other = SessionLock::acquire(
-            super::lock_path(&session_directory(root.path()), "abc"),
-            false,
-        )
-        .unwrap();
+        fs::create_dir_all(scoped_directory(root.path())).unwrap();
+        let other = SessionLock::acquire(session_lock_path(root.path(), "abc"), false).unwrap();
         let item = Item::text(ItemKind::User, "must not persist").with_created_at(Timestamp(9));
 
         let error = opened.observer.0.lock().unwrap().append(&item).unwrap_err();
