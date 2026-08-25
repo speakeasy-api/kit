@@ -12,13 +12,8 @@ use agentkit_loop::{
     Agent, AgentEvent, LoopCtx, LoopError, LoopInterrupt, LoopMutator, LoopStep, ModelAdapter,
     MutationPoint, SessionConfig, TelemetryConfig, TranscriptCursor,
 };
-use agentkit_tool_skills::SkillRegistry;
 use async_trait::async_trait;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, time::Instant};
 
 use crate::{
     events::{self, RuntimeEvent},
@@ -227,7 +222,6 @@ pub fn automatic<M>(
     adapter: M,
     telemetry: TelemetryConfig,
     persistence: Option<SessionObserver>,
-    skills: Arc<SkillRegistry>,
     session_id: impl Into<SessionId>,
 ) -> Result<AutomaticCompactor, String>
 where
@@ -251,11 +245,7 @@ where
             .with_strategy(SummarizeForContinuation::default()),
     )
     .with_backend(backend);
-    Ok(AutomaticCompactor {
-        inner,
-        persistence,
-        skills,
-    })
+    Ok(AutomaticCompactor { inner, persistence })
 }
 
 struct KitCompactionBackend<M> {
@@ -480,43 +470,9 @@ fn user_message_from_marker(mut marker: Item, part_index: usize, message: &str) 
     marker
 }
 
-fn removed_skill_instructions(before: &[Item], after: &[Item]) -> bool {
-    let activation_calls = before
-        .iter()
-        .flat_map(|item| &item.parts)
-        .filter_map(|part| match part {
-            Part::ToolCall(call) if call.name == "activate_skill" => Some(call.id.to_string()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    if activation_calls.is_empty() {
-        return false;
-    }
-    let activation_outputs = |items: &[Item]| {
-        items
-            .iter()
-            .flat_map(|item| &item.parts)
-            .filter_map(|part| match part {
-                Part::ToolResult(result)
-                    if activation_calls.contains(&result.call_id.to_string()) =>
-                {
-                    Some((result.call_id.to_string(), result.output.clone()))
-                }
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>()
-    };
-    let before_outputs = activation_outputs(before);
-    let after_outputs = activation_outputs(after);
-    before_outputs
-        .iter()
-        .any(|(id, output)| after_outputs.get(id) != Some(output))
-}
-
 pub struct AutomaticCompactor {
     inner: StrategyCompactor,
     persistence: Option<SessionObserver>,
-    skills: Arc<SkillRegistry>,
 }
 
 #[async_trait]
@@ -589,11 +545,6 @@ impl LoopMutator for AutomaticCompactor {
                     });
                     finish(false, false);
                     return Err(LoopError::Mutator(error));
-                }
-                // Reset only when model-facing skill instructions were actually removed,
-                // and only after durable replacement succeeds.
-                if removed_skill_instructions(cursor.as_slice(), &compacted) {
-                    self.skills.reset_activations();
                 }
                 metadata.insert(
                     "replaced_items".into(),
@@ -1034,35 +985,6 @@ mod tests {
             tool_safe_boundaries(&items),
             [true, false, false, false, true]
         );
-    }
-
-    #[test]
-    fn skill_reset_is_needed_only_when_activation_output_is_removed() {
-        let call = Item::new(
-            ItemKind::Assistant,
-            vec![Part::ToolCall(ToolCallPart::new(
-                "skill-call",
-                "activate_skill",
-                json!({"name": "simplify"}),
-            ))],
-        );
-        let result = Item::new(
-            ItemKind::Tool,
-            vec![Part::ToolResult(ToolResultPart::success(
-                "skill-call",
-                ToolOutput::text("instructions".repeat(TOOL_OUTPUT_MAX_CHARS)),
-            ))],
-        );
-        let before = vec![call.clone(), result.clone()];
-
-        assert!(!removed_skill_instructions(&before, &before));
-        assert!(removed_skill_instructions(
-            &before,
-            std::slice::from_ref(&call)
-        ));
-
-        let truncated = vec![call, compact_tool_outputs(result)];
-        assert!(removed_skill_instructions(&before, &truncated));
     }
 
     #[test]

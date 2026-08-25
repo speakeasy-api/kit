@@ -1,6 +1,6 @@
 # Agent Plugins
 
-Kit can load Agent Plugin packages from a local directory or a checksum-pinned online archive. Source resolution happens at startup. Kit uses `agentkit-plugins` to validate the resolved package, exposes its valid Agent Skills through the existing `activate_skill` tool, and registers its supported MCP servers. A plugin-only configuration works without `--mcp-config` or `mcp_config`.
+Kit can load Agent Plugin packages from a local directory or a checksum-pinned online archive. Source resolution happens at startup. Kit uses `agentkit-plugins` to validate the resolved package, exposes its valid Agent Skills through the existing `skill` tool, and registers its supported MCP servers. A plugin-only configuration works without `--mcp-config` or `mcp_config`.
 
 ## Configure a source
 

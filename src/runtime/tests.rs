@@ -334,7 +334,7 @@ fn plugin_skills_join_the_catalog_without_broadening_discovery() {
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let runtime = Runtime::with_plugin_skills(runtime, vec![plugin], vec![plugin_skill]).unwrap();
     let skills = runtime.skills.tool_registry();
-    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
+    let tool = ToolSource::get(&skills, &ToolName::new("skill")).unwrap();
     let spec = tool.current_spec().unwrap();
     let catalog = spec.input_schema.to_string();
     assert!(catalog.contains("project-skill"));
@@ -365,7 +365,7 @@ fn plugin_skill_symlink_retargeting_fails_closed() {
     symlink(replacement, skill.join("SKILL.md")).unwrap();
 
     let skills = runtime.skills.tool_registry();
-    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
+    let tool = ToolSource::get(&skills, &ToolName::new("skill")).unwrap();
     let catalog = tool
         .current_spec()
         .map(|spec| spec.description)
@@ -396,14 +396,14 @@ fn project_skills_take_precedence_over_plugin_skills() {
         Runtime::with_plugin_skills(runtime, vec![root.path().to_path_buf()], vec![plugin_skill])
             .unwrap();
     let skills = runtime.skills.tool_registry();
-    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
+    let tool = ToolSource::get(&skills, &ToolName::new("skill")).unwrap();
     let catalog = tool.current_spec().unwrap().description;
     assert!(catalog.contains("Project version."));
     assert!(!catalog.contains("Plugin version."));
 }
 
 #[tokio::test]
-async fn session_skill_registries_reset_independently() {
+async fn compose_can_load_a_skill_repeatedly() {
     let root = tempfile::tempdir().unwrap();
     write_skill(
         &root.path().join(".agents/skills/reusable"),
@@ -412,70 +412,59 @@ async fn session_skill_registries_reset_independently() {
         "full instructions",
     );
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-    let registry = runtime.fresh_skills();
-    let other_registry = runtime.fresh_skills();
-    let skills = registry.tool_registry();
-    let other_skills = other_registry.tool_registry();
-    let tool = ToolSource::get(&skills, &ToolName::new("activate_skill")).unwrap();
-    let other_tool = ToolSource::get(&other_skills, &ToolName::new("activate_skill")).unwrap();
+    let compose = runtime.compose(0);
+    let source: Arc<dyn ToolSource> = Arc::new(compose.compose.clone());
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([source]));
     let permissions = Arc::new(AllowAllPermissions);
     let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+    let session_id = SessionId::new("session");
+    let turn_id = TurnId::new("turn");
     let owned = OwnedToolContext {
-        session_id: SessionId::new("session"),
-        turn_id: TurnId::new("turn"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
         metadata: MetadataMap::new(),
-        permissions,
-        resources,
+        permissions: permissions.clone(),
+        resources: resources.clone(),
         cancellation: None,
-        execution_scope: None,
+        execution_scope: Some(ToolExecutionScope {
+            executor,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            permissions,
+            resources,
+            cancellation: None,
+        }),
         approved_request: None,
     };
-    let request = |call_id| {
-        ToolRequest::new(
-            ToolCallId::new(call_id),
-            ToolName::new("activate_skill"),
-            json!({ "name": "reusable" }),
-            SessionId::new("session"),
-            TurnId::new("turn"),
+    let outcome = compose
+        .backgroundable
+        .invoke_outcome(
+            ToolRequest::new(
+                ToolCallId::new("call"),
+                ToolName::new("compose"),
+                json!({
+                    "script": "first = skill({ name: \"reusable\" })\nsecond = skill({ name: \"reusable\" })\nreturn [first, second]"
+                }),
+                session_id,
+                turn_id,
+            ),
+            &mut owned.borrowed(),
         )
+        .await;
+
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("skill calls did not complete through compose: {outcome:?}");
     };
-    let mut context = owned.borrowed();
-
-    let first = tool.invoke(request("first"), &mut context).await.unwrap();
-    assert!(
-        matches!(first.result.output, ToolOutput::Text(ref text) if text.contains("full instructions"))
-    );
-    let duplicate = tool
-        .invoke(request("duplicate"), &mut context)
-        .await
-        .unwrap();
-    let other_first = other_tool
-        .invoke(request("other-first"), &mut context)
-        .await
-        .unwrap();
-    assert!(
-        matches!(duplicate.result.output, ToolOutput::Text(ref text) if text == "Skill already read.")
-    );
-    assert!(
-        matches!(other_first.result.output, ToolOutput::Text(ref text) if text.contains("full instructions"))
-    );
-
-    registry.reset_activations();
-
-    let reactivated = tool
-        .invoke(request("reactivated"), &mut context)
-        .await
-        .unwrap();
-    assert!(
-        matches!(reactivated.result.output, ToolOutput::Text(ref text) if text.contains("full instructions"))
-    );
-    let other_duplicate = other_tool
-        .invoke(request("other-duplicate"), &mut context)
-        .await
-        .unwrap();
-    assert!(
-        matches!(other_duplicate.result.output, ToolOutput::Text(ref text) if text == "Skill already read.")
-    );
+    let ToolOutput::Structured(loaded) = result.result.output else {
+        panic!("compose did not return structured output");
+    };
+    let loaded = loaded.as_array().expect("compose returned an array");
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.iter().all(|skill| {
+        skill
+            .as_str()
+            .is_some_and(|text| text.contains("full instructions"))
+    }));
 }
 
 #[test]
