@@ -567,6 +567,13 @@ fn transcript_block_lines(
             ))),
             Some(call.id.clone()),
         ),
+        Block::TurnDuration(millis) => (
+            uncopyable(plain_lines(vec![Line::from(Span::styled(
+                format!("· took {}", theme::duration(*millis)),
+                theme::faint(),
+            ))])),
+            None,
+        ),
         Block::Notice(text) => (
             uncopyable(plain_lines(vec![Line::from(Span::styled(
                 format!("· {text}"),
@@ -1351,6 +1358,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn completed_turn_duration_is_rendered() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.blocks.push(Block::TurnDuration(788_645_000));
+
+        let frame = render(&mut app, 80, 12);
+
+        assert!(frame.contains("· took 1w2d 3h04m05s"), "{frame}");
     }
 
     #[test]
