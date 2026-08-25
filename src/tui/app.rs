@@ -13,7 +13,7 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-use agent_client_protocol::schema::v2::{ToolCallStatus, ToolKind};
+use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
 #[cfg(test)]
 use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
@@ -100,6 +100,8 @@ pub enum Update {
         steerable: bool,
         cancelled: bool,
     },
+    /// An ACP v2 turn became idle with its exact terminal reason.
+    Stopped(Option<StopReason>),
     /// A nested tool call started or finished inside a compose run.
     Runtime(RuntimeEvent),
     /// A diagnostic line from the agent process.
@@ -1089,13 +1091,40 @@ impl App {
     }
 
     fn finish_turn(&mut self, cancelled: bool) {
+        self.finish_turn_with_outcome(!cancelled, cancelled.then_some("turn interrupted".into()));
+    }
+
+    fn finish_with_stop_reason(&mut self, reason: Option<StopReason>) {
+        let (successful, notice) = match reason {
+            Some(StopReason::EndTurn) => (true, None),
+            Some(StopReason::Cancelled) => (false, Some("turn interrupted".into())),
+            Some(StopReason::MaxTokens) => (
+                false,
+                Some("turn stopped: maximum token limit reached".into()),
+            ),
+            Some(StopReason::MaxTurnRequests) => (
+                false,
+                Some("turn stopped: maximum turn-request limit reached".into()),
+            ),
+            Some(StopReason::Refusal) => (false, Some("turn refused".into())),
+            Some(StopReason::Other(reason)) if reason == "_error" => {
+                (false, Some("turn failed".into()))
+            }
+            Some(StopReason::Other(reason)) => (false, Some(format!("turn stopped: {reason}"))),
+            Some(_) => (false, Some("turn stopped for an unknown reason".into())),
+            None => (false, Some("turn stopped without a reason".into())),
+        };
+        self.finish_turn_with_outcome(successful, notice);
+    }
+
+    fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
         }
         self.close_thought();
         self.agent_stream_sealed = true;
-        let interrupted = cancelled || self.phase == Phase::Cancelling;
+        let interrupted = self.phase == Phase::Cancelling;
         self.phase = Phase::Idle;
         self.turn_started = None;
         self.compacting = false;
@@ -1105,7 +1134,11 @@ impl App {
                 && call.running()
                 && !call.backgrounded
             {
-                call.status = ToolCallStatus::Completed;
+                call.status = if successful {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
                 call.finished = Some(Instant::now());
                 call.finish_running_children();
                 finished.push(index);
@@ -1117,6 +1150,8 @@ impl App {
         }
         if interrupted {
             self.note("turn interrupted");
+        } else if let Some(notice) = notice {
+            self.note(notice);
         }
     }
 
@@ -1286,8 +1321,9 @@ impl App {
                     self.finish_turn(cancelled);
                 }
             }
+            Update::Stopped(reason) => self.finish_with_stop_reason(reason),
             Update::ProcessExited(error) => {
-                self.finish_turn(false);
+                self.finish_turn_with_outcome(false, None);
                 self.push_block(Block::Error(error));
             }
         }
@@ -1516,6 +1552,21 @@ impl App {
     pub fn clear_attachments(&mut self) {
         self.attachments.clear();
         self.next_attachment = 0;
+    }
+
+    pub fn restore_attachments(&mut self, attachments: Vec<Attachment>) {
+        self.next_attachment = attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .placeholder
+                    .strip_suffix(']')
+                    .and_then(|placeholder| placeholder.rsplit_once('#'))
+                    .and_then(|(_, number)| number.parse().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        self.attachments = attachments;
     }
 
     pub fn prune_attachments(&mut self) {
@@ -2030,7 +2081,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use agent_client_protocol::schema::v2::{ToolCallStatus, ToolKind};
+    use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
     use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -2289,16 +2340,53 @@ mod tests {
             steerable: true,
             cancelled: false,
         });
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::Stopped(Some(StopReason::EndTurn)));
         let Some(Block::Tool(call)) = app.blocks.last() else {
             panic!("expected a tool block");
         };
         assert_eq!(call.status, ToolCallStatus::Completed);
         assert!(!app.working());
+    }
+
+    #[test]
+    fn abnormal_idle_reasons_fail_unresolved_foreground_tools() {
+        for (reason, expected_notice) in [
+            (StopReason::Cancelled, "turn interrupted"),
+            (
+                StopReason::MaxTokens,
+                "turn stopped: maximum token limit reached",
+            ),
+            (
+                StopReason::MaxTurnRequests,
+                "turn stopped: maximum turn-request limit reached",
+            ),
+            (StopReason::Refusal, "turn refused"),
+            (StopReason::Other("_error".into()), "turn failed"),
+            (StopReason::Other("custom".into()), "turn stopped: custom"),
+        ] {
+            let mut app = app();
+            compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
+            app.apply(Update::State {
+                active: true,
+                steerable: true,
+                cancelled: false,
+            });
+            app.apply(Update::Stopped(Some(reason)));
+
+            let Some(Block::Notice(notice)) = app.blocks.last() else {
+                panic!("expected terminal notice");
+            };
+            assert_eq!(notice, expected_notice);
+            let call = app
+                .blocks
+                .iter()
+                .find_map(|block| match block {
+                    Block::Tool(call) => Some(call),
+                    _ => None,
+                })
+                .expect("tool call");
+            assert_eq!(call.status, ToolCallStatus::Failed);
+        }
     }
 
     #[test]
@@ -2508,6 +2596,36 @@ mod tests {
         };
 
         assert!(prompt.attachments.is_empty());
+    }
+
+    #[test]
+    fn rejected_prompt_restores_unique_attachment_numbering() {
+        let mut app = app();
+        for name in ["one.png", "two.png"] {
+            app.attach(
+                PathBuf::from(format!("/tmp/{name}")),
+                "image/png",
+                AttachmentKind::Image,
+                3,
+            );
+        }
+        let rejected = std::mem::take(&mut app.attachments);
+        app.clear_attachments();
+        app.restore_attachments(rejected);
+        app.attach(
+            PathBuf::from("/tmp/three.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(
+            app.attachments
+                .iter()
+                .map(|attachment| attachment.placeholder.as_str())
+                .collect::<Vec<_>>(),
+            ["[Image #1]", "[Image #2]", "[Image #3]"]
+        );
     }
 
     #[test]

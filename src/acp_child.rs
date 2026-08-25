@@ -319,6 +319,8 @@ pub(crate) fn serve_command(
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("serve")
+        .arg("--stdio-protocol-version")
+        .arg("2")
         .arg("--root")
         .arg(root)
         .arg("--model")
@@ -1074,6 +1076,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--reasoning-effort", "medium"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--stdio-protocol-version", "2"])
         );
         assert!(args.iter().all(|arg| arg != "tui-secret"));
         assert!(command.as_std().get_envs().any(|(name, value)| {

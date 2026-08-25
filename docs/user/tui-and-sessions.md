@@ -106,17 +106,19 @@ Fatal error records use their own versioned JSON schema and are not transcript c
 
 `HOME is unset; cannot locate durable sessions` means Kit cannot determine this directory. Set `HOME` to the intended home directory before starting Kit.
 
-Transcript records are versioned and have consecutive generations. Normal items are appended and synced to disk before they are accepted into the in-memory conversation. Operations such as compaction append a replacement record; older records remain in the JSONL file, but readers treat the latest valid replacement as the canonical transcript.
+Transcript records are versioned and have consecutive generations. Transcript schema v3 records the canonical workspace root so ACP discovery and resume cannot expose a session to another project; schema v1 and v2 records remain readable and gain that binding when they are next resumed. Normal items are appended and synced to disk before they are accepted into the in-memory conversation. Operations such as compaction append a replacement record; older records remain in the JSONL file, but readers treat the latest valid replacement as the canonical transcript.
 
 Older sessions under `<root>/.kit/sessions` remain readable. The first resume validates and copies a legacy transcript into `~/.kit/sessions`; a live legacy lock produces `legacy session is actively locked by another Kit instance ...; stop it before resuming with this Kit version`. When both locations contain the ID, the global transcript is preferred.
 
 ### ACP session loading
 
-ACP clients can restore a closed durable session with `session/load`. Kit advertises only the protocol's top-level `loadSession` capability; it does not advertise `session/resume` or `session/list`. Loading uses the exact requested session ID, resumes its canonical transcript, and returns the same model and reasoning configuration options as `session/new`. The requested workspace must match the Kit server's fixed root, and additional directories are not accepted.
+ACP v1 clients restore a closed durable session with `session/load`. The v1 endpoint advertises only the protocol's top-level `loadSession` capability; it does not advertise `session/resume` or `session/list`. ACP v2 clients use `session/list` and `session/resume` instead. Both versions use the exact durable session ID and return the same model and reasoning configuration options as `session/new`.
 
-A load never applies the server process's configured `--force` setting. If another live Kit instance owns the session lock, loading fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can load it again.
+Session discovery and restoration are isolated to the server's canonical workspace root. A requested workspace must match that root, and additional directories are not accepted. Legacy transcripts under a project-local `.kit/sessions` directory follow the same migration and root checks as CLI resume; they do not make a same-named session visible from another workspace.
 
-Before the load response, Kit replays the canonical transcript as ordered ACP updates for representable user text and attachments, assistant text and thoughts, and tool calls and results. Internal instructions, ambient context, notifications, and provider-specific content are not replayed to the client, but remain in the model transcript. Because compaction replaces the canonical transcript, loading a compacted session replays its canonical summary history rather than the superseded pre-compaction items.
+An arbitrary ACP load or resume never applies the server process's configured `--force` setting. The one exception is the initial resume requested by `kit tui --resume <id> --force`: only that matching configured session may use the explicit stale-lock override. If another live Kit instance owns the session lock, restoration fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can restore it again.
+
+Before the restoration response, Kit replays the canonical transcript as ordered ACP updates for representable user text and attachments, assistant text and thoughts, and tool calls and results. Internal instructions, ambient context, notifications, and provider-specific content are not replayed to the client, but remain in the model transcript. Because compaction replaces the canonical transcript, restoring a compacted session replays its canonical summary history rather than the superseded pre-compaction items.
 
 ### Session locks, `--resume`, and `--force`
 
@@ -162,6 +164,6 @@ Set `KIT_THEME=light` or `KIT_THEME=dark` to override the detection — useful u
 
 ### TUI startup and terminal recovery
 
-The TUI runs a `kit serve` child. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.
+The TUI runs a `kit serve` child with ACP v2 selected explicitly for its stdio connection; ordinary `kit serve` invocations continue to default to ACP v1 on stdio. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.
 
 If an external hard kill leaves the shell in raw mode or mouse reporting appears as text, run `reset` (or reopen the terminal) before resuming. Prefer `Esc`, `Ctrl+C`, `Ctrl+D`, `SIGTERM`, or `SIGHUP` for normal shutdown so Kit can restore terminal modes, cancel active work, close the session, and clean up only locks proven stale.

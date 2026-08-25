@@ -525,7 +525,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         Ok(blocks) => blocks,
                                         Err(error) => {
                                             app.paste(&prompt.text);
-                                            app.attachments = prompt.attachments;
+                                            app.restore_attachments(prompt.attachments);
                                             app.note(error);
                                             continue;
                                         }
@@ -550,7 +550,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     };
                                     if let Err(error) = outcome {
                                         app.paste(&prompt.text);
-                                        app.attachments = prompt.attachments;
+                                        app.restore_attachments(prompt.attachments);
                                         app.note(format!("message was not accepted: {}", error.message));
                                     }
                                 }
@@ -1249,7 +1249,11 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             let output = match &update.content {
                 MaybeUndefined::Value(content) => Some(output_of(Some(content))),
                 MaybeUndefined::Null => Some(Vec::new()),
-                MaybeUndefined::Undefined => None,
+                MaybeUndefined::Undefined => match &update.raw_output {
+                    MaybeUndefined::Value(output) => Some(raw_output_lines(output)),
+                    MaybeUndefined::Null => Some(Vec::new()),
+                    MaybeUndefined::Undefined => None,
+                },
             };
             let script = match &update.raw_input {
                 MaybeUndefined::Value(input) => Some(script_of(input).unwrap_or_default()),
@@ -1332,11 +1336,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 steerable: false,
                 cancelled: false,
             }],
-            wire::StateUpdate::Idle(idle) => vec![Update::State {
-                active: false,
-                steerable: false,
-                cancelled: matches!(idle.stop_reason, Some(wire::StopReason::Cancelled)),
-            }],
+            wire::StateUpdate::Idle(idle) => vec![Update::Stopped(idle.stop_reason)],
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -1434,6 +1434,20 @@ fn script_of(input: &Value) -> Option<String> {
 }
 
 /// A tool call's output as readable lines, kept whole for the folded card.
+fn raw_output_lines(output: &Value) -> Vec<String> {
+    if let Some(text) = output
+        .as_str()
+        .or_else(|| output.get("text").and_then(Value::as_str))
+    {
+        return readable(text);
+    }
+    serde_json::to_string_pretty(output)
+        .unwrap_or_else(|_| output.to_string())
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 fn output_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
     let mut output = Vec::new();
     for entry in content.unwrap_or_default() {
@@ -1488,6 +1502,8 @@ mod tests {
         UpdateSessionNotification, UserMessage,
     };
     use crossterm::event::Event;
+
+    use serde_json::json;
 
     use super::{
         MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
@@ -1561,11 +1577,25 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(idle, "session").as_slice(),
-            [Update::State {
-                active: false,
-                steerable: false,
-                cancelled: false
-            }]
+            [Update::Stopped(None)]
+        ));
+    }
+
+    #[test]
+    fn translates_replayed_raw_tool_output() {
+        let update = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool-1")
+                    .status(wire::ToolCallStatus::Completed)
+                    .raw_output(Some(json!({ "text": "first\nsecond" }))),
+            ),
+        );
+
+        assert!(matches!(
+            translate_for_session(update, "session").as_slice(),
+            [Update::ToolPatched { output: Some(output), .. }]
+                if output == &["first", "second"]
         ));
     }
 

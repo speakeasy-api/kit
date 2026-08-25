@@ -431,6 +431,9 @@ enum Command {
         /// Do not serve ACP on stdio. Requires remote ACP over HTTP.
         #[arg(long, requires = "remote_acp")]
         no_stdio: bool,
+        /// ACP wire version for stdio (defaults to v1 for compatibility).
+        #[arg(long, value_enum, default_value = "1", hide = true)]
+        stdio_protocol_version: AcpProtocolVersion,
         /// Require this file's bearer token on every HTTP request.
         #[arg(long, value_name = "PATH")]
         server_credential_file: Option<PathBuf>,
@@ -656,15 +659,25 @@ async fn supervise_serve(
     runtime: std::sync::Arc<kit::Runtime>,
     sessions: kit::protocols::acp::SessionRegistry,
     no_stdio: bool,
+    stdio_protocol_version: AcpProtocolVersion,
     http: kit::protocols::http::HttpServer,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    supervise_serve_with_trigger(runtime, sessions, no_stdio, http, termination_signal()).await
+    supervise_serve_with_trigger(
+        runtime,
+        sessions,
+        no_stdio,
+        stdio_protocol_version,
+        http,
+        termination_signal(),
+    )
+    .await
 }
 
 async fn supervise_serve_with_trigger(
     runtime: std::sync::Arc<kit::Runtime>,
     sessions: kit::protocols::acp::SessionRegistry,
     no_stdio: bool,
+    stdio_protocol_version: AcpProtocolVersion,
     mut http: kit::protocols::http::HttpServer,
     termination: impl Future<Output = io::Result<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -680,7 +693,14 @@ async fn supervise_serve_with_trigger(
             if no_stdio {
                 std::future::pending::<Result<(), agentkit_acp::AcpRuntimeError>>().await
             } else {
-                kit::protocols::acp::serve_with_registry(runtime, stdio_sessions).await
+                match stdio_protocol_version {
+                    AcpProtocolVersion::V1 => {
+                        kit::protocols::acp::serve_with_registry(runtime, stdio_sessions).await
+                    }
+                    AcpProtocolVersion::V2 => {
+                        kit::protocols::acp::v2::serve_with_registry(runtime, stdio_sessions).await
+                    }
+                }
             }
         };
         tokio::pin!(stdio);
@@ -761,6 +781,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             remote_acp,
             no_a2a,
             no_stdio,
+            stdio_protocol_version,
             server_credential_file,
             mcp,
             session_id,
@@ -828,10 +849,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("A2A listening on {bound}");
             }
             if remote_acp {
-                eprintln!("ACP v1 listening on http://{bound}/acp");
+                eprintln!("ACP v1/v2 listening on http://{bound}/acp");
                 eprintln!("ACP v2 listening on http://{bound}/acp/v2");
             }
-            supervise_serve(runtime, sessions, no_stdio, http).await?;
+            supervise_serve(runtime, sessions, no_stdio, stdio_protocol_version, http).await?;
         }
         Command::Acp {
             protocol_version,
@@ -1519,6 +1540,8 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "serve", "--no-a2a"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--no-stdio"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--remote-acp"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "serve", "--stdio-protocol-version", "2"]).is_ok());
+        assert!(Cli::try_parse_from(["kit", "serve", "--stdio-protocol-version", "3"]).is_err());
         assert!(Cli::try_parse_from(["kit", "serve", "--remote-acp", "--no-a2a"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -1558,11 +1581,18 @@ future_option = true
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            supervise_serve_with_trigger(runtime, sessions, true, http, async move {
-                triggered
-                    .await
-                    .map_err(|_| io::Error::other("test shutdown trigger dropped"))
-            }),
+            supervise_serve_with_trigger(
+                runtime,
+                sessions,
+                true,
+                super::AcpProtocolVersion::V1,
+                http,
+                async move {
+                    triggered
+                        .await
+                        .map_err(|_| io::Error::other("test shutdown trigger dropped"))
+                },
+            ),
         )
         .await
         .expect("supervisor shutdown timed out")
