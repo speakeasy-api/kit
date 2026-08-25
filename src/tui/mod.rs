@@ -25,11 +25,9 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
-use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ContentBlock, SessionConfigKind, SessionConfigOption,
-    SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    ToolCallContent,
+use agent_client_protocol::{
+    ByteStreams,
+    schema::{MaybeUndefined, ProtocolVersion, v2 as wire},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
@@ -43,16 +41,21 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::{mpsc, oneshot},
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use wire::{
+    CancelSessionNotification, CloseSessionRequest, ContentBlock, SessionConfigKind,
+    SessionConfigOption, SessionConfigSelectOptions, SessionUpdate, SetSessionConfigOptionRequest,
+    ToolCallContent, UpdateSessionNotification,
+};
 
 use crate::{
     events::{self, EVENTS_ENV},
-    protocols::acp::{CancelBackgroundRequest, DetachComposeRequest, TurnStateNotification},
     tools::mcp::CredentialStorage,
 };
 
@@ -69,6 +72,30 @@ const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// Output lines kept per tool call; the fold shows the count either way.
 const MAX_OUTPUT_LINES: usize = 5_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
+struct CancelBackgroundRequest {
+    session_id: wire::SessionId,
+    call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+struct CancelBackgroundResponse {
+    cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/compose/detach", response = DetachComposeResponse)]
+struct DetachComposeRequest {
+    session_id: wire::SessionId,
+    call_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+struct DetachComposeResponse {
+    detached: bool,
+}
 /// How long the agent gets to answer the ACP handshake before the client gives
 /// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
 const HANDSHAKE: Duration = Duration::from_secs(30);
@@ -76,9 +103,6 @@ const HANDSHAKE: Duration = Duration::from_secs(30);
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
 const FAILURE_LINES: usize = 5;
-/// How long a turn interrupted on the way out gets to finish unwinding, so the
-/// transcript it owns is closed out before the agent is killed.
-const SETTLE: Duration = Duration::from_secs(3);
 
 #[cfg(unix)]
 fn detach_from_controlling_terminal(command: &mut tokio::process::Command) {
@@ -106,7 +130,7 @@ fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<Model
     let current = options
         .unwrap_or_default()
         .iter()
-        .find(|option| option.id.to_string() == "model")
+        .find(|option| option.config_id.to_string() == "model")
         .and_then(|option| match &option.kind {
             SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
             _ => None,
@@ -122,7 +146,7 @@ fn effort_state(options: Option<&[SessionConfigOption]>) -> Option<(String, Vec<
         ..
     } = options?
         .iter()
-        .find(|option| option.id.to_string() == "reasoning_effort")?
+        .find(|option| option.config_id.to_string() == "reasoning_effort")?
     else {
         return None;
     };
@@ -160,7 +184,7 @@ fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
     }) = options
         .unwrap_or_default()
         .iter()
-        .find(|option| option.id.to_string() == "model")
+        .find(|option| option.config_id.to_string() == "model")
     else {
         return Vec::new();
     };
@@ -170,7 +194,7 @@ fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
     groups
         .iter()
         .flat_map(|group| {
-            let provider = group.group.to_string();
+            let provider = group.group_id.to_string();
             group.options.iter().map(move |option| {
                 let id = option.value.to_string();
                 let model = id
@@ -263,8 +287,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let root = &root
         .canonicalize()
         .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
-    let persisted_session_id = resume
-        .map(str::to_string)
+    let resume_session_id = resume.map(str::to_string);
+    let persisted_session_id = resume_session_id
+        .clone()
         .unwrap_or_else(crate::session::new_id);
     let active_persisted_id = Arc::new(Mutex::new(persisted_session_id.clone()));
     let mut command = crate::acp_child::serve_command(
@@ -274,7 +299,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         reasoning_effort,
         openrouter_api_key,
         &persisted_session_id,
-        resume.is_some(),
+        resume_session_id.is_some(),
     )?;
     if let Some(address) = a2a {
         command.arg("--a2a").arg(address);
@@ -337,10 +362,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         }
         // Stderr closing means the agent process is gone; stop any spinner
         // waiting on a turn that can no longer finish.
-        let _ = diagnostics.send(Update::TurnEnded {
-            id: None,
-            error: Some("the agent process exited — press ctrl+c to leave".into()),
-        });
+        let _ = diagnostics.send(Update::ProcessExited(
+            "the agent process exited — press ctrl+c to leave".into(),
+        ));
     });
 
     // The child is watched from its own task, which also owns it: aborting that
@@ -363,32 +387,19 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let notifications = updates_tx.clone();
     let cleanup_root = root.clone();
     let transition_session = Arc::clone(&active_persisted_id);
+    let notification_session = Arc::clone(&active_persisted_id);
     let result = agent_client_protocol::Client
         .builder()
         .on_receive_notification(
-            async move |notification: SessionNotification, _cx| {
-                for update in translate(notification) {
+            async move |notification: UpdateSessionNotification, _cx| {
+                let current = notification_session.lock().ok().map(|id| id.clone());
+                for update in current
+                    .as_deref()
+                    .map_or_else(Vec::new, |current| translate_for_session(notification, current))
+                {
                     let _ = notifications.send(update);
                 }
                 Ok(())
-            },
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .on_receive_notification(
-            {
-                let turn_states = updates_tx.clone();
-                async move |notification: TurnStateNotification, _cx| {
-                    let update = if notification.active {
-                        Update::AutonomousTurnStarted(notification.turn_id)
-                    } else {
-                        Update::AutonomousTurnEnded {
-                            id: notification.turn_id,
-                            error: notification.error,
-                        }
-                    };
-                    let _ = turn_states.send(update);
-                    Ok(())
-                }
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -398,14 +409,42 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // waiting on it forever shows the user nothing at all. Its exit and
             // its silence both end the wait with something to read.
             let handshake = async {
-                connection
-                    .send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1))
+                let initialized = connection
+                    .send_request(wire::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("kit-tui", env!("CARGO_PKG_VERSION")),
+                    ))
                     .block_task()
                     .await?;
-                connection
-                    .send_request(agentkit_acp::NewSessionRequest::new(root.clone()))
-                    .block_task()
-                    .await
+                if initialized.protocol_version != ProtocolVersion::V2 {
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other("the agent did not negotiate ACP v2"),
+                    ));
+                }
+                let can_steer = initialized.capabilities.session.as_ref()
+                    .and_then(|session| session.inject.as_ref())
+                    .is_some_and(|inject| {
+                        inject.modes.contains(&wire::SessionInjectMode::Steer)
+                            && inject.steer_in_stream.as_ref().is_some_and(|modes| {
+                                modes.contains(&wire::SessionInjectSteerInStream::Finish)
+                            })
+                    });
+                if let Some(resume_id) = resume_session_id.clone() {
+                    let response = connection
+                        .send_request(
+                            wire::ResumeSessionRequest::new(resume_id.clone(), root.clone())
+                                .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                        )
+                        .block_task()
+                        .await?;
+                    Ok((wire::SessionId::new(resume_id), response.config_options, can_steer))
+                } else {
+                    let response = connection
+                        .send_request(wire::NewSessionRequest::new(root.clone()))
+                        .block_task()
+                        .await?;
+                    Ok((response.session_id, response.config_options, can_steer))
+                }
             };
             let session = tokio::select! {
                 session = handshake => session?,
@@ -423,16 +462,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     ));
                 }
             };
-            let mut session_id = session.session_id.clone();
+            let (mut session_id, config_options, can_steer) = session;
             let active_session_id = durable_session_id(&session_id).map_err(|error| {
                 agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
             })?;
-            // The server has acquired the mutation lock during NewSession, so
-            // this read is the exact stable snapshot it preloaded into the model.
-            let restored = crate::session::load(&root, &active_session_id).map_err(|error| {
-                agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
-            })?;
-
             let mut terminal =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut app = App::new(
@@ -441,16 +474,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 model,
                 a2a,
             );
-            refresh_config_state(&mut app, session.config_options.as_deref());
+            refresh_config_state(&mut app, Some(&config_options));
+            app.can_steer = can_steer;
             if let Ok(mut active) = transition_session.lock() {
                 *active = active_session_id.clone();
             }
-            app.restore_transcript(active_session_id, &restored);
+            app.start_session(active_session_id);
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // The turn in flight, if any: leaving is not allowed to abandon it.
-            let mut turn: Option<tokio::task::JoinHandle<()>> = None;
             let mut stop =
                 Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let result: Result<(), agent_client_protocol::Error> = async {
@@ -488,89 +520,144 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                             match action {
                                 Action::Quit => return Ok(()),
-                                Action::Submit(prompt) => {
+                                Action::Submit { prompt, inject } => {
                                     let blocks = match prompt_blocks(&prompt) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
+                                            app.paste(&prompt.text);
+                                            app.attachments = prompt.attachments;
                                             app.note(error);
                                             continue;
                                         }
                                     };
-                                    let turn_id = app.push_user(prompt.text);
                                     app.clear_attachments();
-                                    let connection = connection.clone();
-                                    let session = session_id.clone();
-                                    let updates = updates_tx.clone();
-                                    turn = Some(tokio::spawn(async move {
-                                        let outcome = connection
-                                            .send_request(agentkit_acp::PromptRequest::new(
-                                                session, blocks,
+                                    let outcome = if inject {
+                                        connection
+                                            .send_request(wire::InjectSessionRequest::new(
+                                                session_id.clone(),
+                                                wire::SessionInjectMode::Steer,
+                                                blocks,
                                             ))
                                             .block_task()
-                                            .await;
-                                        let _ = updates.send(Update::TurnEnded {
-                                            id: Some(turn_id),
-                                            error: match outcome {
-                                                Ok(_) => None,
-                                                Err(error) => Some(error.to_string()),
-                                            },
-                                        });
-                                    }));
+                                            .await
+                                            .map(|_| ())
+                                    } else {
+                                        connection
+                                            .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
+                                            .block_task()
+                                            .await
+                                            .map(|_| ())
+                                    };
+                                    if let Err(error) = outcome {
+                                        app.paste(&prompt.text);
+                                        app.attachments = prompt.attachments;
+                                        app.note(format!("message was not accepted: {}", error.message));
+                                    }
                                 }
                                 Action::New(first_prompt) => {
-                                    // Idle-only key handling guarantees there is no active
-                                    // turn to abandon. Await its completed task before closing
-                                    // the old ACP driver and its transcript lock.
-                                    if let Some(completed) = turn.take() {
-                                        let _ = completed.await;
-                                    }
                                     connection
                                         .send_request(CloseSessionRequest::new(session_id.clone()))
                                         .block_task()
                                         .await?;
                                     let session = connection
-                                        .send_request(agentkit_acp::NewSessionRequest::new(root.clone()))
+                                        .send_request(wire::NewSessionRequest::new(root.clone()))
                                         .block_task()
                                         .await?;
                                     session_id = session.session_id;
                                     let persisted_id = durable_session_id(&session_id).map_err(|error| {
-                                        agent_client_protocol::Error::into_internal_error(
-                                            std::io::Error::other(error),
-                                        )
+                                        agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
                                     })?;
                                     if let Ok(mut active) = transition_session.lock() {
                                         *active = persisted_id.clone();
                                     }
                                     app.start_session(persisted_id);
-                                    refresh_config_state(
-                                        &mut app,
-                                        session.config_options.as_deref(),
-                                    );
+                                    refresh_config_state(&mut app, Some(&session.config_options));
                                     if let Some(prompt) = first_prompt {
-                                        let turn_id = app.push_user(prompt.clone());
-                                        let connection = connection.clone();
-                                        let session = session_id.clone();
-                                        let updates = updates_tx.clone();
-                                        turn = Some(tokio::spawn(async move {
-                                            let outcome = connection
-                                                .send_request(agentkit_acp::PromptRequest::new(
-                                                    session,
-                                                    vec![ContentBlock::Text(
-                                                        agentkit_acp::TextContent::new(prompt),
-                                                    )],
-                                                ))
-                                                .block_task()
-                                                .await;
-                                            let _ = updates.send(Update::TurnEnded {
-                                                id: Some(turn_id),
-                                                error: match outcome {
-                                                    Ok(_) => None,
-                                                    Err(error) => Some(error.to_string()),
-                                                },
-                                            });
-                                        }));
+                                        let outcome = connection
+                                            .send_request(wire::PromptRequest::new(
+                                                session_id.clone(),
+                                                vec![ContentBlock::Text(wire::TextContent::new(prompt))],
+                                            ))
+                                            .block_task()
+                                            .await;
+                                        if let Err(error) = outcome {
+                                            app.note(format!("message was not accepted: {}", error.message));
+                                        }
                                     }
                                 }
+                                Action::Resume(requested_id) => {
+                                    if let Err(error) = crate::session::validate_id(&requested_id) {
+                                        app.note(format!("invalid session id: {error}"));
+                                        continue;
+                                    }
+                                    if let Err(error) = crate::session::load(&root, &requested_id) {
+                                        app.note(format!("could not resume session: {error}"));
+                                        continue;
+                                    }
+                                    let previous_session_id = session_id.clone();
+                                    let previous_persisted_id = durable_session_id(&session_id)
+                                        .map_err(|error| {
+                                            agent_client_protocol::Error::into_internal_error(
+                                                std::io::Error::other(error),
+                                            )
+                                        })?;
+                                    if let Err(error) = connection
+                                        .send_request(CloseSessionRequest::new(session_id.clone()))
+                                        .block_task()
+                                        .await
+                                    {
+                                        app.note(format!(
+                                            "could not close the current session: {}",
+                                            error.message
+                                        ));
+                                        continue;
+                                    }
+                                    session_id = wire::SessionId::new(requested_id.clone());
+                                    if let Ok(mut active) = transition_session.lock() {
+                                        *active = requested_id.clone();
+                                    }
+                                    app.start_session(requested_id.clone());
+                                    match request_resume(&connection, session_id.clone(), root.clone()).await {
+                                        Ok(response) => refresh_config_state(
+                                            &mut app,
+                                            Some(&response.config_options),
+                                        ),
+                                        Err(error) => {
+                                            session_id = previous_session_id;
+                                            if let Ok(mut active) = transition_session.lock() {
+                                                *active = previous_persisted_id.clone();
+                                            }
+                                            app.start_session(previous_persisted_id);
+                                            let restored = request_resume(
+                                                &connection,
+                                                session_id.clone(),
+                                                root.clone(),
+                                            )
+                                            .await;
+                                            match restored {
+                                                Ok(response) => {
+                                                    refresh_config_state(
+                                                        &mut app,
+                                                        Some(&response.config_options),
+                                                    );
+                                                    app.note(format!(
+                                                        "could not resume {requested_id}: {}",
+                                                        error.message
+                                                    ));
+                                                }
+                                                Err(restore_error) => {
+                                                    return Err(agent_client_protocol::Error::into_internal_error(
+                                                        std::io::Error::other(format!(
+                                                            "could not resume {requested_id}: {}; could not restore the previous session: {}",
+                                                            error.message, restore_error.message
+                                                        )),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Action::Close => return Ok(()),
                                 Action::SelectModel { choice, save_defaults } => {
                                     let response = connection.send_request(
                                         SetSessionConfigOptionRequest::new(
@@ -636,7 +723,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                                 Action::Cancel => {
                                     let _ = connection.send_notification(
-                                        CancelNotification::new(session_id.clone()),
+                                        CancelSessionNotification::new(session_id.clone()),
                                     );
                                 }
                                 Action::DetachCompose(call_id) => {
@@ -676,8 +763,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         },
                         update = updates_rx.recv() => match update {
                             Some(update) => {
+                                if let Update::ConfigOptions(options) = &update {
+                                    refresh_config_state(&mut app, Some(options));
+                                }
                                 app.apply(update);
                                 while let Ok(update) = updates_rx.try_recv() {
+                                    if let Update::ConfigOptions(options) = &update {
+                                        refresh_config_state(&mut app, Some(options));
+                                    }
                                     app.apply(update);
                                 }
                             }
@@ -690,15 +783,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             }
             .await;
             leave(terminal);
-            // Quitting mid-turn — by key, by signal, or because the terminal
-            // went away — must not abandon a running tool call. The agent is
-            // asked to interrupt and given a moment to record the results it
-            // owes, since the transcript it writes has to stay resumable even
-            // though the process is about to be killed.
-            if let Some(turn) = turn.filter(|turn| !turn.is_finished()) {
-                let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
-                let _ = tokio::time::timeout(SETTLE, turn).await;
-            }
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
@@ -985,9 +1069,7 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
             );
         }
     }
-    let mut blocks = vec![ContentBlock::Text(agentkit_acp::TextContent::new(
-        model_text,
-    ))];
+    let mut blocks = vec![ContentBlock::Text(wire::TextContent::new(model_text))];
     for (attachment, bytes) in media {
         let data = STANDARD.encode(bytes);
         blocks.push(match attachment.kind {
@@ -995,12 +1077,10 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
                 let uri = url::Url::from_file_path(&attachment.path)
                     .ok()
                     .map(|uri| uri.to_string());
-                ContentBlock::Image(
-                    agentkit_acp::ImageContent::new(data, attachment.mime_type).uri(uri),
-                )
+                ContentBlock::Image(wire::ImageContent::new(data, attachment.mime_type).uri(uri))
             }
             AttachmentKind::Audio => {
-                ContentBlock::Audio(agentkit_acp::AudioContent::new(data, attachment.mime_type))
+                ContentBlock::Audio(wire::AudioContent::new(data, attachment.mime_type))
             }
         });
     }
@@ -1102,63 +1182,217 @@ fn leave(terminal: DefaultTerminal) {
     ratatui::restore();
 }
 
-fn durable_session_id(session_id: &agentkit_acp::SessionId) -> Result<String, String> {
+async fn request_resume(
+    connection: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    session_id: wire::SessionId,
+    root: PathBuf,
+) -> Result<wire::ResumeSessionResponse, agent_client_protocol::Error> {
+    connection
+        .send_request(
+            wire::ResumeSessionRequest::new(session_id, root)
+                .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+        )
+        .block_task()
+        .await
+}
+
+fn durable_session_id(session_id: &wire::SessionId) -> Result<String, String> {
     let session_id = session_id.to_string();
     crate::session::validate_id(&session_id)?;
     Ok(session_id)
 }
 
 /// Maps one ACP session notification onto client updates.
-fn translate(notification: SessionNotification) -> Vec<Update> {
+fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
     let session_id = notification.session_id.to_string();
-    match notification.update {
+    let updates = match notification.update {
+        SessionUpdate::UserMessageChunk(chunk) => message_of(chunk.content)
+            .map(|text| Update::UserMessage {
+                id: chunk.message_id.to_string(),
+                text,
+                append: true,
+            })
+            .into_iter()
+            .collect(),
         SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
-            .map(Update::Text)
+            .map(|text| Update::AgentMessage {
+                id: chunk.message_id.to_string(),
+                text,
+                append: true,
+            })
             .into_iter()
             .collect(),
         SessionUpdate::AgentThoughtChunk(chunk) => text_of(chunk.content)
-            .map(Update::Thought)
+            .map(|text| Update::AgentThought {
+                id: chunk.message_id.to_string(),
+                text,
+                append: true,
+            })
             .into_iter()
             .collect(),
-        SessionUpdate::ToolCall(call) => vec![Update::ToolStarted {
-            id: call.tool_call_id.to_string(),
-            title: call.title,
-            kind: call.kind,
-            script: call.raw_input.as_ref().and_then(script_of),
-            backgrounded: call
+        SessionUpdate::UserMessage(message) => message_patch(
+            message.message_id.to_string(),
+            message.content,
+            MessageKind::User,
+        ),
+        SessionUpdate::AgentMessage(message) => message_patch(
+            message.message_id.to_string(),
+            message.content,
+            MessageKind::Agent,
+        ),
+        SessionUpdate::AgentThought(message) => message_patch(
+            message.message_id.to_string(),
+            message.content,
+            MessageKind::Thought,
+        ),
+        SessionUpdate::ToolCallUpdate(update) => {
+            let output = match &update.content {
+                MaybeUndefined::Value(content) => Some(output_of(Some(content))),
+                MaybeUndefined::Null => Some(Vec::new()),
+                MaybeUndefined::Undefined => None,
+            };
+            let script = match &update.raw_input {
+                MaybeUndefined::Value(input) => Some(script_of(input).unwrap_or_default()),
+                MaybeUndefined::Null => Some(String::new()),
+                MaybeUndefined::Undefined => None,
+            };
+            let backgrounded = update
                 .raw_input
-                .as_ref()
+                .value()
                 .and_then(|input| input.get("background"))
                 .and_then(Value::as_bool)
-                == Some(true),
-        }],
-        SessionUpdate::ToolCallUpdate(update) => {
-            let output = output_of(update.fields.content.as_deref());
+                == Some(true)
+                || output.as_ref().is_some_and(|lines| {
+                    lines
+                        .iter()
+                        .any(|line| line.contains("is now running in the background"))
+                });
+            vec![Update::ToolPatched {
+                id: update.tool_call_id.to_string(),
+                title: match update.title {
+                    MaybeUndefined::Value(title) => Some(title),
+                    MaybeUndefined::Null => Some("Tool".into()),
+                    MaybeUndefined::Undefined => None,
+                },
+                kind: match update.kind {
+                    MaybeUndefined::Value(kind) => Some(kind),
+                    MaybeUndefined::Null => Some(wire::ToolKind::default()),
+                    MaybeUndefined::Undefined => None,
+                },
+                status: match update.status {
+                    MaybeUndefined::Value(status) => Some(status),
+                    MaybeUndefined::Null => Some(wire::ToolCallStatus::default()),
+                    MaybeUndefined::Undefined => None,
+                },
+                script,
+                output,
+                append_output: false,
+                backgrounded,
+            }]
+        }
+        SessionUpdate::ToolCallContentChunk(chunk) => {
+            let output = output_of(Some(std::slice::from_ref(&chunk.content)));
             let backgrounded = output
                 .iter()
                 .any(|line| line.contains("is now running in the background"));
-            vec![Update::ToolUpdated {
-                id: update.tool_call_id.to_string(),
-                status: update.fields.status,
-                script: update.fields.raw_input.as_ref().and_then(script_of),
-                output,
+            vec![Update::ToolPatched {
+                id: chunk.tool_call_id.to_string(),
+                title: None,
+                kind: None,
+                status: None,
+                script: None,
+                output: Some(output),
+                append_output: true,
                 backgrounded,
             }]
         }
         SessionUpdate::AvailableCommandsUpdate(update) => vec![Update::AvailableCommands {
-            session_id,
+            session_id: session_id.clone(),
             commands: update
                 .available_commands
                 .into_iter()
                 .map(|command| command.name)
                 .collect(),
         }],
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            vec![Update::ConfigOptions(update.config_options)]
+        }
         SessionUpdate::UsageUpdate(usage) => vec![Update::Usage {
             used: usage.used,
             size: usage.size,
         }],
+        SessionUpdate::StateUpdate(state) => match state {
+            wire::StateUpdate::Running(_) => vec![Update::State {
+                active: true,
+                steerable: true,
+                cancelled: false,
+            }],
+            wire::StateUpdate::RequiresAction(_) => vec![Update::State {
+                active: true,
+                steerable: false,
+                cancelled: false,
+            }],
+            wire::StateUpdate::Idle(idle) => vec![Update::State {
+                active: false,
+                steerable: false,
+                cancelled: matches!(idle.stop_reason, Some(wire::StopReason::Cancelled)),
+            }],
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
-    }
+    };
+    (session_id, updates)
+}
+
+fn translate_for_session(notification: UpdateSessionNotification, current: &str) -> Vec<Update> {
+    let (session_id, updates) = translate(notification);
+    updates
+        .into_iter()
+        .filter(|update| {
+            session_id == current || matches!(update, Update::AvailableCommands { .. })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum MessageKind {
+    User,
+    Agent,
+    Thought,
+}
+
+fn message_patch(
+    id: String,
+    content: MaybeUndefined<Vec<ContentBlock>>,
+    kind: MessageKind,
+) -> Vec<Update> {
+    let blocks = match content {
+        MaybeUndefined::Undefined => return Vec::new(),
+        MaybeUndefined::Null => Vec::new(),
+        MaybeUndefined::Value(blocks) => blocks,
+    };
+    let text = blocks
+        .into_iter()
+        .filter_map(message_of)
+        .collect::<Vec<_>>()
+        .join("");
+    vec![match kind {
+        MessageKind::User => Update::UserMessage {
+            id,
+            text,
+            append: false,
+        },
+        MessageKind::Agent => Update::AgentMessage {
+            id,
+            text,
+            append: false,
+        },
+        MessageKind::Thought => Update::AgentThought {
+            id,
+            text,
+            append: false,
+        },
+    }]
 }
 
 fn text_of(content: ContentBlock) -> Option<String> {
@@ -1210,9 +1444,11 @@ fn output_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
                 }
             }
             ToolCallContent::Diff(diff) => output.push(format!(
-                "{} · {} lines",
-                diff.path.display(),
-                diff.new_text.lines().count()
+                "{} files · {} lines",
+                diff.changes.len(),
+                diff.patch
+                    .as_ref()
+                    .map_or(0, |patch| patch.text.lines().count())
             )),
             _ => {}
         }
@@ -1245,9 +1481,11 @@ fn readable(text: &str) -> Vec<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use agentkit_acp::{
-        AvailableCommand, AvailableCommandsUpdate, ContentBlock, SessionConfigOption,
-        SessionConfigSelectGroup, SessionConfigSelectOption, SessionNotification, SessionUpdate,
+    use agent_client_protocol::schema::v2::{
+        AvailableCommand, AvailableCommandsUpdate, ContentBlock, IdleStateUpdate,
+        RunningStateUpdate, SessionConfigOption, SessionConfigSelectGroup,
+        SessionConfigSelectOption, SessionUpdate, StateUpdate, TextContent,
+        UpdateSessionNotification, UserMessage,
     };
     use crossterm::event::Event;
 
@@ -1255,7 +1493,7 @@ mod tests {
         MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
         detach_from_controlling_terminal, durable_session_id, effort_state, handle, message_of,
         osc52, prompt_blocks, readable, refresh_config_state, save_effort_default_to,
-        save_model_defaults_to, translate,
+        save_model_defaults_to, translate, translate_for_session, wire,
     };
     use crate::tui::app::{App, SubmittedPrompt, Update};
 
@@ -1276,7 +1514,7 @@ mod tests {
 
     #[test]
     fn translates_available_commands_with_their_session() {
-        let updates = translate(SessionNotification::new(
+        let (_, updates) = translate(UpdateSessionNotification::new(
             "session",
             SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
                 AvailableCommand::new("compact", "Compact context"),
@@ -1288,6 +1526,65 @@ mod tests {
             [Update::AvailableCommands { session_id, commands }]
                 if session_id == "session" && commands == &["compact"]
         ));
+    }
+
+    #[test]
+    fn translates_accepted_user_messages_and_foreground_state() {
+        let user = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::UserMessage(
+                UserMessage::new("user-1")
+                    .content(vec![ContentBlock::Text(TextContent::new("steer"))]),
+            ),
+        );
+        assert!(matches!(
+            translate_for_session(user, "session").as_slice(),
+            [Update::UserMessage { id, text, append: false }]
+                if id == "user-1" && text == "steer"
+        ));
+
+        let running = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
+        );
+        assert!(matches!(
+            translate_for_session(running, "session").as_slice(),
+            [Update::State {
+                active: true,
+                steerable: true,
+                cancelled: false
+            }]
+        ));
+        let idle = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::StateUpdate(StateUpdate::Idle(IdleStateUpdate::new())),
+        );
+        assert!(matches!(
+            translate_for_session(idle, "session").as_slice(),
+            [Update::State {
+                active: false,
+                steerable: false,
+                cancelled: false
+            }]
+        ));
+    }
+
+    #[test]
+    fn defers_session_scoped_commands_but_drops_other_inactive_updates() {
+        let commands = UpdateSessionNotification::new(
+            "next",
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![])),
+        );
+        assert!(matches!(
+            translate_for_session(commands, "current").as_slice(),
+            [Update::AvailableCommands { session_id, .. }] if session_id == "next"
+        ));
+
+        let state = UpdateSessionNotification::new(
+            "next",
+            SessionUpdate::StateUpdate(wire::StateUpdate::Running(wire::RunningStateUpdate::new())),
+        );
+        assert!(translate_for_session(state, "current").is_empty());
     }
 
     #[test]
@@ -1368,14 +1665,14 @@ mod tests {
 
         let blocks = prompt_blocks(&prompt).unwrap();
 
-        let agentkit_acp::ContentBlock::Text(text) = &blocks[0] else {
+        let ContentBlock::Text(text) = &blocks[0] else {
             panic!("expected text block");
         };
         assert!(text.text.starts_with("describe [Image #1](file://"));
-        let agentkit_acp::ContentBlock::Image(image) = &blocks[1] else {
+        let ContentBlock::Image(image) = &blocks[1] else {
             panic!("expected image block");
         };
-        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.mime_type.to_string(), "image/png");
         assert_eq!(image.data, "cG5n");
         assert!(
             image
@@ -1404,7 +1701,7 @@ mod tests {
         let ContentBlock::Audio(audio) = &blocks[1] else {
             panic!("expected audio block");
         };
-        assert_eq!(audio.mime_type, "audio/wav");
+        assert_eq!(audio.mime_type.to_string(), "audio/wav");
         assert_eq!(audio.data, "d2F2");
     }
 
@@ -1435,7 +1732,7 @@ mod tests {
     #[test]
     fn rendered_image_never_exposes_a_data_url() {
         let content = ContentBlock::Image(
-            agentkit_acp::ImageContent::new("c2VjcmV0", "image/png")
+            agent_client_protocol::schema::v2::ImageContent::new("c2VjcmV0", "image/png")
                 .uri(Some("data:image/png;base64,c2VjcmV0".into())),
         );
 
@@ -1633,10 +1930,10 @@ a = [still text]
     #[test]
     fn uses_the_validated_acp_id_as_the_durable_session_id() {
         assert_eq!(
-            durable_session_id(&agentkit_acp::SessionId::new("s-123-4-5")).unwrap(),
+            durable_session_id(&wire::SessionId::new("s-123-4-5")).unwrap(),
             "s-123-4-5"
         );
-        assert!(durable_session_id(&agentkit_acp::SessionId::new("bad/id")).is_err());
+        assert!(durable_session_id(&wire::SessionId::new("bad/id")).is_err());
     }
 
     #[test]

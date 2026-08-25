@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use agentkit_acp::{ToolCallStatus, ToolKind};
+use agent_client_protocol::schema::v2::{ToolCallStatus, ToolKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
@@ -746,7 +746,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
                 theme::text_color()
             }),
         ),
-        Span::styled(kind_label(call.kind).to_string(), theme::faint()),
+        Span::styled(kind_label(&call.kind).to_string(), theme::faint()),
         Span::styled(
             format!("  {}", theme::duration(call.elapsed())),
             theme::dim(),
@@ -774,7 +774,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
 }
 
 /// Tool kinds worth naming; `other` reads as noise next to the tool's title.
-const fn kind_label(kind: ToolKind) -> &'static str {
+fn kind_label(kind: &ToolKind) -> &'static str {
     match kind {
         ToolKind::Read => "  read",
         ToolKind::Edit => "  edit",
@@ -983,10 +983,10 @@ fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let border = if app.working() {
-        theme::faint()
-    } else {
+    let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
         Style::default().fg(theme::accent_color())
+    } else {
+        theme::faint()
     };
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
@@ -1006,7 +1006,14 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Keep the cursor's row on screen when the prompt is taller than the box.
     let first = cursor_row.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line<'static>> = if app.editor.text().is_empty() {
-        vec![Line::from(Span::styled("message kit…", theme::faint()))]
+        vec![Line::from(Span::styled(
+            if app.phase == Phase::Working && app.can_steer {
+                "steer kit…"
+            } else {
+                "message kit…"
+            },
+            theme::faint(),
+        ))]
     } else {
         prompt_lines(rows, app.editor.text(), &app.available_commands)
             .into_iter()
@@ -1057,6 +1064,10 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::styled("stopping", Style::default().fg(theme::warn_color())),
         ],
+        Phase::Blocked => vec![Span::styled(
+            " waiting for input",
+            Style::default().fg(theme::warn_color()),
+        )],
         Phase::Working => vec![
             Span::styled(
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
@@ -1111,7 +1122,7 @@ fn compact(value: u64) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use agentkit_acp::ToolKind;
+    use agent_client_protocol::schema::v2::ToolKind;
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
@@ -1186,7 +1197,7 @@ mod tests {
         app.toast = None;
         for block in &mut app.blocks {
             let Block::Tool(call) = block else { continue };
-            call.status = agentkit_acp::ToolCallStatus::Completed;
+            call.status = agent_client_protocol::schema::v2::ToolCallStatus::Completed;
             call.finished = Some(call.started + Duration::from_millis(120));
             for (index, child) in call.children.iter_mut().enumerate() {
                 child.millis = Some(40 * (index as u64 + 1));
@@ -1312,7 +1323,7 @@ mod tests {
             "127.0.0.1:7331".into(),
         );
         app.push_user("check every source file".into());
-        app.apply(Update::Text(
+        app.apply(Update::test_text(
             "Reading the tree first.\n\n- one\n- two\n\n```sh\ncargo check\n```".into(),
         ));
         app.apply(Update::ToolStarted {
@@ -1433,7 +1444,7 @@ mod tests {
 
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
-            status: Some(agentkit_acp::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
             output: Vec::new(),
             backgrounded: false,
@@ -1499,24 +1510,26 @@ mod tests {
         let mut app = sample();
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
-            status: Some(agentkit_acp::ToolCallStatus::Failed),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Failed),
             script: None,
             output: vec!["exit code 1".into()],
             backgrounded: false,
         });
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: Some("model refused the request".into()),
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
         app.apply(Update::Log("warn: retrying provider request".into()));
         app.show_logs = true;
         for index in 0..12 {
             app.push_user(format!("follow-up number {index}"));
-            app.apply(Update::Text(format!("answer number {index}")));
+            app.apply(Update::test_text(format!("answer number {index}")));
         }
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
         let _ = render(&mut app, 100, 24);
         app.scroll_by(-6);
@@ -1596,7 +1609,7 @@ mod tests {
         let mut app = sample();
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
-            status: Some(agentkit_acp::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
             output: (0..40)
                 .map(|index| format!("output line {index}"))
@@ -1710,7 +1723,7 @@ mod tests {
             "gpt-5.4".into(),
             "0:0".into(),
         );
-        app.apply(Update::Thought("still thinking".into()));
+        app.apply(Update::test_thought("still thinking".into()));
 
         refresh_transcript_cache(&mut app, 40);
         let first_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
@@ -1720,7 +1733,7 @@ mod tests {
             first_rows
         );
 
-        app.apply(Update::Text("done".into()));
+        app.apply(Update::test_text("done".into()));
         refresh_transcript_cache(&mut app, 40);
         assert!(!app.transcript_dynamic.contains(&0));
         let stable_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
@@ -1774,16 +1787,17 @@ mod tests {
             "gpt-5.4".into(),
             "0:0".into(),
         );
-        for index in 0..100 {
+        for index in 0..99 {
             app.blocks.push(Block::Agent(format!("history {index}")));
         }
+        app.apply(Update::test_text("history 99".into()));
         refresh_transcript_cache(&mut app, 12);
         let history_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
         let history_revision = app.transcript_cache[0].as_ref().unwrap().revision;
         let tail_rows = app.transcript_cache[99].as_ref().unwrap().rows.as_ptr();
 
         super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| count.set(0));
-        app.apply(Update::Text(" changed".into()));
+        app.apply(Update::test_text(" changed".into()));
         refresh_transcript_cache(&mut app, 12);
 
         super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| assert_eq!(count.get(), 1));
