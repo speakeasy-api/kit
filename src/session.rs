@@ -16,7 +16,8 @@ use agentkit_core::{Item, Timestamp};
 use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -25,6 +26,8 @@ struct Record {
     schema_version: u32,
     session_id: String,
     generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_root: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     item: Option<Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,6 +47,7 @@ struct Writer {
     session_id: String,
     generation: u64,
     path: PathBuf,
+    workspace_root: PathBuf,
     file: File,
     lock: SessionLock,
 }
@@ -108,8 +112,10 @@ pub(crate) fn load_in(
     session_id: &str,
 ) -> Result<Vec<Item>, String> {
     validate_id(session_id)?;
-    let path = preferred_transcript(directory, root, session_id)?;
+    let workspace_root = canonical_workspace(root);
+    let path = preferred_transcript(directory, &workspace_root, session_id)?;
     let (mut items, _) = read_records(&path, session_id)?;
+    ensure_workspace(&path, session_id, &workspace_root)?;
     crate::transcript::repair_unanswered_tool_calls(&mut items);
     Ok(items)
 }
@@ -210,10 +216,11 @@ fn open_with_initial_timestamps_in(
     if !resume && initial.is_empty() {
         return Err("a new session requires an initial transcript".into());
     }
+    let workspace_root = canonical_workspace(root);
     fs::create_dir_all(directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
     let path = transcript_path(directory, session_id);
-    let legacy = legacy_transcript(root, session_id);
+    let legacy = legacy_transcript(&workspace_root, session_id);
     let lock = SessionLock::acquire(lock_path(directory, session_id), force)?;
     let global_exists = path
         .try_exists()
@@ -238,6 +245,19 @@ fn open_with_initial_timestamps_in(
     } else {
         (Vec::new(), 0)
     };
+    let stored_workspace = resume
+        .then(|| transcript_workspace(&path, session_id))
+        .transpose()?
+        .flatten();
+    if let Some(stored) = &stored_workspace
+        && stored != &workspace_root
+    {
+        return Err(format!(
+            "session {session_id:?} belongs to workspace {}, not {}",
+            stored.display(),
+            workspace_root.display()
+        ));
+    }
     let mut options = OpenOptions::new();
     options.read(true).append(true);
     if resume {
@@ -253,9 +273,13 @@ fn open_with_initial_timestamps_in(
         session_id: session_id.into(),
         generation,
         path,
+        workspace_root,
         file,
         lock,
     };
+    if resume && stored_workspace.is_none() {
+        writer.replace(&transcript)?;
+    }
     if !resume {
         for mut item in initial {
             if stamp_initial {
@@ -333,6 +357,7 @@ impl Writer {
             schema_version: SCHEMA_VERSION,
             session_id: self.session_id.clone(),
             generation,
+            workspace_root: Some(self.workspace_root.clone()),
             item: Some(item.clone()),
             replacement: None,
         };
@@ -349,6 +374,7 @@ impl Writer {
             schema_version: SCHEMA_VERSION,
             session_id: self.session_id.clone(),
             generation,
+            workspace_root: Some(self.workspace_root.clone()),
             item: None,
             replacement: Some(transcript.to_vec()),
         };
@@ -541,7 +567,7 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
             .map_err(|error| format!("invalid transcript line {}: {error}", index + 1))?;
         if !matches!(
             record.schema_version,
-            LEGACY_SCHEMA_VERSION | SCHEMA_VERSION
+            LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
         ) {
             return Err(format!(
                 "unsupported session schema version {} on line {} (Kit supports {})",
@@ -559,7 +585,7 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
         match (record.item, record.replacement) {
             (Some(item), None) => items.push(item),
             (None, Some(replacement))
-                if record.schema_version == SCHEMA_VERSION && !replacement.is_empty() =>
+                if record.schema_version >= PREVIOUS_SCHEMA_VERSION && !replacement.is_empty() =>
             {
                 items = replacement;
             }
@@ -578,6 +604,27 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
     Ok((items, expected - 1))
 }
 
+fn canonical_workspace(root: &Path) -> PathBuf {
+    if let Ok(canonical) = root.canonicalize() {
+        return canonical;
+    }
+    let mut ancestor = root.to_path_buf();
+    let mut suffix = Vec::new();
+    while let Some(name) = ancestor.file_name().map(ToOwned::to_owned) {
+        suffix.push(name);
+        if !ancestor.pop() {
+            return root.to_path_buf();
+        }
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+    }
+    root.to_path_buf()
+}
+
 fn default_directory() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -586,9 +633,111 @@ fn default_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME is unset; cannot locate durable sessions".into())
 }
 
-/// Lists durable transcript ids without acquiring their mutation locks.
-pub(crate) fn list_ids() -> Result<Vec<String>, String> {
-    list_ids_in(&default_directory()?)
+fn workspace_directory(root: &Path) -> PathBuf {
+    root.join(".kit/sessions")
+}
+
+fn transcript_workspace(path: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
+    let file =
+        File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let mut workspace = None;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line =
+            line.map_err(|error| format!("could not read transcript line {}: {error}", index + 1))?;
+        let record: Record = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid transcript line {}: {error}", index + 1))?;
+        if record.session_id != session_id {
+            return Err(format!(
+                "invalid session identity on transcript line {}",
+                index + 1
+            ));
+        }
+        if record.workspace_root.is_some() {
+            workspace = record.workspace_root;
+        }
+    }
+    Ok(workspace)
+}
+
+fn ensure_workspace(path: &Path, session_id: &str, root: &Path) -> Result<(), String> {
+    if let Some(stored) = transcript_workspace(path, session_id)?
+        && stored != root
+    {
+        return Err(format!(
+            "session {session_id:?} belongs to workspace {}, not {}",
+            stored.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Lists durable transcript ids bound to one workspace without taking mutation locks.
+pub(crate) fn list_ids(root: &Path) -> Result<Vec<String>, String> {
+    list_ids_for_workspace(root, &default_directory()?)
+}
+
+fn list_ids_for_workspace(root: &Path, global_directory: &Path) -> Result<Vec<String>, String> {
+    let root = canonical_workspace(root);
+    let legacy_directory = workspace_directory(&root);
+    let mut ids = Vec::new();
+    for id in list_ids_in(global_directory)? {
+        let path = transcript_path(global_directory, &id);
+        read_records(&path, &id)?;
+        if transcript_workspace(&path, &id)?.as_deref() == Some(root.as_path()) {
+            ids.push(id);
+        }
+    }
+    for id in list_ids_in(&legacy_directory)? {
+        let global = transcript_path(global_directory, &id);
+        let visible = if global
+            .try_exists()
+            .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
+        {
+            read_records(&global, &id)?;
+            transcript_workspace(&global, &id)?
+                .as_deref()
+                .is_none_or(|stored| stored == root)
+        } else {
+            true
+        };
+        if visible {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+pub(crate) fn belongs_to_workspace(root: &Path, session_id: &str) -> Result<bool, String> {
+    belongs_to_workspace_in(root, &default_directory()?, session_id)
+}
+
+fn belongs_to_workspace_in(
+    root: &Path,
+    global_directory: &Path,
+    session_id: &str,
+) -> Result<bool, String> {
+    validate_id(session_id)?;
+    let root = canonical_workspace(root);
+    let global = transcript_path(global_directory, session_id);
+    let legacy = legacy_transcript(&root, session_id);
+    if global
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
+    {
+        read_records(&global, session_id)?;
+        return Ok(match transcript_workspace(&global, session_id)? {
+            Some(stored) => stored == root,
+            None => legacy
+                .try_exists()
+                .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?,
+        });
+    }
+    legacy
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))
 }
 
 pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
@@ -690,7 +839,7 @@ fn transcript_path(directory: &Path, session_id: &str) -> PathBuf {
 }
 
 fn legacy_transcript(root: &Path, session_id: &str) -> PathBuf {
-    transcript_path(&root.join(".kit/sessions"), session_id)
+    transcript_path(&workspace_directory(root), session_id)
 }
 
 fn lock_path(directory: &Path, session_id: &str) -> PathBuf {
@@ -853,8 +1002,9 @@ mod tests {
         assert!(resumed.transcript[0].created_at.is_some());
         assert_eq!(resumed.transcript[1].created_at, Some(Timestamp(123)));
         let text = fs::read_to_string(transcript_path(root.path(), "abc")).unwrap();
-        assert!(text.contains("\"schema_version\":2"));
+        assert!(text.contains(&format!("\"schema_version\":{SCHEMA_VERSION}")));
         assert!(text.contains("\"generation\":2"));
+        assert!(text.contains("\"workspace_root\""));
     }
 
     #[test]
@@ -1197,6 +1347,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             session_id: "abc".into(),
             generation: 1,
+            workspace_root: None,
             item: Some(item.clone()),
             replacement: None,
         };
@@ -1253,6 +1404,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             session_id: "abc".into(),
             generation: 1,
+            workspace_root: None,
             item: Some(Item::text(ItemKind::System, "legacy")),
             replacement: None,
         };
@@ -1324,6 +1476,80 @@ mod tests {
         fs::create_dir(directory.path().join("nested.jsonl")).unwrap();
 
         assert_eq!(list_ids_in(directory.path()).unwrap(), ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn workspace_metadata_isolates_global_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        let opened = open_in(
+            &first,
+            storage.path(),
+            "isolated",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        drop(opened);
+
+        assert_eq!(
+            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            ["isolated"]
+        );
+        assert!(
+            list_ids_for_workspace(&second, storage.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(belongs_to_workspace_in(&first, storage.path(), "isolated").unwrap());
+        assert!(!belongs_to_workspace_in(&second, storage.path(), "isolated").unwrap());
+        let error = open_in(&second, storage.path(), "isolated", true, false, Vec::new())
+            .err()
+            .expect("cross-workspace resume must fail");
+        assert!(error.contains("belongs to workspace"));
+    }
+
+    #[test]
+    fn legacy_transcript_is_listed_only_in_its_project_and_binds_on_resume() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        let legacy = workspace_directory(&first);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let record = serde_json::json!({
+            "schema_version": PREVIOUS_SCHEMA_VERSION,
+            "session_id": "legacy",
+            "generation": 1,
+            "item": Item::text(ItemKind::System, "legacy"),
+        });
+        fs::write(legacy.join("legacy.jsonl"), format!("{record}\n")).unwrap();
+
+        assert_eq!(
+            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            ["legacy"]
+        );
+        assert!(
+            list_ids_for_workspace(&second, storage.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(belongs_to_workspace_in(&first, storage.path(), "legacy").unwrap());
+
+        let opened = open_in(&first, storage.path(), "legacy", true, false, Vec::new()).unwrap();
+        drop(opened);
+        assert_eq!(
+            transcript_workspace(&storage.path().join("legacy.jsonl"), "legacy").unwrap(),
+            Some(canonical_workspace(&first))
+        );
+        assert!(!belongs_to_workspace_in(&second, storage.path(), "legacy").unwrap());
     }
 
     #[test]

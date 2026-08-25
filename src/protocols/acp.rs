@@ -620,8 +620,8 @@ impl Server {
         }
     }
 
-    async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
-        InitializeResponse::new(request.protocol_version)
+    async fn initialize(&self, _request: InitializeRequest) -> InitializeResponse {
+        InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
             .agent_capabilities(capabilities())
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
@@ -1330,8 +1330,14 @@ async fn serve_transport(
 
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
-        component(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP integration must build")
+        let v1 = component(Arc::clone(&runtime), registry.clone())
+            .expect("Kit's fixed ACP v1 integration must build");
+        let v2 = v2::component(Arc::clone(&runtime), registry.clone())
+            .expect("Kit's fixed ACP v2 integration must build");
+        agent_client_protocol::Agent
+            .protocol_router()
+            .with_v1(v1)
+            .with_v2(v2)
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         health_endpoint: false,
@@ -2678,9 +2684,10 @@ mod tests {
             .builder()
             .connect_with(client_transport, async move |connection| {
                 let initialized = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(InitializeRequest::new(ProtocolVersion::V2))
                     .block_task()
                     .await?;
+                assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
                 assert!(initialized.agent_capabilities.load_session);
                 let sessions = &initialized.agent_capabilities.session_capabilities;
                 assert!(sessions.list.is_none());

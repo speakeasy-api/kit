@@ -82,11 +82,10 @@ impl SessionSelection {
     }
 
     fn claim_load(&mut self, id: &str) -> (SessionRequest, bool) {
-        let configured = !self.configured_claimed
-            && self
-                .configured
-                .as_ref()
-                .is_some_and(|request| request.id == id);
+        let matching_configured = self.configured.as_ref().filter(|request| request.id == id);
+        let configured = !self.configured_claimed && matching_configured.is_some();
+        let force = configured
+            && matching_configured.is_some_and(|request| request.resume && request.force);
         if configured {
             self.configured_claimed = true;
         }
@@ -94,7 +93,7 @@ impl SessionSelection {
             SessionRequest {
                 id: id.into(),
                 resume: true,
-                force: false,
+                force,
             },
             configured,
         )
@@ -161,6 +160,14 @@ pub(crate) struct SessionClaim {
 impl SessionClaim {
     pub(crate) fn id(&self) -> &str {
         &self.request.id
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        match self.kind {
+            SessionClaimKind::New { configured, .. } | SessionClaimKind::Load { configured } => {
+                configured
+            }
+        }
     }
 
     fn mark_opened(&mut self) {

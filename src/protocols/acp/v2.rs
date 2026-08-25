@@ -15,8 +15,10 @@ use agentkit_acp::{
         AcpSessionUpdateSink, wire,
     },
 };
-use agentkit_core::{CancellationController, FinishReason, Item, ItemKind, Part, SessionId};
-use agentkit_loop::{LoopDriver, LoopError, LoopInterrupt, LoopStep, ModelSession};
+use agentkit_core::{
+    CancellationController, FinishReason, Item, ItemKind, Part, SessionId, ToolOutput,
+};
+use agentkit_loop::{LoopDriver, LoopInterrupt, LoopStep, ModelSession};
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -44,10 +46,6 @@ fn available_commands_update(session_id: wire::SessionId) -> wire::UpdateSession
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(error.to_string())
-}
-
-fn conversion_error(error: impl ToString) -> AcpRuntimeError {
-    AcpRuntimeError::Sdk(error.to_string())
 }
 
 fn claim_prompt(busy: &AtomicBool) -> Result<(), AcpRuntimeError> {
@@ -87,7 +85,6 @@ struct PromptCommand {
 
 enum Command {
     Prompt(PromptCommand),
-    Cancel,
     SetConfig {
         request: wire::SetSessionConfigOptionRequest,
         reply: oneshot::Sender<Result<wire::SetSessionConfigOptionResponse, AcpRuntimeError>>,
@@ -173,9 +170,9 @@ impl Server {
         &self,
         request: wire::InitializeRequest,
     ) -> Result<wire::InitializeResponse, AcpRuntimeError> {
-        if request.protocol_version != wire::ProtocolVersion::V2 {
+        if request.protocol_version < wire::ProtocolVersion::V2 {
             return Err(AcpRuntimeError::Unsupported(
-                "ACP v2 requires protocol version 2".into(),
+                "ACP v2 requires protocol version 2 or newer".into(),
             ));
         }
         Ok(wire::InitializeResponse::new(
@@ -237,6 +234,17 @@ impl Server {
         let claim = self
             .runtime
             .claim_session_load(&request.session_id.to_string())?;
+        if !claim.is_configured()
+            && !crate::session::belongs_to_workspace(
+                self.runtime.root(),
+                &request.session_id.to_string(),
+            )
+            .map_err(AcpRuntimeError::Loop)?
+        {
+            return Err(AcpRuntimeError::SessionNotFound(
+                request.session_id.to_string(),
+            ));
+        }
         let attached = self
             .attach_session(
                 request.cwd.0,
@@ -279,7 +287,7 @@ impl Server {
             .map(|cursor| parse_cursor(cursor.as_ref()))
             .transpose()?
             .unwrap_or(0);
-        let ids = crate::session::list_ids().map_err(AcpRuntimeError::Loop)?;
+        let ids = crate::session::list_ids(self.runtime.root()).map_err(AcpRuntimeError::Loop)?;
         if offset > ids.len() {
             return Err(AcpRuntimeError::Unsupported(
                 "invalid session list cursor".into(),
@@ -325,7 +333,7 @@ impl Server {
             .reasoning_effort()
             .map_err(AcpRuntimeError::Loop)?;
         let catalog = model_catalog(&current).await;
-        let config_options = v2_config_options(&current, reasoning, &catalog)?;
+        let config_options = v2_config_options(&current, reasoning, &catalog);
         let canonical_transcript = driver.canonical_transcript;
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
@@ -419,7 +427,8 @@ impl Server {
         &self,
         request: wire::PromptRequest,
     ) -> Result<oneshot::Sender<()>, AcpRuntimeError> {
-        let (sender, busy, cancellation_generation) = self.prompt_sender(&request.session_id)?;
+        let (sender, busy, handle, cancellation_generation) =
+            self.prompt_sender(&request.session_id)?;
         let (reply, response) = oneshot::channel();
         if sender
             .send(Command::Prompt(PromptCommand {
@@ -430,12 +439,14 @@ impl Server {
             .await
             .is_err()
         {
+            handle.stop_injection_turn();
             busy.store(false, Ordering::Release);
             return Err(AcpRuntimeError::ClientClosed);
         }
         match response.await {
             Ok(response) => response,
             Err(_) => {
+                handle.stop_injection_turn();
                 busy.store(false, Ordering::Release);
                 Err(AcpRuntimeError::ClientClosed)
             }
@@ -445,16 +456,28 @@ impl Server {
     fn prompt_sender(
         &self,
         session_id: &wire::SessionId,
-    ) -> Result<(mpsc::Sender<Command>, Arc<AtomicBool>, u64), AcpRuntimeError> {
+    ) -> Result<
+        (
+            mpsc::Sender<Command>,
+            Arc<AtomicBool>,
+            AcpSessionHandle,
+            u64,
+        ),
+        AcpRuntimeError,
+    > {
         let sessions = self.sessions.lock().expect("ACP v2 session map poisoned");
         let session = sessions
             .get(session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))?;
         claim_prompt(&session.busy)?;
+        let handle = session.integration.clone();
+        handle.prepare_injection_turn();
+        let generation = handle.cancellation_handle().generation();
         Ok((
             session.commands.clone(),
             Arc::clone(&session.busy),
-            session.integration.cancellation_handle().generation(),
+            handle,
+            generation,
         ))
     }
 
@@ -475,12 +498,16 @@ impl Server {
         &self,
         notification: wire::CancelSessionNotification,
     ) -> Result<(), AcpRuntimeError> {
-        let (sender, handle) = self.sender_and_handle(&notification.session_id)?;
-        handle.interrupt();
-        sender
-            .send(Command::Cancel)
-            .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)
+        let handle = self
+            .sessions
+            .lock()
+            .expect("ACP v2 session map poisoned")
+            .get(&notification.session_id)
+            .map(|session| session.integration.clone());
+        if let Some(handle) = handle {
+            handle.interrupt();
+        }
+        Ok(())
     }
 
     async fn close(
@@ -516,18 +543,6 @@ impl Server {
             .expect("ACP v2 session map poisoned")
             .get(session_id)
             .map(|session| session.commands.clone())
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
-    }
-
-    fn sender_and_handle(
-        &self,
-        session_id: &wire::SessionId,
-    ) -> Result<(mpsc::Sender<Command>, AcpSessionHandle), AcpRuntimeError> {
-        self.sessions
-            .lock()
-            .expect("ACP v2 session map poisoned")
-            .get(session_id)
-            .map(|session| (session.commands.clone(), session.integration.clone()))
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
     }
 
@@ -602,7 +617,6 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             biased;
             command = commands.recv() => match command {
                 Some(Command::Prompt(command)) => {
-                    handle.prepare_injection_turn();
                     let result = prepare_prompt(
                         &session_id,
                         &integration,
@@ -617,7 +631,6 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         eprintln!("ACP v2 prompt failed for {session_id}: {error}");
                     }
                 }
-                Some(Command::Cancel) => {}
                 Some(Command::SetConfig { request, reply }) => {
                     let result = set_v2_config(&adapter, &catalog, request);
                     let _ = reply.send(result);
@@ -639,14 +652,28 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 if let Some(event) = event
                     && driver.submit_input(vec![Item::notification(event.message)]).is_ok()
                 {
-                    drive_autonomous(&session_id, &integration, &mut driver, &sink).await;
+                    drive_autonomous(
+                        &session_id,
+                        &integration,
+                        &handle,
+                        &busy,
+                        &mut driver,
+                        &sink,
+                    ).await;
                 }
             }
             event = tasks.next_event() => match event {
                 Some(TaskEvent::Completed(snapshot, _))
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background =>
                 {
-                    drive_autonomous(&session_id, &integration, &mut driver, &sink).await;
+                    drive_autonomous(
+                        &session_id,
+                        &integration,
+                        &handle,
+                        &busy,
+                        &mut driver,
+                        &sink,
+                    ).await;
                 }
                 Some(_) => {}
                 None => break,
@@ -728,7 +755,13 @@ async fn drive_prompt<S: ModelSession + Send + 'static>(
             Err(_) if cancellation.is_cancelled_since(cancellation_generation) => {
                 return wire::StopReason::Cancelled;
             }
-            Err(_) => return error_stop_reason(),
+            Err(_) => match handle.handle_injection_boundary(driver, true).await {
+                Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
+                    continue;
+                }
+                Ok(AcpInjectionBoundary::Stopped) => return wire::StopReason::Cancelled,
+                Ok(AcpInjectionBoundary::Finished) | Err(_) => return error_stop_reason(),
+            },
         };
         if cancellation.is_cancelled_since(cancellation_generation) {
             return wire::StopReason::Cancelled;
@@ -775,12 +808,21 @@ async fn drive_prompt<S: ModelSession + Send + 'static>(
     }
 }
 
-async fn drive_autonomous<S: ModelSession>(
+async fn drive_autonomous<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,
+    handle: &AcpSessionHandle,
+    busy: &AtomicBool,
     driver: &mut LoopDriver<S>,
     sink: &ConnectionSink,
 ) {
+    if claim_prompt(busy).is_err() {
+        return;
+    }
+    handle.prepare_injection_turn();
+    integration.finish_prompt(session_id);
+    let cancellation_generation = handle.cancellation_handle().generation();
+    handle.start_injection_turn();
     if send_state(
         sink,
         session_id,
@@ -788,34 +830,20 @@ async fn drive_autonomous<S: ModelSession>(
     )
     .is_err()
     {
+        handle.stop_injection_turn();
+        busy.store(false, Ordering::Release);
         return;
     }
-    let stop_reason = loop {
-        match driver.next().await {
-            Ok(LoopStep::Finished(result)) if result.finish_reason == FinishReason::ToolCall => {}
-            Ok(LoopStep::Finished(result)) => {
-                break finish_reason_to_stop_reason(&result.finish_reason);
-            }
-            Ok(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))) => {}
-            Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_))) => {
-                if driver.cancel_pending_approvals().await.is_err() {
-                    break error_stop_reason();
-                }
-            }
-            Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))) => {
-                break wire::StopReason::EndTurn;
-            }
-            Err(LoopError::Cancelled) => break wire::StopReason::Cancelled,
-            Err(_) => break error_stop_reason(),
-        }
-    };
+    let stop_reason = drive_prompt(driver, handle, cancellation_generation).await;
     let _ = integration.flush_session_updates(session_id).await;
     integration.finish_prompt(session_id);
+    handle.stop_injection_turn();
     let _ = send_state(
         sink,
         session_id,
         wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(stop_reason)),
     );
+    busy.store(false, Ordering::Release);
 }
 
 fn send_state(
@@ -831,12 +859,13 @@ fn send_state(
 
 fn finish_reason_to_stop_reason(reason: &FinishReason) -> wire::StopReason {
     match reason {
-        FinishReason::Completed | FinishReason::ToolCall | FinishReason::Other(_) => {
-            wire::StopReason::EndTurn
-        }
+        FinishReason::Completed => wire::StopReason::EndTurn,
+        FinishReason::ToolCall => wire::StopReason::EndTurn,
         FinishReason::MaxTokens => wire::StopReason::MaxTokens,
         FinishReason::Cancelled => wire::StopReason::Cancelled,
-        FinishReason::Blocked | FinishReason::Error => error_stop_reason(),
+        FinishReason::Blocked => wire::StopReason::Refusal,
+        FinishReason::Error => error_stop_reason(),
+        FinishReason::Other(reason) => wire::StopReason::Other(reason.clone()),
     }
 }
 
@@ -848,10 +877,53 @@ fn v2_config_options(
     current: &crate::provider::ModelSelection,
     reasoning: Option<crate::provider::ReasoningEffort>,
     catalog: &[crate::provider::ModelGroup],
-) -> Result<Vec<wire::SessionConfigOption>, AcpRuntimeError> {
-    let v1 = super::config_options(current, reasoning, catalog);
-    serde_json::from_value(serde_json::to_value(v1).map_err(conversion_error)?)
-        .map_err(conversion_error)
+) -> Vec<wire::SessionConfigOption> {
+    let groups = catalog
+        .iter()
+        .map(|group| {
+            let name = match group.provider {
+                crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
+                crate::ProviderKind::OpenRouter => "OpenRouter",
+                crate::ProviderKind::Speakeasy => "Speakeasy",
+            };
+            let options = group
+                .models
+                .iter()
+                .map(|model| {
+                    let selection = crate::provider::ModelSelection {
+                        provider: group.provider,
+                        model: model.clone(),
+                    };
+                    wire::SessionConfigSelectOption::new(selection.id(), model.clone())
+                })
+                .collect();
+            wire::SessionConfigSelectGroup::new(group.provider.as_str(), name, options)
+        })
+        .collect::<Vec<_>>();
+    let effort_options = [
+        ("default", "Default"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+    ]
+    .into_iter()
+    .map(|(value, name)| wire::SessionConfigSelectOption::new(value, name))
+    .collect();
+    vec![
+        wire::SessionConfigOption::select(super::MODEL_CONFIG_ID, "Model", current.id(), groups)
+            .category(wire::SessionConfigOptionCategory::Model),
+        wire::SessionConfigOption::select(
+            super::REASONING_EFFORT_CONFIG_ID,
+            "Reasoning effort",
+            reasoning.map_or("default", crate::provider::ReasoningEffort::as_str),
+            vec![wire::SessionConfigSelectGroup::new(
+                "reasoning-effort",
+                "Reasoning effort",
+                effort_options,
+            )],
+        )
+        .category(wire::SessionConfigOptionCategory::ThoughtLevel),
+    ]
 }
 
 fn set_v2_config(
@@ -859,11 +931,44 @@ fn set_v2_config(
     catalog: &[crate::provider::ModelGroup],
     request: wire::SetSessionConfigOptionRequest,
 ) -> Result<wire::SetSessionConfigOptionResponse, AcpRuntimeError> {
-    let request = serde_json::from_value(serde_json::to_value(request).map_err(conversion_error)?)
-        .map_err(conversion_error)?;
-    let response = super::set_config(adapter, catalog, request)?;
-    serde_json::from_value(serde_json::to_value(response).map_err(conversion_error)?)
-        .map_err(conversion_error)
+    let config_id = request.config_id.to_string();
+    let value = request
+        .value
+        .as_id()
+        .ok_or_else(|| AcpRuntimeError::Unsupported("selection requires an id value".into()))?
+        .to_string();
+    match config_id.as_str() {
+        super::MODEL_CONFIG_ID => {
+            let selection =
+                crate::provider::ModelSelection::from_id(&value).map_err(AcpRuntimeError::Loop)?;
+            let offered = catalog.iter().any(|group| {
+                group.provider == selection.provider && group.models.contains(&selection.model)
+            });
+            if !offered {
+                return Err(AcpRuntimeError::Unsupported(
+                    "model is not in the advertised catalog".into(),
+                ));
+            }
+            adapter.select(selection).map_err(AcpRuntimeError::Loop)?;
+        }
+        super::REASONING_EFFORT_CONFIG_ID => {
+            let effort =
+                crate::provider::ReasoningEffort::from_id(&value).map_err(AcpRuntimeError::Loop)?;
+            adapter
+                .select_reasoning_effort(effort)
+                .map_err(AcpRuntimeError::Loop)?;
+        }
+        _ => {
+            return Err(AcpRuntimeError::Unsupported(
+                "unknown session configuration option".into(),
+            ));
+        }
+    }
+    let current = adapter.selection().map_err(AcpRuntimeError::Loop)?;
+    let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+    Ok(wire::SetSessionConfigOptionResponse::new(
+        v2_config_options(&current, reasoning, catalog),
+    ))
 }
 
 fn parse_cursor(cursor: &str) -> Result<usize, AcpRuntimeError> {
@@ -944,7 +1049,8 @@ fn transcript_replay(
                                 result.call_id.to_string(),
                             ))
                             .status(status)
-                            .raw_output(super::tool_output_raw(&result.output)),
+                            .raw_output(super::tool_output_raw(&result.output))
+                            .content(replay_tool_output_content(&result.output)),
                         ));
                     }
                 }
@@ -976,6 +1082,26 @@ fn replay_content(part: &Part) -> Option<wire::ContentBlock> {
     serde_json::from_value(serde_json::to_value(content).ok()?).ok()
 }
 
+fn replay_tool_output_content(output: &ToolOutput) -> Option<Vec<wire::ToolCallContent>> {
+    let blocks = match output {
+        ToolOutput::Text(text) => vec![wire::ContentBlock::Text(wire::TextContent::new(text))],
+        ToolOutput::Structured(value) => vec![wire::ContentBlock::Text(wire::TextContent::new(
+            value.to_string(),
+        ))],
+        ToolOutput::Parts(parts) => parts.iter().filter_map(replay_content).collect(),
+        ToolOutput::Files(files) => files
+            .iter()
+            .map(|file| wire::ContentBlock::Text(wire::TextContent::new(format!("{file:?}"))))
+            .collect(),
+    };
+    (!blocks.is_empty()).then(|| {
+        blocks
+            .into_iter()
+            .map(|block| wire::ToolCallContent::Content(Box::new(wire::Content::new(block))))
+            .collect()
+    })
+}
+
 pub async fn serve(runtime: Arc<Runtime>) -> Result<(), AcpRuntimeError> {
     serve_transport(runtime, agent_client_protocol::Stdio::new()).await
 }
@@ -984,7 +1110,7 @@ pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    component(runtime, registry)?
+    v2_router(runtime, registry)?
         .connect_to(agent_client_protocol::Stdio::new())
         .await
         .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
@@ -995,7 +1121,7 @@ async fn serve_transport(
     transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
 ) -> Result<(), AcpRuntimeError> {
     let registry = SessionRegistry::new();
-    let result = component(runtime, registry.clone())?
+    let result = v2_router(runtime, registry.clone())?
         .connect_to(transport)
         .await
         .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
@@ -1005,7 +1131,7 @@ async fn serve_transport(
 
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
-        component(Arc::clone(&runtime), registry.clone())
+        v2_router(Arc::clone(&runtime), registry.clone())
             .expect("Kit's fixed ACP v2 integration must build")
     })
     .with_options(agent_client_protocol_http::ServerOptions {
@@ -1016,7 +1142,16 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
     .into_router()
 }
 
-fn component(
+fn v2_router(
+    runtime: Arc<Runtime>,
+    registry: SessionRegistry,
+) -> Result<agent_client_protocol::AgentProtocolRouter, AcpRuntimeError> {
+    Ok(agent_client_protocol::Agent
+        .protocol_router()
+        .with_v2(component(runtime, registry)?))
+}
+
+pub(crate) fn component(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<impl ConnectTo<Client>, AcpRuntimeError> {
@@ -1201,6 +1336,8 @@ fn component(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -1246,6 +1383,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
+        let mut newer = wire::InitializeRequest::new(
+            wire::ProtocolVersion::V2,
+            wire::Implementation::new("newer-client", "0"),
+        );
+        newer.protocol_version = serde_json::from_value(json!(99)).unwrap();
+        assert_eq!(
+            server.initialize(newer).unwrap().protocol_version,
+            wire::ProtocolVersion::V2
+        );
         let session = response.capabilities.session.expect("session capabilities");
         assert!(session.inject.is_some());
         assert!(session.delete.is_none());
@@ -1269,7 +1415,12 @@ mod tests {
         ];
 
         let replay = transcript_replay(&session_id, &transcript);
+        let replay_again = transcript_replay(&session_id, &transcript);
 
+        assert_eq!(
+            serde_json::to_value(&replay).unwrap(),
+            serde_json::to_value(&replay_again).unwrap()
+        );
         assert_eq!(replay.len(), 2);
         assert!(matches!(
             replay[0].update,
@@ -1278,6 +1429,69 @@ mod tests {
         assert!(matches!(
             replay[1].update,
             wire::SessionUpdate::AgentMessage(_)
+        ));
+    }
+
+    #[test]
+    fn v2_config_mapping_uses_v2_ids_categories_and_values() {
+        let current =
+            crate::provider::ModelSelection::new(crate::ProviderKind::OpenRouter, "test-model");
+        let catalog = [crate::provider::ModelGroup {
+            provider: crate::ProviderKind::OpenRouter,
+            models: vec!["test-model".into(), "other-model".into()],
+        }];
+
+        let options = v2_config_options(
+            &current,
+            Some(crate::provider::ReasoningEffort::High),
+            &catalog,
+        );
+        let encoded = serde_json::to_value(&options).unwrap();
+
+        assert_eq!(encoded[0]["configId"], "model");
+        assert_eq!(encoded[0]["category"], "model");
+        assert_eq!(encoded[0]["currentValue"], "openrouter:test-model");
+        assert!(encoded[0].get("id").is_none());
+        assert_eq!(encoded[1]["configId"], "reasoning_effort");
+        assert_eq!(encoded[1]["category"], "thought_level");
+        assert_eq!(encoded[1]["currentValue"], "high");
+    }
+
+    #[test]
+    fn all_finish_reasons_map_to_faithful_v2_idle_reasons() {
+        assert_eq!(
+            finish_reason_to_stop_reason(&FinishReason::Completed),
+            wire::StopReason::EndTurn
+        );
+        assert_eq!(
+            finish_reason_to_stop_reason(&FinishReason::MaxTokens),
+            wire::StopReason::MaxTokens
+        );
+        assert_eq!(
+            finish_reason_to_stop_reason(&FinishReason::Cancelled),
+            wire::StopReason::Cancelled
+        );
+        assert_eq!(
+            finish_reason_to_stop_reason(&FinishReason::Blocked),
+            wire::StopReason::Refusal
+        );
+        assert_eq!(
+            finish_reason_to_stop_reason(&FinishReason::Error),
+            wire::StopReason::Other("_error".into())
+        );
+        assert_eq!(
+            finish_reason_to_stop_reason(&FinishReason::Other("provider-stop".into())),
+            wire::StopReason::Other("provider-stop".into())
+        );
+    }
+
+    #[test]
+    fn replay_tool_results_include_visible_content() {
+        let content = replay_tool_output_content(&ToolOutput::text("done")).unwrap();
+        assert!(matches!(
+            content.as_slice(),
+            [wire::ToolCallContent::Content(content)]
+                if matches!(&content.content, wire::ContentBlock::Text(text) if text.text == "done")
         ));
     }
 

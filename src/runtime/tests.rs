@@ -215,13 +215,29 @@ fn successful_matching_load_consumes_configured_selection() {
     )
     .unwrap();
 
-    runtime
-        .claim_session_load("selected")
-        .unwrap()
-        .commit()
-        .unwrap();
+    let selected = runtime.claim_session_load("selected").unwrap();
+    assert!(selected.request.force);
+    selected.commit().unwrap();
     let next = runtime.claim_session().unwrap();
     assert_ne!(next.id(), "selected");
+}
+
+#[test]
+fn nonmatching_load_never_inherits_configured_force() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::with_session(
+        root.path(),
+        "gpt-5.4",
+        SessionRequest {
+            id: "selected".into(),
+            resume: true,
+            force: true,
+        },
+    )
+    .unwrap();
+
+    let other = runtime.claim_session_load("other").unwrap();
+    assert!(!other.request.force);
 }
 
 #[test]

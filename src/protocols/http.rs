@@ -401,6 +401,29 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
+                "params": {
+                    "protocolVersion": 2,
+                    "info": { "name": "kit-test", "version": "0" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let routed: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            routed["result"]["protocolVersion"], 2,
+            "dual-protocol endpoint did not route to ACP v2: {routed}"
+        );
+
+        let response = client
+            .post(format!("http://{bound}/acp"))
+            .bearer_auth("secret-token")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
                 "params": { "protocolVersion": 1 }
             }))
             .send()
@@ -408,6 +431,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert!(response.headers().contains_key("acp-connection-id"));
+        let initialized: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(initialized["result"]["protocolVersion"], 1);
 
         let response = client
             .post(format!("http://{bound}/acp/v2"))
@@ -418,7 +443,7 @@ mod tests {
                 "id": 2,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": 2,
+                    "protocolVersion": 99,
                     "info": { "name": "kit-test", "version": "0" }
                 }
             }))
