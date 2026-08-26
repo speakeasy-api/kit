@@ -364,6 +364,7 @@ struct SessionHandle {
     integration: AcpSessionHandle,
     busy: Arc<AtomicBool>,
     background_jobs: BackgroundJobs,
+    structured_completion: bool,
     tasks: TaskManagerHandle,
 }
 
@@ -609,6 +610,7 @@ impl Server {
         let canonical_transcript = driver.canonical_transcript;
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
+        let structured_completion = driver.structured_completion;
         let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
         let (tx, rx) = mpsc::channel(8);
         let busy = Arc::new(AtomicBool::new(false));
@@ -621,6 +623,8 @@ impl Server {
             sink,
             driver: driver.driver,
             tasks: driver.tasks,
+            background_jobs: background_jobs.clone(),
+            structured_completion,
             adapter: driver.adapter,
             catalog,
             commands: rx,
@@ -643,11 +647,20 @@ impl Server {
             }
         });
         let interrupt_handle = handle.clone();
-        let interrupt = Arc::new(move || interrupt_handle.interrupt());
+        let interrupt_background_jobs = background_jobs.clone();
+        let interrupt = Arc::new(move || {
+            interrupt_background_jobs.cancel_all();
+            interrupt_handle.interrupt();
+        });
         let weak = tx.downgrade();
+        let close_background_jobs = background_jobs.clone();
+        let close_tasks = tasks.clone();
         let close = Arc::new(move || {
+            let close_background_jobs = close_background_jobs.clone();
+            let close_tasks = close_tasks.clone();
             let weak = weak.clone();
             Box::pin(async move {
+                super::cancel_background_jobs(&close_tasks, &close_background_jobs).await;
                 if let Some(commands) = weak.upgrade() {
                     let (reply, acknowledged) = oneshot::channel();
                     if commands.send(Command::Close { reply }).await.is_ok() {
@@ -684,6 +697,7 @@ impl Server {
                     integration: handle,
                     busy,
                     background_jobs,
+                    structured_completion,
                     tasks,
                 },
             );
@@ -770,13 +784,23 @@ impl Server {
         &self,
         notification: wire::CancelSessionNotification,
     ) -> Result<(), AcpRuntimeError> {
-        let handle = self
+        let session = self
             .sessions
             .lock()
             .expect("ACP v2 session map poisoned")
             .get(&notification.session_id)
-            .map(|session| session.integration.clone());
-        if let Some(handle) = handle {
+            .map(|session| {
+                (
+                    session.integration.clone(),
+                    session.background_jobs.clone(),
+                    session.tasks.clone(),
+                    session.structured_completion,
+                )
+            });
+        if let Some((handle, background_jobs, tasks, structured_completion)) = session {
+            if structured_completion {
+                super::cancel_background_jobs(&tasks, &background_jobs).await;
+            }
             handle.interrupt();
         }
         Ok(())
@@ -792,6 +816,7 @@ impl Server {
             .expect("ACP v2 session map poisoned")
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        super::cancel_background_jobs(&session.tasks, &session.background_jobs).await;
         session.integration.close();
         let (reply, acknowledged) = oneshot::channel();
         session
@@ -862,6 +887,8 @@ struct SessionActor<S: ModelSession> {
     sink: ResponseReplacementSink<ConnectionSink>,
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
+    background_jobs: BackgroundJobs,
+    structured_completion: bool,
     adapter: SelectableAdapter,
     catalog: Vec<crate::provider::ModelGroup>,
     commands: mpsc::Receiver<Command>,
@@ -878,6 +905,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         sink,
         mut driver,
         tasks,
+        background_jobs,
+        structured_completion,
         adapter,
         catalog,
         mut commands,
@@ -896,6 +925,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &mut driver,
                         command,
                         &sink,
+                        &tasks,
+                        &background_jobs,
+                        structured_completion,
                     )
                     .await;
                     busy.store(false, Ordering::Release);
@@ -909,14 +941,14 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
                 Some(Command::Close { reply }) => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks).await;
+                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
                     drop(binding.take());
                     let _ = reply.send(());
                     break;
                 }
                 None => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks).await;
+                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
                     break;
                 }
             },
@@ -939,19 +971,23 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
             }
             event = tasks.next_event() => match event {
-                Some(TaskEvent::Completed(snapshot, _))
-                    if snapshot.kind == agentkit_task_manager::TaskKind::Background =>
-                {
-                    if let Err(error) = drive_autonomous(
-                        &session_id,
-                        &integration,
-                        &handle,
-                        &busy,
-                        &mut driver,
-                        &sink,
-                    ).await {
+                Some(TaskEvent::Completed(snapshot, _)) => {
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
+                    if snapshot.kind == agentkit_task_manager::TaskKind::Background
+                        && let Err(error) = drive_autonomous(
+                            &session_id,
+                            &integration,
+                            &handle,
+                            &busy,
+                            &mut driver,
+                            &sink,
+                        ).await
+                    {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                     }
+                }
+                Some(TaskEvent::Cancelled(snapshot) | TaskEvent::Failed(snapshot, _)) => {
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
                 }
                 Some(_) => {}
                 None => break,
@@ -960,6 +996,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,
@@ -967,12 +1004,23 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     driver: &mut LoopDriver<S>,
     command: PromptCommand,
     sink: &impl AcpSessionUpdateSink,
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+    structured_completion: bool,
 ) -> Result<(), AcpRuntimeError> {
     let PromptCommand {
         request,
         cancellation_generation,
         reply,
     } = command;
+    if structured_completion
+        && let Err(error) = super::settle_background_jobs(tasks, background_jobs).await
+    {
+        handle.stop_injection_turn();
+        let _ = reply.send(Err(error));
+        return Ok(());
+    }
+    background_jobs.begin_turn();
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
         driver
             .submit_input(items)
@@ -1006,8 +1054,14 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
             session_id,
             wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
         )?;
-        let stop_reason = match drive_prompt(session_id, driver, handle, cancellation_generation)
-            .await
+        let stop_reason = match drive_prompt(
+            session_id,
+            driver,
+            handle,
+            cancellation_generation,
+            structured_completion.then_some((tasks, background_jobs)),
+        )
+        .await
         {
             Ok(stop_reason) => stop_reason,
             Err(_)
@@ -1018,10 +1072,18 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
                 wire::StopReason::Cancelled
             }
             Err(error) => {
+                if structured_completion {
+                    super::cancel_background_jobs(tasks, background_jobs).await;
+                    let _ = super::settle_background_jobs(tasks, background_jobs).await;
+                }
                 terminalize_running_error(session_id, integration, handle, sink, &error).await?;
                 return Err(error);
             }
         };
+        if structured_completion && stop_reason == wire::StopReason::Cancelled {
+            super::cancel_background_jobs(tasks, background_jobs).await;
+            let _ = super::settle_background_jobs(tasks, background_jobs).await?;
+        }
         let _ = integration.flush_session_updates(session_id).await;
         integration.finish_prompt(session_id);
         send_state(
@@ -1031,6 +1093,10 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         )
     }
     .await;
+    if result.is_err() && structured_completion {
+        super::cancel_background_jobs(tasks, background_jobs).await;
+        let _ = super::settle_background_jobs(tasks, background_jobs).await;
+    }
     integration.finish_prompt(session_id);
     handle.stop_injection_turn();
     result
@@ -1071,6 +1137,7 @@ async fn drive_prompt<S, C>(
     driver: &mut LoopDriver<S>,
     control: &C,
     cancellation_generation: u64,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<wire::StopReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
@@ -1102,6 +1169,11 @@ where
                     }
                     return Err(AcpRuntimeError::Loop("model turn failed".into()));
                 }
+                if let Some((tasks, background_jobs)) = structured
+                    && super::settle_background_jobs(tasks, background_jobs).await?
+                {
+                    continue;
+                }
                 match control.handle_injection_boundary(driver, true).await {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
@@ -1122,6 +1194,11 @@ where
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
+                if let Some((tasks, background_jobs)) = structured
+                    && super::settle_background_jobs(tasks, background_jobs).await?
+                {
+                    continue;
+                }
                 match control.handle_injection_boundary(driver, true).await {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
@@ -1129,7 +1206,9 @@ where
                     Ok(AcpInjectionBoundary::Stopped) => {
                         return Ok(wire::StopReason::Cancelled);
                     }
-                    Ok(AcpInjectionBoundary::Finished) => return Ok(wire::StopReason::EndTurn),
+                    Ok(AcpInjectionBoundary::Finished) => {
+                        return Ok(wire::StopReason::EndTurn);
+                    }
                     Err(error) => {
                         control.stop_injection_turn();
                         if control.is_cancelled_since(cancellation_generation) {
@@ -1188,22 +1267,22 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
             session_id,
             wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
         )?;
-        let stop_reason = match drive_prompt(session_id, driver, handle, cancellation_generation)
-            .await
-        {
-            Ok(stop_reason) => stop_reason,
-            Err(_)
-                if handle
-                    .cancellation_handle()
-                    .is_cancelled_since(cancellation_generation) =>
-            {
-                wire::StopReason::Cancelled
-            }
-            Err(error) => {
-                terminalize_running_error(session_id, integration, handle, sink, &error).await?;
-                return Err(error);
-            }
-        };
+        let stop_reason =
+            match drive_prompt(session_id, driver, handle, cancellation_generation, None).await {
+                Ok(stop_reason) => stop_reason,
+                Err(_)
+                    if handle
+                        .cancellation_handle()
+                        .is_cancelled_since(cancellation_generation) =>
+                {
+                    wire::StopReason::Cancelled
+                }
+                Err(error) => {
+                    terminalize_running_error(session_id, integration, handle, sink, &error)
+                        .await?;
+                    return Err(error);
+                }
+            };
         let _ = integration.flush_session_updates(session_id).await;
         send_state(
             sink,
@@ -1750,6 +1829,8 @@ pub(crate) fn component(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use serde_json::json;
 
     use agent_client_protocol::schema::MaybeUndefined;
@@ -1758,8 +1839,15 @@ mod tests {
         Agent, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest, TurnResult,
     };
+    use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager};
+    use agentkit_tools_core::{ToolAnnotations, ToolName, ToolRegistry, ToolSpec};
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
 
     use super::*;
+    use crate::protocols::acp::tests::{BlockingTool, ScriptAdapter};
 
     #[derive(Clone, Default)]
     struct RecordingSink {
@@ -2412,6 +2500,9 @@ mod tests {
             response.await.unwrap().unwrap().send(()).unwrap();
         };
 
+        let task_manager = AsyncTaskManager::new();
+        let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
@@ -2420,6 +2511,9 @@ mod tests {
                 &mut driver,
                 command,
                 &sink,
+                &tasks,
+                &background_jobs,
+                false,
             ),
             acknowledge,
         );
@@ -2460,6 +2554,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_prompt_waits_for_background_synthesis_and_consumes_completion() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Notify::new());
+        let task_manager = AsyncTaskManager::new()
+            .routing(|_request: &agentkit_tools_core::ToolRequest| RoutingDecision::Foreground);
+        let tasks = task_manager.handle();
+        let tools = ToolRegistry::new().with(BlockingTool {
+            spec: ToolSpec {
+                name: ToolName::new(agentkit_tool_compose::COMPOSE_TOOL_NAME),
+                description: "controlled compose tool".into(),
+                input_schema: json!({"type": "object", "additionalProperties": false}),
+                output_schema: None,
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            },
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns: Arc::clone(&turns),
+                user_items_seen: Arc::new(AtomicUsize::new(0)),
+                notification_items_seen: Arc::new(AtomicUsize::new(0)),
+            })
+            .add_tool_source(tools)
+            .task_manager(task_manager)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new("v2-structured-loop")).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "start background")])
+            .unwrap();
+
+        let integration = AcpIntegration::default();
+        let session_id = wire::SessionId::new("v2-structured");
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new("v2-structured-loop"),
+                RecordingSink::default(),
+            ))
+            .unwrap();
+        handle.prepare_injection_turn();
+        handle.start_injection_turn();
+        let generation = handle.cancellation_handle().generation();
+        let background_jobs = BackgroundJobs::default();
+        let prompt = drive_prompt(
+            &session_id,
+            &mut driver,
+            &handle,
+            generation,
+            Some((&tasks, &background_jobs)),
+        );
+        tokio::pin!(prompt);
+
+        timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut prompt => panic!("structured v2 prompt resolved early: {result:?}"),
+                _ = async {
+                    while !entered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(super::super::detach_compose_call(
+                        &tasks,
+                        &background_jobs,
+                        "background-call",
+                    ).await);
+                    background_jobs.register_foreground_for_test("background-call");
+                    while turns.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("structured v2 prompt did not reach its provisional response");
+        assert!(
+            timeout(Duration::from_millis(20), &mut prompt)
+                .await
+                .is_err()
+        );
+
+        background_jobs.finish_for_test("background-call");
+        assert!(
+            timeout(Duration::from_millis(20), &mut prompt)
+                .await
+                .is_err(),
+            "structured v2 prompt crossed the terminal publication handoff early"
+        );
+        release.notify_one();
+        let reason = timeout(Duration::from_secs(1), &mut prompt)
+            .await
+            .expect("structured v2 prompt did not synthesize")
+            .unwrap();
+        assert_eq!(reason, wire::StopReason::EndTurn);
+        assert_eq!(turns.load(Ordering::SeqCst), 3);
+        assert!(
+            timeout(Duration::from_millis(20), tasks.next_event())
+                .await
+                .is_err()
+        );
+        handle.stop_injection_turn();
+    }
+
+    #[tokio::test]
     async fn finish_error_stops_before_delivering_pending_steer() {
         let (mut driver, turns) = test_driver(TestOutcome::FinishError, "finish-error").await;
         driver
@@ -2472,6 +2674,7 @@ mod tests {
             &mut driver,
             &control,
             0,
+            None,
         )
         .await;
 
@@ -2507,7 +2710,7 @@ mod tests {
             .submit_input(vec![Item::text(ItemKind::User, "cancel")])
             .unwrap();
 
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation).await;
+        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
 
         assert_eq!(result.unwrap(), wire::StopReason::Cancelled);
     }
@@ -2525,6 +2728,7 @@ mod tests {
             &mut driver,
             &control,
             0,
+            None,
         )
         .await;
 
