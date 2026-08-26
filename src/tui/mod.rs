@@ -9,6 +9,7 @@
 mod app;
 mod command;
 mod editor;
+mod herdr;
 mod image;
 mod markdown;
 mod plan;
@@ -947,6 +948,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             );
             app.can_steer = can_steer;
             app.auth_methods = auth_methods;
+            let herdr_env = std::env::var("HERDR_ENV").ok();
+            let herdr_bin = std::env::var("HERDR_BIN_PATH").ok();
+            let herdr_pane = std::env::var("HERDR_PANE_ID").ok();
+            let mut herdr = herdr::Integration::from_values(
+                herdr_env.as_deref(),
+                herdr_bin.as_deref(),
+                herdr_pane.as_deref(),
+            );
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1115,6 +1124,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             app.start_session(active_session_id.clone());
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
+                    if let (Some(integration), Some(active_session)) =
+                        (herdr.as_mut(), app.session_id.as_deref())
+                    {
+                        let state = if app.working() {
+                            herdr::State::Working
+                        } else {
+                            herdr::State::Idle
+                        };
+                        integration.report(active_session, state).await;
+                    }
                     terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -1597,6 +1616,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             }
             .await;
             leave(&mut terminal);
+            if let Some(integration) = herdr {
+                integration.release().await;
+            }
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
@@ -2420,6 +2442,181 @@ fn readable(text: &str) -> Vec<String> {
         .lines()
         .map(|line| line.replace('\t', "    "))
         .collect()
+}
+
+#[cfg(test)]
+mod herdr_compat_tests {
+    use super::herdr::{Integration, State};
+    use std::ffi::OsString;
+
+    #[test]
+    fn activates_only_with_complete_herdr_environment() {
+        assert!(Integration::from_values(Some("1"), Some("herdr"), Some("w1:p1")).is_some());
+        assert!(Integration::from_values(None, Some("herdr"), Some("w1:p1")).is_none());
+        assert!(Integration::from_values(Some("1"), None, Some("w1:p1")).is_none());
+        assert!(Integration::from_values(Some("1"), Some("herdr"), None).is_none());
+    }
+
+    #[test]
+    fn reports_only_changed_state_or_session() {
+        let mut integration = Integration::for_test("herdr", "w1:p1");
+
+        assert_eq!(
+            integration.command("session-1", State::Idle),
+            Some(vec![
+                OsString::from("pane"),
+                OsString::from("report-agent"),
+                OsString::from("w1:p1"),
+                OsString::from("--source"),
+                OsString::from("custom:kit"),
+                OsString::from("--agent"),
+                OsString::from("kit"),
+                OsString::from("--state"),
+                OsString::from("idle"),
+                OsString::from("--agent-session-id"),
+                OsString::from("session-1"),
+            ]),
+        );
+        assert_eq!(integration.command("session-1", State::Idle), None);
+        assert!(integration.command("session-1", State::Working).is_some());
+        assert!(integration.command("session-2", State::Working).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invokes_herdr_for_transitions_and_release() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = dir.path().join("herdr");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\nprintf '%s\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut integration = Integration::for_test(bin.as_os_str(), "w1:p1");
+
+        integration.report("session-1", State::Idle).await;
+        integration.report("session-1", State::Idle).await;
+        wait_for_lines(&log, 1).await;
+        integration.report("session-1", State::Working).await;
+        wait_for_lines(&log, 2).await;
+        integration.release().await;
+
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "pane report-agent w1:p1 --source custom:kit --agent kit --state idle --agent-session-id session-1\n\
+             pane report-agent w1:p1 --source custom:kit --agent kit --state working --agent-session-id session-1\n\
+             pane release-agent w1:p1 --source custom:kit --agent kit\n".replace("            ", ""),
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_lines(path: &std::path::Path, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    >= expected
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Herdr command did not finish");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_herdr_command_is_bounded() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("herdr");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 2\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut integration = Integration::for_test(bin.as_os_str(), "w1:p1");
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            integration.report("session-1", State::Idle),
+        )
+        .await
+        .expect("Herdr reporting should not stall the TUI");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_report_is_retried() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("failed-once");
+        let log = dir.path().join("calls");
+        let bin = dir.path().join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nif [ ! -e '{}' ]; then touch '{}'; exit 1; fi\nprintf '%s\n' \"$*\" >> '{}'\n",
+                marker.display(),
+                marker.display(),
+                log.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut integration = Integration::for_test(bin.as_os_str(), "w1:p1");
+
+        integration.report("session-1", State::Idle).await;
+        wait_for_lines(&log, 1).await;
+
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("pane report-agent"),
+            "a transiently failed lifecycle report should be retried",
+        );
+        integration.release().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_release_does_not_prevent_shutdown() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("herdr");
+        std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let integration = Integration::for_test(bin.as_os_str(), "w1:p1");
+
+        tokio::time::timeout(std::time::Duration::from_millis(750), integration.release())
+            .await
+            .expect("a failed release should not prevent Kit from exiting");
+    }
+
+    #[test]
+    fn releases_lifecycle_authority() {
+        let integration = Integration::for_test("herdr", "w1:p1");
+        assert_eq!(
+            integration.release_command(),
+            vec![
+                OsString::from("pane"),
+                OsString::from("release-agent"),
+                OsString::from("w1:p1"),
+                OsString::from("--source"),
+                OsString::from("custom:kit"),
+                OsString::from("--agent"),
+                OsString::from("kit"),
+            ],
+        );
+    }
 }
 
 #[cfg(test)]
