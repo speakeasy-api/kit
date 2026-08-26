@@ -126,7 +126,7 @@ kit prompt --root /path/to/project \
 
 ### ACP and A2A server commands
 
-Use `kit serve` for ACP on stdio plus a selectable HTTP protocol surface:
+Use `kit serve` for ACP v1 on stdio plus selectable HTTP protocol surfaces:
 
 ```sh
 kit serve --root /path/to/project                         # A2A
@@ -136,12 +136,13 @@ kit serve --root /path/to/project --http 127.0.0.1:7331
 kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 # daemon
 ```
 
-Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP is available at `/acp` over HTTP/SSE or WebSocket. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
+Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection remains ACP v1. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
 
-Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. A non-loopback daemon must not be exposed without authentication and suitable network controls. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener:
+Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. A non-loopback daemon must not be exposed without authentication and suitable network controls. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener. Select the wire version explicitly with `--protocol-version 1|2`; omitting it defaults to ACP v1:
 
 ```sh
-kit acp --root /path/to/project
+kit acp --root /path/to/project --protocol-version 1
+kit acp --root /path/to/project --protocol-version 2
 ```
 
 ## Configure `~/.kit/config.toml`

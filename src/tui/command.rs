@@ -8,6 +8,8 @@ use std::ops::Range;
 #[derive(Clone, Copy)]
 enum Kind {
     New,
+    Resume,
+    Close,
     Model,
     Effort,
 }
@@ -25,6 +27,14 @@ const LOCAL_COMMANDS: &[Spec] = &[
         kind: Kind::New,
     },
     Spec {
+        token: "/resume",
+        kind: Kind::Resume,
+    },
+    Spec {
+        token: "/close",
+        kind: Kind::Close,
+    },
+    Spec {
         token: "/model",
         kind: Kind::Model,
     },
@@ -37,6 +47,8 @@ const LOCAL_COMMANDS: &[Spec] = &[
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed<'a> {
     New { prompt: Option<&'a str> },
+    Resume { session_id: Option<&'a str> },
+    Close,
     Model { query: Option<&'a str> },
     Effort { value: Option<&'a str> },
     Prompt(&'a str),
@@ -66,6 +78,8 @@ pub fn parse(input: &str) -> Parsed<'_> {
     let prompt = (!remainder.is_empty()).then_some(remainder);
     match spec.kind {
         Kind::New => Parsed::New { prompt },
+        Kind::Resume => Parsed::Resume { session_id: prompt },
+        Kind::Close => Parsed::Close,
         Kind::Model => Parsed::Model { query: prompt },
         Kind::Effort => Parsed::Effort { value: prompt },
     }
@@ -91,6 +105,13 @@ mod tests {
     #[test]
     fn parses_commands_with_or_without_a_following_prompt() {
         assert_eq!(parse("/new"), Parsed::New { prompt: None });
+        assert_eq!(
+            parse("/resume session-1"),
+            Parsed::Resume {
+                session_id: Some("session-1")
+            }
+        );
+        assert_eq!(parse("/close"), Parsed::Close);
         assert_eq!(parse("/model"), Parsed::Model { query: None });
         assert_eq!(parse("/effort"), Parsed::Effort { value: None });
         assert_eq!(

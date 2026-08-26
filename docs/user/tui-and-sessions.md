@@ -1,6 +1,6 @@
 # TUI Interaction, Sessions, and Recovery
 
-Kit's terminal UI is an ACP client backed by a persisted session. It supports prompt editing, turn cancellation, transcript and tool-output navigation, fresh or resumed conversations, and automatic or manual context compaction. The session ID appears in the TUI header. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line options.
+Kit's bundled terminal UI is an ACP v2 client backed by a persisted session. It supports prompt editing, active-turn steering, turn cancellation, transcript and tool-output navigation, fresh or resumed conversations, and automatic or manual context compaction. The session ID appears in the TUI header. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line options.
 
 ## Start or resume the terminal UI
 
@@ -22,7 +22,7 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 
 | Key or input | Action |
 | --- | --- |
-| `Enter` | Send a non-empty prompt when idle |
+| `Enter` | Send a non-empty prompt when idle; steer and finish the current response while active if the agent advertises that capability |
 | `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
 | `Esc` | Interrupt a running turn; dismiss a notice when idle |
 | `Command+B` | Move the newest running foreground top-level compose call to the background |
@@ -46,6 +46,8 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 
 Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
 
+When the session is idle, `Enter` starts a normal prompt. While the agent is active, `Enter` uses ACP v2 `steer` injection with `finish` stream behavior only when the agent advertised both capabilities. An accepted injected user message appears in the transcript as part of the current turn. If steering is unavailable, the editor keeps the message and shows `this agent does not support active steering`. Local commands and agent-advertised session commands are available only while idle.
+
 ### Attach local images and audio
 
 Drag one or more supported local media files into the terminal while editing a prompt. Terminals deliver a drop as pasted, shell-escaped paths rather than as a dedicated file-drop event. Kit treats the paste as attachments only when every parsed token resolves to a supported regular file. Mixed text and paths, unsupported files, invalid shell quoting, missing files, and ambiguous input remain ordinary pasted text. There is no `/attach` command.
@@ -60,7 +62,7 @@ Assistant- and tool-produced media appears as portable Markdown placeholders or 
 
 ### Interrupt a running turn or quit
 
-Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes. Sending another prompt while work is active is refused with `a turn is already running — esc interrupts it`.
+Press `Esc` or `Ctrl+C` once to request cancellation. The TUI shows `interrupting the turn`, then records `turn interrupted` when cancellation completes.
 
 If a turn does not stop, press `Ctrl+C` again while Kit is cancelling to leave the TUI and terminate its agent child. On normal exit during a turn, Kit first requests cancellation and briefly allows the turn to unwind so tool outcomes can be persisted, then closes the session and releases its lock.
 
@@ -68,13 +70,15 @@ Press `Command+B` to detach the newest running foreground top-level compose call
 
 At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
 
-## Start a new session and compact from the TUI
+## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/close`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
 /new Start by reviewing the tests
+/resume <session-id>
+/close
 /compact
 /compact Continue with the migration
 /model
@@ -82,7 +86,7 @@ The TUI handles `/new`, `/model`, and `/effort` as exact local slash-command tok
 /effort high
 ```
 
-`/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt.
+These local commands are available only while the session is idle. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
@@ -102,17 +106,19 @@ Fatal error records use their own versioned JSON schema and are not transcript c
 
 `HOME is unset; cannot locate durable sessions` means Kit cannot determine this directory. Set `HOME` to the intended home directory before starting Kit.
 
-Transcript records are versioned and have consecutive generations. Normal items are appended and synced to disk before they are accepted into the in-memory conversation. Operations such as compaction append a replacement record; older records remain in the JSONL file, but readers treat the latest valid replacement as the canonical transcript.
+Transcript records are versioned and have consecutive generations. Transcript schema v3 records the canonical workspace root so ACP discovery and resume cannot expose a session to another project; schema v1 and v2 records remain readable and gain that binding when they are next resumed. Normal items are appended and synced to disk before they are accepted into the in-memory conversation. Operations such as compaction append a replacement record; older records remain in the JSONL file, but readers treat the latest valid replacement as the canonical transcript.
 
 Older sessions under `<root>/.kit/sessions` remain readable. The first resume validates and copies a legacy transcript into `~/.kit/sessions`; a live legacy lock produces `legacy session is actively locked by another Kit instance ...; stop it before resuming with this Kit version`. When both locations contain the ID, the global transcript is preferred.
 
 ### ACP session loading
 
-ACP clients can restore a closed durable session with `session/load`. Kit advertises only the protocol's top-level `loadSession` capability; it does not advertise `session/resume` or `session/list`. Loading uses the exact requested session ID, resumes its canonical transcript, and returns the same model and reasoning configuration options as `session/new`. The requested workspace must match the Kit server's fixed root, and additional directories are not accepted.
+ACP v1 clients restore a closed durable session with `session/load`. The v1 endpoint advertises only the protocol's top-level `loadSession` capability; it does not advertise `session/resume` or `session/list`. ACP v2 clients use `session/list` and `session/resume` instead. Both versions use the exact durable session ID and return the same model and reasoning configuration options as `session/new`.
 
-A load never applies the server process's configured `--force` setting. If another live Kit instance owns the session lock, loading fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can load it again.
+Session discovery and restoration are isolated to the server's canonical workspace root. A requested workspace must match that root, and additional directories are not accepted. Legacy transcripts under a project-local `.kit/sessions` directory follow the same migration and root checks as CLI resume; they do not make a same-named session visible from another workspace.
 
-Before the load response, Kit replays the canonical transcript as ordered ACP updates for representable user text and attachments, assistant text and thoughts, and tool calls and results. Internal instructions, ambient context, notifications, and provider-specific content are not replayed to the client, but remain in the model transcript. Because compaction replaces the canonical transcript, loading a compacted session replays its canonical summary history rather than the superseded pre-compaction items.
+An arbitrary ACP load or resume never applies the server process's configured `--force` setting. The one exception is the initial resume requested by `kit tui --resume <id> --force`: only that matching configured session may use the explicit stale-lock override. If another live Kit instance owns the session lock, restoration fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can restore it again.
+
+Before the restoration response, Kit replays the canonical transcript as ordered ACP updates for representable user text and attachments, assistant text and thoughts, and tool calls and results. Internal instructions, ambient context, notifications, and provider-specific content are not replayed to the client, but remain in the model transcript. Because compaction replaces the canonical transcript, restoring a compacted session replays its canonical summary history rather than the superseded pre-compaction items.
 
 ### Session locks, `--resume`, and `--force`
 
@@ -158,6 +164,6 @@ Set `KIT_THEME=light` or `KIT_THEME=dark` to override the detection — useful u
 
 ### TUI startup and terminal recovery
 
-The TUI runs a `kit serve` child. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.
+The TUI runs a `kit serve` child with ACP v2 selected explicitly for its stdio connection; ordinary `kit serve` invocations continue to default to ACP v1 on stdio. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.
 
 If an external hard kill leaves the shell in raw mode or mouse reporting appears as text, run `reset` (or reopen the terminal) before resuming. Prefer `Esc`, `Ctrl+C`, `Ctrl+D`, `SIGTERM`, or `SIGHUP` for normal shutdown so Kit can restore terminal modes, cancel active work, close the session, and clean up only locks proven stale.

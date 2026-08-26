@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -36,6 +38,8 @@ use tokio::{
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
+
+pub mod v2;
 
 use crate::{
     provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
@@ -81,7 +85,7 @@ fn transcript_replay(
     replay
 }
 
-fn user_replay_content(part: &Part) -> Option<ContentChunk> {
+pub(super) fn user_replay_content(part: &Part) -> Option<ContentChunk> {
     let content = match part {
         Part::Text(text) => ContentBlock::Text(TextContent::new(text.text.clone())),
         Part::Media(media) => media_replay_content(media),
@@ -142,7 +146,7 @@ fn tool_replay_update(part: &Part) -> Option<SessionUpdate> {
     ))
 }
 
-fn tool_output_raw(output: &ToolOutput) -> Option<serde_json::Value> {
+pub(super) fn tool_output_raw(output: &ToolOutput) -> Option<serde_json::Value> {
     match output {
         ToolOutput::Text(text) => Some(json!({ "text": text })),
         ToolOutput::Structured(value) => Some(value.clone()),
@@ -349,9 +353,22 @@ struct RegisteredSession {
     completed: watch::Receiver<bool>,
 }
 
+type CloseV2Session =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct RegisteredV2Session {
+    token: u64,
+    interrupt: Arc<dyn Fn() + Send + Sync>,
+    close: CloseV2Session,
+    actor: AbortHandle,
+    completed: watch::Receiver<bool>,
+}
+
 struct RegistryState {
     accepting: bool,
     sessions: HashMap<u64, RegisteredSession>,
+    v2_sessions: HashMap<u64, RegisteredV2Session>,
 }
 
 struct SessionRegistryInner {
@@ -373,12 +390,13 @@ impl SessionRegistry {
                 state: Mutex::new(RegistryState {
                     accepting: true,
                     sessions: HashMap::new(),
+                    v2_sessions: HashMap::new(),
                 }),
             }),
         }
     }
 
-    fn next_token(&self) -> u64 {
+    pub(super) fn next_token(&self) -> u64 {
         self.inner.next_token.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -395,23 +413,56 @@ impl SessionRegistry {
         Ok(())
     }
 
-    fn remove(&self, token: u64) {
-        self.inner
+    pub(super) fn register_v2(
+        &self,
+        token: u64,
+        interrupt: Arc<dyn Fn() + Send + Sync>,
+        close: CloseV2Session,
+        actor: AbortHandle,
+        completed: watch::Receiver<bool>,
+    ) -> Result<(), ()> {
+        let mut state = self
+            .inner
             .state
             .lock()
-            .expect("ACP session registry poisoned")
-            .sessions
-            .remove(&token);
+            .expect("ACP session registry poisoned");
+        if !state.accepting {
+            return Err(());
+        }
+        state.v2_sessions.insert(
+            token,
+            RegisteredV2Session {
+                token,
+                interrupt,
+                close,
+                actor,
+                completed,
+            },
+        );
+        Ok(())
     }
 
-    fn close_gate_and_snapshot(&self) -> Vec<RegisteredSession> {
+    pub(super) fn remove(&self, token: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        state.sessions.remove(&token);
+        state.v2_sessions.remove(&token);
+    }
+
+    fn close_gate_and_snapshot(&self) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
         let mut state = self
             .inner
             .state
             .lock()
             .expect("ACP session registry poisoned");
         state.accepting = false;
-        state.sessions.values().cloned().collect()
+        (
+            state.sessions.values().cloned().collect(),
+            state.v2_sessions.values().cloned().collect(),
+        )
     }
 
     pub async fn shutdown(&self) {
@@ -419,9 +470,12 @@ impl SessionRegistry {
     }
 
     async fn shutdown_with_timeout(&self, limit: Duration) {
-        let sessions = self.close_gate_and_snapshot();
+        let (sessions, v2_sessions) = self.close_gate_and_snapshot();
         for session in &sessions {
             let _ = session.integration.interrupt_session(&session.session_id);
+        }
+        for session in &v2_sessions {
+            (session.interrupt)();
         }
 
         let mut closing = JoinSet::new();
@@ -441,6 +495,17 @@ impl SessionRegistry {
             });
         }
 
+        for mut session in v2_sessions.iter().cloned() {
+            let registry = self.clone();
+            closing.spawn(async move {
+                (session.close)().await;
+                if !*session.completed.borrow() {
+                    let _ = session.completed.changed().await;
+                }
+                registry.remove(session.token);
+            });
+        }
+
         if timeout(limit, async {
             while closing.join_next().await.is_some() {}
         })
@@ -453,8 +518,16 @@ impl SessionRegistry {
                     session.actor.abort();
                 }
             }
+            for session in &v2_sessions {
+                if !*session.completed.borrow() {
+                    session.actor.abort();
+                }
+            }
             while closing.join_next().await.is_some() {}
             for session in sessions {
+                self.remove(session.token);
+            }
+            for session in v2_sessions {
                 self.remove(session.token);
             }
         }
@@ -547,8 +620,8 @@ impl Server {
         }
     }
 
-    async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
-        InitializeResponse::new(request.protocol_version)
+    async fn initialize(&self, _request: InitializeRequest) -> InitializeResponse {
+        InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
             .agent_capabilities(capabilities())
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
@@ -846,7 +919,7 @@ impl Server {
     }
 }
 
-async fn detach_compose_call(
+pub(super) async fn detach_compose_call(
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
     call_id: &str,
@@ -973,7 +1046,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     }
 }
 
-fn config_options(
+pub(super) fn config_options(
     current: &ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
     catalog: &[ModelGroup],
@@ -1027,7 +1100,7 @@ fn config_options(
     ]
 }
 
-fn set_config(
+pub(super) fn set_config(
     adapter: &SelectableAdapter,
     catalog: &[ModelGroup],
     request: SetSessionConfigOptionRequest,
@@ -1072,7 +1145,7 @@ fn set_config(
     )))
 }
 
-async fn clean_up_session<S: ModelSession>(
+pub(super) async fn clean_up_session<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     driver: &mut LoopDriver<S>,
     tasks: &TaskManagerHandle,
@@ -1257,8 +1330,14 @@ async fn serve_transport(
 
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
-        component(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP integration must build")
+        let v1 = component(Arc::clone(&runtime), registry.clone())
+            .expect("Kit's fixed ACP v1 integration must build");
+        let v2 = v2::component(Arc::clone(&runtime), registry.clone())
+            .expect("Kit's fixed ACP v2 integration must build");
+        agent_client_protocol::Agent
+            .protocol_router()
+            .with_v1(v1)
+            .with_v2(v2)
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         health_endpoint: false,
@@ -2605,9 +2684,10 @@ mod tests {
             .builder()
             .connect_with(client_transport, async move |connection| {
                 let initialized = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(InitializeRequest::new(ProtocolVersion::V2))
                     .block_task()
                     .await?;
+                assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
                 assert!(initialized.agent_capabilities.load_session);
                 let sessions = &initialized.agent_capabilities.session_capabilities;
                 assert!(sessions.list.is_none());

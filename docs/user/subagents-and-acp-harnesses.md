@@ -64,7 +64,7 @@ Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 K
 
 ## Choose the built-in `acp.kit` harness
 
-`acp.kit` is always available and is the default when `[subagent].harness` is not configured. By default Kit launches the installed `kit` executable as `kit acp`. A built-in child inherits the runtime root, provider, model, MCP configuration and credential storage, cancellation, and nesting depth. An explicit `subagent.model` selection overrides the inherited model for that ACP session. It does not start an A2A listener.
+`acp.kit` is always available and is the default when `[subagent].harness` is not configured. By default Kit launches the installed `kit` executable as `kit acp`, whose default stdio protocol is ACP v1. A built-in child inherits the runtime root, provider, model, MCP configuration and credential storage, cancellation, and nesting depth. An explicit `subagent.model` selection overrides the inherited model for that ACP session. It does not start an A2A listener.
 
 You can override only the executable and base arguments while preserving built-in Kit behavior:
 
@@ -82,7 +82,7 @@ Built-in subagent transcripts are durable on disk, but their reusable parent-own
 
 ## Configure a generic ACP v1 harness
 
-A generic harness must speak ACP v1 as newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly with the runtime root as its current working directory and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
+Generic external child harnesses remain ACP v1: they must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly with the runtime root as its current working directory and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
 
 Configure trusted argv profiles in `~/.kit/config.toml`:
 

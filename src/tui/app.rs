@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
     time::{Duration, Instant},
@@ -13,17 +13,22 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-use agentkit_acp::{ToolCallStatus, ToolKind};
+use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
+#[cfg(test)]
 use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::text::Line;
 
-use crate::{compaction::is_compaction_summary, events::RuntimeEvent};
+#[cfg(test)]
+use crate::compaction::is_compaction_summary;
+use crate::events::RuntimeEvent;
+
+const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
 
 use super::{
-    command::{Parsed, parse},
+    command::{Parsed, known_token, parse},
     editor::Editor,
     plan::{PlanNode, parse as parse_plan},
     wrap::LinkHit,
@@ -34,10 +39,26 @@ use super::{
 pub enum Update {
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
-    /// A chunk of agent prose.
-    Text(String),
-    /// A chunk of agent reasoning.
-    Thought(String),
+    /// A steer was accepted but has not been delivered into the transcript yet.
+    SteerAccepted { id: String, text: String },
+    /// A user message delivered or replayed by the agent.
+    UserMessage {
+        id: String,
+        text: String,
+        append: bool,
+    },
+    /// Agent prose, either appended as a chunk or replaced by an upsert.
+    AgentMessage {
+        id: String,
+        text: String,
+        append: bool,
+    },
+    /// Agent reasoning, either appended as a chunk or replaced by an upsert.
+    AgentThought {
+        id: String,
+        text: String,
+        append: bool,
+    },
     /// A tool call was announced.
     ToolStarted {
         id: String,
@@ -47,6 +68,7 @@ pub enum Update {
         backgrounded: bool,
     },
     /// A tool call changed status or produced output.
+    #[cfg(test)]
     ToolUpdated {
         id: String,
         status: Option<ToolCallStatus>,
@@ -54,26 +76,59 @@ pub enum Update {
         output: Vec<String>,
         backgrounded: bool,
     },
+    /// A patchable ACP v2 tool call update or content chunk.
+    ToolPatched {
+        id: String,
+        title: Option<String>,
+        kind: Option<ToolKind>,
+        status: Option<ToolCallStatus>,
+        script: Option<String>,
+        output: Option<Vec<String>>,
+        append_output: bool,
+        backgrounded: bool,
+    },
     /// Agent-advertised slash commands for one session.
     AvailableCommands {
         session_id: String,
         commands: Vec<String>,
     },
+    /// Full session configuration snapshot.
+    ConfigOptions(Vec<agent_client_protocol::schema::v2::SessionConfigOption>),
     /// Context window accounting.
     Usage { used: u64, size: u64 },
+    /// Standard ACP v2 foreground state.
+    State {
+        active: bool,
+        steerable: bool,
+        cancelled: bool,
+    },
+    /// An ACP v2 turn became idle with its exact terminal reason.
+    Stopped(Option<StopReason>),
     /// A nested tool call started or finished inside a compose run.
     Runtime(RuntimeEvent),
     /// A diagnostic line from the agent process.
     Log(String),
-    /// An autonomous turn started after a background result arrived.
-    AutonomousTurnStarted(u64),
-    /// An autonomous turn ended.
-    AutonomousTurnEnded { id: u64, error: Option<String> },
-    /// A specific submitted turn ended. `None` identifies a process-wide failure.
-    TurnEnded {
-        id: Option<u64>,
-        error: Option<String>,
-    },
+    /// The ACP process exited while work could still be active.
+    ProcessExited(String),
+}
+
+#[cfg(test)]
+impl Update {
+    pub(super) fn test_text(text: String) -> Self {
+        Self::AgentMessage {
+            id: "test-agent".into(),
+            text,
+            append: true,
+        }
+    }
+
+    pub(super) fn test_thought(text: String) -> Self {
+        Self::AgentThought {
+            id: "test-thought".into(),
+            text,
+            append: true,
+        }
+    }
 }
 
 /// Latest provider-reported occupancy of the main model's context window.
@@ -141,11 +196,22 @@ pub struct SubmittedPrompt {
     pub attachments: Vec<Attachment>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingSteer {
+    pub id: String,
+    pub text: String,
+}
+
 pub enum Action {
     None,
     Redraw,
-    Submit(SubmittedPrompt),
+    Submit {
+        prompt: SubmittedPrompt,
+        inject: bool,
+    },
     New(Option<String>),
+    Resume(String),
+    Close,
     SelectModel {
         choice: ModelChoice,
         save_defaults: bool,
@@ -303,7 +369,15 @@ pub(super) struct CachedTranscriptBlock {
 pub enum Phase {
     Idle,
     Working,
+    Blocked,
     Cancelling,
+}
+
+#[derive(Clone, Copy)]
+enum MessageRole {
+    User,
+    Agent,
+    Thought,
 }
 
 pub struct App {
@@ -318,6 +392,8 @@ pub struct App {
     pub available_commands: Vec<String>,
     pub a2a: String,
     pub session_id: Option<String>,
+    /// Session currently associated with the ordered runtime side channel.
+    runtime_session_id: Option<String>,
     pub blocks: Vec<Block>,
     pub(super) transcript_cache: Vec<Option<CachedTranscriptBlock>>,
     pub(super) transcript_revisions: Vec<u64>,
@@ -333,9 +409,9 @@ pub struct App {
     next_attachment: usize,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
-    next_turn_id: u64,
-    active_turn_id: Option<u64>,
-    active_autonomous_turn_id: Option<u64>,
+    pub can_steer: bool,
+    pub(super) pending_steers: VecDeque<PendingSteer>,
+    message_blocks: HashMap<String, usize>,
     /// The previous assistant stream ended; the next text starts a new block.
     agent_stream_sealed: bool,
     /// Exact source bytes in the latest assistant stream, before TUI rendering.
@@ -507,6 +583,7 @@ fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
     ordered_token_score(&all_tokens, &query_tokens).map(|score| ModelScore { tier: 4, ..score })
 }
 
+#[cfg(test)]
 fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
     let kind = match media.modality {
         Modality::Image => "Image",
@@ -520,11 +597,13 @@ fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn safe_media_uri(uri: &str) -> bool {
     uri.len() <= 2_048
         && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
 }
 
+#[cfg(test)]
 fn persisted_output(output: &ToolOutput) -> Vec<String> {
     let text = match output {
         ToolOutput::Text(text) => text.clone(),
@@ -576,6 +655,7 @@ impl App {
             available_commands: Vec::new(),
             a2a,
             session_id: None,
+            runtime_session_id: None,
             blocks: Vec::new(),
             transcript_cache: Vec::new(),
             transcript_revisions: Vec::new(),
@@ -591,9 +671,9 @@ impl App {
             next_attachment: 0,
             phase: Phase::Idle,
             turn_started: None,
-            next_turn_id: 0,
-            active_turn_id: None,
-            active_autonomous_turn_id: None,
+            can_steer: false,
+            pending_steers: VecDeque::new(),
+            message_blocks: HashMap::new(),
             agent_stream_sealed: false,
             latest_agent_source: String::new(),
             compacting: false,
@@ -783,6 +863,7 @@ impl App {
     }
 
     /// Rebuilds the visible history from the same Items preloaded into the model.
+    #[cfg(test)]
     pub fn restore_transcript(&mut self, session_id: String, transcript: &[Item]) {
         self.session_id = Some(session_id);
         for item in transcript {
@@ -950,6 +1031,144 @@ impl App {
         self.toast = Some((text.into(), Instant::now()));
     }
 
+    fn apply_message(&mut self, id: String, text: String, append: bool, role: MessageRole) {
+        if let Some(&index) = self.message_blocks.get(&id) {
+            let mut changed = false;
+            match (&mut self.blocks[index], role) {
+                (Block::User(existing), MessageRole::User) => {
+                    if append {
+                        existing.push_str(&text);
+                    } else {
+                        *existing = text.clone();
+                    }
+                    changed = true;
+                }
+                (Block::Agent(existing), MessageRole::Agent) => {
+                    if append {
+                        existing.push_str(&text);
+                        self.latest_agent_source.push_str(&text);
+                    } else {
+                        if self.latest_agent_source.ends_with(existing.as_str()) {
+                            self.latest_agent_source
+                                .truncate(self.latest_agent_source.len() - existing.len());
+                            self.latest_agent_source.push_str(&text);
+                        } else {
+                            self.latest_agent_source = text.clone();
+                        }
+                        *existing = text.clone();
+                    }
+                    changed = true;
+                }
+                (Block::Thought { text: existing, .. }, MessageRole::Thought) => {
+                    if append {
+                        existing.push_str(&text);
+                    } else {
+                        *existing = text.clone();
+                    }
+                    changed = true;
+                }
+                _ => {}
+            }
+            if changed {
+                self.mark_block_dirty(index);
+                return;
+            }
+        }
+
+        match role {
+            MessageRole::User => {
+                self.close_thought();
+                self.agent_stream_sealed = true;
+                self.push_block(Block::User(text));
+            }
+            MessageRole::Agent => {
+                self.close_thought();
+                if self.agent_stream_sealed {
+                    self.latest_agent_source = text.clone();
+                } else {
+                    self.latest_agent_source.push_str(&text);
+                }
+                self.agent_stream_sealed = false;
+                self.push_block(Block::Agent(text));
+            }
+            MessageRole::Thought => self.push_block(Block::Thought {
+                text,
+                started: Instant::now(),
+                millis: None,
+            }),
+        }
+        self.message_blocks.insert(id, self.blocks.len() - 1);
+    }
+
+    fn finish_turn(&mut self, cancelled: bool) {
+        self.finish_turn_with_outcome(!cancelled, cancelled.then_some("turn interrupted".into()));
+    }
+
+    fn finish_with_stop_reason(&mut self, reason: Option<StopReason>) {
+        let (successful, notice) = match reason {
+            Some(StopReason::EndTurn) => (true, None),
+            Some(StopReason::Cancelled) => (false, Some("turn interrupted".into())),
+            Some(StopReason::MaxTokens) => (
+                false,
+                Some("turn stopped: maximum token limit reached".into()),
+            ),
+            Some(StopReason::MaxTurnRequests) => (
+                false,
+                Some("turn stopped: maximum turn-request limit reached".into()),
+            ),
+            Some(StopReason::Refusal) => (false, Some("turn refused".into())),
+            Some(StopReason::Other(reason)) if reason == "_error" => {
+                (false, Some("turn failed".into()))
+            }
+            Some(StopReason::Other(reason)) => (false, Some(format!("turn stopped: {reason}"))),
+            Some(_) => (false, Some("turn stopped for an unknown reason".into())),
+            None => (false, Some("turn stopped without a reason".into())),
+        };
+        self.finish_turn_with_outcome(successful, notice);
+    }
+
+    fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
+        self.pending_steers.clear();
+        if self.phase == Phase::Idle {
+            self.agent_stream_sealed = true;
+            return;
+        }
+        self.close_thought();
+        self.agent_stream_sealed = true;
+        let interrupted = self.phase == Phase::Cancelling;
+        let turn_millis = self.stop_turn_timer();
+        self.phase = Phase::Idle;
+        self.compacting = false;
+        let mut finished = Vec::new();
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            if let Block::Tool(call) = block
+                && call.running()
+                && !call.backgrounded
+            {
+                call.status = if successful {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
+                call.finished = Some(Instant::now());
+                call.finish_running_children();
+                finished.push(index);
+            }
+        }
+        for index in finished {
+            self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
+        }
+        if interrupted {
+            self.note("turn interrupted");
+        } else if let Some(notice) = notice {
+            self.note(notice);
+        }
+        if let Some(millis) = turn_millis {
+            self.push_block(Block::TurnDuration(millis));
+        }
+    }
+
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::A2aAddress(address) => self.a2a = address,
@@ -961,39 +1180,30 @@ impl App {
                     self.available_commands = commands;
                 }
             }
-            Update::Text(text) => {
-                self.close_thought();
-                if self.agent_stream_sealed {
-                    self.latest_agent_source.clear();
-                    self.latest_agent_source.push_str(&text);
-                    self.push_block(Block::Agent(text));
-                    self.agent_stream_sealed = false;
+            Update::SteerAccepted { id, text } => {
+                if self.message_blocks.contains_key(&id) {
+                    return;
+                }
+                if let Some(pending) = self
+                    .pending_steers
+                    .iter_mut()
+                    .find(|pending| pending.id == id)
+                {
+                    pending.text = text;
                 } else {
-                    self.latest_agent_source.push_str(&text);
-                    match self.blocks.last_mut() {
-                        Some(Block::Agent(existing)) => {
-                            existing.push_str(&text);
-                            self.mark_block_dirty(self.blocks.len() - 1);
-                        }
-                        _ => self.push_block(Block::Agent(text)),
-                    }
+                    self.pending_steers.push_back(PendingSteer { id, text });
                 }
             }
-            Update::Thought(text) => match self.blocks.last_mut() {
-                Some(Block::Thought {
-                    text: existing,
-                    millis: None,
-                    ..
-                }) => {
-                    existing.push_str(&text);
-                    self.mark_block_dirty(self.blocks.len() - 1);
-                }
-                _ => self.push_block(Block::Thought {
-                    text,
-                    started: Instant::now(),
-                    millis: None,
-                }),
-            },
+            Update::UserMessage { id, text, append } => {
+                self.pending_steers.retain(|pending| pending.id != id);
+                self.apply_message(id, text, append, MessageRole::User);
+            }
+            Update::AgentMessage { id, text, append } => {
+                self.apply_message(id, text, append, MessageRole::Agent);
+            }
+            Update::AgentThought { id, text, append } => {
+                self.apply_message(id, text, append, MessageRole::Thought);
+            }
             Update::ToolStarted {
                 id,
                 title,
@@ -1017,6 +1227,7 @@ impl App {
                     backgrounded,
                 }));
             }
+            #[cfg(test)]
             Update::ToolUpdated {
                 id,
                 status,
@@ -1053,6 +1264,58 @@ impl App {
                     self.reclassify_dynamic(index);
                 }
             }
+            Update::ToolPatched {
+                id,
+                title,
+                kind,
+                status,
+                script,
+                output,
+                append_output,
+                backgrounded,
+            } => {
+                if self.call_index(&id).is_none() {
+                    self.apply(Update::ToolStarted {
+                        id: id.clone(),
+                        title: title.clone().unwrap_or_else(|| "Tool".into()),
+                        kind: kind.clone().unwrap_or_default(),
+                        script: script.clone(),
+                        backgrounded,
+                    });
+                }
+                let Some(call) = self.call_mut(&id) else {
+                    return;
+                };
+                if let Some(title) = title {
+                    call.title = title;
+                }
+                if let Some(kind) = kind {
+                    call.kind = kind;
+                }
+                if let Some(script) = script {
+                    call.plan = parse_plan(&script);
+                }
+                if let Some(output) = output {
+                    if append_output {
+                        call.output.extend(output);
+                    } else {
+                        call.output = output;
+                    }
+                    call.output.truncate(MAX_TOOL_OUTPUT_LINES);
+                }
+                call.backgrounded |= backgrounded;
+                if let Some(status) = status {
+                    call.status = status;
+                    if !call.running() {
+                        call.finished = Some(Instant::now());
+                        call.finish_running_children();
+                    }
+                }
+                if let Some(index) = self.call_index(&id) {
+                    self.mark_block_dirty(index);
+                    self.reclassify_dynamic(index);
+                }
+            }
             Update::Usage { used, size } => {
                 self.usage = Some(ContextUsage { used, size });
             }
@@ -1063,71 +1326,34 @@ impl App {
                     self.logs.drain(..self.logs.len() - 500);
                 }
             }
-            Update::AutonomousTurnStarted(id) => {
-                if self.active_turn_id.is_none() {
-                    self.active_autonomous_turn_id = Some(id);
-                    self.agent_stream_sealed = true;
-                    self.phase = Phase::Working;
-                    self.turn_started = Some(Instant::now());
+            Update::ConfigOptions(_) => {}
+            Update::State {
+                active,
+                steerable,
+                cancelled,
+            } => {
+                if active {
+                    if self.phase == Phase::Idle {
+                        self.agent_stream_sealed = true;
+                        self.turn_started = Some(Instant::now());
+                    }
+                    if self.phase != Phase::Cancelling {
+                        self.phase = if steerable {
+                            Phase::Working
+                        } else {
+                            Phase::Blocked
+                        };
+                    }
                     self.follow = true;
                     self.scroll = usize::MAX;
+                } else {
+                    self.finish_turn(cancelled);
                 }
             }
-            Update::AutonomousTurnEnded { id, error } => {
-                if self.active_autonomous_turn_id != Some(id) || self.active_turn_id.is_some() {
-                    return;
-                }
-                self.close_thought();
-                self.agent_stream_sealed = true;
-                let interrupted = self.phase == Phase::Cancelling;
-                let turn_millis = self.stop_turn_timer();
-                self.phase = Phase::Idle;
-                self.active_autonomous_turn_id = None;
-                match (interrupted, error) {
-                    (true, _) => self.note("turn interrupted"),
-                    (false, Some(error)) => self.push_block(Block::Error(error)),
-                    (false, None) => {}
-                }
-                if let Some(millis) = turn_millis {
-                    self.push_block(Block::TurnDuration(millis));
-                }
-            }
-            Update::TurnEnded { id, error } => {
-                if id.is_some() && id != self.active_turn_id {
-                    return;
-                }
-                self.close_thought();
-                self.agent_stream_sealed = true;
-                let interrupted = self.phase == Phase::Cancelling;
-                let turn_millis = self.stop_turn_timer();
-                self.phase = Phase::Idle;
-                self.active_turn_id = None;
-                self.active_autonomous_turn_id = None;
-                self.compacting = false;
-                let mut finished = Vec::new();
-                for (index, block) in self.blocks.iter_mut().enumerate() {
-                    if let Block::Tool(call) = block
-                        && call.running()
-                        && !call.backgrounded
-                    {
-                        call.status = ToolCallStatus::Completed;
-                        call.finished = Some(Instant::now());
-                        call.finish_running_children();
-                        finished.push(index);
-                    }
-                }
-                for index in finished {
-                    self.mark_block_dirty(index);
-                    self.reclassify_dynamic(index);
-                }
-                match (interrupted, error) {
-                    (true, _) => self.note("turn interrupted"),
-                    (false, Some(error)) => self.push_block(Block::Error(error)),
-                    (false, None) => {}
-                }
-                if let Some(millis) = turn_millis {
-                    self.push_block(Block::TurnDuration(millis));
-                }
+            Update::Stopped(reason) => self.finish_with_stop_reason(reason),
+            Update::ProcessExited(error) => {
+                self.finish_turn_with_outcome(false, None);
+                self.push_block(Block::Error(error));
             }
         }
         if self.follow {
@@ -1136,8 +1362,15 @@ impl App {
     }
 
     fn apply_runtime(&mut self, event: RuntimeEvent) {
+        if let RuntimeEvent::SessionStarted { session_id } = event {
+            self.runtime_session_id = Some(session_id);
+            return;
+        }
+        if self.session_id.is_some() && self.runtime_session_id != self.session_id {
+            return;
+        }
         let event = match event {
-            RuntimeEvent::SessionStarted { .. } => return,
+            RuntimeEvent::SessionStarted { .. } => unreachable!("handled above"),
             RuntimeEvent::CompactionStarted { .. } => {
                 self.compacting = true;
                 return;
@@ -1247,8 +1480,8 @@ impl App {
         self.latest_agent_source.clear();
         self.phase = Phase::Idle;
         self.turn_started = None;
-        self.active_turn_id = None;
-        self.active_autonomous_turn_id = None;
+        self.message_blocks.clear();
+        self.pending_steers.clear();
         self.compacting = false;
         self.usage = None;
         self.scroll = usize::MAX;
@@ -1264,21 +1497,20 @@ impl App {
         self.row_code.clear();
     }
 
+    #[cfg(test)]
     pub fn push_user(&mut self, prompt: String) -> u64 {
-        self.push_block(Block::User(prompt));
-        self.begin_turn()
-    }
-
-    fn begin_turn(&mut self) -> u64 {
-        self.next_turn_id = self.next_turn_id.wrapping_add(1);
-        self.active_turn_id = Some(self.next_turn_id);
-        self.active_autonomous_turn_id = None;
-        self.agent_stream_sealed = true;
-        self.phase = Phase::Working;
-        self.turn_started = Some(Instant::now());
-        self.follow = true;
-        self.scroll = usize::MAX;
-        self.next_turn_id
+        let id = format!("test-user-{}", self.blocks.len());
+        self.apply(Update::UserMessage {
+            id,
+            text: prompt,
+            append: false,
+        });
+        self.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
+        self.blocks.len() as u64
     }
 
     /// Folds a tool call's raw output open or shut.
@@ -1350,6 +1582,21 @@ impl App {
     pub fn clear_attachments(&mut self) {
         self.attachments.clear();
         self.next_attachment = 0;
+    }
+
+    pub fn restore_attachments(&mut self, attachments: Vec<Attachment>) {
+        self.next_attachment = attachments
+            .iter()
+            .filter_map(|attachment| {
+                attachment
+                    .placeholder
+                    .strip_suffix(']')
+                    .and_then(|placeholder| placeholder.rsplit_once('#'))
+                    .and_then(|(_, number)| number.parse().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        self.attachments = attachments;
     }
 
     pub fn prune_attachments(&mut self) {
@@ -1586,13 +1833,35 @@ impl App {
                 if self.editor.is_empty() {
                     return Action::None;
                 }
-                if self.working() {
-                    self.toast("a turn is already running — esc interrupts it");
-                    return Action::None;
+                let inject = self.working();
+                if inject {
+                    if self.phase != Phase::Working {
+                        self.toast("the agent is waiting for required input");
+                        return Action::None;
+                    }
+                    let input = self.editor.text();
+                    if !matches!(parse(input), Parsed::Prompt(_))
+                        || known_token(input, &self.available_commands).is_some()
+                    {
+                        self.toast("commands are available only while idle");
+                        return Action::None;
+                    }
+                    if !self.can_steer {
+                        self.toast("this agent does not support active steering");
+                        return Action::None;
+                    }
                 }
                 let input = self.editor.submit();
                 return match parse(&input) {
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
+                    Parsed::Resume {
+                        session_id: Some(session_id),
+                    } => Action::Resume(session_id.to_string()),
+                    Parsed::Resume { session_id: None } => {
+                        self.toast("usage: /resume <session-id>");
+                        Action::None
+                    }
+                    Parsed::Close => Action::Close,
                     Parsed::Model { query: Some(query) } => match self.closest_model(query) {
                         Some(choice) => Action::SelectModel {
                             choice,
@@ -1642,15 +1911,18 @@ impl App {
                         }
                         Action::None
                     }
-                    Parsed::Prompt(prompt) => Action::Submit(SubmittedPrompt {
-                        text: prompt.to_string(),
-                        attachments: self
-                            .attachments
-                            .iter()
-                            .filter(|attachment| prompt.contains(&attachment.placeholder))
-                            .cloned()
-                            .collect(),
-                    }),
+                    Parsed::Prompt(prompt) => Action::Submit {
+                        prompt: SubmittedPrompt {
+                            text: prompt.to_string(),
+                            attachments: self
+                                .attachments
+                                .iter()
+                                .filter(|attachment| prompt.contains(&attachment.placeholder))
+                                .cloned()
+                                .collect(),
+                        },
+                        inject,
+                    },
                 };
             }
             KeyCode::Enter => self.editor.insert_char('\n'),
@@ -1839,7 +2111,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use agentkit_acp::{ToolCallStatus, ToolKind};
+    use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
     use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -1915,12 +2187,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_events_do_not_cross_session_transitions() {
+        let mut app = app();
+        app.start_session("new-session".into());
+        app.apply(Update::Runtime(RuntimeEvent::SessionStarted {
+            session_id: "old-session".into(),
+        }));
+        app.apply(Update::Runtime(RuntimeEvent::CompactionStarted {
+            reason: "TokenThreshold".into(),
+            at: 0,
+        }));
+        assert!(!app.compacting);
+
+        app.apply(Update::Runtime(RuntimeEvent::SessionStarted {
+            session_id: "new-session".into(),
+        }));
+        app.apply(Update::Runtime(RuntimeEvent::CompactionStarted {
+            reason: "TokenThreshold".into(),
+            at: 0,
+        }));
+        assert!(app.compacting);
+    }
+
+    #[test]
     fn turn_end_clears_compaction_state() {
         let mut app = app();
         app.compacting = true;
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
         assert!(!app.compacting);
     }
@@ -2064,45 +2365,110 @@ mod tests {
     fn closes_running_calls_when_the_turn_ends() {
         let mut app = app();
         compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
         });
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
+        app.apply(Update::Stopped(Some(StopReason::EndTurn)));
+        let call = app
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::Tool(call) => Some(call),
+                _ => None,
+            })
+            .expect("tool block");
         assert_eq!(call.status, ToolCallStatus::Completed);
         assert!(!app.working());
     }
 
     #[test]
-    fn stale_turn_end_cannot_finish_a_newer_turn() {
+    fn abnormal_idle_reasons_fail_unresolved_foreground_tools() {
+        for (reason, expected_notice) in [
+            (StopReason::Cancelled, "turn interrupted"),
+            (
+                StopReason::MaxTokens,
+                "turn stopped: maximum token limit reached",
+            ),
+            (
+                StopReason::MaxTurnRequests,
+                "turn stopped: maximum turn-request limit reached",
+            ),
+            (StopReason::Refusal, "turn refused"),
+            (StopReason::Other("_error".into()), "turn failed"),
+            (StopReason::Other("custom".into()), "turn stopped: custom"),
+        ] {
+            let mut app = app();
+            compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
+            app.apply(Update::State {
+                active: true,
+                steerable: true,
+                cancelled: false,
+            });
+            app.apply(Update::Stopped(Some(reason)));
+
+            let notice = app
+                .blocks
+                .iter()
+                .rev()
+                .find_map(|block| match block {
+                    Block::Notice(notice) => Some(notice),
+                    _ => None,
+                })
+                .expect("terminal notice");
+            assert_eq!(notice, expected_notice);
+            let call = app
+                .blocks
+                .iter()
+                .find_map(|block| match block {
+                    Block::Tool(call) => Some(call),
+                    _ => None,
+                })
+                .expect("tool call");
+            assert_eq!(call.status, ToolCallStatus::Failed);
+        }
+    }
+
+    #[test]
+    fn duplicate_state_updates_are_idempotent() {
         let mut app = app();
-        let first = app.push_user("first".into());
-        app.apply(Update::TurnEnded {
-            id: Some(first),
-            error: None,
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
         });
-        let second = app.push_user("second".into());
-
-        app.apply(Update::TurnEnded {
-            id: Some(first),
-            error: None,
+        let started = app.turn_started;
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
         });
-
-        assert!(app.working());
-        assert_eq!(app.active_turn_id, Some(second));
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
+        });
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
+        });
+        assert!(!app.working());
     }
 
     #[test]
     fn completed_turn_duration_is_recorded_at_the_end() {
         let mut app = app();
-        let id = app.push_user("hello".into());
+        app.push_user("hello".into());
         app.turn_started = Some(Instant::now() - Duration::from_secs(65));
 
-        app.apply(Update::TurnEnded {
-            id: Some(id),
-            error: None,
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
 
         assert!(matches!(
@@ -2115,13 +2481,21 @@ mod tests {
     fn autonomous_turn_is_visible_and_cancellable() {
         let mut app = app();
 
-        app.apply(Update::AutonomousTurnStarted(7));
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
 
         assert!(app.working());
         assert!(matches!(app.request_cancel(), Action::Cancel));
         assert!(app.phase == Phase::Cancelling);
 
-        app.apply(Update::AutonomousTurnEnded { id: 7, error: None });
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
+        });
 
         assert!(!app.working());
         assert!(matches!(
@@ -2148,9 +2522,10 @@ mod tests {
             backgrounded: true,
         });
 
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
 
         let running = app
@@ -2259,11 +2634,41 @@ mod tests {
         app.paste("describe without it");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
 
-        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
             panic!("expected the prompt to be sent");
         };
 
         assert!(prompt.attachments.is_empty());
+    }
+
+    #[test]
+    fn rejected_prompt_restores_unique_attachment_numbering() {
+        let mut app = app();
+        for name in ["one.png", "two.png"] {
+            app.attach(
+                PathBuf::from(format!("/tmp/{name}")),
+                "image/png",
+                AttachmentKind::Image,
+                3,
+            );
+        }
+        let rejected = std::mem::take(&mut app.attachments);
+        app.clear_attachments();
+        app.restore_attachments(rejected);
+        app.attach(
+            PathBuf::from("/tmp/three.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(
+            app.attachments
+                .iter()
+                .map(|attachment| attachment.placeholder.as_str())
+                .collect::<Vec<_>>(),
+            ["[Image #1]", "[Image #2]", "[Image #3]"]
+        );
     }
 
     #[test]
@@ -2320,7 +2725,7 @@ mod tests {
         let mut app = app();
         app.paste("first line");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
             panic!("expected the prompt to be sent");
         };
         assert_eq!(prompt.text, "first line");
@@ -2332,7 +2737,7 @@ mod tests {
         app.available_commands = vec!["compact".into()];
         app.paste("/compact continue with this");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
             panic!("expected an ordinary prompt");
         };
         assert_eq!(prompt.text, "/compact continue with this");
@@ -2366,10 +2771,71 @@ mod tests {
         let mut app = app();
         app.paste("/newer keep this");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        let Action::Submit(prompt) = app.handle_key(press(KeyCode::Enter)) else {
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
             panic!("expected a model prompt");
         };
         assert_eq!(prompt.text, "/newer keep this");
+    }
+
+    #[test]
+    fn active_plain_text_is_submitted_as_steering_when_advertised() {
+        let mut app = app();
+        app.can_steer = true;
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
+        app.paste("change direction");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+
+        let Action::Submit { prompt, inject } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected steering submission");
+        };
+        assert!(inject);
+        assert_eq!(prompt.text, "change direction");
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::User(_)))
+        );
+
+        app.apply(Update::SteerAccepted {
+            id: "injected-1".into(),
+            text: prompt.text,
+        });
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::User(_)))
+        );
+
+        app.apply(Update::UserMessage {
+            id: "injected-1".into(),
+            text: "change direction".into(),
+            append: false,
+        });
+        assert!(app.pending_steers.is_empty());
+        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "change direction"));
+        assert!(app.working());
+    }
+
+    #[test]
+    fn active_text_is_preserved_when_steering_is_not_advertised() {
+        let mut app = app();
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
+        app.paste("wait");
+        app.last_key = Some(Instant::now() - Duration::from_millis(500));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "wait");
     }
 
     #[test]
@@ -2461,9 +2927,13 @@ mod tests {
     fn copies_latest_agent_source_across_tool_boundaries() {
         let mut app = app();
         app.push_user("first".into());
-        app.apply(Update::Text("# Heading\n\tindented  ".into()));
+        app.apply(Update::test_text("# Heading\n\tindented  ".into()));
         compose(&mut app, "value = tool({})");
-        app.apply(Update::Text("\n\n- item".into()));
+        app.apply(Update::AgentMessage {
+            id: "post-tool-agent".into(),
+            text: "\n\n- item".into(),
+            append: true,
+        });
 
         let action = app.handle_key(modified_press(KeyCode::Char('y'), KeyModifiers::CONTROL));
         let Action::Copy(text) = action else {
@@ -2475,13 +2945,18 @@ mod tests {
     #[test]
     fn copies_only_agent_text_after_the_latest_user_message() {
         let mut app = app();
-        app.apply(Update::Text("old".into()));
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::test_text("old".into()));
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
         app.push_user("next".into());
-        app.apply(Update::Text("new".into()));
+        app.apply(Update::AgentMessage {
+            id: "next-agent".into(),
+            text: "new".into(),
+            append: true,
+        });
 
         assert_eq!(app.latest_agent_text().as_deref(), Some("new"));
     }
@@ -2489,8 +2964,8 @@ mod tests {
     #[test]
     fn streams_agent_text_into_one_block() {
         let mut app = app();
-        app.apply(Update::Text("he".into()));
-        app.apply(Update::Text("llo".into()));
+        app.apply(Update::test_text("he".into()));
+        app.apply(Update::test_text("llo".into()));
         assert_eq!(app.blocks.len(), 1);
         let Some(Block::Agent(text)) = app.blocks.last() else {
             panic!("expected an agent block");
@@ -2501,13 +2976,22 @@ mod tests {
     #[test]
     fn autonomous_text_starts_a_new_block_after_turn_end() {
         let mut app = app();
-        app.apply(Update::Text("Started.".into()));
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::test_text("Started.".into()));
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
-        app.apply(Update::Text("RAVENS_".into()));
-        app.apply(Update::Text("HARBOR_INEVITABLE".into()));
+        app.apply(Update::AgentMessage {
+            id: "autonomous".into(),
+            text: "RAVENS_".into(),
+            append: true,
+        });
+        app.apply(Update::AgentMessage {
+            id: "autonomous".into(),
+            text: "HARBOR_INEVITABLE".into(),
+            append: true,
+        });
 
         let agents = app
             .blocks
@@ -2534,7 +3018,7 @@ mod tests {
             script: None,
             backgrounded: true,
         });
-        app.apply(Update::Text("first completion".into()));
+        app.apply(Update::test_text("first completion".into()));
         app.apply(Update::ToolUpdated {
             id: "background".into(),
             status: Some(ToolCallStatus::Completed),
@@ -2542,8 +3026,16 @@ mod tests {
             output: Vec::new(),
             backgrounded: false,
         });
-        app.apply(Update::Text("second completion".into()));
-        app.apply(Update::Text(" continued".into()));
+        app.apply(Update::AgentMessage {
+            id: "second".into(),
+            text: "second completion".into(),
+            append: true,
+        });
+        app.apply(Update::AgentMessage {
+            id: "second".into(),
+            text: " continued".into(),
+            append: true,
+        });
 
         let agents = app
             .blocks

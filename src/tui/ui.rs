@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use agentkit_acp::{ToolCallStatus, ToolKind};
+use agent_client_protocol::schema::v2::{ToolCallStatus, ToolKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
@@ -34,6 +34,7 @@ use super::{
 const SIDE_BY_SIDE_WIDTH: u16 = 108;
 const GRAPH_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
+const MAX_PENDING_STEER_ROWS: usize = 3;
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
 
@@ -51,10 +52,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .clamp(1, MAX_PROMPT_ROWS) as u16
         + 2;
     let logs_rows = if app.show_logs { 9 } else { 0 };
-    let [header, body, logs, prompt, status] = Layout::vertical([
+    let pending_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS) as u16;
+    let [header, body, logs, pending, prompt, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(logs_rows),
+        Constraint::Length(pending_rows),
         Constraint::Length(prompt_rows),
         Constraint::Length(1),
     ])
@@ -65,6 +68,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.show_logs {
         draw_logs(frame, app, logs);
     }
+    draw_pending_steers(frame, app, pending);
     draw_prompt(frame, app, prompt);
     draw_status(frame, app, status);
     if app.model_dialog.is_some() {
@@ -746,7 +750,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
                 theme::text_color()
             }),
         ),
-        Span::styled(kind_label(call.kind).to_string(), theme::faint()),
+        Span::styled(kind_label(&call.kind).to_string(), theme::faint()),
         Span::styled(
             format!("  {}", theme::duration(call.elapsed())),
             theme::dim(),
@@ -774,7 +778,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
 }
 
 /// Tool kinds worth naming; `other` reads as noise next to the tool's title.
-const fn kind_label(kind: ToolKind) -> &'static str {
+fn kind_label(kind: &ToolKind) -> &'static str {
     match kind {
         ToolKind::Read => "  read",
         ToolKind::Edit => "  edit",
@@ -982,11 +986,43 @@ fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let border = if app.working() {
-        theme::faint()
+fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let visible = area.height as usize;
+    if visible == 0 || app.pending_steers.is_empty() {
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(visible);
+    let skip = if app.pending_steers.len() > visible && visible > 1 {
+        let hidden = app.pending_steers.len() - (visible - 1);
+        lines.push(Line::from(Span::styled(
+            format!("  … {hidden} earlier pending"),
+            theme::faint(),
+        )));
+        hidden
     } else {
+        app.pending_steers.len().saturating_sub(visible)
+    };
+    lines.extend(app.pending_steers.iter().skip(skip).map(|pending| {
+        let text = pending
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Line::from(vec![
+            Span::styled("  › ", theme::bold(theme::user_color())),
+            Span::styled(text, theme::bold(theme::user_color())),
+            Span::styled("  · pending", theme::faint()),
+        ])
+    }));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
         Style::default().fg(theme::accent_color())
+    } else {
+        theme::faint()
     };
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
@@ -1006,7 +1042,14 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Keep the cursor's row on screen when the prompt is taller than the box.
     let first = cursor_row.saturating_sub(height.saturating_sub(1));
     let lines: Vec<Line<'static>> = if app.editor.text().is_empty() {
-        vec![Line::from(Span::styled("message kit…", theme::faint()))]
+        vec![Line::from(Span::styled(
+            if app.phase == Phase::Working && app.can_steer {
+                "steer kit…"
+            } else {
+                "message kit…"
+            },
+            theme::faint(),
+        ))]
     } else {
         prompt_lines(rows, app.editor.text(), &app.available_commands)
             .into_iter()
@@ -1057,6 +1100,10 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::styled("stopping", Style::default().fg(theme::warn_color())),
         ],
+        Phase::Blocked => vec![Span::styled(
+            " waiting for input",
+            Style::default().fg(theme::warn_color()),
+        )],
         Phase::Working => vec![
             Span::styled(
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
@@ -1111,7 +1158,7 @@ fn compact(value: u64) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use agentkit_acp::ToolKind;
+    use agent_client_protocol::schema::v2::ToolKind;
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
@@ -1186,7 +1233,7 @@ mod tests {
         app.toast = None;
         for block in &mut app.blocks {
             let Block::Tool(call) = block else { continue };
-            call.status = agentkit_acp::ToolCallStatus::Completed;
+            call.status = agent_client_protocol::schema::v2::ToolCallStatus::Completed;
             call.finished = Some(call.started + Duration::from_millis(120));
             for (index, child) in call.children.iter_mut().enumerate() {
                 child.millis = Some(40 * (index as u64 + 1));
@@ -1312,7 +1359,7 @@ mod tests {
             "127.0.0.1:7331".into(),
         );
         app.push_user("check every source file".into());
-        app.apply(Update::Text(
+        app.apply(Update::test_text(
             "Reading the tree first.\n\n- one\n- two\n\n```sh\ncargo check\n```".into(),
         ));
         app.apply(Update::ToolStarted {
@@ -1358,6 +1405,52 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn pending_steers_render_above_input_until_delivery() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.can_steer = true;
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
+        app.apply(Update::SteerAccepted {
+            id: "first".into(),
+            text: "first pending".into(),
+        });
+        app.apply(Update::SteerAccepted {
+            id: "second".into(),
+            text: "second pending".into(),
+        });
+
+        let frame = render(&mut app, 80, 18);
+        let first = frame.find("first pending").expect("first steer");
+        let second = frame.find("second pending").expect("second steer");
+        let input = frame.find("steer kit…").expect("steering input");
+        assert!(first < second && second < input, "{frame}");
+        assert_eq!(frame.matches("· pending").count(), 2, "{frame}");
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::User(_)))
+        );
+
+        app.apply(Update::UserMessage {
+            id: "first".into(),
+            text: "first pending".into(),
+            append: false,
+        });
+        let frame = render(&mut app, 80, 18);
+        assert_eq!(frame.matches("· pending").count(), 1, "{frame}");
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "first pending"));
     }
 
     #[test]
@@ -1433,7 +1526,7 @@ mod tests {
 
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
-            status: Some(agentkit_acp::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
             output: Vec::new(),
             backgrounded: false,
@@ -1499,24 +1592,26 @@ mod tests {
         let mut app = sample();
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
-            status: Some(agentkit_acp::ToolCallStatus::Failed),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Failed),
             script: None,
             output: vec!["exit code 1".into()],
             backgrounded: false,
         });
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: Some("model refused the request".into()),
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
         app.apply(Update::Log("warn: retrying provider request".into()));
         app.show_logs = true;
         for index in 0..12 {
             app.push_user(format!("follow-up number {index}"));
-            app.apply(Update::Text(format!("answer number {index}")));
+            app.apply(Update::test_text(format!("answer number {index}")));
         }
-        app.apply(Update::TurnEnded {
-            id: None,
-            error: None,
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
         let _ = render(&mut app, 100, 24);
         app.scroll_by(-6);
@@ -1596,7 +1691,7 @@ mod tests {
         let mut app = sample();
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
-            status: Some(agentkit_acp::ToolCallStatus::Completed),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
             output: (0..40)
                 .map(|index| format!("output line {index}"))
@@ -1710,7 +1805,7 @@ mod tests {
             "gpt-5.4".into(),
             "0:0".into(),
         );
-        app.apply(Update::Thought("still thinking".into()));
+        app.apply(Update::test_thought("still thinking".into()));
 
         refresh_transcript_cache(&mut app, 40);
         let first_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
@@ -1720,7 +1815,7 @@ mod tests {
             first_rows
         );
 
-        app.apply(Update::Text("done".into()));
+        app.apply(Update::test_text("done".into()));
         refresh_transcript_cache(&mut app, 40);
         assert!(!app.transcript_dynamic.contains(&0));
         let stable_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
@@ -1774,16 +1869,17 @@ mod tests {
             "gpt-5.4".into(),
             "0:0".into(),
         );
-        for index in 0..100 {
+        for index in 0..99 {
             app.blocks.push(Block::Agent(format!("history {index}")));
         }
+        app.apply(Update::test_text("history 99".into()));
         refresh_transcript_cache(&mut app, 12);
         let history_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
         let history_revision = app.transcript_cache[0].as_ref().unwrap().revision;
         let tail_rows = app.transcript_cache[99].as_ref().unwrap().rows.as_ptr();
 
         super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| count.set(0));
-        app.apply(Update::Text(" changed".into()));
+        app.apply(Update::test_text(" changed".into()));
         refresh_transcript_cache(&mut app, 12);
 
         super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| assert_eq!(count.get(), 1));

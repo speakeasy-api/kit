@@ -14,7 +14,9 @@ use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
 };
-use agentkit_loop::{Agent, LoopDriver, LoopError, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_loop::{
+    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
+};
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
@@ -80,11 +82,10 @@ impl SessionSelection {
     }
 
     fn claim_load(&mut self, id: &str) -> (SessionRequest, bool) {
-        let configured = !self.configured_claimed
-            && self
-                .configured
-                .as_ref()
-                .is_some_and(|request| request.id == id);
+        let matching_configured = self.configured.as_ref().filter(|request| request.id == id);
+        let configured = !self.configured_claimed && matching_configured.is_some();
+        let force = configured
+            && matching_configured.is_some_and(|request| request.resume && request.force);
         if configured {
             self.configured_claimed = true;
         }
@@ -92,7 +93,7 @@ impl SessionSelection {
             SessionRequest {
                 id: id.into(),
                 resume: true,
-                force: false,
+                force,
             },
             configured,
         )
@@ -136,10 +137,10 @@ impl SessionSelection {
     }
 }
 
-pub(crate) struct AcpDriverContext {
+pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
-    pub integration: Arc<AcpIntegration>,
+    pub integration: Arc<I>,
     pub cancellation: CancellationHandle,
 }
 
@@ -159,6 +160,14 @@ pub(crate) struct SessionClaim {
 impl SessionClaim {
     pub(crate) fn id(&self) -> &str {
         &self.request.id
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        match self.kind {
+            SessionClaimKind::New { configured, .. } | SessionClaimKind::Load { configured } => {
+                configured
+            }
+        }
     }
 
     fn mark_opened(&mut self) {
@@ -854,11 +863,14 @@ impl Runtime {
         })
     }
 
-    pub(crate) async fn start_acp_driver(
+    pub(crate) async fn start_acp_driver<I>(
         self: &Arc<Self>,
-        context: AcpDriverContext,
+        context: AcpDriverContext<I>,
         claim: &mut SessionClaim,
-    ) -> Result<AcpDriver, AcpRuntimeError> {
+    ) -> Result<AcpDriver, AcpRuntimeError>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
         let cwd = context
             .cwd
             .canonicalize()

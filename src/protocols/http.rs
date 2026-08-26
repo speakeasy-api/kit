@@ -147,7 +147,10 @@ pub async fn start_with_registry(
         .then(|| crate::protocols::a2a::dispatcher(runtime.clone(), bound, credential.is_some()))
         .transpose()?
         .map(Arc::new);
-    let acp = serve_remote_acp.then(|| crate::protocols::acp::http_router(runtime, sessions));
+    let acp = serve_remote_acp.then(|| {
+        crate::protocols::acp::http_router(runtime.clone(), sessions.clone())
+            .merge(crate::protocols::acp::v2::http_router(runtime, sessions))
+    });
     let stop_accepting = CancellationToken::new();
     let accepts_stopped = CancellationToken::new();
     let shutdown_connections = CancellationToken::new();
@@ -280,7 +283,7 @@ async fn dispatch(
             .expect("fixed unauthorized response"));
     }
 
-    if request.uri().path() == "/acp"
+    if matches!(request.uri().path(), "/acp" | "/acp/v2")
         && let Some(router) = acp
     {
         let response = router
@@ -365,6 +368,15 @@ mod tests {
             unauthorized_acp.headers()[reqwest::header::WWW_AUTHENTICATE],
             "Bearer"
         );
+        assert_eq!(
+            client
+                .post(format!("http://{bound}/acp/v2"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
 
         let card = format!("http://{bound}/.well-known/agent-card.json");
         assert_eq!(
@@ -389,6 +401,29 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
+                "params": {
+                    "protocolVersion": 2,
+                    "info": { "name": "kit-test", "version": "0" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let routed: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            routed["result"]["protocolVersion"], 2,
+            "dual-protocol endpoint did not route to ACP v2: {routed}"
+        );
+
+        let response = client
+            .post(format!("http://{bound}/acp"))
+            .bearer_auth("secret-token")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
                 "params": { "protocolVersion": 1 }
             }))
             .send()
@@ -396,6 +431,31 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert!(response.headers().contains_key("acp-connection-id"));
+        let initialized: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(initialized["result"]["protocolVersion"], 1);
+
+        let response = client
+            .post(format!("http://{bound}/acp/v2"))
+            .bearer_auth("secret-token")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 99,
+                    "info": { "name": "kit-test", "version": "0" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let initialized: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            initialized["result"]["protocolVersion"], 2,
+            "unexpected ACP v2 initialize response: {initialized}"
+        );
 
         let mut websocket = tokio::net::TcpStream::connect(bound).await.unwrap();
         websocket
