@@ -391,7 +391,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let transition_session = Arc::clone(&active_persisted_id);
     let notification_session = Arc::clone(&active_persisted_id);
     let result = agent_client_protocol::Client
-        .builder()
+        .v2()
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
                 let current = notification_session.lock().ok().map(|id| id.clone());
@@ -1209,7 +1209,7 @@ fn leave(terminal: DefaultTerminal) {
 }
 
 async fn request_resume(
-    connection: &agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
     session_id: wire::SessionId,
     root: PathBuf,
 ) -> Result<wire::ResumeSessionResponse, agent_client_protocol::Error> {
