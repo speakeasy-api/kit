@@ -2779,6 +2779,21 @@ mod tests {
             append: false,
         });
         assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "change direction"));
+
+        // Delivery is echoed with the accepted message ID and must update the
+        // optimistic block rather than rendering the steer twice.
+        app.apply(Update::UserMessage {
+            id: "injected-1".into(),
+            text: "change direction".into(),
+            append: false,
+        });
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|block| matches!(block, Block::User(_)))
+                .count(),
+            1
+        );
         assert!(app.working());
     }
 

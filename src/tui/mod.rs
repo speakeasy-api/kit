@@ -544,18 +544,26 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             ))
                                             .block_task()
                                             .await
-                                            .map(|_| ())
+                                            .map(|response| Some(response.message_id))
                                     } else {
                                         connection
                                             .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
                                             .block_task()
                                             .await
-                                            .map(|_| ())
+                                            .map(|_| None)
                                     };
-                                    if let Err(error) = outcome {
-                                        app.paste(&prompt.text);
-                                        app.restore_attachments(prompt.attachments);
-                                        app.note(format!("message was not accepted: {}", error.message));
+                                    match outcome {
+                                        Ok(Some(message_id)) => app.apply(Update::UserMessage {
+                                            id: message_id.to_string(),
+                                            text: prompt.text,
+                                            append: false,
+                                        }),
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            app.paste(&prompt.text);
+                                            app.restore_attachments(prompt.attachments);
+                                            app.note(format!("message was not accepted: {}", error.message));
+                                        }
                                     }
                                 }
                                 Action::New(first_prompt) => {
