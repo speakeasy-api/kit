@@ -2,6 +2,7 @@
 /dist/
 /.pi-subagents/
 /.kit/
+/worktrees/
 /.kit-codesign-identity
 /.env
 .DS_Store
