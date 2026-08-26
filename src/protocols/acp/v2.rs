@@ -16,7 +16,7 @@ use agentkit_acp::{
     },
 };
 use agentkit_core::{
-    CancellationController, FinishReason, Item, ItemKind, Part, SessionId, ToolOutput,
+    CancellationController, FinishReason, Item, ItemKind, Part, SessionId, ToolOutput, Usage,
 };
 use agentkit_loop::{
     AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
@@ -257,6 +257,21 @@ struct ResponseReplacementObserver<S> {
     session_id: wire::SessionId,
 }
 
+fn usage_update(usage: &Usage) -> Option<wire::UsageUpdate> {
+    let tokens = usage.tokens.as_ref()?;
+    let used = tokens.input_tokens.checked_add(tokens.output_tokens)?;
+    let size = [
+        "context_window",
+        "context_window_tokens",
+        "model.context_window",
+        "model.context_length",
+        "openrouter.context_length",
+    ]
+    .iter()
+    .find_map(|key| usage.metadata.get(*key).and_then(|value| value.as_u64()))?;
+    Some(wire::UsageUpdate::new(used, size))
+}
+
 impl<S> ResponseReplacementObserver<S> {
     fn new(
         inner: AcpIntegration,
@@ -286,6 +301,19 @@ where
     S: AcpSessionUpdateSink + Clone,
 {
     fn handle_event(&self, event: ObservedEvent) {
+        if let AgentEvent::UsageUpdated(usage) = &event.event {
+            let Some(update) = usage_update(usage) else {
+                return;
+            };
+            let notification = wire::UpdateSessionNotification::new(
+                self.session_id.clone(),
+                wire::SessionUpdate::UsageUpdate(update),
+            );
+            if let Err(error) = self.sink.update(notification) {
+                tracing::debug!(%error, "failed to queue ACP v2 usage update");
+            }
+            return;
+        }
         if matches!(
             &event.event,
             AgentEvent::ContentDelta(delta) if crate::response_attempt::is_marker(delta)
@@ -1760,6 +1788,42 @@ mod tests {
             self.flushes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
+    }
+
+    #[test]
+    fn observer_reports_usage_with_a_known_context_window() {
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let observer = ResponseReplacementObserver::new(
+            AcpIntegration::default(),
+            sink,
+            wire::SessionId::new("usage-session"),
+        );
+        let loop_session_id = SessionId::new("usage-loop");
+        let emit = |usage| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_session_id.clone()),
+                event: AgentEvent::UsageUpdated(usage),
+            });
+        };
+
+        emit(agentkit_core::Usage::new(agentkit_core::TokenUsage::new(
+            10, 2,
+        )));
+        emit(
+            agentkit_core::Usage::new(agentkit_core::TokenUsage::new(50_000, 3_000)).with_metadata(
+                MetadataMap::from([("context_window".into(), json!(272_000))]),
+            ),
+        );
+
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        let wire::SessionUpdate::UsageUpdate(usage) = &updates[0].update else {
+            panic!("expected usage update, got {:?}", updates[0].update);
+        };
+        assert_eq!(usage.used, 53_000);
+        assert_eq!(usage.size, 272_000);
+        assert!(usage.cost.is_none());
     }
 
     #[test]
