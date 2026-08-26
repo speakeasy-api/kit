@@ -996,6 +996,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,
