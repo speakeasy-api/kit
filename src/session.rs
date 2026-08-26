@@ -3,7 +3,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Seek, Write},
+    io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -17,6 +17,7 @@ use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 3;
+const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -32,6 +33,8 @@ struct Record {
     item: Option<Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
     replacement: Option<Vec<Item>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect: Option<PathBuf>,
 }
 
 /// A loaded transcript together with the observer that owns its mutation lock.
@@ -113,9 +116,9 @@ pub(crate) fn load_in(
 ) -> Result<Vec<Item>, String> {
     validate_id(session_id)?;
     let workspace_root = canonical_workspace(root);
-    let path = preferred_transcript(directory, &workspace_root, session_id)?;
-    let (mut items, _) = read_records(&path, session_id)?;
-    ensure_workspace(&path, session_id, &workspace_root)?;
+    let mut items = select_authority(directory, &workspace_root, session_id)?
+        .ok_or_else(|| format!("session {session_id:?} does not exist"))?
+        .items;
     crate::transcript::repair_unanswered_tool_calls(&mut items);
     Ok(items)
 }
@@ -241,19 +244,18 @@ fn open_with_initial_timestamps_in(
     fs::create_dir_all(&scoped_directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
     let path = transcript_path(&scoped_directory, session_id);
-    let legacy = legacy_transcript_for_workspace(directory, &workspace_root, session_id)?;
     let lock = SessionLock::acquire(lock_path(&scoped_directory, session_id), force)?;
-    let scoped_exists = path
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-    if resume && !scoped_exists {
-        let legacy = legacy
-            .as_ref()
-            .ok_or_else(|| format!("session {session_id:?} does not exist"))?;
-        let _legacy_lock = lock_legacy_for_migration(legacy)?;
-        read_records(legacy, session_id)?;
-        copy_new(legacy, &path)?;
-    } else if !resume && (scoped_exists || legacy.is_some()) {
+    let _migration_locks = lock_migration_sources(directory, &workspace_root, session_id)?;
+    recover_torn_migration_writes(&path, directory, &workspace_root, session_id)?;
+    let authority = select_authority(directory, &workspace_root, session_id)?;
+    if resume {
+        let authority =
+            authority.ok_or_else(|| format!("session {session_id:?} does not exist"))?;
+        establish_scoped_authority(&path, session_id, &workspace_root, &authority.items)?;
+        for legacy in authority.legacy_histories {
+            redirect_legacy_transcript(&legacy, &path, session_id, &workspace_root)?;
+        }
+    } else if authority.is_some() {
         return Err(format!(
             "session {session_id:?} already exists; use --resume"
         ));
@@ -378,6 +380,7 @@ impl Writer {
             workspace_root: Some(self.workspace_root.clone()),
             item: Some(item.clone()),
             replacement: None,
+            redirect: None,
         };
         self.write_record(record, generation)
     }
@@ -395,6 +398,7 @@ impl Writer {
             workspace_root: Some(self.workspace_root.clone()),
             item: None,
             replacement: Some(transcript.to_vec()),
+            redirect: None,
         };
         self.write_record(record, generation)
     }
@@ -497,6 +501,15 @@ impl SessionLock {
         force: bool,
         initialize: impl FnOnce(&mut File, &str) -> io::Result<()>,
     ) -> Result<Self, String> {
+        Self::acquire_with_hook(path, force, || {}, initialize)
+    }
+
+    fn acquire_with_hook(
+        path: PathBuf,
+        force: bool,
+        before_lock: impl FnOnce(),
+        initialize: impl FnOnce(&mut File, &str) -> io::Result<()>,
+    ) -> Result<Self, String> {
         let token = format!("{}:{}:{}", std::process::id(), new_id(), SCHEMA_VERSION);
         let mut options = OpenOptions::new();
         options.read(true).write(true);
@@ -512,10 +525,12 @@ impl SessionLock {
                 format!("could not acquire session lock {}: {error}", path.display())
             }
         })?;
+        before_lock();
         if file.try_lock().is_err() {
-            if !force {
-                remove_failed_lock(&path, file);
-            }
+            // A forced opener can take the OS lock after this process creates
+            // the pathname but before this call. It now owns that pathname, so
+            // the loser must close only and must never unlink it.
+            drop(file);
             return Err(format!(
                 "session is actively locked by another Kit instance ({})",
                 path.display()
@@ -573,11 +588,44 @@ fn stamp_item(item: &mut Item, now: Timestamp) {
     }
 }
 
+struct TranscriptHistory {
+    items: Vec<Item>,
+    generation: u64,
+    states: Vec<Vec<Item>>,
+}
+
+enum StoredTranscript {
+    History(TranscriptHistory),
+    Redirect(PathBuf),
+}
+
 fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), String> {
+    read_records_following(path, session_id, 0)
+}
+
+fn read_records_following(
+    path: &Path,
+    session_id: &str,
+    redirects: usize,
+) -> Result<(Vec<Item>, u64), String> {
+    match read_records_direct(path, session_id)? {
+        StoredTranscript::History(history) => Ok((history.items, history.generation)),
+        StoredTranscript::Redirect(target) => {
+            if redirects >= 4 || target.file_name() != path.file_name() || !target.is_absolute() {
+                return Err(format!("invalid session redirect in {}", path.display()));
+            }
+            read_records_following(&target, session_id, redirects + 1)
+        }
+    }
+}
+
+fn read_records_direct(path: &Path, session_id: &str) -> Result<StoredTranscript, String> {
     let file =
         File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let mut items = Vec::new();
     let mut expected = 1_u64;
+    let mut states = Vec::new();
+    let mut redirect = None;
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line =
             line.map_err(|error| format!("could not read transcript line {}: {error}", index + 1))?;
@@ -585,13 +633,16 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
             .map_err(|error| format!("invalid transcript line {}: {error}", index + 1))?;
         if !matches!(
             record.schema_version,
-            LEGACY_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+            LEGACY_SCHEMA_VERSION
+                | PREVIOUS_SCHEMA_VERSION
+                | SCHEMA_VERSION
+                | REDIRECT_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "unsupported session schema version {} on line {} (Kit supports {})",
                 record.schema_version,
                 index + 1,
-                SCHEMA_VERSION
+                REDIRECT_SCHEMA_VERSION
             ));
         }
         if record.session_id != session_id || record.generation != expected {
@@ -600,26 +651,52 @@ fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), Strin
                 index + 1
             ));
         }
-        match (record.item, record.replacement) {
-            (Some(item), None) => items.push(item),
-            (None, Some(replacement))
-                if record.schema_version >= PREVIOUS_SCHEMA_VERSION && !replacement.is_empty() =>
+        if redirect.is_some() {
+            return Err(format!(
+                "session redirect must be the final transcript line ({})",
+                path.display()
+            ));
+        }
+        match (record.item, record.replacement, record.redirect) {
+            (Some(item), None, None) if record.schema_version <= SCHEMA_VERSION => items.push(item),
+            (None, Some(replacement), None)
+                if matches!(
+                    record.schema_version,
+                    PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+                ) && !replacement.is_empty() =>
             {
+                if !items.is_empty() {
+                    states.push(items.clone());
+                }
                 items = replacement;
+            }
+            (None, None, Some(target))
+                if record.schema_version == REDIRECT_SCHEMA_VERSION
+                    && record.workspace_root.is_some() =>
+            {
+                redirect = Some(target);
             }
             _ => {
                 return Err(format!(
-                    "transcript line {} must contain exactly one item or replacement",
+                    "transcript line {} must contain exactly one item, replacement, or redirect",
                     index + 1
                 ));
             }
         }
         expected += 1;
     }
+    if let Some(target) = redirect {
+        return Ok(StoredTranscript::Redirect(target));
+    }
     if items.is_empty() {
         return Err(format!("session transcript {} is empty", path.display()));
     }
-    Ok((items, expected - 1))
+    states.push(items.clone());
+    Ok(StoredTranscript::History(TranscriptHistory {
+        items,
+        generation: expected - 1,
+        states,
+    }))
 }
 
 fn canonical_workspace(root: &Path) -> PathBuf {
@@ -643,6 +720,11 @@ fn canonical_workspace(root: &Path) -> PathBuf {
     root.to_path_buf()
 }
 
+fn normalized_absolute(path: &Path) -> Result<PathBuf, String> {
+    path.canonicalize()
+        .map_err(|error| format!("could not normalize {}: {error}", path.display()))
+}
+
 fn default_directory() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -656,13 +738,21 @@ fn workspace_directory(root: &Path) -> PathBuf {
 }
 
 fn transcript_workspace(path: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
-    let file =
-        File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    transcript_workspace_bytes(path, session_id, &bytes)
+}
+
+fn transcript_workspace_bytes(
+    path: &Path,
+    session_id: &str,
+    bytes: &[u8],
+) -> Result<Option<PathBuf>, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("invalid transcript {}: {error}", path.display()))?;
     let mut workspace = None;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line =
-            line.map_err(|error| format!("could not read transcript line {}: {error}", index + 1))?;
-        let record: Record = serde_json::from_str(&line)
+    for (index, line) in text.lines().enumerate() {
+        let record: Record = serde_json::from_str(line)
             .map_err(|error| format!("invalid transcript line {}: {error}", index + 1))?;
         if record.session_id != session_id {
             return Err(format!(
@@ -709,14 +799,8 @@ fn list_ids_for_workspace(root: &Path, global_directory: &Path) -> Result<Vec<St
     for id in list_ids_in(global_directory)? {
         let path = transcript_path(global_directory, &id);
         read_records(&path, &id)?;
-        let legacy = legacy_transcript(&root, &id);
-        let legacy_exists = legacy
-            .try_exists()
-            .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?;
         let stored_workspace = transcript_workspace(&path, &id)?;
-        if stored_workspace.as_deref() == Some(root.as_path())
-            || stored_workspace.is_none() && legacy_exists
-        {
+        if stored_workspace.as_deref() == Some(root.as_path()) || stored_workspace.is_none() {
             ids.push(id);
         }
     }
@@ -741,19 +825,7 @@ fn belongs_to_workspace_in(
 ) -> Result<bool, String> {
     validate_id(session_id)?;
     let root = canonical_workspace(root);
-    let scoped = transcript_path(
-        &workspace_storage_directory(global_directory, &root),
-        session_id,
-    );
-    if scoped
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
-    {
-        read_records(&scoped, session_id)?;
-        ensure_workspace(&scoped, session_id, &root)?;
-        return Ok(true);
-    }
-    Ok(legacy_transcript_for_workspace(global_directory, &root, session_id)?.is_some())
+    Ok(select_authority(global_directory, &root, session_id)?.is_some())
 }
 
 pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
@@ -790,19 +862,387 @@ pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
-fn preferred_transcript(
+struct Authority {
+    items: Vec<Item>,
+    legacy_histories: Vec<PathBuf>,
+}
+
+struct HistoryCandidate {
+    path: PathBuf,
+    history: TranscriptHistory,
+}
+
+fn history_descends_from(history: &TranscriptHistory, ancestor: &[Item]) -> bool {
+    history
+        .states
+        .iter()
+        .any(|state| state.starts_with(ancestor))
+}
+
+fn select_authority(
     directory: &Path,
     root: &Path,
     session_id: &str,
-) -> Result<PathBuf, String> {
+) -> Result<Option<Authority>, String> {
     let scoped = transcript_path(&workspace_storage_directory(directory, root), session_id);
-    if scoped
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
-    {
-        return Ok(scoped);
+    let global = transcript_path(directory, session_id);
+    let local = legacy_transcript(root, session_id);
+    let mut histories = Vec::new();
+    let mut legacy_histories = Vec::new();
+
+    for (path, is_global, is_legacy) in [
+        (&scoped, false, false),
+        (&global, true, true),
+        (&local, false, true),
+    ] {
+        if !path
+            .try_exists()
+            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
+        {
+            continue;
+        }
+        let workspace = transcript_workspace(path, session_id)?;
+        if is_global && workspace.as_deref().is_some_and(|stored| stored != root) {
+            continue;
+        }
+        if !is_global && workspace.as_deref().is_some_and(|stored| stored != root) {
+            return Err(format!(
+                "session {session_id:?} belongs to workspace {}, not {}",
+                workspace.unwrap().display(),
+                root.display()
+            ));
+        }
+        match read_records_direct(path, session_id)? {
+            StoredTranscript::History(history) => {
+                histories.push(HistoryCandidate {
+                    path: path.clone(),
+                    history,
+                });
+                if is_legacy {
+                    legacy_histories.push(path.clone());
+                }
+            }
+            StoredTranscript::Redirect(target) => {
+                let target = normalized_absolute(&target)?;
+                let scoped_target = normalized_absolute(&scoped)?;
+                if target != scoped_target {
+                    return Err(format!("invalid session redirect in {}", path.display()));
+                }
+                ensure_workspace(&target, session_id, root)?;
+                let StoredTranscript::History(history) = read_records_direct(&target, session_id)?
+                else {
+                    return Err(format!(
+                        "scoped transcript {} is a redirect",
+                        target.display()
+                    ));
+                };
+                histories.push(HistoryCandidate {
+                    path: target,
+                    history,
+                });
+            }
+        }
     }
-    Ok(legacy_transcript_for_workspace(directory, root, session_id)?.unwrap_or(scoped))
+
+    let mut authority: Option<HistoryCandidate> = None;
+    for candidate in histories {
+        let Some(current) = authority.as_mut() else {
+            authority = Some(candidate);
+            continue;
+        };
+        let candidate_descends = history_descends_from(&candidate.history, &current.history.items);
+        let current_descends = history_descends_from(&current.history, &candidate.history.items);
+        match (candidate_descends, current_descends) {
+            (true, false) => *current = candidate,
+            (false, true) => {}
+            (true, true) if candidate.path == scoped => *current = candidate,
+            (true, true) => {}
+            (false, false) => {
+                return Err(format!(
+                    "divergent session histories for {session_id:?}: {} and {}",
+                    current.path.display(),
+                    candidate.path.display()
+                ));
+            }
+        }
+    }
+    Ok(authority.map(|candidate| Authority {
+        items: candidate.history.items,
+        legacy_histories,
+    }))
+}
+
+fn torn_migration_tail_start(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return None;
+    }
+    let start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    serde_json::from_slice::<Record>(&bytes[start..])
+        .is_err()
+        .then_some(start)
+}
+
+fn migration_source_workspace(path: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let complete = torn_migration_tail_start(&bytes).unwrap_or(bytes.len());
+    transcript_workspace_bytes(path, session_id, &bytes[..complete])
+}
+
+fn recover_torn_migration_writes(
+    scoped: &Path,
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    let mut paths = applicable_migration_sources(directory, root, session_id)?;
+    paths.push(scoped.to_path_buf());
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let exists = path
+            .try_exists()
+            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+        if !exists {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if bytes.is_empty() && path == scoped {
+            fs::remove_file(&path)
+                .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
+            sync_parent_directory(&path)?;
+            continue;
+        }
+        let Some(complete) = torn_migration_tail_start(&bytes) else {
+            continue;
+        };
+        if complete == 0 && path == scoped {
+            fs::remove_file(&path)
+                .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
+            sync_parent_directory(&path)?;
+        } else {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+            file.set_len(complete as u64)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| {
+                    format!(
+                        "could not recover torn migration {}: {error}",
+                        path.display()
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "could not sync session directory {}: {error}",
+                parent.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn applicable_migration_sources(
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let global = transcript_path(directory, session_id);
+    let mut sources = vec![legacy_transcript(root, session_id)];
+    let global_exists = global
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", global.display()))?;
+    if !global_exists
+        || migration_source_workspace(&global, session_id)?
+            .as_deref()
+            .is_none_or(|stored| stored == root)
+    {
+        sources.push(global);
+    }
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+fn lock_migration_sources(
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+) -> Result<Vec<SessionLock>, String> {
+    let mut locks = Vec::new();
+    let mut locked_paths = Vec::new();
+    loop {
+        let sources = applicable_migration_sources(directory, root, session_id)?;
+        let pending = sources
+            .into_iter()
+            .map(|path| path.with_extension("lock"))
+            .filter(|path| !locked_paths.contains(path))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(locks);
+        }
+        for path in pending {
+            fs::create_dir_all(path.parent().expect("session lock has a parent"))
+                .map_err(|error| format!("could not create legacy session directory: {error}"))?;
+            let lock = SessionLock::acquire(path.clone(), true)
+                .map_err(|error| format!("legacy {error}"))?;
+            locked_paths.push(path);
+            locks.push(lock);
+        }
+        // Re-read source ownership while the applicable locks are held. If a
+        // previously absent source appeared, the next iteration locks it too.
+    }
+}
+
+fn write_migration_record(path: &Path, record: &Record, create: bool) -> Result<(), String> {
+    write_migration_record_with(path, record, create, |file, encoded| {
+        file.write_all(encoded)
+    })
+}
+
+fn write_migration_record_with(
+    path: &Path,
+    record: &Record,
+    create: bool,
+    write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+) -> Result<(), String> {
+    let mut encoded = serde_json::to_vec(record)
+        .map_err(|error| format!("could not encode transcript record: {error}"))?;
+    encoded.push(b'\n');
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create {
+        options.create_new(true);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let original_len = file
+        .metadata()
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
+        .len();
+    if !create {
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| format!("could not seek {}: {error}", path.display()))?;
+    }
+    if let Err(error) = write(&mut file, &encoded).and_then(|_| file.sync_all()) {
+        let rollback = if create {
+            drop(file);
+            fs::remove_file(path)
+        } else {
+            file.set_len(original_len).and_then(|_| file.sync_all())
+        };
+        return match rollback {
+            Ok(()) => Err(format!("could not persist transcript migration: {error}")),
+            Err(rollback) => Err(format!(
+                "could not persist transcript migration: {error}; rollback failed: {rollback}"
+            )),
+        };
+    }
+    if create {
+        sync_parent_directory(path)?;
+    }
+    Ok(())
+}
+
+fn establish_scoped_authority(
+    path: &Path,
+    session_id: &str,
+    root: &Path,
+    items: &[Item],
+) -> Result<(), String> {
+    let exists = path
+        .try_exists()
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+    let generation = if exists {
+        match read_records_direct(path, session_id)? {
+            StoredTranscript::History(history)
+                if history.items == items
+                    && transcript_workspace(path, session_id)?.as_deref() == Some(root) =>
+            {
+                return Ok(());
+            }
+            StoredTranscript::History(history) => history
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "session generation overflowed".to_string())?,
+            StoredTranscript::Redirect(_) => {
+                return Err(format!(
+                    "scoped transcript {} is a redirect",
+                    path.display()
+                ));
+            }
+        }
+    } else {
+        1
+    };
+    write_migration_record(
+        path,
+        &Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: session_id.into(),
+            generation,
+            workspace_root: Some(root.to_path_buf()),
+            item: None,
+            replacement: Some(items.to_vec()),
+            redirect: None,
+        },
+        !exists,
+    )
+}
+
+fn redirect_legacy_transcript(
+    path: &Path,
+    target: &Path,
+    session_id: &str,
+    root: &Path,
+) -> Result<(), String> {
+    let target = normalized_absolute(target)?;
+    let generation = match read_records_direct(path, session_id)? {
+        StoredTranscript::History(history) => history
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?,
+        StoredTranscript::Redirect(current) if normalized_absolute(&current)? == target => {
+            return Ok(());
+        }
+        StoredTranscript::Redirect(_) => {
+            return Err(format!("invalid session redirect in {}", path.display()));
+        }
+    };
+    write_migration_record(
+        path,
+        &Record {
+            schema_version: REDIRECT_SCHEMA_VERSION,
+            session_id: session_id.into(),
+            generation,
+            workspace_root: Some(root.to_path_buf()),
+            item: None,
+            replacement: None,
+            redirect: Some(target),
+        },
+        false,
+    )
 }
 
 fn legacy_transcript_for_workspace(
@@ -810,72 +1250,21 @@ fn legacy_transcript_for_workspace(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
-    let unscoped = transcript_path(directory, session_id);
-    let legacy = legacy_transcript(root, session_id);
-    let legacy_exists = legacy
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", legacy.display()))?;
-    if unscoped
-        .try_exists()
-        .map_err(|error| format!("could not inspect {}: {error}", unscoped.display()))?
+    let global = transcript_path(directory, session_id);
+    if global.exists()
+        && transcript_workspace(&global, session_id)?
+            .as_deref()
+            .is_none_or(|stored| stored == root)
     {
-        read_records(&unscoped, session_id)?;
-        match transcript_workspace(&unscoped, session_id)? {
-            Some(stored) if stored == root => return Ok(Some(unscoped)),
-            None if legacy_exists => return Ok(Some(legacy)),
-            _ => {}
-        }
+        return Ok(Some(global));
     }
-    if legacy_exists {
-        read_records(&legacy, session_id)?;
-        Ok(Some(legacy))
+    let local = legacy_transcript(root, session_id);
+    if local.exists() {
+        read_records(&local, session_id)?;
+        Ok(Some(local))
     } else {
         Ok(None)
     }
-}
-
-fn lock_legacy_for_migration(transcript: &Path) -> Result<Option<File>, String> {
-    let path = transcript.with_extension("lock");
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "could not inspect legacy session lock {}: {error}",
-                path.display()
-            ));
-        }
-    };
-    file.try_lock().map_err(|_| {
-        format!(
-            "legacy session is actively locked by another Kit instance ({}); stop it before resuming with this Kit version",
-            path.display()
-        )
-    })?;
-    Ok(Some(file))
-}
-
-fn copy_new(source: &Path, destination: &Path) -> Result<(), String> {
-    let mut source =
-        File::open(source).map_err(|error| format!("could not read legacy session: {error}"))?;
-    let mut copied = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|error| {
-            format!(
-                "could not copy legacy session to {}: {error}",
-                destination.display()
-            )
-        })?;
-    if let Err(error) = io::copy(&mut source, &mut copied).and_then(|_| copied.sync_all()) {
-        let _ = fs::remove_file(destination);
-        return Err(format!(
-            "could not copy legacy session to {}: {error}",
-            destination.display()
-        ));
-    }
-    Ok(())
 }
 
 fn workspace_storage_directory(directory: &Path, root: &Path) -> PathBuf {
@@ -981,6 +1370,42 @@ mod tests {
         &text.text
     }
 
+    fn write_history(
+        path: &Path,
+        schema_version: u32,
+        session_id: &str,
+        texts: &[&str],
+        workspace_root: Option<PathBuf>,
+    ) -> Vec<Item> {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let items = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                Item::text(ItemKind::System, *text).with_created_at(Timestamp((index + 1) as u64))
+            })
+            .collect::<Vec<_>>();
+        let encoded = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                serde_json::to_string(&Record {
+                    schema_version,
+                    session_id: session_id.into(),
+                    generation: (index + 1) as u64,
+                    workspace_root: workspace_root.clone(),
+                    item: Some(item.clone()),
+                    replacement: None,
+                    redirect: None,
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{encoded}\n")).unwrap();
+        items
+    }
+
     #[test]
     fn generated_ids_are_valid_unique_and_durable() {
         let first = new_id();
@@ -1042,6 +1467,30 @@ mod tests {
             "failed forced initialization left a lock path"
         );
         drop(SessionLock::acquire(path.clone(), false).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn non_force_lock_loser_does_not_unlink_forced_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("takeover.lock");
+        let takeover = std::cell::RefCell::new(None);
+
+        let error = SessionLock::acquire_with_hook(
+            path.clone(),
+            false,
+            || {
+                *takeover.borrow_mut() = Some(SessionLock::acquire(path.clone(), true).unwrap());
+            },
+            |file, token| file.write_all(token.as_bytes()),
+        )
+        .err()
+        .expect("non-force opener unexpectedly retained the OS lock");
+
+        assert!(error.contains("actively locked"));
+        assert!(path.exists(), "lock loser unlinked the forced owner's path");
+        assert!(takeover.borrow().as_ref().unwrap().check().is_ok());
+        drop(takeover.into_inner());
         assert!(!path.exists());
     }
 
@@ -1421,6 +1870,7 @@ mod tests {
             workspace_root: None,
             item: Some(item.clone()),
             replacement: None,
+            redirect: None,
         };
         fs::write(
             legacy.join("abc.jsonl"),
@@ -1457,7 +1907,356 @@ mod tests {
     }
 
     #[test]
-    fn global_transcript_wins_over_legacy() {
+    fn schema_one_and_two_global_only_transcripts_migrate() {
+        let root = tempfile::tempdir().unwrap();
+        for (schema, session_id) in [
+            (LEGACY_SCHEMA_VERSION, "schema-one"),
+            (PREVIOUS_SCHEMA_VERSION, "schema-two"),
+        ] {
+            let global = super::transcript_path(&session_directory(root.path()), session_id);
+            let expected = write_history(&global, schema, session_id, &["global"], None);
+
+            assert_eq!(load(root.path(), session_id).unwrap(), expected);
+            let opened = open(root.path(), session_id, true, false, Vec::new()).unwrap();
+            assert_eq!(opened.transcript, expected);
+            drop(opened);
+
+            let scoped = transcript_path(root.path(), session_id);
+            assert!(scoped.is_file());
+            assert!(matches!(
+                read_records_direct(&global, session_id).unwrap(),
+                StoredTranscript::Redirect(target) if target == normalized_absolute(&scoped).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn migrated_redirect_roundtrips_through_current_readers() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["before"], None);
+
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        write(&opened.observer, &Item::text(ItemKind::User, "after"));
+        drop(opened);
+
+        assert_eq!(read_records(&global, "abc").unwrap().0.len(), 2);
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unrelated_live_global_lock_does_not_block_another_workspace() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let global = super::transcript_path(storage.path(), "shared");
+        write_history(
+            &global,
+            SCHEMA_VERSION,
+            "shared",
+            &["first"],
+            Some(canonical_workspace(&first)),
+        );
+        let global_lock_path = global.with_extension("lock");
+        let global_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&global_lock_path)
+            .unwrap();
+        global_lock.try_lock().unwrap();
+
+        let opened = open_in(
+            &second,
+            storage.path(),
+            "shared",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "second")],
+        )
+        .unwrap();
+        assert_eq!(item_text(&opened.transcript[0]), "second");
+        drop(opened);
+
+        global_lock.unlock().unwrap();
+        drop(global_lock);
+        fs::remove_file(global_lock_path).unwrap();
+    }
+
+    #[test]
+    fn failed_tombstone_append_rolls_back_partial_record() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("abc.jsonl");
+        write_history(&path, PREVIOUS_SCHEMA_VERSION, "abc", &["original"], None);
+        let before = fs::read(&path).unwrap();
+        let _lock = SessionLock::acquire(path.with_extension("lock"), true).unwrap();
+        let record = Record {
+            schema_version: REDIRECT_SCHEMA_VERSION,
+            session_id: "abc".into(),
+            generation: 2,
+            workspace_root: Some(root.path().to_path_buf()),
+            item: None,
+            replacement: None,
+            redirect: Some(root.path().join("scoped/abc.jsonl")),
+        };
+
+        let error = write_migration_record_with(&path, &record, false, |file, encoded| {
+            file.write_all(&encoded[..encoded.len() / 2])?;
+            Err(io::Error::other("injected tombstone failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("injected tombstone failure"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(matches!(
+            read_records_direct(&path, "abc").unwrap(),
+            StoredTranscript::History(TranscriptHistory { generation: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn relative_session_directory_migration_persists_absolute_redirect() {
+        let current = env::current_dir().unwrap();
+        let owner = tempfile::tempdir_in(&current).unwrap();
+        let relative_owner = owner.path().strip_prefix(&current).unwrap();
+        let directory = relative_owner.join("sessions");
+        let root = owner.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let global = super::transcript_path(&directory, "abc");
+        let expected = write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["relative"], None);
+
+        drop(open_in(&root, &directory, "abc", true, false, Vec::new()).unwrap());
+
+        let target = match read_records_direct(&global, "abc").unwrap() {
+            StoredTranscript::Redirect(target) => target,
+            StoredTranscript::History(_) => panic!("legacy transcript was not redirected"),
+        };
+        assert!(target.is_absolute());
+        assert_eq!(target, target.canonicalize().unwrap());
+        assert_eq!(load_in(&root, &directory, "abc").unwrap(), expected);
+    }
+
+    #[test]
+    fn newer_global_history_extends_stale_scoped_and_workspace_local_histories() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let local = super::transcript_path(&legacy_directory(root.path()), "abc");
+        write_history(
+            &transcript_path(root.path(), "abc"),
+            SCHEMA_VERSION,
+            "abc",
+            &["first"],
+            Some(canonical_workspace(&project_root(root.path()))),
+        );
+        write_history(&local, LEGACY_SCHEMA_VERSION, "abc", &["first"], None);
+        let expected = write_history(
+            &global,
+            PREVIOUS_SCHEMA_VERSION,
+            "abc",
+            &["first", "newer"],
+            None,
+        );
+
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.transcript, expected);
+        drop(opened);
+        assert!(matches!(
+            read_records_direct(&global, "abc").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+        assert!(matches!(
+            read_records_direct(&local, "abc").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+    }
+
+    #[test]
+    fn scoped_replacement_descends_from_materialized_stale_legacy_history() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let stale = write_history(
+            &global,
+            PREVIOUS_SCHEMA_VERSION,
+            "abc",
+            &["before-one", "before-two"],
+            None,
+        );
+        let scoped = transcript_path(root.path(), "abc");
+        write_history(
+            &scoped,
+            SCHEMA_VERSION,
+            "abc",
+            &["before-one", "before-two"],
+            Some(canonical_workspace(&project_root(root.path()))),
+        );
+        let compacted = vec![
+            Item::text(ItemKind::Context, "compacted newer state").with_created_at(Timestamp(9)),
+        ];
+        write_migration_record(
+            &scoped,
+            &Record {
+                schema_version: SCHEMA_VERSION,
+                session_id: "abc".into(),
+                generation: stale.len() as u64 + 1,
+                workspace_root: Some(canonical_workspace(&project_root(root.path()))),
+                item: None,
+                replacement: Some(compacted.clone()),
+                redirect: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(load(root.path(), "abc").unwrap(), compacted);
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.transcript, compacted);
+        drop(opened);
+        assert!(matches!(
+            read_records_direct(&global, "abc").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+    }
+
+    #[test]
+    fn torn_new_scoped_authority_is_removed_and_recreated_from_legacy() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let expected = write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["legacy"], None);
+        let scoped = transcript_path(root.path(), "abc");
+        fs::create_dir_all(scoped.parent().unwrap()).unwrap();
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: "abc".into(),
+            generation: 1,
+            workspace_root: Some(canonical_workspace(&project_root(root.path()))),
+            item: None,
+            replacement: Some(expected.clone()),
+            redirect: None,
+        };
+        let encoded = serde_json::to_vec(&record).unwrap();
+        fs::write(&scoped, &encoded[..encoded.len() / 2]).unwrap();
+
+        assert!(load(root.path(), "abc").is_err());
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.transcript, expected);
+        drop(opened);
+        assert_eq!(load(root.path(), "abc").unwrap(), expected);
+    }
+
+    #[test]
+    fn torn_redirect_is_truncated_and_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let expected = write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["shared"], None);
+        let scoped = transcript_path(root.path(), "abc");
+        write_history(
+            &scoped,
+            SCHEMA_VERSION,
+            "abc",
+            &["shared"],
+            Some(canonical_workspace(&project_root(root.path()))),
+        );
+        let record = Record {
+            schema_version: REDIRECT_SCHEMA_VERSION,
+            session_id: "abc".into(),
+            generation: 2,
+            workspace_root: Some(canonical_workspace(&project_root(root.path()))),
+            item: None,
+            replacement: None,
+            redirect: Some(normalized_absolute(&scoped).unwrap()),
+        };
+        let encoded = serde_json::to_vec(&record).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&global)
+            .unwrap()
+            .write_all(&encoded[..encoded.len() / 2])
+            .unwrap();
+
+        assert!(load(root.path(), "abc").is_err());
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.transcript, expected);
+        drop(opened);
+        assert!(matches!(
+            read_records_direct(&global, "abc").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+        assert_eq!(load(root.path(), "abc").unwrap(), expected);
+    }
+
+    #[test]
+    fn downgraded_reader_rejects_tombstone_before_write_and_reupgrade_resumes() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["original"], None);
+        drop(open(root.path(), "abc", true, false, Vec::new()).unwrap());
+        let before = fs::read(&global).unwrap();
+
+        let downgraded_append = || -> Result<(), String> {
+            let mut generation = 0;
+            for line in BufReader::new(File::open(&global).unwrap()).lines() {
+                let record: Record = serde_json::from_str(&line.unwrap()).unwrap();
+                if record.schema_version > SCHEMA_VERSION {
+                    return Err("unsupported schema".into());
+                }
+                generation = record.generation;
+            }
+            write_migration_record(
+                &global,
+                &Record {
+                    schema_version: SCHEMA_VERSION,
+                    session_id: "abc".into(),
+                    generation: generation + 1,
+                    workspace_root: None,
+                    item: Some(Item::text(ItemKind::User, "downgraded write")),
+                    replacement: None,
+                    redirect: None,
+                },
+                false,
+            )
+        };
+        assert_eq!(downgraded_append().unwrap_err(), "unsupported schema");
+        assert_eq!(fs::read(&global).unwrap(), before);
+
+        let reopened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(item_text(&reopened.transcript[0]), "original");
+    }
+
+    #[test]
+    fn migration_honors_global_and_workspace_local_mixed_version_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let local = super::transcript_path(&legacy_directory(root.path()), "abc");
+        write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["same"], None);
+        write_history(&local, LEGACY_SCHEMA_VERSION, "abc", &["same"], None);
+
+        for lock_path in [global.with_extension("lock"), local.with_extension("lock")] {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .unwrap();
+            lock.try_lock().unwrap();
+            assert!(
+                open(root.path(), "abc", true, false, Vec::new())
+                    .err()
+                    .unwrap()
+                    .contains("legacy session is actively locked")
+            );
+            lock.unlock().unwrap();
+            drop(lock);
+            fs::remove_file(lock_path).unwrap();
+        }
+
+        assert!(open(root.path(), "abc", true, false, Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn divergent_scoped_and_workspace_local_histories_are_rejected() {
         let root = tempfile::tempdir().unwrap();
         let global = open(
             root.path(),
@@ -1467,7 +2266,6 @@ mod tests {
             vec![Item::text(ItemKind::System, "global")],
         )
         .unwrap();
-        let expected = global.transcript.clone();
         drop(global);
         let legacy = project_root(root.path()).join(".kit/sessions");
         fs::create_dir_all(&legacy).unwrap();
@@ -1478,6 +2276,7 @@ mod tests {
             workspace_root: None,
             item: Some(Item::text(ItemKind::System, "legacy")),
             replacement: None,
+            redirect: None,
         };
         fs::write(
             legacy.join("abc.jsonl"),
@@ -1485,7 +2284,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(load(root.path(), "abc").unwrap(), expected);
+        let error = load(root.path(), "abc").unwrap_err();
+        assert!(error.contains("divergent session histories"));
+        assert!(
+            open(root.path(), "abc", true, false, Vec::new())
+                .err()
+                .unwrap()
+                .contains("divergent session histories")
+        );
     }
 
     #[test]
@@ -1639,6 +2445,7 @@ mod tests {
             workspace_root: Some(canonical_workspace(&first)),
             item: Some(item.clone()),
             replacement: None,
+            redirect: None,
         };
         let unscoped = super::transcript_path(storage.path(), "legacy-id");
         fs::write(
