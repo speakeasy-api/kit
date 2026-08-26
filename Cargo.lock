@@ -322,8 +322,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-skills"
-version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+version = "0.10.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb5c594d40e5308f9a90bac127ba5ad728ba8e9845a811ced94a03c80633fe3e"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",

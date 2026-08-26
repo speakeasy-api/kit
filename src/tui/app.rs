@@ -1125,8 +1125,8 @@ impl App {
         self.close_thought();
         self.agent_stream_sealed = true;
         let interrupted = self.phase == Phase::Cancelling;
+        let turn_millis = self.stop_turn_timer();
         self.phase = Phase::Idle;
-        self.turn_started = None;
         self.compacting = false;
         let mut finished = Vec::new();
         for (index, block) in self.blocks.iter_mut().enumerate() {
@@ -1152,6 +1152,9 @@ impl App {
             self.note("turn interrupted");
         } else if let Some(notice) = notice {
             self.note(notice);
+        }
+        if let Some(millis) = turn_millis {
+            self.push_block(Block::TurnDuration(millis));
         }
     }
 
@@ -2341,9 +2344,15 @@ mod tests {
             cancelled: false,
         });
         app.apply(Update::Stopped(Some(StopReason::EndTurn)));
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
+        let call = app
+            .blocks
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::Tool(call) => Some(call),
+                _ => None,
+            })
+            .expect("tool block");
         assert_eq!(call.status, ToolCallStatus::Completed);
         assert!(!app.working());
     }
@@ -2373,9 +2382,15 @@ mod tests {
             });
             app.apply(Update::Stopped(Some(reason)));
 
-            let Some(Block::Notice(notice)) = app.blocks.last() else {
-                panic!("expected terminal notice");
-            };
+            let notice = app
+                .blocks
+                .iter()
+                .rev()
+                .find_map(|block| match block {
+                    Block::Notice(notice) => Some(notice),
+                    _ => None,
+                })
+                .expect("terminal notice");
             assert_eq!(notice, expected_notice);
             let call = app
                 .blocks
@@ -2420,12 +2435,13 @@ mod tests {
     #[test]
     fn completed_turn_duration_is_recorded_at_the_end() {
         let mut app = app();
-        let id = app.push_user("hello".into());
+        app.push_user("hello".into());
         app.turn_started = Some(Instant::now() - Duration::from_secs(65));
 
-        app.apply(Update::TurnEnded {
-            id: Some(id),
-            error: None,
+        app.apply(Update::State {
+            active: false,
+            steerable: false,
+            cancelled: false,
         });
 
         assert!(matches!(
