@@ -871,6 +871,57 @@ fn duplicate_detach_does_not_take_rollback_ownership() {
 }
 
 #[test]
+fn background_terminal_publication_is_acknowledged_by_call_id() {
+    let jobs = BackgroundJobs::default();
+
+    jobs.register_foreground_for_test("finished-first");
+    assert_eq!(
+        jobs.detach("finished-first"),
+        Some(DetachRegistration::Registered)
+    );
+    jobs.finish_for_test("finished-first");
+    assert!(jobs.activity().unacknowledged_terminals);
+
+    jobs.acknowledge_terminal(&ToolCallId::new("other-call"));
+    assert!(jobs.activity().unacknowledged_terminals);
+    jobs.acknowledge_terminal(&ToolCallId::new("finished-first"));
+    assert!(!jobs.activity().unacknowledged_terminals);
+
+    jobs.register_foreground_for_test("published-first");
+    assert_eq!(
+        jobs.detach("published-first"),
+        Some(DetachRegistration::Registered)
+    );
+    jobs.acknowledge_terminal(&ToolCallId::new("published-first"));
+    jobs.finish_for_test("published-first");
+    assert!(!jobs.activity().unacknowledged_terminals);
+}
+
+#[test]
+fn cancel_all_covers_running_and_late_background_registration() {
+    let jobs = BackgroundJobs::default();
+    let initial = jobs.activity();
+    jobs.register_foreground_for_test("running");
+    assert!(jobs.activity().active);
+
+    jobs.cancel_all();
+    assert!(jobs.is_cancelled_for_test("running"));
+    jobs.register_foreground_for_test("late");
+    assert!(jobs.is_cancelled_for_test("late"));
+
+    jobs.finish_for_test("running");
+    jobs.finish_for_test("late");
+    let quiescent = jobs.activity();
+    assert!(!quiescent.active);
+    assert!(quiescent.generation > initial.generation);
+
+    jobs.begin_turn();
+    jobs.register_foreground_for_test("next-turn");
+    assert!(!jobs.is_cancelled_for_test("next-turn"));
+    jobs.finish_for_test("next-turn");
+}
+
+#[test]
 fn system_prompt_guides_compose_and_subagent_hygiene() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();

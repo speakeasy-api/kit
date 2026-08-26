@@ -336,6 +336,7 @@ struct SessionHandle {
     token: u64,
     commands: mpsc::Sender<Command>,
     background_jobs: BackgroundJobs,
+    structured_completion: bool,
     tasks: TaskManagerHandle,
 }
 
@@ -344,6 +345,8 @@ struct RegisteredSession {
     token: u64,
     session_id: agentkit_acp::SessionId,
     integration: Arc<AcpIntegration>,
+    background_jobs: BackgroundJobs,
+    tasks: TaskManagerHandle,
     commands: mpsc::WeakSender<Command>,
     actor: AbortHandle,
     completed: watch::Receiver<bool>,
@@ -468,6 +471,7 @@ impl SessionRegistry {
     async fn shutdown_with_timeout(&self, limit: Duration) {
         let (sessions, v2_sessions) = self.close_gate_and_snapshot();
         for session in &sessions {
+            session.background_jobs.cancel_all();
             let _ = session.integration.interrupt_session(&session.session_id);
         }
         for session in &v2_sessions {
@@ -478,6 +482,7 @@ impl SessionRegistry {
         for mut session in sessions.iter().cloned() {
             let registry = self.clone();
             closing.spawn(async move {
+                cancel_background_jobs(&session.tasks, &session.background_jobs).await;
                 if let Some(commands) = session.commands.upgrade() {
                     let (reply, acknowledged) = oneshot::channel();
                     if commands.send(Command::Close { reply }).await.is_ok() {
@@ -785,6 +790,7 @@ impl Server {
         let config_options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
+        let structured_completion = driver.structured_completion;
         let canonical_transcript = driver.canonical_transcript;
         let (tx, rx) = mpsc::channel(8);
         let actor = SessionActor {
@@ -793,6 +799,8 @@ impl Server {
             binding,
             driver: driver.driver,
             tasks: driver.tasks,
+            background_jobs: background_jobs.clone(),
+            structured_completion,
             adapter: driver.adapter,
             catalog,
             commands: rx,
@@ -819,6 +827,8 @@ impl Server {
             token,
             session_id: session_id.clone(),
             integration: Arc::clone(&self.integration),
+            background_jobs: background_jobs.clone(),
+            tasks: tasks.clone(),
             commands: tx.downgrade(),
             actor: actor_task.abort_handle(),
             completed: completion,
@@ -848,6 +858,7 @@ impl Server {
                 token,
                 commands: tx,
                 background_jobs,
+                structured_completion,
                 tasks,
             },
         );
@@ -887,9 +898,25 @@ impl Server {
         // Interrupt out of band because the actor may currently be inside
         // `driver.next()`. The queued marker preserves command ordering once
         // that call settles.
+        let (sender, background_jobs, tasks, structured_completion) = self
+            .sessions
+            .lock()
+            .expect("ACP session map poisoned")
+            .get(&notification.session_id)
+            .map(|session| {
+                (
+                    session.commands.clone(),
+                    session.background_jobs.clone(),
+                    session.tasks.clone(),
+                    session.structured_completion,
+                )
+            })
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(notification.session_id.to_string()))?;
+        if structured_completion {
+            cancel_background_jobs(&tasks, &background_jobs).await;
+        }
         self.integration
             .interrupt_session(&notification.session_id)?;
-        let sender = self.sender(&notification.session_id).await?;
         sender
             .send(Command::Cancel)
             .await
@@ -902,13 +929,14 @@ impl Server {
     ) -> Result<CloseSessionResponse, AcpRuntimeError> {
         // Closing uses the same out-of-band interrupt, then waits for the
         // actor to reach and acknowledge the serialized close boundary.
-        self.integration.interrupt_session(&request.session_id)?;
         let session = self
             .sessions
             .lock()
             .expect("ACP session map poisoned")
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        cancel_background_jobs(&session.tasks, &session.background_jobs).await;
+        self.integration.interrupt_session(&request.session_id)?;
         let (tx, rx) = oneshot::channel();
         session
             .commands
@@ -996,6 +1024,8 @@ struct SessionActor<S: ModelSession> {
     binding: SessionBindingGuard,
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
+    background_jobs: BackgroundJobs,
+    structured_completion: bool,
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
@@ -1010,6 +1040,8 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         binding,
         mut driver,
         tasks,
+        background_jobs,
+        structured_completion,
         adapter,
         catalog,
         mut commands,
@@ -1025,7 +1057,15 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
             biased;
             command = commands.recv() => match command {
                 Some(Command::Prompt { request, reply }) => {
-                    let result = drive_prompt(&session_id, &integration, &mut driver, request).await;
+                    let result = drive_prompt(
+                        &session_id,
+                        &integration,
+                        &mut driver,
+                        request,
+                        &tasks,
+                        &background_jobs,
+                        structured_completion,
+                    ).await;
                     let _ = reply.send(result);
                 }
                 // The server already interrupted the shared controller; this
@@ -1036,7 +1076,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
-                    clean_up_session(&session_id, &mut driver, &tasks).await;
+                    clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
                     // A close acknowledgement means the actor-owned binding is
                     // already gone, so callers can immediately reuse the id.
                     drop(binding.take());
@@ -1044,7 +1084,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     break;
                 }
                 None => {
-                    clean_up_session(&session_id, &mut driver, &tasks).await;
+                    clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
                     break;
                 },
             },
@@ -1071,19 +1111,23 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
             // Task events remain queued while a prompt is being driven, so a
             // completion cannot be lost in the prompt-to-idle transition.
             event = tasks.next_event() => match event {
-                Some(TaskEvent::Completed(snapshot, _))
-                    if snapshot.kind == agentkit_task_manager::TaskKind::Background =>
-                {
-                    let result = drive_unsolicited(
-                        &session_id,
-                        &integration,
-                        &mut driver,
-                        &turn_states,
-                        &mut next_autonomous_turn_id,
-                    ).await;
-                    if let Err(error) = result {
-                        eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
+                Some(TaskEvent::Completed(snapshot, _)) => {
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
+                    if snapshot.kind == agentkit_task_manager::TaskKind::Background {
+                        let result = drive_unsolicited(
+                            &session_id,
+                            &integration,
+                            &mut driver,
+                            &turn_states,
+                            &mut next_autonomous_turn_id,
+                        ).await;
+                        if let Err(error) = result {
+                            eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
+                        }
                     }
+                }
+                Some(TaskEvent::Cancelled(snapshot) | TaskEvent::Failed(snapshot, _)) => {
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
                 }
                 Some(_) => {}
                 None => break,
@@ -1191,16 +1235,89 @@ pub(super) fn set_config(
     )))
 }
 
+pub(super) async fn settle_background_jobs(
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+) -> Result<bool, AcpRuntimeError> {
+    let initial = background_jobs.activity();
+    let mut observed_activity = false;
+    loop {
+        let activity = background_jobs.activity();
+        let running = tasks
+            .list_running()
+            .await
+            .into_iter()
+            .any(|task| task.kind == agentkit_task_manager::TaskKind::Background);
+        let stable = background_jobs.activity();
+        if stable.generation != activity.generation {
+            observed_activity = true;
+            continue;
+        }
+        observed_activity |= stable.background_started > initial.background_started
+            || stable.active
+            || running
+            || stable.unacknowledged_terminals;
+        if !stable.active && !running && !stable.unacknowledged_terminals {
+            return Ok(observed_activity);
+        }
+        tokio::select! {
+            biased;
+            _ = background_jobs.activity_after(stable.generation) => {}
+            event = tasks.next_event(), if running || stable.unacknowledged_terminals => {
+                match event {
+                    Some(
+                        TaskEvent::Completed(snapshot, _)
+                        | TaskEvent::Cancelled(snapshot)
+                        | TaskEvent::Failed(snapshot, _),
+                    ) => {
+                        background_jobs.acknowledge_terminal(&snapshot.call_id);
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(AcpRuntimeError::Loop(
+                            "background task event stream closed before quiescence".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(super) async fn cancel_background_jobs(
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+) {
+    background_jobs.cancel_all();
+    let _ = timeout(
+        Duration::from_millis(100),
+        background_jobs.wait_for_quiescence(),
+    )
+    .await;
+    for task in tasks.list_running().await {
+        if task.kind == agentkit_task_manager::TaskKind::Background {
+            let _ = tasks.cancel(task.id).await;
+        }
+    }
+}
+
 pub(super) async fn clean_up_session<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     driver: &mut LoopDriver<S>,
     tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
 ) {
+    cancel_background_jobs(tasks, background_jobs).await;
     for task in tasks.list_running().await {
         if let Err(error) = tasks.cancel(task.id).await {
             eprintln!("failed to cancel ACP task for {session_id}: {error}");
         }
     }
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        background_jobs.wait_for_quiescence(),
+    )
+    .await;
     if let Err(error) = driver.cancel_pending_approvals().await {
         eprintln!("failed to cancel ACP approvals for {session_id}: {error}");
     }
@@ -1251,14 +1368,46 @@ async fn drive_prompt<S: ModelSession>(
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     request: PromptRequest,
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+    structured_completion: bool,
 ) -> Result<PromptResponse, AcpRuntimeError> {
+    if structured_completion {
+        let _ = settle_background_jobs(tasks, background_jobs).await?;
+    }
+    background_jobs.begin_turn();
     let items = integration.input_port().prompt_to_items(&request)?;
     driver
         .submit_input(items)
         .map_err(|error| record_acp_loop_failure(session_id, &error))?;
-    drive_until_pause(session_id, integration, driver, true)
-        .await?
-        .ok_or_else(|| AcpRuntimeError::Loop("prompt ended without a response".into()))
+    let response = match drive_until_pause(
+        session_id,
+        integration,
+        driver,
+        true,
+        structured_completion.then_some((tasks, background_jobs)),
+    )
+    .await
+    {
+        Ok(Some(response)) => response,
+        Ok(None) => {
+            return Err(AcpRuntimeError::Loop(
+                "prompt ended without a response".into(),
+            ));
+        }
+        Err(error) => {
+            if structured_completion {
+                cancel_background_jobs(tasks, background_jobs).await;
+                let _ = settle_background_jobs(tasks, background_jobs).await;
+            }
+            return Err(error);
+        }
+    };
+    if structured_completion && response.stop_reason == StopReason::Cancelled {
+        cancel_background_jobs(tasks, background_jobs).await;
+        let _ = settle_background_jobs(tasks, background_jobs).await?;
+    }
+    Ok(response)
 }
 
 async fn drive_unsolicited<S: ModelSession>(
@@ -1292,7 +1441,7 @@ async fn drive_autonomous<S: ModelSession>(
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
 ) -> Result<(), AcpRuntimeError> {
-    let _ = drive_until_pause(session_id, integration, driver, false).await?;
+    let _ = drive_until_pause(session_id, integration, driver, false, None).await?;
     Ok(())
 }
 
@@ -1301,6 +1450,7 @@ async fn drive_until_pause<S: ModelSession>(
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<Option<PromptResponse>, AcpRuntimeError> {
     loop {
         let step = match driver.next().await {
@@ -1321,10 +1471,21 @@ async fn drive_until_pause<S: ModelSession>(
                     return Ok(None);
                 }
                 let reason = agentkit_acp::finish_reason_to_stop_reason(&result.finish_reason)?;
+                if let Some((tasks, background_jobs)) = structured
+                    && settle_background_jobs(tasks, background_jobs).await?
+                {
+                    continue;
+                }
                 return Ok(Some(PromptResponse::new(reason)));
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 integration.flush_session_updates(session_id).await?;
+                if answer_prompt
+                    && let Some((tasks, background_jobs)) = structured
+                    && settle_background_jobs(tasks, background_jobs).await?
+                {
+                    continue;
+                }
                 return Ok(answer_prompt.then(|| PromptResponse::new(StopReason::EndTurn)));
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
@@ -1599,7 +1760,7 @@ async fn drain_client_messages(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1614,9 +1775,13 @@ mod tests {
         Agent, LoopError, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest,
     };
-    use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager};
+    use agentkit_task_manager::{
+        AsyncTaskManager, RoutingDecision, TaskLaunchRequest, TaskManager, TaskStartContext,
+    };
     use agentkit_tools_core::{
-        Tool, ToolAnnotations, ToolContext, ToolName, ToolRegistry, ToolResult, ToolSpec,
+        AllowAllPermissions, BasicToolExecutor, OwnedToolContext, Tool, ToolAnnotations,
+        ToolContext, ToolExecutor, ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSource,
+        ToolSpec,
     };
     use async_trait::async_trait;
     use tokio::{
@@ -1645,9 +1810,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_sends_close_and_rejects_new_registration() {
+    async fn shutdown_force_cancels_background_before_close_and_rejects_registration() {
         let registry = SessionRegistry::new();
         let integration = shutdown_test_integration();
+        let (background_jobs, tasks) = start_non_cooperative_background("shutdown-call").await;
         let session_id = agentkit_acp::SessionId::new("close-me");
         let token = registry.next_token();
         let (commands, mut received) = mpsc::channel(1);
@@ -1667,6 +1833,8 @@ mod tests {
                 token,
                 session_id,
                 integration: Arc::clone(&integration),
+                background_jobs: background_jobs.clone(),
+                tasks: tasks.clone(),
                 commands: weak_commands,
                 actor: actor.abort_handle(),
                 completed: completion,
@@ -1676,6 +1844,8 @@ mod tests {
 
         registry.shutdown_with_timeout(Duration::from_secs(1)).await;
         assert!(closed.load(Ordering::SeqCst));
+        assert!(tasks.list_running().await.is_empty());
+        assert!(!background_jobs.activity().active);
 
         let late_token = registry.next_token();
         let (late_commands, _late_received) = mpsc::channel(1);
@@ -1690,6 +1860,8 @@ mod tests {
                     token: late_token,
                     session_id: agentkit_acp::SessionId::new("too-late"),
                     integration,
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
                     commands: late_commands.downgrade(),
                     actor: late_actor.abort_handle(),
                     completed: late_completion,
@@ -1712,6 +1884,8 @@ mod tests {
                 token,
                 session_id: agentkit_acp::SessionId::new("stuck"),
                 integration: shutdown_test_integration(),
+                background_jobs: BackgroundJobs::default(),
+                tasks: AsyncTaskManager::new().handle(),
                 commands: commands.downgrade(),
                 actor: actor.abort_handle(),
                 completed: completion,
@@ -1963,19 +2137,19 @@ mod tests {
         integration.unbind_session(&session_id).unwrap();
     }
 
-    struct ScriptAdapter {
+    pub(super) struct ScriptAdapter {
+        pub(super) turns: Arc<AtomicUsize>,
+        pub(super) user_items_seen: Arc<AtomicUsize>,
+        pub(super) notification_items_seen: Arc<AtomicUsize>,
+    }
+
+    pub(super) struct ScriptSession {
         turns: Arc<AtomicUsize>,
         user_items_seen: Arc<AtomicUsize>,
         notification_items_seen: Arc<AtomicUsize>,
     }
 
-    struct ScriptSession {
-        turns: Arc<AtomicUsize>,
-        user_items_seen: Arc<AtomicUsize>,
-        notification_items_seen: Arc<AtomicUsize>,
-    }
-
-    struct ScriptTurn {
+    pub(super) struct ScriptTurn {
         events: VecDeque<ModelTurnEvent>,
     }
 
@@ -2129,10 +2303,10 @@ mod tests {
         }
     }
 
-    struct BlockingTool {
-        spec: ToolSpec,
-        entered: Arc<AtomicBool>,
-        release: Arc<Notify>,
+    pub(super) struct BlockingTool {
+        pub(super) spec: ToolSpec,
+        pub(super) entered: Arc<AtomicBool>,
+        pub(super) release: Arc<Notify>,
     }
 
     #[async_trait]
@@ -2159,6 +2333,259 @@ mod tests {
                 metadata: MetadataMap::new(),
             })
         }
+    }
+
+    struct FinishBackgroundOnDrop {
+        jobs: BackgroundJobs,
+        call_id: String,
+    }
+
+    impl Drop for FinishBackgroundOnDrop {
+        fn drop(&mut self) {
+            self.jobs.finish_for_test(&self.call_id);
+        }
+    }
+
+    struct NonCooperativeTool {
+        spec: ToolSpec,
+        entered: Arc<AtomicBool>,
+        jobs: BackgroundJobs,
+    }
+
+    #[async_trait]
+    impl Tool for NonCooperativeTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
+            let _finish = FinishBackgroundOnDrop {
+                jobs: self.jobs.clone(),
+                call_id: request.call_id.to_string(),
+            };
+            self.entered.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    struct FailingBackgroundTool {
+        spec: ToolSpec,
+        jobs: BackgroundJobs,
+    }
+
+    #[async_trait]
+    impl Tool for FailingBackgroundTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
+            let _finish = FinishBackgroundOnDrop {
+                jobs: self.jobs.clone(),
+                call_id: request.call_id.to_string(),
+            };
+            Err(agentkit_tools_core::ToolError::Unavailable(
+                "fast failure".into(),
+            ))
+        }
+    }
+
+    fn background_task_context(executor: Arc<dyn ToolExecutor>) -> TaskStartContext {
+        TaskStartContext {
+            executor,
+            tool_context: OwnedToolContext {
+                session_id: agentkit_core::SessionId::new("background-session"),
+                turn_id: agentkit_core::TurnId::new("background-turn"),
+                metadata: MetadataMap::new(),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+                execution_scope: None,
+                approved_request: None,
+            },
+        }
+    }
+
+    fn background_task_request(call_id: &str, tool_name: &str) -> TaskLaunchRequest {
+        TaskLaunchRequest::plain(
+            None,
+            ToolRequest {
+                call_id: ToolCallId::new(call_id),
+                tool_name: ToolName::new(tool_name),
+                input: json!({}),
+                session_id: agentkit_core::SessionId::new("background-session"),
+                turn_id: agentkit_core::TurnId::new("background-turn"),
+                metadata: MetadataMap::new(),
+            },
+        )
+    }
+
+    async fn start_non_cooperative_background(
+        call_id: &str,
+    ) -> (BackgroundJobs, TaskManagerHandle) {
+        let jobs = BackgroundJobs::default();
+        jobs.register_foreground_for_test(call_id);
+        assert_eq!(jobs.detach(call_id), Some(DetachRegistration::Registered));
+        let entered = Arc::new(AtomicBool::new(false));
+        let tools = ToolRegistry::new().with(NonCooperativeTool {
+            spec: ToolSpec {
+                name: ToolName::new("non-cooperative"),
+                description: "ignores cooperative cancellation".into(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            },
+            entered: Arc::clone(&entered),
+            jobs: jobs.clone(),
+        });
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([
+            Arc::new(tools) as Arc<dyn ToolSource>
+        ]));
+        let manager =
+            AsyncTaskManager::new().routing(|_request: &ToolRequest| RoutingDecision::Background);
+        let tasks = manager.handle();
+        manager
+            .start_task(
+                background_task_request(call_id, "non-cooperative"),
+                background_task_context(executor),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("non-cooperative task did not start");
+        (jobs, tasks)
+    }
+
+    #[tokio::test]
+    async fn depth_zero_cancel_leaves_detached_background_running() {
+        let (jobs, tasks) = start_non_cooperative_background("root-call").await;
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let integration = AcpIntegration::builder()
+            .name("root-cancel-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("root-cancel-session");
+        let (client, _messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                AgentkitSessionId::new("root-cancel-session"),
+                client,
+            ))
+            .unwrap();
+        let server = Server::new(runtime, integration, SessionRegistry::new());
+        let (commands, mut received) = mpsc::channel(1);
+        server.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                token: 1,
+                commands,
+                background_jobs: jobs.clone(),
+                structured_completion: false,
+                tasks: tasks.clone(),
+            },
+        );
+
+        server
+            .cancel(CancelNotification::new(session_id))
+            .await
+            .unwrap();
+        assert!(matches!(received.recv().await, Some(Command::Cancel)));
+        assert!(!jobs.is_cancelled_for_test("root-call"));
+        assert!(!tasks.list_running().await.is_empty());
+
+        cancel_background_jobs(&tasks, &jobs).await;
+        timeout(
+            Duration::from_secs(1),
+            settle_background_jobs(&tasks, &jobs),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_background_terminal_settles_after_fast_completion() {
+        let jobs = BackgroundJobs::default();
+        jobs.register_foreground_for_test("failed-call");
+        assert_eq!(
+            jobs.detach("failed-call"),
+            Some(DetachRegistration::Registered)
+        );
+        let tools = ToolRegistry::new().with(FailingBackgroundTool {
+            spec: ToolSpec {
+                name: ToolName::new("fast-failure"),
+                description: "fails immediately".into(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            },
+            jobs: jobs.clone(),
+        });
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([
+            Arc::new(tools) as Arc<dyn ToolSource>
+        ]));
+        let manager =
+            AsyncTaskManager::new().routing(|_request: &ToolRequest| RoutingDecision::Background);
+        let tasks = manager.handle();
+        manager
+            .start_task(
+                background_task_request("failed-call", "fast-failure"),
+                background_task_context(executor),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                settle_background_jobs(&tasks, &jobs)
+            )
+            .await
+            .expect("failed background terminal did not settle")
+            .unwrap()
+        );
+        assert!(tasks.list_running().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_cooperative_background_is_force_cancelled_before_settlement() {
+        let (jobs, tasks) = start_non_cooperative_background("stuck-call").await;
+
+        timeout(
+            Duration::from_secs(1),
+            cancel_background_jobs(&tasks, &jobs),
+        )
+        .await
+        .expect("bounded background cancellation hung");
+        assert!(tasks.list_running().await.is_empty());
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                settle_background_jobs(&tasks, &jobs)
+            )
+            .await
+            .expect("forced cancellation did not settle")
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2196,6 +2623,9 @@ mod tests {
             .await
             .unwrap();
 
+        let task_manager = AsyncTaskManager::new();
+        let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
         let response = drive_prompt(
             &acp_session_id,
             &integration,
@@ -2206,11 +2636,139 @@ mod tests {
                     agentkit_acp::TextContent::new("cancel me"),
                 )],
             ),
+            &tasks,
+            &background_jobs,
+            false,
         )
         .await
         .expect("cancellation must be an ACP response, not an RPC error");
 
         assert_eq!(response.stop_reason, StopReason::Cancelled);
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_waits_for_background_completion_and_synthesis() {
+        let turns = Arc::new(AtomicUsize::new(0));
+        let user_items_seen = Arc::new(AtomicUsize::new(0));
+        let notification_items_seen = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Notify::new());
+        let integration = Arc::new(
+            AcpIntegration::builder()
+                .name("structured-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+        );
+        let acp_session_id = agentkit_acp::SessionId::new("s-structured-session");
+        let agentkit_session_id = AgentkitSessionId::new("s-structured-session");
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                acp_session_id.clone(),
+                agentkit_session_id.clone(),
+                client,
+            ))
+            .unwrap();
+        let drain = tokio::spawn(async move {
+            while let Some(message) = messages.recv().await {
+                if let AcpClientMessage::Flush { response } = message {
+                    let _ = response.send(());
+                }
+            }
+        });
+
+        let task_manager = AsyncTaskManager::new()
+            .routing(|_request: &agentkit_tools_core::ToolRequest| RoutingDecision::Foreground);
+        let tasks = task_manager.handle();
+        let tools = ToolRegistry::new().with(BlockingTool {
+            spec: ToolSpec {
+                name: ToolName::new(agentkit_tool_compose::COMPOSE_TOOL_NAME),
+                description: "controlled compose tool".into(),
+                input_schema: json!({"type": "object", "additionalProperties": false}),
+                output_schema: None,
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            },
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns: Arc::clone(&turns),
+                user_items_seen,
+                notification_items_seen,
+            })
+            .add_tool_source(tools)
+            .task_manager(task_manager)
+            .observer(integration.as_ref().clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(agentkit_session_id).without_cache())
+            .await
+            .unwrap();
+        let background_jobs = BackgroundJobs::default();
+        let request = PromptRequest::new(
+            acp_session_id.clone(),
+            vec![agentkit_acp::ContentBlock::Text(
+                agentkit_acp::TextContent::new("start one background call"),
+            )],
+        );
+        let prompt = drive_prompt(
+            &acp_session_id,
+            &integration,
+            &mut driver,
+            request,
+            &tasks,
+            &background_jobs,
+            true,
+        );
+        tokio::pin!(prompt);
+
+        timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                response = &mut prompt => panic!("structured prompt resolved before its task started: {response:?}"),
+                _ = async {
+                    while !entered.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(detach_compose_call(
+                        &tasks,
+                        &background_jobs,
+                        "background-call",
+                    ).await);
+                    background_jobs.register_foreground_for_test("background-call");
+                    while turns.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("structured prompt did not reach its provisional response");
+        assert!(
+            timeout(Duration::from_millis(20), &mut prompt)
+                .await
+                .is_err()
+        );
+
+        // The compose guard can disappear before the task manager publishes its
+        // result. Structured completion must wait through that handoff.
+        background_jobs.finish_for_test("background-call");
+        assert!(
+            timeout(Duration::from_millis(20), &mut prompt)
+                .await
+                .is_err(),
+            "structured prompt crossed the terminal publication handoff early"
+        );
+        release.notify_one();
+        let response = timeout(Duration::from_secs(1), &mut prompt)
+            .await
+            .expect("structured prompt did not synthesize the background result")
+            .unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(turns.load(Ordering::SeqCst), 3);
         drain.abort();
     }
 
@@ -2297,6 +2855,8 @@ mod tests {
             binding: SessionBindingGuard::new(Arc::clone(&integration), acp_session_id.clone()),
             driver,
             tasks: tasks.clone(),
+            background_jobs: background_jobs.clone(),
+            structured_completion: false,
             adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
                 .unwrap(),
             catalog: Vec::new(),
@@ -2347,6 +2907,7 @@ mod tests {
             completed[0].kind,
             agentkit_task_manager::TaskKind::Background
         );
+        background_jobs.finish_for_test("background-call");
         let notification = timeout(Duration::from_secs(1), async {
             loop {
                 let notification = updates_rx.recv().await.expect("update stream closed");
