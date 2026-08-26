@@ -41,6 +41,7 @@ h2 = "=0.4.17"
 httpdate = "=1.0.3"
 hyper = "=1.11.0"
 hyper-util = { version = "=0.1.20", features = ["server", "http1", "http2", "tokio"] }
+image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
 keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
 jsonschema = { version = "=0.50.1", default-features = false }
@@ -48,6 +49,7 @@ opentelemetry = { version = "=0.32.0", default-features = false, features = ["tr
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.1.4", default-features = false, features = ["auth", "client"] }
 runlet = "=0.4.0"

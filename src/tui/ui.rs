@@ -23,11 +23,16 @@ thread_local! {
 }
 
 use super::{
-    app::{App, Block, CachedTranscriptBlock, Child, CodeHit, Phase, ToolCall},
-    command, markdown,
+    app::{
+        App, Block, CachedTranscriptBlock, CachedTranscriptImage, CachedTranscriptRow, Child,
+        CodeHit, Phase, ToolCall, UserMessage,
+    },
+    command,
+    image::{ImageRuntime, RESERVED_ROWS},
+    markdown,
     plan::PlanKind,
     theme,
-    wrap::{LinkedLine, wrap, wrap_linked_tagged},
+    wrap::{LinkedLine, LinkedSpan, wrap, wrap_linked_tagged},
 };
 
 /// Width at which the graph moves beside the transcript instead of below it.
@@ -41,7 +46,7 @@ const MAX_OUTPUT_ROWS: usize = 400;
 type TranscriptTag = (Option<String>, Option<CodeHit>);
 type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
-pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
     let prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
@@ -64,7 +69,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     .areas(frame.area());
 
     draw_header(frame, app, header);
-    draw_body(frame, app, body);
+    draw_body(frame, app, images, body);
     if app.show_logs {
         draw_logs(frame, app, logs);
     }
@@ -312,25 +317,25 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::bar()), area);
 }
 
-fn draw_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
     if !app.show_graph() {
-        draw_transcript(frame, app, area);
+        draw_transcript(frame, app, images, area);
         return;
     }
     if area.width >= SIDE_BY_SIDE_WIDTH {
         let [transcript, graph] =
             Layout::horizontal([Constraint::Min(40), Constraint::Length(GRAPH_WIDTH)]).areas(area);
-        draw_transcript(frame, app, transcript);
+        draw_transcript(frame, app, images, transcript);
         draw_graph(frame, app, graph);
     } else {
         let [transcript, graph] =
             Layout::vertical([Constraint::Min(6), Constraint::Percentage(45)]).areas(area);
-        draw_transcript(frame, app, transcript);
+        draw_transcript(frame, app, images, transcript);
         draw_graph(frame, app, graph);
     }
 }
 
-fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
     let [text_area, bar_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let inner = Rect {
@@ -347,7 +352,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     let width = inner.width.max(1) as usize;
-    refresh_transcript_cache(app, width);
+    refresh_transcript_cache_with_images(app, images, width);
     let working_rows = if app.working() {
         wrap_linked_tagged(
             &[(LinkedLine::plain(working_line(app)), (None, None))],
@@ -381,6 +386,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut visible = Vec::with_capacity(height);
     let end = offset.saturating_add(height);
     let separator = (Line::default(), (None, None), Vec::new());
+    let mut visible_images: Vec<(usize, usize, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
         #[cfg(test)]
         MATERIALIZED_TRANSCRIPT_ROWS.with(|count| count.set(count.get() + 1));
@@ -416,6 +422,18 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     }
                     materialize(row);
                 }
+                for placement in &block.images {
+                    let image_start = content_start + placement.row;
+                    let image_end = image_start + usize::from(RESERVED_ROWS);
+                    if image_start < end && image_end > offset {
+                        let y = image_start as isize - offset as isize;
+                        visible_images.push((
+                            block_index,
+                            placement.source,
+                            y.clamp(i16::MIN as isize, i16::MAX as isize) as i16,
+                        ));
+                    }
+                }
             }
             block_index += 1;
         }
@@ -435,6 +453,17 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(visible), inner);
+    for (block_index, source_index, y) in visible_images {
+        let Some(Block::User(message)) = app.blocks.get(block_index) else {
+            continue;
+        };
+        let Some(source) = message.images.get(source_index) else {
+            continue;
+        };
+        if let Some(image) = images.prepare(source, inner.width.max(1)) {
+            images.render(frame, image, inner, y);
+        }
+    }
     if total > height {
         let mut state = ScrollbarState::new(bottom).position(offset);
         frame.render_stateful_widget(
@@ -482,7 +511,7 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
 
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
-fn refresh_transcript_cache(app: &mut App, width: usize) {
+fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime, width: usize) {
     if app.transcript_revisions.len() != app.blocks.len()
         || app.transcript_cache.len() != app.blocks.len()
         || app.transcript_prefixes.len() != app.blocks.len() + 1
@@ -520,11 +549,22 @@ fn refresh_transcript_cache(app: &mut App, width: usize) {
         let old_count = app.transcript_cache[block_index]
             .as_ref()
             .map_or(0, |cached| cached.rows.len());
-        let rows = wrap_linked_tagged(&transcript_block_lines(app, block_index, show_graph), width);
+        let (rows, cached_images) = if let Block::User(message) = &app.blocks[block_index] {
+            user_block_rows(message, width, images.enabled())
+        } else {
+            (
+                wrap_linked_tagged(&transcript_block_lines(app, block_index, show_graph), width),
+                Vec::new(),
+            )
+        };
         if missing || rows.len() != old_count {
             first_changed_count = first_changed_count.min(block_index);
         }
-        app.transcript_cache[block_index] = Some(CachedTranscriptBlock { revision, rows });
+        app.transcript_cache[block_index] = Some(CachedTranscriptBlock {
+            revision,
+            rows,
+            images: cached_images,
+        });
         if dynamic {
             app.transcript_dynamic.insert(block_index);
         } else {
@@ -540,6 +580,42 @@ fn refresh_transcript_cache(app: &mut App, width: usize) {
     }
 }
 
+#[cfg(test)]
+fn refresh_transcript_cache(app: &mut App, width: usize) {
+    let mut images = ImageRuntime::disabled();
+    refresh_transcript_cache_with_images(app, &mut images, width);
+}
+
+fn user_block_rows(
+    message: &UserMessage,
+    width: usize,
+    reserve_images: bool,
+) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+    let mut rows = Vec::new();
+    let mut placements = Vec::new();
+    for (line_index, text) in message.text.split('\n').enumerate() {
+        rows.extend(wrap_linked_tagged(
+            &[(user_line(text, line_index == 0), (None, None))],
+            width,
+        ));
+        if reserve_images {
+            for (source, _) in message
+                .images
+                .iter()
+                .enumerate()
+                .filter(|(_, image)| image.line == line_index)
+            {
+                let row = rows.len();
+                rows.extend(
+                    (0..RESERVED_ROWS).map(|_| (Line::default(), (None, None), Vec::new())),
+                );
+                placements.push(CachedTranscriptImage { source, row });
+            }
+        }
+    }
+    (rows, placements)
+}
+
 fn transcript_block_lines(
     app: &App,
     block_index: usize,
@@ -547,7 +623,7 @@ fn transcript_block_lines(
 ) -> Vec<TaggedTranscriptLine> {
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
-        Block::User(text) => (uncopyable(plain_lines(user_lines(text))), None),
+        Block::User(_) => unreachable!("user blocks are laid out with image anchors"),
         Block::Agent(text) => (markdown::render_copyable(text), None),
         Block::Thought {
             text,
@@ -613,19 +689,14 @@ fn plain_lines(lines: Vec<Line<'static>>) -> Vec<LinkedLine> {
     lines.into_iter().map(LinkedLine::plain).collect()
 }
 
-fn user_lines(text: &str) -> Vec<Line<'static>> {
-    text.split('\n')
-        .enumerate()
-        .map(|(index, line)| {
-            Line::from(vec![
-                Span::styled(
-                    if index == 0 { "› " } else { "  " },
-                    theme::bold(theme::user_color()),
-                ),
-                Span::styled(line.to_string(), theme::bold(theme::user_color())),
-            ])
-        })
-        .collect()
+fn user_line(text: &str, first: bool) -> LinkedLine {
+    let style = theme::bold(theme::user_color());
+    let mut spans = vec![LinkedSpan {
+        span: Span::styled(if first { "› " } else { "  " }, style),
+        url: None,
+    }];
+    spans.extend(markdown::inline_spans(text, style));
+    LinkedLine { spans }
 }
 
 fn thought_lines(
@@ -1159,15 +1230,21 @@ mod tests {
     use std::path::PathBuf;
 
     use agent_client_protocol::schema::v2::ToolKind;
+    use base64::Engine as _;
     use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_image::picker::Picker;
 
     use super::{
         MAX_PROMPT_ROWS, ModelDialogRow, draw, graph_lines, model_dialog_rows,
         model_dialog_viewport, prompt_lines, refresh_transcript_cache,
+        refresh_transcript_cache_with_images, user_block_rows, user_line,
     };
     use crate::{
         events::RuntimeEvent,
-        tui::app::{Action, App, Block, EffortChoice, EffortDialog, ModelDialog, Update},
+        tui::app::{
+            Action, App, Block, EffortChoice, EffortDialog, ModelDialog, Update, UserImage,
+            UserMessage,
+        },
     };
 
     fn model_choice(provider: &str, model: &str) -> crate::tui::app::ModelChoice {
@@ -1257,8 +1334,9 @@ mod tests {
             theme::set(appearance);
             let mut app = frozen();
             let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+            let mut images = crate::tui::image::ImageRuntime::disabled();
             terminal
-                .draw(|frame| draw(frame, &mut app))
+                .draw(|frame| draw(frame, &mut app, &mut images))
                 .expect("draw succeeds");
             let buffer = terminal.backend().buffer().clone();
             theme::set(Appearance::Dark);
@@ -1393,8 +1471,9 @@ mod tests {
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let mut images = crate::tui::image::ImageRuntime::disabled();
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| draw(frame, app, &mut images))
             .expect("draw succeeds");
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -1445,12 +1524,15 @@ mod tests {
         app.apply(Update::UserMessage {
             id: "first".into(),
             text: "first pending".into(),
+            images: Vec::new(),
             append: false,
         });
         let frame = render(&mut app, 80, 18);
         assert_eq!(frame.matches("· pending").count(), 1, "{frame}");
         assert_eq!(app.pending_steers.len(), 1);
-        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "first pending"));
+        assert!(
+            matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "first pending")
+        );
     }
 
     #[test]
@@ -1835,7 +1917,8 @@ mod tests {
             "0:0".into(),
         );
         for index in 0..30 {
-            app.blocks.push(Block::User(format!("old row {index}")));
+            app.blocks
+                .push(Block::User(format!("old row {index}").into()));
         }
         app.blocks.push(Block::Agent(
             "[visible link](https://example.com/target)".into(),
@@ -1889,6 +1972,107 @@ mod tests {
         assert_ne!(
             app.transcript_cache[99].as_ref().unwrap().rows.as_ptr(),
             tail_rows
+        );
+    }
+
+    #[test]
+    fn user_attachment_links_remain_clickable() {
+        let lines = [user_line(
+            "inspect [Image #1](file:///tmp/image_(1).png)",
+            true,
+        )];
+        let links = lines[0]
+            .spans
+            .iter()
+            .filter_map(|span| span.url.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(links, ["file:///tmp/image_(1).png"]);
+        let displayed = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(displayed, "› inspect Image #1");
+    }
+
+    #[test]
+    fn image_rows_preserve_text_image_text_display_order() {
+        let image = UserImage::new("AQID".into(), "image/png".into(), 1).unwrap();
+        let message = UserMessage {
+            text: "before\n[Image #1]\nafter".into(),
+            images: vec![image],
+        };
+
+        let (rows, placements) = user_block_rows(&message, 40, true);
+
+        assert_eq!(placements.len(), 1);
+        let after = &rows[placements[0].row + usize::from(super::RESERVED_ROWS)].0;
+        assert!(
+            after
+                .spans
+                .iter()
+                .any(|span| span.content.contains("after"))
+        );
+    }
+
+    #[test]
+    fn image_rows_are_fixed_and_decoding_is_lazy() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(400, 200)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let source = UserImage::new(
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            "image/png".into(),
+            0,
+        )
+        .unwrap();
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.blocks.push(Block::User(UserMessage {
+            text: "[Image #1](file:///tmp/image.png)".into(),
+            images: vec![source],
+        }));
+        let mut images = crate::tui::image::ImageRuntime::with_picker(Picker::halfblocks());
+
+        refresh_transcript_cache_with_images(&mut app, &mut images, 12);
+        assert_eq!(images.cached_entries(), 0, "layout must not decode images");
+        let narrow = app.transcript_cache[0].as_ref().unwrap();
+        assert_eq!(narrow.images.len(), 1);
+        assert!(narrow.rows.len() > 1);
+        let narrow_rows = narrow.rows.len();
+        assert_eq!(app.transcript_prefixes.last().copied(), Some(narrow_rows));
+
+        refresh_transcript_cache_with_images(&mut app, &mut images, 40);
+        assert_eq!(images.cached_entries(), 0, "width changes stay lazy");
+        let wide = app.transcript_cache[0].as_ref().unwrap();
+        assert_eq!(wide.images.len(), 1);
+        assert_eq!(wide.rows.len(), narrow_rows);
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(images.cached_entries(), 1, "visible image is prepared");
+        let reserved_rows = app.transcript_cache[0].as_ref().unwrap().rows.len();
+
+        images.clear();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(
+            images.cached_entries(),
+            1,
+            "an evicted visible image is prepared again before rendering"
+        );
+        assert_eq!(
+            app.transcript_cache[0].as_ref().unwrap().rows.len(),
+            reserved_rows,
+            "cache eviction cannot remove reserved transcript rows"
         );
     }
 

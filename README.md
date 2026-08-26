@@ -631,8 +631,11 @@ only when every pasted token is a supported file; otherwise it preserves the
 whole paste as text. A prompt can contain at most 8 attachments, 10 MiB each
 and 20 MiB total. Kit sends the bytes through OpenRouter or OpenAI subscription
 while retaining canonical local `file://` links in model-facing text. Model
-modality support varies. Video, terminal image rendering, and audio playback are
-not supported, and Kit never displays base64 or `data:` URLs. See
+modality support varies. In terminals detected as supporting Kitty, Sixel, or
+iTerm2 graphics, user-attached images render inline as a bounded static first
+frame; other terminals and decode failures keep the safe clickable attachment
+label. Video and audio playback are not supported, and Kit never displays
+base64 or `data:` URLs. See
 [the TUI guide](docs/user/tui-and-sessions.md#attach-local-images-and-audio).
 
 ## Deliberate limits
