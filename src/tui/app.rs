@@ -26,6 +26,9 @@ use crate::compaction::is_compaction_summary;
 use crate::events::RuntimeEvent;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
+const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
+const MAX_IMAGE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 use super::{
     command::{Parsed, known_token, parse},
@@ -45,6 +48,7 @@ pub enum Update {
     UserMessage {
         id: String,
         text: String,
+        images: Vec<UserImage>,
         append: bool,
     },
     /// Agent prose, either appended as a chunk or replaced by an upsert.
@@ -345,8 +349,67 @@ impl ToolCall {
 }
 
 /// One entry in the transcript.
+#[derive(Clone, Debug)]
+pub struct UserImage {
+    pub(super) key: [u8; 32],
+    pub(super) data: String,
+    pub(super) mime_type: String,
+    /// Source line after which the fixed image viewport is reserved.
+    pub(super) line: usize,
+}
+
+impl UserImage {
+    pub(super) fn new(data: String, mime_type: String, line: usize) -> Option<Self> {
+        // Check the encoded and maximum decoded lengths before hashing or retaining
+        // attacker-controlled ACP payloads. The exact decode stays lazy.
+        if data.len() > MAX_IMAGE_BASE64_BYTES {
+            return None;
+        }
+        let padding = data
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'=')
+            .take(2)
+            .count();
+        let decoded_upper_bound = data
+            .len()
+            .div_ceil(4)
+            .saturating_mul(3)
+            .saturating_sub(padding);
+        if decoded_upper_bound > MAX_IMAGE_SOURCE_BYTES {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(mime_type.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(data.as_bytes());
+        Some(Self {
+            key: *hasher.finalize().as_bytes(),
+            data,
+            mime_type,
+            line,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UserMessage {
+    pub(super) text: String,
+    pub(super) images: Vec<UserImage>,
+}
+
+impl From<String> for UserMessage {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
 pub enum Block {
-    User(String),
+    User(UserMessage),
     Agent(String),
     Thought {
         text: String,
@@ -359,9 +422,15 @@ pub enum Block {
     Error(String),
 }
 
+pub(super) struct CachedTranscriptImage {
+    pub source: usize,
+    pub row: usize,
+}
+
 pub(super) struct CachedTranscriptBlock {
     pub revision: u64,
     pub rows: Vec<CachedTranscriptRow>,
+    pub images: Vec<CachedTranscriptImage>,
 }
 
 /// What the client is doing right now.
@@ -402,6 +471,7 @@ pub struct App {
     pub(super) transcript_thoughts: BTreeSet<usize>,
     pub(super) transcript_prefixes: Vec<usize>,
     pub(super) transcript_cache_width: usize,
+    retained_image_source_bytes: usize,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
     pub editor: Editor,
@@ -664,6 +734,7 @@ impl App {
             transcript_thoughts: BTreeSet::new(),
             transcript_prefixes: vec![0],
             transcript_cache_width: 0,
+            retained_image_source_bytes: 0,
             next_transcript_revision: 0,
             transcript_focus_index: None,
             editor: Editor::default(),
@@ -893,7 +964,10 @@ impl App {
                     if !text.is_empty() {
                         if item.kind == ItemKind::User {
                             self.latest_agent_source.clear();
-                            self.push_block(Block::User(text));
+                            self.push_block(Block::User(UserMessage {
+                                text,
+                                images: Vec::new(),
+                            }));
                         } else {
                             self.push_block(Block::Notice(text));
                         }
@@ -1031,15 +1105,67 @@ impl App {
         self.toast = Some((text.into(), Instant::now()));
     }
 
-    fn apply_message(&mut self, id: String, text: String, append: bool, role: MessageRole) {
-        if let Some(&index) = self.message_blocks.get(&id) {
+    fn apply_message(
+        &mut self,
+        id: String,
+        text: String,
+        images: Vec<UserImage>,
+        append: bool,
+        role: MessageRole,
+    ) {
+        let mut images = images;
+        let existing_index = self.message_blocks.get(&id).copied();
+        if !append
+            && matches!(role, MessageRole::User)
+            && let Some(index) = existing_index
+            && let Block::User(existing) = &self.blocks[index]
+        {
+            let replaced = existing
+                .images
+                .iter()
+                .map(|image| image.data.len())
+                .sum::<usize>();
+            self.retained_image_source_bytes =
+                self.retained_image_source_bytes.saturating_sub(replaced);
+        }
+        images.retain(|image| {
+            let retained = self
+                .retained_image_source_bytes
+                .saturating_add(image.data.len());
+            if retained > MAX_RETAINED_IMAGE_SOURCE_BYTES {
+                false
+            } else {
+                self.retained_image_source_bytes = retained;
+                true
+            }
+        });
+        if let Some(index) = existing_index {
             let mut changed = false;
             match (&mut self.blocks[index], role) {
                 (Block::User(existing), MessageRole::User) => {
                     if append {
-                        existing.push_str(&text);
+                        let last_line = existing.text.bytes().filter(|&byte| byte == b'\n').count();
+                        let follows_image =
+                            existing.images.iter().any(|image| image.line == last_line);
+                        let starts_image = !images.is_empty();
+                        if !existing.text.is_empty()
+                            && !existing.text.ends_with('\n')
+                            && !text.starts_with('\n')
+                            && !text.is_empty()
+                            && (follows_image || starts_image)
+                        {
+                            existing.text.push('\n');
+                        }
+                        let line_offset =
+                            existing.text.bytes().filter(|&byte| byte == b'\n').count();
+                        existing.text.push_str(&text);
+                        for image in &mut images {
+                            image.line += line_offset;
+                        }
+                        existing.images.extend(std::mem::take(&mut images));
                     } else {
-                        *existing = text.clone();
+                        existing.text = text.clone();
+                        existing.images = std::mem::take(&mut images);
                     }
                     changed = true;
                 }
@@ -1079,7 +1205,7 @@ impl App {
             MessageRole::User => {
                 self.close_thought();
                 self.agent_stream_sealed = true;
-                self.push_block(Block::User(text));
+                self.push_block(Block::User(UserMessage { text, images }));
             }
             MessageRole::Agent => {
                 self.close_thought();
@@ -1194,15 +1320,20 @@ impl App {
                     self.pending_steers.push_back(PendingSteer { id, text });
                 }
             }
-            Update::UserMessage { id, text, append } => {
+            Update::UserMessage {
+                id,
+                text,
+                images,
+                append,
+            } => {
                 self.pending_steers.retain(|pending| pending.id != id);
-                self.apply_message(id, text, append, MessageRole::User);
+                self.apply_message(id, text, images, append, MessageRole::User);
             }
             Update::AgentMessage { id, text, append } => {
-                self.apply_message(id, text, append, MessageRole::Agent);
+                self.apply_message(id, text, Vec::new(), append, MessageRole::Agent);
             }
             Update::AgentThought { id, text, append } => {
-                self.apply_message(id, text, append, MessageRole::Thought);
+                self.apply_message(id, text, Vec::new(), append, MessageRole::Thought);
             }
             Update::ToolStarted {
                 id,
@@ -1475,6 +1606,7 @@ impl App {
         self.transcript_prefixes.clear();
         self.transcript_prefixes.push(0);
         self.transcript_cache_width = 0;
+        self.retained_image_source_bytes = 0;
         self.transcript_focus_index = None;
         self.clear_attachments();
         self.latest_agent_source.clear();
@@ -1503,6 +1635,7 @@ impl App {
         self.apply(Update::UserMessage {
             id,
             text: prompt,
+            images: Vec::new(),
             append: false,
         });
         self.apply(Update::State {
@@ -2115,7 +2248,10 @@ mod tests {
     use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    use super::{Action, App, AttachmentKind, Block, Phase, Update};
+    use super::{
+        Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
+        MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+    };
     use crate::{events::RuntimeEvent, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -2138,6 +2274,38 @@ mod tests {
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         )
+    }
+
+    #[test]
+    fn oversized_user_image_payload_is_rejected_before_retention() {
+        let encoded_too_large = "A".repeat(MAX_IMAGE_BASE64_BYTES + 1);
+        assert!(UserImage::new(encoded_too_large, "image/png".into(), 0).is_none());
+
+        let decoded_too_large = "A".repeat((MAX_IMAGE_SOURCE_BYTES + 1).div_ceil(3) * 4);
+        assert!(UserImage::new(decoded_too_large, "image/png".into(), 0).is_none());
+    }
+
+    #[test]
+    fn retained_user_image_sources_have_an_aggregate_bound() {
+        let source_bytes = 9 * 1024 * 1024;
+        let mut app = app();
+        for index in 0..4 {
+            let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0)
+                .expect("source is within the per-image limit");
+            app.apply(Update::UserMessage {
+                id: format!("image-{index}"),
+                text: format!("[Image #{index}]"),
+                images: vec![image],
+                append: false,
+            });
+        }
+
+        assert_eq!(app.retained_image_source_bytes, source_bytes * 3);
+        assert!(app.retained_image_source_bytes <= MAX_RETAINED_IMAGE_SOURCE_BYTES);
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::User(message)) if message.images.is_empty()
+        ));
     }
 
     fn compose(app: &mut App, script: &str) {
@@ -2257,7 +2425,7 @@ mod tests {
         app.restore_transcript("session".into(), &transcript);
 
         assert_eq!(app.blocks.len(), 2);
-        assert!(matches!(&app.blocks[0], Block::User(text) if text == "run the build"));
+        assert!(matches!(&app.blocks[0], Block::User(message) if message.text == "run the build"));
         assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "the build passed"));
     }
 
@@ -2298,9 +2466,9 @@ mod tests {
 
         assert!(matches!(
             &app.blocks[0],
-            Block::User(text)
-                if text == "inspect these\n[Image #1](file:///tmp/image.png)\n[Image #2]"
-                    && !text.contains("data:")
+            Block::User(message)
+                if message.text == "inspect these\n[Image #1](file:///tmp/image.png)\n[Image #2]"
+                    && !message.text.contains("data:")
         ));
         assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "done"));
         assert!(matches!(
@@ -2814,10 +2982,13 @@ mod tests {
         app.apply(Update::UserMessage {
             id: "injected-1".into(),
             text: "change direction".into(),
+            images: Vec::new(),
             append: false,
         });
         assert!(app.pending_steers.is_empty());
-        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "change direction"));
+        assert!(
+            matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "change direction")
+        );
         assert!(app.working());
     }
 
@@ -2854,7 +3025,8 @@ mod tests {
     #[test]
     fn switching_sessions_clears_only_transcript_derived_state() {
         let mut app = app();
-        app.blocks.push(Block::User("old transcript".into()));
+        app.blocks
+            .push(Block::User("old transcript".to_string().into()));
         app.logs.push("diagnostic".into());
         app.usage = Some(super::ContextUsage { used: 1, size: 2 });
         app.start_session("fresh".into());

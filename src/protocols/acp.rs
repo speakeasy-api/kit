@@ -160,24 +160,15 @@ pub(super) fn tool_output_raw(output: &ToolOutput) -> Option<serde_json::Value> 
 }
 
 fn media_replay_content(media: &MediaPart) -> ContentBlock {
-    match media.modality {
-        Modality::Image
-            if matches!(media.data, DataRef::InlineText(_) | DataRef::InlineBytes(_)) =>
-        {
-            ContentBlock::Image(ImageContent::new(
-                data_ref_base64_payload(&media.data),
-                media.mime_type.clone(),
-            ))
+    let payload = data_ref_base64_payload(&media.data);
+    match (media.modality, payload) {
+        (Modality::Image, Some(payload)) => {
+            ContentBlock::Image(ImageContent::new(payload, media.mime_type.clone()))
         }
-        Modality::Audio
-            if matches!(media.data, DataRef::InlineText(_) | DataRef::InlineBytes(_)) =>
-        {
-            ContentBlock::Audio(AudioContent::new(
-                data_ref_base64_payload(&media.data),
-                media.mime_type.clone(),
-            ))
+        (Modality::Audio, Some(payload)) => {
+            ContentBlock::Audio(AudioContent::new(payload, media.mime_type.clone()))
         }
-        Modality::Image | Modality::Audio | Modality::Video | Modality::Binary => {
+        (Modality::Image | Modality::Audio | Modality::Video | Modality::Binary, _) => {
             data_ref_replay_content(None, Some(&media.mime_type), &media.data)
         }
     }
@@ -218,7 +209,7 @@ fn data_ref_replay_content(
         }
         _ => {
             let mut resource = BlobResourceContents::new(
-                data_ref_base64_payload(data),
+                data_ref_base64_payload(data).unwrap_or_default(),
                 format!("agentkit://session-replay/{}", name.unwrap_or("content")),
             );
             if let Some(mime_type) = mime_type {
@@ -231,13 +222,14 @@ fn data_ref_replay_content(
     }
 }
 
-fn data_ref_base64_payload(data: &DataRef) -> String {
+fn data_ref_base64_payload(data: &DataRef) -> Option<String> {
     match data {
         DataRef::InlineText(text) => {
-            data_url_base64_payload(text).unwrap_or_else(|| BASE64.encode(text.as_bytes()))
+            Some(data_url_base64_payload(text).unwrap_or_else(|| BASE64.encode(text.as_bytes())))
         }
-        DataRef::InlineBytes(bytes) => BASE64.encode(bytes),
-        DataRef::Uri(_) | DataRef::Handle(_) => String::new(),
+        DataRef::InlineBytes(bytes) => Some(BASE64.encode(bytes)),
+        DataRef::Uri(uri) => data_url_base64_payload(uri),
+        DataRef::Handle(_) => None,
     }
 }
 
@@ -1752,6 +1744,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["compact"]
         );
+    }
+
+    #[test]
+    fn replay_restores_data_url_images_as_image_content() {
+        let part = Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::uri("data:image/png;base64,AQID"),
+        );
+        let chunk = user_replay_content(&part).expect("image replay content");
+
+        assert!(matches!(
+            chunk.content,
+            ContentBlock::Image(image) if image.data == "AQID"
+        ));
     }
 
     #[test]

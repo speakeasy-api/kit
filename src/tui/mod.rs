@@ -9,6 +9,7 @@
 mod app;
 mod command;
 mod editor;
+mod image;
 mod markdown;
 mod plan;
 mod theme;
@@ -61,6 +62,7 @@ use crate::{
 
 use app::{
     Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
+    UserImage,
 };
 
 /// Animation and elapsed-time refresh interval.
@@ -472,7 +474,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // an installation failure cannot leave the caller's terminal altered.
             let mut stop =
                 Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
-            let mut terminal =
+            let (mut terminal, mut images) =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut app = App::new(
                 root.clone(),
@@ -492,7 +494,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
                     terminal
-                        .draw(|frame| ui::draw(frame, &mut app))
+                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     tokio::select! {
                         terminal_event = events.next() => {
@@ -581,6 +583,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     if let Ok(mut active) = transition_session.lock() {
                                         *active = persisted_id.clone();
                                     }
+                                    images.clear();
                                     app.start_session(persisted_id);
                                     refresh_config_state(&mut app, Some(&session.config_options));
                                     if let Some(prompt) = first_prompt {
@@ -627,6 +630,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     if let Ok(mut active) = transition_session.lock() {
                                         *active = requested_id.clone();
                                     }
+                                    images.clear();
                                     app.start_session(requested_id.clone());
                                     match request_resume(&connection, session_id.clone(), root.clone()).await {
                                         Ok(response) => refresh_config_state(
@@ -638,6 +642,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             if let Ok(mut active) = transition_session.lock() {
                                                 *active = previous_persisted_id.clone();
                                             }
+                                            images.clear();
                                             app.start_session(previous_persisted_id);
                                             let restored = request_resume(
                                                 &connection,
@@ -1104,11 +1109,12 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
     Ok(blocks)
 }
 
-fn enter() -> std::io::Result<DefaultTerminal> {
-    // Asked before the alternate screen is entered: the query needs the
-    // terminal's own input stream, which the event loop owns from here on.
+fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
     theme::detect();
     let terminal = ratatui::try_init()?;
+    // Query after entering the alternate screen but before the event stream owns
+    // terminal input, as required by ratatui-image. The query has a short bound.
+    let images = image::ImageRuntime::detect();
     let mut stdout = std::io::stdout();
     // Bracketed paste is what keeps pasted text out of the key stream: without
     // it every newline in a paste arrives as a return press, which submits the
@@ -1131,7 +1137,7 @@ fn enter() -> std::io::Result<DefaultTerminal> {
         restore_modes();
         previous(info);
     }));
-    Ok(terminal)
+    Ok((terminal, images))
 }
 
 /// Whether the keyboard enhancement flags were pushed and still need popping.
@@ -1239,14 +1245,15 @@ fn durable_session_id(session_id: &wire::SessionId) -> Result<String, String> {
 fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
     let session_id = notification.session_id.to_string();
     let updates = match notification.update {
-        SessionUpdate::UserMessageChunk(chunk) => message_of(chunk.content)
-            .map(|text| Update::UserMessage {
+        SessionUpdate::UserMessageChunk(chunk) => {
+            let (text, images) = user_message_of(vec![chunk.content]);
+            vec![Update::UserMessage {
                 id: chunk.message_id.to_string(),
                 text,
+                images,
                 append: true,
-            })
-            .into_iter()
-            .collect(),
+            }]
+        }
         SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
             .map(|text| Update::AgentMessage {
                 id: chunk.message_id.to_string(),
@@ -1255,14 +1262,14 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             })
             .into_iter()
             .collect(),
-        SessionUpdate::AgentThoughtChunk(chunk) => text_of(chunk.content)
-            .map(|text| Update::AgentThought {
+        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) => vec![Update::AgentThought {
                 id: chunk.message_id.to_string(),
-                text,
+                text: text.text,
                 append: true,
-            })
-            .into_iter()
-            .collect(),
+            }],
+            _ => Vec::new(),
+        },
         SessionUpdate::UserMessage(message) => message_patch(
             message.message_id.to_string(),
             message.content,
@@ -1404,17 +1411,22 @@ fn message_patch(
         MaybeUndefined::Null => Vec::new(),
         MaybeUndefined::Value(blocks) => blocks,
     };
+    if matches!(kind, MessageKind::User) {
+        let (text, images) = user_message_of(blocks);
+        return vec![Update::UserMessage {
+            id,
+            text,
+            images,
+            append: false,
+        }];
+    }
     let text = blocks
         .into_iter()
         .filter_map(message_of)
         .collect::<Vec<_>>()
         .join("");
     vec![match kind {
-        MessageKind::User => Update::UserMessage {
-            id,
-            text,
-            append: false,
-        },
+        MessageKind::User => unreachable!("handled above"),
         MessageKind::Agent => Update::AgentMessage {
             id,
             text,
@@ -1428,11 +1440,55 @@ fn message_patch(
     }]
 }
 
-fn text_of(content: ContentBlock) -> Option<String> {
-    match content {
-        ContentBlock::Text(text) => Some(text.text),
-        _ => None,
+fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    let mut image_ordinal = 0;
+    let mut separate_after_image = false;
+
+    for block in blocks {
+        match block {
+            ContentBlock::Image(image) => {
+                image_ordinal += 1;
+                let uri = image.uri.filter(|uri| safe_media_uri(uri));
+                let existing_line = uri
+                    .as_deref()
+                    .and_then(|uri| markdown::line_with_link(&text, uri));
+                let line =
+                    existing_line.unwrap_or_else(|| {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        let line = text.bytes().filter(|&byte| byte == b'\n').count();
+                        let label = format!("Image #{image_ordinal}");
+                        text.push_str(&uri.as_ref().map_or_else(
+                            || format!("[{label}]"),
+                            |uri| format!("[{label}]({uri})"),
+                        ));
+                        separate_after_image = true;
+                        line
+                    });
+                if let Some(image) = UserImage::new(image.data, image.mime_type.to_string(), line) {
+                    images.push(image);
+                }
+            }
+            block => {
+                let Some(content) = message_of(block) else {
+                    continue;
+                };
+                if separate_after_image
+                    && !text.ends_with('\n')
+                    && !content.starts_with('\n')
+                    && !content.is_empty()
+                {
+                    text.push('\n');
+                }
+                text.push_str(&content);
+                separate_after_image = false;
+            }
+        }
     }
+    (text, images)
 }
 
 fn message_of(content: ContentBlock) -> Option<String> {
@@ -1542,7 +1598,7 @@ mod tests {
         MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
         detach_from_controlling_terminal, durable_session_id, effort_state, handle, message_of,
         osc52, prompt_blocks, readable, refresh_config_state, save_effort_default_to,
-        save_model_defaults_to, translate, translate_for_session, wire,
+        save_model_defaults_to, translate, translate_for_session, user_message_of, wire,
     };
     use crate::tui::app::{App, SubmittedPrompt, Update};
 
@@ -1588,7 +1644,7 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(user, "session").as_slice(),
-            [Update::UserMessage { id, text, append: false }]
+            [Update::UserMessage { id, text, append: false, .. }]
                 if id == "user-1" && text == "steer"
         ));
 
@@ -1813,6 +1869,59 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "attachments exceed the 20 MiB total limit");
+    }
+
+    #[test]
+    fn user_image_payload_is_structured_without_a_duplicate_label() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!("describe [Image #1]({uri})"))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("describe [Image #1]({uri})"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "AQID");
+        assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn user_image_blocks_preserve_text_image_text_order() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new("before")),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Text(TextContent::new("after")),
+        ]);
+
+        assert_eq!(text, format!("before\n[Image #1]({uri})\nafter"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 1);
+    }
+
+    #[test]
+    fn image_deduplication_requires_the_exact_trusted_link() {
+        let actual = "file:///tmp/actual.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new("[Image #1](file:///tmp/different.png)")),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(actual.into())),
+            ),
+        ]);
+
+        assert_eq!(
+            text,
+            format!("[Image #1](file:///tmp/different.png)\n[Image #1]({actual})")
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 1);
     }
 
     #[test]

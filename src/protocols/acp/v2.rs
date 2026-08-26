@@ -1724,7 +1724,8 @@ pub(crate) fn component(
 mod tests {
     use serde_json::json;
 
-    use agentkit_core::{MetadataMap, TurnCancellation};
+    use agent_client_protocol::schema::MaybeUndefined;
+    use agentkit_core::{DataRef, MetadataMap, Modality, TurnCancellation};
     use agentkit_loop::{
         Agent, ModelAdapter, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest, TurnResult,
@@ -2728,6 +2729,31 @@ mod tests {
         assert!(matches!(
             replay[1].update,
             wire::SessionUpdate::AgentMessage(_)
+        ));
+    }
+
+    #[test]
+    fn replay_preserves_data_url_user_images() {
+        let replay = transcript_replay(
+            &wire::SessionId::new("saved"),
+            &[Item::new(
+                ItemKind::User,
+                vec![Part::media(
+                    Modality::Image,
+                    "image/png",
+                    DataRef::uri("data:image/png;base64,AQID"),
+                )],
+            )],
+        );
+        let wire::SessionUpdate::UserMessage(message) = &replay[0].update else {
+            panic!("expected user message");
+        };
+        let MaybeUndefined::Value(content) = &message.content else {
+            panic!("expected user content");
+        };
+        assert!(matches!(
+            content.as_slice(),
+            [wire::ContentBlock::Image(image)] if image.data == "AQID"
         ));
     }
 

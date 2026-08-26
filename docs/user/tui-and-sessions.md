@@ -58,7 +58,7 @@ An accepted file appears in the editor as `[Image #N]` or `[Audio #N]`. Add surr
 
 The model-facing prompt retains canonical `file://` Markdown links, while Kit also reads and sends the file bytes because remote providers cannot access local files. Image and audio acceptance remains model-dependent. Kit supports these request shapes through OpenRouter and OpenAI subscription; an individual model can still reject a modality it does not support. Video is not supported.
 
-Assistant- and tool-produced media appears as portable Markdown placeholders or links. Kit does not render images in the terminal or play audio. Only bounded `file://`, `http://`, and `https://` links are displayed; base64 and `data:` URLs are never copied into terminal text or Markdown links.
+User-attached images render inline as a bounded static first frame when Kit detects Kitty, Sixel, or iTerm2 graphics support. No setting is required. Unsupported terminals, malformed or oversized images, and decode failures retain the safe clickable attachment label. Animated GIF and WebP files currently show only their first frame. Assistant- and tool-produced media remains portable Markdown placeholders or links, and audio is not played. Only bounded `file://`, `http://`, and `https://` links are displayed; base64 and `data:` URLs are never copied into terminal text or Markdown links.
 
 ### Interrupt a running turn or quit
 

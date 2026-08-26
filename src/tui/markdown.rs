@@ -240,7 +240,7 @@ fn next_markdown_link(source: &str) -> Option<Link<'_>> {
         }
         let url_end = url_end?;
         let url = &source[url_start..url_end];
-        if url.starts_with("https://") || url.starts_with("http://") {
+        if super::safe_media_uri(url) {
             return Some(Link {
                 start,
                 end: url_end + 1,
@@ -294,8 +294,28 @@ fn next_link(source: &str) -> Option<Link<'_>> {
     }
 }
 
+pub(super) fn line_with_link(source: &str, url: &str) -> Option<usize> {
+    source.split('\n').position(|line| {
+        inline(line, Style::default())
+            .iter()
+            .any(|span| span.url.as_deref() == Some(url))
+    })
+}
+
+pub(super) fn inline_spans(source: &str, base: Style) -> Vec<LinkedSpan> {
+    inline_with_link_destinations(source, base, false)
+}
+
 /// Splits inline links, emphasis, and code spans out of one line of Markdown.
 fn inline(source: &str, base: Style) -> Vec<LinkedSpan> {
+    inline_with_link_destinations(source, base, true)
+}
+
+fn inline_with_link_destinations(
+    source: &str,
+    base: Style,
+    show_link_destinations: bool,
+) -> Vec<LinkedSpan> {
     let mut spans = Vec::new();
     let mut plain = String::new();
     let mut rest = source;
@@ -310,12 +330,16 @@ fn inline(source: &str, base: Style) -> Vec<LinkedSpan> {
             if !plain.is_empty() {
                 spans.push(plain_span(std::mem::take(&mut plain), base));
             }
-            let link_style = theme::accent().add_modifier(Modifier::UNDERLINED);
+            let link_style = base
+                .patch(theme::accent())
+                .add_modifier(Modifier::UNDERLINED);
             if let Some(label) = link.label {
                 spans.push(link_span(label.to_string(), link_style, link.url));
-                spans.push(plain_span(" (", base));
-                spans.push(link_span(link.url.to_string(), link_style, link.url));
-                spans.push(plain_span(")", base));
+                if show_link_destinations {
+                    spans.push(plain_span(" (", base));
+                    spans.push(link_span(link.url.to_string(), link_style, link.url));
+                    spans.push(plain_span(")", base));
+                }
             } else {
                 spans.push(link_span(link.url.to_string(), link_style, link.url));
             }
@@ -375,7 +399,15 @@ fn inline(source: &str, base: Style) -> Vec<LinkedSpan> {
         if !plain.is_empty() {
             spans.push(plain_span(std::mem::take(&mut plain), base));
         }
-        spans.push(plain_span(body[..close].to_string(), style));
+        if delimiter == "`" {
+            spans.push(plain_span(body[..close].to_string(), style));
+        } else {
+            spans.extend(inline_with_link_destinations(
+                &body[..close],
+                style,
+                show_link_destinations,
+            ));
+        }
         rest = &body[close + delimiter.len()..];
     }
     if !plain.is_empty() {
@@ -530,6 +562,52 @@ mod tests {
             linked_urls(source),
             ["https://linear.app/docs/mcp", "https://linear.app/docs/mcp"]
         );
+    }
+
+    #[test]
+    fn parses_links_inside_bold_and_italic() {
+        let url = "https://example.com/docs";
+        for (source, emphasis) in [
+            (format!("**[label]({url})**"), Modifier::BOLD),
+            (format!("*[label]({url})*"), Modifier::ITALIC),
+            (format!("_[label]({url})_"), Modifier::ITALIC),
+        ] {
+            let rendered = render_linked(&source);
+            let line = &rendered[0];
+            let joined: String = line
+                .spans
+                .iter()
+                .map(|span| span.span.content.as_ref())
+                .collect();
+            assert_eq!(joined, format!("label ({url})"));
+
+            let linked: Vec<_> = line
+                .spans
+                .iter()
+                .filter(|span| span.url.is_some())
+                .collect();
+            assert_eq!(linked.len(), 2);
+            assert!(linked.iter().all(|span| span.url.as_deref() == Some(url)));
+            assert!(linked.iter().all(|span| {
+                span.span.style.add_modifier.contains(emphasis)
+                    && span.span.style.add_modifier.contains(Modifier::UNDERLINED)
+            }));
+        }
+    }
+
+    #[test]
+    fn leaves_markdown_links_inside_code_spans_literal_and_unlinked() {
+        let source = "`[label](https://example.com/docs)`";
+        let rendered = render_linked(source);
+        let line = &rendered[0];
+        let joined: String = line
+            .spans
+            .iter()
+            .map(|span| span.span.content.as_ref())
+            .collect();
+
+        assert_eq!(joined, "[label](https://example.com/docs)");
+        assert!(linked_urls(source).is_empty());
     }
 
     #[test]
