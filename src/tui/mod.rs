@@ -553,10 +553,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             .map(|_| None)
                                     };
                                     match outcome {
-                                        Ok(Some(message_id)) => app.apply(Update::UserMessage {
+                                        Ok(Some(message_id)) => app.apply(Update::SteerAccepted {
                                             id: message_id.to_string(),
                                             text: prompt.text,
-                                            append: false,
                                         }),
                                         Ok(None) => {}
                                         Err(error) => {

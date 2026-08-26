@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
     time::{Duration, Instant},
@@ -39,7 +39,9 @@ use super::{
 pub enum Update {
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
-    /// A user message accepted or replayed by the agent.
+    /// A steer was accepted but has not been delivered into the transcript yet.
+    SteerAccepted { id: String, text: String },
+    /// A user message delivered or replayed by the agent.
     UserMessage {
         id: String,
         text: String,
@@ -192,6 +194,12 @@ pub struct Attachment {
 pub struct SubmittedPrompt {
     pub text: String,
     pub attachments: Vec<Attachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingSteer {
+    pub id: String,
+    pub text: String,
 }
 
 pub enum Action {
@@ -402,6 +410,7 @@ pub struct App {
     pub phase: Phase,
     pub turn_started: Option<Instant>,
     pub can_steer: bool,
+    pub(super) pending_steers: VecDeque<PendingSteer>,
     message_blocks: HashMap<String, usize>,
     /// The previous assistant stream ended; the next text starts a new block.
     agent_stream_sealed: bool,
@@ -663,6 +672,7 @@ impl App {
             phase: Phase::Idle,
             turn_started: None,
             can_steer: false,
+            pending_steers: VecDeque::new(),
             message_blocks: HashMap::new(),
             agent_stream_sealed: false,
             latest_agent_source: String::new(),
@@ -1118,6 +1128,7 @@ impl App {
     }
 
     fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
+        self.pending_steers.clear();
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
@@ -1169,7 +1180,22 @@ impl App {
                     self.available_commands = commands;
                 }
             }
+            Update::SteerAccepted { id, text } => {
+                if self.message_blocks.contains_key(&id) {
+                    return;
+                }
+                if let Some(pending) = self
+                    .pending_steers
+                    .iter_mut()
+                    .find(|pending| pending.id == id)
+                {
+                    pending.text = text;
+                } else {
+                    self.pending_steers.push_back(PendingSteer { id, text });
+                }
+            }
             Update::UserMessage { id, text, append } => {
+                self.pending_steers.retain(|pending| pending.id != id);
                 self.apply_message(id, text, append, MessageRole::User);
             }
             Update::AgentMessage { id, text, append } => {
@@ -1455,6 +1481,7 @@ impl App {
         self.phase = Phase::Idle;
         self.turn_started = None;
         self.message_blocks.clear();
+        self.pending_steers.clear();
         self.compacting = false;
         self.usage = None;
         self.scroll = usize::MAX;
@@ -2773,27 +2800,24 @@ mod tests {
                 .any(|block| matches!(block, Block::User(_)))
         );
 
-        app.apply(Update::UserMessage {
+        app.apply(Update::SteerAccepted {
             id: "injected-1".into(),
             text: prompt.text,
-            append: false,
         });
-        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "change direction"));
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::User(_)))
+        );
 
-        // Delivery is echoed with the accepted message ID and must update the
-        // optimistic block rather than rendering the steer twice.
         app.apply(Update::UserMessage {
             id: "injected-1".into(),
             text: "change direction".into(),
             append: false,
         });
-        assert_eq!(
-            app.blocks
-                .iter()
-                .filter(|block| matches!(block, Block::User(_)))
-                .count(),
-            1
-        );
+        assert!(app.pending_steers.is_empty());
+        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "change direction"));
         assert!(app.working());
     }
 

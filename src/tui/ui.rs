@@ -34,6 +34,7 @@ use super::{
 const SIDE_BY_SIDE_WIDTH: u16 = 108;
 const GRAPH_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
+const MAX_PENDING_STEER_ROWS: usize = 3;
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
 
@@ -51,10 +52,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .clamp(1, MAX_PROMPT_ROWS) as u16
         + 2;
     let logs_rows = if app.show_logs { 9 } else { 0 };
-    let [header, body, logs, prompt, status] = Layout::vertical([
+    let pending_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS) as u16;
+    let [header, body, logs, pending, prompt, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(logs_rows),
+        Constraint::Length(pending_rows),
         Constraint::Length(prompt_rows),
         Constraint::Length(1),
     ])
@@ -65,6 +68,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.show_logs {
         draw_logs(frame, app, logs);
     }
+    draw_pending_steers(frame, app, pending);
     draw_prompt(frame, app, prompt);
     draw_status(frame, app, status);
     if app.model_dialog.is_some() {
@@ -982,6 +986,38 @@ fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let visible = area.height as usize;
+    if visible == 0 || app.pending_steers.is_empty() {
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(visible);
+    let skip = if app.pending_steers.len() > visible && visible > 1 {
+        let hidden = app.pending_steers.len() - (visible - 1);
+        lines.push(Line::from(Span::styled(
+            format!("  … {hidden} earlier pending"),
+            theme::faint(),
+        )));
+        hidden
+    } else {
+        app.pending_steers.len().saturating_sub(visible)
+    };
+    lines.extend(app.pending_steers.iter().skip(skip).map(|pending| {
+        let text = pending
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Line::from(vec![
+            Span::styled("  › ", theme::bold(theme::user_color())),
+            Span::styled(text, theme::bold(theme::user_color())),
+            Span::styled("  · pending", theme::faint()),
+        ])
+    }));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
         Style::default().fg(theme::accent_color())
@@ -1369,6 +1405,52 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn pending_steers_render_above_input_until_delivery() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.can_steer = true;
+        app.apply(Update::State {
+            active: true,
+            steerable: true,
+            cancelled: false,
+        });
+        app.apply(Update::SteerAccepted {
+            id: "first".into(),
+            text: "first pending".into(),
+        });
+        app.apply(Update::SteerAccepted {
+            id: "second".into(),
+            text: "second pending".into(),
+        });
+
+        let frame = render(&mut app, 80, 18);
+        let first = frame.find("first pending").expect("first steer");
+        let second = frame.find("second pending").expect("second steer");
+        let input = frame.find("steer kit…").expect("steering input");
+        assert!(first < second && second < input, "{frame}");
+        assert_eq!(frame.matches("· pending").count(), 2, "{frame}");
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::User(_)))
+        );
+
+        app.apply(Update::UserMessage {
+            id: "first".into(),
+            text: "first pending".into(),
+            append: false,
+        });
+        let frame = render(&mut app, 80, 18);
+        assert_eq!(frame.matches("· pending").count(), 1, "{frame}");
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(matches!(app.blocks.last(), Some(Block::User(text)) if text == "first pending"));
     }
 
     #[test]
