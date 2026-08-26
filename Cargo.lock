@@ -2400,13 +2400,14 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.92"
+version = "0.1.93"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
  "a2a-protocol-types",
  "agent-client-protocol",
  "agent-client-protocol-http",
+ "agent-client-protocol-schema",
  "agentkit-acp",
  "agentkit-adapter-completions",
  "agentkit-compaction",
@@ -2458,6 +2459,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tower",
+ "tracing",
  "tracing-opentelemetry 0.33.0",
  "tracing-subscriber",
  "unicode-width",

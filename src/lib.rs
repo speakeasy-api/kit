@@ -9,6 +9,7 @@ mod fatal;
 pub mod plugins;
 pub mod protocols;
 pub mod provider;
+mod response_attempt;
 pub mod runtime;
 pub mod session;
 pub mod telemetry;

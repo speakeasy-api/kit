@@ -142,6 +142,7 @@ pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub additional_directories: Vec<PathBuf>,
     pub integration: Arc<I>,
     pub cancellation: CancellationHandle,
+    pub response_attempt_replacement: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -925,6 +926,10 @@ impl Runtime {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let canonical_transcript = opened.transcript.clone();
+        let mut session_config = SessionConfig::new(session_id.clone()).without_cache();
+        if context.response_attempt_replacement {
+            crate::response_attempt::enable(&mut session_config);
+        }
         let driver = Agent::builder()
             .model(adapter.clone())
             .telemetry(self.agentkit_telemetry())
@@ -942,7 +947,7 @@ impl Runtime {
             .cancellation(context.cancellation)
             .build()
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
-            .start(SessionConfig::new(session_id.clone()).without_cache())
+            .start(session_config)
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let driver = AcpDriver {

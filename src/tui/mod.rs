@@ -1529,8 +1529,8 @@ mod tests {
     use std::path::PathBuf;
 
     use agent_client_protocol::schema::v2::{
-        AvailableCommand, AvailableCommandsUpdate, ContentBlock, IdleStateUpdate,
-        RunningStateUpdate, SessionConfigOption, SessionConfigSelectGroup,
+        AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
+        IdleStateUpdate, RunningStateUpdate, SessionConfigOption, SessionConfigSelectGroup,
         SessionConfigSelectOption, SessionUpdate, StateUpdate, TextContent,
         UpdateSessionNotification, UserMessage,
     };
@@ -1611,6 +1611,29 @@ mod tests {
         assert!(matches!(
             translate_for_session(idle, "session").as_slice(),
             [Update::Stopped(None)]
+        ));
+    }
+
+    #[test]
+    fn translates_empty_agent_replacements_as_whole_message_patches() {
+        let message = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::AgentMessage(AgentMessage::new("message").content(Vec::new())),
+        );
+        assert!(matches!(
+            translate_for_session(message, "session").as_slice(),
+            [Update::AgentMessage { id, text, append: false }]
+                if id == "message" && text.is_empty()
+        ));
+
+        let thought = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::AgentThought(AgentThought::new("thought").content(Vec::new())),
+        );
+        assert!(matches!(
+            translate_for_session(thought, "session").as_slice(),
+            [Update::AgentThought { id, text, append: false }]
+                if id == "thought" && text.is_empty()
         ));
     }
 
