@@ -43,7 +43,7 @@ const MAX_PENDING_STEER_ROWS: usize = 3;
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
 
-type TranscriptTag = (Option<String>, Option<CodeHit>);
+type TranscriptTag = (Option<String>, Option<CodeHit>, Option<usize>);
 type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
@@ -355,7 +355,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     refresh_transcript_cache_with_images(app, images, width);
     let working_rows = if app.working() {
         wrap_linked_tagged(
-            &[(LinkedLine::plain(working_line(app)), (None, None))],
+            &[(LinkedLine::plain(working_line(app)), (None, None, None))],
             width,
         )
     } else {
@@ -385,7 +385,12 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     app.row_links.reserve(height);
     let mut visible = Vec::with_capacity(height);
     let end = offset.saturating_add(height);
-    let separator = (Line::default(), (None, None), Vec::new());
+    let separator = (
+        Line::default(),
+        (None, None, None),
+        Vec::new(),
+        String::new(),
+    );
     let mut visible_images: Vec<(usize, usize, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
         #[cfg(test)]
@@ -452,7 +457,9 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             materialize(row);
         }
     }
+    let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
     frame.render_widget(Paragraph::new(visible), inner);
+    draw_selection(frame, app, inner, offset, &row_widths);
     for (block_index, source_index, y) in visible_images {
         let Some(Block::User(message)) = app.blocks.get(block_index) else {
             continue;
@@ -474,6 +481,46 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                 .track_style(theme::faint()),
             bar_area,
             &mut state,
+        );
+    }
+}
+
+/// Restyles the cells a drag selected. The highlight hugs each row's text
+/// instead of running to the margin, so it shows exactly what a copy takes.
+fn draw_selection(
+    frame: &mut Frame<'_>,
+    app: &App,
+    inner: Rect,
+    offset: usize,
+    row_widths: &[usize],
+) {
+    let Some(selection) = app.selection else {
+        return;
+    };
+    let (start, end) = selection.ordered();
+    for (row_index, row_width) in row_widths.iter().copied().enumerate() {
+        let line = offset + row_index;
+        if line < start.0 || line > end.0 {
+            continue;
+        }
+        let from = if line == start.0 { start.1 } else { 0 };
+        let to = if line == end.0 {
+            (end.1 + 1).min(row_width)
+        } else {
+            row_width
+        };
+        let to = to.min(inner.width as usize);
+        if from >= to {
+            continue;
+        }
+        frame.buffer_mut().set_style(
+            Rect {
+                x: inner.x + from as u16,
+                y: inner.y + row_index as u16,
+                width: (to - from) as u16,
+                height: 1,
+            },
+            theme::selection(),
         );
     }
 }
@@ -512,13 +559,14 @@ fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'stati
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
 fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime, width: usize) {
-    if app.transcript_revisions.len() != app.blocks.len()
+    let structure_changed = app.transcript_revisions.len() != app.blocks.len()
         || app.transcript_cache.len() != app.blocks.len()
-        || app.transcript_prefixes.len() != app.blocks.len() + 1
-    {
+        || app.transcript_prefixes.len() != app.blocks.len() + 1;
+    if structure_changed {
         app.sync_transcript_cache();
     }
     let width_changed = app.transcript_cache_width != width;
+    let mut layout_changed = structure_changed || width_changed;
     if width_changed {
         app.transcript_cache_width = width;
         app.transcript_dirty.extend(0..app.blocks.len());
@@ -559,6 +607,7 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         };
         if missing || rows.len() != old_count {
             first_changed_count = first_changed_count.min(block_index);
+            layout_changed |= !missing;
         }
         app.transcript_cache[block_index] = Some(CachedTranscriptBlock {
             revision,
@@ -578,6 +627,9 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         app.transcript_prefixes[index + 1] =
             app.transcript_prefixes[index] + rows + usize::from(app.transcript_prefixes[index] > 0);
     }
+    if layout_changed {
+        app.clear_transcript_interaction();
+    }
 }
 
 #[cfg(test)]
@@ -595,7 +647,10 @@ fn user_block_rows(
     let mut placements = Vec::new();
     for (line_index, text) in message.text.split('\n').enumerate() {
         rows.extend(wrap_linked_tagged(
-            &[(user_line(text, line_index == 0), (None, None))],
+            &[(
+                user_line(text, line_index == 0),
+                (None, None, Some(line_index)),
+            )],
             width,
         ));
         if reserve_images {
@@ -606,9 +661,14 @@ fn user_block_rows(
                 .filter(|(_, image)| image.line == line_index)
             {
                 let row = rows.len();
-                rows.extend(
-                    (0..RESERVED_ROWS).map(|_| (Line::default(), (None, None), Vec::new())),
-                );
+                rows.extend((0..RESERVED_ROWS).map(|_| {
+                    (
+                        Line::default(),
+                        (None, None, None),
+                        Vec::new(),
+                        String::new(),
+                    )
+                }));
                 placements.push(CachedTranscriptImage { source, row });
             }
         }
@@ -671,12 +731,13 @@ fn transcript_block_lines(
     };
     block_lines
         .into_iter()
-        .map(|(line, code)| {
+        .enumerate()
+        .map(|(line_index, (line, code))| {
             let code = code.map(|range| CodeHit {
                 block: block_index,
                 range,
             });
-            (line, (call.clone(), code))
+            (line, (call.clone(), code, Some(line_index)))
         })
         .collect()
 }
@@ -1753,8 +1814,14 @@ mod tests {
             .position(|line| line.contains("  cargo check"))
             .expect("code row is on screen");
 
-        let action = app.handle_mouse(MouseEvent {
+        app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: u16::try_from(row).unwrap(),
+            modifiers: KeyModifiers::NONE,
+        });
+        let action = app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
             column: 5,
             row: u16::try_from(row).unwrap(),
             modifiers: KeyModifiers::NONE,
@@ -1789,15 +1856,156 @@ mod tests {
             .lines()
             .position(|line| line.contains("lines of output"))
             .expect("fold row is on screen");
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 6,
-            row: u16::try_from(row).unwrap(),
-            modifiers: KeyModifiers::NONE,
-        });
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column: 6,
+                row: u16::try_from(row).unwrap(),
+                modifiers: KeyModifiers::NONE,
+            });
+        }
         let frame = render(&mut app, 100, 24);
         println!("{frame}");
         assert!(frame.contains("output line 39"));
+    }
+
+    #[test]
+    fn selection_copy_rejoins_wrapped_lines_and_keeps_paragraphs() {
+        use crate::tui::app::Selection;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        let source = "alpha beta gamma delta epsilon zeta\n\nsecond paragraph";
+        app.blocks.push(Block::Agent(source.into()));
+        let frame = render(&mut app, 30, 24);
+        assert!(
+            frame.lines().any(|line| line.contains("alpha beta")),
+            "text should be on screen: {frame}"
+        );
+        assert!(
+            !frame.lines().any(|line| line.contains("delta epsilon")),
+            "paragraph should have wrapped: {frame}"
+        );
+
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (
+                app.total_lines.saturating_sub(1),
+                app.transcript_width.saturating_sub(1),
+            ),
+        });
+        assert_eq!(app.selection_text().as_deref(), Some(source));
+    }
+
+    #[test]
+    fn selection_copy_does_not_add_spaces_to_hard_wrapped_tokens() {
+        use crate::tui::app::Selection;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        let source = "abcdefghijklmnopqrstuvwxyz0123456789";
+        app.blocks.push(Block::Agent(source.into()));
+        let _ = render(&mut app, 20, 24);
+        assert!(app.total_lines > 1);
+
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (
+                app.total_lines.saturating_sub(1),
+                app.transcript_width.saturating_sub(1),
+            ),
+        });
+        assert_eq!(app.selection_text().as_deref(), Some(source));
+    }
+
+    #[test]
+    fn transcript_reflow_clears_display_coordinate_selection() {
+        use crate::tui::app::Selection;
+
+        let mut app = sample();
+        let _ = render(&mut app, 40, 24);
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (0, 2),
+        });
+
+        let _ = render(&mut app, 100, 24);
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn selection_copy_strips_the_code_display_indent() {
+        use crate::tui::app::Selection;
+
+        let mut app = sample();
+        let frame = render(&mut app, 100, 24);
+        let row = frame
+            .lines()
+            .position(|line| line.contains("  cargo check"))
+            .expect("code row is on screen");
+        let line = app.scroll + (row - app.transcript_top);
+        app.selection = Some(Selection {
+            anchor: (line, 0),
+            head: (line, app.transcript_width.saturating_sub(1)),
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("cargo check"));
+    }
+
+    #[test]
+    fn dragging_selects_and_ctrl_y_copies_instead_of_clicking() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let mut app = sample();
+        let frame = render(&mut app, 100, 24);
+        let row = frame
+            .lines()
+            .position(|line| line.contains("• one"))
+            .expect("bullet line is on screen");
+        let row = u16::try_from(row).unwrap();
+        let left = u16::try_from(app.transcript_left).unwrap();
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left + 2));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), left + 4));
+        let action = app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), left + 4));
+        assert!(
+            matches!(action, Action::None),
+            "releasing a drag must not click"
+        );
+        assert!(app.selection.is_some());
+
+        let action = app.handle_key(KeyEvent {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        let Action::Copy(text) = action else {
+            panic!("expected selection copy");
+        };
+        assert_eq!(text, "one");
+
+        // The next press clears the selection.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left));
+        assert!(app.selection.is_none());
     }
 
     #[test]

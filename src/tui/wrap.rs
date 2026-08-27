@@ -92,19 +92,21 @@ pub fn wrap_tagged<T: Clone>(
 }
 
 /// Wraps lines whose spans carry exact link identity, retaining that identity
-/// in the hit ranges for every display row produced.
+/// in the hit ranges for every display row produced. The final tuple field is
+/// source whitespace removed before that row, so copy can restore word wraps
+/// without inserting spaces into hard-wrapped tokens.
 pub fn wrap_linked_tagged<T: Clone>(
     lines: &[(LinkedLine, T)],
     width: usize,
-) -> Vec<(Line<'static>, T, Vec<LinkHit>)> {
+) -> Vec<(Line<'static>, T, Vec<LinkHit>, String)> {
     if width == 0 {
         return Vec::new();
     }
     let mut wrapped = Vec::with_capacity(lines.len());
     for (line, tag) in lines {
-        for row in wrap_linked_line(line, width) {
+        for (row, separator) in wrap_linked_line(line, width) {
             let (line, hits) = linked_flush(row);
-            wrapped.push((line, tag.clone(), hits));
+            wrapped.push((line, tag.clone(), hits, separator));
         }
     }
     wrapped
@@ -167,25 +169,30 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
 
 /// Takes the pending spans as a line, without the trailing space that the
 /// wrap point left behind.
-fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<Vec<LinkedSpan>> {
+fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, String)> {
     if line.width() <= width {
-        return vec![line.spans.clone()];
+        return vec![(line.spans.clone(), String::new())];
     }
     let indent = hanging_indent(&line.line()).min(width / 2);
     let mut lines = Vec::new();
     let mut spans = Vec::new();
+    let mut separator = String::new();
     let mut used = 0;
 
     for (chunk, style, url) in linked_chunks(line) {
         let chunk_width = chunk.width();
         let blank = chunk.trim().is_empty();
         if blank && spans.is_empty() && !lines.is_empty() {
+            separator.push_str(&chunk);
             continue;
         }
         if used + chunk_width > width && !spans.is_empty() {
-            trim_linked_and_push(&mut lines, &mut spans);
+            let before = std::mem::take(&mut separator);
+            let trailing = trim_linked_and_push(&mut lines, &mut spans, before);
+            separator.push_str(&trailing);
             used = 0;
             if blank {
+                separator.push_str(&chunk);
                 continue;
             }
             if indent > 0 {
@@ -215,7 +222,9 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<Vec<LinkedSpan>> {
             let character = character.to_string();
             let character_width = character.width();
             if used + character_width > width {
-                trim_linked_and_push(&mut lines, &mut spans);
+                let before = std::mem::take(&mut separator);
+                let trailing = trim_linked_and_push(&mut lines, &mut spans, before);
+                separator.push_str(&trailing);
                 used = indent;
                 if indent > 0 {
                     spans.push(LinkedSpan {
@@ -232,19 +241,26 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<Vec<LinkedSpan>> {
         }
     }
     if !spans.is_empty() {
-        trim_linked_and_push(&mut lines, &mut spans);
+        trim_linked_and_push(&mut lines, &mut spans, separator);
     }
     lines
 }
 
-fn trim_linked_and_push(lines: &mut Vec<Vec<LinkedSpan>>, spans: &mut Vec<LinkedSpan>) {
+fn trim_linked_and_push(
+    lines: &mut Vec<(Vec<LinkedSpan>, String)>,
+    spans: &mut Vec<LinkedSpan>,
+    separator: String,
+) -> String {
+    let mut trailing = Vec::new();
     while spans
         .last()
         .is_some_and(|span| span.span.content.trim().is_empty())
     {
-        spans.pop();
+        trailing.push(spans.pop().expect("the final span exists").span.content);
     }
-    lines.push(std::mem::take(spans));
+    trailing.reverse();
+    lines.push((std::mem::take(spans), separator));
+    trailing.concat()
 }
 
 fn linked_flush(spans: Vec<LinkedSpan>) -> (Line<'static>, Vec<LinkHit>) {
@@ -373,7 +389,7 @@ mod tests {
         let linked = wrap_linked_tagged(&[(LinkedLine::plain(line), ())], 10);
         let linked_lines = linked
             .into_iter()
-            .map(|(line, (), _)| line)
+            .map(|(line, (), _, _)| line)
             .collect::<Vec<_>>();
         assert_eq!(text(&linked_lines), ["  alpha", "  beta", "  gamma"]);
     }

@@ -148,11 +148,35 @@ pub struct CodeHit {
     pub range: Range<usize>,
 }
 
+/// A display row's tags: owning tool call, fenced-code content, the logical
+/// source line it was wrapped from, and source whitespace removed before this
+/// row. The latter lets copy distinguish word wraps from hard token wraps.
 pub(super) type CachedTranscriptRow = (
     Line<'static>,
-    (Option<String>, Option<CodeHit>),
+    (Option<String>, Option<CodeHit>, Option<usize>),
     Vec<LinkHit>,
+    String,
 );
+
+/// A drag selection over the transcript, in absolute display-line coordinates
+/// so it stays anchored to content while the transcript scrolls. Both cells
+/// are inclusive; `anchor` is where the drag began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl Selection {
+    /// The selection's cells in reading order, both ends inclusive.
+    pub fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
 
 /// What the event loop should do after a key press.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,6 +536,10 @@ pub struct App {
     pub transcript_top: usize,
     pub transcript_left: usize,
     pub transcript_width: usize,
+    pub selection: Option<Selection>,
+    /// Pending left press; the flag suppresses a release-click when this press
+    /// dismissed an older selection, while still allowing it to start a drag.
+    press: Option<(usize, usize, bool)>,
     pub toast: Option<(String, Instant)>,
     /// When the last key arrived, for telling a paste from typing.
     pub last_key: Option<Instant>,
@@ -766,6 +794,8 @@ impl App {
             transcript_top: 0,
             transcript_left: 0,
             transcript_width: 0,
+            selection: None,
+            press: None,
             toast: None,
             last_key: None,
         }
@@ -1627,6 +1657,8 @@ impl App {
         self.row_calls.clear();
         self.row_links.clear();
         self.row_code.clear();
+        self.selection = None;
+        self.press = None;
     }
 
     #[cfg(test)]
@@ -1668,13 +1700,21 @@ impl App {
     }
 
     pub fn scroll_by(&mut self, lines: isize) {
+        self.press = None;
         let top = self.total_lines.saturating_sub(self.viewport);
         let current = self.scroll.min(top);
         self.scroll = current.saturating_add_signed(lines).min(top);
         self.follow = self.scroll >= top;
     }
 
+    fn scroll_to_top(&mut self) {
+        self.press = None;
+        self.follow = false;
+        self.scroll = 0;
+    }
+
     pub fn scroll_to_bottom(&mut self) {
+        self.press = None;
         self.follow = true;
         self.scroll = usize::MAX;
     }
@@ -1949,6 +1989,10 @@ impl App {
             }
             KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
             KeyCode::Char('y') if control => {
+                if let Some(text) = self.selection_text() {
+                    self.toast("copied selection");
+                    return Action::Copy(text);
+                }
                 let Some(text) = self.latest_agent_text() else {
                     self.toast("no agent response to copy");
                     return Action::None;
@@ -2099,7 +2143,7 @@ impl App {
                     self.editor.history_next();
                 }
             }
-            KeyCode::Home if control => self.scroll = 0,
+            KeyCode::Home if control => self.scroll_to_top(),
             KeyCode::End if control => self.scroll_to_bottom(),
             KeyCode::Home => self.editor.move_line_start(),
             KeyCode::End => self.editor.move_line_end(),
@@ -2141,11 +2185,68 @@ impl App {
                 return Action::Redraw;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                return self.click(mouse.column as usize, mouse.row as usize);
+                let dismissed = self.selection.take().is_some();
+                self.press = Some((mouse.column as usize, mouse.row as usize, dismissed));
+                if dismissed {
+                    return Action::Redraw;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some((column, row, _)) = self.press else {
+                    return Action::None;
+                };
+                let Some(anchor) = self.transcript_position(column, row) else {
+                    return Action::None;
+                };
+                let head =
+                    self.transcript_position_clamped(mouse.column as usize, mouse.row as usize);
+                self.selection = Some(Selection { anchor, head });
+                return Action::Redraw;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let press = self.press.take();
+                // A drag that produced a selection is not a click.
+                if self.selection.is_some() {
+                    return Action::None;
+                }
+                if let Some((column, row, false)) = press {
+                    return self.click(column, row);
+                }
             }
             _ => {}
         }
         Action::None
+    }
+
+    pub(super) fn clear_transcript_interaction(&mut self) {
+        self.selection = None;
+        self.press = None;
+    }
+
+    /// Maps a screen cell to (absolute transcript line, column), if it is
+    /// inside the transcript area.
+    fn transcript_position(&self, column: usize, row: usize) -> Option<(usize, usize)> {
+        if self.scroll == usize::MAX || self.viewport == 0 {
+            return None;
+        }
+        let offset = row.checked_sub(self.transcript_top)?;
+        let inside = offset < self.viewport
+            && column >= self.transcript_left
+            && column < self.transcript_left + self.transcript_width;
+        inside.then(|| (self.scroll + offset, column - self.transcript_left))
+    }
+
+    /// Like [`Self::transcript_position`], but clamps a cell outside the
+    /// transcript to its nearest edge so a drag can leave the area.
+    fn transcript_position_clamped(&self, column: usize, row: usize) -> (usize, usize) {
+        let last_row = self.transcript_top + self.viewport.saturating_sub(1);
+        let row = row.clamp(self.transcript_top, last_row);
+        let last_column = self.transcript_left + self.transcript_width.saturating_sub(1);
+        let column = column.clamp(self.transcript_left, last_column);
+        (
+            self.scroll + (row - self.transcript_top),
+            column - self.transcript_left,
+        )
     }
 
     /// Copies code, opens links, or folds tool output at the clicked row.
@@ -2199,6 +2300,95 @@ impl App {
             .find(|link| column >= link.start && column < link.end)
             .map(|link| link.url.clone())
     }
+
+    /// The cached row behind an absolute transcript line. `None` covers the
+    /// separator rows between blocks and lines outside the cache.
+    fn transcript_row(&self, line: usize) -> Option<(usize, &CachedTranscriptRow)> {
+        let total = self.transcript_prefixes.last().copied()?;
+        if line >= total || self.blocks.is_empty() {
+            return None;
+        }
+        let block = self
+            .transcript_prefixes
+            .partition_point(|prefix| *prefix <= line)
+            .saturating_sub(1)
+            .min(self.blocks.len() - 1);
+        let span_start = self.transcript_prefixes[block];
+        let content_start = span_start + usize::from(span_start > 0);
+        let row = line.checked_sub(content_start)?;
+        self.transcript_cache
+            .get(block)?
+            .as_ref()?
+            .rows
+            .get(row)
+            .map(|cached| (block, cached))
+    }
+
+    /// The selected text, reconstructed from the rendered rows: rows wrapped
+    /// from one logical line rejoin, trailing padding is dropped, and fenced
+    /// code loses the two-column display indent it is drawn with.
+    pub fn selection_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (start, end) = selection.ordered();
+        let mut lines: Vec<String> = Vec::new();
+        let mut last_logical: Option<(usize, usize)> = None;
+        for line in start.0..=end.0 {
+            let Some((block, row)) = self.transcript_row(line) else {
+                lines.push(String::new());
+                last_logical = None;
+                continue;
+            };
+            let text: String = row
+                .0
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let from = if line == start.0 { start.1 } else { 0 };
+            let to = if line == end.0 { end.1 + 1 } else { usize::MAX };
+            let mut fragment = column_slice(&text, from, to).trim_end().to_string();
+            if row.1.1.is_some() && from == 0 && fragment.starts_with("  ") {
+                fragment.drain(..2);
+            }
+            let logical = row.1.2.map(|index| (block, index));
+            match (logical, last_logical) {
+                (Some(current), Some(previous)) if current == previous => {
+                    let joined = lines.last_mut().expect("a wrapped row follows its first");
+                    let fragment = fragment.trim_start();
+                    if !fragment.is_empty() {
+                        joined.push_str(&row.3);
+                        joined.push_str(fragment);
+                    }
+                }
+                _ => lines.push(fragment),
+            }
+            last_logical = logical;
+        }
+        let text = lines.join("\n");
+        let text = text.trim_matches('\n');
+        (!text.trim().is_empty()).then(|| text.to_string())
+    }
+}
+
+/// The substring of `text` covering display columns `[from, to)`.
+fn column_slice(text: &str, from: usize, to: usize) -> &str {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut column = 0;
+    let mut start = None;
+    let mut end = text.len();
+    for (index, character) in text.char_indices() {
+        let width = character.width().unwrap_or(0);
+        if width > 0 && column >= to {
+            end = index;
+            break;
+        }
+        if start.is_none() && column + width > from {
+            start = Some(index);
+        }
+        column += width;
+    }
+    start.and_then(|start| text.get(start..end)).unwrap_or("")
 }
 
 #[cfg(target_os = "macos")]
@@ -2246,7 +2436,9 @@ mod tests {
 
     use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
     use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     use super::{
         Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
@@ -2265,6 +2457,67 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn column_slice_includes_a_selected_wide_character_and_its_combining_marks() {
+        assert_eq!(super::column_slice("界a", 1, 2), "界");
+        assert_eq!(super::column_slice("e\u{301}x", 0, 1), "e\u{301}");
+    }
+
+    #[test]
+    fn scrolling_or_dismissing_a_selection_cancels_a_pending_mouse_press() {
+        let mut app = app();
+        app.total_lines = 20;
+        app.viewport = 5;
+        app.follow = false;
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(down);
+        assert!(app.press.is_some());
+        app.scroll_by(1);
+        assert!(app.press.is_none());
+
+        app.handle_mouse(down);
+        app.scroll_to_bottom();
+        assert!(app.press.is_none());
+
+        app.handle_mouse(down);
+        app.scroll_to_top();
+        assert!(app.press.is_none());
+
+        app.transcript_width = 10;
+        app.selection = Some(super::Selection {
+            anchor: (0, 0),
+            head: (0, 1),
+        });
+        assert!(matches!(app.handle_mouse(down), Action::Redraw));
+        assert!(app.selection.is_none());
+        assert!(app.press.is_some());
+
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 3,
+                ..down
+            }),
+            Action::Redraw
+        ));
+        assert!(app.selection.is_some());
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 3,
+                ..down
+            }),
+            Action::None
+        ));
+        assert!(app.press.is_none());
     }
 
     fn app() -> App {
