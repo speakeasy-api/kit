@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.95"
+version = "0.1.96"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -85,6 +85,7 @@ windows-sys = { version = "=0.61.2", features = [
 [dev-dependencies]
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 tempfile = "=3.27.0"
+tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
 agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597" }

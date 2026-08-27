@@ -40,9 +40,12 @@ const MAX_FIELD_BYTES: usize = 1024 * 1024;
 const MAX_ITEMS: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_RETRIES: usize = 25;
-const RETRY_BUDGET: Duration = Duration::from_secs(10 * 60);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const RETRY_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(10 * 60);
+const RATE_LIMIT_RESET_GRACE: Duration = Duration::from_secs(10 * 60);
+const MAX_RETRY_HINT: Duration = RATE_LIMIT_MAX_WAIT;
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROVIDER_REQUEST_DIGEST: &str = "kit.model_call.request_digest";
 const PROVIDER_FINISH_REASONS_METADATA: &str = "agentkit.provider_finish_reasons";
 const GENERATED_IMAGE_METADATA: &str = "openai.subscription.generated_image.v1";
@@ -197,6 +200,7 @@ struct OpenAiSubscriptionRequestContext {
     body_bytes: Zeroizing<Vec<u8>>,
     idempotency_key: String,
     started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
     retries: usize,
     credentials: auth::TokenRecord,
     unauthorized: bool,
@@ -249,6 +253,7 @@ impl ModelSession for OpenAiSubscriptionSession {
             body_bytes,
             idempotency_key,
             started,
+            deadline: started + RETRY_BUDGET,
             retries: 0,
             credentials,
             unauthorized: false,
@@ -267,6 +272,9 @@ impl ModelSession for OpenAiSubscriptionSession {
                 .transpose()?;
             let response_request_id = crate::fatal::safe_response_request_id(response.headers());
             let wire_bytes = context.wire_bytes;
+            let attempt_deadline = context
+                .deadline
+                .min(tokio::time::Instant::now() + ATTEMPT_TIMEOUT);
             let mut turn = OpenAiSubscriptionTurn::new_inner(
                 response.bytes_stream(),
                 OpenAiSubscriptionTurnInit {
@@ -290,26 +298,17 @@ impl ModelSession for OpenAiSubscriptionSession {
                 },
             );
             let first_event = tokio::time::timeout_at(
-                started + RETRY_BUDGET,
+                attempt_deadline,
                 turn.next_event_inner(cancellation.clone()),
             )
-            .await
-            .map_err(|_| {
-                retry_exhausted(
-                    LoopError::Provider(
-                        "openai-subscription response exceeded retry budget".into(),
-                    ),
-                    turn.attempt,
-                    started.elapsed(),
-                )
-            })?;
-            match first_event {
-                Ok(Some(event)) => {
+            .await;
+            let (error, retry_after) = match first_event {
+                Ok(Ok(Some(event))) => {
                     turn.queued.push_front(event);
                     return Ok(turn);
                 }
-                Ok(None) => return Ok(turn),
-                Err(error) => {
+                Ok(Ok(None)) => return Ok(turn),
+                Ok(Err(error)) => {
                     let retry_after = turn
                         .pending_failure
                         .as_ref()
@@ -319,22 +318,31 @@ impl ModelSession for OpenAiSubscriptionSession {
                     let Some(retry_after) = retry_after else {
                         return Err(error);
                     };
-                    context = turn
-                        .request_context
-                        .take()
-                        .ok_or_else(|| protocol("stream retry context is unavailable"))?;
-                    context.wire_bytes = turn.wire_bytes;
-                    if let Some(turn_state) = turn.turn_state.as_deref() {
-                        context.turn_state = Some(turn_state.parse().map_err(|_| {
-                            protocol("validated x-codex-turn-state became invalid")
-                        })?);
-                        context.turn_state_from_header = turn.turn_state_from_header;
-                    }
-                    context
-                        .retry_response_failure(error, retry_after, cancellation.clone())
-                        .await?;
+                    (error, retry_after)
                 }
+                Err(_) => (
+                    LoopError::Provider(
+                        "openai-subscription timed out before the first event".into(),
+                    ),
+                    None,
+                ),
+            };
+            context = turn
+                .request_context
+                .take()
+                .ok_or_else(|| protocol("stream retry context is unavailable"))?;
+            context.wire_bytes = turn.wire_bytes;
+            if let Some(turn_state) = turn.turn_state.as_deref() {
+                context.turn_state = Some(
+                    turn_state
+                        .parse()
+                        .map_err(|_| protocol("validated x-codex-turn-state became invalid"))?,
+                );
+                context.turn_state_from_header = turn.turn_state_from_header;
             }
+            context
+                .retry_response_failure(error, RetryDelay::Hint(retry_after), cancellation.clone())
+                .await?;
         }
     }
 
@@ -366,7 +374,7 @@ impl OpenAiSubscriptionSession {
             ));
         }
         tokio::time::timeout_at(
-            started + RETRY_BUDGET,
+            (started + RETRY_BUDGET).min(tokio::time::Instant::now() + ATTEMPT_TIMEOUT),
             self.credentials(rejected, cancellation),
         )
         .await
@@ -420,18 +428,18 @@ impl OpenAiSubscriptionRequestContext {
         rejected: Option<auth::TokenRecord>,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<auth::TokenRecord, LoopError> {
-        let elapsed = self.started.elapsed();
-        if elapsed >= RETRY_BUDGET {
+        let now = tokio::time::Instant::now();
+        if now >= self.deadline {
             return Err(retry_exhausted(
                 LoopError::Provider(
                     "openai-subscription credential lookup exceeded retry budget".into(),
                 ),
                 self.retries.saturating_add(1),
-                elapsed,
+                self.started.elapsed(),
             ));
         }
         tokio::time::timeout_at(
-            self.started + RETRY_BUDGET,
+            self.deadline.min(now + ATTEMPT_TIMEOUT),
             self.credentials(rejected, cancellation),
         )
         .await
@@ -449,14 +457,15 @@ impl OpenAiSubscriptionRequestContext {
     async fn retry_response_failure(
         &mut self,
         error: LoopError,
-        retry_after: Option<Duration>,
+        delay: RetryDelay,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<(), LoopError> {
         retry_failure(
             error,
-            retry_after,
+            delay,
             &mut self.retries,
             self.started,
+            &mut self.deadline,
             &self.idempotency_key,
             cancellation.clone(),
         )
@@ -470,12 +479,12 @@ impl OpenAiSubscriptionRequestContext {
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<reqwest::Response, LoopError> {
         loop {
-            let elapsed = self.started.elapsed();
-            if elapsed >= RETRY_BUDGET {
+            let now = tokio::time::Instant::now();
+            if now >= self.deadline {
                 return Err(retry_exhausted(
                     LoopError::Provider("openai-subscription retry budget exhausted".into()),
                     self.retries.saturating_add(1),
-                    elapsed,
+                    self.started.elapsed(),
                 ));
             }
             self.ensure_binding(&self.credentials)?;
@@ -495,7 +504,7 @@ impl OpenAiSubscriptionRequestContext {
                 builder = builder.header(X_CODEX_TURN_STATE, value);
             }
             let send = tokio::time::timeout_at(
-                self.started + RETRY_BUDGET,
+                self.deadline.min(now + ATTEMPT_TIMEOUT),
                 builder.body(self.body_bytes.to_vec()).send(),
             );
             let response = if let Some(cancel) = cancellation.clone() {
@@ -509,13 +518,13 @@ impl OpenAiSubscriptionRequestContext {
             };
             let response = match response {
                 Err(_) => {
-                    return Err(retry_exhausted(
-                        LoopError::Provider(
-                            "openai-subscription request exceeded retry budget".into(),
-                        ),
-                        self.retries.saturating_add(1),
-                        self.started.elapsed(),
-                    ));
+                    self.retry_response_failure(
+                        LoopError::Provider("openai-subscription request timed out".into()),
+                        RetryDelay::Hint(None),
+                        cancellation.clone(),
+                    )
+                    .await?;
+                    continue;
                 }
                 Ok(Ok(response)) => response,
                 Ok(Err(error))
@@ -529,7 +538,7 @@ impl OpenAiSubscriptionRequestContext {
                             self.retries.saturating_add(1),
                             None,
                         ),
-                        None,
+                        RetryDelay::Hint(None),
                         cancellation.clone(),
                     )
                     .await?;
@@ -546,14 +555,13 @@ impl OpenAiSubscriptionRequestContext {
                 }
             };
             if response.status() == reqwest::StatusCode::UNAUTHORIZED && !self.unauthorized {
-                let elapsed = self.started.elapsed();
-                if self.retries >= MAX_RETRIES || elapsed >= RETRY_BUDGET {
+                if tokio::time::Instant::now() >= self.deadline {
                     return Err(retry_exhausted(
                         LoopError::Provider(
                             "openai-subscription unauthorized before credential refresh".into(),
                         ),
                         self.retries.saturating_add(1),
-                        elapsed,
+                        self.started.elapsed(),
                     ));
                 }
                 self.retries += 1;
@@ -567,7 +575,13 @@ impl OpenAiSubscriptionRequestContext {
             }
             if retriable_http_status(response.status()) {
                 let status = response.status();
-                let delay = retry_after(response.headers());
+                let reset = (status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+                    .then(|| rate_limit_reset(response.headers()))
+                    .flatten();
+                let delay = match reset {
+                    Some(reset) => RetryDelay::RateLimitReset(reset),
+                    None => RetryDelay::Hint(retry_after(response.headers())),
+                };
                 self.retry_response_failure(
                     LoopError::Provider(format!(
                         "openai-subscription returned retryable HTTP {status}"
@@ -585,12 +599,12 @@ impl OpenAiSubscriptionRequestContext {
                 ));
             }
             if !status.is_success() {
-                let elapsed = self.started.elapsed();
-                let detail = if elapsed < RETRY_BUDGET {
+                let now = tokio::time::Instant::now();
+                let detail = if now < self.deadline {
                     failure_body_excerpt(
                         response,
                         cancellation.clone(),
-                        self.started + RETRY_BUDGET,
+                        self.deadline.min(now + ATTEMPT_TIMEOUT),
                     )
                     .await?
                 } else {
@@ -949,43 +963,49 @@ impl OpenAiSubscriptionTurn {
             .pending_reopen
             .take()
             .ok_or_else(|| protocol("stream retry action is unavailable"))?;
-        let mut context = self
-            .request_context
-            .take()
-            .ok_or_else(|| protocol("stream retry context is unavailable"))?;
         self.retryable_transport_failure = false;
-        context.wire_bytes = self.wire_bytes;
-        if let Some(turn_state) = self.turn_state.as_deref() {
-            context.turn_state = Some(
-                turn_state
-                    .parse()
-                    .map_err(|_| protocol("validated x-codex-turn-state became invalid"))?,
-            );
+        let parsed_turn_state = self
+            .turn_state
+            .as_deref()
+            .map(|value| {
+                value
+                    .parse::<reqwest::header::HeaderValue>()
+                    .map_err(|_| protocol("validated x-codex-turn-state became invalid"))
+            })
+            .transpose()?;
+        let wire_bytes = self.wire_bytes;
+        let context = self
+            .request_context
+            .as_mut()
+            .ok_or_else(|| protocol("stream retry context is unavailable"))?;
+        context.wire_bytes = wire_bytes;
+        if let Some(turn_state) = parsed_turn_state {
+            context.turn_state = Some(turn_state);
         }
         context
-            .retry_response_failure(error, retry_after, cancellation.clone())
+            .retry_response_failure(error, RetryDelay::Hint(retry_after), cancellation.clone())
             .await?;
         let response = context.send_response(cancellation).await?;
-        let header_model = response
-            .headers()
-            .get("openai-model")
-            .map(validated_model_header)
-            .transpose()?;
+        let attempt = context.retries.saturating_add(1);
         let turn_state = context
             .turn_state
             .as_ref()
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let turn_state_from_header = context.turn_state_from_header;
+        let header_model = response
+            .headers()
+            .get("openai-model")
+            .map(validated_model_header)
+            .transpose()?;
         let response_request_id = crate::fatal::safe_response_request_id(response.headers());
         self.reset_attempt_state();
         self.header_model = header_model;
         self.turn_state_from_header = turn_state_from_header;
         self.turn_state = turn_state;
-        self.attempt = context.retries.saturating_add(1);
+        self.attempt = attempt;
         self.response_request_id = response_request_id;
         self.stream = Box::pin(response.bytes_stream());
-        self.request_context = Some(context);
         Ok(())
     }
 
@@ -2432,7 +2452,7 @@ fn classify_provider_error(
                 .as_u64()
                 .or_else(|| value.as_str()?.parse::<u64>().ok())
         })
-        .map(|seconds| Duration::from_secs(seconds).min(RETRY_BUDGET));
+        .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_HINT));
     let authentication = status.is_some_and(|status| status == 401 || status == 403)
         || [code, error_type].iter().any(|value| {
             matches!(
@@ -2449,38 +2469,26 @@ fn classify_provider_error(
             400 | 402 | 403 | 404 | 405 | 406 | 410 | 413 | 415 | 422 | 501 | 505
         )
     }) || [code, error_type].iter().any(|value| {
-        matches!(
-            *value,
-            "account_deactivated"
-                | "billing_hard_limit_reached"
-                | "content_policy_violation"
-                | "insufficient_credits"
-                | "insufficient_quota"
-                | "invalid_request_error"
-                | "model_not_found"
-                | "permission_denied"
-        )
-    });
-    let retriable_by_code = [code, error_type].iter().any(|value| {
-        matches!(
-            *value,
-            "rate_limit_exceeded"
-                | "rate_limit_error"
-                | "rate_limited"
-                | "overloaded"
-                | "server_overloaded"
-                | "server_error"
-                | "internal_error"
-                | "service_unavailable"
-                | "request_timeout"
-                | "timeout"
-        )
+        [
+            "billing",
+            "content_policy",
+            "deactivated",
+            "insufficient",
+            "invalid",
+            "not_found",
+            "not_supported",
+            "permission",
+            "quota",
+            "unsupported",
+        ]
+        .iter()
+        .any(|marker| value.contains(marker))
     });
     let retriable = !authentication
         && !permanent
         && match status {
             Some(status) => retriable_status_code(status),
-            None => retriable_by_code,
+            None => true,
         };
     let message = if authentication {
         "openai-subscription authentication failed after inference acceptance".to_owned()
@@ -2789,6 +2797,12 @@ fn validated_model_header(value: &reqwest::header::HeaderValue) -> Result<String
         .ok_or_else(|| protocol("OpenAI-Model response header is outside canonical bounds"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryDelay {
+    Hint(Option<Duration>),
+    RateLimitReset(Duration),
+}
+
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let seconds = value.parse::<u64>().ok().or_else(|| {
@@ -2798,7 +2812,68 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
             .ok()
             .map(|duration| duration.as_secs())
     })?;
-    Some(Duration::from_secs(seconds).min(RETRY_BUDGET))
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_HINT))
+}
+
+fn rate_limit_reset(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with("x-ratelimit-reset"))
+        .filter_map(|(_, value)| parse_rate_limit_reset(value.to_str().ok()?))
+        .max()
+        .map(|reset| reset.min(RETRY_BUDGET))
+}
+
+fn parse_rate_limit_reset(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(number) = value.parse::<f64>() {
+        if !number.is_finite() || number < 0.0 {
+            return None;
+        }
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        let seconds = if number >= 1e12 {
+            number / 1000.0 - unix_now
+        } else if number >= 1e9 {
+            number - unix_now
+        } else {
+            number
+        };
+        return duration_from_secs(seconds.max(0.0));
+    }
+    parse_unit_duration(value)
+}
+
+fn duration_from_secs(seconds: f64) -> Option<Duration> {
+    (seconds.is_finite() && seconds >= 0.0)
+        .then(|| Duration::from_secs_f64(seconds.min(RETRY_BUDGET.as_secs_f64())))
+}
+
+fn parse_unit_duration(value: &str) -> Option<Duration> {
+    let mut total = Duration::ZERO;
+    let mut rest = value;
+    while !rest.is_empty() {
+        let number_len = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .filter(|len| *len > 0)?;
+        let number = rest[..number_len].parse::<f64>().ok()?;
+        rest = &rest[number_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let seconds = match &rest[..unit_len] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 0.001,
+            _ => return None,
+        };
+        total = total.saturating_add(duration_from_secs(number * seconds)?);
+        rest = &rest[unit_len..];
+    }
+    (!value.is_empty()).then_some(total)
 }
 
 fn retry_backoff(idempotency_key: &str, retry_number: usize) -> Duration {
@@ -2828,25 +2903,31 @@ fn retry_exhausted(error: LoopError, attempts: usize, elapsed: Duration) -> Loop
 
 async fn retry_failure(
     error: LoopError,
-    retry_after: Option<Duration>,
+    delay: RetryDelay,
     retries: &mut usize,
     started: tokio::time::Instant,
+    deadline: &mut tokio::time::Instant,
     idempotency_key: &str,
     cancellation: Option<agentkit_core::TurnCancellation>,
 ) -> Result<(), LoopError> {
-    let elapsed = started.elapsed();
-    let attempts = retries.saturating_add(1);
-    if *retries >= MAX_RETRIES || elapsed >= RETRY_BUDGET {
-        return Err(retry_exhausted(error, attempts, elapsed));
+    let now = tokio::time::Instant::now();
+    if let RetryDelay::RateLimitReset(reset) = delay {
+        *deadline = (now + reset + RATE_LIMIT_RESET_GRACE).min(started + RETRY_BUDGET);
     }
-    let retry_number = retries.saturating_add(1);
-    let delay =
-        retry_backoff(idempotency_key, retry_number).max(retry_after.unwrap_or(Duration::ZERO));
-    if delay >= RETRY_BUDGET.saturating_sub(elapsed) {
-        return Err(retry_exhausted(error, attempts, elapsed));
+    let attempts = retries.saturating_add(1);
+    if now >= *deadline {
+        return Err(retry_exhausted(error, attempts, started.elapsed()));
+    }
+    let jitter = retry_backoff(idempotency_key, attempts);
+    let wait = match delay {
+        RetryDelay::Hint(hint) => jitter.max(hint.unwrap_or(Duration::ZERO).min(MAX_RETRY_HINT)),
+        RetryDelay::RateLimitReset(reset) => jitter.max(reset).min(RATE_LIMIT_MAX_WAIT),
+    };
+    if now + wait >= *deadline {
+        return Err(retry_exhausted(error, attempts, started.elapsed()));
     }
     *retries += 1;
-    sleep_before_retry(Some(delay), cancellation).await
+    sleep_before_retry(Some(wait), cancellation).await
 }
 
 fn retriable_transport_error(stage: crate::fatal::TransportStage, error: &reqwest::Error) -> bool {
@@ -2997,12 +3078,13 @@ mod usage_tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
-        CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRIES,
-        MAX_RETRY_BACKOFF, MAX_STREAM_BYTES, MAX_WIRE_BYTES, OpenAiSubscriptionSession,
+        CONTINUATION_METADATA, ContinuationContext, GENERATED_IMAGE_METADATA, MAX_RETRY_BACKOFF,
+        MAX_RETRY_HINT, MAX_STREAM_BYTES, MAX_WIRE_BYTES, OpenAiSubscriptionSession,
         OpenAiSubscriptionTurn, OpenAiSubscriptionTurnInit, PROVIDER_FINISH_REASONS_METADATA,
-        RETRY_BUDGET, ResponseFailure, SubscriptionConfig, X_CODEX_TURN_STATE,
-        classify_response_failure, classify_top_level_error, map_item, parse_context_windows,
-        parse_usage, request_body, retriable_http_status, retriable_status_code,
+        RATE_LIMIT_MAX_WAIT, RATE_LIMIT_RESET_GRACE, RETRY_BUDGET, ResponseFailure, RetryDelay,
+        SubscriptionConfig, X_CODEX_TURN_STATE, classify_response_failure,
+        classify_top_level_error, map_item, parse_context_windows, parse_rate_limit_reset,
+        parse_usage, rate_limit_reset, request_body, retriable_http_status, retriable_status_code,
         retriable_transport_error, retry_backoff, retry_failure, set_provider_finish_reasons,
         sleep_before_retry, tool_output, zeroizing_extend,
     };
@@ -3760,7 +3842,7 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
 
     #[test]
     fn retry_backoff_is_deterministic_and_bounded() {
-        for retry in 1..=MAX_RETRIES {
+        for retry in 1..=40 {
             let delay = retry_backoff("stable-idempotency-key", retry);
             let exponent = retry.saturating_sub(1).min(5) as u32;
             let cap = Duration::from_secs(1_u64 << exponent).min(MAX_RETRY_BACKOFF);
@@ -3774,13 +3856,16 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
     }
 
     #[tokio::test]
-    async fn retry_budget_stops_after_twenty_five_retries() {
-        let mut retries = MAX_RETRIES;
+    async fn retry_budget_stops_at_the_deadline() {
+        let started = tokio::time::Instant::now();
+        let mut deadline = started;
+        let mut retries = 25;
         let error = retry_failure(
             LoopError::Provider("transient".into()),
-            None,
+            RetryDelay::Hint(None),
             &mut retries,
-            tokio::time::Instant::now(),
+            started,
+            &mut deadline,
             "key",
             None,
         )
@@ -3789,6 +3874,56 @@ data: {"type":"response.future.delta","sequence_number":3,"delta":"ignored"}
         .to_string();
 
         assert!(error.contains("after 26 attempts"), "{error}");
+        assert_eq!(retries, 25);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_reset_extends_the_deadline_and_caps_the_wait() {
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut deadline = started;
+        let mut retries = 0;
+        let reset = Duration::from_secs(3600);
+        retry_failure(
+            LoopError::Provider("rate limited".into()),
+            RetryDelay::RateLimitReset(reset),
+            &mut retries,
+            started,
+            &mut deadline,
+            "key",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deadline, started + reset + RATE_LIMIT_RESET_GRACE);
+        assert_eq!(retries, 1);
+        let waited = started.elapsed();
+        assert!(
+            waited >= RATE_LIMIT_MAX_WAIT && waited < RATE_LIMIT_MAX_WAIT + Duration::from_secs(1),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_reset_never_extends_past_the_retry_budget() {
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut deadline = started + RETRY_BUDGET;
+        let mut retries = 0;
+        retry_failure(
+            LoopError::Provider("rate limited".into()),
+            RetryDelay::RateLimitReset(RETRY_BUDGET * 2),
+            &mut retries,
+            started,
+            &mut deadline,
+            "key",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deadline, started + RETRY_BUDGET);
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -4490,7 +4625,7 @@ data: {"# ,
         }));
 
         assert!(failure.retriable);
-        assert_eq!(failure.retry_after, Some(RETRY_BUDGET));
+        assert_eq!(failure.retry_after, Some(MAX_RETRY_HINT));
         assert_eq!(
             failure.message,
             "openai-subscription transient response failed: error/server_error"
@@ -4536,6 +4671,64 @@ data: {"# ,
             }));
             assert!(!failure.retriable, "status={status} code={code}");
         }
+    }
+
+    #[test]
+    fn statusless_unknown_codes_default_to_retriable() {
+        for (error_type, code) in [
+            ("service_unavailable_error", "server_is_overloaded"),
+            ("brand_new_error", "never_seen_before"),
+        ] {
+            let failure = classify_response_failure(&json!({
+                "type": "response.failed",
+                "response": {"error": {"type": error_type, "code": code}}
+            }));
+            assert!(failure.retriable, "{error_type}/{code}");
+        }
+
+        for (error_type, code) in [
+            ("invalid_request_error", "invalid_prompt"),
+            ("quota_error", "quota_exceeded"),
+            ("request_error", "model_not_found"),
+            ("authentication_error", "expired"),
+        ] {
+            let failure = classify_response_failure(&json!({
+                "type": "response.failed",
+                "response": {"error": {"type": error_type, "code": code}}
+            }));
+            assert!(!failure.retriable, "{error_type}/{code}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_reset_headers_parse_and_win_over_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(rate_limit_reset(&headers), None);
+
+        headers.insert("x-ratelimit-reset-requests", "1.5".parse().unwrap());
+        headers.insert("x-ratelimit-reset-tokens", "6m30s".parse().unwrap());
+        assert_eq!(rate_limit_reset(&headers), Some(Duration::from_secs(390)));
+
+        assert_eq!(
+            parse_rate_limit_reset("250ms"),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_rate_limit_reset("1h2m3s"),
+            Some(Duration::from_secs(3723))
+        );
+        assert_eq!(parse_rate_limit_reset("soon"), None);
+        assert_eq!(parse_rate_limit_reset("-5"), None);
+        assert_eq!(parse_rate_limit_reset(""), None);
+        assert_eq!(parse_rate_limit_reset("0s"), Some(Duration::ZERO));
+        assert_eq!(parse_rate_limit_reset("0"), Some(Duration::ZERO));
+        let epoch_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 120;
+        let reset = parse_rate_limit_reset(&epoch_seconds.to_string()).unwrap();
+        assert!(reset > Duration::from_secs(110) && reset < Duration::from_secs(130));
     }
 
     #[tokio::test]
@@ -4727,6 +4920,7 @@ data: {"type":"response.incomplete","response":{"id":"resp_test_123","incomplete
             body_bytes: zeroize::Zeroizing::new(b"sensitive request body".to_vec()),
             idempotency_key: "sensitive-idempotency-key".to_owned(),
             started: tokio::time::Instant::now(),
+            deadline: tokio::time::Instant::now() + RETRY_BUDGET,
             retries: 0,
             credentials,
             unauthorized: false,
@@ -4775,6 +4969,7 @@ data: {"type":"response.incomplete","response":{"id":"resp_test_123","incomplete
             body_bytes: zeroize::Zeroizing::new(b"sensitive request body".to_vec()),
             idempotency_key: "sensitive-idempotency-key".to_owned(),
             started: tokio::time::Instant::now(),
+            deadline: tokio::time::Instant::now() + RETRY_BUDGET,
             retries: 0,
             credentials,
             unauthorized: false,
@@ -4802,7 +4997,8 @@ data: {"type":"response.incomplete","response":{"id":"resp_test_123","incomplete
         ));
         assert!(!turn.model_event_emitted);
         assert!(!turn.retryable_transport_failure);
-        assert!(turn.request_context.is_none());
+        assert!(turn.request_context.is_some());
+        assert!(turn.pending_reopen.is_none());
     }
 
     #[tokio::test]
@@ -4841,6 +5037,7 @@ data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"item-1
             body_bytes: zeroize::Zeroizing::new(b"sensitive request body".to_vec()),
             idempotency_key: "sensitive-idempotency-key".to_owned(),
             started: tokio::time::Instant::now(),
+            deadline: tokio::time::Instant::now() + RETRY_BUDGET,
             retries: 0,
             credentials,
             unauthorized: false,
