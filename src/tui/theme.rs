@@ -34,6 +34,7 @@ struct Palette {
     code_fg: Color,
     code_bg: Color,
     bar_bg: Color,
+    selection_bg: Color,
 }
 
 const DARK: Palette = Palette {
@@ -49,6 +50,7 @@ const DARK: Palette = Palette {
     code_fg: Color::Rgb(232, 200, 140),
     code_bg: Color::Rgb(30, 33, 41),
     bar_bg: Color::Rgb(24, 27, 34),
+    selection_bg: Color::Rgb(62, 76, 110),
 };
 
 /// The same roles at the same hues, darkened to carry on a light terminal.
@@ -65,6 +67,7 @@ const LIGHT: Palette = Palette {
     code_fg: Color::Rgb(124, 72, 16),
     code_bg: Color::Rgb(234, 236, 240),
     bar_bg: Color::Rgb(216, 220, 228),
+    selection_bg: Color::Rgb(184, 202, 235),
 };
 
 /// The palette in force, as an [`Appearance`] discriminant.
@@ -418,6 +421,10 @@ pub fn code() -> Style {
 
 pub fn bar() -> Style {
     Style::default().fg(palette().dim).bg(palette().bar_bg)
+}
+
+pub fn selection() -> Style {
+    Style::default().bg(palette().selection_bg)
 }
 
 /// The frame this indicator shows on an animation tick.
