@@ -20,25 +20,55 @@ Clippy, and tests, builds Linux x86-64 and macOS arm64 archives, generates
 checksums, and publishes them to the tagged GitHub release. Prerelease tags are
 marked as prereleases on GitHub.
 
-## Optional macOS signing and notarization
+## macOS signing and notarization
 
-The macOS build does not require Apple credentials. When none are configured,
-the workflow publishes an unsigned, unnotarized archive and identifies it as
-such in the release notes. This is the expected setup until signing credentials
-are added to the repository.
+The release workflow signs the standalone Mach-O executable with the code-signing
+identifier `com.speakeasy.kit`, enables the hardened runtime, and submits it to
+Apple's notary service. This Developer ID distribution does not require an Apple
+App ID or provisioning profile.
 
-To enable signing and notarization, configure all of these repository secrets:
+Create the credentials as follows:
 
-- `MACOS_CERTIFICATE_P12_BASE64`
-- `MACOS_CERTIFICATE_PASSWORD`
-- `MACOS_SIGNING_IDENTITY`
-- `APPLE_API_KEY_P8_BASE64`
-- `APPLE_API_KEY_ID`
-- `APPLE_API_ISSUER_ID`
+1. In Keychain Access, use **Certificate Assistant > Request a Certificate From
+   a Certificate Authority** to save a certificate signing request (CSR).
+2. In Apple Developer **Certificates, Identifiers & Profiles**, create a
+   **Developer ID Application** certificate from that CSR. If that option is not
+   available for your role, ask the team's Account Holder to create it. Import
+   the downloaded certificate on the Mac that created the CSR.
+3. In Keychain Access, export the Developer ID certificate together with its
+   private key as a password-protected PKCS#12 (`.p12`) file. Record the exact
+   identity shown by `security find-identity -v -p codesigning`. It normally has
+   the form `Developer ID Application: <Organization> (<TEAM_ID>)`.
+4. In App Store Connect **Users and Access > Integrations**, create a team API
+   key that can access the notary service. Record its key ID and issuer ID, and
+   retain the downloaded `.p8`; Apple does not allow it to be downloaded again.
+5. Store the `.p12`, its password, and the `.p8` in the company's secret manager.
+   Configure these repository Actions secrets:
+
+   - `MACOS_CERTIFICATE_P12_BASE64`: base64-encoded `.p12`
+   - `MACOS_CERTIFICATE_PASSWORD`: `.p12` export password
+   - `MACOS_SIGNING_IDENTITY`: exact Keychain identity from step 3
+   - `APPLE_API_KEY_P8_BASE64`: base64-encoded `.p8`
+   - `APPLE_API_KEY_ID`: App Store Connect API key ID
+   - `APPLE_API_ISSUER_ID`: App Store Connect issuer ID
+
+For example, from a trusted Mac authenticated to GitHub CLI:
+
+```sh
+repo=speakeasy-api/kit
+base64 < DeveloperIDApplication.p12 | gh secret set MACOS_CERTIFICATE_P12_BASE64 -R "$repo"
+read -r -s 'p12_password?P12 password: '; echo
+printf %s "$p12_password" | gh secret set MACOS_CERTIFICATE_PASSWORD -R "$repo"
+unset p12_password
+printf %s 'Developer ID Application: Example Corp (TEAMID)' | gh secret set MACOS_SIGNING_IDENTITY -R "$repo"
+base64 < AuthKey_KEYID.p8 | gh secret set APPLE_API_KEY_P8_BASE64 -R "$repo"
+printf %s 'KEYID' | gh secret set APPLE_API_KEY_ID -R "$repo"
+printf %s 'issuer-uuid' | gh secret set APPLE_API_ISSUER_ID -R "$repo"
+```
 
 The workflow fails on a partial configuration rather than silently publishing
-an unsigned build. Downloaded `.p8` keys cannot be downloaded again, so retain
-the original in the company's secret manager.
+an unsigned build. With none of these secrets configured, it still publishes an
+unsigned, unnotarized archive and identifies it as such in the release notes.
 
 ## Verify a release
 

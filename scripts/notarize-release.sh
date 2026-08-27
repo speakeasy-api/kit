@@ -9,13 +9,13 @@ Builds, Developer ID signs, and notarizes the macOS ARM64 release binary on
 this Mac. The exact signed binary is preserved under dist/notarize/vVERSION/.
 
 Required configuration (`.env` or environment variables):
+  KIT_CODESIGN_IDENTITY
   KIT_NOTARY_API_KEY_DOCUMENT
   KIT_NOTARY_API_KEY_VAULT
   KIT_NOTARY_API_KEY_ID
   KIT_NOTARY_API_ISSUER_ID
 
 Optional overrides:
-  KIT_CODESIGN_IDENTITY
   KIT_CODESIGN_IDENTIFIER
 EOF
 }
@@ -57,8 +57,8 @@ if [[ -n $(git status --porcelain) ]]; then
   exit 1
 fi
 
-identity=${KIT_CODESIGN_IDENTITY:-Developer ID Application: Inlucent Limited (TAMRUK8SL6)}
-identifier=${KIT_CODESIGN_IDENTIFIER:-com.danielkov.kit}
+identity=${KIT_CODESIGN_IDENTITY:?KIT_CODESIGN_IDENTITY must be set}
+identifier=${KIT_CODESIGN_IDENTIFIER:-com.speakeasy.kit}
 api_key_document=${KIT_NOTARY_API_KEY_DOCUMENT:?KIT_NOTARY_API_KEY_DOCUMENT must be set}
 api_key_vault=${KIT_NOTARY_API_KEY_VAULT:?KIT_NOTARY_API_KEY_VAULT must be set}
 api_key_id=${KIT_NOTARY_API_KEY_ID:?KIT_NOTARY_API_KEY_ID must be set}
@@ -88,7 +88,7 @@ umask 077
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/kit-notary.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT
 api_key="$tmp_dir/AuthKey_${api_key_id}.p8"
-op document get "$api_key_document" --vault "$api_key_vault" --output "$api_key" >/dev/null
+op document get "$api_key_document" --vault "$api_key_vault" --out-file "$api_key" >/dev/null
 chmod 600 "$api_key"
 source_dir="$tmp_dir/source"
 mkdir -p "$source_dir"

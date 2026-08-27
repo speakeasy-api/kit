@@ -129,7 +129,7 @@ jobs:
           cp target/aarch64-apple-darwin/release/kit stage/kit
           if [[ $SIGN_RELEASE == true ]]; then
             codesign --force --options runtime --timestamp \
-              --identifier com.danielkov.kit \
+              --identifier com.speakeasy.kit \
               --sign "$MACOS_SIGNING_IDENTITY" stage/kit
             codesign --verify --strict --verbose=2 stage/kit
             ditto -c -k --keepParent stage/kit "$RUNNER_TEMP/kit-notarization.zip"
