@@ -64,8 +64,8 @@ use crate::{
 };
 
 use app::{
-    Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
-    UserImage,
+    Action, App, Attachment, AttachmentKind, Block, EffortChoice, ModelChoice, SubmittedPrompt,
+    Update, UserImage,
 };
 
 /// Animation and elapsed-time refresh interval.
@@ -1132,7 +1132,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         } else {
                             herdr::State::Idle
                         };
-                        integration.report(active_session, state).await;
+                        let prompt = app.blocks.iter().rev().find_map(|block| match block {
+                            Block::User(message) => Some(message.text.as_str()),
+                            _ => None,
+                        });
+                        integration
+                            .report_with_summary(active_session, state, prompt)
+                            .await;
                     }
                     terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
@@ -2482,6 +2488,112 @@ mod herdr_compat_tests {
         assert!(integration.command("session-2", State::Working).is_some());
     }
 
+    #[test]
+    fn reports_bounded_single_line_prompt_summary_as_metadata() {
+        let mut integration = Integration::for_test("herdr", "w1:p1");
+        let prompt = format!("  Add context to\nKit's agents panel {}", "é".repeat(80));
+
+        let commands = integration
+            .commands("session-1", State::Working, Some(&prompt))
+            .expect("new snapshot");
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[1],
+            vec![
+                OsString::from("pane"),
+                OsString::from("report-metadata"),
+                OsString::from("w1:p1"),
+                OsString::from("--source"),
+                OsString::from("custom:kit-context"),
+                OsString::from("--agent"),
+                OsString::from("kit"),
+                OsString::from("--applies-to-source"),
+                OsString::from("custom:kit"),
+                OsString::from("--token"),
+                OsString::from(format!(
+                    "summary={}",
+                    format!("Add context to Kit's agents panel {}", "é".repeat(80))
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                )),
+                OsString::from("--seq"),
+                OsString::from("1"),
+            ],
+        );
+        assert_eq!(
+            integration.commands("session-1", State::Working, Some(&prompt)),
+            None,
+        );
+    }
+
+    #[test]
+    fn clears_stale_summary_when_integration_starts_without_a_prompt() {
+        let mut integration = Integration::for_test("herdr", "w1:p1");
+        let commands = integration
+            .commands("session-1", State::Idle, None)
+            .unwrap();
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands[1],
+            vec![
+                OsString::from("pane"),
+                OsString::from("report-metadata"),
+                OsString::from("w1:p1"),
+                OsString::from("--source"),
+                OsString::from("custom:kit-context"),
+                OsString::from("--clear-token"),
+                OsString::from("summary"),
+                OsString::from("--seq"),
+                OsString::from("1"),
+            ],
+        );
+    }
+
+    #[test]
+    fn deduplicates_lifecycle_and_summary_independently() {
+        let mut integration = Integration::for_test("herdr", "w1:p1");
+        assert_eq!(
+            integration
+                .commands("session-1", State::Working, Some("first task"))
+                .unwrap()
+                .len(),
+            2,
+        );
+
+        let summary_only = integration
+            .commands("session-1", State::Working, Some("second task"))
+            .unwrap();
+        assert_eq!(summary_only.len(), 1);
+        assert_eq!(summary_only[0][1], OsString::from("report-metadata"));
+
+        let lifecycle_only = integration
+            .commands("session-1", State::Idle, Some("second task"))
+            .unwrap();
+        assert_eq!(lifecycle_only.len(), 1);
+        assert_eq!(lifecycle_only[0][1], OsString::from("report-agent"));
+    }
+
+    #[test]
+    fn strips_unsafe_prompt_characters_from_summary() {
+        let mut integration = Integration::for_test("herdr", "w1:p1");
+        let commands = integration
+            .commands(
+                "session-1",
+                State::Working,
+                Some("add\0 context\u{1b}[31m safely \u{202e}now"),
+            )
+            .unwrap();
+
+        assert!(
+            commands[1]
+                .iter()
+                .any(|arg| arg == &OsString::from("summary=add context[31m safely now"))
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn invokes_herdr_for_transitions_and_release() {
@@ -2498,19 +2610,31 @@ mod herdr_compat_tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut integration = Integration::for_test(bin.as_os_str(), "w1:p1");
 
-        integration.report("session-1", State::Idle).await;
-        integration.report("session-1", State::Idle).await;
-        wait_for_lines(&log, 1).await;
-        integration.report("session-1", State::Working).await;
+        integration
+            .report_with_summary("session-1", State::Idle, Some("Adding Herdr context"))
+            .await;
+        integration
+            .report_with_summary("session-1", State::Idle, Some("Adding Herdr context"))
+            .await;
         wait_for_lines(&log, 2).await;
+        integration
+            .report_with_summary("session-1", State::Working, Some("Adding Herdr context"))
+            .await;
+        wait_for_lines(&log, 3).await;
         integration.release().await;
 
-        assert_eq!(
-            std::fs::read_to_string(log).unwrap(),
-            "pane report-agent w1:p1 --source custom:kit --agent kit --state idle --agent-session-id session-1\n\
-             pane report-agent w1:p1 --source custom:kit --agent kit --state working --agent-session-id session-1\n\
-             pane release-agent w1:p1 --source custom:kit --agent kit\n".replace("            ", ""),
-        );
+        let calls = std::fs::read_to_string(log).unwrap();
+        let lines = calls.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5);
+        for expected in [
+            "pane report-agent w1:p1 --source custom:kit --agent kit --state idle --agent-session-id session-1",
+            "pane report-metadata w1:p1 --source custom:kit-context --agent kit --applies-to-source custom:kit --token summary=Adding Herdr context --seq 1",
+            "pane report-agent w1:p1 --source custom:kit --agent kit --state working --agent-session-id session-1",
+            "pane report-metadata w1:p1 --source custom:kit-context --clear-token summary --seq 2",
+            "pane release-agent w1:p1 --source custom:kit --agent kit",
+        ] {
+            assert!(lines.contains(&expected), "missing Herdr call: {expected}");
+        }
     }
 
     #[cfg(unix)]
@@ -2574,7 +2698,7 @@ mod herdr_compat_tests {
         let mut integration = Integration::for_test(bin.as_os_str(), "w1:p1");
 
         integration.report("session-1", State::Idle).await;
-        wait_for_lines(&log, 1).await;
+        wait_for_lines(&log, 2).await;
 
         assert!(
             std::fs::read_to_string(&log)
@@ -2592,13 +2716,37 @@ mod herdr_compat_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("herdr");
-        std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&bin, "#!/bin/sh\nsleep 5\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let integration = Integration::for_test(bin.as_os_str(), "w1:p1");
 
-        tokio::time::timeout(std::time::Duration::from_millis(750), integration.release())
+        tokio::time::timeout(std::time::Duration::from_millis(650), integration.release())
             .await
             .expect("a failed release should not prevent Kit from exiting");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_metadata_does_not_prevent_shutdown() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("herdr");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$2\" = report-metadata ]; then sleep 5; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut integration = Integration::for_test(bin.as_os_str(), "w1:p1");
+        integration
+            .report_with_summary("session-1", State::Working, Some("task"))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        tokio::time::timeout(std::time::Duration::from_millis(650), integration.release())
+            .await
+            .expect("failed metadata should not prevent Kit from exiting");
     }
 
     #[test]
