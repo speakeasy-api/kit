@@ -154,13 +154,11 @@ This repair does not hide general JSONL damage. Errors including `invalid transc
 
 While a session is open, Kit can reconstruct a transcript path deleted from disk using its still-open file and can reacquire a missing lock only if no other owner won the lock. It fails closed if another process owns recovery authority. After an abnormal TUI shutdown, restarting with `--resume` should be the first recovery attempt; add `--force` only after confirming the remaining lock is stale.
 
-### Colours on light and dark terminals
+### Terminal colours and Speakeasy branding
 
-The TUI draws on the terminal's own background, so it asks the terminal for that background over OSC 11 at startup and picks a dark or light palette to match. Terminals that do not answer within 100 ms fall back to `COLORFGBG`, and then to the dark palette.
+The TUI inherits the terminal's configured foreground and background. Functional accents use ANSI colour slots, so success, warning, error, focus, and muted text follow the user's terminal palette instead of a Kit-specific dark or light theme. Selection uses the terminal's reversed style, and Kit does not probe or repaint the terminal background.
 
-Windows builds do not query the terminal at all: they use `KIT_THEME` if it is set, and the dark palette otherwise.
-
-Set `KIT_THEME=light` or `KIT_THEME=dark` to override the detection — useful under multiplexers or remote sessions that report the wrong background, or answer for a different terminal than the one in front of you. Any other value, including unset, keeps automatic detection.
+The empty starter screen adds a decorative Speakeasy rainbow line beneath the Kit name. Once a session has transcript content, the line moves beneath the header and spans the terminal width when the terminal is tall enough to show it without displacing required content. Terminals that advertise 24-bit colour receive the Speakeasy brand ramp; limited-colour terminals receive an ANSI approximation from their configured palette. No status or instruction depends on distinguishing those colours.
 
 ### TUI startup and terminal recovery
 

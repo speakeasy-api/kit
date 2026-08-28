@@ -128,7 +128,7 @@ pub(crate) fn dispatcher(
     let card = AgentCard {
         url: None,
         name: "Kit".into(),
-        description: "Directory-rooted coding agent".into(),
+        description: "Coding agent runtime".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         supported_interfaces: vec![AgentInterface {
             url,

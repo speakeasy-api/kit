@@ -68,7 +68,7 @@ Loading progressively discloses the skill's full `SKILL.md` body, directory, and
 
 ## Run commands with `shell`
 
-`shell({ command, timeout_seconds? })` runs with the canonical runtime root as its working directory. On Unix it uses `sh -lc`; on Windows it uses `cmd /C`. Standard input is null. The default timeout is 120 seconds, and accepted `timeout_seconds` values are 1 through 3600.
+`shell({ command, timeout_seconds? })` runs from Kit's canonical working directory. On Unix it uses `sh -lc`; on Windows it uses `cmd /C`. Standard input is null. The default timeout is 120 seconds, and accepted `timeout_seconds` values are 1 through 3600.
 
 A normally completed command returns:
 
@@ -82,11 +82,11 @@ Stdout and stderr are captured separately and remain complete for downstream Run
 
 Only the final compose return value crosses the model-context boundary. When its serialized form exceeds 8 KiB, Kit writes the complete result to `compose-output.json` under the call's artifact directory and returns `{ preview, artifact, original_bytes }` to the model. The preview contains bounded head and tail text separated by a `compose output spilled` marker. Compose final results have a 64 MiB safety limit. Return focused summaries when possible; inspect only a narrow artifact range when the complete final result is not needed in context.
 
-The runtime root is a working directory, not an operating-system security boundary. A shell command can use absolute paths, `..`, the network, and any credentials or files allowed to the Kit process. Quote untrusted values, inspect destructive commands before running them, and avoid putting secrets into command text or returned output. There is no automatic rollback for shell side effects.
+Kit's working directory is project context, not an operating-system security boundary. A shell command can use absolute paths, `..`, the network, and any credentials or files allowed to the Kit process. Quote untrusted values, inspect destructive commands before running them, and avoid putting secrets into command text or returned output. There is no automatic rollback for shell side effects.
 
 ## Make exact file changes with `edit`
 
-`edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from the runtime root. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.
+`edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from Kit's working directory. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.
 
 An edit hunk replaces `old` while using optional `context_before` and `context_after` as its exact anchor:
 

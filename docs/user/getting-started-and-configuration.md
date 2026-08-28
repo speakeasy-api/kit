@@ -1,6 +1,6 @@
 # Getting Started and Configuring Kit
 
-Kit is a directory-rooted coding-agent runtime. Choose a project directory as the runtime root, authenticate the model provider, and then use the installed `kit` binary interactively, for one prompt, or as an ACP/A2A server. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line reference.
+Kit is a coding agent runtime and terminal client. Choose a project working directory, authenticate the model provider, and then use the installed `kit` binary interactively, for one prompt, or as an ACP/A2A server. Run `kit --help` and `kit <command> --help` for the current, exhaustive command-line reference.
 
 Run `kit init` to write the recommended `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when those files do not exist. It selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. The command leaves existing files unchanged.
 
@@ -90,7 +90,7 @@ credential. Revoke the API key remotely in the Speakeasy dashboard.
 
 ## Run common command workflows
 
-The runtime root must exist and be a directory. If `--root` is omitted, Kit uses configured `root`, then `.`. A bad path reports `could not open runtime root`; a non-directory reports `runtime root is not a directory`.
+The working directory must exist and be a directory. If `--root` is omitted, Kit uses configured `root`, then `.`. A bad path reports `could not open working directory`; a non-directory reports `working directory is not a directory`. This directory supplies project context and relative-path resolution; it does not restrict filesystem access.
 
 ### Interactive terminal client with `kit tui`
 
@@ -245,7 +245,7 @@ For example, with `model = "gpt-5.4"` in TOML, `kit prompt --model anthropic/cla
 
 ## Project instructions from `AGENTS.md`
 
-Kit discovers `AGENTS.md` files at the runtime root and its ancestor directories and loads their content into the initial transcript as agent context. Put repository-wide guidance in a higher-level `AGENTS.md` and project-specific guidance nearer the selected root. Choose `--root` deliberately because it controls both the working directory and which `AGENTS.md` instruction chain is loaded.
+Kit discovers `AGENTS.md` files at the project working directory and its ancestor directories and loads their content into the initial transcript as agent context. Put repository-wide guidance in a higher-level `AGENTS.md` and project-specific guidance nearer the selected root. Choose `--root` deliberately because it controls both the working directory and which `AGENTS.md` instruction chain is loaded.
 
 If startup reports `could not load AGENTS.md context`, inspect the `AGENTS.md` files at the root and above it for read or loading problems. Changing `~/.kit/config.toml` does not replace project instructions; configuration selects runtime behavior, while `AGENTS.md` supplies instructions to the agent.
 

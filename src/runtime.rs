@@ -302,10 +302,10 @@ impl Runtime {
         let root = root
             .as_ref()
             .canonicalize()
-            .map_err(|error| format!("could not open runtime root: {error}"))?;
+            .map_err(|error| format!("could not open working directory: {error}"))?;
         if !root.is_dir() {
             return Err(format!(
-                "runtime root is not a directory: {}",
+                "working directory is not a directory: {}",
                 root.display()
             ));
         }
@@ -970,7 +970,7 @@ impl Runtime {
     fn system_prompt(&self, depth: usize) -> String {
         format!(
             concat!(
-                "You are a coding agent using Kit version {} as your harness, rooted at {}. ",
+                "You are a coding agent using Kit version {} as your harness, working in {}. This is your cwd and project context, not a filesystem boundary. ",
                 "Make minimal changes, inspect before editing, and run the smallest useful check. ",
                 "Keep tool output lean: use targeted paths, ranges, filters, and bounded `head`/`tail` output. Do not dump whole trees, generated files, long successful build logs, credential files, or environment contents.\n\n",
                 "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",

@@ -2326,7 +2326,7 @@ impl App {
 
     /// The selected text, reconstructed from the rendered rows: rows wrapped
     /// from one logical line rejoin, trailing padding is dropped, and fenced
-    /// code loses the two-column display indent it is drawn with.
+    /// code loses the two-column display gutter it is drawn with.
     pub fn selection_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (start, end) = selection.ordered();
@@ -2346,10 +2346,12 @@ impl App {
                 .collect();
             let from = if line == start.0 { start.1 } else { 0 };
             let to = if line == end.0 { end.1 + 1 } else { usize::MAX };
-            let mut fragment = column_slice(&text, from, to).trim_end().to_string();
-            if row.1.1.is_some() && from == 0 && fragment.starts_with("  ") {
-                fragment.drain(..2);
+            let mut fragment = column_slice(&text, from, to);
+            if row.1.1.is_some() && from < 2 && (text.starts_with('│') || text.starts_with("  "))
+            {
+                fragment = column_slice(fragment, 2 - from, usize::MAX);
             }
+            let fragment = fragment.trim_end().to_string();
             let logical = row.1.2.map(|index| (block, index));
             match (logical, last_logical) {
                 (Some(current), Some(previous)) if current == previous => {

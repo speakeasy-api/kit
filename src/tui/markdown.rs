@@ -151,22 +151,20 @@ fn block_line(raw: &str, trimmed: &str) -> LinkedLine {
     if let Some(quoted) = trimmed.strip_prefix("> ") {
         let mut spans = vec![plain_span(format!("{indent}▏ "), theme::faint())];
         spans.extend(inline(quoted, theme::dim().add_modifier(Modifier::ITALIC)));
-        return LinkedLine { spans };
+        return LinkedLine::new(spans).with_leading_gutter();
     }
     if let Some(item) = bullet(trimmed) {
         let mut spans = vec![plain_span(format!("{indent}• "), theme::accent())];
         spans.extend(inline(item, theme::text()));
-        return LinkedLine { spans };
+        return LinkedLine::new(spans).with_leading_gutter();
     }
-    LinkedLine {
-        spans: inline(raw, theme::text()),
-    }
+    LinkedLine::new(inline(raw, theme::text()))
 }
 
 fn heading_line(indent: String, heading: &str, style: Style) -> LinkedLine {
     let mut spans = vec![plain_span(indent, Style::default())];
     spans.extend(inline(heading, style));
-    LinkedLine { spans }
+    LinkedLine::new(spans)
 }
 
 fn bullet(trimmed: &str) -> Option<&str> {
@@ -177,9 +175,10 @@ fn bullet(trimmed: &str) -> Option<&str> {
 
 fn code_line(raw: &str) -> LinkedLine {
     plain_line(Line::from(vec![
-        Span::styled("  ", theme::code()),
+        Span::styled("│ ", theme::faint()),
         Span::styled(raw.replace('\t', "    "), theme::code()),
     ]))
+    .with_leading_gutter()
 }
 
 fn code_frame(label: &str) -> LinkedLine {
@@ -353,7 +352,7 @@ fn inline_with_link_destinations(
         let (delimiter, style) = if tail.starts_with("**") {
             ("**", base.add_modifier(Modifier::BOLD))
         } else if tail.starts_with('`') {
-            ("`", theme::code())
+            ("`", theme::inline_code())
         } else if tail.starts_with('*') {
             ("*", base.add_modifier(Modifier::ITALIC))
         } else {
@@ -400,7 +399,7 @@ fn inline_with_link_destinations(
             spans.push(plain_span(std::mem::take(&mut plain), base));
         }
         if delimiter == "`" {
-            spans.push(plain_span(body[..close].to_string(), style));
+            spans.push(plain_span(format!("`{}`", &body[..close]), style));
         } else {
             spans.extend(inline_with_link_destinations(
                 &body[..close],
@@ -430,7 +429,9 @@ mod tests {
         let lines = render("text\n```rust\nlet x = 1;\n```\nmore");
         assert_eq!(lines.len(), 5);
         assert!(lines[1].spans[0].content.contains("rust"));
+        assert_eq!(lines[2].spans[0].content, "│ ");
         assert!(lines[2].spans[1].content.contains("let x = 1;"));
+        assert_eq!(lines[2].spans[1].style.bg, None);
     }
 
     #[test]
@@ -480,7 +481,14 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(contents, ["run ", "cargo test", " and ", "stop"]);
+        assert_eq!(contents, ["run ", "`cargo test`", " and ", "stop"]);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -606,7 +614,7 @@ mod tests {
             .map(|span| span.span.content.as_ref())
             .collect();
 
-        assert_eq!(joined, "[label](https://example.com/docs)");
+        assert_eq!(joined, "`[label](https://example.com/docs)`");
         assert!(linked_urls(source).is_empty());
     }
 

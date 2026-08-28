@@ -20,7 +20,7 @@ subdir = "optional/plugin/path"
 
 Aliases must contain 1–64 lowercase ASCII letters, digits, or single hyphens, with an alphanumeric first and last character. Duplicate plugin manifest names are an error.
 
-A relative `path` is resolved against Kit's runtime root, not the configuration directory. An absolute path is used directly. Local packages are validated on every startup and remain mutable local content.
+A relative `path` is resolved against Kit's working directory, not the configuration directory. An absolute path is used directly. Local packages are validated on every startup and remain mutable local content.
 
 For an `archive`, provide the final archive URL. Kit does not clone Git repositories, translate forge URLs, select branches or tags, or automatically update plugins. `sha256` is mandatory and identifies the exact downloaded bytes. HTTPS is required, except that explicit loopback HTTP URLs are accepted for local testing. Redirects from HTTPS must remain HTTPS. URL credentials and fragments are rejected.
 

@@ -1,17 +1,17 @@
 # Security, Limits, and Troubleshooting
 
-Kit is a directory-rooted coding-agent runtime, not a security boundary. Treat the model, prompts, configured ACP harnesses, MCP servers, and remote A2A agents according to the access they receive. For command-specific options, use `kit --help` and `kit <command> --help`; this page describes behavior and boundaries rather than every CLI flag.
+Kit is a coding agent runtime, not a security boundary. Treat the model, prompts, configured ACP harnesses, MCP servers, and remote A2A agents according to the access they receive. For command-specific options, use `kit --help` and `kit <command> --help`; this page describes behavior and boundaries rather than every CLI flag.
 
-## Trust model and runtime root
+## Trust model and working directory
 
-The runtime root is the working directory and project context, **not a sandbox**. Kit canonicalizes the root at startup and rejects a missing root (`could not open runtime root`) or a non-directory (`runtime root is not a directory`). An ACP client must open exactly that root and cannot add `additional_directories`.
+`--root` selects Kit's working directory and project context; it is **not a sandbox**. Kit canonicalizes the directory at startup and rejects a missing path (`could not open working directory`) or a non-directory (`working directory is not a directory`). An ACP client must open exactly that project context and cannot add `additional_directories`.
 
 The root does not confine processes:
 
 - `shell` starts the platform shell with the root as its current directory. The command can read or change anything allowed by the Kit process, including paths outside the root, the network, and inherited environment variables.
 - ACP subagents are child processes started directly from trusted local `command` and `args` profiles, with the same root as their current directory. They inherit normal child-process host access; selecting a harness is not isolation.
 - MCP stdio servers are local processes, while MCP HTTP servers and A2A agents are remote trust domains. Tool arguments, prompts, and returned data cross those boundaries.
-- `edit` resolves relative paths from the runtime root, but also accepts `..`, absolute paths, and paths through symlinks. It can change any filesystem path allowed by the Kit process.
+- `edit` resolves relative paths from Kit's working directory, but also accepts `..`, absolute paths, and paths through symlinks. It can change any filesystem path allowed by the Kit process.
 
 Kit has no general permissions or interactive approval framework for its own tools. The fact that only `compose` is model-visible organizes tool use; it does not make hidden `shell`, `edit`, subagent, A2A, or MCP calls harmless. Review requested work and run Kit with the least host, repository, network, and account access appropriate for it.
 
@@ -99,7 +99,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 ### Kit does not start or the TUI exits before opening a session
 
 1. Run `kit --version` and `kit <command> --help` to verify the installed binary and command syntax.
-2. If the diagnostic says `could not open runtime root` or `runtime root is not a directory`, verify that `--root` exists, is a directory, and is accessible to the Kit process.
+2. If the diagnostic says `could not open working directory` or `working directory is not a directory`, verify that `--root` exists, is a directory, and is accessible to the Kit process.
 3. If A2A binding fails or the port is taken, omit the fixed address to get an available loopback port, choose another loopback port, or use `kit acp` when HTTP is unnecessary.
 4. If the failure mentions OpenAI subscription credentials, run status and login with the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` used by the runtime; standalone login rejects `memory`. Ensure loopback port 1455 or 1457 is available. Retry without pasting secrets into the prompt.
 
@@ -107,7 +107,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 
 1. For `shell command timed out`, reduce the task, diagnose a blocked subprocess, or intentionally raise `timeout_seconds` within 1–3600. An interrupt kills Kit's child command but still inspect for partial side effects.
 2. When a result reports `compose output spilled`, inspect a small relevant range from its artifact instead of returning the full artifact to model context. Internal Runlet consumers receive complete shell output before this boundary guard runs.
-3. For `path must be non-empty`, provide either a path relative to the runtime root or an absolute path.
+3. For `path must be non-empty`, provide either a path relative to Kit's working directory or an absolute path.
 4. For a hunk mismatch or ambiguity, reread the file and provide more unique exact context.
 
 ### A subagent fails, hangs, or cannot fork

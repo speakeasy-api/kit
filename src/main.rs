@@ -11,7 +11,7 @@ use kit::tools::CredentialStorage;
 use serde::Deserialize;
 
 #[derive(Parser)]
-#[command(version, about = "Lean directory-rooted coding agent runtime")]
+#[command(version, about = "Coding agent runtime and terminal client")]
 struct Cli {
     #[command(flatten)]
     telemetry: TelemetryArgs,
@@ -407,7 +407,7 @@ enum Command {
     },
     /// Serve ACP on stdio with A2A, remote ACP, or both over HTTP.
     Serve {
-        /// Runtime root (defaults to config or `.`).
+        /// Working directory and project context (defaults to config or `.`).
         #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
@@ -454,6 +454,7 @@ enum Command {
         /// ACP wire protocol version.
         #[arg(long, value_enum, default_value = "1")]
         protocol_version: AcpProtocolVersion,
+        /// Working directory and project context (defaults to config or `.`).
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long)]
@@ -475,7 +476,7 @@ enum Command {
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
-        /// Runtime root (defaults to config or `.`).
+        /// Working directory and project context (defaults to config or `.`).
         #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
@@ -499,7 +500,7 @@ enum Command {
     },
     /// Start the ACP-backed terminal client.
     Tui {
-        /// Runtime root (defaults to config or `.`).
+        /// Working directory and project context (defaults to config or `.`).
         #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
