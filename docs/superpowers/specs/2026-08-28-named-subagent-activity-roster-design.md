@@ -2,28 +2,30 @@
 
 ## Summary
 
-Kit will give parent-owned subagents stable, friendly display names and render their lifecycle directly in the existing TUI graph. Names come from a configurable pool first, then from an optional fallback suggested by the parent model without an extra model call. The existing immutable `s-…` ID remains authoritative.
+Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated flat TUI Agents panel. Names come from a configurable pool first, then from an optional fallback suggested by the parent model without an extra model call. The existing immutable `s-…` ID remains authoritative.
 
-The feature is backed by Kit's in-process subagent registry and private runtime-event channel. It does not claim that ACP provides portable parent/child session enumeration.
+The feature is backed by each Kit process's in-process subagent registry and recursively forwarded private runtime events. It does not claim that ACP provides portable parent/child session enumeration.
 
 ## Goals
 
-- Make concurrent subagents easy to recognize in the TUI.
+- Make concurrent subagents easy to recognize in a dedicated flat TUI panel.
+- Include foreground and background work independently of the currently focused tool call.
+- Aggregate observable nested descendants and show their immediate parent identity.
 - Keep one display identity across repeated prompts to the same reusable handle.
 - Let users replace Kit's built-in whimsical name pool.
 - Allow the parent model to suggest additional names after the pool is exhausted without a dedicated naming request.
-- Expose useful parent-scoped lifecycle metadata through `subagents({})`.
-- Associate an agent with the exact `subagent`, `prompt`, or `fork` runtime operation that initiated its current generation.
+- Expose useful direct-child lifecycle metadata through `subagents({})`.
 - Preserve compatibility with existing configuration and handles.
 
 ## Non-goals
 
 - Defining a new portable ACP child-session protocol.
-- Enumerating subagents owned by unrelated Kit processes or top-level sessions.
+- Enumerating subagents owned by unrelated top-level Kit sessions or process trees.
+- Discovering private internal agents created by generic ACP harnesses that do not emit Kit runtime events.
 - Restoring live child processes after Kit restarts.
 - Replacing immutable subagent IDs with display names in tool inputs.
-- Adding a separate roster panel, mode, or keyboard shortcut in the first version.
-- Reworking identity and attribution for every non-subagent graph node.
+- Enforcing display-name uniqueness across separate descendant branches.
+- Changing the existing runtime graph's contents or `Ctrl+G` behavior.
 
 ## Background and constraints
 
@@ -73,34 +75,43 @@ Pool order is deterministic. A name is reserved as soon as creation begins. If c
 
 Names compare case-insensitively for collision purposes. If a valid fallback name is occupied, Kit appends ` 2`, ` 3`, and so on, choosing the lowest available positive suffix. `Agent N` likewise uses the lowest positive integer that produces an available name, so released numbers may be reused. The base is safely shortened when necessary so the final display name remains within 32 Unicode scalar values.
 
+Name reservations and case-insensitive uniqueness apply to one parent's direct children. Independent descendant branches may reuse both child and parent names, so two rows can have an identical visible label such as `Scout · via Pip`. This ambiguity is explicitly accepted in the first version to avoid a cross-process naming coordinator; immutable IDs remain distinct internally.
+
 Model-provided fallback values are best-effort metadata and must not prevent subagent work. Kit trims surrounding whitespace, collapses repeated internal whitespace, and discards empty, multiline, control-character-containing, or otherwise invalid suggestions. A discarded or absent suggestion falls through to `Agent N`. Unicode names are supported.
 
 `prompt` reuses the handle's existing name. `fork` creates a distinct handle and receives a new name through the normal assignment order. Names are never accepted as identity selectors; `id` remains authoritative.
 
 ## Lifecycle model
 
-The displayed lifecycle is:
+The live registry lifecycle is:
 
 ```text
-starting -> working -> idle -> working -> idle -> closed
+starting -> working -> idle -> working -> idle
+    |          |        |
+    +----------+--------+-> removed
 ```
 
 - `starting`: the handle and name are reserved while its child session is being created.
 - `working`: the child is processing the current generation.
 - `idle`: the generation finished and the handle can be prompted, forked, or closed.
-- `closed`: the handle is unusable and its name is released. Closed identities are removed from live annotations.
+- `removed`: explicit close, failed initial creation, or terminal retirement makes the handle unusable and releases its name. `removed` is an event tombstone, not a live listing status.
 
-A generation failure returns the handle to `idle` when the underlying child remains reusable. A terminal child failure retires the handle and releases its capacity and name. Lifecycle changes occur under the same synchronization that protects the corresponding subagent state so listing and emitted events cannot report a transition that did not take effect.
+A successful generation transitions `working -> idle` with a successful outcome. A reusable generation failure also transitions `working -> idle`, records a failed outcome timestamp, and remains counted as idle. The TUI renders that idle row with a red `✗` for four seconds, then with the ordinary dim `○`.
+
+A terminal generation failure retires the handle, releases its name and capacity, and emits a failed `removed` tombstone. The TUI excludes it from live footer counts, retains a red `✗` tombstone for four seconds, then deletes the row. Explicit close emits a non-failed `removed` tombstone and deletes the row immediately. Failed initial creation releases its reservation and emits a failed `removed` tombstone under the same four-second display rule.
+
+Lifecycle changes occur under the same synchronization that protects the corresponding subagent state so listing and emitted events cannot report a transition that did not take effect.
 
 ## Data model
 
 The private subagent state gains:
 
 - assigned display name;
-- explicit lifecycle status;
+- explicit live lifecycle status;
 - bounded current-task summary;
-- current generation; and
-- timestamps needed for elapsed-time display.
+- current generation;
+- current generation outcome; and
+- Unix-millisecond timestamps needed for elapsed-time and failure-grace display.
 
 The registry map remains keyed by immutable subagent ID. Name availability is derived or maintained under the registry's existing synchronization so concurrent starts cannot claim the same name. Assignment and insertion must be atomic from the perspective of other starts and listings.
 
@@ -181,60 +192,88 @@ SubagentStateChanged {
     id: String,
     name: String,
     status: SubagentStatus,
+    outcome: Option<GenerationOutcome>,
     generation: u64,
     task: String,
-    operation_call: String,
+    parent_id: Option<String>,
+    parent_name: Option<String>,
     harness: String,
     model: Option<String>,
-    at: u64,
+    created_at_unix_ms: u64,
+    generation_started_at_unix_ms: u64,
+    generation_finished_at_unix_ms: Option<u64>,
 }
 ```
 
-`operation_call` is the unique runtime child-call ID for the `subagent`, `prompt`, or `fork` operation that initiated the generation. This lets the TUI decorate the exact child record rather than matching only by tool name.
+`SubagentStatus` contains `starting`, `working`, `idle`, and the non-live `removed` tombstone. `GenerationOutcome` is `success` or `failed`. All serialized times are Unix epoch milliseconds so they remain meaningful across process boundaries. For a live duration, the TUI subtracts `generation_started_at_unix_ms` from its current Unix-millisecond clock and clamps negative results to zero. For a finished generation it subtracts the start from `generation_finished_at_unix_ms`.
 
-Events are emitted after successful state transitions. Event delivery is observational: serialization, transport, parsing, or rendering failure must not change tool behavior. Existing event-marker framing and opt-in `KIT_RUNTIME_EVENTS` transport are retained.
+Direct children of the top-level runtime omit `parent_id` and `parent_name`. When Kit launches a child Kit runtime, it passes that child handle's immutable ID and display name as internal parent context. Lifecycle events emitted by that runtime for its own direct children include the immediate parent context. Existing child stderr event forwarding is extended to forward subagent transition events unchanged, so ancestry remains intact across multiple levels.
+
+The top-level TUI deduplicates recursively forwarded events by immutable agent ID. IDs are globally unique enough for the existing process/session model; display names are not used as keys. Generic ACP harnesses that do not run Kit or emit Kit runtime events cannot expose their private internal agents.
+
+A second tombstone event, `SubagentDescendantsRemoved { ancestor_id }`, handles recursive cleanup. The ACP child wrapper emits it when a child Kit process or its runtime-event forwarding channel exits, whether orderly or unexpectedly. On receipt, each parent forwards it unchanged. The top-level TUI removes every strict descendant whose recorded parent chain contains `ancestor_id`, but does not remove the ancestor row itself. The ancestor remains governed by its own direct registry transition: reusable failure returns it to idle, while close or terminal retirement emits `removed`. Cleanup is idempotent by immutable ID.
+
+Events are emitted after successful state transitions. They are emitted whether the initiating compose/tool call remains foregrounded or has been backgrounded. Event delivery is observational: serialization, transport, parsing, forwarding, or rendering failure must not change tool behavior. Existing event-marker framing and opt-in `KIT_RUNTIME_EVENTS` transport are retained.
 
 The ACP-facing transcript is not extended with a pretend portable child-session type. Tool inputs and outputs continue to flow through ACP normally; lifecycle detail remains on Kit's private runtime channel.
 
-## TUI activity graph
+## TUI Agents panel
 
-The existing graph becomes an activity graph without adding a separate mode. `Ctrl+G` retains its current behavior.
+The roster is a dedicated flat panel, independent from the existing graph.
 
-Subagent operations render inline:
+### Visibility and layout
+
+- `Ctrl+R` toggles the Agents panel.
+- `/agents` performs the same toggle and makes the feature discoverable through local command help.
+- `Ctrl+G` and the graph remain unchanged.
+- The transcript, graph, and Agents panel retain independent visibility and scroll state.
+- Graph and Agents each use the existing 46-column side-panel width.
+- With exactly one side panel visible, widths at or above the existing 108-column breakpoint render transcript then side panel horizontally. Below 108 columns, they render top-to-bottom as transcript then side panel using the existing 55/45 percent split.
+- With both side panels visible, widths at or above 154 columns render three full-height columns in this order: transcript, graph, Agents. The two side panels are 46 columns each and the transcript receives the remainder.
+- With both side panels visible below 154 columns, the body renders vertically in this order: transcript, graph, Agents, using a 40/30/30 percent height split. The outer TUI already guarantees the body area; each panel preserves its border and handles zero-width or zero-height inner content with the existing saturating layout conventions.
+
+The Agents panel is global to the current top-level process tree. Its contents do not depend on the focused transcript block, foreground tool call, or graph selection. Mouse-wheel scrolling over the panel changes only its own offset. Active rows sort before idle rows; starting sorts before working, and each status group uses creation time then immutable ID for deterministic ordering.
+
+### Rows
+
+Each agent occupies two terminal lines:
 
 ```text
-◆ ACTIVITY
-┌ compose                                      ● running
-├─ subagent -> Scout                           ● working
-│  └ Trace ACP lifecycle · gen 1 · 1m 12s
-├─ subagent -> Pip                             ● working
-│  └ Inspect graph event flow · gen 1 · 48s
-├─ shell                                       ✓ 1.2s
-└─ fork Scout -> Miso                          ◐ starting
-   └ Try the alternate approach · gen 1
+⠋ Scout · via Pip
+  Trace ACP lifecycle                         1m 12s
 ```
 
-A re-prompt shows the retained identity and new generation:
+The first line contains the state indicator and display name. Nested descendants append ` · via Parent` using the immediate parent's display name; top-level direct children omit it. The second line contains the bounded task summary and the current generation's elapsed time. Elapsed time is right-justified against the panel's inner edge. Task text truncates before the reserved duration column and never shifts the duration.
+
+Rows do not print textual status labels. State is communicated by the selected Kit-native indicator palette:
+
+- `starting`: yellow `Pulse::Child`, the slow orbiting child pulse;
+- `working`: cyan `Pulse::Tool`, the familiar tool spinner;
+- successful or ordinary `idle`: dim static `○`;
+- failed reusable `idle`: red static `✗` for four seconds after its failure timestamp, then dim `○`;
+- failed `removed` tombstone: red static `✗` for four seconds after its failure timestamp, then row deletion.
+
+Starting and working durations update on animation ticks. Elapsed time measures the current generation from its initial `starting` transition and freezes when the generation becomes idle or reaches terminal failure. A later prompt starts a new duration for the new generation. The four-second failure grace affects only glyph rendering and tombstone retention, not lifecycle status or footer counts.
+
+### Aggregate footer
+
+A fixed footer remains visible while rows scroll and shows the total plus nonzero lifecycle buckets:
 
 ```text
-├─ prompt -> Scout                             ● working
-│  └ Verify the proposed event model · gen 2
+3 agents · 2 working · 1 idle
 ```
 
-Status presentation is:
+or:
 
-- `starting`: yellow half-filled indicator;
-- `working`: active green/accent indicator;
-- `idle`: dimmed hollow indicator;
-- failed generation: red outcome on that operation, followed by idle when reusable.
+```text
+5 agents · 1 starting · 3 working · 1 idle
+```
 
-The TUI maintains live agent state keyed by immutable ID. When an agent becomes idle, its most recent operation remains visible with a dimmed live annotation. A new prompt moves the live annotation to the new operation; older operations remain ordinary history. Closing removes the live annotation and releases the name, while completed graph history retains the name and outcome recorded for that operation.
+Foreground and background are deliberately not separate buckets. A failed-but-reusable handle counts as idle immediately after its transition back to idle, including during its red-glyph grace period. Explicitly closed and terminally retired handles are excluded from the live total immediately, even if a failed tombstone remains visible for four seconds.
 
-Collapsed rows show name, bounded task, state, generation, and elapsed time. Existing expansion behavior exposes immutable ID, harness/model when relevant, and existing result or error detail.
+### Closing and history
 
-Elapsed time measures the current generation's operation from its initial `starting` transition. It updates while the operation is starting or working and freezes when that generation reaches idle or a terminal failure. A later prompt starts a new elapsed duration for the new generation.
-
-At narrow widths, existing graph layout and truncation rules apply. Names and task summaries truncate before status indicators so lifecycle remains readable.
+Idle handles remain visible until explicitly closed. Closing removes the live row and releases its locally reserved name. The Agents panel is live process state, not a historical operation log; completed transcript and tool output history remains unchanged.
 
 ## Persistence and restart behavior
 
@@ -249,6 +288,7 @@ The optional config field and optional serialized handle field are backward-comp
 - A failed initial child creation removes its registry entry and releases its name and capacity.
 - A failed reusable generation records the failed operation and returns the identity to idle.
 - A terminally retired child is omitted from listings and releases its name.
+- Child-process or forwarding-channel exit emits descendant cleanup so stale nested rows do not survive their owning subtree.
 - Unknown or stale IDs retain existing tool errors.
 - Runtime-event failures do not fail subagent operations.
 
@@ -258,26 +298,31 @@ Focused tests will cover:
 
 1. Built-in defaults, custom replacement, and an empty pool.
 2. Whitespace normalization, invalid configured names, and case-insensitive duplicates.
-3. Atomic deterministic allocation under concurrent starts.
+3. Atomic deterministic allocation under concurrent sibling starts.
 4. Release after failed creation, explicit close, and terminal retirement.
 5. Pool exhaustion, valid and invalid fallback names, collision suffixes, and length limits.
 6. Name preservation across `prompt` and fresh assignment across `fork`.
 7. Starting, working, idle, failed-reusable, retired, and closed transitions.
 8. Current handles with names and compatibility with old handles lacking names.
-9. Deterministic enriched `subagents({})` listings.
-10. Runtime-event serialization, parsing, and transition ordering.
-11. Exact association between operation-call IDs and graph child rows.
-12. Activity rendering, status styling, expansion details, and narrow-width truncation.
-13. Config documentation examples and relevant schema/snapshot expectations.
+9. Deterministic enriched direct-child `subagents({})` listings.
+10. Runtime-event serialization, parsing, background delivery, and transition ordering.
+11. Parent-context propagation and recursive forwarding across nested Kit runtimes.
+12. Top-level deduplication by immutable ID and strict-descendant cleanup after child or forwarding exit.
+13. Duplicate visible labels across branches remain separate internal rows.
+14. Reusable and terminal failure glyph grace, row retention, and footer accounting.
+15. `Ctrl+R` and `/agents` toggling without changing `Ctrl+G`.
+16. Two-column, three-column, and exact 40/30/30 narrow vertical layouts.
+17. Two-line rows, palette A indicators, right-justified duration, truncation, sorting, scrolling, and aggregate footer counts.
+18. Config documentation examples and relevant schema/snapshot expectations.
 
 The smallest relevant unit and TUI tests should run during development, followed by the repository's standard targeted verification for the touched crates.
 
 ## Documentation and release
 
-Update the user documentation for subagents/configuration and the TUI graph to explain names, fallback behavior, lifecycle states, and process-local scope.
+Update the user documentation for subagents/configuration and the TUI to explain names, fallback behavior, `Ctrl+R` and `/agents`, lifecycle indicators, foreground/background inclusion, observable nested descendants, ancestry-scoped uniqueness, and process-tree scope.
 
 This feature meaningfully changes Kit behavior and tool schemas. Under repository policy it requires a patch version bump before completion.
 
 ## Future extensions
 
-Possible follow-up work includes a machine-wide daemon-backed roster, persisted runtime history, filtering or sorting controls, and a standardized ACP proposal for child-session relationships. None are required for this design.
+Possible follow-up work includes a machine-wide daemon-backed roster, persisted runtime history, strict tree-wide name coordination, keyboard-focused roster navigation, filtering or sorting controls, and a standardized ACP proposal for child-session relationships. None are required for this design.
