@@ -1646,6 +1646,8 @@ impl App {
         self.pending_steers.clear();
         self.compacting = false;
         self.usage = None;
+        self.show_logs = false;
+        self.graph_pinned = None;
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
@@ -3278,16 +3280,20 @@ mod tests {
     }
 
     #[test]
-    fn switching_sessions_clears_only_transcript_derived_state() {
+    fn switching_sessions_restores_the_initial_view_but_retains_diagnostics() {
         let mut app = app();
         app.blocks
             .push(Block::User("old transcript".to_string().into()));
         app.logs.push("diagnostic".into());
+        app.show_logs = true;
+        app.graph_pinned = Some(true);
         app.usage = Some(super::ContextUsage { used: 1, size: 2 });
         app.start_session("fresh".into());
         assert_eq!(app.session_id.as_deref(), Some("fresh"));
         assert!(app.blocks.is_empty());
         assert!(app.usage.is_none());
+        assert!(!app.show_logs);
+        assert_eq!(app.graph_pinned, None);
         assert_eq!(app.logs, ["diagnostic"]);
     }
 
