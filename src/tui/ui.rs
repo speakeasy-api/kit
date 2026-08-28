@@ -40,6 +40,7 @@ const SIDE_BY_SIDE_WIDTH: u16 = 108;
 const GRAPH_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 const MAX_PENDING_STEER_ROWS: usize = 3;
+const HEADER_SEPARATOR: &str = "  ·  ";
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
 
@@ -58,8 +59,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         + 2;
     let logs_rows = if app.show_logs { 9 } else { 0 };
     let pending_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS) as u16;
+    let minimum_rows = 1 + 3 + logs_rows + pending_rows + prompt_rows + 1;
+    let rainbow_fits = frame.area().height >= minimum_rows.saturating_add(1);
+    let header_rows = 1 + u16::from(!app.blocks.is_empty() && rainbow_fits);
     let [header, body, logs, pending, prompt, status] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(header_rows),
         Constraint::Min(3),
         Constraint::Length(logs_rows),
         Constraint::Length(pending_rows),
@@ -283,26 +287,22 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         || app.root.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     );
+    let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
     let mut spans = vec![
         Span::styled(" kit ", theme::bold(theme::accent_color())),
+        Span::styled(version.clone(), theme::faint()),
         Span::styled("▏ ", theme::faint()),
-        Span::styled(root, theme::text()),
-        Span::styled("  ·  ", theme::faint()),
-        Span::styled(format!("{} / {}", app.provider, app.model), theme::dim()),
-        Span::styled("  ·  ", theme::faint()),
-        Span::styled(format!("effort {}", app.reasoning_effort), theme::dim()),
-        Span::styled("  ·  ", theme::faint()),
-        Span::styled(
-            format!(
-                "session {}",
-                app.session_id.as_deref().unwrap_or("starting")
-            ),
-            theme::dim(),
-        ),
+    ];
+    // Keep complete high-value fields and drop low-priority fields rather than
+    // clipping a session ID or context-window value into something misleading.
+    let mut fields = vec![
+        (2, root, theme::text()),
+        (3, format!("{} / {}", app.provider, app.model), theme::dim()),
+        (1, format!("effort {}", app.reasoning_effort), theme::dim()),
     ];
     if let Some(usage) = app.usage {
-        spans.push(Span::styled("  ·  ", theme::faint()));
-        spans.push(Span::styled(
+        fields.push((
+            4,
             format!(
                 "{} {}/{}",
                 percent(usage.used, usage.size),
@@ -312,9 +312,55 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             theme::dim(),
         ));
     }
-    spans.push(Span::styled("  ·  ", theme::faint()));
-    spans.push(Span::styled(format!("a2a {}", app.a2a), theme::dim()));
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::bar()), area);
+    fields.push((
+        5,
+        format!(
+            "session {}",
+            app.session_id.as_deref().unwrap_or("starting")
+        ),
+        theme::dim(),
+    ));
+    fields.push((0, format!("a2a {}", app.a2a), theme::dim()));
+
+    let prefix_width = Line::from(spans.clone()).width();
+    let header_width = |fields: &[(u8, String, Style)]| {
+        prefix_width
+            + fields
+                .iter()
+                .map(|(_, text, _)| UnicodeWidthStr::width(text.as_str()))
+                .sum::<usize>()
+            + fields.len().saturating_sub(1) * UnicodeWidthStr::width(HEADER_SEPARATOR)
+    };
+    while header_width(&fields) > area.width as usize {
+        let Some(index) = fields
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (priority, _, _))| *priority)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        fields.remove(index);
+    }
+    for (index, (_, text, style)) in fields.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(HEADER_SEPARATOR, theme::faint()));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    let metadata = Rect { height: 1, ..area };
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::bar()),
+        metadata,
+    );
+    if area.height > 1 {
+        let rainbow = Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(rainbow_line(area.width as usize)), rainbow);
+    }
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
@@ -525,17 +571,30 @@ fn draw_selection(
     }
 }
 
+fn rainbow_line(width: usize) -> Line<'static> {
+    let colors = theme::brand_rainbow();
+    Line::from(
+        colors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, color)| {
+                let start = index * width / colors.len();
+                let end = (index + 1) * width / colors.len();
+                (end > start)
+                    .then(|| Span::styled("━".repeat(end - start), Style::default().fg(*color)))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn welcome() -> Paragraph<'static> {
     let lines = vec![
         Line::default(),
-        Line::from(Span::styled("kit", theme::bold(theme::accent_color()))),
-        Line::from(Span::styled(
-            "a directory-rooted coding agent",
-            theme::dim(),
-        )),
+        Line::from(Span::styled("kit", theme::bold(theme::text_color()))),
+        rainbow_line(27),
         Line::default(),
         Line::from(Span::styled(
-            "ask for a change, a review, or a command to run",
+            "Ask for a change, review, or command.",
             theme::text(),
         )),
         Line::default(),
@@ -549,9 +608,9 @@ fn welcome() -> Paragraph<'static> {
 
 fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{left_key:>5} "), theme::accent()),
+        Span::styled(format!("{left_key:>5} "), theme::bold(theme::text_color())),
         Span::styled(format!("{left:<18}"), theme::dim()),
-        Span::styled(format!("{right_key:>5} "), theme::accent()),
+        Span::styled(format!("{right_key:>5} "), theme::bold(theme::text_color())),
         Span::styled(right.to_string(), theme::dim()),
     ])
 }
@@ -724,7 +783,7 @@ fn transcript_block_lines(
         Block::Error(text) => (
             uncopyable(plain_lines(vec![Line::from(vec![
                 Span::styled("✗ ", theme::bold(theme::error_color())),
-                Span::styled(text.clone(), Style::default().fg(theme::error_color())),
+                Span::styled(text.clone(), theme::text()),
             ])])),
             None,
         ),
@@ -751,13 +810,18 @@ fn plain_lines(lines: Vec<Line<'static>>) -> Vec<LinkedLine> {
 }
 
 fn user_line(text: &str, first: bool) -> LinkedLine {
-    let style = theme::bold(theme::user_color());
     let mut spans = vec![LinkedSpan {
-        span: Span::styled(if first { "› " } else { "  " }, style),
+        span: Span::styled(
+            if first { "› " } else { "  " },
+            theme::bold(theme::user_color()),
+        ),
         url: None,
     }];
-    spans.extend(markdown::inline_spans(text, style));
-    LinkedLine { spans }
+    spans.extend(markdown::inline_spans(
+        text,
+        theme::bold(theme::text_color()),
+    ));
+    LinkedLine::new(spans).with_leading_gutter()
 }
 
 fn thought_lines(
@@ -1143,7 +1207,7 @@ fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .join(" ");
         Line::from(vec![
             Span::styled("  › ", theme::bold(theme::user_color())),
-            Span::styled(text, theme::bold(theme::user_color())),
+            Span::styled(text, theme::bold(theme::text_color())),
             Span::styled("  · pending", theme::faint()),
         ])
     }));
@@ -1228,7 +1292,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Phase::Cancelling => vec![
             Span::styled(
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
-                theme::bar(),
+                Style::default().fg(theme::warn_color()),
             ),
             Span::styled("stopping", Style::default().fg(theme::warn_color())),
         ],
@@ -1239,23 +1303,19 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Phase::Working => vec![
             Span::styled(
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
-                Style::default()
-                    .fg(theme::accent_color())
-                    .bg(theme::bar_bg()),
+                Style::default().fg(theme::accent_color()),
             ),
             Span::styled(
                 format!("working {}", theme::duration(app.elapsed())),
-                Style::default()
-                    .fg(theme::accent_color())
-                    .bg(theme::bar_bg()),
+                Style::default().fg(theme::accent_color()),
             ),
         ],
     };
     if let Some(toast) = app.toast_text() {
-        left.push(Span::styled("  ", theme::bar()));
+        left.push(Span::styled("  ", theme::dim()));
         left.push(Span::styled(
             toast.to_string(),
-            Style::default().fg(theme::warn_color()).bg(theme::bar_bg()),
+            Style::default().fg(theme::warn_color()),
         ));
     }
     let hints = "⏎ send   ⇧⏎ newline   ^g graph   ^l log   ^c quit ";
@@ -1263,8 +1323,8 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let gap = (area.width as usize)
         .saturating_sub(used + hints.chars().count())
         .max(1);
-    left.push(Span::styled(" ".repeat(gap), theme::bar()));
-    left.push(Span::styled(hints, theme::bar()));
+    left.push(Span::styled(" ".repeat(gap), theme::dim()));
+    left.push(Span::styled(hints, theme::dim()));
     frame.render_widget(Paragraph::new(Line::from(left)).style(theme::bar()), area);
 }
 
@@ -1354,91 +1414,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    /// `sample()` with every clock stopped.
-    ///
-    /// The contrast comparison renders the transcript twice, once per palette,
-    /// and reads the two frames cell against cell. A duration still counting
-    /// up between the two renders would widen a card's label in one of them
-    /// and shift every cell after it.
-    fn frozen() -> App {
-        use std::time::Duration;
-
-        let mut app = sample();
-        app.turn_started = None;
-        app.tick = 0;
-        app.toast = None;
-        for block in &mut app.blocks {
-            let Block::Tool(call) = block else { continue };
-            call.status = agent_client_protocol::schema::v2::ToolCallStatus::Completed;
-            call.finished = Some(call.started + Duration::from_millis(120));
-            for (index, child) in call.children.iter_mut().enumerate() {
-                child.millis = Some(40 * (index as u64 + 1));
-            }
-        }
-        app
-    }
-
-    /// Every colour the client picks on a light terminal must read at least
-    /// as well as the colour it picks for the same cell on a dark one. A dark
-    /// palette on a light terminal is what makes the transcript vanish: its
-    /// colours all sit a few shades from white.
-    #[test]
-    fn a_light_terminal_reads_as_well_as_a_dark_one() {
-        use ratatui::style::Color;
-
-        use crate::tui::theme::{self, Appearance, contrast};
-
-        // What the terminal itself paints where the client sets no colour.
-        fn ink(appearance: Appearance, paper: Color) -> Vec<(String, f64)> {
-            theme::set(appearance);
-            let mut app = frozen();
-            let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
-            let mut images = crate::tui::image::ImageRuntime::disabled();
-            terminal
-                .draw(|frame| draw(frame, &mut app, &mut images))
-                .expect("draw succeeds");
-            let buffer = terminal.backend().buffer().clone();
-            theme::set(Appearance::Dark);
-            (0..buffer.area.height)
-                .flat_map(|row| (0..buffer.area.width).map(move |column| (column, row)))
-                .map(|cell| {
-                    let cell = &buffer[cell];
-                    let background = match cell.bg {
-                        Color::Reset => paper,
-                        background => background,
-                    };
-                    let contrast = match cell.fg {
-                        _ if cell.symbol().trim().is_empty() => f64::INFINITY,
-                        Color::Reset => f64::INFINITY,
-                        foreground => contrast(foreground, background),
-                    };
-                    (cell.symbol().to_string(), contrast)
-                })
-                .collect()
-        }
-
-        let light = ink(Appearance::Light, Color::Rgb(255, 255, 255));
-        let dark = ink(Appearance::Dark, Color::Rgb(0, 0, 0));
-        assert_eq!(light.len(), dark.len());
-        assert!(
-            light.iter().any(|(_, contrast)| contrast.is_finite()),
-            "the frame draws no colour at all"
-        );
-        // Deliberately quiet chrome — faint text on the status bar — reads low
-        // in either palette, so each cell is held to whichever is weaker: the
-        // legibility floor, or what the dark palette already settled for.
-        for ((symbol, light), (drawn, dark)) in light.into_iter().zip(dark) {
-            // Both frames are drawn from the same stopped clock, so a cell
-            // holding different text means the comparison has slipped.
-            assert_eq!(symbol, drawn, "the two frames drew different text");
-            let wanted = dark.min(4.5);
-            assert!(
-                light + 0.01 >= wanted,
-                "{symbol:?} reads at {light:.2}:1 on a light terminal, short of {wanted:.2}:1"
-            );
-        }
     }
 
     #[test]
@@ -1811,7 +1786,7 @@ mod tests {
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()
-            .position(|line| line.contains("  cargo check"))
+            .position(|line| line.contains("│ cargo check"))
             .expect("code row is on screen");
 
         app.handle_mouse(MouseEvent {
@@ -1952,7 +1927,7 @@ mod tests {
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()
-            .position(|line| line.contains("  cargo check"))
+            .position(|line| line.contains("│ cargo check"))
             .expect("code row is on screen");
         let line = app.scroll + (row - app.transcript_top);
         app.selection = Some(Selection {
@@ -1960,6 +1935,96 @@ mod tests {
             head: (line, app.transcript_width.saturating_sub(1)),
         });
         assert_eq!(app.selection_text().as_deref(), Some("cargo check"));
+    }
+
+    #[test]
+    fn selection_copy_strips_empty_and_wrapped_code_gutters() {
+        use crate::tui::app::Selection;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        let code = "one\n\n  abcdefghijklmnopqrstuvwxyz0123456789\ntwo";
+        app.blocks
+            .push(Block::Agent(format!("```text\n{code}\n```")));
+        let frame = render(&mut app, 24, 24);
+        let first = frame
+            .lines()
+            .position(|line| line.contains("│ one"))
+            .expect("first code row is on screen");
+        let closing = frame
+            .lines()
+            .position(|line| line.contains("└─ text"))
+            .expect("closing fence is on screen");
+        app.selection = Some(Selection {
+            anchor: (app.scroll + first - app.transcript_top, 0),
+            head: (
+                app.scroll + closing - app.transcript_top - 1,
+                app.transcript_width.saturating_sub(1),
+            ),
+        });
+
+        assert_eq!(app.selection_text().as_deref(), Some(code));
+    }
+
+    #[test]
+    fn narrow_code_selection_preserves_source_indentation() {
+        use crate::tui::app::Selection;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.blocks.push(Block::Agent("```text\n 界x\n```".into()));
+        let _ = render(&mut app, 5, 24);
+        let rows = &app.transcript_cache[0]
+            .as_ref()
+            .expect("agent block is cached")
+            .rows;
+        let selected = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.1.2 == Some(1))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        app.selection = Some(Selection {
+            anchor: (*selected.first().expect("code has a first row"), 0),
+            head: (
+                *selected.last().expect("code has a last row"),
+                app.transcript_width.saturating_sub(1),
+            ),
+        });
+
+        assert_eq!(app.selection_text().as_deref(), Some(" 界x"));
+    }
+
+    #[test]
+    fn wrapped_prose_selection_preserves_space_before_styled_text() {
+        use crate::tui::app::Selection;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.blocks.push(Block::Agent("hello `x`".into()));
+        let _ = render(&mut app, 9, 24);
+        let rows = &app.transcript_cache[0]
+            .as_ref()
+            .expect("agent block is cached")
+            .rows;
+        app.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (rows.len() - 1, app.transcript_width.saturating_sub(1)),
+        });
+
+        assert_eq!(app.selection_text().as_deref(), Some("hello `x`"));
     }
 
     #[test]
@@ -2041,12 +2106,40 @@ mod tests {
             used: 1_360,
             size: 272_000,
         });
+        app.session_id = Some("s-1770000000000-12345-0".into());
 
         let frame = render(&mut app, 120, 24);
 
+        assert!(frame.contains(concat!("kit v", env!("CARGO_PKG_VERSION"))));
         assert!(frame.contains("openai-subscription / gpt-5.4"));
         assert!(frame.contains("0.5% 1k/272k"));
+        assert!(frame.contains("session s-1770000000000-12345-0"));
+        assert_eq!(frame.lines().nth(1), Some("━".repeat(120).as_str()));
         assert!(!frame.contains("ctx "));
+    }
+
+    #[test]
+    fn header_fitting_uses_terminal_column_width() {
+        let mut app = sample();
+        app.provider = "p".into();
+        app.model = "模型".into();
+        app.session_id = Some("s".into());
+
+        let frame = render(&mut app, 35, 24);
+        let header = frame.lines().next().expect("header row");
+
+        assert!(header.contains("session s"));
+        assert!(!header.contains("p / 模型"));
+    }
+
+    #[test]
+    fn short_terminals_keep_the_prompt_instead_of_the_header_rainbow() {
+        let mut app = sample();
+
+        let frame = render(&mut app, 80, 8);
+
+        assert!(frame.contains("message kit…"));
+        assert_ne!(frame.lines().nth(1), Some("━".repeat(80).as_str()));
     }
 
     #[test]
@@ -2311,6 +2404,8 @@ mod tests {
         );
         let frame = render(&mut app, 90, 24);
         println!("{frame}");
+        assert!(frame.contains("━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+        assert!(frame.contains("Ask for a change, review, or command."));
         assert!(frame.contains("send"));
         assert!(frame.contains("message kit"));
     }

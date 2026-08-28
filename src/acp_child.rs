@@ -231,7 +231,7 @@ impl AcpHarnesses {
             command
         };
         // Every trusted profile is spawned directly (never through a shell)
-        // with the runtime root as cwd.
+        // with Kit's working directory as cwd.
         command.current_dir(&config.root);
         Ok(command)
     }
@@ -300,7 +300,7 @@ struct LaunchContext {
 impl LaunchContext {
     fn error(&self, phase: &str, error: impl std::fmt::Display) -> String {
         format!(
-            "ACP harness {phase}: {error} (harness={:?}, source={}, cwd=runtime root)",
+            "ACP harness {phase}: {error} (harness={:?}, source={}, cwd=Kit working directory)",
             self.harness, self.source
         )
     }
@@ -1258,7 +1258,7 @@ mod tests {
         let error = context.error("handshake timeout", "no response within 30 seconds");
         assert!(error.contains("harness=\"acp.safe-name\""));
         assert!(error.contains("source=configured ACP profile"));
-        assert!(error.contains("cwd=runtime root"));
+        assert!(error.contains("cwd=Kit working directory"));
         assert!(!error.contains("secret-command-name"));
         assert!(!error.contains("secret-argument"));
         assert!(!error.contains("/private/runtime/root"));
@@ -1321,7 +1321,7 @@ mod tests {
         assert!(error.contains("protocol handshake failure"), "{error}");
         assert!(error.contains("harness=\"acp.broken\""), "{error}");
         assert!(error.contains("source=configured ACP profile"), "{error}");
-        assert!(error.contains("cwd=runtime root"), "{error}");
+        assert!(error.contains("cwd=Kit working directory"), "{error}");
         assert!(
             error.contains("the child did not complete the ACP handshake"),
             "{error}"
@@ -1379,7 +1379,7 @@ mod tests {
         assert!(error.contains("17"), "{error}");
         assert!(error.contains("harness=\"acp.exits\""), "{error}");
         assert!(error.contains("source=configured ACP profile"), "{error}");
-        assert!(error.contains("cwd=runtime root"), "{error}");
+        assert!(error.contains("cwd=Kit working directory"), "{error}");
         assert!(!error.contains("python3"), "{error}");
         assert!(!error.contains("raise SystemExit"), "{error}");
         assert!(!error.contains(root.path().to_string_lossy().as_ref()));
@@ -1565,7 +1565,7 @@ mod tests {
             assert!(error.contains("spawn failure"), "{error}");
             assert!(error.contains("harness=\"acp.broken\""), "{error}");
             assert!(error.contains("source=configured ACP profile"), "{error}");
-            assert!(error.contains("cwd=runtime root"), "{error}");
+            assert!(error.contains("cwd=Kit working directory"), "{error}");
             assert!(!error.contains("kit-test-acp-executable-that-does-not-exist"));
             assert!(!error.contains(root.path().to_string_lossy().as_ref()));
         }

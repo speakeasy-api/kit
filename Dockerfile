@@ -60,7 +60,7 @@ FROM debian:${DEBIAN_SUITE} AS bookworm
 ARG VERSION
 ARG REVISION
 LABEL org.opencontainers.image.title="Kit" \
-      org.opencontainers.image.description="Directory-rooted coding agent runtime" \
+      org.opencontainers.image.description="Coding agent runtime and terminal client" \
       org.opencontainers.image.source="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.url="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.documentation="https://github.com/speakeasy-api/kit#readme" \
@@ -91,7 +91,7 @@ FROM debian:${DEBIAN_SUITE}-slim AS slim
 ARG VERSION
 ARG REVISION
 LABEL org.opencontainers.image.title="Kit" \
-      org.opencontainers.image.description="Directory-rooted coding agent runtime" \
+      org.opencontainers.image.description="Coding agent runtime and terminal client" \
       org.opencontainers.image.source="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.url="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.documentation="https://github.com/speakeasy-api/kit#readme" \
@@ -124,7 +124,7 @@ FROM alpine:${ALPINE_VERSION} AS alpine
 ARG VERSION
 ARG REVISION
 LABEL org.opencontainers.image.title="Kit" \
-      org.opencontainers.image.description="Directory-rooted coding agent runtime" \
+      org.opencontainers.image.description="Coding agent runtime and terminal client" \
       org.opencontainers.image.source="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.url="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.documentation="https://github.com/speakeasy-api/kit#readme" \

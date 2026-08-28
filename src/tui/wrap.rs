@@ -20,9 +20,17 @@ pub struct LinkedSpan {
 #[derive(Clone, Debug)]
 pub struct LinkedLine {
     pub spans: Vec<LinkedSpan>,
+    leading_gutter: Option<bool>,
 }
 
 impl LinkedLine {
+    pub fn new(spans: Vec<LinkedSpan>) -> Self {
+        Self {
+            spans,
+            leading_gutter: Some(false),
+        }
+    }
+
     pub fn plain(line: Line<'static>) -> Self {
         Self {
             spans: line
@@ -30,7 +38,13 @@ impl LinkedLine {
                 .into_iter()
                 .map(|span| LinkedSpan { span, url: None })
                 .collect(),
+            leading_gutter: None,
         }
+    }
+
+    pub fn with_leading_gutter(mut self) -> Self {
+        self.leading_gutter = Some(true);
+        self
     }
 
     pub fn line(&self) -> Line<'static> {
@@ -113,7 +127,7 @@ pub fn wrap_linked_tagged<T: Clone>(
 }
 
 fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let indent = hanging_indent(line).min(width / 2);
+    let indent = hanging_indent(line, None).min(width / 2);
     let mut lines = Vec::new();
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
@@ -127,7 +141,7 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
         if blank && spans.is_empty() && !lines.is_empty() {
             continue;
         }
-        if used + chunk_width > width && !spans.is_empty() {
+        if used + chunk_width > width && used > indent {
             lines.push(flush(&mut spans));
             used = 0;
             if blank {
@@ -173,7 +187,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
     if line.width() <= width {
         return vec![(line.spans.clone(), String::new())];
     }
-    let indent = hanging_indent(&line.line()).min(width / 2);
+    let indent = hanging_indent(&line.line(), line.leading_gutter).min(width / 2);
     let mut lines = Vec::new();
     let mut spans = Vec::new();
     let mut separator = String::new();
@@ -186,7 +200,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
             separator.push_str(&chunk);
             continue;
         }
-        if used + chunk_width > width && !spans.is_empty() {
+        if used + chunk_width > width && used > indent {
             let before = std::mem::take(&mut separator);
             let trailing = trim_linked_and_push(&mut lines, &mut spans, before);
             separator.push_str(&trailing);
@@ -290,7 +304,15 @@ fn linked_flush(spans: Vec<LinkedSpan>) -> (Line<'static>, Vec<LinkHit>) {
 
 fn linked_chunks(line: &LinkedLine) -> Vec<(String, Style, Option<String>)> {
     let mut chunks = Vec::new();
-    for linked in &line.spans {
+    for (index, linked) in line.spans.iter().enumerate() {
+        if index == 0 && line.leading_gutter == Some(true) {
+            chunks.push((
+                linked.span.content.to_string(),
+                linked.span.style,
+                linked.url.clone(),
+            ));
+            continue;
+        }
         for (chunk, style) in span_chunks(&linked.span) {
             chunks.push((chunk, style, linked.url.clone()));
         }
@@ -333,19 +355,35 @@ fn span_chunks(span: &Span<'static>) -> Vec<(String, Style)> {
 
 /// Continuation indent: the line's own leading whitespace, plus the width of a
 /// leading gutter span such as `› ` or `✓ ` so wrapped text stays aligned.
-fn hanging_indent(line: &Line<'static>) -> usize {
+fn hanging_indent(line: &Line<'static>, leading_gutter: Option<bool>) -> usize {
     let text: String = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect();
-    let leading = text.len() - text.trim_start().len();
-    let gutter = line
-        .spans
-        .first()
-        .filter(|span| span.content.ends_with(' ') && span.content.width() <= 8)
-        .map_or(0, |span| span.content.width());
-    leading.max(gutter)
+    let leading_width = |text: &str| {
+        let end = text.len() - text.trim_start().len();
+        UnicodeWidthStr::width(&text[..end])
+    };
+    let leading = leading_width(&text);
+    let gutter_span = match leading_gutter {
+        Some(true) => line.spans.first(),
+        Some(false) => None,
+        None => line
+            .spans
+            .first()
+            .filter(|span| span.content.ends_with(' ') && span.content.width() <= 8),
+    };
+    let Some(gutter_span) = gutter_span else {
+        return leading;
+    };
+    let gutter = gutter_span.content.width();
+    let content_indent = if gutter_span.content.trim().is_empty() {
+        0
+    } else {
+        leading_width(&text[gutter_span.content.len()..])
+    };
+    leading.max(gutter + content_indent)
 }
 
 #[cfg(test)]
@@ -376,6 +414,38 @@ mod tests {
     fn hangs_continuations_under_the_gutter() {
         let line = Line::from(vec![Span::raw("› "), Span::raw("alpha beta gamma")]);
         assert_eq!(text(&wrap(&[line], 10)), ["› alpha", "  beta", "  gamma"]);
+    }
+
+    #[test]
+    fn preserves_content_indent_after_a_visible_gutter() {
+        let line = Line::from(vec![Span::raw("│ "), Span::raw("  alpha beta")]);
+        assert_eq!(
+            text(&wrap(std::slice::from_ref(&line), 10)),
+            ["│   alpha", "    beta"]
+        );
+
+        let linked = wrap_linked_tagged(&[(LinkedLine::plain(line).with_leading_gutter(), ())], 10);
+        let linked_lines = linked
+            .into_iter()
+            .map(|(line, (), _, _)| line)
+            .collect::<Vec<_>>();
+        assert_eq!(text(&linked_lines), ["│   alpha", "    beta"]);
+    }
+
+    #[test]
+    fn fills_the_first_row_before_splitting_an_oversized_first_token() {
+        let line = Line::from(vec![Span::raw("│ "), Span::raw("  abcdefghijk")]);
+        assert_eq!(
+            text(&wrap(std::slice::from_ref(&line), 10)),
+            ["│   abcdef", "    ghijk"]
+        );
+
+        let linked = wrap_linked_tagged(&[(LinkedLine::plain(line).with_leading_gutter(), ())], 10);
+        let linked_lines = linked
+            .into_iter()
+            .map(|(line, (), _, _)| line)
+            .collect::<Vec<_>>();
+        assert_eq!(text(&linked_lines), ["│   abcdef", "    ghijk"]);
     }
 
     #[test]

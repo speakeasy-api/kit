@@ -1110,7 +1110,6 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
 }
 
 fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
-    theme::detect();
     let terminal = ratatui::try_init()?;
     // Query after entering the alternate screen but before the event stream owns
     // terminal input, as required by ratatui-image. The query has a short bound.

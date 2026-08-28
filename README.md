@@ -1,6 +1,6 @@
 # Kit
 
-Kit is a small, directory-rooted coding-agent runtime.
+Kit is a coding agent runtime and terminal client.
 
 It exposes:
 
@@ -9,7 +9,7 @@ It exposes:
 - a Ratatui ACP client
 - one model-visible tool: `compose`, backed by released Runlet
 - hidden compose children for bundled Kit documentation, shell commands, hunk edits, reusable ACP subagents, A2A calls, Agent Skills, and MCP discovery/authentication
-- `AGENTS.md` instructions loaded from the runtime root and its ancestors
+- `AGENTS.md` instructions loaded from the working directory and its ancestors
 - Agent Skills discovered from `<root>/.agents/skills`, `~/.agents/skills`, and validated local or checksum-pinned archive [Agent Plugins](docs/user/agent-plugins.md)
 - OpenAI subscription access through Kit's native ChatGPT OAuth login
 - OpenRouter through AgentKit's OpenRouter provider adapter
@@ -269,8 +269,8 @@ the fully resolved settings, including an explicit false, to its TUI server and
 nested `acp.kit` children. The OTLP subscriber exports only AgentKit loop/MCP
 semantic targets and omits source location, thread, tracing target, and span
 busy/idle metadata. ACP profiles are trusted, strict `command`/`args` argv
-configurations: Kit does not invoke a shell and always sets the child cwd to the
-runtime root. Multiple names may be configured. `[subagent].harness` selects the
+configurations: Kit does not invoke a shell and always sets the child cwd to Kit's
+working directory. Multiple names may be configured. `[subagent].harness` selects the
 default; references must use the fully qualified `acp.<name>` form. When
 omitted, `acp.kit` runs the current executable with `acp` as its base argv. An
 explicit `[acp.kit]` overrides that executable/base argv. In both cases Kit then
@@ -291,8 +291,8 @@ spawns it directly, so shell quoting, pipes, environment assignments, and
 compound commands do not work. Use an executable on `PATH` for a portable
 configuration, or an absolute path for a machine-specific one. The agent must
 keep stdout protocol-only, may log to stderr, and must support `initialize`,
-`session/new`, and `session/prompt`. Kit sets its cwd to the runtime root and
-inherits the parent environment.
+`session/new`, and `session/prompt`. Kit sets its cwd to Kit's working directory
+and inherits the parent environment.
 
 For example, these profiles pin the npm adapters while leaving the executable
 lookup portable:

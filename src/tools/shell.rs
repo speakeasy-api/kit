@@ -23,7 +23,7 @@ impl ShellTool {
             root,
             spec: ToolSpec::new(
                 ToolName::new("shell"),
-                "Run a shell command with the runtime root as its working directory.",
+                "Run a shell command from Kit's working directory. Commands can access any path allowed to the Kit process.",
                 json!({
                     "type": "object",
                     "properties": {
