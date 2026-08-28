@@ -5,8 +5,8 @@ use std::ops::Range;
 use agent_client_protocol::schema::v2::{ToolCallStatus, ToolKind};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Position, Rect},
-    style::{Modifier, Style},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block as Panel, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -40,6 +40,11 @@ const SIDE_BY_SIDE_WIDTH: u16 = 108;
 const GRAPH_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 const MAX_PENDING_STEER_ROWS: usize = 3;
+const START_MAX_WIDTH: u16 = 96;
+const START_LOGO_ROWS: u16 = 3;
+const START_LOGO_GAP: u16 = 2;
+const START_PROMPT_CHROME_ROWS: u16 = 4;
+const START_MIN_PROMPT_ROWS: u16 = START_PROMPT_CHROME_ROWS + 1;
 const HEADER_SEPARATOR: &str = "  ·  ";
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
@@ -50,36 +55,65 @@ type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
-    let prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
-    app.prompt_width = prompt_width;
-    let prompt_rows = app
+    let start_width = frame
+        .area()
+        .width
+        .saturating_sub(4)
+        .min(START_MAX_WIDTH)
+        .max(1);
+    let start_prompt_width = start_width.saturating_sub(4).max(1) as usize;
+    let available_start_prompt_rows = frame
+        .area()
+        .height
+        .saturating_sub(START_LOGO_ROWS + START_LOGO_GAP + 1);
+    let start_prompt_rows = (app
         .editor
-        .display_rows(prompt_width)
+        .display_rows(start_prompt_width)
         .clamp(1, MAX_PROMPT_ROWS) as u16
-        + 2;
-    let logs_rows = if app.show_logs { 9 } else { 0 };
-    let pending_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS) as u16;
-    let minimum_rows = 1 + 3 + logs_rows + pending_rows + prompt_rows + 1;
-    let rainbow_fits = frame.area().height >= minimum_rows.saturating_add(1);
-    let header_rows = 1 + u16::from(!app.blocks.is_empty() && rainbow_fits);
-    let [header, body, logs, pending, prompt, status] = Layout::vertical([
-        Constraint::Length(header_rows),
-        Constraint::Min(3),
-        Constraint::Length(logs_rows),
-        Constraint::Length(pending_rows),
-        Constraint::Length(prompt_rows),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+        + START_PROMPT_CHROME_ROWS)
+        .min(available_start_prompt_rows);
+    let show_start = frame.area().width >= 20
+        && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
+        && app.blocks.is_empty()
+        && app.pending_steers.is_empty()
+        && !app.show_logs
+        && !app.show_graph();
 
-    draw_header(frame, app, header);
-    draw_body(frame, app, images, body);
-    if app.show_logs {
-        draw_logs(frame, app, logs);
+    if show_start {
+        app.prompt_width = start_prompt_width;
+        draw_start(frame, app, start_width, start_prompt_rows);
+    } else {
+        let prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
+        app.prompt_width = prompt_width;
+        let prompt_rows = app
+            .editor
+            .display_rows(prompt_width)
+            .clamp(1, MAX_PROMPT_ROWS) as u16
+            + 2;
+        let logs_rows = if app.show_logs { 9 } else { 0 };
+        let pending_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS) as u16;
+        let minimum_rows = 1 + 3 + logs_rows + pending_rows + prompt_rows + 1;
+        let rainbow_fits = frame.area().height >= minimum_rows.saturating_add(1);
+        let header_rows = 1 + u16::from(!app.blocks.is_empty() && rainbow_fits);
+        let [header, body, logs, pending, prompt, status] = Layout::vertical([
+            Constraint::Length(header_rows),
+            Constraint::Min(3),
+            Constraint::Length(logs_rows),
+            Constraint::Length(pending_rows),
+            Constraint::Length(prompt_rows),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        draw_header(frame, app, header);
+        draw_body(frame, app, images, body);
+        if app.show_logs {
+            draw_logs(frame, app, logs);
+        }
+        draw_pending_steers(frame, app, pending);
+        draw_prompt(frame, app, prompt);
+        draw_status(frame, app, status);
     }
-    draw_pending_steers(frame, app, pending);
-    draw_prompt(frame, app, prompt);
-    draw_status(frame, app, status);
     if app.model_dialog.is_some() {
         draw_model_dialog(frame, app);
     } else if app.effort_dialog.is_some() {
@@ -359,8 +393,27 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             height: 1,
             ..area
         };
-        frame.render_widget(Paragraph::new(rainbow_line(area.width as usize)), rainbow);
+        frame.render_widget(
+            Paragraph::new(rainbow_line(area.width as usize, "━")),
+            rainbow,
+        );
     }
+}
+
+fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
+    let area = frame.area();
+    let height = START_LOGO_ROWS + START_LOGO_GAP + prompt_rows + 1;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let mut y = area.y + area.height.saturating_sub(height) / 2;
+
+    let logo = Rect::new(x, y, width, START_LOGO_ROWS);
+    frame.render_widget(welcome_logo(), logo);
+    y += START_LOGO_ROWS + START_LOGO_GAP;
+
+    let prompt = Rect::new(x, y, width, prompt_rows);
+    draw_start_prompt(frame, app, prompt);
+    let status = Rect::new(x, y + prompt_rows, width, 1);
+    draw_status(frame, app, status);
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
@@ -393,7 +446,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         app.row_calls.clear();
         app.row_links.clear();
         app.row_code.clear();
-        frame.render_widget(welcome(), inner);
+        frame.render_widget(welcome_logo(), inner);
         return;
     }
 
@@ -571,7 +624,7 @@ fn draw_selection(
     }
 }
 
-fn rainbow_line(width: usize) -> Line<'static> {
+fn rainbow_line(width: usize, symbol: &str) -> Line<'static> {
     let colors = theme::brand_rainbow();
     Line::from(
         colors
@@ -581,38 +634,22 @@ fn rainbow_line(width: usize) -> Line<'static> {
                 let start = index * width / colors.len();
                 let end = (index + 1) * width / colors.len();
                 (end > start)
-                    .then(|| Span::styled("━".repeat(end - start), Style::default().fg(*color)))
+                    .then(|| Span::styled(symbol.repeat(end - start), Style::default().fg(*color)))
             })
             .collect::<Vec<_>>(),
     )
 }
 
-fn welcome() -> Paragraph<'static> {
+fn welcome_logo() -> Paragraph<'static> {
     let lines = vec![
-        Line::default(),
-        Line::from(Span::styled("kit", theme::bold(theme::text_color()))),
-        rainbow_line(27),
-        Line::default(),
-        Line::from(Span::styled(
-            "Ask for a change, review, or command.",
-            theme::text(),
-        )),
-        Line::default(),
-        hint("⏎", "send", "⇧⏎", "newline"),
-        hint("esc", "interrupt", "^c", "quit"),
-        hint("^g", "runtime graph", "^l", "agent log"),
-        hint("^t", "reasoning", "⇧↑ ⇧↓", "scroll"),
+        Line::from(Span::styled("█   ▀ ▄█▄              ", theme::text())),
+        Line::from(Span::styled("█▄▀ █  █               ", theme::text())),
+        Line::from(vec![
+            Span::styled("█▀▄ █  █▄", theme::text()),
+            Span::styled("  by Speakeasy", theme::dim()),
+        ]),
     ];
-    Paragraph::new(lines)
-}
-
-fn hint(left_key: &str, left: &str, right_key: &str, right: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{left_key:>5} "), theme::bold(theme::text_color())),
-        Span::styled(format!("{left:<18}"), theme::dim()),
-        Span::styled(format!("{right_key:>5} "), theme::bold(theme::text_color())),
-        Span::styled(right.to_string(), theme::dim()),
-    ])
+    Paragraph::new(lines).alignment(Alignment::Center)
 }
 
 /// Renders the transcript, tagging each line with the tool call it belongs to
@@ -1214,6 +1251,33 @@ fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let inner = draw_start_prompt_frame(frame, area);
+    let [input, _, metadata] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    draw_prompt_editor(frame, app, input, theme::dim());
+
+    let metadata = Rect {
+        x: metadata.x + 2,
+        width: metadata.width.saturating_sub(2),
+        ..metadata
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(app.provider.clone(), theme::accent()),
+            Span::styled("  ·  ", theme::dim()),
+            Span::styled(app.model.clone(), theme::text()),
+            Span::styled("  ·  ", theme::dim()),
+            Span::styled(format!("effort {}", app.reasoning_effort), theme::dim()),
+        ])),
+        metadata,
+    );
+}
+
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
         Style::default().fg(theme::accent_color())
@@ -1225,9 +1289,44 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    draw_prompt_editor(frame, app, inner, theme::faint());
+}
 
+fn draw_start_prompt_frame(frame: &mut Frame<'_>, area: Rect) -> Rect {
+    let surface = theme::composer();
+    frame.render_widget(Panel::default().style(surface), area);
+    if area.width >= 2
+        && area.height >= 2
+        && let Some(color) = surface.bg
+    {
+        let corner = Style::default().fg(color).bg(Color::Reset);
+        let y = area.y + area.height - 1;
+        frame.render_widget(
+            Paragraph::new(Span::styled("▜", corner)),
+            Rect::new(area.x, y, 1, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled("▛", corner)),
+            Rect::new(area.x + area.width - 1, y, 1, 1),
+        );
+    }
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let rainbow = Rect { height: 1, ..area };
+    frame.render_widget(
+        Paragraph::new(rainbow_line(area.width as usize, "▔")),
+        rainbow,
+    );
+    inner
+}
+
+fn draw_prompt_editor(frame: &mut Frame<'_>, app: &App, area: Rect, placeholder_style: Style) {
     let [gutter, field] =
-        Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+        Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(area);
     frame.render_widget(
         Paragraph::new(Span::styled("›", theme::bold(theme::accent_color()))),
         gutter,
@@ -1244,7 +1343,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
             } else {
                 "message kit…"
             },
-            theme::faint(),
+            placeholder_style,
         ))]
     } else {
         prompt_lines(rows, app.editor.text(), &app.available_commands)
@@ -1760,12 +1859,8 @@ mod tests {
         }
         let frame = render(&mut app, 60, 20);
         println!("{frame}");
-        let rows: Vec<&str> = frame.lines().collect();
-        let prompt: Vec<&&str> = rows.iter().filter(|row| row.starts_with('│')).collect();
-        assert!(prompt.len() >= 2, "prompt should have grown: {prompt:?}");
-        for row in prompt {
-            assert!(row.ends_with('│'), "prompt row overflowed: {row:?}");
-        }
+        assert!(frame.contains("explain how the compose tool dispatches hidden"));
+        assert!(frame.contains("children and everything internal to it"));
 
         // A prompt taller than the cap scrolls inside the box instead of
         // pushing the transcript off the screen.
@@ -1773,9 +1868,64 @@ mod tests {
             app.editor.insert_str("more text to type ");
         }
         let frame = render(&mut app, 60, 20);
-        let prompt = frame.lines().filter(|row| row.starts_with('│')).count();
-        assert_eq!(prompt, MAX_PROMPT_ROWS);
+        let rows = frame.lines().collect::<Vec<_>>();
+        let rainbow = rows
+            .iter()
+            .rposition(|row| row.trim_start().starts_with('▔'))
+            .expect("prompt rainbow");
+        let status = rows
+            .iter()
+            .skip(rainbow + 1)
+            .position(|row| row.contains("send"))
+            .map(|offset| rainbow + 1 + offset)
+            .expect("status row");
+        assert_eq!(status - rainbow - 4, MAX_PROMPT_ROWS);
         assert!(frame.contains("message kit") || frame.contains("more text"));
+    }
+
+    #[test]
+    fn start_screen_stays_stable_as_the_prompt_grows() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        let initial = render(&mut app, 60, 11);
+        let prompt_width = app.prompt_width;
+        app.editor.insert_str(&"wrapped prompt ".repeat(80));
+        let grown = render(&mut app, 60, 11);
+
+        assert!(initial.contains("by Speakeasy"));
+        assert!(grown.contains("by Speakeasy"));
+        assert!(grown.contains('▔'));
+        assert_eq!(app.prompt_width, prompt_width);
+    }
+
+    #[test]
+    fn compact_prompt_still_wraps_and_caps_after_submission() {
+        let mut app = sample();
+        app.editor.insert_str(&"more text to type ".repeat(80));
+        let frame = render(&mut app, 60, 20);
+        let rows = frame.lines().collect::<Vec<_>>();
+        let status = rows
+            .iter()
+            .position(|row| row.contains("send"))
+            .expect("status row");
+        let bottom = status - 1;
+        let top = rows[..bottom]
+            .iter()
+            .rposition(|row| row.starts_with('╭'))
+            .expect("prompt top border");
+        let prompt = &rows[top + 1..bottom];
+
+        assert_eq!(prompt.len(), MAX_PROMPT_ROWS);
+        assert!(
+            prompt
+                .iter()
+                .all(|row| row.starts_with('│') && row.ends_with('│'))
+        );
+        assert!(rows[bottom].starts_with('╰'));
     }
 
     #[test]
@@ -2114,7 +2264,7 @@ mod tests {
         assert!(frame.contains("openai-subscription / gpt-5.4"));
         assert!(frame.contains("0.5% 1k/272k"));
         assert!(frame.contains("session s-1770000000000-12345-0"));
-        assert_eq!(frame.lines().nth(1), Some("━".repeat(120).as_str()));
+        assert!(frame.lines().any(|line| line == "━".repeat(120)));
         assert!(!frame.contains("ctx "));
     }
 
@@ -2139,7 +2289,7 @@ mod tests {
         let frame = render(&mut app, 80, 8);
 
         assert!(frame.contains("message kit…"));
-        assert_ne!(frame.lines().nth(1), Some("━".repeat(80).as_str()));
+        assert!(!frame.lines().any(|line| line == "━".repeat(80)));
     }
 
     #[test]
@@ -2395,6 +2545,21 @@ mod tests {
     }
 
     #[test]
+    fn restores_the_compact_prompt_after_the_first_submission() {
+        let mut app = sample();
+        let frame = render(&mut app, 90, 24);
+        let rows = frame.lines().collect::<Vec<_>>();
+        let input = rows
+            .iter()
+            .position(|row| row.starts_with("│› message kit…"))
+            .expect("prompt input");
+
+        assert!(rows[input - 1].starts_with('╭'));
+        assert!(rows[input + 1].starts_with('╰'));
+        assert!(!frame.contains('▜'));
+    }
+
+    #[test]
     fn shows_the_welcome_screen_before_the_first_prompt() {
         let mut app = App::new(
             PathBuf::from("/tmp/kit"),
@@ -2404,9 +2569,15 @@ mod tests {
         );
         let frame = render(&mut app, 90, 24);
         println!("{frame}");
-        assert!(frame.contains("━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-        assert!(frame.contains("Ask for a change, review, or command."));
-        assert!(frame.contains("send"));
+        assert!(frame.contains("█▀▄ █  █▄  by Speakeasy"));
+        assert!(!frame.contains("╭──────────────╮"));
+        assert!(frame.contains("openai-subscription  ·  gpt-5.4  ·  effort default"));
+        assert!(frame.contains(
+            "▜                                                                                    ▛"
+        ));
+        assert!(frame.lines().any(|line| line.trim() == "▔".repeat(86)));
+        assert!(frame.contains(" ready"));
+        assert!(frame.contains("⏎ send   ⇧⏎ newline   ^g graph   ^l log   ^c quit"));
         assert!(frame.contains("message kit"));
     }
 }
