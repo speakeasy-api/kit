@@ -32,7 +32,7 @@ Retries repeat the body. Do not retry a write unless repeating it is safe or the
 
 Background calls no longer hold their originating turn open, and interrupting that turn does not stop them. When a call detaches, the model receives its tool-call ID and can stop it with `close({ call_id: "call_..." })`. Cancellation is delivered through the same result lifecycle as completion, as a failed result reporting that tool execution was cancelled.
 
-The TUI keeps every running call visible; select a tool card to inspect its runtime graph. Completion or failure is delivered back to the owning session and wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
+The TUI keeps every running call visible. A running compose card shows its Runlet source inline, with live call states, binding resolution, and loop or retry counts. Completion replaces the source with the compose output. Unless the user explicitly opened or closed it, the output collapses when a later tool call or model message arrives and remains available from the tool card. Completion or failure is delivered back to the owning session and wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
 
 ## Ordering, dependencies, and concurrency
 

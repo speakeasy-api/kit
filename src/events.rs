@@ -4,13 +4,13 @@
 //! ACP reports the model-visible `compose` call, but every interesting thing
 //! Kit does happens *inside* that call: the Runlet program dispatches shell,
 //! edit, subagent, and A2A children concurrently. The terminal client renders
-//! that as a live runtime graph, so it needs the child lifecycle.
+//! that as inline live script state, so it needs the child lifecycle.
 //!
 //! Rather than fork the ACP surface, the events ride on stderr — Kit's
 //! diagnostics channel — as single JSON lines behind a control-character
 //! marker. The terminal client owns the `serve` child process and pipes its
-//! stderr, so marked lines become graph updates and everything else becomes
-//! log output. Emission is opt-in through `KIT_RUNTIME_EVENTS` so ordinary
+//! stderr, so marked lines become script-state updates and everything else
+//! becomes log output. Emission is opt-in through `KIT_RUNTIME_EVENTS` so ordinary
 //! ACP hosts never see the extra chatter.
 
 use std::{

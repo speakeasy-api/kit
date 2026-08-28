@@ -427,8 +427,8 @@ The delay must be an integer from 1 through 86,400 seconds.
 Press `Command+B` in the TUI to move the newest running foreground top-level
 compose call into the background. This shortcut requires a terminal that reports
 the Command key through the Kitty keyboard protocol; there is no control-key equivalent. Detached calls
-remain visible and selectable in the TUI runtime graph. Interrupting the originating
-turn does not stop them. The model receives each detached call's ID
+remain visible in the TUI transcript with their annotated Runlet source. Interrupting
+the originating turn does not stop them. The model receives each detached call's ID
 and can cancel it with `close({ call_id: "call_..." })`; the selected running
 background call can also be killed with `Ctrl+K` in the TUI. Completion and
 cancellation are delivered through the normal background-result lifecycle. Detached
@@ -573,14 +573,16 @@ require a Developer ID Application certificate.
 `tui` starts a `kit serve` child and drives it over ACP, so the client sees the
 same protocol any editor would.
 
-While a `compose` call runs, the right-hand pane draws its runtime graph: the
-Runlet program parsed into its call, loop, branch, and boundary structure, with
-each nested shell, edit, subagent, prompt, fork, subagents, close, A2A, and MCP meta-tool dispatch shown live under the node
-that most likely issued it, including concurrent fan-out and failures. Child
-call lifecycle is exact; when the same tool appears in several places, node
-attribution is a stable heuristic. Nested-call
-lifecycle reaches the client on stderr as marked JSON lines, enabled for the
-child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
+While a `compose` call runs, its Runlet source appears directly in the transcript.
+Calls are colored and annotated as idle, running, successful, or failed; bindings
+show whether their value is waiting or resolved; and loops and retry boundaries
+show live iteration and attempt counts. On completion, the source is replaced by
+the compose output. Unless the user explicitly opened or closed it, that output
+collapses automatically when a later tool call or model message arrives. It can
+still be reopened from its card. Nested child lifecycle is exact; when the same tool appears
+in several source locations, source attribution is a stable heuristic. The child
+events reach the TUI on stderr as marked JSON lines, enabled for the child process
+with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 
 | Key | Action |
 | --- | --- |
@@ -600,7 +602,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | `⌘⌫`, `^u` / `^k` | delete to line start / end |
 | `↑`/`↓` | move between prompt lines, then browse history |
 | `⇧↑`/`⇧↓`, `pgup`/`pgdn`, wheel | scroll the transcript |
-| `^g` / `^l` / `^t` | runtime graph / agent log / reasoning |
+| `^l` / `^t` | agent log / reasoning |
 | click a tool card, `^o` | fold its raw output open or shut |
 
 `⌘` and `⇧⏎` need a terminal that speaks the Kitty keyboard protocol (Ghostty,

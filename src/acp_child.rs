@@ -735,7 +735,7 @@ async fn run(
                         | crate::events::RuntimeEvent::ChildFinished { .. }
                 )
             ) {
-                // Only nested tool events belong to this process's runtime graph.
+                // Only nested tool events belong to this process's live script state.
                 // A harness's compaction changes its own transcript, not ours.
                 eprintln!("{line}");
             } else {

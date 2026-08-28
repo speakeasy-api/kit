@@ -37,7 +37,7 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 | `Up` / `Down` | Move through prompt lines, then prompt history |
 | `Shift+Up` / `Shift+Down`, `PageUp` / `PageDown`, mouse wheel | Scroll the transcript |
 | `Ctrl+Home` / `Ctrl+End` | Jump to transcript top / bottom |
-| `Ctrl+G` / `Ctrl+L` / `Ctrl+T` | Toggle the runtime graph / agent log / reasoning |
+| `Ctrl+L` / `Ctrl+T` | Toggle the agent log / reasoning |
 | `Ctrl+K` | Kill the selected running background tool call; otherwise delete to the end of the editor line |
 | `Ctrl+O`, or click a tool card | Fold or unfold raw tool output |
 | `Ctrl+Y` | Copy the latest agent response as original Markdown |
