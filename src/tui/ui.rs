@@ -696,7 +696,10 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
             user_block_rows(message, width, images.enabled())
         } else {
             (
-                wrap_linked_tagged(&transcript_block_lines(app, block_index, show_graph), width),
+                wrap_linked_tagged(
+                    &transcript_block_lines(app, block_index, show_graph, width),
+                    width,
+                ),
                 Vec::new(),
             )
         };
@@ -775,11 +778,12 @@ fn transcript_block_lines(
     app: &App,
     block_index: usize,
     show_graph: bool,
+    width: usize,
 ) -> Vec<TaggedTranscriptLine> {
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
         Block::User(_) => unreachable!("user blocks are laid out with image anchors"),
-        Block::Agent(text) => (markdown::render_copyable(text), None),
+        Block::Agent(text) => (markdown::render_copyable_at_width(text, Some(width)), None),
         Block::Thought {
             text,
             started,

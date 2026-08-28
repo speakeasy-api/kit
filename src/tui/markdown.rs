@@ -3,7 +3,7 @@
 //! Models answer in Markdown, so the transcript reads much better with
 //! headings, lists, and code told apart. This covers the constructs that
 //! actually show up in agent output and deliberately stops there: block
-//! quotes, rules, fenced and inline code, bullets, and emphasis.
+//! quotes, rules, fenced and inline code, bullets, tables, and emphasis.
 
 use std::ops::Range;
 
@@ -15,6 +15,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Renders Markdown source into styled transcript lines.
 #[cfg(test)]
@@ -36,7 +37,15 @@ pub fn render_linked(source: &str) -> Vec<LinkedLine> {
 
 /// Renders Markdown and tags every row of a fenced code block with its exact
 /// source content, excluding the fence and language label.
+#[cfg(test)]
 pub fn render_copyable(source: &str) -> Vec<(LinkedLine, Option<Range<usize>>)> {
+    render_copyable_at_width(source, None)
+}
+
+pub(super) fn render_copyable_at_width(
+    source: &str,
+    max_width: Option<usize>,
+) -> Vec<(LinkedLine, Option<Range<usize>>)> {
     let mut next_offset = 0;
     let raw_lines: Vec<(usize, &str)> = source
         .split('\n')
@@ -48,7 +57,11 @@ pub fn render_copyable(source: &str) -> Vec<(LinkedLine, Option<Range<usize>>)> 
         .collect();
     let mut lines = Vec::new();
     let mut fence: Option<(String, char, usize, Range<usize>)> = None;
+    let mut table_end = 0;
     for (index, (offset, raw)) in raw_lines.iter().copied().enumerate() {
+        if index < table_end {
+            continue;
+        }
         let trimmed = raw.trim_start();
         let candidate = fence_line(raw);
         if let Some((language, marker, length, content)) = fence.as_ref() {
@@ -101,12 +114,257 @@ pub fn render_copyable(source: &str) -> Vec<(LinkedLine, Option<Range<usize>>)> 
             fence = Some((language, marker, length, content));
             continue;
         }
+        if let Some((end, table)) = table_at(&raw_lines, index, max_width) {
+            lines.extend(table.into_iter().map(|line| (line, None)));
+            table_end = end;
+            continue;
+        }
         lines.push((block_line(raw, trimmed), None));
     }
     if let Some((_, _, _, content)) = fence {
         lines.push((code_frame("└─ code"), Some(content)));
     }
     lines
+}
+
+#[derive(Clone, Copy)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+struct TableCell {
+    spans: Vec<LinkedSpan>,
+    width: usize,
+}
+
+fn table_at(
+    lines: &[(usize, &str)],
+    start: usize,
+    max_width: Option<usize>,
+) -> Option<(usize, Vec<LinkedLine>)> {
+    let header_line = lines.get(start)?.1;
+    if !table_row_allowed(header_line) {
+        return None;
+    }
+    let header = table_cells(header_line)?;
+    let delimiter = table_cells(lines.get(start + 1)?.1)?;
+    if header.len() != delimiter.len() || header.is_empty() {
+        return None;
+    }
+    let alignments: Vec<_> = delimiter
+        .iter()
+        .map(|cell| table_alignment(cell))
+        .collect::<Option<_>>()?;
+
+    let columns = header.len();
+    let mut rows = vec![header];
+    let mut end = start + 2;
+    while let Some((_, raw)) = lines.get(end) {
+        if !table_row_allowed(raw) {
+            break;
+        }
+        let Some(mut row) = table_cells(raw) else {
+            break;
+        };
+        row.resize(columns, String::new());
+        row.truncate(columns);
+        rows.push(row);
+        end += 1;
+    }
+
+    let rows: Vec<Vec<TableCell>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(row, cells)| {
+            cells
+                .into_iter()
+                .map(|cell| {
+                    let base = if row == 0 {
+                        theme::text().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::text()
+                    };
+                    let spans = inline(&cell, base);
+                    let width = spans.iter().map(|span| span.span.content.width()).sum();
+                    TableCell { spans, width }
+                })
+                .collect()
+        })
+        .collect();
+    let widths = (0..columns)
+        .map(|column| rows.iter().map(|row| row[column].width).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+
+    let table_width = 1 + widths.iter().map(|width| width + 3).sum::<usize>();
+    if max_width.is_some_and(|max_width| table_width > max_width) {
+        return Some((end, stacked_table(&rows)));
+    }
+
+    let mut rendered = vec![table_rule(&widths, '┌', '┬', '┐')];
+    rendered.push(table_row(&rows[0], &widths, &alignments));
+    rendered.push(table_rule(&widths, '├', '┼', '┤'));
+    rendered.extend(
+        rows[1..]
+            .iter()
+            .map(|row| table_row(row, &widths, &alignments)),
+    );
+    rendered.push(table_rule(&widths, '└', '┴', '┘'));
+    Some((end, rendered))
+}
+
+fn table_row_allowed(line: &str) -> bool {
+    let Some(trimmed) = fence_line(line) else {
+        return false;
+    };
+    opening_fence(trimmed).is_none()
+        && !trimmed.starts_with("# ")
+        && !trimmed.starts_with("## ")
+        && !trimmed.starts_with("### ")
+        && !trimmed.starts_with("> ")
+        && bullet(trimmed).is_none()
+        && !(trimmed.starts_with("---") && trimmed.chars().all(|character| character == '-'))
+}
+
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 || line[indentation..].starts_with('\t') {
+        return None;
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let characters: Vec<char> = line.chars().collect();
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut saw_pipe = false;
+    let mut ends_with_separator = false;
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] == '\\' {
+            let start = index;
+            while index < characters.len() && characters[index] == '\\' {
+                index += 1;
+            }
+            let count = index - start;
+            if index < characters.len() && characters[index] == '|' {
+                cell.extend(std::iter::repeat_n('\\', count / 2));
+                if count % 2 == 1 {
+                    cell.push('|');
+                    ends_with_separator = false;
+                    index += 1;
+                    continue;
+                }
+            } else {
+                cell.extend(std::iter::repeat_n('\\', count));
+                ends_with_separator = false;
+                continue;
+            }
+        }
+        if characters[index] == '|' {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+            saw_pipe = true;
+            ends_with_separator = true;
+        } else {
+            cell.push(characters[index]);
+            ends_with_separator = false;
+        }
+        index += 1;
+    }
+    cells.push(cell.trim().to_string());
+
+    if !saw_pipe {
+        return None;
+    }
+    if line.starts_with('|') {
+        cells.remove(0);
+    }
+    if ends_with_separator {
+        cells.pop();
+    }
+    Some(cells)
+}
+
+fn table_alignment(cell: &str) -> Option<TableAlignment> {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.ends_with(':');
+    let rule = cell.strip_prefix(':').unwrap_or(cell);
+    let rule = rule.strip_suffix(':').unwrap_or(rule);
+    if rule.is_empty() || !rule.chars().all(|character| character == '-') {
+        return None;
+    }
+    Some(match (left, right) {
+        (true, true) => TableAlignment::Center,
+        (false, true) => TableAlignment::Right,
+        _ => TableAlignment::Left,
+    })
+}
+
+fn stacked_table(rows: &[Vec<TableCell>]) -> Vec<LinkedLine> {
+    if rows.len() == 1 {
+        return rows[0]
+            .iter()
+            .map(|header| {
+                let mut spans = vec![plain_span("• ", theme::accent())];
+                spans.extend(header.spans.iter().cloned());
+                LinkedLine::new(spans).with_leading_gutter()
+            })
+            .collect();
+    }
+
+    rows[1..]
+        .iter()
+        .flat_map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    let mut spans = vec![plain_span(
+                        if column == 0 { "• " } else { "  " },
+                        theme::accent(),
+                    )];
+                    spans.extend(rows[0][column].spans.iter().cloned());
+                    spans.push(plain_span(": ", theme::faint()));
+                    spans.extend(cell.spans.iter().cloned());
+                    LinkedLine::new(spans).with_leading_gutter()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn table_rule(widths: &[usize], left: char, middle: char, right: char) -> LinkedLine {
+    let mut rule = String::from(left);
+    for (index, width) in widths.iter().enumerate() {
+        rule.push_str(&"─".repeat(width + 2));
+        rule.push(if index + 1 == widths.len() {
+            right
+        } else {
+            middle
+        });
+    }
+    plain_line(Line::from(Span::styled(rule, theme::faint())))
+}
+
+fn table_row(cells: &[TableCell], widths: &[usize], alignments: &[TableAlignment]) -> LinkedLine {
+    let mut spans = vec![plain_span("│", theme::faint())];
+    for (index, cell) in cells.iter().enumerate() {
+        let remaining = widths[index] - cell.width;
+        let (left, right) = match alignments[index] {
+            TableAlignment::Left => (0, remaining),
+            TableAlignment::Center => (remaining / 2, remaining - remaining / 2),
+            TableAlignment::Right => (remaining, 0),
+        };
+        spans.push(plain_span(" ".repeat(left + 1), theme::text()));
+        spans.extend(cell.spans.iter().cloned());
+        spans.push(plain_span(" ".repeat(right + 1), theme::text()));
+        spans.push(plain_span("│", theme::faint()));
+    }
+    LinkedLine::new(spans)
 }
 
 fn fence_line(line: &str) -> Option<&str> {
@@ -422,7 +680,107 @@ fn inline_with_link_destinations(
 mod tests {
     use ratatui::style::Modifier;
 
-    use super::{render, render_copyable, render_linked};
+    use super::{render, render_copyable, render_copyable_at_width, render_linked};
+
+    fn line_text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn renders_aligned_pipe_tables() {
+        let rendered =
+            render("| Name | Status |\n| :--- | ---: |\n| alpha | Ready |\n| beta | In progress |");
+        let text: Vec<_> = rendered.iter().map(line_text).collect();
+        assert_eq!(
+            text,
+            [
+                "┌───────┬─────────────┐",
+                "│ Name  │      Status │",
+                "├───────┼─────────────┤",
+                "│ alpha │       Ready │",
+                "│ beta  │ In progress │",
+                "└───────┴─────────────┘",
+            ]
+        );
+        assert!(
+            rendered[1]
+                .spans
+                .iter()
+                .any(|span| span.content == "Name"
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn preserves_inline_table_formatting_and_links() {
+        let source =
+            "| Resource | Value |\n| --- | :---: |\n| [Docs](https://example.com) | **a \\| b** |";
+        let rendered = render_linked(source);
+        let text: Vec<_> = rendered
+            .iter()
+            .map(|line| line_text(&line.line()))
+            .collect();
+        assert_eq!(text[3], "│ Docs (https://example.com) │ a | b │");
+        assert_eq!(
+            rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter_map(|span| span.url.as_deref())
+                .collect::<Vec<_>>(),
+            ["https://example.com", "https://example.com"]
+        );
+        assert!(rendered[3].spans.iter().any(|span| {
+            span.span.content == "a | b" && span.span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn stacks_tables_that_are_wider_than_the_transcript() {
+        let rendered =
+            render_copyable_at_width("| A | B |\n| --- | --- |\n| 123456 | x |", Some(12));
+        let text: Vec<_> = rendered
+            .iter()
+            .map(|(line, _)| line_text(&line.line()))
+            .collect();
+        assert_eq!(text, ["• A: 123456", "  B: x"]);
+    }
+
+    #[test]
+    fn preserves_block_boundaries_around_tables() {
+        let source =
+            "| Name | Value |\n| --- | --- |\n| alpha | beta |\n~~~text|meta\ncode\n~~~\nafter";
+        let rendered = render(source);
+        assert_eq!(line_text(&rendered[4]), "└───────┴───────┘");
+        assert!(line_text(&rendered[5]).contains("text|meta"));
+        assert_eq!(line_text(&rendered[6]), "│ code");
+        assert_eq!(line_text(rendered.last().unwrap()), "after");
+
+        let heading = render("# Name | Value\n--- | ---");
+        assert_eq!(line_text(&heading[0]), "Name | Value");
+    }
+
+    #[test]
+    fn splits_only_unescaped_table_pipes() {
+        assert_eq!(super::table_cells(r"| a\\| b |").unwrap(), [r"a\", "b"]);
+        assert_eq!(super::table_cells(r"| a\\\| b |").unwrap(), [r"a\| b"]);
+        assert_eq!(super::table_cells(r"| `a|b` | c |").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn requires_a_valid_delimiter_row_before_rendering_a_table() {
+        for source in [
+            "| Name | Value |\n| alpha | beta |",
+            "| Name | Value |\n| ::--- | --- |",
+            "    | Name | Value |\n    | --- | --- |",
+        ] {
+            let rendered = render(source);
+            assert_eq!(rendered.len(), 2);
+            assert_eq!(line_text(&rendered[0]), source.lines().next().unwrap());
+        }
+    }
 
     #[test]
     fn styles_code_fences_apart_from_prose() {
