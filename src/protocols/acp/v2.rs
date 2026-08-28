@@ -1262,33 +1262,19 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     let cancellation_generation = handle.cancellation_handle().generation();
     handle.start_injection_turn();
     let result = async {
-        send_state(
-            sink,
-            session_id,
-            wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
-        )?;
-        let stop_reason =
-            match drive_prompt(session_id, driver, handle, cancellation_generation, None).await {
-                Ok(stop_reason) => stop_reason,
-                Err(_)
-                    if handle
-                        .cancellation_handle()
-                        .is_cancelled_since(cancellation_generation) =>
-                {
-                    wire::StopReason::Cancelled
-                }
-                Err(error) => {
-                    terminalize_running_error(session_id, integration, handle, sink, &error)
-                        .await?;
-                    return Err(error);
-                }
-            };
+        match drive_prompt(session_id, driver, handle, cancellation_generation, None).await {
+            Ok(_) => {}
+            Err(_)
+                if handle
+                    .cancellation_handle()
+                    .is_cancelled_since(cancellation_generation) => {}
+            Err(error) => {
+                terminalize_error(session_id, integration, handle, sink, &error, None).await?;
+                return Err(error);
+            }
+        }
         let _ = integration.flush_session_updates(session_id).await;
-        send_state(
-            sink,
-            session_id,
-            wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(stop_reason)),
-        )
+        Ok(())
     }
     .await;
     integration.finish_prompt(session_id);
@@ -1304,40 +1290,54 @@ async fn terminalize_running_error(
     sink: &impl AcpSessionUpdateSink,
     error: &AcpRuntimeError,
 ) -> Result<(), AcpRuntimeError> {
+    terminalize_error(
+        session_id,
+        integration,
+        handle,
+        sink,
+        error,
+        Some(wire::IdleStateUpdate::new().stop_reason(error_stop_reason())),
+    )
+    .await
+}
+
+async fn terminalize_error(
+    session_id: &wire::SessionId,
+    integration: &AcpIntegration,
+    handle: &AcpSessionHandle,
+    sink: &impl AcpSessionUpdateSink,
+    error: &AcpRuntimeError,
+    idle: Option<wire::IdleStateUpdate>,
+) -> Result<(), AcpRuntimeError> {
     handle.stop_injection_turn();
     let _ = integration.flush_session_updates(session_id).await;
     integration.finish_prompt(session_id);
 
-    let [diagnostic, idle] = running_error_notifications(session_id, error);
-    let diagnostic_result = sink.update(diagnostic);
-    let idle_result = sink.update(idle);
-    diagnostic_result.and(idle_result)
+    let diagnostic_result = sink.update(error_diagnostic_notification(session_id, error));
+    if let Some(idle) = idle {
+        let idle_result = send_state(sink, session_id, wire::StateUpdate::Idle(idle));
+        diagnostic_result.and(idle_result)
+    } else {
+        diagnostic_result
+    }
 }
 
-fn running_error_notifications(
+fn error_diagnostic_notification(
     session_id: &wire::SessionId,
     error: &AcpRuntimeError,
-) -> [wire::UpdateSessionNotification; 2] {
+) -> wire::UpdateSessionNotification {
     let sequence = NEXT_ERROR_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
-    [
-        wire::UpdateSessionNotification::new(
-            session_id.clone(),
-            wire::SessionUpdate::AgentMessage(
-                wire::AgentMessage::new(wire::MessageId::new(format!(
-                    "{session_id}-error-{sequence}"
-                )))
-                .content(vec![wire::ContentBlock::Text(wire::TextContent::new(
-                    error.to_string(),
-                ))]),
-            ),
+    wire::UpdateSessionNotification::new(
+        session_id.clone(),
+        wire::SessionUpdate::AgentMessage(
+            wire::AgentMessage::new(wire::MessageId::new(format!(
+                "{session_id}-error-{sequence}"
+            )))
+            .content(vec![wire::ContentBlock::Text(wire::TextContent::new(
+                error.to_string(),
+            ))]),
         ),
-        wire::UpdateSessionNotification::new(
-            session_id.clone(),
-            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(
-                wire::IdleStateUpdate::new().stop_reason(error_stop_reason()),
-            )),
-        ),
-    ]
+    )
 }
 
 fn send_state(
@@ -1829,7 +1829,7 @@ pub(crate) fn component(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{collections::VecDeque, sync::atomic::AtomicUsize};
 
     use serde_json::json;
 
@@ -2167,6 +2167,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum TestOutcome {
+        Content,
         FinishError,
         ProviderError,
     }
@@ -2184,7 +2185,7 @@ mod tests {
     }
 
     struct TestTurn {
-        event: Option<ModelTurnEvent>,
+        events: VecDeque<ModelTurnEvent>,
     }
 
     struct MarkerCancellationAdapter {
@@ -2280,15 +2281,38 @@ mod tests {
                 handle.interrupt();
             }
             match self.outcome {
+                TestOutcome::Content => {
+                    let text = "autonomous content";
+                    Ok(TestTurn {
+                        events: VecDeque::from([
+                            ModelTurnEvent::Delta(agentkit_core::Delta::BeginPart {
+                                part_id: agentkit_core::PartId::new("message-1"),
+                                kind: agentkit_core::PartKind::Text,
+                            }),
+                            ModelTurnEvent::Delta(agentkit_core::Delta::AppendText {
+                                part_id: agentkit_core::PartId::new("message-1"),
+                                chunk: text.into(),
+                            }),
+                            ModelTurnEvent::Finished(ModelTurnResult {
+                                model: None,
+                                response_id: None,
+                                finish_reason: FinishReason::Completed,
+                                output_items: vec![Item::text(ItemKind::Assistant, text)],
+                                usage: None,
+                                metadata: MetadataMap::new(),
+                            }),
+                        ]),
+                    })
+                }
                 TestOutcome::FinishError => Ok(TestTurn {
-                    event: Some(ModelTurnEvent::Finished(ModelTurnResult {
+                    events: VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
                         model: None,
                         response_id: None,
                         finish_reason: FinishReason::Error,
                         output_items: Vec::new(),
                         usage: None,
                         metadata: MetadataMap::new(),
-                    })),
+                    })]),
                 }),
                 TestOutcome::ProviderError => Err(LoopError::Provider("provider failed".into())),
             }
@@ -2301,7 +2325,7 @@ mod tests {
             &mut self,
             _cancellation: Option<TurnCancellation>,
         ) -> Result<Option<ModelTurnEvent>, LoopError> {
-            Ok(self.event.take())
+            Ok(self.events.pop_front())
         }
     }
 
@@ -2737,7 +2761,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn autonomous_provider_error_emits_diagnostic_and_one_error_idle() {
+    async fn autonomous_no_work_emits_no_state_update() {
+        let integration = AcpIntegration::default();
+        let sink = RecordingSink::default();
+        let session_id = wire::SessionId::new("autonomous-no-work");
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new("autonomous-no-work-loop"),
+                sink.clone(),
+            ))
+            .unwrap();
+        let (mut driver, turns) =
+            test_driver(TestOutcome::Content, "autonomous-no-work-loop").await;
+        let busy = AtomicBool::new(false);
+
+        drive_autonomous(
+            &session_id,
+            &integration,
+            &handle,
+            &busy,
+            &mut driver,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert!(!busy.load(Ordering::Relaxed));
+        assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
+        assert!(sink.updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn autonomous_content_emits_no_state_update() {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("autonomous-content");
+        let loop_session_id = SessionId::new("autonomous-content-loop");
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: Arc::clone(&turns),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_session_id).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::notification("background event")])
+            .unwrap();
+        let busy = AtomicBool::new(false);
+
+        drive_autonomous(
+            &session_id,
+            &integration,
+            &handle,
+            &busy,
+            &mut driver,
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+        assert!(!busy.load(Ordering::Relaxed));
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        let updates = recording.updates.lock().unwrap();
+        assert!(updates.iter().any(|update| {
+            serde_json::to_string(&update.update)
+                .unwrap()
+                .contains("autonomous content")
+        }));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_provider_error_emits_diagnostic_without_state_update() {
         let integration = AcpIntegration::default();
         let sink = RecordingSink::default();
         let session_id = wire::SessionId::new("autonomous-provider-error");
@@ -2767,27 +2885,24 @@ mod tests {
 
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
         assert_eq!(turns.load(Ordering::Relaxed), 1);
+        assert!(!busy.load(Ordering::Relaxed));
         assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
         let updates = sink.updates.lock().unwrap();
-        assert_eq!(updates.len(), 3);
-        assert!(matches!(
-            updates[0].update,
-            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
-        ));
+        assert_eq!(updates.len(), 1);
         assert!(
-            serde_json::to_string(&updates[1].update)
+            serde_json::to_string(&updates[0].update)
                 .unwrap()
                 .contains("provider failed")
         );
         assert!(matches!(
-            updates[1].update,
+            updates[0].update,
             wire::SessionUpdate::AgentMessage(_)
         ));
-        assert!(matches!(
-            &updates[2].update,
-            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle))
-                if idle.stop_reason == Some(error_stop_reason())
-        ));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
+        );
     }
 
     #[tokio::test]
@@ -2825,27 +2940,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(turns.load(Ordering::Relaxed), 1);
+        assert!(!busy.load(Ordering::Relaxed));
         assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
-        let updates = sink.updates.lock().unwrap();
-        assert_eq!(updates.len(), 2);
-        assert!(matches!(
-            updates[0].update,
-            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
-        ));
-        assert!(
-            !updates
-                .iter()
-                .any(|update| matches!(update.update, wire::SessionUpdate::AgentMessage(_)))
-        );
-        assert!(matches!(
-            &updates[1].update,
-            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle))
-                if idle.stop_reason == Some(wire::StopReason::Cancelled)
-        ));
+        assert!(sink.updates.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn autonomous_finish_error_emits_running_diagnostic_and_one_error_idle() {
+    async fn autonomous_finish_error_emits_diagnostic_without_state_update() {
         let integration = AcpIntegration::default();
         let sink = RecordingSink::default();
         let session_id = wire::SessionId::new("autonomous-error");
@@ -2878,34 +2979,21 @@ mod tests {
         assert!(!busy.load(Ordering::Relaxed));
         assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
         let updates = sink.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
         assert!(matches!(
             updates[0].update,
-            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
-        ));
-        assert!(matches!(
-            updates[1].update,
             wire::SessionUpdate::AgentMessage(_)
         ));
         assert!(
-            serde_json::to_string(&updates[1].update)
+            serde_json::to_string(&updates[0].update)
                 .unwrap()
                 .contains("loop error: model turn failed")
         );
-        assert_eq!(
-            updates
+        assert!(
+            !updates
                 .iter()
-                .filter(|update| matches!(
-                    update.update,
-                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
-                ))
-                .count(),
-            1
+                .any(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
         );
-        assert!(matches!(
-            updates.last().map(|update| &update.update),
-            Some(wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle)))
-                if idle.stop_reason == Some(error_stop_reason())
-        ));
     }
 
     #[test]

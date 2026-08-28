@@ -133,8 +133,8 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.9"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+version = "0.10.11"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -150,8 +150,8 @@ dependencies = [
 
 [[package]]
 name = "agentkit-adapter-completions"
-version = "0.10.6"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+version = "0.10.7"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -169,7 +169,7 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "agentkit-compaction"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -193,7 +193,7 @@ dependencies = [
 [[package]]
 name = "agentkit-context"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "async-fs",
@@ -205,7 +205,7 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "futures-timer",
  "serde",
@@ -216,7 +216,7 @@ dependencies = [
 [[package]]
 name = "agentkit-http"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -230,8 +230,8 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+version = "0.10.10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "agentkit-mcp"
 version = "0.10.6"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -269,7 +269,7 @@ dependencies = [
 [[package]]
 name = "agentkit-plugins"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "http",
  "serde",
@@ -282,7 +282,7 @@ dependencies = [
 [[package]]
 name = "agentkit-provider-openrouter"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -296,8 +296,8 @@ dependencies = [
 
 [[package]]
 name = "agentkit-task-manager"
-version = "0.10.6"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+version = "0.10.7"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -309,7 +309,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tool-compose"
 version = "0.10.9"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -339,7 +339,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597#4299f31ec1455ea8ee4c46b4dce8e5bec4fdc597"
+source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -2517,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.103"
+version = "0.1.104"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
