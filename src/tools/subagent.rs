@@ -143,7 +143,8 @@ fn task_summary(prompt: &str) -> String {
 
 use crate::{
     acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession},
-    events, session,
+    events::{self, GenerationOutcome, SubagentStatus},
+    session,
 };
 
 #[derive(Clone)]
@@ -155,6 +156,8 @@ pub struct Subagents {
     capacity: Arc<Semaphore>,
     #[cfg(test)]
     failed_removals: Arc<Mutex<Vec<FailedRemoval>>>,
+    #[cfg(test)]
+    runtime_events: Arc<Mutex<Vec<events::RuntimeEvent>>>,
 }
 
 struct SessionEntry {
@@ -188,20 +191,24 @@ struct State {
     _permit: OwnedSemaphorePermit,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SubagentStatus {
-    Starting,
-    Working,
-    Idle,
-    Removed,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GenerationOutcome {
-    Success,
-    Failed,
+impl State {
+    fn runtime_event(&self, id: String) -> events::RuntimeEvent {
+        events::RuntimeEvent::SubagentStateChanged {
+            id,
+            name: self.name.clone(),
+            status: self.status,
+            outcome: self.outcome,
+            generation: self.generation,
+            task: self.task.clone(),
+            parent_id: None,
+            parent_name: None,
+            harness: self.harness.clone(),
+            model: self.model.clone(),
+            created_at_unix_ms: self.created_at_unix_ms,
+            generation_started_at_unix_ms: self.generation_started_at_unix_ms,
+            generation_finished_at_unix_ms: self.generation_finished_at_unix_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -297,6 +304,8 @@ impl Subagents {
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
             #[cfg(test)]
             failed_removals: Arc::default(),
+            #[cfg(test)]
+            runtime_events: Arc::default(),
         }
     }
 
@@ -310,6 +319,19 @@ impl Subagents {
 
     pub(crate) fn names_policy(&self) -> SubagentNames {
         self.names.clone()
+    }
+
+    fn emit_event(&self, event: events::RuntimeEvent) {
+        #[cfg(test)]
+        if let Ok(mut emitted) = self.runtime_events.lock() {
+            emitted.push(event.clone());
+        }
+        events::emit(&event);
+    }
+
+    #[cfg(test)]
+    fn runtime_events_for_test(&self) -> Vec<events::RuntimeEvent> {
+        self.runtime_events.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -418,6 +440,7 @@ impl Subagents {
             let mut locked = state.lock().await;
             locked.status = SubagentStatus::Working;
             locked.child = Some(child.clone());
+            self.emit_event(locked.runtime_event(id.clone()));
         }
         let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
@@ -439,7 +462,9 @@ impl Subagents {
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
         let name = locked.name.clone();
+        let event = locked.runtime_event(id.clone());
         drop(locked);
+        self.emit_event(event);
         Ok(SubagentValue {
             id,
             name: Some(name),
@@ -478,7 +503,9 @@ impl Subagents {
             .clone()
             .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?;
         let name = locked.name.clone();
+        let event = locked.runtime_event(prior.id.clone());
         drop(locked);
+        self.emit_event(event);
         match child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
@@ -492,6 +519,9 @@ impl Subagents {
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 locked.output.clone_from(&output);
                 locked.updates.clone_from(&updates);
+                let event = locked.runtime_event(prior.id.clone());
+                drop(locked);
+                self.emit_event(event);
                 Ok(SubagentValue {
                     id: prior.id,
                     name: Some(name),
@@ -511,6 +541,9 @@ impl Subagents {
                     // A failed call returns no replacement handle, so preserve the
                     // last completed generation for a retry with the same handle.
                     locked.generation = prior.generation;
+                    let event = locked.runtime_event(prior.id.clone());
+                    drop(locked);
+                    self.emit_event(event);
                 }
                 Err(error)
             }
@@ -603,6 +636,7 @@ impl Subagents {
             let mut locked = state.lock().await;
             locked.status = SubagentStatus::Working;
             locked.child = Some(child.clone());
+            self.emit_event(locked.runtime_event(id.clone()));
         }
         let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
@@ -623,7 +657,9 @@ impl Subagents {
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
         let name = locked.name.clone();
+        let event = locked.runtime_event(id.clone());
         drop(locked);
+        self.emit_event(event);
         Ok(SubagentValue {
             id,
             name: Some(name),
@@ -711,6 +747,7 @@ impl Subagents {
         let previous_status = locked.status;
         locked.status = SubagentStatus::Removed;
         let child = locked.child.take();
+        let event = locked.runtime_event(id.to_string());
         drop(locked);
 
         let result = match &child {
@@ -720,6 +757,7 @@ impl Subagents {
         match result {
             Ok(()) => {
                 self.remove_if_same(id, &state);
+                self.emit_event(event);
                 Ok(())
             }
             Err(error) => {
@@ -728,6 +766,7 @@ impl Subagents {
                     .is_none_or(|child| child_error_is_terminal(&error, child));
                 if terminal || previous_status != SubagentStatus::Idle {
                     self.remove_if_same(id, &state);
+                    self.emit_event(event);
                 } else {
                     let mut locked = state.lock().await;
                     if locked.status == SubagentStatus::Removed {
@@ -765,6 +804,7 @@ impl Subagents {
             .collect::<HashSet<_>>();
         let name = allocate_name(self.names.as_slice(), &mut used, fallback_name);
         state.name.clone_from(&name);
+        let event = state.runtime_event(id.clone());
         let state = Arc::new(AsyncMutex::new(state));
         sessions.insert(
             id,
@@ -773,6 +813,8 @@ impl Subagents {
                 state: Arc::clone(&state),
             },
         );
+        drop(sessions);
+        self.emit_event(event);
         Ok(state)
     }
 
@@ -805,8 +847,10 @@ impl Subagents {
                 finished_at_unix_ms: locked.generation_finished_at_unix_ms,
             });
         }
+        let event = locked.runtime_event(id.to_string());
         drop(locked);
         self.remove_if_same(id, state);
+        self.emit_event(event);
     }
 
     #[cfg(test)]
@@ -1807,6 +1851,137 @@ mod tests {
             },
             2,
         )
+    }
+
+    mod lifecycle_events {
+        use super::*;
+
+        fn transitions(manager: &Subagents) -> Vec<(SubagentStatus, Option<GenerationOutcome>)> {
+            manager
+                .runtime_events_for_test()
+                .into_iter()
+                .filter_map(|event| match event {
+                    events::RuntimeEvent::SubagentStateChanged {
+                        status, outcome, ..
+                    } => Some((status, outcome)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn emits_committed_create_prompt_failure_and_close_transitions() {
+            let root = tempfile::tempdir().unwrap();
+            let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
+            let handle = manager
+                .create(
+                    "base task".into(),
+                    None,
+                    None,
+                    None,
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                transitions(&manager),
+                vec![
+                    (SubagentStatus::Starting, None),
+                    (SubagentStatus::Working, None),
+                    (SubagentStatus::Idle, Some(GenerationOutcome::Success)),
+                ]
+            );
+
+            let handle = manager
+                .prompt(
+                    handle,
+                    "successful continuation".into(),
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                &transitions(&manager)[3..],
+                &[
+                    (SubagentStatus::Working, None),
+                    (SubagentStatus::Idle, Some(GenerationOutcome::Success)),
+                ]
+            );
+
+            let error = manager
+                .prompt(
+                    handle.clone(),
+                    "MOCK_REFUSAL".into(),
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "nested agent refused the prompt");
+            manager
+                .close(&handle.id, &TurnCancellation::default())
+                .await
+                .unwrap();
+
+            let emitted = manager.runtime_events_for_test();
+            assert_eq!(
+                &transitions(&manager)[5..],
+                &[
+                    (SubagentStatus::Working, None),
+                    (SubagentStatus::Idle, Some(GenerationOutcome::Failed)),
+                    (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
+                ]
+            );
+            assert!(emitted.iter().all(|event| event.parent_call().is_none()));
+            assert!(
+                matches!(emitted.last(), Some(events::RuntimeEvent::SubagentStateChanged { id, name, status: SubagentStatus::Removed, generation_finished_at_unix_ms: Some(_), .. }) if id.as_str() == handle.id.as_str() && name == "Scout")
+            );
+        }
+
+        #[tokio::test]
+        async fn emits_removed_after_failed_creation_and_terminal_retirement() {
+            let root = tempfile::tempdir().unwrap();
+            let failed = manager_with_generic_harness(root.path(), vec!["--fail-start".into()]);
+            assert!(
+                failed
+                    .create(
+                        "create".into(),
+                        None,
+                        None,
+                        None,
+                        0,
+                        TurnCancellation::default(),
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                transitions(&failed),
+                vec![
+                    (SubagentStatus::Starting, None),
+                    (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
+                ]
+            );
+
+            let (terminal, _, prior) = manager_with_disconnected_session(root.path());
+            assert!(
+                terminal
+                    .prompt(prior, "continue".into(), TurnCancellation::default(), None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                transitions(&terminal),
+                vec![
+                    (SubagentStatus::Working, None),
+                    (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
+                ]
+            );
+        }
     }
 
     #[tokio::test]

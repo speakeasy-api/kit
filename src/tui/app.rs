@@ -1618,6 +1618,8 @@ impl App {
                 }
                 return;
             }
+            RuntimeEvent::SubagentStateChanged { .. }
+            | RuntimeEvent::SubagentDescendantsRemoved { .. } => return,
             event => event,
         };
         let parent = event.parent_call().map(str::to_string);
@@ -1647,7 +1649,9 @@ impl App {
             } => call.finish_child(&child_call, ok, summary, millis),
             RuntimeEvent::SessionStarted { .. }
             | RuntimeEvent::CompactionStarted { .. }
-            | RuntimeEvent::CompactionFinished { .. } => unreachable!("handled above"),
+            | RuntimeEvent::CompactionFinished { .. }
+            | RuntimeEvent::SubagentStateChanged { .. }
+            | RuntimeEvent::SubagentDescendantsRemoved { .. } => unreachable!("handled above"),
         }
         if let Some(index) = self.call_index(&owner_id) {
             self.reclassify_dynamic(index);

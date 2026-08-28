@@ -33,7 +33,7 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 ///
 /// `call` is the compose child call id, shaped `<parent>:compose:<operation>`,
 /// so a client can attribute every child to the ACP tool call it belongs to.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     /// A persisted ACP session was opened by the child runtime.
@@ -62,6 +62,40 @@ pub enum RuntimeEvent {
         compacted: bool,
         millis: u64,
     },
+    /// A direct subagent registry lifecycle transition was committed.
+    SubagentStateChanged {
+        id: String,
+        name: String,
+        status: SubagentStatus,
+        outcome: Option<GenerationOutcome>,
+        generation: u64,
+        task: String,
+        parent_id: Option<String>,
+        parent_name: Option<String>,
+        harness: String,
+        model: Option<String>,
+        created_at_unix_ms: u64,
+        generation_started_at_unix_ms: u64,
+        generation_finished_at_unix_ms: Option<u64>,
+    },
+    /// Every observable strict descendant of an ancestor should be removed.
+    SubagentDescendantsRemoved { ancestor_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Starting,
+    Working,
+    Idle,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationOutcome {
+    Success,
+    Failed,
 }
 
 impl RuntimeEvent {
@@ -72,7 +106,9 @@ impl RuntimeEvent {
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
             Self::SessionStarted { .. }
             | Self::CompactionStarted { .. }
-            | Self::CompactionFinished { .. } => return None,
+            | Self::CompactionFinished { .. }
+            | Self::SubagentStateChanged { .. }
+            | Self::SubagentDescendantsRemoved { .. } => return None,
         };
         call.rsplit_once(":compose:").map(|(parent, _)| parent)
     }
@@ -90,9 +126,13 @@ pub fn emit(event: &RuntimeEvent) {
     if !enabled() {
         return;
     }
+    let mut stderr = std::io::stderr().lock();
+    write_event(&mut stderr, event);
+}
+
+fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
     if let Ok(line) = serde_json::to_string(event) {
-        let mut stderr = std::io::stderr().lock();
-        let _ = writeln!(stderr, "{EVENT_MARKER}{line}");
+        let _ = writeln!(writer, "{EVENT_MARKER}{line}");
     }
 }
 
@@ -168,9 +208,14 @@ fn truncate(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+
     use serde_json::json;
 
-    use super::{EVENT_MARKER, RuntimeEvent, parse, summarize_input, summarize_output};
+    use super::{
+        EVENT_MARKER, GenerationOutcome, RuntimeEvent, SubagentStatus, parse, summarize_input,
+        summarize_output, write_event,
+    };
 
     #[test]
     fn reads_back_an_emitted_event_line() {
@@ -183,6 +228,41 @@ mod tests {
         let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
         let parsed = parse(&line).expect("event round trips");
         assert_eq!(parsed.parent_call(), Some("call-1"));
+    }
+
+    #[test]
+    fn subagent_lifecycle_events_round_trip_with_stable_wire_names() {
+        let changed = RuntimeEvent::SubagentStateChanged {
+            id: "s-child".into(),
+            name: "Scout".into(),
+            status: SubagentStatus::Idle,
+            outcome: Some(GenerationOutcome::Success),
+            generation: 2,
+            task: "Trace lifecycle events".into(),
+            parent_id: None,
+            parent_name: None,
+            harness: "acp.kit".into(),
+            model: Some("test-model".into()),
+            created_at_unix_ms: 1_000,
+            generation_started_at_unix_ms: 2_000,
+            generation_finished_at_unix_ms: Some(3_000),
+        };
+        let changed_json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(changed_json["event"], "subagent_state_changed");
+        assert_eq!(changed_json["status"], "idle");
+        assert_eq!(changed_json["outcome"], "success");
+        assert_eq!(changed_json["created_at_unix_ms"], 1_000);
+        assert_eq!(changed_json["generation_started_at_unix_ms"], 2_000);
+        assert_eq!(changed_json["generation_finished_at_unix_ms"], 3_000);
+
+        let removed = RuntimeEvent::SubagentDescendantsRemoved {
+            ancestor_id: "s-parent".into(),
+        };
+        for event in [changed, removed] {
+            let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+            assert_eq!(parse(&line), Some(event.clone()));
+            assert_eq!(event.parent_call(), None);
+        }
     }
 
     #[test]
@@ -206,6 +286,27 @@ mod tests {
         let parsed = parse(&line).expect("event round trips");
         assert!(matches!(parsed, RuntimeEvent::CompactionStarted { .. }));
         assert_eq!(parsed.parent_call(), None);
+    }
+
+    #[test]
+    fn event_write_failures_are_observational() {
+        struct BrokenWriter;
+        impl Write for BrokenWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken event transport"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("broken event transport"))
+            }
+        }
+
+        write_event(
+            &mut BrokenWriter,
+            &RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "s-parent".into(),
+            },
+        );
     }
 
     #[test]
