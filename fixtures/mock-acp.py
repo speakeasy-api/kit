@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import os
 import sys
 import threading
 import time
@@ -88,6 +89,9 @@ def prompt(request):
         },
     })
     respond(request["id"], {"stopReason": "end_turn"})
+    if "--exit-after-prompt" in sys.argv:
+        time.sleep(0.05)
+        os._exit(0)
 
 
 for line in sys.stdin:

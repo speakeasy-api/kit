@@ -471,6 +471,7 @@ impl Subagents {
             locked.child = Some(child.clone());
             self.emit_event(locked.runtime_event(id.clone()));
         }
+        self.monitor_child_exit(id.clone(), &state, &child);
         let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
@@ -673,6 +674,7 @@ impl Subagents {
             locked.child = Some(child.clone());
             self.emit_event(locked.runtime_event(id.clone()));
         }
+        self.monitor_child_exit(id.clone(), &state, &child);
         let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
@@ -888,8 +890,44 @@ impl Subagents {
         })
     }
 
+    fn monitor_child_exit(&self, id: String, state: &Arc<AsyncMutex<State>>, child: &ChildSession) {
+        let manager = self.clone();
+        let state = Arc::downgrade(state);
+        let mut closed = child.closed_signal();
+        tokio::spawn(async move {
+            if !*closed.borrow() {
+                let _ = closed.changed().await;
+            }
+            if let Some(state) = state.upgrade() {
+                manager.retire_closed_child(id, state).await;
+            }
+        });
+    }
+
+    async fn retire_closed_child(&self, id: String, state: Arc<AsyncMutex<State>>) {
+        let mut locked = state.lock().await;
+        if locked.status == SubagentStatus::Removed {
+            return;
+        }
+        if locked.status != SubagentStatus::Idle {
+            locked.outcome = Some(GenerationOutcome::Failed);
+        }
+        locked.status = SubagentStatus::Removed;
+        locked
+            .generation_finished_at_unix_ms
+            .get_or_insert_with(events::now_millis);
+        let event = locked.runtime_event(id.clone());
+        drop(locked);
+        self.remove_if_same(&id, &state);
+        drop(state);
+        self.emit_event(event);
+    }
+
     async fn fail_removed_and_remove(&self, id: &str, state: &Arc<AsyncMutex<State>>) {
         let mut locked = state.lock().await;
+        if locked.status == SubagentStatus::Removed {
+            return;
+        }
         locked.status = SubagentStatus::Removed;
         locked.outcome = Some(GenerationOutcome::Failed);
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
@@ -2107,6 +2145,59 @@ mod tests {
                 ));
                 assert!(manager.lookup(&prior).is_err());
             }
+        }
+
+        #[tokio::test]
+        async fn idle_child_exit_promptly_retires_the_direct_handle_once() {
+            let root = tempfile::tempdir().unwrap();
+            let manager =
+                manager_with_generic_harness(root.path(), vec!["--exit-after-prompt".into()]);
+            let handle = manager
+                .create(
+                    "finish before exiting".into(),
+                    None,
+                    None,
+                    None,
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if transitions(&manager).last()
+                        == Some(&(SubagentStatus::Removed, Some(GenerationOutcome::Success)))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("idle child exit did not emit direct removal promptly");
+
+            assert_eq!(
+                transitions(&manager),
+                vec![
+                    (SubagentStatus::Starting, None),
+                    (SubagentStatus::Working, None),
+                    (SubagentStatus::Idle, Some(GenerationOutcome::Success)),
+                    (SubagentStatus::Removed, Some(GenerationOutcome::Success)),
+                ]
+            );
+            assert!(manager.lookup(&handle).is_err());
+            assert_eq!(manager.capacity.available_permits(), MAX_LIVE_SUBAGENTS);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                transitions(&manager)
+                    .into_iter()
+                    .filter(|(status, _)| *status == SubagentStatus::Removed)
+                    .count(),
+                1
+            );
+            assert_eq!(manager.insert_starting_for_test(None).await, "Scout");
         }
 
         #[tokio::test]

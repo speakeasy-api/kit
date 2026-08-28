@@ -24,7 +24,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -509,6 +509,7 @@ pub(crate) struct ChildSession {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
     serial: Arc<tokio::sync::Mutex<()>>,
+    closed: watch::Receiver<bool>,
 }
 
 impl ChildSession {
@@ -524,9 +525,10 @@ impl ChildSession {
         let actor_context = context.clone();
         let (tx, mut rx) = mpsc::channel(1);
         let (ready_tx, mut ready_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = watch::channel(false);
         let actor_tx = tx.clone();
         let mut task = tokio::spawn(async move {
-            run(
+            let result = run(
                 RunConfig {
                     config,
                     harness,
@@ -537,8 +539,11 @@ impl ChildSession {
                 },
                 &mut rx,
                 ready_tx,
+                closed_tx.clone(),
             )
-            .await
+            .await;
+            let _ = closed_tx.send(true);
+            result
         });
         let result = tokio::select! {
             ready = &mut ready_rx => match ready {
@@ -563,6 +568,7 @@ impl ChildSession {
                 session_id: ready.session_id,
                 capabilities: ready.capabilities,
                 serial: Arc::new(tokio::sync::Mutex::new(())),
+                closed: closed_rx,
             }),
             Err(error) => {
                 task.abort();
@@ -573,8 +579,13 @@ impl ChildSession {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
+        self.tx.is_closed() || *self.closed.borrow()
     }
+
+    pub fn closed_signal(&self) -> watch::Receiver<bool> {
+        self.closed.clone()
+    }
+
     pub fn supports_native_fork(&self) -> bool {
         self.capabilities.session_capabilities.fork.is_some()
     }
@@ -620,6 +631,7 @@ impl ChildSession {
                 session_id: "test".into(),
                 capabilities: agentkit_acp::AgentCapabilities::default(),
                 serial: Arc::new(tokio::sync::Mutex::new(())),
+                closed: watch::channel(false).1,
             },
             closed_rx,
         )
@@ -634,6 +646,7 @@ impl ChildSession {
             session_id: "test".into(),
             capabilities: agentkit_acp::AgentCapabilities::default(),
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            closed: watch::channel(false).1,
         }
     }
 
@@ -669,6 +682,7 @@ impl ChildSession {
             session_id,
             capabilities: self.capabilities.clone(),
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            closed: self.closed.clone(),
         })
     }
 
@@ -725,6 +739,7 @@ async fn run(
     run_config: RunConfig,
     rx: &mut mpsc::Receiver<Request>,
     ready: oneshot::Sender<Result<Ready, String>>,
+    closed: watch::Sender<bool>,
 ) -> Result<(), String> {
     let RunConfig {
         config,
@@ -1003,6 +1018,7 @@ async fn run(
         result = &mut connected => result,
         status = child.wait() => {
             let status = status.map_err(|error| context.error("process status failure", error))?;
+            let _ = closed.send(true);
             if !startup_complete.load(Ordering::Acquire) && !status.success() {
                 return Err(pre_handshake_exit(&context, status));
             }

@@ -1872,6 +1872,12 @@ impl App {
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
+        self.agents.clear();
+        self.agent_versions.clear();
+        self.cleaned_agent_ids.clear();
+        self.agents_scroll = 0;
+        self.agents_viewport = 0;
+        self.agents_area = Rect::default();
         self.viewport = 0;
         self.total_lines = 0;
         self.transcript_top = 0;
@@ -3008,6 +3014,43 @@ mod tests {
             at: 0,
         }));
         assert!(app.compacting);
+    }
+
+    #[test]
+    fn switching_sessions_clears_the_process_local_agent_roster() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+        use ratatui::layout::Rect;
+
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "stale",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(GenerationOutcome::Success),
+                1,
+                None,
+                10,
+                20,
+                Some(30),
+            ),
+            100,
+        );
+        app.cleaned_agent_ids.insert("cleaned".into());
+        app.set_agents_viewport(Rect::new(20, 5, 10, 4), 2);
+
+        assert!(!app.agents.is_empty());
+        assert!(!app.agent_versions.is_empty());
+        assert!(!app.cleaned_agent_ids.is_empty());
+
+        app.start_session("replacement".into());
+
+        assert!(app.agents.is_empty());
+        assert!(app.agent_versions.is_empty());
+        assert!(app.cleaned_agent_ids.is_empty());
+        assert_eq!(app.agents_scroll, 0);
+        assert_eq!(app.agents_viewport, 0);
+        assert_eq!(app.agents_area, Rect::default());
     }
 
     #[test]
