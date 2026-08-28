@@ -558,6 +558,8 @@ pub struct App {
     agents_visible: bool,
     agents: HashMap<String, AgentRow>,
     agent_versions: HashMap<String, (u64, u8)>,
+    /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
+    cleaned_agent_ids: HashSet<String>,
     agents_scroll: usize,
     agents_viewport: usize,
     agents_area: Rect,
@@ -839,6 +841,7 @@ impl App {
             agents_visible: false,
             agents: HashMap::new(),
             agent_versions: HashMap::new(),
+            cleaned_agent_ids: HashSet::new(),
             agents_scroll: 0,
             agents_viewport: 0,
             agents_area: Rect::default(),
@@ -1954,6 +1957,9 @@ impl App {
                 generation_started_at_unix_ms,
                 generation_finished_at_unix_ms,
             } => {
+                if self.cleaned_agent_ids.contains(&id) {
+                    return;
+                }
                 let incoming_rank = agent_status_rank(status);
                 if self
                     .agent_versions
@@ -2009,6 +2015,7 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
+                self.cleaned_agent_ids.extend(removed);
             }
             _ => unreachable!("only subagent runtime events reach the roster reducer"),
         }
@@ -4333,6 +4340,129 @@ mod tests {
             100,
         );
         assert!(app.agents().iter().all(|row| row.id != "closed"));
+    }
+
+    #[test]
+    fn agents_descendant_cleanup_terminally_suppresses_every_removed_depth() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                1,
+                1,
+                Some(2),
+            ),
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Starting,
+                None,
+                1,
+                Some(("root", "Root")),
+                2,
+                2,
+                None,
+            ),
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Working,
+                None,
+                2,
+                Some(("child", "Child")),
+                3,
+                3,
+                None,
+            ),
+            agent_event(
+                "great",
+                "Great",
+                SubagentStatus::Idle,
+                None,
+                3,
+                Some(("grand", "Grand")),
+                4,
+                4,
+                Some(5),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "root".into(),
+            },
+            100,
+        );
+
+        // Delayed events advance rank and/or generation at every removed depth.
+        // Cleanup is terminal for immutable IDs, so none may recreate a row.
+        for event in [
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("root", "Root")),
+                2,
+                2,
+                None,
+            ),
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Idle,
+                None,
+                2,
+                Some(("child", "Child")),
+                3,
+                3,
+                Some(90),
+            ),
+            agent_event(
+                "great",
+                "Great",
+                SubagentStatus::Working,
+                None,
+                4,
+                Some(("grand", "Grand")),
+                4,
+                80,
+                None,
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+
+        app.apply_runtime_at(
+            agent_event(
+                "unrelated",
+                "Unrelated",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                10,
+                10,
+                None,
+            ),
+            100,
+        );
+        assert!(app.agents().iter().any(|row| row.id == "unrelated"));
     }
 
     #[test]
