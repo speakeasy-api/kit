@@ -1462,6 +1462,19 @@ fn truncate_to_width(text: &str, width: usize) -> String {
     truncated
 }
 
+fn agent_duration(millis: u64) -> String {
+    let mut duration = theme::duration(millis);
+    if let Some(minutes_end) = duration.rfind('m').map(|index| index + 1)
+        && duration[minutes_end..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    {
+        duration.insert(minutes_end, ' ');
+    }
+    duration
+}
+
 fn agent_lines(row: &AgentRow, tick: usize, now_unix_ms: u64, width: usize) -> [Line<'static>; 2] {
     let failed = row.outcome == Some(GenerationOutcome::Failed)
         && row
@@ -1493,7 +1506,7 @@ fn agent_lines(row: &AgentRow, tick: usize, now_unix_ms: u64, width: usize) -> [
     ]);
 
     let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
-    let duration = theme::duration(finished.saturating_sub(row.generation_started_at_unix_ms));
+    let duration = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
     let duration_full_width = UnicodeWidthStr::width(duration.as_str());
     let duration_width = duration_full_width.min(width);
     let displayed_duration = if duration_width < duration_full_width {
@@ -1947,6 +1960,7 @@ mod tests {
 
     use agent_client_protocol::schema::v2::ToolKind;
     use base64::Engine as _;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
     use ratatui_image::picker::Picker;
 
@@ -2005,10 +2019,10 @@ mod tests {
         );
         let lines = agent_lines(&top, 0, 74_000, 48);
         assert_eq!(line_text(&lines[0]), "⠋ Scout");
-        assert_eq!(
-            line_text(&lines[1]),
-            "  Trace ACP lifecycle                      1m12s"
-        );
+        let second = line_text(&lines[1]);
+        assert_eq!(second, "  Trace ACP lifecycle                     1m 12s");
+        assert_eq!(&second[42..48], "1m 12s");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(second.as_str()), 48);
         assert_eq!(
             lines[0].spans[0].style.fg,
             Some(ratatui::style::Color::Cyan)
@@ -2132,46 +2146,103 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agents_panel_renders_fixed_footer_and_two_line_rows() {
+    fn panel_app(agent_count: usize) -> App {
         let mut app = App::new(
             PathBuf::from("/tmp/project"),
             "provider".into(),
             "model".into(),
             "127.0.0.1:7331".into(),
         );
-        app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
-            id: "agent-1".into(),
-            name: "Scout".into(),
-            status: SubagentStatus::Idle,
-            outcome: Some(GenerationOutcome::Success),
-            generation: 1,
-            task: "Trace ACP lifecycle".into(),
-            parent_id: None,
-            parent_name: None,
-            harness: "acp.kit".into(),
-            model: Some("test".into()),
-            created_at_unix_ms: 1_000,
-            generation_started_at_unix_ms: 2_000,
-            generation_finished_at_unix_ms: Some(74_000),
-        }));
+        for index in 0..agent_count {
+            app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+                id: format!("agent-{index}"),
+                name: format!("Scout {index}"),
+                status: SubagentStatus::Idle,
+                outcome: Some(GenerationOutcome::Success),
+                generation: 1,
+                task: format!("Task {index}"),
+                parent_id: None,
+                parent_name: None,
+                harness: "acp.kit".into(),
+                model: Some("test".into()),
+                created_at_unix_ms: 1_000 + index as u64,
+                generation_started_at_unix_ms: 2_000,
+                generation_finished_at_unix_ms: Some(74_000),
+            }));
+        }
+        app
+    }
+
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    fn buffer_cells(
+        buffer: &ratatui::buffer::Buffer,
+        row: u16,
+        columns: std::ops::Range<u16>,
+    ) -> String {
+        columns
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn agents_panel_keeps_footer_fixed_while_overflowing_rows_scroll() {
+        let mut app = panel_app(5);
         let mut terminal = Terminal::new(TestBackend::new(46, 8)).expect("terminal");
         terminal
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
-        let buffer = terminal.backend().buffer();
-        let rendered = (0..buffer.area.height)
-            .map(|row| {
-                (0..buffer.area.width)
-                    .map(|column| buffer[(column, row)].symbol())
-                    .collect::<String>()
+        let initial = terminal.backend().buffer();
+        assert_eq!(buffer_cells(initial, 0, 1..9), " AGENTS ");
+        assert_eq!(buffer_cells(initial, 1, 1..10), "○ Scout 0");
+        assert_eq!(buffer_cells(initial, 2, 3..9), "Task 0");
+        assert_eq!(buffer_cells(initial, 3, 1..10), "○ Scout 1");
+        assert_eq!(buffer_cells(initial, 6, 1..18), "5 agents · 5 idle");
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.agents_scroll(), 3);
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        let scrolled = terminal.backend().buffer();
+        assert_eq!(buffer_cells(scrolled, 1, 1..10), "○ Scout 3");
+        assert_eq!(buffer_cells(scrolled, 3, 1..10), "○ Scout 4");
+        assert_eq!(buffer_cells(scrolled, 6, 1..18), "5 agents · 5 idle");
+        assert_eq!(
+            buffer_row(scrolled, 7),
+            "╰────────────────────────────────────────────╯"
+        );
+    }
+
+    #[test]
+    fn agents_panel_draws_zero_and_tiny_rectangles_without_panicking() {
+        let mut app = panel_app(5);
+        app.set_agents_viewport(ratatui::layout::Rect::new(0, 0, 2, 4), 1);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.agents_scroll(), 3);
+
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw_agents(frame, &mut app, ratatui::layout::Rect::default());
+                draw_agents(frame, &mut app, ratatui::layout::Rect::new(0, 0, 1, 1));
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains(" AGENTS "), "{rendered}");
-        assert!(rendered.contains("○ Scout"), "{rendered}");
-        assert!(rendered.contains("Trace ACP lifecycle"), "{rendered}");
-        assert!(rendered.contains("1 agents · 1 idle"), "{rendered}");
+            .expect("zero and tiny draws succeed");
+        assert_eq!(app.agents_scroll(), 3);
     }
 
     fn model_choice(provider: &str, model: &str) -> crate::tui::app::ModelChoice {
