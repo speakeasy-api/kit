@@ -210,6 +210,7 @@ struct Config {
 #[derive(Debug, Deserialize)]
 struct SubagentConfig {
     harness: String,
+    names: Option<Vec<String>>,
     #[serde(default)]
     harnesses: BTreeMap<String, kit::SubagentHarnessPolicy>,
 }
@@ -254,6 +255,12 @@ impl Config {
             )
         })?;
         config.config_dir = config_dir;
+        config.subagent_names().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid config {}: {error}", path.display()),
+            )
+        })?;
         Ok(config)
     }
 
@@ -332,6 +339,14 @@ impl Config {
             max_bytes,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+    }
+
+    fn subagent_names(&self) -> Result<kit::tools::SubagentNames, String> {
+        kit::tools::SubagentNames::resolve(
+            self.subagent
+                .as_ref()
+                .and_then(|subagent| subagent.names.clone()),
+        )
     }
 
     fn harnesses(&self) -> Result<(kit::AcpHarnesses, String), String> {
@@ -850,6 +865,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 plugins.skill_directories,
             )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
+            let runtime = kit::Runtime::with_subagent_names(runtime, config.subagent_names()?)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -928,6 +944,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
+            let runtime = kit::Runtime::with_subagent_names(runtime, config.subagent_names()?)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -1046,6 +1063,51 @@ mod tests {
         init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
         validate_auth_storage,
     };
+
+    #[test]
+    fn subagent_names_preserve_absent_custom_and_empty_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let absent_path = directory.path().join("absent.toml");
+        fs::write(&absent_path, "[subagent]\nharness = \"acp.kit\"\n").unwrap();
+        let absent = Config::load(&absent_path).unwrap();
+        assert_eq!(absent.subagent.unwrap().names, None);
+
+        let custom_path = directory.path().join("custom.toml");
+        fs::write(
+            &custom_path,
+            "[subagent]\nharness = \"acp.kit\"\nnames = [\" Acorn \", \"Moss\"]\n",
+        )
+        .unwrap();
+        let custom = Config::load(&custom_path).unwrap();
+        assert_eq!(
+            custom.subagent.unwrap().names,
+            Some(vec![" Acorn ".into(), "Moss".into()])
+        );
+
+        let empty_path = directory.path().join("empty.toml");
+        fs::write(
+            &empty_path,
+            "[subagent]\nharness = \"acp.kit\"\nnames = []\n",
+        )
+        .unwrap();
+        let empty = Config::load(&empty_path).unwrap();
+        assert_eq!(empty.subagent.unwrap().names, Some(Vec::new()));
+    }
+
+    #[test]
+    fn subagent_names_are_validated_during_config_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "[subagent]\nharness = \"acp.kit\"\nnames = [\"Scout\", \"scout\"]\n",
+        )
+        .unwrap();
+
+        let error = Config::load(&path).expect_err("duplicate names must fail config loading");
+        assert!(error.to_string().contains("scout"));
+    }
 
     #[test]
     fn config_file_supplies_defaults_and_cli_values_win() {

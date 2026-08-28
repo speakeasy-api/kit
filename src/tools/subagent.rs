@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -14,6 +14,64 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
 
+pub const DEFAULT_SUBAGENT_NAMES: &[&str] = &[
+    "Scout", "Pip", "Juniper", "Miso", "Clover", "Pixel", "Pebble", "Nova",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentNames {
+    names: Arc<[String]>,
+}
+
+impl SubagentNames {
+    pub fn resolve(configured: Option<Vec<String>>) -> Result<Self, String> {
+        let values = configured.unwrap_or_else(|| {
+            DEFAULT_SUBAGENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect()
+        });
+        let mut names = Vec::with_capacity(values.len());
+        let mut normalized = HashSet::with_capacity(values.len());
+
+        for source in values {
+            let name = source.trim();
+            if name.is_empty() {
+                return Err(format!("subagent name {source:?} must not be empty"));
+            }
+            if name.chars().any(char::is_control) {
+                return Err(format!(
+                    "subagent name {source:?} must not contain control characters"
+                ));
+            }
+            if name.chars().count() > 32 {
+                return Err(format!(
+                    "subagent name {source:?} must be at most 32 characters"
+                ));
+            }
+            let key = name.to_lowercase();
+            if !normalized.insert(key) {
+                return Err(format!("duplicate subagent name {name:?}"));
+            }
+            names.push(name.to_string());
+        }
+
+        Ok(Self {
+            names: names.into(),
+        })
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.names
+    }
+}
+
+impl Default for SubagentNames {
+    fn default() -> Self {
+        Self::resolve(None).expect("built-in subagent names are valid")
+    }
+}
+
 use crate::{
     acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession},
     session,
@@ -23,6 +81,7 @@ use crate::{
 pub struct Subagents {
     config: ChildConfig,
     max_depth: usize,
+    names: SubagentNames,
     sessions: Arc<Mutex<HashMap<String, Arc<AsyncMutex<State>>>>>,
     capacity: Arc<Semaphore>,
 }
@@ -117,9 +176,14 @@ fn turn_output(
 
 impl Subagents {
     pub(crate) fn new(config: ChildConfig, max_depth: usize) -> Self {
+        Self::with_names(config, max_depth, SubagentNames::default())
+    }
+
+    pub(crate) fn with_names(config: ChildConfig, max_depth: usize, names: SubagentNames) -> Self {
         Self {
             config,
             max_depth,
+            names,
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
         }
@@ -130,7 +194,16 @@ impl Subagents {
     }
 
     pub(crate) fn fresh(&self) -> Self {
-        Self::new(self.config.clone(), self.max_depth)
+        Self::with_names(self.config.clone(), self.max_depth, self.names.clone())
+    }
+
+    pub(crate) fn names_policy(&self) -> SubagentNames {
+        self.names.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subagent_names(&self) -> &[String] {
+        self.names.as_slice()
     }
 
     fn harness_references(&self) -> Vec<String> {
@@ -847,6 +920,50 @@ mod tests {
     use agentkit_core::{Item, ItemKind};
 
     use super::*;
+
+    #[test]
+    fn configured_subagent_names_use_defaults_or_explicit_replacement() {
+        let defaults = SubagentNames::resolve(None).expect("default names");
+        assert_eq!(
+            defaults.as_slice(),
+            DEFAULT_SUBAGENT_NAMES
+                .iter()
+                .copied()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+
+        let names = SubagentNames::resolve(Some(vec!["  Acorn  ".into(), "Moss".into()]))
+            .expect("valid names");
+        assert_eq!(names.as_slice(), &["Acorn", "Moss"]);
+        assert!(
+            SubagentNames::resolve(Some(Vec::new()))
+                .expect("empty pool")
+                .as_slice()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_subagent_names_reject_invalid_values() {
+        let too_long = "x".repeat(33);
+        for invalid in ["   ", "line\nbreak", "control\u{7}", too_long.as_str()] {
+            let error = SubagentNames::resolve(Some(vec![invalid.into()]))
+                .expect_err("invalid configured name must fail");
+            let identified = format!("{invalid:?}");
+            assert!(
+                error.contains(&identified),
+                "{error:?} did not identify {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_subagent_names_reject_case_insensitive_duplicates() {
+        let error = SubagentNames::resolve(Some(vec!["Scout".into(), "scout".into()]))
+            .expect_err("case-insensitive duplicate must fail");
+        assert!(error.contains("scout"));
+    }
 
     #[test]
     fn structured_output_is_parsed_and_validated() {

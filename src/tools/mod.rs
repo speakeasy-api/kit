@@ -14,4 +14,6 @@ pub use mcp::{AuthTool, McpTool, ToolSearch};
 pub use observed::Observed;
 pub(crate) use observed::shared as observe_shared;
 pub use shell::ShellTool;
-pub use subagent::{CloseTool, ForkTool, PromptTool, SubagentTool, Subagents, SubagentsTool};
+pub use subagent::{
+    CloseTool, ForkTool, PromptTool, SubagentNames, SubagentTool, Subagents, SubagentsTool,
+};

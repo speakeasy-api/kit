@@ -36,7 +36,8 @@ use crate::{
     provider::{ProviderKind, SelectableAdapter, SelectableSession},
     tools::{
         A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
-        ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
+        ShellTool, SubagentNames, SubagentTool, Subagents, SubagentsTool, ToolSearch,
+        observe_shared,
     },
 };
 
@@ -462,6 +463,22 @@ impl Runtime {
         &self.root
     }
 
+    /// Configures the ordered name pool used by nested agents.
+    pub fn with_subagent_names(
+        runtime: Arc<Self>,
+        names: SubagentNames,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
+            "could not configure subagent names after runtime was shared".to_string()
+        })?;
+        runtime.subagents = Subagents::with_names(
+            runtime.subagents.child_config(),
+            runtime.max_subagent_depth,
+            names,
+        );
+        Ok(Arc::new(runtime))
+    }
+
     /// Configures the trusted named ACP harnesses used by nested agents.
     pub fn with_acp_harnesses(
         runtime: Arc<Self>,
@@ -474,14 +491,16 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
             "could not configure ACP harnesses after runtime was shared".to_string()
         })?;
+        let names = runtime.subagents.names_policy();
         let previous = runtime.subagents.child_config();
-        runtime.subagents = Subagents::new(
+        runtime.subagents = Subagents::with_names(
             ChildConfig {
                 harnesses,
                 default_harness,
                 ..previous
             },
             runtime.max_subagent_depth,
+            names,
         );
         Ok(Arc::new(runtime))
     }
@@ -495,13 +514,15 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure telemetry after runtime was shared".to_string())?;
         runtime.telemetry = telemetry.clone();
+        let names = runtime.subagents.names_policy();
         let previous = runtime.subagents.child_config();
-        runtime.subagents = Subagents::new(
+        runtime.subagents = Subagents::with_names(
             ChildConfig {
                 telemetry,
                 ..previous
             },
             runtime.max_subagent_depth,
+            names,
         );
         Ok(Arc::new(runtime))
     }
@@ -546,8 +567,9 @@ impl Runtime {
             .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
         runtime.mcp = mcp;
         runtime.credential_storage = credential_storage.clone();
+        let names = runtime.subagents.names_policy();
         let previous = runtime.subagents.child_config();
-        runtime.subagents = Subagents::new(
+        runtime.subagents = Subagents::with_names(
             ChildConfig {
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
@@ -561,6 +583,7 @@ impl Runtime {
                 default_harness: previous.default_harness,
             },
             runtime.max_subagent_depth,
+            names,
         );
         Ok(Arc::new(runtime))
     }
