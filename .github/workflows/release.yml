@@ -223,9 +223,12 @@ jobs:
           gh release edit "${edit_args[@]}"
 
   container-build:
-    name: Build container images (${{ matrix.arch }})
+    name: Build container images (${{ matrix.arch }}, ${{ matrix.family }})
     needs: publish
     runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: release-container-cache-${{ matrix.arch }}-${{ matrix.family }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -236,9 +239,19 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
+            family: gnu
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            family: musl
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+            family: gnu
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            family: musl
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
@@ -257,6 +270,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push slim image by digest
+        if: matrix.family == 'gnu'
         id: slim
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
@@ -266,8 +280,10 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             REVISION=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
       - name: Build and push Bookworm image by digest
+        if: matrix.family == 'gnu'
         id: bookworm
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
@@ -277,8 +293,11 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             REVISION=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
       - name: Build and push Alpine image by digest
+        if: matrix.family == 'musl'
         id: alpine
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
@@ -288,22 +307,31 @@ jobs:
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             REVISION=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Export image digests
+      - name: Export GNU image digests
+        if: matrix.family == 'gnu'
         env:
           SLIM_DIGEST: ${{ steps.slim.outputs.digest }}
           BOOKWORM_DIGEST: ${{ steps.bookworm.outputs.digest }}
+        shell: bash
+        run: |
+          mkdir -p /tmp/digests/{slim,bookworm}
+          touch "/tmp/digests/slim/${SLIM_DIGEST#sha256:}"
+          touch "/tmp/digests/bookworm/${BOOKWORM_DIGEST#sha256:}"
+      - name: Export Alpine image digest
+        if: matrix.family == 'musl'
+        env:
           ALPINE_DIGEST: ${{ steps.alpine.outputs.digest }}
         shell: bash
         run: |
-          mkdir -p /tmp/digests/{slim,bookworm,alpine}
-          touch "/tmp/digests/slim/${SLIM_DIGEST#sha256:}"
-          touch "/tmp/digests/bookworm/${BOOKWORM_DIGEST#sha256:}"
+          mkdir -p /tmp/digests/alpine
           touch "/tmp/digests/alpine/${ALPINE_DIGEST#sha256:}"
       - name: Upload image digests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: container-digests-${{ matrix.arch }}
+          name: container-digests-${{ matrix.arch }}-${{ matrix.family }}
           path: /tmp/digests
           if-no-files-found: error
           retention-days: 1
