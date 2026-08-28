@@ -11,6 +11,9 @@ supports_models = "--models" in sys.argv
 selected_models = {}
 model_ids = ["mock/default", "mock/requested"]
 
+if "--fail-start" in sys.argv:
+    sys.exit(2)
+
 
 def send(message):
     with write_lock:
@@ -31,6 +34,9 @@ def prompt(request):
         text = selected_models.get(session_id, model_ids[0])
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
+    if "MOCK_REFUSAL" in text:
+        respond(request["id"], {"stopReason": "refusal"})
+        return
     if "MOCK_RICH_OUTPUT" in text:
         updates = [
             {
@@ -112,6 +118,13 @@ for line in sys.stdin:
             }]
         respond(request["id"], result)
     elif method == "session/fork":
+        if "--fail-fork" in sys.argv:
+            send({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": -32000, "message": "fork failed"},
+            })
+            continue
         if not supports_fork:
             send({
                 "jsonrpc": "2.0",
@@ -141,4 +154,6 @@ for line in sys.stdin:
     elif method == "session/cancel":
         pass
     elif method == "session/close":
+        if "--slow-close" in sys.argv:
+            time.sleep(0.40)
         respond(request["id"], {})

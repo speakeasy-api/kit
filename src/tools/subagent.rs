@@ -122,6 +122,13 @@ fn suffixed_name(base: &str, suffix: usize) -> String {
     format!("{}{}", base.chars().take(keep).collect::<String>(), suffix)
 }
 
+fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
+    match error {
+        ChildError::TerminalCancelled | ChildError::TerminalFailed(_) => true,
+        ChildError::Cancelled | ChildError::Failed(_) => child.is_closed(),
+    }
+}
+
 fn task_summary(prompt: &str) -> String {
     let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -146,11 +153,21 @@ pub struct Subagents {
     names: SubagentNames,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
+    #[cfg(test)]
+    failed_removals: Arc<Mutex<Vec<FailedRemoval>>>,
 }
 
 struct SessionEntry {
     name: String,
     state: Arc<AsyncMutex<State>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct FailedRemoval {
+    status: SubagentStatus,
+    outcome: Option<GenerationOutcome>,
+    finished_at_unix_ms: Option<u64>,
 }
 
 struct State {
@@ -278,6 +295,8 @@ impl Subagents {
             names,
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
+            #[cfg(test)]
+            failed_removals: Arc::default(),
         }
     }
 
@@ -296,6 +315,35 @@ impl Subagents {
     #[cfg(test)]
     pub(crate) fn subagent_names(&self) -> &[String] {
         self.names.as_slice()
+    }
+
+    #[cfg(test)]
+    async fn insert_starting_for_test(&self, fallback_name: Option<&str>) -> String {
+        let now = events::now_millis();
+        let state = self
+            .insert_starting(
+                session::new_id(),
+                fallback_name,
+                State {
+                    name: String::new(),
+                    status: SubagentStatus::Starting,
+                    task: "test".into(),
+                    generation: 1,
+                    outcome: None,
+                    created_at_unix_ms: now,
+                    generation_started_at_unix_ms: now,
+                    generation_finished_at_unix_ms: None,
+                    output: Value::Null,
+                    updates: None,
+                    harness: crate::acp_child::BUILTIN_HARNESS.into(),
+                    model: None,
+                    kit: true,
+                    child: None,
+                    _permit: self.reserve().unwrap(),
+                },
+            )
+            .unwrap();
+        state.lock().await.name.clone()
     }
 
     fn harness_references(&self) -> Vec<String> {
@@ -362,7 +410,7 @@ impl Subagents {
         {
             Ok(child) => child,
             Err(error) => {
-                self.remove_if_same(&id, &state);
+                self.fail_removed_and_remove(&id, &state).await;
                 return Err(error);
             }
         };
@@ -377,12 +425,7 @@ impl Subagents {
         {
             Ok(output) => output,
             Err(error) => {
-                let mut locked = state.lock().await;
-                locked.status = SubagentStatus::Removed;
-                locked.outcome = Some(GenerationOutcome::Failed);
-                locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                drop(locked);
-                self.remove_if_same(&id, &state);
+                self.fail_removed_and_remove(&id, &state).await;
                 let _ = child.close().await;
                 return Err(error);
             }
@@ -458,14 +501,17 @@ impl Subagents {
                 })
             }
             Err(error) => {
-                // Any dispatched unsuccessful turn may have changed the durable
-                // transcript. Retire it rather than accepting the old generation.
-                let mut locked = state.lock().await;
-                locked.status = SubagentStatus::Removed;
-                locked.outcome = Some(GenerationOutcome::Failed);
-                locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                drop(locked);
-                self.remove_if_same(&prior.id, &state);
+                if child_error_is_terminal(&error, &child) {
+                    self.fail_removed_and_remove(&prior.id, &state).await;
+                } else {
+                    let mut locked = state.lock().await;
+                    locked.status = SubagentStatus::Idle;
+                    locked.outcome = Some(GenerationOutcome::Failed);
+                    locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                    // A failed call returns no replacement handle, so preserve the
+                    // last completed generation for a retry with the same handle.
+                    locked.generation = prior.generation;
+                }
                 Err(error)
             }
         }
@@ -549,7 +595,7 @@ impl Subagents {
         let child = match child_result {
             Ok(child) => child,
             Err(error) => {
-                self.remove_if_same(&id, &state);
+                self.fail_removed_and_remove(&id, &state).await;
                 return Err(error);
             }
         };
@@ -564,12 +610,7 @@ impl Subagents {
         {
             Ok(output) => output,
             Err(error) => {
-                let mut locked = state.lock().await;
-                locked.status = SubagentStatus::Removed;
-                locked.outcome = Some(GenerationOutcome::Failed);
-                locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                drop(locked);
-                self.remove_if_same(&id, &state);
+                self.fail_removed_and_remove(&id, &state).await;
                 let _ = child.close().await;
                 return Err(error);
             }
@@ -667,13 +708,36 @@ impl Subagents {
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_active(&locked)?;
-        if let Some(child) = &locked.child {
-            child.close().await?;
-        }
+        let previous_status = locked.status;
         locked.status = SubagentStatus::Removed;
+        let child = locked.child.take();
         drop(locked);
-        self.remove_if_same(id, &state);
-        Ok(())
+
+        let result = match &child {
+            Some(child) => child.close().await,
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.remove_if_same(id, &state);
+                Ok(())
+            }
+            Err(error) => {
+                let terminal = child
+                    .as_ref()
+                    .is_none_or(|child| child_error_is_terminal(&error, child));
+                if terminal || previous_status != SubagentStatus::Idle {
+                    self.remove_if_same(id, &state);
+                } else {
+                    let mut locked = state.lock().await;
+                    if locked.status == SubagentStatus::Removed {
+                        locked.status = previous_status;
+                        locked.child = child;
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     fn lookup(&self, prior: &SubagentValue) -> Result<Arc<AsyncMutex<State>>, ChildError> {
@@ -726,6 +790,28 @@ impl Subagents {
                 "live subagent session limit ({MAX_LIVE_SUBAGENTS}) reached"
             ))
         })
+    }
+
+    async fn fail_removed_and_remove(&self, id: &str, state: &Arc<AsyncMutex<State>>) {
+        let mut locked = state.lock().await;
+        locked.status = SubagentStatus::Removed;
+        locked.outcome = Some(GenerationOutcome::Failed);
+        locked.generation_finished_at_unix_ms = Some(events::now_millis());
+        #[cfg(test)]
+        if let Ok(mut transitions) = self.failed_removals.lock() {
+            transitions.push(FailedRemoval {
+                status: locked.status,
+                outcome: locked.outcome,
+                finished_at_unix_ms: locked.generation_finished_at_unix_ms,
+            });
+        }
+        drop(locked);
+        self.remove_if_same(id, state);
+    }
+
+    #[cfg(test)]
+    fn failed_removals_for_test(&self) -> Vec<FailedRemoval> {
+        self.failed_removals.lock().unwrap().clone()
     }
 
     fn remove_if_same(&self, id: &str, expected: &Arc<AsyncMutex<State>>) {
@@ -973,8 +1059,10 @@ fn result(
     value: Result<SubagentValue, ChildError>,
 ) -> Result<ToolResult, ToolError> {
     let value = value.map_err(|error| match error {
-        ChildError::Cancelled => ToolError::Cancelled,
-        ChildError::Failed(error) => ToolError::ExecutionFailed(error),
+        ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
+        ChildError::Failed(error) | ChildError::TerminalFailed(error) => {
+            ToolError::ExecutionFailed(error)
+        }
     })?;
     Ok(ToolResult::new(ToolResultPart::success(
         request.call_id,
@@ -1234,6 +1322,33 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(allocated.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn manager_name_allocation_is_atomic_across_concurrent_insertions() {
+        let root = tempfile::tempdir().unwrap();
+        let base = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
+        let manager = Subagents::with_names(
+            base.child_config(),
+            2,
+            SubagentNames::resolve(Some(vec!["Scout".into()])).unwrap(),
+        );
+        let starts = (0..8)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(async move { manager.insert_starting_for_test(Some("Waffles")).await })
+            })
+            .collect::<Vec<_>>();
+        let mut allocated = HashSet::new();
+        for start in starts {
+            allocated.insert(start.await.unwrap());
+        }
+
+        assert_eq!(allocated.len(), 8);
+        assert!(allocated.contains("Scout"));
+        assert!(allocated.contains("Waffles"));
+        assert!(allocated.contains("Waffles 2"));
+        assert_eq!(manager.sessions.lock().unwrap().len(), 8);
     }
 
     #[test]
@@ -1504,6 +1619,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_does_not_block_listings_or_allow_stale_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+            "generic".into(),
+            crate::acp_child::AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![fixture, "--slow-close".into()],
+                permissions: Default::default(),
+            },
+        )]))
+        .unwrap();
+        let manager = Subagents::new(
+            ChildConfig {
+                root: root.path().to_path_buf(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses,
+                default_harness: "acp.generic".into(),
+            },
+            2,
+        );
+        let handle = manager
+            .create(
+                "base".into(),
+                None,
+                None,
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let close_manager = manager.clone();
+        let close_id = handle.id.clone();
+        let close = tokio::spawn(async move {
+            close_manager
+                .close(&close_id, &TurnCancellation::default())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let listing = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            manager.list(&TurnCancellation::default()),
+        )
+        .await
+        .expect("listing blocked behind child close")
+        .unwrap();
+        assert!(listing.is_empty());
+        let reuse = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            manager.prompt(
+                handle,
+                "stale reuse".into(),
+                TurnCancellation::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("reuse blocked behind child close");
+        assert!(reuse.is_err());
+        close.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn listing_omits_closed_subagents() {
         let directory = tempfile::tempdir().unwrap();
         let (manager, state, prior) = manager_with_disconnected_session(directory.path());
@@ -1592,6 +1779,175 @@ mod tests {
             structured_output("not JSON".into(), Some(&contract)),
             Value::String("not JSON".into())
         );
+    }
+
+    fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
+        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+            "generic".into(),
+            crate::acp_child::AcpHarnessProfile {
+                command: "python3".into(),
+                args: std::iter::once(fixture).chain(args).collect(),
+                permissions: Default::default(),
+            },
+        )]))
+        .unwrap();
+        Subagents::new(
+            ChildConfig {
+                root: root.to_path_buf(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses,
+                default_harness: "acp.generic".into(),
+            },
+            2,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_create_and_fork_startup_record_failed_removed_transitions() {
+        let root = tempfile::tempdir().unwrap();
+        let failed_create = manager_with_generic_harness(root.path(), vec!["--fail-start".into()]);
+        assert!(
+            failed_create
+                .create(
+                    "create".into(),
+                    None,
+                    None,
+                    None,
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        let create_transitions = failed_create.failed_removals_for_test();
+        assert_eq!(create_transitions.len(), 1);
+        assert_eq!(create_transitions[0].status, SubagentStatus::Removed);
+        assert_eq!(
+            create_transitions[0].outcome,
+            Some(GenerationOutcome::Failed)
+        );
+        assert!(create_transitions[0].finished_at_unix_ms.is_some());
+
+        let failed_fork = manager_with_generic_harness(root.path(), vec!["--fail-fork".into()]);
+        let source = failed_fork
+            .create(
+                "source".into(),
+                None,
+                None,
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            failed_fork
+                .fork(
+                    source,
+                    "fork".into(),
+                    None,
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        let fork_transitions = failed_fork.failed_removals_for_test();
+        assert_eq!(fork_transitions.len(), 1);
+        assert_eq!(fork_transitions[0].status, SubagentStatus::Removed);
+        assert_eq!(fork_transitions[0].outcome, Some(GenerationOutcome::Failed));
+        assert!(fork_transitions[0].finished_at_unix_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_child_errors_do_not_depend_on_channel_close_timing() {
+        let (child, _) = ChildSession::closure_probe_for_test();
+        assert!(child_error_is_terminal(
+            &ChildError::TerminalCancelled,
+            &child
+        ));
+        assert!(child_error_is_terminal(
+            &ChildError::TerminalFailed("transport ended".into()),
+            &child
+        ));
+    }
+
+    #[tokio::test]
+    async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
+        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+            "generic".into(),
+            crate::acp_child::AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![fixture, "--no-fork".into()],
+                permissions: Default::default(),
+            },
+        )]))
+        .unwrap();
+        let manager = Subagents::new(
+            ChildConfig {
+                root: root.path().to_path_buf(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses,
+                default_harness: "acp.generic".into(),
+            },
+            2,
+        );
+        let handle = manager
+            .create(
+                "base".into(),
+                None,
+                None,
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = manager
+            .prompt(
+                handle.clone(),
+                "MOCK_REFUSAL".into(),
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "nested agent refused the prompt");
+        let state = manager
+            .lookup(&handle)
+            .expect("live child remains reusable");
+        let state = state.lock().await;
+        assert_eq!(state.status, SubagentStatus::Idle);
+        assert_eq!(state.outcome, Some(GenerationOutcome::Failed));
+        assert!(state.generation_finished_at_unix_ms.is_some());
+        drop(state);
+
+        let retried = manager
+            .prompt(handle, "retry".into(), TurnCancellation::default(), None)
+            .await
+            .expect("failed reusable generation does not stale the last handle");
+        assert_eq!(retried.generation, 2);
+        assert_eq!(retried.name.as_deref(), Some("Scout"));
     }
 
     #[tokio::test]

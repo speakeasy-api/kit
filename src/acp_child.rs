@@ -358,12 +358,14 @@ pub(crate) struct ChildConfig {
 pub(crate) enum ChildError {
     Cancelled,
     Failed(String),
+    TerminalCancelled,
+    TerminalFailed(String),
 }
 impl std::fmt::Display for ChildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cancelled => f.write_str("nested agent cancelled"),
-            Self::Failed(e) => f.write_str(e),
+            Self::Cancelled | Self::TerminalCancelled => f.write_str("nested agent cancelled"),
+            Self::Failed(e) | Self::TerminalFailed(e) => f.write_str(e),
         }
     }
 }
@@ -576,9 +578,13 @@ impl ChildSession {
                 reply,
             }))
             .await
-            .map_err(|_| ChildError::Failed("nested agent process is no longer running".into()))?;
+            .map_err(|_| {
+                ChildError::TerminalFailed("nested agent process is no longer running".into())
+            })?;
         response.await.map_err(|_| {
-            ChildError::Failed("nested agent process exited without a close response".into())
+            ChildError::TerminalFailed(
+                "nested agent process exited without a close response".into(),
+            )
         })?
     }
 
@@ -634,11 +640,11 @@ impl ChildSession {
                 model: model.map(str::to_owned),
                 cancellation: cancellation.clone(),
                 reply,
-            })) => sent.map_err(|_| ChildError::Failed("nested agent process is no longer running".into()))?,
+            })) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         }
         let session_id = response.await.map_err(|_| {
-            ChildError::Failed("nested agent process exited without a fork response".into())
+            ChildError::TerminalFailed("nested agent process exited without a fork response".into())
         })??;
         Ok(Self {
             tx: self.tx.clone(),
@@ -665,11 +671,11 @@ impl ChildSession {
             reply,
         });
         tokio::select! {
-            sent = self.tx.send(request) => sent.map_err(|_| ChildError::Failed("nested agent process is no longer running".into()))?,
+            sent = self.tx.send(request) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         }
         response.await.map_err(|_| {
-            ChildError::Failed("nested agent process exited without a response".into())
+            ChildError::TerminalFailed("nested agent process exited without a response".into())
         })?
     }
 }
@@ -932,7 +938,7 @@ async fn run(
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
                                         Ok(result) => (result.map_err(|error| error.to_string()), true),
                                         Err(_) => {
-                                            let _ = prompt.reply.send(Err(ChildError::Cancelled));
+                                            let _ = prompt.reply.send(Err(ChildError::TerminalCancelled));
                                             let _ = fatal.send(());
                                             return;
                                         }
