@@ -59,8 +59,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         .area()
         .width
         .saturating_sub(4)
-        .min(START_MAX_WIDTH)
-        .max(1);
+        .clamp(1, START_MAX_WIDTH);
     let start_prompt_width = start_width.saturating_sub(4).max(1) as usize;
     let available_start_prompt_rows = frame
         .area()
