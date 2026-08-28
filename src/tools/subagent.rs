@@ -72,9 +72,71 @@ impl Default for SubagentNames {
     }
 }
 
+fn allocate_name(
+    pool: &[String],
+    used: &mut HashSet<String>,
+    fallback_name: Option<&str>,
+) -> String {
+    for name in pool {
+        if reserve_name(used, name) {
+            return name.clone();
+        }
+    }
+
+    if let Some(base) = fallback_name.and_then(normalize_fallback_name) {
+        for suffix in 1usize.. {
+            let name = suffixed_name(&base, suffix);
+            if reserve_name(used, &name) {
+                return name;
+            }
+        }
+    }
+
+    for number in 1usize.. {
+        let name = format!("Agent {number}");
+        if reserve_name(used, &name) {
+            return name;
+        }
+    }
+    unreachable!("generated subagent name space is inexhaustible")
+}
+
+fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
+    used.insert(name.to_lowercase())
+}
+
+fn normalize_fallback_name(value: &str) -> Option<String> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty() && normalized.chars().count() <= 32).then_some(normalized)
+}
+
+fn suffixed_name(base: &str, suffix: usize) -> String {
+    if suffix == 1 {
+        return base.to_string();
+    }
+    let suffix = format!(" {suffix}");
+    let keep = 32usize.saturating_sub(suffix.chars().count());
+    format!("{}{}", base.chars().take(keep).collect::<String>(), suffix)
+}
+
+fn task_summary(prompt: &str) -> String {
+    let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "Untitled task".into();
+    }
+    if normalized.chars().count() <= 96 {
+        normalized
+    } else {
+        format!("{}…", normalized.chars().take(95).collect::<String>())
+    }
+}
+
 use crate::{
     acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession},
-    session,
+    events, session,
 };
 
 #[derive(Clone)]
@@ -82,27 +144,55 @@ pub struct Subagents {
     config: ChildConfig,
     max_depth: usize,
     names: SubagentNames,
-    sessions: Arc<Mutex<HashMap<String, Arc<AsyncMutex<State>>>>>,
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
 }
 
+struct SessionEntry {
+    name: String,
+    state: Arc<AsyncMutex<State>>,
+}
+
 struct State {
-    starting: bool,
+    name: String,
+    status: SubagentStatus,
+    task: String,
     generation: u64,
+    outcome: Option<GenerationOutcome>,
+    created_at_unix_ms: u64,
+    generation_started_at_unix_ms: u64,
+    generation_finished_at_unix_ms: Option<u64>,
     output: Value,
     updates: Option<SubagentUpdates>,
-    retired: bool,
     harness: String,
     model: Option<String>,
     kit: bool,
-    child: ChildSession,
+    child: Option<ChildSession>,
     _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubagentStatus {
+    Starting,
+    Working,
+    Idle,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GenerationOutcome {
+    Success,
+    Failed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentValue {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub output: Value,
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,11 +205,13 @@ pub struct SubagentUpdates {
     pub truncated: bool,
 }
 
-#[derive(Serialize)]
-#[serde(untagged)]
-enum SubagentListing {
-    Starting { id: String, status: &'static str },
-    Ready(SubagentValue),
+#[derive(Clone, Debug, Serialize)]
+struct SubagentListing {
+    id: String,
+    name: String,
+    status: SubagentStatus,
+    generation: u64,
+    task: String,
 }
 
 struct OutputContract {
@@ -215,6 +307,7 @@ impl Subagents {
         prompt: String,
         harness: Option<String>,
         model: Option<String>,
+        fallback_name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -234,38 +327,61 @@ impl Subagents {
             .transpose()
             .map_err(ChildError::Failed)?;
         let kit = self.config.harnesses.is_kit(&harness);
-        let persisted = kit.then(|| (id.clone(), false));
-        let child = ChildSession::start(
-            self.config.clone(),
-            harness.clone(),
-            persisted,
-            model.clone(),
-            depth + 1,
-            cancellation.clone(),
-        )
-        .await?;
-        let state = self.insert(
+        let now = events::now_millis();
+        let state = self.insert_starting(
             id.clone(),
+            fallback_name.as_deref(),
             State {
-                starting: true,
-                generation: 0,
+                name: String::new(),
+                status: SubagentStatus::Starting,
+                task: task_summary(&prompt),
+                generation: 1,
+                outcome: None,
+                created_at_unix_ms: now,
+                generation_started_at_unix_ms: now,
+                generation_finished_at_unix_ms: None,
                 output: Value::Null,
                 updates: None,
-                retired: false,
-                harness,
-                model,
+                harness: harness.clone(),
+                model: model.clone(),
                 kit,
-                child: child.clone(),
+                child: None,
                 _permit: permit,
             },
         )?;
+        let persisted = kit.then(|| (id.clone(), false));
+        let child = match ChildSession::start(
+            self.config.clone(),
+            harness,
+            persisted,
+            model,
+            depth + 1,
+            cancellation.clone(),
+        )
+        .await
+        {
+            Ok(child) => child,
+            Err(error) => {
+                self.remove_if_same(&id, &state);
+                return Err(error);
+            }
+        };
+        {
+            let mut locked = state.lock().await;
+            locked.status = SubagentStatus::Working;
+            locked.child = Some(child.clone());
+        }
         let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
         {
             Ok(output) => output,
             Err(error) => {
-                state.lock().await.retired = true;
+                let mut locked = state.lock().await;
+                locked.status = SubagentStatus::Removed;
+                locked.outcome = Some(GenerationOutcome::Failed);
+                locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                drop(locked);
                 self.remove_if_same(&id, &state);
                 let _ = child.close().await;
                 return Err(error);
@@ -274,13 +390,16 @@ impl Subagents {
         let (output, updates) = turn_output(output, contract);
         let mut locked = state.lock().await;
         self.check_active(&locked)?;
-        locked.starting = false;
-        locked.generation = 1;
+        locked.status = SubagentStatus::Idle;
+        locked.outcome = Some(GenerationOutcome::Success);
+        locked.generation_finished_at_unix_ms = Some(events::now_millis());
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
+        let name = locked.name.clone();
         drop(locked);
         Ok(SubagentValue {
             id,
+            name: Some(name),
             output,
             generation: 1,
             updates,
@@ -305,18 +424,34 @@ impl Subagents {
             .generation
             .checked_add(1)
             .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
-        match locked
+        locked.status = SubagentStatus::Working;
+        locked.task = task_summary(&prompt);
+        locked.generation = generation;
+        locked.outcome = None;
+        locked.generation_started_at_unix_ms = events::now_millis();
+        locked.generation_finished_at_unix_ms = None;
+        let child = locked
             .child
+            .clone()
+            .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?;
+        let name = locked.name.clone();
+        drop(locked);
+        match child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
         {
             Ok(output) => {
                 let (output, updates) = turn_output(output, contract);
-                locked.generation = generation;
+                let mut locked = state.lock().await;
+                self.check_active(&locked)?;
+                locked.status = SubagentStatus::Idle;
+                locked.outcome = Some(GenerationOutcome::Success);
+                locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 locked.output.clone_from(&output);
                 locked.updates.clone_from(&updates);
                 Ok(SubagentValue {
                     id: prior.id,
+                    name: Some(name),
                     output,
                     generation,
                     updates,
@@ -325,7 +460,10 @@ impl Subagents {
             Err(error) => {
                 // Any dispatched unsuccessful turn may have changed the durable
                 // transcript. Retire it rather than accepting the old generation.
-                locked.retired = true;
+                let mut locked = state.lock().await;
+                locked.status = SubagentStatus::Removed;
+                locked.outcome = Some(GenerationOutcome::Failed);
+                locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 drop(locked);
                 self.remove_if_same(&prior.id, &state);
                 Err(error)
@@ -337,6 +475,7 @@ impl Subagents {
         &self,
         prior: SubagentValue,
         prompt: String,
+        fallback_name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -354,62 +493,99 @@ impl Subagents {
         let harness = source.harness.clone();
         let model = source.model.clone();
         let kit = source.kit;
-        let child = if source.child.supports_native_fork() {
-            let child = source.child.fork(model.as_deref(), &cancellation).await?;
-            drop(source);
-            child
-        } else if kit {
+        let source_child = source
+            .child
+            .clone()
+            .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?;
+        let native_fork = source_child.supports_native_fork();
+        if !native_fork && kit {
             session::clone_completed(&self.config.root, &prior.id, &id)
                 .map_err(ChildError::Failed)?;
-            // The clone is the stable snapshot boundary. Do not keep the source
-            // registry lock across child startup or the branch prompt.
-            drop(source);
-            ChildSession::start(
-                self.config.clone(),
-                harness.clone(),
-                Some((id.clone(), true)),
-                model.clone(),
-                depth + 1,
-                cancellation.clone(),
-            )
-            .await?
-        } else {
+        } else if !native_fork {
             return Err(ChildError::Failed(format!(
                 "ACP harness {harness:?} does not advertise session/fork; transcript fallback is only available for Kit"
             )));
+        }
+        drop(source);
+        let generation = prior
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
+        let now = events::now_millis();
+        let state = self.insert_starting(
+            id.clone(),
+            fallback_name.as_deref(),
+            State {
+                name: String::new(),
+                status: SubagentStatus::Starting,
+                task: task_summary(&prompt),
+                generation,
+                outcome: None,
+                created_at_unix_ms: now,
+                generation_started_at_unix_ms: now,
+                generation_finished_at_unix_ms: None,
+                output: Value::Null,
+                updates: None,
+                harness: harness.clone(),
+                model: model.clone(),
+                kit,
+                child: None,
+                _permit: permit,
+            },
+        )?;
+        let child_result = if native_fork {
+            source_child.fork(model.as_deref(), &cancellation).await
+        } else {
+            ChildSession::start(
+                self.config.clone(),
+                harness,
+                Some((id.clone(), true)),
+                model,
+                depth + 1,
+                cancellation.clone(),
+            )
+            .await
         };
+        let child = match child_result {
+            Ok(child) => child,
+            Err(error) => {
+                self.remove_if_same(&id, &state);
+                return Err(error);
+            }
+        };
+        {
+            let mut locked = state.lock().await;
+            locked.status = SubagentStatus::Working;
+            locked.child = Some(child.clone());
+        }
         let output = match child
             .prompt(structured_prompt(prompt, contract), cancellation)
             .await
         {
             Ok(output) => output,
             Err(error) => {
+                let mut locked = state.lock().await;
+                locked.status = SubagentStatus::Removed;
+                locked.outcome = Some(GenerationOutcome::Failed);
+                locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                drop(locked);
+                self.remove_if_same(&id, &state);
                 let _ = child.close().await;
                 return Err(error);
             }
         };
         let (output, updates) = turn_output(output, contract);
-        let generation = prior
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
-        self.insert(
-            id.clone(),
-            State {
-                starting: false,
-                generation,
-                output: output.clone(),
-                updates: updates.clone(),
-                retired: false,
-                harness,
-                model,
-                kit,
-                child,
-                _permit: permit,
-            },
-        )?;
+        let mut locked = state.lock().await;
+        locked.status = SubagentStatus::Idle;
+        locked.outcome = Some(GenerationOutcome::Success);
+        locked.generation_finished_at_unix_ms = Some(events::now_millis());
+        locked.output.clone_from(&output);
+        locked.updates.clone_from(&updates);
+        let name = locked.name.clone();
+        drop(locked);
         Ok(SubagentValue {
             id,
+            name: Some(name),
             output,
             generation,
             updates,
@@ -448,7 +624,7 @@ impl Subagents {
             .lock()
             .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
             .iter()
-            .map(|(id, state)| (id.clone(), Arc::clone(state)))
+            .map(|(id, entry)| (id.clone(), Arc::clone(&entry.state)))
             .collect::<Vec<_>>();
         let mut values = Vec::with_capacity(states.len());
         for (id, state) in states {
@@ -456,24 +632,26 @@ impl Subagents {
                 state = state.lock() => state,
                 () = cancellation.cancelled() => return Err(ChildError::Cancelled),
             };
-            if !state.retired && !state.child.is_closed() {
-                if state.starting {
-                    values.push(SubagentListing::Starting {
+            let child_closed = state.child.as_ref().is_some_and(ChildSession::is_closed);
+            if state.status != SubagentStatus::Removed && !child_closed {
+                values.push((
+                    state.created_at_unix_ms,
+                    SubagentListing {
                         id,
-                        status: "starting",
-                    });
-                } else {
-                    values.push(SubagentListing::Ready(SubagentValue {
-                        id,
-                        output: state.output.clone(),
+                        name: state.name.clone(),
+                        status: state.status,
                         generation: state.generation,
-                        updates: state.updates.clone(),
-                    }));
-                }
+                        task: state.task.clone(),
+                    },
+                ));
             }
         }
-        values.sort_by(|left, right| listing_id(left).cmp(listing_id(right)));
-        Ok(values)
+        values.sort_by(|(left_created, left), (right_created, right)| {
+            left_created
+                .cmp(right_created)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(values.into_iter().map(|(_, value)| value).collect())
     }
 
     async fn close(&self, id: &str, cancellation: &TurnCancellation) -> Result<(), ChildError> {
@@ -482,15 +660,17 @@ impl Subagents {
             .lock()
             .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
             .get(id)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.state))
             .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {id:?}")))?;
         let mut locked = tokio::select! {
             locked = state.lock() => locked,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_active(&locked)?;
-        locked.child.close().await?;
-        locked.retired = true;
+        if let Some(child) = &locked.child {
+            child.close().await?;
+        }
+        locked.status = SubagentStatus::Removed;
         drop(locked);
         self.remove_if_same(id, &state);
         Ok(())
@@ -501,16 +681,34 @@ impl Subagents {
             .lock()
             .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
             .get(&prior.id)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.state))
             .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {:?}", prior.id)))
     }
 
-    fn insert(&self, id: String, state: State) -> Result<Arc<AsyncMutex<State>>, ChildError> {
-        let state = Arc::new(AsyncMutex::new(state));
-        self.sessions
+    fn insert_starting(
+        &self,
+        id: String,
+        fallback_name: Option<&str>,
+        mut state: State,
+    ) -> Result<Arc<AsyncMutex<State>>, ChildError> {
+        let mut sessions = self
+            .sessions
             .lock()
-            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
-            .insert(id, Arc::clone(&state));
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?;
+        let mut used = sessions
+            .values()
+            .map(|entry| entry.name.to_lowercase())
+            .collect::<HashSet<_>>();
+        let name = allocate_name(self.names.as_slice(), &mut used, fallback_name);
+        state.name.clone_from(&name);
+        let state = Arc::new(AsyncMutex::new(state));
+        sessions.insert(
+            id,
+            SessionEntry {
+                name,
+                state: Arc::clone(&state),
+            },
+        );
         Ok(state)
     }
 
@@ -518,10 +716,10 @@ impl Subagents {
         self.sessions
             .lock()
             .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
-            .retain(|_, state| {
-                state
-                    .try_lock()
-                    .map_or(true, |state| !state.child.is_closed())
+            .retain(|_, entry| {
+                entry.state.try_lock().map_or(true, |state| {
+                    !state.child.as_ref().is_some_and(ChildSession::is_closed)
+                })
             });
         Arc::clone(&self.capacity).try_acquire_owned().map_err(|_| {
             ChildError::Failed(format!(
@@ -534,13 +732,13 @@ impl Subagents {
         if let Ok(mut sessions) = self.sessions.lock()
             && sessions
                 .get(id)
-                .is_some_and(|state| Arc::ptr_eq(state, expected))
+                .is_some_and(|entry| Arc::ptr_eq(&entry.state, expected))
         {
             sessions.remove(id);
         }
     }
     fn check_active(&self, state: &State) -> Result<(), ChildError> {
-        if state.retired {
+        if state.status == SubagentStatus::Removed {
             Err(ChildError::Failed("subagent session is retired".into()))
         } else {
             Ok(())
@@ -548,12 +746,15 @@ impl Subagents {
     }
     fn check_ready(&self, state: &State) -> Result<(), ChildError> {
         self.check_active(state)?;
-        if state.starting {
-            Err(ChildError::Failed(
+        match state.status {
+            SubagentStatus::Idle => Ok(()),
+            SubagentStatus::Starting => Err(ChildError::Failed(
                 "subagent session is still starting".into(),
-            ))
-        } else {
-            Ok(())
+            )),
+            SubagentStatus::Working => Err(ChildError::Failed(
+                "subagent session is already working".into(),
+            )),
+            SubagentStatus::Removed => unreachable!("check_active rejects removed sessions"),
         }
     }
     fn check_generation(&self, prior: &SubagentValue, actual: u64) -> Result<(), ChildError> {
@@ -640,20 +841,20 @@ impl CloseInput {
 }
 
 fn listing_id(value: &SubagentListing) -> &str {
-    match value {
-        SubagentListing::Starting { id, .. } => id,
-        SubagentListing::Ready(value) => &value.id,
-    }
+    &value.id
 }
 
 fn value_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"id":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1},"updates":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean"}},"required":["items","truncated"],"additionalProperties":false}},"required":["id","output","generation"],"additionalProperties":false})
+    json!({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1},"updates":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean"}},"required":["items","truncated"],"additionalProperties":false}},"required":["id","output","generation"],"additionalProperties":false})
 }
 fn listing_schema() -> serde_json::Value {
-    json!({"oneOf":[value_schema(),{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["starting"]}},"required":["id","status"],"additionalProperties":false}]})
+    json!({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string","enum":["starting","working","idle"]},"generation":{"type":"integer","minimum":1},"task":{"type":"string"}},"required":["id","name","status","generation","task"],"additionalProperties":false})
 }
 fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
+}
+fn fork_schema() -> serde_json::Value {
+    json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"fallback_name":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
@@ -665,7 +866,7 @@ fn call_id_schema() -> serde_json::Value {
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. Provide a short whimsical `fallback_name`; Kit uses it only after the configured name pool is exhausted. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"fallback_name":{"type":"string","description":"A short whimsical fallback name used only after the configured name pool is exhausted."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -684,7 +885,7 @@ impl PromptTool {
 }
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, prompt it, and return the new session value.", continuation_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, prompt it, and return the new session value. Provide a short whimsical `fallback_name`; Kit uses it only after the configured name pool is exhausted.", fork_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl SubagentsTool {
@@ -726,6 +927,7 @@ struct Input {
     prompt: String,
     harness: Option<String>,
     model: Option<String>,
+    fallback_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -734,6 +936,15 @@ struct Input {
 struct Continuation {
     subagent: SubagentValue,
     prompt: String,
+    #[serde(default, deserialize_with = "deserialize_output_schema")]
+    output_schema: Option<Value>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkInput {
+    subagent: SubagentValue,
+    prompt: String,
+    fallback_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -849,6 +1060,7 @@ impl Tool for SubagentTool {
                     input.prompt,
                     input.harness,
                     input.model,
+                    input.fallback_name,
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -895,7 +1107,7 @@ impl Tool for ForkTool {
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let input: Continuation = serde_json::from_value(request.input.clone())
+        let input: ForkInput = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let contract = input.output_schema.map(OutputContract::new).transpose()?;
         result(
@@ -904,6 +1116,7 @@ impl Tool for ForkTool {
                 .fork(
                     input.subagent,
                     input.prompt,
+                    input.fallback_name,
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -966,6 +1179,145 @@ mod tests {
     }
 
     #[test]
+    fn name_allocation_uses_pool_order_then_reuses_released_names() {
+        let pool = vec!["Scout".into(), "Pip".into()];
+        let mut used = HashSet::new();
+
+        assert_eq!(allocate_name(&pool, &mut used, Some("Waffles")), "Scout");
+        assert_eq!(allocate_name(&pool, &mut used, Some("Waffles")), "Pip");
+        assert_eq!(allocate_name(&pool, &mut used, Some("Waffles")), "Waffles");
+        used.remove("scout");
+        assert_eq!(allocate_name(&pool, &mut used, None), "Scout");
+    }
+
+    #[test]
+    fn name_allocation_normalizes_fallbacks_and_generates_collision_safe_names() {
+        let mut used = HashSet::from(["waffles".into(), "agent 1".into()]);
+        assert_eq!(
+            allocate_name(&[], &mut used, Some("  Waffles   McGee  ")),
+            "Waffles McGee"
+        );
+        assert_eq!(allocate_name(&[], &mut used, Some("Waffles")), "Waffles 2");
+        assert_eq!(
+            allocate_name(&[], &mut used, Some("line\nbreak")),
+            "Agent 2"
+        );
+        assert_eq!(allocate_name(&[], &mut used, Some("   ")), "Agent 3");
+    }
+
+    #[test]
+    fn name_allocation_truncates_suffixed_fallbacks_to_32_chars() {
+        let base = "🦀".repeat(32);
+        let mut used = HashSet::from([base.to_lowercase()]);
+        let allocated = allocate_name(&[], &mut used, Some(&base));
+
+        assert_eq!(allocated.chars().count(), 32);
+        assert!(allocated.ends_with(" 2"));
+    }
+
+    #[test]
+    fn name_allocation_is_unique_when_siblings_allocate_concurrently() {
+        let used = Arc::new(Mutex::new(HashSet::new()));
+        let names = Arc::new(vec!["Scout".into(), "Pip".into()]);
+        let threads = (0..8)
+            .map(|_| {
+                let used = Arc::clone(&used);
+                let names = Arc::clone(&names);
+                std::thread::spawn(move || {
+                    allocate_name(&names, &mut used.lock().unwrap(), Some("Waffles"))
+                })
+            })
+            .collect::<Vec<_>>();
+        let allocated = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(allocated.len(), 8);
+    }
+
+    #[test]
+    fn name_allocation_uses_generated_names_for_an_explicit_empty_pool() {
+        assert_eq!(allocate_name(&[], &mut HashSet::new(), None), "Agent 1");
+    }
+
+    #[test]
+    fn name_allocation_summarizes_tasks_as_single_bounded_lines() {
+        assert_eq!(task_summary("  trace\n\t the   flow  "), "trace the flow");
+        assert_eq!(task_summary(" \n\t "), "Untitled task");
+        let summary = task_summary(&"é".repeat(97));
+        assert_eq!(summary.chars().count(), 96);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn subagent_value_reads_legacy_and_current_handles_and_rejects_malformed_shapes() {
+        let legacy = serde_json::from_value::<SubagentValue>(json!({
+            "id": "s-old", "output": null, "generation": 1
+        }))
+        .expect("legacy handle remains readable");
+        assert_eq!(legacy.name, None);
+
+        let current = serde_json::from_value::<SubagentValue>(json!({
+            "id": "s-current", "name": "Scout", "output": "done", "generation": 2
+        }))
+        .expect("current handle remains readable");
+        assert_eq!(current.name.as_deref(), Some("Scout"));
+        assert!(
+            serde_json::from_value::<SubagentValue>(json!({
+                "id": "s-bad", "name": 42, "output": null, "generation": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SubagentValue>(json!({
+                "id": "s-bad", "output": null, "generation": 1, "extra": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subagent_value_schema_accepts_legacy_and_current_handles() {
+        let validator = jsonschema::validator_for(&value_schema()).unwrap();
+        assert!(validator.is_valid(&json!({
+            "id": "s-old", "output": null, "generation": 1
+        })));
+        assert!(validator.is_valid(&json!({
+            "id": "s-new", "name": "Scout", "output": null, "generation": 1
+        })));
+        assert!(!validator.is_valid(&json!({
+            "id": "s-bad", "name": 7, "output": null, "generation": 1
+        })));
+    }
+
+    #[test]
+    fn fallback_name_is_accepted_only_for_subagent_and_fork_inputs() {
+        let input = serde_json::from_value::<Input>(json!({
+            "prompt": "work", "fallback_name": "Waffles"
+        }))
+        .expect("subagent accepts fallback_name");
+        assert_eq!(input.fallback_name.as_deref(), Some("Waffles"));
+
+        let fork = serde_json::from_value::<ForkInput>(json!({
+            "subagent": {"id": "s", "output": null, "generation": 1},
+            "prompt": "fork work",
+            "fallback_name": "Mochi"
+        }))
+        .expect("fork accepts fallback_name");
+        assert_eq!(fork.fallback_name.as_deref(), Some("Mochi"));
+
+        assert!(
+            serde_json::from_value::<Continuation>(json!({
+                "subagent": {"id": "s", "output": null, "generation": 1},
+                "prompt": "continue",
+                "fallback_name": "not allowed"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn structured_output_is_parsed_and_validated() {
         let contract = OutputContract::new(json!({
             "type": "object",
@@ -1014,6 +1366,7 @@ mod tests {
     fn text_only_values_keep_the_existing_json_shape() {
         let value = SubagentValue {
             id: "child".into(),
+            name: None,
             output: Value::String("done".into()),
             generation: 1,
             updates: None,
@@ -1055,24 +1408,32 @@ mod tests {
             2,
         );
         let state = Arc::new(AsyncMutex::new(State {
-            starting: false,
+            name: "Scout".into(),
+            status: SubagentStatus::Idle,
+            task: "done".into(),
             generation: 1,
+            outcome: Some(GenerationOutcome::Success),
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: Some(2),
             output: Value::String("done".into()),
             updates: None,
-            retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
             model: None,
             kit: true,
-            child: ChildSession::disconnected_for_test(),
+            child: Some(ChildSession::disconnected_for_test()),
             _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
         }));
-        manager
-            .sessions
-            .lock()
-            .unwrap()
-            .insert("source".into(), Arc::clone(&state));
+        manager.sessions.lock().unwrap().insert(
+            "source".into(),
+            SessionEntry {
+                name: "Scout".into(),
+                state: Arc::clone(&state),
+            },
+        );
         let prior = SubagentValue {
             id: "source".into(),
+            name: Some("Scout".into()),
             output: Value::String("done".into()),
             generation: 1,
             updates: None,
@@ -1109,24 +1470,32 @@ mod tests {
             2,
         );
         let state = Arc::new(AsyncMutex::new(State {
-            starting: false,
+            name: "Scout".into(),
+            status: SubagentStatus::Idle,
+            task: "done".into(),
             generation: 1,
+            outcome: Some(GenerationOutcome::Success),
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: Some(2),
             output: Value::String("done".into()),
             updates: None,
-            retired: false,
             harness: crate::acp_child::BUILTIN_HARNESS.into(),
             model: None,
             kit: true,
-            child: ChildSession::disconnected_for_test(),
+            child: Some(ChildSession::disconnected_for_test()),
             _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
         }));
-        manager
-            .sessions
-            .lock()
-            .unwrap()
-            .insert("source".into(), Arc::clone(&state));
+        manager.sessions.lock().unwrap().insert(
+            "source".into(),
+            SessionEntry {
+                name: "Scout".into(),
+                state: Arc::clone(&state),
+            },
+        );
         let prior = SubagentValue {
             id: "source".into(),
+            name: Some("Scout".into()),
             output: Value::String("done".into()),
             generation: 1,
             updates: None,
@@ -1135,11 +1504,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_subagents_can_be_listed_and_closed() {
+    async fn listing_omits_closed_subagents() {
         let directory = tempfile::tempdir().unwrap();
         let (manager, state, prior) = manager_with_disconnected_session(directory.path());
         let (child, closed) = ChildSession::closure_probe_for_test();
-        state.lock().await.child = child;
+        state.lock().await.child = Some(child);
         drop(state);
 
         let cancellation = TurnCancellation::default();
@@ -1162,7 +1531,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (manager, state, _) = manager_with_disconnected_session(directory.path());
         let (child, closed) = ChildSession::closure_probe_for_test();
-        state.lock().await.child = child;
+        state.lock().await.child = Some(child);
         drop(state);
 
         drop(manager);
@@ -1226,7 +1595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_prompt_failure_retires_the_session() {
+    async fn listing_omits_terminally_retired_subagents() {
         let directory = tempfile::tempdir().unwrap();
         let (manager, _, prior) = manager_with_disconnected_session(directory.path());
 
@@ -1242,9 +1611,16 @@ mod tests {
                 .is_err()
         );
         assert!(manager.lookup(&prior).is_err());
+        assert!(
+            manager
+                .list(&TurnCancellation::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
     #[tokio::test]
-    async fn starting_subagents_are_listed_before_the_first_prompt_completes() {
+    async fn listing_includes_named_starting_and_idle_subagents() {
         let root = tempfile::tempdir().unwrap();
         let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
         let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
@@ -1278,6 +1654,7 @@ mod tests {
                     "first prompt".into(),
                     None,
                     None,
+                    None,
                     0,
                     TurnCancellation::default(),
                     None,
@@ -1301,20 +1678,59 @@ mod tests {
         })
         .await
         .expect("starting subagent was not registered");
-        assert!(matches!(
-            listing,
-            SubagentListing::Starting {
-                status: "starting",
-                ..
-            }
-        ));
+        assert_eq!(listing.name, "Scout");
+        assert_eq!(listing.status, SubagentStatus::Starting);
+        assert_eq!(listing.generation, 1);
+        assert_eq!(listing.task, "first prompt");
 
         let completed = create.await.unwrap().unwrap();
+        assert_eq!(completed.name.as_deref(), Some("Scout"));
         let listings = manager.list(&TurnCancellation::default()).await.unwrap();
-        assert!(matches!(
-            &listings[0],
-            SubagentListing::Ready(value) if value.id == completed.id
-        ));
+        assert_eq!(listings[0].id, completed.id);
+        assert_eq!(listings[0].name, "Scout");
+        assert_eq!(listings[0].status, SubagentStatus::Idle);
+        assert_eq!(listings[0].generation, 1);
+        assert_eq!(listings[0].task, "first prompt");
+        assert_eq!(
+            serde_json::to_value(&listings[0]).unwrap(),
+            json!({
+                "id": completed.id,
+                "name": "Scout",
+                "status": "idle",
+                "generation": 1,
+                "task": "first prompt"
+            })
+        );
+
+        let mut informational_name = completed.clone();
+        informational_name.name = Some("Imposter".into());
+        let prompt_manager = manager.clone();
+        let continued = tokio::spawn(async move {
+            prompt_manager
+                .prompt(
+                    informational_name,
+                    "second prompt".into(),
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let listing = manager.list(&TurnCancellation::default()).await.unwrap();
+                if listing[0].status == SubagentStatus::Working {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("working continuation was not listable");
+        let continued = continued.await.unwrap().unwrap();
+        assert_eq!(continued.name.as_deref(), Some("Scout"));
+        let listing = manager.list(&TurnCancellation::default()).await.unwrap();
+        assert_eq!(listing[0].generation, 2);
+        assert_eq!(listing[0].task, "second prompt");
     }
 
     #[tokio::test]
@@ -1350,6 +1766,7 @@ mod tests {
                 "base".into(),
                 None,
                 None,
+                None,
                 0,
                 TurnCancellation::default(),
                 None,
@@ -1358,7 +1775,14 @@ mod tests {
             .unwrap();
 
         let error = manager
-            .fork(prior, "branch".into(), 0, TurnCancellation::default(), None)
+            .fork(
+                prior,
+                "branch".into(),
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
             .await
             .unwrap_err();
 
