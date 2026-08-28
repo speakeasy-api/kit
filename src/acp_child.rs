@@ -1052,15 +1052,7 @@ async fn forward_stderr(
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                if matches!(
-                    crate::events::parse(&line),
-                    Some(
-                        crate::events::RuntimeEvent::ChildStarted { .. }
-                            | crate::events::RuntimeEvent::ChildFinished { .. }
-                            | crate::events::RuntimeEvent::SubagentStateChanged { .. }
-                            | crate::events::RuntimeEvent::SubagentDescendantsRemoved { .. }
-                    )
-                ) {
+                if crate::events::parse(&line).is_some_and(|event| event.forward_from_child()) {
                     // Preserve recursively forwarded private runtime events byte-for-byte.
                     output(ForwardedStderr::RuntimeLine(line));
                 } else {
@@ -1863,6 +1855,79 @@ mod tests {
                 .iter()
                 .filter(|item| matches!(item, ForwardedStderr::Cleanup(_)))
                 .count()
+        }
+
+        #[tokio::test]
+        async fn abrupt_child_exit_forwards_exact_roster_lines_and_cleans_descendants_once() {
+            let nested = crate::events::RuntimeEvent::SubagentStateChanged {
+                id: "s-nested".into(),
+                name: "Scout".into(),
+                status: crate::events::SubagentStatus::Working,
+                outcome: None,
+                generation: 3,
+                task: "inspect".into(),
+                parent_id: Some("s-owner".into()),
+                parent_name: Some("Pip".into()),
+                harness: BUILTIN_HARNESS.into(),
+                model: None,
+                created_at_unix_ms: 10,
+                generation_started_at_unix_ms: 20,
+                generation_finished_at_unix_ms: None,
+            };
+            let nested_cleanup = crate::events::RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "s-nested".into(),
+            };
+            let lines = [nested, nested_cleanup]
+                .map(|event| {
+                    format!(
+                        "{}{}",
+                        crate::events::EVENT_MARKER,
+                        serde_json::to_string(&event).unwrap()
+                    )
+                })
+                .to_vec();
+            let payload = format!("{}\n", lines.join("\n"));
+            let mut child = Command::new("python3")
+                .arg("-c")
+                .arg("import os; os.write(2, os.environ['PAYLOAD'].encode()); os._exit(23)")
+                .env("PAYLOAD", payload)
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let mut output = Vec::new();
+
+            forward_stderr(stderr, "acp.kit", Some("s-owner"), |item| output.push(item)).await;
+            let status = child.wait().await.unwrap();
+
+            assert_eq!(status.code(), Some(23));
+            let forwarded = output
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardedStderr::RuntimeLine(line) => Some(line.clone()),
+                    ForwardedStderr::Diagnostic(_) | ForwardedStderr::Cleanup(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(forwarded, lines);
+            assert_eq!(cleanup_count(&output), 1);
+            assert!(matches!(
+                output.last(),
+                Some(ForwardedStderr::Cleanup(
+                    crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id }
+                )) if ancestor_id == "s-owner"
+            ));
+            assert!(!output.iter().any(|item| match item {
+                ForwardedStderr::RuntimeLine(line) => matches!(
+                    crate::events::parse(line),
+                    Some(crate::events::RuntimeEvent::SubagentStateChanged { id, .. })
+                        if id == "s-owner"
+                ),
+                ForwardedStderr::Cleanup(crate::events::RuntimeEvent::SubagentStateChanged {
+                    id,
+                    ..
+                }) => id == "s-owner",
+                ForwardedStderr::Diagnostic(_) | ForwardedStderr::Cleanup(_) => false,
+            }));
         }
 
         #[tokio::test]

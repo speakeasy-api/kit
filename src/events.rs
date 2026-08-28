@@ -99,6 +99,17 @@ pub enum GenerationOutcome {
 }
 
 impl RuntimeEvent {
+    /// Whether a parent Kit runtime should forward this child event unchanged.
+    pub(crate) fn forward_from_child(&self) -> bool {
+        matches!(
+            self,
+            Self::ChildStarted { .. }
+                | Self::ChildFinished { .. }
+                | Self::SubagentStateChanged { .. }
+                | Self::SubagentDescendantsRemoved { .. }
+        )
+    }
+
     /// The ACP tool call this child belongs to, when the id carries one.
     #[must_use]
     pub fn parent_call(&self) -> Option<&str> {
@@ -262,6 +273,35 @@ mod tests {
             let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
             assert_eq!(parse(&line), Some(event.clone()));
             assert_eq!(event.parent_call(), None);
+        }
+    }
+
+    #[test]
+    fn nested_roster_events_round_trip_as_child_forwarding_payloads() {
+        let changed = RuntimeEvent::SubagentStateChanged {
+            id: "s-child".into(),
+            name: "Scout".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 2,
+            task: "inspect".into(),
+            parent_id: Some("s-parent".into()),
+            parent_name: Some("偵察 🦀".into()),
+            harness: "acp.kit".into(),
+            model: None,
+            created_at_unix_ms: 10,
+            generation_started_at_unix_ms: 20,
+            generation_finished_at_unix_ms: None,
+        };
+        let removed = RuntimeEvent::SubagentDescendantsRemoved {
+            ancestor_id: "s-parent".into(),
+        };
+
+        for event in [changed, removed] {
+            let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+            let parsed = parse(&line).expect("nested roster event parses");
+            assert_eq!(parsed, event);
+            assert!(parsed.forward_from_child());
         }
     }
 
