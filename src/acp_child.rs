@@ -22,7 +22,7 @@ use agentkit_core::TurnCancellation;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -271,6 +271,13 @@ impl AcpHarnesses {
             .arg(id)
             .arg("--subagent-depth")
             .arg(depth.to_string());
+        if let (Some(parent_id), Some(parent_name)) = (&config.parent_id, &config.parent_name) {
+            command
+                .arg("--subagent-parent-id")
+                .arg(parent_id)
+                .arg("--subagent-parent-name")
+                .arg(parent_name);
+        }
         if resume {
             command.arg("--resume");
         }
@@ -352,6 +359,17 @@ pub(crate) struct ChildConfig {
     pub telemetry: crate::telemetry::Settings,
     pub harnesses: AcpHarnesses,
     pub default_harness: String,
+    /// Immediate owning Kit subagent, present only inside a nested Kit runtime.
+    pub parent_id: Option<String>,
+    pub parent_name: Option<String>,
+}
+
+impl ChildConfig {
+    pub(crate) fn with_parent_context(mut self, id: String, name: String) -> Self {
+        self.parent_id = Some(id);
+        self.parent_name = Some(name);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -745,13 +763,20 @@ async fn run(
         .take()
         .ok_or("could not open ACP harness stderr")?;
     let label = harness.clone();
+    let ancestor_id = config.parent_id.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(line) = harness_diagnostic(&label, &line) {
-                eprintln!("{line}");
-            }
-        }
+        forward_stderr(
+            stderr,
+            &label,
+            ancestor_id.as_deref(),
+            |output| match output {
+                ForwardedStderr::RuntimeLine(line) | ForwardedStderr::Diagnostic(line) => {
+                    eprintln!("{line}");
+                }
+                ForwardedStderr::Cleanup(event) => crate::events::emit(&event),
+            },
+        )
+        .await;
     });
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(
@@ -1010,6 +1035,52 @@ async fn run(
     })
 }
 
+#[derive(Debug, PartialEq)]
+enum ForwardedStderr {
+    RuntimeLine(String),
+    Diagnostic(String),
+    Cleanup(crate::events::RuntimeEvent),
+}
+
+async fn forward_stderr(
+    stderr: impl AsyncRead + Unpin,
+    label: &str,
+    ancestor_id: Option<&str>,
+    mut output: impl FnMut(ForwardedStderr),
+) {
+    let mut lines = BufReader::new(stderr).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if matches!(
+                    crate::events::parse(&line),
+                    Some(
+                        crate::events::RuntimeEvent::ChildStarted { .. }
+                            | crate::events::RuntimeEvent::ChildFinished { .. }
+                            | crate::events::RuntimeEvent::SubagentStateChanged { .. }
+                            | crate::events::RuntimeEvent::SubagentDescendantsRemoved { .. }
+                    )
+                ) {
+                    // Preserve recursively forwarded private runtime events byte-for-byte.
+                    output(ForwardedStderr::RuntimeLine(line));
+                } else {
+                    output(ForwardedStderr::Diagnostic(format!(
+                        "ACP harness {label}: {line}"
+                    )));
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    if let Some(ancestor_id) = ancestor_id {
+        output(ForwardedStderr::Cleanup(
+            crate::events::RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: ancestor_id.to_owned(),
+            },
+        ));
+    }
+}
+
 fn pre_handshake_exit(context: &LaunchContext, status: std::process::ExitStatus) -> String {
     context.error(
         "pre-handshake exit",
@@ -1145,6 +1216,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses: harnesses.clone(),
                 default_harness: "acp.external".into(),
+                parent_id: None,
+                parent_name: None,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -1335,6 +1408,8 @@ mod tests {
             telemetry: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
             default_harness: "acp.broken".into(),
+            parent_id: None,
+            parent_name: None,
         };
         let result = ChildSession::start(
             config,
@@ -1390,6 +1465,8 @@ mod tests {
             telemetry: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
             default_harness: "acp.exits".into(),
+            parent_id: None,
+            parent_name: None,
         };
 
         let error = match ChildSession::start(
@@ -1440,6 +1517,8 @@ mod tests {
             telemetry: Default::default(),
             harnesses: harnesses.clone(),
             default_harness: "acp.other".into(),
+            parent_id: None,
+            parent_name: None,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -1483,6 +1562,8 @@ mod tests {
             .unwrap(),
             harnesses: harnesses.clone(),
             default_harness: BUILTIN_HARNESS.into(),
+            parent_id: None,
+            parent_name: None,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -1570,6 +1651,8 @@ mod tests {
             telemetry: Default::default(),
             harnesses: AcpHarnesses::new(profiles).unwrap(),
             default_harness: "acp.broken".into(),
+            parent_id: None,
+            parent_name: None,
         };
         let starts = (0..64)
             .map(|_| {
@@ -1629,6 +1712,8 @@ mod tests {
             telemetry: Default::default(),
             harnesses,
             default_harness: "acp.mock".into(),
+            parent_id: None,
+            parent_name: None,
         };
         let base = ChildSession::start(
             config,
@@ -1727,6 +1812,167 @@ mod tests {
                 .unwrap_err()
                 .contains("is not allowed")
         );
+    }
+
+    mod forwards_subagent_events {
+        use super::*;
+
+        #[tokio::test]
+        async fn preserves_nested_roster_event_lines_exactly() {
+            let event = crate::events::RuntimeEvent::SubagentStateChanged {
+                id: "s-child".into(),
+                name: "Scout".into(),
+                status: crate::events::SubagentStatus::Working,
+                outcome: None,
+                generation: 2,
+                task: "inspect".into(),
+                parent_id: Some("s-parent".into()),
+                parent_name: Some("Pip".into()),
+                harness: BUILTIN_HARNESS.into(),
+                model: Some("model".into()),
+                created_at_unix_ms: 10,
+                generation_started_at_unix_ms: 20,
+                generation_finished_at_unix_ms: None,
+            };
+            let line = format!(
+                "{}{}",
+                crate::events::EVENT_MARKER,
+                serde_json::to_string(&event).unwrap()
+            );
+            let input = format!("{line}\n");
+            let mut output = Vec::new();
+            forward_stderr(input.as_bytes(), "acp.kit", Some("s-owner"), |item| {
+                output.push(item)
+            })
+            .await;
+
+            assert!(matches!(&output[0], ForwardedStderr::RuntimeLine(actual) if actual == &line));
+            assert!(matches!(
+                &output[1],
+                ForwardedStderr::Cleanup(crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id })
+                    if ancestor_id == "s-owner"
+            ));
+        }
+    }
+
+    mod removes_descendants_on_exit {
+        use super::*;
+
+        fn cleanup_count(output: &[ForwardedStderr]) -> usize {
+            output
+                .iter()
+                .filter(|item| matches!(item, ForwardedStderr::Cleanup(_)))
+                .count()
+        }
+
+        #[tokio::test]
+        async fn emits_cleanup_once_on_normal_eof() {
+            let mut output = Vec::new();
+            forward_stderr(&b""[..], "acp.kit", Some("s-owner"), |item| {
+                output.push(item)
+            })
+            .await;
+            assert_eq!(cleanup_count(&output), 1);
+        }
+
+        #[tokio::test]
+        async fn emits_cleanup_once_on_abrupt_stream_error() {
+            let mut output = Vec::new();
+            forward_stderr(&b"\xff"[..], "acp.kit", Some("s-owner"), |item| {
+                output.push(item)
+            })
+            .await;
+            assert_eq!(cleanup_count(&output), 1);
+        }
+    }
+
+    mod subagent_parent_context {
+        use super::*;
+
+        fn config(parent_id: Option<&str>, parent_name: Option<&str>) -> ChildConfig {
+            ChildConfig {
+                root: PathBuf::from("/tmp"),
+                model: "model".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses: AcpHarnesses::default(),
+                default_harness: BUILTIN_HARNESS.into(),
+                parent_id: parent_id.map(str::to_owned),
+                parent_name: parent_name.map(str::to_owned),
+            }
+        }
+
+        fn args(command: &Command) -> Vec<String> {
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        #[test]
+        fn kit_child_receives_unicode_immediate_parent_context() {
+            let config = config(Some("s-parent"), Some("偵察 🦀"));
+            let command = config
+                .harnesses
+                .spawn(BUILTIN_HARNESS, &config, Some(("session", false)), 1)
+                .unwrap();
+            let args = args(&command);
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--subagent-parent-id", "s-parent"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--subagent-parent-name", "偵察 🦀"])
+            );
+        }
+
+        #[test]
+        fn recursive_launch_replaces_inherited_parent_context() {
+            let config = config(Some("s-grandparent"), Some("Pip"))
+                .with_parent_context("s-parent".into(), "Scout".into());
+            assert_eq!(config.parent_id.as_deref(), Some("s-parent"));
+            assert_eq!(config.parent_name.as_deref(), Some("Scout"));
+        }
+
+        #[test]
+        fn top_level_and_generic_acp_commands_do_not_receive_parent_arguments() {
+            let top_level = config(None, None);
+            let top_level_args = args(
+                &top_level
+                    .harnesses
+                    .spawn(BUILTIN_HARNESS, &top_level, Some(("session", false)), 1)
+                    .unwrap(),
+            );
+            assert!(
+                !top_level_args
+                    .iter()
+                    .any(|arg| arg.starts_with("--subagent-parent-"))
+            );
+
+            let harnesses = AcpHarnesses::new(BTreeMap::from([(
+                "generic".into(),
+                AcpHarnessProfile {
+                    command: "generic-acp".into(),
+                    args: Vec::new(),
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            )]))
+            .unwrap();
+            let mut generic = config(Some("s-parent"), Some("Scout"));
+            generic.harnesses = harnesses.clone();
+            let generic_args = args(&harnesses.spawn("acp.generic", &generic, None, 1).unwrap());
+            assert!(
+                !generic_args
+                    .iter()
+                    .any(|arg| arg.starts_with("--subagent-parent-"))
+            );
+        }
     }
 
     #[test]

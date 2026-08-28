@@ -494,6 +494,10 @@ enum Command {
         force: bool,
         #[arg(long, default_value_t = 0, hide = true)]
         subagent_depth: usize,
+        #[arg(long, hide = true, requires = "subagent_parent_name")]
+        subagent_parent_id: Option<String>,
+        #[arg(long, hide = true, requires = "subagent_parent_id")]
+        subagent_parent_name: Option<String>,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
@@ -909,6 +913,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
             subagent_depth,
+            subagent_parent_id,
+            subagent_parent_name,
         } => {
             let root = config.root(root);
             let model = config.model(model);
@@ -944,6 +950,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
+            let runtime = kit::Runtime::with_subagent_parent_context(
+                runtime,
+                subagent_parent_id.zip(subagent_parent_name),
+            )?;
             let runtime = kit::Runtime::with_subagent_names(runtime, config.subagent_names()?)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -1753,6 +1763,29 @@ review = "opus"
                 .unwrap_err()
                 .contains("not in allow_model_overrides")
         );
+    }
+
+    #[test]
+    fn acp_accepts_hidden_immediate_subagent_parent_context() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "acp",
+            "--subagent-parent-id",
+            "s-parent",
+            "--subagent-parent-name",
+            "偵察 🦀",
+        ])
+        .unwrap();
+        let Command::Acp {
+            subagent_parent_id,
+            subagent_parent_name,
+            ..
+        } = cli.command
+        else {
+            panic!("expected acp command");
+        };
+        assert_eq!(subagent_parent_id.as_deref(), Some("s-parent"));
+        assert_eq!(subagent_parent_name.as_deref(), Some("偵察 🦀"));
     }
 
     #[test]

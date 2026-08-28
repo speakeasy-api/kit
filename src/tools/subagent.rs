@@ -329,7 +329,16 @@ impl Subagents {
         self.names.clone()
     }
 
-    fn emit_event(&self, event: events::RuntimeEvent) {
+    fn emit_event(&self, mut event: events::RuntimeEvent) {
+        if let events::RuntimeEvent::SubagentStateChanged {
+            parent_id,
+            parent_name,
+            ..
+        } = &mut event
+        {
+            *parent_id = self.config.parent_id.clone();
+            *parent_name = self.config.parent_name.clone();
+        }
         #[cfg(test)]
         if let Ok(mut emitted) = self.runtime_events.lock() {
             emitted.push(event.clone());
@@ -436,8 +445,12 @@ impl Subagents {
             },
         )?;
         let persisted = kit.then(|| (id.clone(), false));
+        let child_config = self
+            .config
+            .clone()
+            .with_parent_context(id.clone(), state.lock().await.name.clone());
         let child = match ChildSession::start(
-            self.config.clone(),
+            child_config,
             harness,
             persisted,
             model,
@@ -630,11 +643,15 @@ impl Subagents {
                 _permit: permit,
             },
         )?;
+        let child_config = self
+            .config
+            .clone()
+            .with_parent_context(id.clone(), state.lock().await.name.clone());
         let child_result = if native_fork {
             source_child.fork(model.as_deref(), &cancellation).await
         } else {
             ChildSession::start(
-                self.config.clone(),
+                child_config,
                 harness,
                 Some((id.clone(), true)),
                 model,
@@ -1600,6 +1617,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses: Default::default(),
                 default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         );
@@ -1663,6 +1682,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses: Default::default(),
                 default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         );
@@ -1726,6 +1747,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses,
                 default_harness: "acp.generic".into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         );
@@ -1887,6 +1910,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses,
                 default_harness: "acp.generic".into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         )
@@ -1906,6 +1931,27 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        #[tokio::test]
+        async fn nested_runtime_events_include_only_the_immediate_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let base = manager_with_generic_harness(root.path(), Vec::new());
+            let mut config = base.child_config();
+            config.parent_id = Some("s-parent".into());
+            config.parent_name = Some("偵察 🦀".into());
+            let manager = Subagents::new(config, 2);
+
+            manager.insert_starting_for_test(None).await;
+
+            assert!(matches!(
+                manager.runtime_events_for_test().as_slice(),
+                [events::RuntimeEvent::SubagentStateChanged {
+                    parent_id: Some(parent_id),
+                    parent_name: Some(parent_name),
+                    ..
+                }] if parent_id == "s-parent" && parent_name == "偵察 🦀"
+            ));
         }
 
         #[tokio::test]
@@ -2204,6 +2250,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses,
                 default_harness: "acp.generic".into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         );
@@ -2297,6 +2345,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses,
                 default_harness: "acp.generic".into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         );
@@ -2411,6 +2461,8 @@ mod tests {
                 telemetry: Default::default(),
                 harnesses,
                 default_harness: "acp.generic".into(),
+                parent_id: None,
+                parent_name: None,
             },
             2,
         );
