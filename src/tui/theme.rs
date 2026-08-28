@@ -141,6 +141,23 @@ pub fn bar() -> Style {
     Style::default()
 }
 
+/// Raised surface for the prompt composer.
+pub fn composer() -> Style {
+    composer_for(crossterm::style::available_color_count())
+}
+
+fn composer_for(color_count: u16) -> Style {
+    match color_count {
+        u16::MAX => Style::default()
+            .fg(Color::Rgb(0xf2, 0xf2, 0xf2))
+            .bg(Color::Rgb(0x32, 0x36, 0x3d)),
+        colors if colors >= 256 => Style::default()
+            .fg(Color::Indexed(255))
+            .bg(Color::Indexed(238)),
+        _ => Style::default().fg(Color::White).bg(Color::DarkGray),
+    }
+}
+
 pub fn selection() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
@@ -183,9 +200,12 @@ pub fn duration(millis: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::{Color, Modifier, Style};
 
-    use super::{BRAND_ANSI, BRAND_RGB, bar, brand_rainbow_for, code, duration, selection, text};
+    use super::{
+        BRAND_ANSI, BRAND_RGB, bar, brand_rainbow_for, code, composer, composer_for, duration,
+        selection, text,
+    };
 
     #[test]
     fn formats_turn_durations_through_weeks() {
@@ -213,6 +233,20 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn composer_uses_a_contrasting_surface() {
+        assert!(composer().fg.is_some());
+        assert!(composer().bg.is_some());
+        assert_eq!(
+            composer_for(u16::MAX),
+            Style::default()
+                .fg(Color::Rgb(0xf2, 0xf2, 0xf2))
+                .bg(Color::Rgb(0x32, 0x36, 0x3d))
+        );
+        assert_eq!(composer_for(256).bg, Some(Color::Indexed(238)));
+        assert_eq!(composer_for(8).bg, Some(Color::DarkGray));
     }
 
     #[test]
