@@ -147,6 +147,8 @@ use crate::{
     session,
 };
 
+type EventSink = Arc<dyn Fn(&events::RuntimeEvent) -> Result<(), ()> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Subagents {
     config: ChildConfig,
@@ -154,6 +156,7 @@ pub struct Subagents {
     names: SubagentNames,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
+    event_sink: EventSink,
     #[cfg(test)]
     failed_removals: Arc<Mutex<Vec<FailedRemoval>>>,
     #[cfg(test)]
@@ -178,6 +181,7 @@ struct State {
     status: SubagentStatus,
     task: String,
     generation: u64,
+    handle_generation: u64,
     outcome: Option<GenerationOutcome>,
     created_at_unix_ms: u64,
     generation_started_at_unix_ms: u64,
@@ -302,6 +306,10 @@ impl Subagents {
             names,
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
+            event_sink: Arc::new(|event| {
+                events::emit(event);
+                Ok(())
+            }),
             #[cfg(test)]
             failed_removals: Arc::default(),
             #[cfg(test)]
@@ -326,12 +334,18 @@ impl Subagents {
         if let Ok(mut emitted) = self.runtime_events.lock() {
             emitted.push(event.clone());
         }
-        events::emit(&event);
+        let _ = (self.event_sink)(&event);
     }
 
     #[cfg(test)]
     fn runtime_events_for_test(&self) -> Vec<events::RuntimeEvent> {
         self.runtime_events.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn with_event_sink_for_test(mut self, event_sink: EventSink) -> Self {
+        self.event_sink = event_sink;
+        self
     }
 
     #[cfg(test)]
@@ -351,6 +365,7 @@ impl Subagents {
                     status: SubagentStatus::Starting,
                     task: "test".into(),
                     generation: 1,
+                    handle_generation: 1,
                     outcome: None,
                     created_at_unix_ms: now,
                     generation_started_at_unix_ms: now,
@@ -406,6 +421,7 @@ impl Subagents {
                 status: SubagentStatus::Starting,
                 task: task_summary(&prompt),
                 generation: 1,
+                handle_generation: 1,
                 outcome: None,
                 created_at_unix_ms: now,
                 generation_started_at_unix_ms: now,
@@ -487,7 +503,7 @@ impl Subagents {
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_ready(&locked)?;
-        self.check_generation(&prior, locked.generation)?;
+        self.check_generation(&prior, locked.handle_generation)?;
         let generation = locked
             .generation
             .checked_add(1)
@@ -515,6 +531,7 @@ impl Subagents {
                 let mut locked = state.lock().await;
                 self.check_active(&locked)?;
                 locked.status = SubagentStatus::Idle;
+                locked.handle_generation = generation;
                 locked.outcome = Some(GenerationOutcome::Success);
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 locked.output.clone_from(&output);
@@ -539,8 +556,8 @@ impl Subagents {
                     locked.outcome = Some(GenerationOutcome::Failed);
                     locked.generation_finished_at_unix_ms = Some(events::now_millis());
                     // A failed call returns no replacement handle, so preserve the
-                    // last completed generation for a retry with the same handle.
-                    locked.generation = prior.generation;
+                    // accepted handle generation for a retry while keeping lifecycle
+                    // generations monotonic.
                     let event = locked.runtime_event(prior.id.clone());
                     drop(locked);
                     self.emit_event(event);
@@ -567,7 +584,7 @@ impl Subagents {
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_ready(&source)?;
-        self.check_generation(&prior, source.generation)?;
+        self.check_generation(&prior, source.handle_generation)?;
         let id = session::new_id();
         let harness = source.harness.clone();
         let model = source.model.clone();
@@ -585,11 +602,11 @@ impl Subagents {
                 "ACP harness {harness:?} does not advertise session/fork; transcript fallback is only available for Kit"
             )));
         }
-        drop(source);
-        let generation = prior
+        let generation = source
             .generation
             .checked_add(1)
             .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
+        drop(source);
         let now = events::now_millis();
         let state = self.insert_starting(
             id.clone(),
@@ -599,6 +616,7 @@ impl Subagents {
                 status: SubagentStatus::Starting,
                 task: task_summary(&prompt),
                 generation,
+                handle_generation: generation,
                 outcome: None,
                 created_at_unix_ms: now,
                 generation_started_at_unix_ms: now,
@@ -682,7 +700,7 @@ impl Subagents {
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_ready(&source)?;
-        self.check_generation(prior, source.generation)?;
+        self.check_generation(prior, source.handle_generation)?;
         let id = session::new_id();
         session::clone_completed_in(&self.config.root, directory, &prior.id, &id)
             .map_err(ChildError::Failed)?;
@@ -819,14 +837,33 @@ impl Subagents {
     }
 
     fn reserve(&self) -> Result<OwnedSemaphorePermit, ChildError> {
-        self.sessions
+        let mut removed_events = Vec::new();
+        let mut sessions = self
+            .sessions
             .lock()
-            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
-            .retain(|_, entry| {
-                entry.state.try_lock().map_or(true, |state| {
-                    !state.child.as_ref().is_some_and(ChildSession::is_closed)
-                })
-            });
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?;
+        sessions.retain(|id, entry| {
+            entry.state.try_lock().map_or(true, |mut state| {
+                if !state.child.as_ref().is_some_and(ChildSession::is_closed) {
+                    return true;
+                }
+                if state.status != SubagentStatus::Removed {
+                    if state.status != SubagentStatus::Idle {
+                        state.outcome = Some(GenerationOutcome::Failed);
+                    }
+                    state.status = SubagentStatus::Removed;
+                    state
+                        .generation_finished_at_unix_ms
+                        .get_or_insert_with(events::now_millis);
+                    removed_events.push(state.runtime_event(id.clone()));
+                }
+                false
+            })
+        });
+        drop(sessions);
+        for event in removed_events {
+            self.emit_event(event);
+        }
         Arc::clone(&self.capacity).try_acquire_owned().map_err(|_| {
             ChildError::Failed(format!(
                 "live subagent session limit ({MAX_LIVE_SUBAGENTS}) reached"
@@ -1571,6 +1608,7 @@ mod tests {
             status: SubagentStatus::Idle,
             task: "done".into(),
             generation: 1,
+            handle_generation: 1,
             outcome: Some(GenerationOutcome::Success),
             created_at_unix_ms: 1,
             generation_started_at_unix_ms: 1,
@@ -1633,6 +1671,7 @@ mod tests {
             status: SubagentStatus::Idle,
             task: "done".into(),
             generation: 1,
+            handle_generation: 1,
             outcome: Some(GenerationOutcome::Success),
             created_at_unix_ms: 1,
             generation_started_at_unix_ms: 1,
@@ -1936,9 +1975,92 @@ mod tests {
                 ]
             );
             assert!(emitted.iter().all(|event| event.parent_call().is_none()));
+            let generations = emitted
+                .iter()
+                .filter_map(|event| match event {
+                    events::RuntimeEvent::SubagentStateChanged { generation, .. } => {
+                        Some(*generation)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(generations, vec![1, 1, 1, 2, 2, 3, 3, 3]);
             assert!(
                 matches!(emitted.last(), Some(events::RuntimeEvent::SubagentStateChanged { id, name, status: SubagentStatus::Removed, generation_finished_at_unix_ms: Some(_), .. }) if id.as_str() == handle.id.as_str() && name == "Scout")
             );
+        }
+
+        #[tokio::test]
+        async fn failing_event_transport_does_not_change_subagent_operations() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let root = tempfile::tempdir().unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let sink_attempts = Arc::clone(&attempts);
+            let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()])
+                .with_event_sink_for_test(Arc::new(move |_| {
+                    sink_attempts.fetch_add(1, Ordering::Relaxed);
+                    Err(())
+                }));
+
+            let handle = manager
+                .create(
+                    "create".into(),
+                    None,
+                    None,
+                    None,
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .expect("event failure must not fail create");
+            let handle = manager
+                .prompt(handle, "continue".into(), TurnCancellation::default(), None)
+                .await
+                .expect("event failure must not fail prompt");
+            assert_eq!(
+                manager.lookup(&handle).unwrap().lock().await.status,
+                SubagentStatus::Idle
+            );
+            manager
+                .close(&handle.id, &TurnCancellation::default())
+                .await
+                .expect("event failure must not fail close");
+            assert!(manager.lookup(&handle).is_err());
+            assert!(attempts.load(Ordering::Relaxed) >= 6);
+        }
+
+        #[tokio::test]
+        async fn closed_sessions_emit_one_removed_transition_before_name_reuse() {
+            for (working, expected_outcome) in [
+                (false, Some(GenerationOutcome::Success)),
+                (true, Some(GenerationOutcome::Failed)),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let (manager, state, prior) = manager_with_disconnected_session(root.path());
+                if working {
+                    let mut state = state.lock().await;
+                    state.status = SubagentStatus::Working;
+                    state.outcome = None;
+                    state.generation_finished_at_unix_ms = None;
+                }
+
+                assert_eq!(manager.insert_starting_for_test(None).await, "Scout");
+                let removed = manager
+                    .runtime_events_for_test()
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(event, events::RuntimeEvent::SubagentStateChanged { id, status: SubagentStatus::Removed, .. } if id == &prior.id)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(removed.len(), 1);
+                assert!(matches!(
+                    &removed[0],
+                    events::RuntimeEvent::SubagentStateChanged { outcome, generation_finished_at_unix_ms: Some(_), .. } if *outcome == expected_outcome
+                ));
+                assert!(manager.lookup(&prior).is_err());
+            }
         }
 
         #[tokio::test]
@@ -2121,7 +2243,7 @@ mod tests {
             .prompt(handle, "retry".into(), TurnCancellation::default(), None)
             .await
             .expect("failed reusable generation does not stale the last handle");
-        assert_eq!(retried.generation, 2);
+        assert_eq!(retried.generation, 3);
         assert_eq!(retried.name.as_deref(), Some("Scout"));
     }
 
