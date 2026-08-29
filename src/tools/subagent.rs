@@ -31,10 +31,6 @@ fn normalize_display_name(candidate: &str) -> Option<String> {
     }
 }
 
-fn allocate_name(used: &mut HashSet<String>, generate: &NameGenerator) -> String {
-    allocate_name_with(used, || generate())
-}
-
 fn allocate_name_with(used: &mut HashSet<String>, mut generate: impl FnMut() -> String) -> String {
     for _ in 0..MAX_RANDOM_NAME_ATTEMPTS {
         let Some(name) = normalize_display_name(&generate()) else {
@@ -765,7 +761,7 @@ impl Subagents {
             .values()
             .map(|entry| entry.name.to_lowercase())
             .collect::<HashSet<_>>();
-        let name = allocate_name(&mut used, &self.name_generator);
+        let name = allocate_name_with(&mut used, || (self.name_generator)());
         state.name.clone_from(&name);
         let event = state.runtime_event(id.clone());
         let state = Arc::new(AsyncMutex::new(state));
@@ -1002,9 +998,6 @@ fn listing_schema() -> serde_json::Value {
 fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
-fn fork_schema() -> serde_json::Value {
-    continuation_schema()
-}
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
 }
@@ -1034,7 +1027,7 @@ impl PromptTool {
 }
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, assign the fork a fresh random display name, prompt it, and return the new session value.", fork_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, assign the fork a fresh random display name, prompt it, and return the new session value.", continuation_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl SubagentsTool {
@@ -1442,7 +1435,12 @@ mod tests {
             }))
             .is_err()
         );
-        assert!(fork_schema()["properties"].get("name").is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let fork = ForkTool::new(
+            manager_with_generic_harness(directory.path(), Vec::new()),
+            1,
+        );
+        assert!(fork.spec.input_schema["properties"].get("name").is_none());
     }
 
     #[test]

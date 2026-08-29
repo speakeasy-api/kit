@@ -37,10 +37,7 @@ use super::{
     wrap::{LinkedLine, LinkedSpan, wrap_linked_tagged},
 };
 
-/// Width at which the graph moves beside the transcript instead of below it.
 const SIDE_BY_SIDE_WIDTH: u16 = 108;
-const THREE_COLUMN_WIDTH: u16 = 154;
-const GRAPH_WIDTH: u16 = 46;
 const AGENTS_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 const MAX_PENDING_STEER_ROWS: usize = 3;
@@ -486,110 +483,25 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
     draw_status(frame, app, status);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BodyLayout {
-    Transcript(Rect),
-    Graph {
-        transcript: Rect,
-        graph: Rect,
-    },
-    Agents {
-        transcript: Rect,
-        agents: Rect,
-    },
-    GraphAndAgents {
-        transcript: Rect,
-        graph: Rect,
-        agents: Rect,
-    },
-}
-
-fn body_layout(area: Rect, show_graph: bool, show_agents: bool) -> BodyLayout {
-    match (show_graph, show_agents) {
-        (false, false) => BodyLayout::Transcript(area),
-        (show_graph, show_agents) if !(show_graph && show_agents) => {
-            let (transcript, side) = if area.width >= SIDE_BY_SIDE_WIDTH {
-                let [transcript, side] = Layout::horizontal([
-                    Constraint::Min(40),
-                    Constraint::Length(if show_graph {
-                        GRAPH_WIDTH
-                    } else {
-                        AGENTS_WIDTH
-                    }),
-                ])
-                .areas(area);
-                (transcript, side)
-            } else {
-                let [transcript, side] =
-                    Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
-                        .areas(area);
-                (transcript, side)
-            };
-            if show_graph {
-                BodyLayout::Graph {
-                    transcript,
-                    graph: side,
-                }
-            } else {
-                BodyLayout::Agents {
-                    transcript,
-                    agents: side,
-                }
-            }
-        }
-        (true, true) if area.width >= THREE_COLUMN_WIDTH => {
-            let [transcript, graph, agents] = Layout::horizontal([
-                Constraint::Min(40),
-                Constraint::Length(GRAPH_WIDTH),
-                Constraint::Length(AGENTS_WIDTH),
-            ])
-            .areas(area);
-            BodyLayout::GraphAndAgents {
-                transcript,
-                graph,
-                agents,
-            }
-        }
-        (true, true) => {
-            let [transcript, graph, agents] = Layout::vertical([
-                Constraint::Percentage(40),
-                Constraint::Percentage(30),
-                Constraint::Percentage(30),
-            ])
-            .areas(area);
-            BodyLayout::GraphAndAgents {
-                transcript,
-                graph,
-                agents,
-            }
-        }
-        _ => unreachable!(),
+fn body_layout(area: Rect, show_agents: bool) -> (Rect, Option<Rect>) {
+    if !show_agents {
+        return (area, None);
     }
+    let [transcript, agents] = if area.width >= SIDE_BY_SIDE_WIDTH {
+        Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area)
+    } else {
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
+    };
+    (transcript, Some(agents))
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
-    if !app.show_agents() {
+    let (transcript, agents) = body_layout(area, app.show_agents());
+    draw_transcript(frame, app, images, transcript);
+    if let Some(agents) = agents {
+        draw_agents(frame, app, agents);
+    } else {
         app.set_agents_viewport(Rect::default(), 0);
-    }
-    match body_layout(area, app.show_graph(), app.show_agents()) {
-        BodyLayout::Transcript(transcript) => draw_transcript(frame, app, images, transcript),
-        BodyLayout::Graph { transcript, graph } => {
-            draw_transcript(frame, app, images, transcript);
-            draw_graph(frame, app, graph);
-        }
-        BodyLayout::Agents { transcript, agents } => {
-            draw_transcript(frame, app, images, transcript);
-            draw_agents(frame, app, agents);
-        }
-        BodyLayout::GraphAndAgents {
-            transcript,
-            graph,
-            agents,
-        } => {
-            draw_transcript(frame, app, images, transcript);
-            draw_graph(frame, app, graph);
-            draw_agents(frame, app, agents);
-        }
     }
 }
 
@@ -1619,129 +1531,6 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_graph(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = Panel::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme::faint())
-        .title(Span::styled(" runtime graph ", theme::accent()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let Some(call) = app.focus_call() else {
-        frame.render_widget(
-            Paragraph::new(Span::styled("no tool calls yet", theme::faint())),
-            inner,
-        );
-        return;
-    };
-    let graph = graph_lines(app, call)
-        .into_iter()
-        .map(|line| (LinkedLine::plain(line), ()))
-        .collect::<Vec<_>>();
-    let lines = wrap_linked_tagged(&graph, inner.width.max(1) as usize)
-        .into_iter()
-        .map(|(line, (), _, _)| line)
-        .collect::<Vec<_>>();
-    let offset = lines.len().saturating_sub(inner.height as usize);
-    frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
-        inner,
-    );
-}
-
-fn graph_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
-        Span::styled(call.title.clone(), theme::bold(theme::text_color())),
-        Span::styled(
-            format!("  {}", theme::duration(call.elapsed())),
-            theme::dim(),
-        ),
-    ])];
-    let done = call.children.len() - call.running_children();
-    let failed = call.children.iter().filter(|child| !child.ok).count();
-    let program = if call.running() {
-        "running"
-    } else if call.status == ToolCallStatus::Failed {
-        "failed"
-    } else {
-        "complete"
-    };
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{} plan nodes · {done} calls done · {} calls running{} · program {program}",
-            call.plan.len(),
-            call.running_children(),
-            if failed > 0 {
-                format!(" · {failed} calls failed")
-            } else {
-                String::new()
-            }
-        ),
-        theme::faint(),
-    )));
-    lines.push(Line::default());
-
-    if call.plan.is_empty() {
-        if call.children.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "waiting for the program to dispatch…",
-                theme::faint(),
-            )));
-        }
-        for child in call.children.iter().rev().take(20) {
-            lines.push(Line::from(child_spans(app, child, "")));
-        }
-        return lines;
-    }
-
-    for (index, node) in call.plan.iter().enumerate() {
-        let attached: Vec<&Child> = call
-            .children
-            .iter()
-            .filter(|child| child.node == Some(index))
-            .collect();
-        let indent = "  ".repeat(node.depth);
-        let style = node_style(node.kind, &attached);
-        let mut spans = vec![
-            Span::styled(format!("{indent}{} ", node.kind.glyph()), style),
-            Span::styled(node.label.clone(), style),
-        ];
-        if attached.len() > 1 {
-            spans.push(Span::styled(
-                format!("  ×{}", attached.len()),
-                theme::faint(),
-            ));
-        }
-        lines.push(Line::from(spans));
-        for child in attached.iter().rev().take(4) {
-            lines.push(Line::from(child_spans(app, child, &format!("{indent}  "))));
-        }
-        if attached.len() > 4 {
-            lines.push(Line::from(Span::styled(
-                format!("{indent}  … {} earlier", attached.len() - 4),
-                theme::faint(),
-            )));
-        }
-    }
-    lines
-}
-
-fn node_style(kind: PlanKind, attached: &[&Child]) -> Style {
-    if attached.iter().any(|child| child.running()) {
-        return theme::bold(theme::running_color());
-    }
-    if attached.iter().any(|child| !child.ok) {
-        return Style::default().fg(theme::error_color());
-    }
-    if !attached.is_empty() {
-        return Style::default().fg(theme::success_color());
-    }
-    match kind {
-        PlanKind::Call => theme::dim(),
-        _ => theme::faint(),
-    }
-}
-
 fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
@@ -2003,12 +1792,12 @@ mod tests {
 
     use agent_client_protocol::schema::v2::ToolKind;
     use base64::Engine as _;
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
     use ratatui_image::picker::Picker;
 
     use super::{
-        BodyLayout, MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
+        MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
         model_dialog_rows, model_dialog_viewport, prompt_lines, refresh_transcript_cache,
         refresh_transcript_cache_with_images, user_block_rows, user_line,
     };
@@ -2162,54 +1951,24 @@ mod tests {
     }
 
     #[test]
-    fn agents_layout_obeys_one_and_two_panel_boundaries() {
+    fn agents_layout_obeys_hidden_and_107_108_boundaries() {
         let area_107 = ratatui::layout::Rect::new(2, 3, 107, 20);
+        assert_eq!(body_layout(area_107, false), (area_107, None));
         assert_eq!(
-            body_layout(area_107, false, true),
-            BodyLayout::Agents {
-                transcript: ratatui::layout::Rect::new(2, 3, 107, 11),
-                agents: ratatui::layout::Rect::new(2, 14, 107, 9),
-            }
+            body_layout(area_107, true),
+            (
+                ratatui::layout::Rect::new(2, 3, 107, 11),
+                Some(ratatui::layout::Rect::new(2, 14, 107, 9)),
+            )
         );
-        assert_eq!(
-            body_layout(area_107, true, false),
-            BodyLayout::Graph {
-                transcript: ratatui::layout::Rect::new(2, 3, 107, 11),
-                graph: ratatui::layout::Rect::new(2, 14, 107, 9),
-            }
-        );
+
         let area_108 = ratatui::layout::Rect::new(2, 3, 108, 20);
         assert_eq!(
-            body_layout(area_108, true, false),
-            BodyLayout::Graph {
-                transcript: ratatui::layout::Rect::new(2, 3, 62, 20),
-                graph: ratatui::layout::Rect::new(64, 3, 46, 20),
-            }
-        );
-        assert_eq!(
-            body_layout(area_108, false, true),
-            BodyLayout::Agents {
-                transcript: ratatui::layout::Rect::new(2, 3, 62, 20),
-                agents: ratatui::layout::Rect::new(64, 3, 46, 20),
-            }
-        );
-        let area_153 = ratatui::layout::Rect::new(2, 3, 153, 20);
-        assert_eq!(
-            body_layout(area_153, true, true),
-            BodyLayout::GraphAndAgents {
-                transcript: ratatui::layout::Rect::new(2, 3, 153, 8),
-                graph: ratatui::layout::Rect::new(2, 11, 153, 6),
-                agents: ratatui::layout::Rect::new(2, 17, 153, 6),
-            }
-        );
-        let area_154 = ratatui::layout::Rect::new(2, 3, 154, 20);
-        assert_eq!(
-            body_layout(area_154, true, true),
-            BodyLayout::GraphAndAgents {
-                transcript: ratatui::layout::Rect::new(2, 3, 62, 20),
-                graph: ratatui::layout::Rect::new(64, 3, 46, 20),
-                agents: ratatui::layout::Rect::new(110, 3, 46, 20),
-            }
+            body_layout(area_108, true),
+            (
+                ratatui::layout::Rect::new(2, 3, 62, 20),
+                Some(ratatui::layout::Rect::new(64, 3, 46, 20)),
+            )
         );
     }
 
@@ -2548,9 +2307,33 @@ mod tests {
     }
 
     #[test]
+    fn active_compose_keeps_the_full_transcript_layout() {
+        let mut app = sample();
+
+        render(&mut app, 120, 40);
+
+        assert!(app.transcript_width > 100, "{}", app.transcript_width);
+    }
+
+    #[test]
+    fn ctrl_g_does_not_toggle_a_runtime_graph_layout() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.push_user("keep the transcript full width".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        render(&mut app, 120, 20);
+
+        assert!(app.transcript_width > 100, "{}", app.transcript_width);
+    }
+
+    #[test]
     fn compose_script_runs_inline_with_live_annotations_at_full_width() {
         let mut app = sample();
-        app.graph_pinned = Some(false);
 
         let frame = render(&mut app, 120, 40);
 
@@ -2901,7 +2684,6 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let mut app = sample();
-        app.graph_pinned = Some(false);
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()
@@ -3047,7 +2829,6 @@ mod tests {
         use crate::tui::app::Selection;
 
         let mut app = sample();
-        app.graph_pinned = Some(false);
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()
@@ -3158,7 +2939,6 @@ mod tests {
         };
 
         let mut app = sample();
-        app.graph_pinned = Some(false);
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()

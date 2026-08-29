@@ -562,8 +562,6 @@ pub struct App {
     pub logs: Vec<String>,
     pub show_logs: bool,
     pub show_thoughts: bool,
-    /// `None` shows the graph while a tool runs; `Some` pins it open or shut.
-    pub graph_pinned: Option<bool>,
     agents_visible: bool,
     agents: HashMap<String, AgentRow>,
     agent_versions: HashMap<String, (u64, u8)>,
@@ -572,7 +570,7 @@ pub struct App {
     agents_scroll: usize,
     agents_viewport: usize,
     agents_area: Rect,
-    /// Tool card selected for output toggling, background cancellation, and the runtime graph.
+    /// Tool card selected for output toggling or background cancellation.
     pub focused_call_id: Option<String>,
     pub tick: usize,
     pub scroll: usize,
@@ -846,7 +844,6 @@ impl App {
             logs: Vec::new(),
             show_logs: false,
             show_thoughts: false,
-            graph_pinned: None,
             agents_visible: false,
             agents: HashMap::new(),
             agent_versions: HashMap::new(),
@@ -1390,13 +1387,6 @@ impl App {
     fn scroll_agents_by(&mut self, rows: isize) {
         let top = self.agents.len().saturating_sub(self.agents_viewport);
         self.agents_scroll = self.agents_scroll.saturating_add_signed(rows).min(top);
-    }
-
-    pub fn show_graph(&self) -> bool {
-        match self.graph_pinned {
-            Some(pinned) => pinned,
-            None => self.focus_call().is_some_and(ToolCall::running),
-        }
     }
 
     pub fn elapsed(&self) -> u64 {
@@ -2595,9 +2585,6 @@ impl App {
             KeyCode::Char('f') if alt => self.editor.move_word_right(),
             KeyCode::Char('a') if control => self.editor.move_line_start(),
             KeyCode::Char('e') if control => self.editor.move_line_end(),
-            KeyCode::Char('g') if control => {
-                self.graph_pinned = Some(!self.show_graph());
-            }
             KeyCode::Char('r') if control => self.toggle_agents(),
             KeyCode::Char('l') if control => self.show_logs = !self.show_logs,
             KeyCode::Char('o') if control => self.toggle_last_output(),
@@ -4830,7 +4817,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_toggle_without_disturbing_editor_or_graph() {
+    fn agents_toggle_without_disturbing_editor() {
         let mut app = app();
         app.editor.insert_str("abc");
         app.handle_key(modified_press(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -4842,10 +4829,6 @@ mod tests {
             app.handle_key(modified_press(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Action::None
         ));
-        assert!(app.show_agents());
-        assert!(!app.show_graph());
-        app.handle_key(modified_press(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        assert!(app.show_graph());
         assert!(app.show_agents());
 
         app.editor.clear();
