@@ -26,7 +26,7 @@ kit init && kit auth login openai && kit tui
 
 Most agent harnesses expose many tools and pay one model round trip per call. Kit exposes **one tool, `compose`**, whose argument is a short program in [Runlet](https://github.com/danielkov/runlet). A single round trip can read several files, run the tests, apply an edit, retry a flaky command, delegate to subagents, and return one structured value.
 
-Fewer round trips means less repeated context per task and more work done per request.
+Fewer round trips means less repeated context per task and more work done per request: on size-matched issues in a production repository, Kit shipped a hand-written line for about half the input tokens and half the active time of Codex CLI or Claude Code ([comparison](#how-it-compares)).
 
 - **One tool, unlimited composition.** `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool`, `auth`, `skill`, `a2a`, `docs` are the tools a `compose` program calls. Independent calls run concurrently; data dependencies and `after` blocks express ordering; `boundary retry N` and `fail()` handle errors in-program.
 - **Subagents are values, not fire-and-forget tasks.** Start one, prompt it again, fork it, require JSON that matches a schema, close it. Point it at another harness — Claude Code, Codex, Cursor, or Kit itself — over ACP.
@@ -265,7 +265,16 @@ flash = "openrouter:openai/gpt-5.6-luna"
 
 ## How it compares
 
-A preliminary comparison of Kit, Codex CLI, and Claude Code, parsed from one developer's session transcripts, is in [docs/harness-comparison.md](docs/harness-comparison.md) together with the scripts that produced it. It is observational — different models, tasks, and periods — and its conclusions depend heavily on how turns, active time, and context are counted, so it is not summarized here.
+Kit, Codex CLI, and Claude Code were each used to ship Linear issues in the same production repository, [speakeasy-api/gram](https://github.com/speakeasy-api/gram), during July–August 2026. Every session was matched to the pull request it opened, and PRs were sized by hand-written lines (generated code excluded). All 16 PRs merged.
+
+| Median per hand-written line (300–1000-line PRs) | Kit | Codex CLI | Claude Code |
+| --- | ---: | ---: | ---: |
+| Input tokens | **49.7k** | 113k | 99.6k |
+| Output tokens | 274 | 321 | 325 |
+| Active minutes | **0.13** | 0.31 | 0.31 |
+| User messages per session (all rows, median) | **5** | 14 | 11 |
+
+Kit shipped a hand-written line for roughly half the input tokens and half the active time of the other two, with comparable output and the least steering, on a 272k context window with a lower peak context than Claude Code. Two Kit runs merged from a single message. The sample is small (5 Kit, 2 Codex CLI, 7 Claude Code sessions), the models differ (gpt-5.6-sol vs gpt-5.5 vs Claude Fable 5 / Opus 5), and tokens are not cost. Per-session data and method: [docs/harness-comparison.md](docs/harness-comparison.md).
 
 ## Deliberate limits
 
