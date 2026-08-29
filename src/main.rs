@@ -210,7 +210,6 @@ struct Config {
 #[derive(Debug, Deserialize)]
 struct SubagentConfig {
     harness: String,
-    names: Option<Vec<String>>,
     #[serde(default)]
     harnesses: BTreeMap<String, kit::SubagentHarnessPolicy>,
 }
@@ -244,6 +243,15 @@ impl Config {
             .map_err(|error| format!("could not parse TOML: {error}"))
             .map(migrate_config)
             .and_then(|config| {
+                if config
+                    .get("subagent")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|subagent| subagent.contains_key("names"))
+                {
+                    return Err(
+                        "could not parse config: unknown field `names` in `subagent`".into(),
+                    );
+                }
                 toml::Value::Table(config)
                     .try_into()
                     .map_err(|error| format!("could not parse config: {error}"))
@@ -255,12 +263,6 @@ impl Config {
             )
         })?;
         config.config_dir = config_dir;
-        config.subagent_names().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid config {}: {error}", path.display()),
-            )
-        })?;
         Ok(config)
     }
 
@@ -339,14 +341,6 @@ impl Config {
             max_bytes,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
-    }
-
-    fn subagent_names(&self) -> Result<kit::tools::SubagentNames, String> {
-        kit::tools::SubagentNames::resolve(
-            self.subagent
-                .as_ref()
-                .and_then(|subagent| subagent.names.clone()),
-        )
     }
 
     fn harnesses(&self) -> Result<(kit::AcpHarnesses, String), String> {
@@ -869,7 +863,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 plugins.skill_directories,
             )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
-            let runtime = kit::Runtime::with_subagent_names(runtime, config.subagent_names()?)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -954,7 +947,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 runtime,
                 subagent_parent_id.zip(subagent_parent_name),
             )?;
-            let runtime = kit::Runtime::with_subagent_names(runtime, config.subagent_names()?)?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -1075,48 +1067,17 @@ mod tests {
     };
 
     #[test]
-    fn subagent_names_preserve_absent_custom_and_empty_configuration() {
-        let directory = tempfile::tempdir().unwrap();
-
-        let absent_path = directory.path().join("absent.toml");
-        fs::write(&absent_path, "[subagent]\nharness = \"acp.kit\"\n").unwrap();
-        let absent = Config::load(&absent_path).unwrap();
-        assert_eq!(absent.subagent.unwrap().names, None);
-
-        let custom_path = directory.path().join("custom.toml");
-        fs::write(
-            &custom_path,
-            "[subagent]\nharness = \"acp.kit\"\nnames = [\" Acorn \", \"Moss\"]\n",
-        )
-        .unwrap();
-        let custom = Config::load(&custom_path).unwrap();
-        assert_eq!(
-            custom.subagent.unwrap().names,
-            Some(vec![" Acorn ".into(), "Moss".into()])
-        );
-
-        let empty_path = directory.path().join("empty.toml");
-        fs::write(
-            &empty_path,
-            "[subagent]\nharness = \"acp.kit\"\nnames = []\n",
-        )
-        .unwrap();
-        let empty = Config::load(&empty_path).unwrap();
-        assert_eq!(empty.subagent.unwrap().names, Some(Vec::new()));
-    }
-
-    #[test]
-    fn subagent_names_are_validated_during_config_load() {
+    fn subagent_names_are_rejected_as_unknown_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "[subagent]\nharness = \"acp.kit\"\nnames = [\"Scout\", \"scout\"]\n",
+            "[subagent]\nharness = \"acp.kit\"\nnames = [\"Scout\"]\n",
         )
         .unwrap();
 
-        let error = Config::load(&path).expect_err("duplicate names must fail config loading");
-        assert!(error.to_string().contains("scout"));
+        let error = Config::load(&path).expect_err("removed names key must fail config loading");
+        assert!(error.to_string().contains("unknown field `names`"));
     }
 
     #[test]

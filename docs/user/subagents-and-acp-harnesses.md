@@ -25,25 +25,15 @@ Always pass the latest completed value back to `prompt` or `fork`. Reusing an ol
 
 The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
 
-## Configure and inspect display names
+## Inspect display names
 
-Kit assigns each new `subagent` or `fork` handle a stable display name. With no `names` key, it uses this built-in pool in order:
+Kit assigns every new `subagent` and `fork` handle a random, one-word human-readable display name. Names are generated internally; there is no name configuration and no naming field in the `subagent`, `fork`, or `prompt` inputs. `prompt` preserves the existing handle name, while `fork` allocates a fresh random name for its distinct identity.
 
-```toml
-[subagent]
-harness = "acp.kit"
-names = ["Scout", "Pip", "Juniper", "Miso", "Clover", "Pixel", "Pebble", "Nova"]
-```
+Generated words are normalized to a capitalized label no longer than 32 Unicode scalar values. Names compare case-insensitively among one parent's direct live children. A collision receives the lowest available suffix, such as `Otter 2` or `Otter 3`. If bounded generation unexpectedly cannot produce an available valid word, Kit uses the lowest available `Agent N` label. The immutable `s-…` ID remains authoritative; names never select handles.
 
-A configured `[subagent].names` list **replaces** that pool; it does not extend it. `names = []` is valid and skips directly to fallback assignment. Kit trims configured names, then requires each one to be non-empty, single-line, free of control characters, no longer than 32 Unicode scalar values, and unique case-insensitively. Invalid names make configuration loading fail.
+A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Case-insensitive uniqueness applies only among one parent's direct children. Separate descendant branches may reuse names, so the Agents panel can contain duplicate visible labels with different immutable IDs.
 
-A new handle takes the first unreserved pool name. After the pool is exhausted, an optional `fallback_name` supplied on `subagent` or `fork` is used; the parent model may suggest it as part of the existing call, so Kit makes no separate naming request. Kit normalizes valid suggestions and disambiguates collisions with ` 2`, ` 3`, and so on. An absent or invalid suggestion produces the lowest available generated `Agent N` name. `prompt` keeps the existing name, and names are never identity selectors: the immutable `s-…` ID remains authoritative.
-
-A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Case-insensitive uniqueness applies only among one parent's direct children. Separate descendant branches may reuse names, so the Agents panel can contain duplicate visible labels such as `Scout · via Pip`; their IDs remain distinct.
-
-`subagents({})` directly lists only the current parent's live children, ordered by creation time and then ID. Each entry reports `id`, `name`, `status` (`starting`, `working`, or `idle`), `generation`, and `task`; closed and retired handles are omitted. This direct listing includes both foreground and background calls. A top-level Kit TUI can additionally observe nested descendants from child Kit processes because they forward private Kit runtime events recursively. Generic ACP does not define portable parent/child session enumeration, so private agents created inside a generic ACP harness are not discoverable unless that harness emits compatible Kit events.
-
-Older serialized handles without `name` remain accepted by `prompt`, `fork`, and `close`; any supplied name is informational and cannot rename or redirect the handle.
+Use `subagents({})` to inspect live direct children. Each row contains `id`, `name`, `status`, `generation`, and the bounded current task summary. Closed and terminally retired children are omitted.
 
 ## Require structured JSON output with `output_schema`
 

@@ -13,192 +13,44 @@
 ## Global Constraints
 
 - Invoke `updating-artifact-schema` before changing `[subagent]` config or serialized `SubagentValue` handles.
-- Preserve old configs and old handles that omit `name`; current outputs always populate `name`.
+- Reject removed name configuration while preserving old serialized handles that omit `name`; current outputs always populate `name`.
 - Keep immutable `s-…` IDs authoritative; display names never select handles.
-- Default names are exactly `Scout`, `Pip`, `Juniper`, `Miso`, `Clover`, `Pixel`, `Pebble`, `Nova`, in that order.
-- Configured names replace defaults; an explicitly empty list is valid.
+- Allocate one-word random petnames internally; model inputs never provide names.
 - Name uniqueness is case-insensitive only among one parent's direct children.
 - Runtime event timestamps are Unix epoch milliseconds.
 - Event delivery remains observational and cannot fail subagent work.
 - `Ctrl+G` and the existing graph remain unchanged; `Ctrl+R` and `/agents` toggle the new panel.
 - Wide three-panel layout begins at 154 columns; narrow three-panel layout is transcript/graph/Agents at 40/30/30 percent.
-- Meaningful behavior changes require the package patch version to move from `0.1.101` to `0.1.102`.
+- Keep the package version exactly `0.1.104` for this unreleased revision, including after dependency lock changes.
 
 ---
 
 ## File Structure
 
-- `src/tools/subagent.rs`: validated name pools, allocation/reservation, lifecycle state, handle/listing schemas, lifecycle event emission.
-- `src/runtime.rs`: carry name-pool policy through every runtime reconstruction path.
-- `src/main.rs`: parse and validate `[subagent].names`, then apply it to Serve and ACP runtimes.
+- `src/tools/subagent.rs`: random name allocation/reservation, lifecycle state, handle/listing schemas, lifecycle event emission.
+- `src/runtime.rs`: reconstruct subagent managers without naming policy.
+- `src/main.rs`: strictly reject removed subagent naming configuration.
 - `src/events.rs`: shared subagent status/outcome types and lifecycle/descendant-removal wire events.
 - `src/acp_child.rs`: pass parent identity into child Kit processes and forward nested roster events/cleanup.
 - `src/tui/app.rs`: reduce roster events, hold sorting/counting/scroll state, and handle `Ctrl+R`.
 - `src/tui/command.rs`: parse and highlight `/agents`.
 - `src/tui/ui.rs`: render the two-line flat panel, footer, spinner palette, and responsive layouts.
-- `docs/user/subagents-and-acp-harnesses.md`: document naming, fallback assignment, and observable descendants.
+- `docs/user/subagents-and-acp-harnesses.md`: document random naming, emergency fallback, and observable descendants.
 - `docs/user/tui-and-sessions.md`: document the Agents panel, controls, states, and layout.
 - `Cargo.toml`, `Cargo.lock`: patch version bump.
 
 ---
 
-### Task 1: Validated Name Pool and Runtime Configuration
+### Tasks 1–2: Random Names, Handles, Listings, and Lifecycle State
 
-**Files:**
-- Modify: `src/tools/subagent.rs:1-140`
-- Modify: `src/runtime.rs:230-565`
-- Modify: `src/runtime/tests.rs`
-- Modify: `src/main.rs:187-258, 337-353, 776-912`
+**Files:** `Cargo.toml`, `Cargo.lock`, `src/tools/subagent.rs`, `src/runtime.rs`, `src/main.rs`, and focused tests.
 
-**Interfaces:**
-- Produces: `SubagentNames::resolve(Option<Vec<String>>) -> Result<SubagentNames, String>`
-- Produces: `SubagentNames::as_slice(&self) -> &[String]`
-- Produces: `Runtime::with_subagent_names(Arc<Runtime>, SubagentNames) -> Result<Arc<Runtime>, String>`
-- Produces: a cloned `SubagentNames` policy in `Subagents::fresh()`
-
-- [ ] **Step 1: Load the persistent-artifact workflow and inventory readers/writers**
-
-Invoke `updating-artifact-schema`. Record in the task notes that `[subagent].names` is read in `Config::load`, while `SubagentValue` is serialized into tool results/transcripts and read by continuation schemas. Confirm the compatibility strategy: optional config field, optional handle input field, populated current output field.
-
-- [ ] **Step 2: Write failing name-pool validation tests**
-
-Add unit tests covering absent defaults, explicit replacement, `Some(vec![])`, trimming, empty values, controls/newlines, more than 32 `char`s, and case-insensitive duplicates. Use assertions of this shape:
-
-```rust
-#[test]
-fn configured_subagent_names_replace_defaults_and_reject_duplicates() {
-    let names = SubagentNames::resolve(Some(vec!["  Acorn  ".into(), "Moss".into()]))
-        .expect("valid names");
-    assert_eq!(names.as_slice(), &["Acorn", "Moss"]);
-
-    let error = SubagentNames::resolve(Some(vec!["Scout".into(), "scout".into()]))
-        .expect_err("case-insensitive duplicate must fail");
-    assert!(error.contains("scout"));
-}
-```
-
-- [ ] **Step 3: Run the focused tests and confirm failure**
-
-Run: `cargo test --lib tools::subagent::tests::configured_subagent_names -- --nocapture`
-
-Expected: FAIL because `SubagentNames` and its resolver do not exist.
-
-- [ ] **Step 4: Implement `SubagentNames` and defaults**
-
-Use an owned, cloneable list and a `HashSet<String>` validation key based on normalized lowercase text. Count `value.chars()`, reject `character.is_control()`, trim only surrounding whitespace for configured values, and preserve source order. Keep absence distinct from an explicit empty vector.
-
-```rust
-pub const DEFAULT_SUBAGENT_NAMES: &[&str] =
-    &["Scout", "Pip", "Juniper", "Miso", "Clover", "Pixel", "Pebble", "Nova"];
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubagentNames {
-    names: Arc<[String]>,
-}
-```
-
-- [ ] **Step 5: Write failing config/runtime propagation tests**
-
-Add `names: Option<Vec<String>>` to the expected `SubagentConfig` shape in tests, then test that absent/custom/empty values survive `Config::load`, `Runtime::with_telemetry`, `with_acp_harnesses`, `with_mcp_config`, and `Subagents::fresh()`. Assert the manager's test-only name slice after each reconstruction.
-
-- [ ] **Step 6: Run config/runtime tests and confirm failure**
-
-Run: `cargo test --bin kit subagent_names -- --nocapture && cargo test --lib runtime::tests::subagent_names -- --nocapture`
-
-Expected: FAIL because config and runtime do not carry the policy.
-
-- [ ] **Step 7: Plumb the validated policy through runtime construction**
-
-Add `SubagentConfig.names: Option<Vec<String>>`, validate during `Config::load`, and call `Runtime::with_subagent_names` in both Serve and ACP setup before tool registries are used. Ensure every runtime reconstruction copies the current policy instead of resetting to defaults.
-
-- [ ] **Step 8: Run focused tests and format**
-
-Run: `cargo fmt --check && cargo test --bin kit subagent_names -- --nocapture && cargo test --lib configured_subagent_names -- --nocapture && cargo test --lib runtime::tests::subagent_names -- --nocapture`
-
-Expected: PASS.
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add src/main.rs src/runtime.rs src/runtime/tests.rs src/tools/subagent.rs
-git commit -m "feat: configure subagent name pools"
-```
-
----
-
-### Task 2: Name Allocation, Handles, Listings, and Lifecycle State
-
-**Files:**
-- Modify: `src/tools/subagent.rs:22-486, 540-760, 898-end`
-
-**Interfaces:**
-- Consumes: `SubagentNames` from Task 1
-- Produces: `State.name`, explicit `SubagentStatus`, task summary, outcome, and Unix-ms fields
-- Produces: `allocate_name(pool, sessions, fallback_name) -> String`
-- Produces: optional `fallback_name` inputs for `subagent` and `fork`
-- Produces: current `SubagentValue.name: Option<String>` compatibility field populated in new outputs
-- Produces: structured direct-child `SubagentListing`
-
-- [ ] **Step 1: Write failing allocator and summary tests**
-
-Cover deterministic pool order, reservation until close, released-name reuse, explicit empty pool, fallback normalization, invalid fallback to `Agent N`, suffix collision, 32-`char` truncation, and 96-`char` task summaries. Include concurrent allocation that proves sibling names cannot collide.
-
-```rust
-#[test]
-fn fallback_is_used_only_after_the_pool_is_exhausted() {
-    let mut used = HashSet::new();
-    assert_eq!(allocate_name(&["Scout".into()], &mut used, Some("Waffles")), "Scout");
-    assert_eq!(allocate_name(&["Scout".into()], &mut used, Some("Waffles")), "Waffles");
-}
-```
-
-- [ ] **Step 2: Run allocator tests and confirm failure**
-
-Run: `cargo test --lib tools::subagent::tests::name_allocation -- --nocapture`
-
-Expected: FAIL because allocation helpers and reservations do not exist.
-
-- [ ] **Step 3: Implement atomic allocation and lifecycle fields**
-
-Reserve the name while holding the same registry synchronization used for insertion. Insert a `starting` state before asynchronous child startup, then transition it to `working` and `idle`. Release the reservation on failed creation, explicit close, or terminal retirement. Store creation/generation timestamps from `events::now_millis()`.
-
-- [ ] **Step 4: Write failing handle/schema/listing tests**
-
-Test all of the following:
-
-```rust
-let legacy = serde_json::from_value::<SubagentValue>(json!({
-    "id": "s-old", "output": null, "generation": 1
-})).expect("legacy handle remains readable");
-assert_eq!(legacy.name, None);
-```
-
-Also assert that new outputs populate `name`, `subagent` and `fork` accept `fallback_name`, `prompt` does not, listing rows always contain `id/name/status/generation/task`, and closed/retired entries are absent.
-
-- [ ] **Step 5: Run schema/listing tests and confirm failure**
-
-Run: `cargo test --lib tools::subagent::tests::subagent_value -- --nocapture && cargo test --lib tools::subagent::tests::listing -- --nocapture && cargo test --lib tools::subagent::tests::fallback_name -- --nocapture`
-
-Expected: FAIL on missing fields and old listing shape.
-
-- [ ] **Step 6: Implement tool schemas and compatibility behavior**
-
-Add `fallback_name: Option<String>` to initial and fork request structs. Keep `name` optional when deserializing a handle and in continuation input schemas, ignore supplied handle names for lookup, and always rebuild output handles from authoritative registry state. Replace the untagged starting/ready listing with a single roster row shape.
-
-- [ ] **Step 7: Run the full subagent test module**
-
-Run: `cargo fmt --check && cargo test --lib tools::subagent::tests -- --nocapture`
-
-Expected: PASS, including existing capacity, generation, prompt, fork, close, and cancellation tests.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/tools/subagent.rs
-git commit -m "feat: name and track subagent lifecycles"
-```
-
----
+- Inventory all name configuration, allocator, request-schema, serialized-handle, and lifecycle readers/writers before editing.
+- Add RED tests proving `[subagent].names` is unknown configuration, model inputs reject naming fields, generated candidates are one-word/capitalized, collisions use case-insensitive numeric suffixes, retries are bounded, and `Agent N` is the emergency fallback.
+- Replace the compiled/configured pool with `petname` 3.2 using only `default-rng` and `default-words` library features; do not enable `clap`.
+- Allocate atomically while inserting the starting registry entry. Preserve names on `prompt`, allocate a fresh name on `fork`, and release reservations on failed creation, close, or terminal retirement.
+- Keep `SubagentValue.name` optional when reading legacy handles while populating it in current outputs. Keep immutable IDs authoritative and retain the strict listing shape.
+- Run focused allocator/config/schema tests, then the full subagent module before proceeding.
 
 ### Task 3: Structured Runtime Lifecycle Events
 
@@ -460,19 +312,19 @@ git commit -m "feat: render the subagent agents panel"
 
 **Interfaces:**
 - Consumes: all completed behavior
-- Produces: user-facing configuration/control documentation and package version `0.1.102`
+- Produces: user-facing configuration/control documentation while retaining package version `0.1.104`
 
 - [ ] **Step 1: Update user documentation**
 
-Document the exact `[subagent].names` replacement semantics, defaults, empty list, fallback names, reservation-until-close, sibling-only uniqueness, direct-child `subagents({})` listing, observable nested Kit descendants, generic-harness limitation, foreground/background inclusion, row glyphs, footer, `Ctrl+R`, `/agents`, and responsive panel layout.
+Document random one-word naming, bounded emergency fallback, reservation-until-close, sibling-only uniqueness, direct-child `subagents({})` listing, observable nested Kit descendants, generic-harness limitation, foreground/background inclusion, row glyphs, footer, `Ctrl+R`, `/agents`, and responsive panel layout.
 
 - [ ] **Step 2: Add documentation assertions where the repository already tests help/config text**
 
-Extend existing command/config documentation tests to assert `/agents`, `Ctrl+R`, and `[subagent].names` examples remain discoverable. Avoid introducing a separate documentation harness.
+Extend existing command/config documentation tests to assert `/agents` and `Ctrl+R` remain discoverable and removed naming configuration is absent. Avoid introducing a separate documentation harness.
 
-- [ ] **Step 3: Bump the patch version**
+- [ ] **Step 3: Verify the package version**
 
-Change the root package version from `0.1.101` to `0.1.102` in `Cargo.toml` and update the root `kit` package entry in `Cargo.lock` through Cargo. Do not change dependency versions.
+Keep the root package and lockfile package version exactly `0.1.104`; dependency lock changes must not alter it.
 
 - [ ] **Step 4: Run formatting and targeted verification**
 
@@ -480,7 +332,7 @@ Run:
 
 ```bash
 cargo fmt --check
-cargo test --bin kit subagent_names -- --nocapture
+cargo test --bin kit subagent_names_are_rejected_as_unknown_configuration -- --nocapture
 cargo test --lib events::tests -- --nocapture
 cargo test --lib tools::subagent::tests -- --nocapture
 cargo test --lib acp_child::tests -- --nocapture

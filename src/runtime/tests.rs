@@ -16,22 +16,15 @@ use super::{
 };
 
 #[tokio::test]
-async fn subagent_names_survive_runtime_reconstruction_and_fresh_managers() {
+async fn subagent_manager_survives_runtime_reconstruction() {
     let root = tempfile::tempdir().unwrap();
-    let names = crate::tools::SubagentNames::resolve(Some(vec!["Acorn".into(), "Moss".into()]))
-        .expect("valid names");
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-    let runtime = Runtime::with_subagent_names(runtime, names).unwrap();
-    assert_eq!(runtime.subagents.subagent_names(), &["Acorn", "Moss"]);
-
     let runtime = Runtime::with_telemetry(runtime, Default::default()).unwrap();
-    assert_eq!(runtime.subagents.subagent_names(), &["Acorn", "Moss"]);
 
     let harnesses = crate::acp_child::AcpHarnesses::default();
     let runtime =
         Runtime::with_acp_harnesses(runtime, harnesses, crate::acp_child::BUILTIN_HARNESS.into())
             .unwrap();
-    assert_eq!(runtime.subagents.subagent_names(), &["Acorn", "Moss"]);
 
     let mcp_path = root.path().join("mcp.json");
     std::fs::write(&mcp_path, r#"{"mcpServers":{}}"#).unwrap();
@@ -44,11 +37,7 @@ async fn subagent_names_survive_runtime_reconstruction_and_fresh_managers() {
     )
     .await
     .unwrap();
-    assert_eq!(runtime.subagents.subagent_names(), &["Acorn", "Moss"]);
-    assert_eq!(
-        runtime.subagents.fresh().subagent_names(),
-        &["Acorn", "Moss"]
-    );
+    let _fresh = runtime.subagents.fresh();
 }
 
 #[test]

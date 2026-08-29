@@ -33,53 +33,13 @@ ACP v2 can list persisted sessions and report foreground session state, but its 
 
 Kit already owns authoritative parent-scoped state in `src/tools/subagent.rs::Subagents.sessions`. The TUI already receives private structured events from `src/events.rs::RuntimeEvent` and applies them in `src/tui/app.rs`. The feature will extend these existing paths.
 
-## Naming configuration
-
-The existing singular `[subagent]` configuration table gains an optional `names` list:
-
-```toml
-[subagent]
-harness = "acp.kit"
-names = [
-  "Scout",
-  "Pip",
-  "Juniper",
-  "Miso",
-  "Clover",
-  "Pixel",
-  "Pebble",
-  "Nova",
-]
-```
-
-When `names` is absent, Kit uses the compiled list shown above. When it is present, the configured list replaces the compiled defaults rather than extending them. An explicitly empty list is valid and proceeds directly to fallback assignment.
-
-Configured names are normalized by trimming surrounding whitespace, then validated. A configured name must:
-
-- be non-empty;
-- be a single line and contain no control characters;
-- be at most 32 Unicode scalar values (Rust `char` values); and
-- be unique case-insensitively after normalization.
-
-Invalid configuration fails during config loading with a message identifying the offending value or duplicate.
-
 ## Name assignment and ownership
 
-A newly created identity is assigned a name in this order:
+Kit does not expose name configuration and does not ask a model or other AI to choose names. Every new `subagent` and `fork` independently requests a one-word English name from `petname` 3.2. Kit trims and normalizes the generated word to a capitalized display label, rejects invalid, multi-word, control-character, or over-32-character candidates, and retries within a fixed bound.
 
-1. The first configured or built-in name not reserved by another live handle.
-2. The operation's optional model-suggested `fallback_name`.
-3. A generated `Agent N` name.
+Names compare case-insensitively among one parent's direct live children. A collision uses the lowest available suffix (`Name 2`, `Name 3`, and so on), shortening the base if needed to keep the label within 32 Unicode scalar values. If bounded generation cannot produce an available valid candidate, Kit uses the lowest available `Agent N` label.
 
-Pool order is deterministic. A name is reserved as soon as creation begins. If child creation fails, Kit releases the reservation. The reservation otherwise lasts through starting, working, idle, and failed-but-reusable generations and is released only when the handle is closed or terminally retired.
-
-Names compare case-insensitively for collision purposes. If a valid fallback name is occupied, Kit appends ` 2`, ` 3`, and so on, choosing the lowest available positive suffix. `Agent N` likewise uses the lowest positive integer that produces an available name, so released numbers may be reused. The base is safely shortened when necessary so the final display name remains within 32 Unicode scalar values.
-
-Name reservations and case-insensitive uniqueness apply to one parent's direct children. Independent descendant branches may reuse both child and parent names, so two rows can have an identical visible label such as `Scout · via Pip`. This ambiguity is explicitly accepted in the first version to avoid a cross-process naming coordinator; immutable IDs remain distinct internally.
-
-Model-provided fallback values are best-effort metadata and must not prevent subagent work. Kit trims surrounding whitespace, collapses repeated internal whitespace, and discards empty, multiline, control-character-containing, or otherwise invalid suggestions. A discarded or absent suggestion falls through to `Agent N`. Unicode names are supported.
-
-`prompt` reuses the handle's existing name. `fork` creates a distinct handle and receives a new name through the normal assignment order. Names are never accepted as identity selectors; `id` remains authoritative.
+The reservation is created atomically with the starting registry entry. It remains held while the handle is starting, working, idle, or reusable after a non-terminal failure. Failed initial creation, explicit close, and terminal retirement remove the registry entry and release the name. Separate parent branches may reuse visible labels because immutable `s-…` IDs remain authoritative. `prompt` preserves the source handle's name; `fork` creates a distinct identity and allocates a fresh random name.
 
 ## Lifecycle model
 
@@ -121,24 +81,15 @@ Task summaries are deterministic, bounded, single-line renderings of the operati
 
 ### `subagent`
 
-The input schema gains an optional `fallback_name` string:
-
-```json
-{
-  "prompt": "Trace the graph event flow",
-  "fallback_name": "Waffles"
-}
-```
-
-The tool description asks the parent model to provide a short whimsical fallback. Kit uses it only after the configured/default pool is exhausted. No extra model request is made.
+The existing input remains unchanged for naming: callers provide the task prompt and any supported harness/model/output-schema selection. There is no name field. Kit allocates the display name internally before child startup.
 
 ### `fork`
 
-Because `fork` creates a distinct identity, its input schema gains the same optional `fallback_name` field. The name of the source handle is preserved only on the source; the fork receives a newly allocated name.
+The existing fork input remains unchanged for naming and has no name field. The source keeps its name; the fork receives a newly allocated random name.
 
 ### `prompt`
 
-`prompt` does not accept a naming field. It retains the target handle's assigned name.
+`prompt` continues to accept the prior handle plus the next prompt and preserves the authoritative registry name. A caller-supplied informational `name` in a serialized handle never changes identity or naming.
 
 ### Returned handles
 
@@ -296,12 +247,11 @@ The optional config field and optional serialized handle field are backward-comp
 
 Focused tests will cover:
 
-1. Built-in defaults, custom replacement, and an empty pool.
-2. Whitespace normalization, invalid configured names, and case-insensitive duplicates.
-3. Atomic deterministic allocation under concurrent sibling starts.
+1. One-word petname normalization, capitalization, and length limits.
+2. Bounded retries and emergency `Agent N` fallback.
+3. Atomic case-insensitive allocation and collision suffixes under concurrent sibling starts.
 4. Release after failed creation, explicit close, and terminal retirement.
-5. Pool exhaustion, valid and invalid fallback names, collision suffixes, and length limits.
-6. Name preservation across `prompt` and fresh assignment across `fork`.
+5. Name preservation across `prompt` and fresh random assignment across `fork`.
 7. Starting, working, idle, failed-reusable, retired, and closed transitions.
 8. Current handles with names and compatibility with old handles lacking names.
 9. Deterministic enriched direct-child `subagents({})` listings.
@@ -319,7 +269,7 @@ The smallest relevant unit and TUI tests should run during development, followed
 
 ## Documentation and release
 
-Update the user documentation for subagents/configuration and the TUI to explain names, fallback behavior, `Ctrl+R` and `/agents`, lifecycle indicators, foreground/background inclusion, observable nested descendants, ancestry-scoped uniqueness, and process-tree scope.
+Update the user documentation for subagents and the TUI to explain random names, emergency fallback behavior, `Ctrl+R` and `/agents`, lifecycle indicators, foreground/background inclusion, observable nested descendants, ancestry-scoped uniqueness, and process-tree scope.
 
 This feature meaningfully changes Kit behavior and tool schemas. Under repository policy it requires a patch version bump before completion.
 

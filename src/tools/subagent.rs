@@ -13,78 +13,21 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
+const MAX_PETNAME_ATTEMPTS: usize = 32;
 
-pub const DEFAULT_SUBAGENT_NAMES: &[&str] = &[
-    "Scout", "Pip", "Juniper", "Miso", "Clover", "Pixel", "Pebble", "Nova",
-];
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubagentNames {
-    names: Arc<[String]>,
+fn allocate_name(used: &mut HashSet<String>) -> String {
+    allocate_name_with(used, || petname::petname(1, ""))
 }
 
-impl SubagentNames {
-    pub fn resolve(configured: Option<Vec<String>>) -> Result<Self, String> {
-        let values = configured.unwrap_or_else(|| {
-            DEFAULT_SUBAGENT_NAMES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect()
-        });
-        let mut names = Vec::with_capacity(values.len());
-        let mut normalized = HashSet::with_capacity(values.len());
-
-        for source in values {
-            let name = source.trim();
-            if name.is_empty() {
-                return Err(format!("subagent name {source:?} must not be empty"));
-            }
-            if name.chars().any(char::is_control) {
-                return Err(format!(
-                    "subagent name {source:?} must not contain control characters"
-                ));
-            }
-            if name.chars().count() > 32 {
-                return Err(format!(
-                    "subagent name {source:?} must be at most 32 characters"
-                ));
-            }
-            let key = name.to_lowercase();
-            if !normalized.insert(key) {
-                return Err(format!("duplicate subagent name {name:?}"));
-            }
-            names.push(name.to_string());
-        }
-
-        Ok(Self {
-            names: names.into(),
-        })
-    }
-
-    pub fn as_slice(&self) -> &[String] {
-        &self.names
-    }
-}
-
-impl Default for SubagentNames {
-    fn default() -> Self {
-        Self::resolve(None).expect("built-in subagent names are valid")
-    }
-}
-
-fn allocate_name(
-    pool: &[String],
+fn allocate_name_with(
     used: &mut HashSet<String>,
-    fallback_name: Option<&str>,
+    mut candidate: impl FnMut() -> Option<String>,
 ) -> String {
-    for name in pool {
-        if reserve_name(used, name) {
-            return name.clone();
-        }
-    }
-
-    if let Some(base) = fallback_name.and_then(normalize_fallback_name) {
-        for suffix in 1usize.. {
+    for _ in 0..MAX_PETNAME_ATTEMPTS {
+        let Some(base) = candidate().and_then(|value| normalize_petname(&value)) else {
+            continue;
+        };
+        for suffix in 1..=MAX_LIVE_SUBAGENTS + 1 {
             let name = suffixed_name(&base, suffix);
             if reserve_name(used, &name) {
                 return name;
@@ -105,12 +48,23 @@ fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
     used.insert(name.to_lowercase())
 }
 
-fn normalize_fallback_name(value: &str) -> Option<String> {
-    if value.chars().any(char::is_control) {
+fn normalize_petname(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().count() > 32
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
         return None;
     }
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!normalized.is_empty() && normalized.chars().count() <= 32).then_some(normalized)
+    let mut characters = value.chars();
+    let first = characters.next()?;
+    let normalized = first
+        .to_uppercase()
+        .chain(characters.flat_map(char::to_lowercase))
+        .collect::<String>();
+    (normalized.chars().count() <= 32).then_some(normalized)
 }
 
 fn suffixed_name(base: &str, suffix: usize) -> String {
@@ -153,7 +107,6 @@ type EventSink = Arc<dyn Fn(&events::RuntimeEvent) -> Result<(), ()> + Send + Sy
 pub struct Subagents {
     config: ChildConfig,
     max_depth: usize,
-    names: SubagentNames,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
@@ -296,14 +249,9 @@ fn turn_output(
 
 impl Subagents {
     pub(crate) fn new(config: ChildConfig, max_depth: usize) -> Self {
-        Self::with_names(config, max_depth, SubagentNames::default())
-    }
-
-    pub(crate) fn with_names(config: ChildConfig, max_depth: usize, names: SubagentNames) -> Self {
         Self {
             config,
             max_depth,
-            names,
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
             event_sink: Arc::new(|event| {
@@ -322,11 +270,7 @@ impl Subagents {
     }
 
     pub(crate) fn fresh(&self) -> Self {
-        Self::with_names(self.config.clone(), self.max_depth, self.names.clone())
-    }
-
-    pub(crate) fn names_policy(&self) -> SubagentNames {
-        self.names.clone()
+        Self::new(self.config.clone(), self.max_depth)
     }
 
     fn emit_event(&self, mut event: events::RuntimeEvent) {
@@ -358,17 +302,11 @@ impl Subagents {
     }
 
     #[cfg(test)]
-    pub(crate) fn subagent_names(&self) -> &[String] {
-        self.names.as_slice()
-    }
-
-    #[cfg(test)]
-    async fn insert_starting_for_test(&self, fallback_name: Option<&str>) -> String {
+    async fn insert_starting_for_test(&self) -> String {
         let now = events::now_millis();
         let state = self
             .insert_starting(
                 session::new_id(),
-                fallback_name,
                 State {
                     name: String::new(),
                     status: SubagentStatus::Starting,
@@ -401,7 +339,6 @@ impl Subagents {
         prompt: String,
         harness: Option<String>,
         model: Option<String>,
-        fallback_name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -424,7 +361,6 @@ impl Subagents {
         let now = events::now_millis();
         let state = self.insert_starting(
             id.clone(),
-            fallback_name.as_deref(),
             State {
                 name: String::new(),
                 status: SubagentStatus::Starting,
@@ -585,7 +521,6 @@ impl Subagents {
         &self,
         prior: SubagentValue,
         prompt: String,
-        fallback_name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -624,7 +559,6 @@ impl Subagents {
         let now = events::now_millis();
         let state = self.insert_starting(
             id.clone(),
-            fallback_name.as_deref(),
             State {
                 name: String::new(),
                 status: SubagentStatus::Starting,
@@ -828,7 +762,6 @@ impl Subagents {
     fn insert_starting(
         &self,
         id: String,
-        fallback_name: Option<&str>,
         mut state: State,
     ) -> Result<Arc<AsyncMutex<State>>, ChildError> {
         let mut sessions = self
@@ -839,7 +772,7 @@ impl Subagents {
             .values()
             .map(|entry| entry.name.to_lowercase())
             .collect::<HashSet<_>>();
-        let name = allocate_name(self.names.as_slice(), &mut used, fallback_name);
+        let name = allocate_name(&mut used);
         state.name.clone_from(&name);
         let event = state.runtime_event(id.clone());
         let state = Arc::new(AsyncMutex::new(state));
@@ -1076,7 +1009,7 @@ fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
 fn fork_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"fallback_name":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
+    continuation_schema()
 }
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
@@ -1088,7 +1021,7 @@ fn call_id_schema() -> serde_json::Value {
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. Provide a short whimsical `fallback_name`; Kit uses it only after the configured name pool is exhausted. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"fallback_name":{"type":"string","description":"A short whimsical fallback name used only after the configured name pool is exhausted."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. Kit assigns the handle a random display name. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -1107,7 +1040,7 @@ impl PromptTool {
 }
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, prompt it, and return the new session value. Provide a short whimsical `fallback_name`; Kit uses it only after the configured name pool is exhausted.", fork_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, assign the fork a fresh random display name, prompt it, and return the new session value.", fork_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl SubagentsTool {
@@ -1149,7 +1082,6 @@ struct Input {
     prompt: String,
     harness: Option<String>,
     model: Option<String>,
-    fallback_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -1166,7 +1098,6 @@ struct Continuation {
 struct ForkInput {
     subagent: SubagentValue,
     prompt: String,
-    fallback_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -1284,7 +1215,6 @@ impl Tool for SubagentTool {
                     input.prompt,
                     input.harness,
                     input.model,
-                    input.fallback_name,
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -1340,7 +1270,6 @@ impl Tool for ForkTool {
                 .fork(
                     input.subagent,
                     input.prompt,
-                    input.fallback_name,
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -1359,137 +1288,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_subagent_names_use_defaults_or_explicit_replacement() {
-        let defaults = SubagentNames::resolve(None).expect("default names");
+    fn petname_candidates_are_one_word_capitalized_and_collision_safe() {
+        let mut used = HashSet::from(["waffles".into()]);
+        let mut candidates = [Some("wAfFlEs".to_string())].into_iter();
+
         assert_eq!(
-            defaults.as_slice(),
-            DEFAULT_SUBAGENT_NAMES
-                .iter()
-                .copied()
-                .map(String::from)
-                .collect::<Vec<_>>()
-        );
-
-        let names = SubagentNames::resolve(Some(vec!["  Acorn  ".into(), "Moss".into()]))
-            .expect("valid names");
-        assert_eq!(names.as_slice(), &["Acorn", "Moss"]);
-        assert!(
-            SubagentNames::resolve(Some(Vec::new()))
-                .expect("empty pool")
-                .as_slice()
-                .is_empty()
+            allocate_name_with(&mut used, || candidates.next().flatten()),
+            "Waffles 2"
         );
     }
 
     #[test]
-    fn configured_subagent_names_reject_invalid_values() {
-        let too_long = "x".repeat(33);
-        for invalid in ["   ", "line\nbreak", "control\u{7}", too_long.as_str()] {
-            let error = SubagentNames::resolve(Some(vec![invalid.into()]))
-                .expect_err("invalid configured name must fail");
-            let identified = format!("{invalid:?}");
-            assert!(
-                error.contains(&identified),
-                "{error:?} did not identify {invalid:?}"
-            );
-        }
+    fn invalid_petname_candidates_are_bounded_before_agent_fallback() {
+        let mut used = HashSet::from(["agent 1".into()]);
+        let mut calls = 0;
+
+        let allocated = allocate_name_with(&mut used, || {
+            calls += 1;
+            Some("not one word".into())
+        });
+
+        assert_eq!(calls, MAX_PETNAME_ATTEMPTS);
+        assert_eq!(allocated, "Agent 2");
     }
 
     #[test]
-    fn configured_subagent_names_reject_case_insensitive_duplicates() {
-        let error = SubagentNames::resolve(Some(vec!["Scout".into(), "scout".into()]))
-            .expect_err("case-insensitive duplicate must fail");
-        assert!(error.contains("scout"));
-    }
-
-    #[test]
-    fn name_allocation_uses_pool_order_then_reuses_released_names() {
-        let pool = vec!["Scout".into(), "Pip".into()];
+    fn petname_allocation_retries_missing_names_and_accepts_a_valid_candidate() {
         let mut used = HashSet::new();
+        let mut candidates = [None, Some("otter".to_string())].into_iter();
 
-        assert_eq!(allocate_name(&pool, &mut used, Some("Waffles")), "Scout");
-        assert_eq!(allocate_name(&pool, &mut used, Some("Waffles")), "Pip");
-        assert_eq!(allocate_name(&pool, &mut used, Some("Waffles")), "Waffles");
-        used.remove("scout");
-        assert_eq!(allocate_name(&pool, &mut used, None), "Scout");
+        assert_eq!(
+            allocate_name_with(&mut used, || candidates.next().flatten()),
+            "Otter"
+        );
     }
 
     #[test]
-    fn name_allocation_normalizes_fallbacks_and_generates_collision_safe_names() {
-        let mut used = HashSet::from(["waffles".into(), "agent 1".into()]);
-        assert_eq!(
-            allocate_name(&[], &mut used, Some("  Waffles   McGee  ")),
-            "Waffles McGee"
-        );
-        assert_eq!(allocate_name(&[], &mut used, Some("Waffles")), "Waffles 2");
-        assert_eq!(
-            allocate_name(&[], &mut used, Some("line\nbreak")),
-            "Agent 2"
-        );
-        assert_eq!(allocate_name(&[], &mut used, Some("   ")), "Agent 3");
-    }
-
-    #[test]
-    fn name_allocation_truncates_suffixed_fallbacks_to_32_chars() {
-        let base = "🦀".repeat(32);
-        let mut used = HashSet::from([base.to_lowercase()]);
-        let allocated = allocate_name(&[], &mut used, Some(&base));
+    fn suffixes_remain_bounded_to_the_display_limit() {
+        let base = "x".repeat(32);
+        let mut used = HashSet::from([base.clone()]);
+        let mut candidates = [Some(base)].into_iter();
+        let allocated = allocate_name_with(&mut used, || candidates.next().flatten());
 
         assert_eq!(allocated.chars().count(), 32);
         assert!(allocated.ends_with(" 2"));
     }
 
-    #[test]
-    fn name_allocation_is_unique_when_siblings_allocate_concurrently() {
-        let used = Arc::new(Mutex::new(HashSet::new()));
-        let names = Arc::new(vec!["Scout".into(), "Pip".into()]);
-        let threads = (0..8)
-            .map(|_| {
-                let used = Arc::clone(&used);
-                let names = Arc::clone(&names);
-                std::thread::spawn(move || {
-                    allocate_name(&names, &mut used.lock().unwrap(), Some("Waffles"))
-                })
-            })
-            .collect::<Vec<_>>();
-        let allocated = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<HashSet<_>>();
-
-        assert_eq!(allocated.len(), 8);
-    }
-
     #[tokio::test]
     async fn manager_name_allocation_is_atomic_across_concurrent_insertions() {
         let root = tempfile::tempdir().unwrap();
-        let base = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
-        let manager = Subagents::with_names(
-            base.child_config(),
-            2,
-            SubagentNames::resolve(Some(vec!["Scout".into()])).unwrap(),
-        );
+        let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
         let starts = (0..8)
             .map(|_| {
                 let manager = manager.clone();
-                tokio::spawn(async move { manager.insert_starting_for_test(Some("Waffles")).await })
+                tokio::spawn(async move { manager.insert_starting_for_test().await })
             })
             .collect::<Vec<_>>();
         let mut allocated = HashSet::new();
         for start in starts {
-            allocated.insert(start.await.unwrap());
+            allocated.insert(start.await.unwrap().to_lowercase());
         }
 
         assert_eq!(allocated.len(), 8);
-        assert!(allocated.contains("Scout"));
-        assert!(allocated.contains("Waffles"));
-        assert!(allocated.contains("Waffles 2"));
         assert_eq!(manager.sessions.lock().unwrap().len(), 8);
-    }
-
-    #[test]
-    fn name_allocation_uses_generated_names_for_an_explicit_empty_pool() {
-        assert_eq!(allocate_name(&[], &mut HashSet::new(), None), "Agent 1");
     }
 
     #[test]
@@ -1543,29 +1404,22 @@ mod tests {
     }
 
     #[test]
-    fn fallback_name_is_accepted_only_for_subagent_and_fork_inputs() {
-        let input = serde_json::from_value::<Input>(json!({
-            "prompt": "work", "fallback_name": "Waffles"
-        }))
-        .expect("subagent accepts fallback_name");
-        assert_eq!(input.fallback_name.as_deref(), Some("Waffles"));
-
-        let fork = serde_json::from_value::<ForkInput>(json!({
-            "subagent": {"id": "s", "output": null, "generation": 1},
-            "prompt": "fork work",
-            "fallback_name": "Mochi"
-        }))
-        .expect("fork accepts fallback_name");
-        assert_eq!(fork.fallback_name.as_deref(), Some("Mochi"));
-
+    fn model_inputs_cannot_supply_subagent_names() {
         assert!(
-            serde_json::from_value::<Continuation>(json!({
-                "subagent": {"id": "s", "output": null, "generation": 1},
-                "prompt": "continue",
-                "fallback_name": "not allowed"
+            serde_json::from_value::<Input>(json!({
+                "prompt": "work", "name": "Waffles"
             }))
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<ForkInput>(json!({
+                "subagent": {"id": "s", "output": null, "generation": 1},
+                "prompt": "fork work",
+                "name": "Mochi"
+            }))
+            .is_err()
+        );
+        assert!(fork_schema()["properties"].get("name").is_none());
     }
 
     #[test]
@@ -1795,7 +1649,6 @@ mod tests {
                 "base".into(),
                 None,
                 None,
-                None,
                 0,
                 TurnCancellation::default(),
                 None,
@@ -1980,7 +1833,7 @@ mod tests {
             config.parent_name = Some("偵察 🦀".into());
             let manager = Subagents::new(config, 2);
 
-            manager.insert_starting_for_test(None).await;
+            manager.insert_starting_for_test().await;
 
             assert!(matches!(
                 manager.runtime_events_for_test().as_slice(),
@@ -1999,7 +1852,6 @@ mod tests {
             let handle = manager
                 .create(
                     "base task".into(),
-                    None,
                     None,
                     None,
                     0,
@@ -2070,7 +1922,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(generations, vec![1, 1, 1, 2, 2, 3, 3, 3]);
             assert!(
-                matches!(emitted.last(), Some(events::RuntimeEvent::SubagentStateChanged { id, name, status: SubagentStatus::Removed, generation_finished_at_unix_ms: Some(_), .. }) if id.as_str() == handle.id.as_str() && name == "Scout")
+                matches!(emitted.last(), Some(events::RuntimeEvent::SubagentStateChanged { id, name, status: SubagentStatus::Removed, generation_finished_at_unix_ms: Some(_), .. }) if id.as_str() == handle.id.as_str() && Some(name.as_str()) == handle.name.as_deref())
             );
         }
 
@@ -2090,7 +1942,6 @@ mod tests {
             let handle = manager
                 .create(
                     "create".into(),
-                    None,
                     None,
                     None,
                     0,
@@ -2130,7 +1981,7 @@ mod tests {
                     state.generation_finished_at_unix_ms = None;
                 }
 
-                assert_eq!(manager.insert_starting_for_test(None).await, "Scout");
+                manager.insert_starting_for_test().await;
                 let removed = manager
                     .runtime_events_for_test()
                     .into_iter()
@@ -2155,7 +2006,6 @@ mod tests {
             let handle = manager
                 .create(
                     "finish before exiting".into(),
-                    None,
                     None,
                     None,
                     0,
@@ -2197,7 +2047,7 @@ mod tests {
                     .count(),
                 1
             );
-            assert_eq!(manager.insert_starting_for_test(None).await, "Scout");
+            manager.insert_starting_for_test().await;
         }
 
         #[tokio::test]
@@ -2208,7 +2058,6 @@ mod tests {
                 failed
                     .create(
                         "create".into(),
-                        None,
                         None,
                         None,
                         0,
@@ -2253,7 +2102,6 @@ mod tests {
                     "create".into(),
                     None,
                     None,
-                    None,
                     0,
                     TurnCancellation::default(),
                     None,
@@ -2276,7 +2124,6 @@ mod tests {
                 "source".into(),
                 None,
                 None,
-                None,
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2285,14 +2132,7 @@ mod tests {
             .unwrap();
         assert!(
             failed_fork
-                .fork(
-                    source,
-                    "fork".into(),
-                    None,
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
+                .fork(source, "fork".into(), 0, TurnCancellation::default(), None,)
                 .await
                 .is_err()
         );
@@ -2351,7 +2191,6 @@ mod tests {
                 "base".into(),
                 None,
                 None,
-                None,
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2378,12 +2217,13 @@ mod tests {
         assert!(state.generation_finished_at_unix_ms.is_some());
         drop(state);
 
+        let original_name = handle.name.clone();
         let retried = manager
             .prompt(handle, "retry".into(), TurnCancellation::default(), None)
             .await
             .expect("failed reusable generation does not stale the last handle");
         assert_eq!(retried.generation, 3);
-        assert_eq!(retried.name.as_deref(), Some("Scout"));
+        assert_eq!(retried.name, original_name);
     }
 
     #[tokio::test]
@@ -2448,7 +2288,6 @@ mod tests {
                     "first prompt".into(),
                     None,
                     None,
-                    None,
                     0,
                     TurnCancellation::default(),
                     None,
@@ -2472,16 +2311,16 @@ mod tests {
         })
         .await
         .expect("starting subagent was not registered");
-        assert_eq!(listing.name, "Scout");
+        let allocated_name = listing.name.clone();
         assert_eq!(listing.status, SubagentStatus::Starting);
         assert_eq!(listing.generation, 1);
         assert_eq!(listing.task, "first prompt");
 
         let completed = create.await.unwrap().unwrap();
-        assert_eq!(completed.name.as_deref(), Some("Scout"));
+        assert_eq!(completed.name.as_deref(), Some(allocated_name.as_str()));
         let listings = manager.list(&TurnCancellation::default()).await.unwrap();
         assert_eq!(listings[0].id, completed.id);
-        assert_eq!(listings[0].name, "Scout");
+        assert_eq!(listings[0].name, allocated_name);
         assert_eq!(listings[0].status, SubagentStatus::Idle);
         assert_eq!(listings[0].generation, 1);
         assert_eq!(listings[0].task, "first prompt");
@@ -2489,7 +2328,7 @@ mod tests {
             serde_json::to_value(&listings[0]).unwrap(),
             json!({
                 "id": completed.id,
-                "name": "Scout",
+                "name": allocated_name.clone(),
                 "status": "idle",
                 "generation": 1,
                 "task": "first prompt"
@@ -2521,10 +2360,42 @@ mod tests {
         .await
         .expect("working continuation was not listable");
         let continued = continued.await.unwrap().unwrap();
-        assert_eq!(continued.name.as_deref(), Some("Scout"));
+        assert_eq!(continued.name.as_deref(), Some(allocated_name.as_str()));
         let listing = manager.list(&TurnCancellation::default()).await.unwrap();
         assert_eq!(listing[0].generation, 2);
         assert_eq!(listing[0].task, "second prompt");
+    }
+
+    #[tokio::test]
+    async fn fork_allocates_a_fresh_random_name() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager_with_generic_harness(root.path(), Vec::new());
+        let source = manager
+            .create(
+                "source".into(),
+                None,
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let source_name = source.name.clone();
+
+        let fork = manager
+            .fork(
+                source,
+                "branch".into(),
+                0,
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(fork.name.is_some());
+        assert_ne!(fork.name, source_name);
     }
 
     #[tokio::test]
@@ -2562,7 +2433,6 @@ mod tests {
                 "base".into(),
                 None,
                 None,
-                None,
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2571,14 +2441,7 @@ mod tests {
             .unwrap();
 
         let error = manager
-            .fork(
-                prior,
-                "branch".into(),
-                None,
-                0,
-                TurnCancellation::default(),
-                None,
-            )
+            .fork(prior, "branch".into(), 0, TurnCancellation::default(), None)
             .await
             .unwrap_err();
 
