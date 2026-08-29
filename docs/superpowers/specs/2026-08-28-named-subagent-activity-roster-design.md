@@ -25,7 +25,6 @@ The feature is backed by each Kit process's in-process subagent registry and rec
 - Restoring live child processes after Kit restarts.
 - Replacing immutable subagent IDs with display names in tool inputs.
 - Enforcing display-name uniqueness across separate descendant branches.
-- Changing the existing runtime graph's contents or `Ctrl+G` behavior.
 
 ## Background and constraints
 
@@ -120,7 +119,7 @@ Because handles can appear in persisted transcripts, the deserializer and JSON S
     "name": "Scout",
     "status": "working",
     "generation": 2,
-    "task": "Trace the graph event flow"
+    "task": "Trace the runtime event flow"
   },
   {
     "id": "s-…",
@@ -170,20 +169,18 @@ The ACP-facing transcript is not extended with a pretend portable child-session 
 
 ## TUI Agents panel
 
-The roster is a dedicated always-expanded tree panel, independent from the existing graph.
+The roster is a dedicated always-expanded tree panel.
 
 ### Visibility and layout
 
 - `Ctrl+R` toggles the Agents panel.
 - `/agents` performs the same toggle and makes the feature discoverable through local command help.
-- `Ctrl+G` and the graph remain unchanged.
-- The transcript, graph, and Agents panel retain independent visibility and scroll state.
-- Graph and Agents each use the existing 46-column side-panel width.
-- With exactly one side panel visible, widths at or above the existing 108-column breakpoint render transcript then side panel horizontally. Below 108 columns, they render top-to-bottom as transcript then side panel using the existing 55/45 percent split.
-- With both side panels visible, widths at or above 154 columns render three full-height columns in this order: transcript, graph, Agents. The two side panels are 46 columns each and the transcript receives the remainder.
-- With both side panels visible below 154 columns, the body renders vertically in this order: transcript, graph, Agents, using a 40/30/30 percent height split. The outer TUI already guarantees the body area; each panel preserves its border and handles zero-width or zero-height inner content with the existing saturating layout conventions.
+- The Agents panel retains independent visibility and scroll state.
+- When Agents is hidden, the transcript uses the full main area.
+- At widths of at least 108 columns, the transcript and fixed 46-column Agents panel render side by side.
+- At widths of at most 107 columns, the transcript and Agents panel stack top-to-bottom using a 55/45 percent height split. The outer TUI already guarantees the body area; the panel preserves its border and handles zero-width or zero-height inner content with the existing saturating layout conventions.
 
-The Agents panel is global to the current top-level process tree. Its contents do not depend on the focused transcript block, foreground tool call, or graph selection. Mouse-wheel scrolling over the panel changes only its own offset. Active rows sort before idle rows; starting sorts before working, and each status group uses creation time then immutable ID for deterministic ordering.
+The Agents panel is global to the current top-level process tree. Its contents do not depend on the focused transcript block or foreground tool call. Mouse-wheel scrolling over the panel changes only its own offset. Active rows sort before idle rows; starting sorts before working, and each status group uses creation time then immutable ID for deterministic ordering.
 
 ### Rows
 
@@ -261,7 +258,7 @@ Focused tests will cover:
 11. Top-level deduplication by immutable ID and strict-descendant cleanup after child or forwarding exit.
 12. Duplicate visible labels across independently allocating branches remain separate internal rows.
 13. Reusable and terminal failure glyph grace, row retention, and footer accounting.
-14. `Ctrl+R` and `/agents` toggling without changing `Ctrl+G`.
+14. `Ctrl+R` and `/agents` toggling.
 15. Two-column, three-column, and exact 40/30/30 narrow vertical layouts.
 16. Two-line rows, palette A indicators, right-justified duration, truncation, sorting, scrolling, and aggregate footer counts.
 17. Documentation and relevant schema/snapshot expectations, including the absence of naming configuration or tool inputs.

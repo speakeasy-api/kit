@@ -4,7 +4,7 @@
 
 **Goal:** Give every Kit subagent a stable friendly name and show all observable foreground, background, and nested descendants in a dedicated always-expanded tree TUI Agents panel.
 
-**Architecture:** Keep direct-child truth in `Subagents.sessions`, emit structured process-safe lifecycle events, and recursively forward child Kit events to a top-level TUI reducer keyed by immutable agent ID. Render that reducer in an independently toggled 46-column panel without changing the existing graph.
+**Architecture:** Keep direct-child truth in `Subagents.sessions`, emit structured process-safe lifecycle events, and recursively forward child Kit events to a top-level TUI reducer keyed by immutable agent ID. Render that reducer in an independently toggled 46-column panel while preserving current-main transcript and tool rendering.
 
 **Tech Stack:** Rust, Tokio, Serde/JSON, Ratatui, Crossterm, TOML configuration, ACP child-process transport.
 
@@ -19,8 +19,8 @@
 - Name uniqueness is case-insensitive only among one parent's direct children.
 - Runtime event timestamps are Unix epoch milliseconds.
 - Event delivery remains observational and cannot fail subagent work.
-- `Ctrl+G` and the existing graph remain unchanged; `Ctrl+R` and `/agents` toggle the new panel.
-- Wide three-panel layout begins at 154 columns; narrow three-panel layout is transcript/graph/Agents at 40/30/30 percent.
+- `Ctrl+R` and `/agents` toggle the new panel.
+- Agents hidden uses the full main transcript area; visible Agents stacks at widths through 107 and uses a fixed 46-column side panel from width 108.
 - Keep the package version exactly `0.1.109` for this unreleased revision, including after dependency lock changes.
 
 ---
@@ -203,7 +203,7 @@ Store rows in `HashMap<String, AgentRow>`, retain failed removed tombstones sepa
 
 - [ ] **Step 4: Write failing command and keyboard tests**
 
-Assert `/agents` parses only as an exact local token, is recognized by highlighting, toggles without sending a prompt, and `Ctrl+R` toggles the same state. Assert `Ctrl+A` still moves the editor cursor and `Ctrl+G` still only controls graph visibility.
+Assert `/agents` parses only as an exact local token, is recognized by highlighting, toggles without sending a prompt, and `Ctrl+R` toggles the same state. Assert `Ctrl+A` still moves the editor cursor.
 
 - [ ] **Step 5: Run command/input tests and confirm failure**
 
@@ -213,11 +213,11 @@ Expected: FAIL because `/agents`, `Parsed::Agents`, and the key binding do not e
 
 - [ ] **Step 6: Implement command and input behavior**
 
-Add `Kind::Agents`/`Parsed::Agents`, register `/agents`, handle it beside other local commands, and add `KeyCode::Char('r') if control` after editor movement bindings. Do not alter `Ctrl+A` or `Ctrl+G`.
+Add `Kind::Agents`/`Parsed::Agents`, register `/agents`, handle it beside other local commands, and add `KeyCode::Char('r') if control` after editor movement bindings. Do not alter `Ctrl+A`.
 
 - [ ] **Step 7: Route mouse scrolling by panel bounds**
 
-Record the last rendered Agents rectangle in App. When a wheel event falls inside it, update only roster offset and consume the event; otherwise preserve transcript/graph behavior. Add boundary and saturation tests.
+Record the last rendered Agents rectangle in App. When a wheel event falls inside it, update only roster offset and consume the event; otherwise preserve transcript behavior. Add boundary and saturation tests.
 
 - [ ] **Step 8: Run TUI state tests**
 
@@ -244,7 +244,7 @@ git commit -m "feat: track agents in the TUI"
 - Consumes: sorted roster rows/counts/scroll offset from Task 5
 - Produces: `draw_agents(frame, app, area)`
 - Produces: two-line row formatter with reserved right-aligned duration column
-- Produces: exact transcript/graph/Agents responsive rectangles
+- Produces: exact transcript/Agents responsive rectangles
 
 - [ ] **Step 1: Write failing row-format tests**
 
@@ -272,27 +272,25 @@ Draw a bordered `AGENTS` panel, reserve two lines per visible row plus one fixed
 
 Assert exact rectangles at representative widths:
 
-- 107 columns, one side panel: vertical 55/45.
-- 108 columns, one side panel: transcript + 46-column side panel.
-- 153 columns, both panels: vertical transcript/graph/Agents at 40/30/30.
-- 154 columns, both panels: transcript remainder + 46-column graph + 46-column Agents.
-- Graph hidden/Agents shown and Graph shown/Agents hidden each retain the one-panel behavior.
+- Agents hidden: transcript uses the full main area.
+- 107 columns with Agents visible: vertical 55/45.
+- 108 columns with Agents visible: transcript + fixed 46-column Agents panel.
 
 - [ ] **Step 5: Run layout tests and confirm failure**
 
 Run: `cargo test --lib tui::ui::tests::agents_layout -- --nocapture`
 
-Expected: FAIL because `draw_body` only handles graph visibility.
+Expected: FAIL because `draw_body` does not handle Agents visibility.
 
-- [ ] **Step 6: Implement all four visibility combinations**
+- [ ] **Step 6: Implement the two Agents visibility layouts**
 
-Refactor `draw_body` around `(app.show_graph(), app.show_agents())`. Keep `SIDE_BY_SIDE_WIDTH = 108`, `GRAPH_WIDTH = 46`, add `AGENTS_WIDTH = 46` and `THREE_COLUMN_WIDTH = 154`, and use the exact ordering and percentages from the spec. Record Agents bounds for mouse routing.
+Refactor `draw_body` around `app.show_agents()`. Keep `SIDE_BY_SIDE_WIDTH = 108`, add `AGENTS_WIDTH = 46`, draw the transcript exactly once, and optionally draw Agents in the exact rectangle from the spec. Record Agents bounds for mouse routing.
 
 - [ ] **Step 7: Run TUI rendering tests**
 
 Run: `cargo fmt --check && cargo test --lib tui::ui::tests -- --nocapture && cargo test --lib tui::app::tests::agents -- --nocapture`
 
-Expected: PASS with existing graph snapshots/assertions unchanged except deliberate body-layout cases.
+Expected: PASS with current-main transcript and tool rendering unchanged except deliberate Agents body-layout cases.
 
 - [ ] **Step 8: Commit**
 
