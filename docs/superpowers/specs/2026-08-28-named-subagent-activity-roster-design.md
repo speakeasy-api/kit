@@ -2,7 +2,7 @@
 
 ## Summary
 
-Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated always-expanded tree TUI Agents panel. Kit randomly selects each new handle's one-word display name from a curated built-in catalog of exactly 350 whimsical names; callers and configuration do not supply names. The existing immutable `s-…` ID remains authoritative.
+Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated always-expanded tree TUI Agents panel. Kit generates each new handle's display name as an English first name with the Rust `fake` crate; callers and configuration do not supply names. The existing immutable `s-…` ID remains authoritative.
 
 The feature is backed by each Kit process's in-process subagent registry and recursively forwarded private runtime events. It does not claim that ACP provides portable parent/child session enumeration.
 
@@ -35,11 +35,11 @@ Kit already owns authoritative parent-scoped state in `src/tools/subagent.rs::Su
 
 ## Name assignment and ownership
 
-Kit does not expose name configuration and does not ask a model or other AI to choose names. Every new `subagent` and `fork` independently selects a name at random from a compile-time built-in catalog of exactly 350 reviewed, whimsical codenames spanning cosmic, botanical, food, music, craft, weather, and playful themes. Every catalog entry is an ASCII alphabetic word of 1–16 characters and is unique case-insensitively.
+Kit does not expose name configuration and does not ask a model or other AI to choose names. Every new `subagent` and `fork` independently generates an English first name with the Rust `fake` crate. Kit trims the candidate and accepts only 1–32 ASCII alphabetic characters as a safe display name.
 
-Names compare case-insensitively among one parent's direct live children. A collision uses the lowest available suffix (`Name 2`, `Name 3`, and so on), shortening the base if needed to keep the label within 32 Unicode scalar values. If bounded generation cannot produce an available valid candidate, Kit uses the lowest available `Agent N` label.
+Names compare case-insensitively among one parent's direct live children. An invalid candidate or clash is rerolled, with exactly 64 bounded attempts. A normal faker allocation is used without a numeric suffix. If all 64 attempts fail, Kit uses the lowest available `Agent N` label.
 
-The reservation is created atomically with the starting registry entry. It remains held while the handle is starting, working, idle, or reusable after a non-terminal failure. Failed initial creation, explicit close, and terminal retirement remove the registry entry and release the name. Separate parent branches may reuse visible labels because immutable `s-…` IDs remain authoritative. `prompt` preserves the source handle's name; `fork` creates a distinct identity and allocates a fresh random name.
+The reservation is created atomically with the starting registry entry. It remains held while the handle is starting, working, idle, or reusable after a non-terminal failure. Failed initial creation, explicit close, and terminal retirement remove the registry entry and release the name. Nested Kit processes allocate independently, so separate descendant branches can produce the same visible first name; immutable `s-…` IDs remain authoritative. `prompt` preserves the source handle's name; `fork` creates a distinct identity and performs a fresh allocation.
 
 ## Lifecycle model
 
@@ -235,7 +235,7 @@ The optional serialized handle field is a backward-compatible schema addition. I
 
 ## Error handling
 
-- Random catalog selection is retried within a fixed bound if entropy is unavailable or a selected base cannot be used.
+- Faker candidates are retried for exactly 64 attempts when invalid or already reserved case-insensitively.
 - Exhausted random retries fall through to the lowest available `Agent N`; naming never blocks useful work.
 - A failed initial child creation removes its registry entry and releases its name and capacity.
 - A failed reusable generation records the failed operation and returns the identity to idle.
@@ -270,7 +270,7 @@ The smallest relevant unit and TUI tests should run during development, followed
 
 ## Documentation and release
 
-Update the user documentation for subagents and the TUI to explain random names, emergency fallback behavior, `Ctrl+R` and `/agents`, lifecycle indicators, foreground/background inclusion, observable nested descendants, ancestry-scoped uniqueness, and process-tree scope.
+Update the user documentation for subagents and the TUI to explain faker first names, emergency fallback behavior, `Ctrl+R` and `/agents`, lifecycle indicators, foreground/background inclusion, observable nested descendants, direct-child uniqueness, and independent nested-process allocation.
 
 This feature meaningfully changes Kit behavior and tool schemas. Under repository policy it requires a patch version bump before completion.
 

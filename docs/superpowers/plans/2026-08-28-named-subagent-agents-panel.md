@@ -15,7 +15,7 @@
 - Invoke `updating-artifact-schema` before changing `[subagent]` config or serialized `SubagentValue` handles.
 - Reject removed name configuration while preserving old serialized handles that omit `name`; current outputs always populate `name`.
 - Keep immutable `s-…` IDs authoritative; display names never select handles.
-- Randomly allocate one-word names from a curated built-in catalog of exactly 350 reviewed entries; model inputs never provide names.
+- Generate English first names with `fake` using no default features; model inputs never provide names.
 - Name uniqueness is case-insensitive only among one parent's direct children.
 - Runtime event timestamps are Unix epoch milliseconds.
 - Event delivery remains observational and cannot fail subagent work.
@@ -37,7 +37,7 @@
 - `src/tui/ui.rs`: render the two-line always-expanded tree panel, footer, spinner palette, and responsive layouts.
 - `docs/user/subagents-and-acp-harnesses.md`: document random naming, emergency fallback, and observable descendants.
 - `docs/user/tui-and-sessions.md`: document the Agents panel, controls, states, and layout.
-- `Cargo.toml`, `Cargo.lock`: patch version bump.
+- `Cargo.toml`, `Cargo.lock`: add the minimal faker dependency while keeping the unreleased package version at `0.1.109`.
 
 ---
 
@@ -46,9 +46,9 @@
 **Files:** `Cargo.toml`, `Cargo.lock`, `src/tools/subagent.rs`, `src/runtime.rs`, `src/main.rs`, and focused tests.
 
 - Inventory all name configuration, allocator, request-schema, serialized-handle, and lifecycle readers/writers before editing.
-- Add RED tests proving `[subagent].names` is unknown configuration, model inputs reject naming fields, the catalog contains exactly 350 ASCII alphabetic 1–16 character entries that are case-insensitively unique, random selection works, collisions use case-insensitive numeric suffixes, retries are bounded, and `Agent N` is the emergency fallback.
-- Store exactly 350 reviewed names in a dedicated one-name-per-line resource, include it at compile time, and select randomly with the already-direct `getrandom` dependency; add no naming dependency or CLI feature baggage.
-- Allocate atomically while inserting the starting registry entry. Preserve names on `prompt`, allocate a fresh name on `fork`, and release reservations on failed creation, close, or terminal retirement.
+- Add RED tests for injected candidates covering first-choice allocation, normalization, invalid-candidate rerolls, case-insensitive single and multiple clashes, exactly 64 failed attempts before the lowest `Agent N` fallback, release/reuse, and atomic concurrent insertion. Keep a small real-faker smoke test that validates shape without fixing a random value.
+- Add the Rust `fake` crate with default features disabled and generate English `FirstName` values. Trim and accept only safe 1–32 character ASCII alphabetic display names; reroll invalid values and clashes rather than adding numeric suffixes.
+- Allocate atomically while inserting the starting registry entry. Preserve names on `prompt`, perform a fresh allocation on `fork`, and release reservations on failed creation, close, or terminal retirement. Nested Kit processes remain independent, so duplicates across descendant branches are possible.
 - Keep `SubagentValue.name` optional when reading legacy handles while populating it in current outputs. Keep immutable IDs authoritative and retain the strict listing shape.
 - Run focused allocator/config/schema tests, then the full subagent module before proceeding.
 
