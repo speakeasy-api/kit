@@ -693,7 +693,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         app.note(format!("session {requested_id} is already active"));
                                         continue;
                                     };
-                                    if let Err(error) = crate::session::load(&root, &requested_id) {
+                                    // Session switching has no `--force` flag. Reclaim only a
+                                    // lock that the OS proves no live Kit process still holds.
+                                    if let Err(error) = crate::session::load(&root, &requested_id)
+                                        .and_then(|_| {
+                                            crate::session::remove_stale_lock(&root, &requested_id)
+                                        })
+                                    {
                                         app.note(format!("could not resume session: {error}"));
                                         continue;
                                     }
