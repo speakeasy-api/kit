@@ -8,36 +8,40 @@ use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use fake::{Fake, faker::name::en::FirstName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
-const MAX_RANDOM_NAME_ATTEMPTS: usize = 64;
-
-type NameGenerator = Arc<dyn Fn() -> String + Send + Sync>;
-
-fn faker_first_name() -> String {
-    FirstName().fake()
-}
+const MAX_DISPLAY_NAME_LEN: usize = 32;
 
 fn normalize_display_name(candidate: &str) -> Option<String> {
     let name = candidate.trim();
-    if (1..=32).contains(&name.len()) && name.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+    if (1..=MAX_DISPLAY_NAME_LEN).contains(&name.len())
+        && name.is_ascii()
+        && name.bytes().all(|byte| !byte.is_ascii_control())
+    {
         Some(name.to_string())
     } else {
         None
     }
 }
 
-fn allocate_name_with(used: &mut HashSet<String>, mut generate: impl FnMut() -> String) -> String {
-    for _ in 0..MAX_RANDOM_NAME_ATTEMPTS {
-        let Some(name) = normalize_display_name(&generate()) else {
-            continue;
-        };
+fn allocate_display_name(used: &mut HashSet<String>, preferred: Option<&str>) -> String {
+    if let Some(name) = preferred.and_then(normalize_display_name) {
         if reserve_name(used, &name) {
             return name;
+        }
+        for number in 2usize.. {
+            let suffix = format!(" {number}");
+            let Some(max_base_len) = MAX_DISPLAY_NAME_LEN.checked_sub(suffix.len()) else {
+                break;
+            };
+            let base = name[..name.len().min(max_base_len)].trim_end();
+            let candidate = format!("{base}{suffix}");
+            if reserve_name(used, &candidate) {
+                return candidate;
+            }
         }
     }
 
@@ -51,7 +55,7 @@ fn allocate_name_with(used: &mut HashSet<String>, mut generate: impl FnMut() -> 
 }
 
 fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
-    used.insert(name.to_lowercase())
+    used.insert(name.to_ascii_lowercase())
 }
 
 fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
@@ -88,7 +92,6 @@ pub struct Subagents {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
-    name_generator: NameGenerator,
     #[cfg(test)]
     failed_removals: Arc<Mutex<Vec<FailedRemoval>>>,
     #[cfg(test)]
@@ -226,6 +229,13 @@ fn turn_output(
     (value, updates)
 }
 
+#[derive(Default)]
+struct CreateOptions {
+    name: Option<String>,
+    harness: Option<String>,
+    model: Option<String>,
+}
+
 impl Subagents {
     pub(crate) fn new(config: ChildConfig, max_depth: usize) -> Self {
         Self {
@@ -237,7 +247,6 @@ impl Subagents {
                 events::emit(event);
                 Ok(())
             }),
-            name_generator: Arc::new(faker_first_name),
             #[cfg(test)]
             failed_removals: Arc::default(),
             #[cfg(test)]
@@ -282,15 +291,6 @@ impl Subagents {
     }
 
     #[cfg(test)]
-    fn with_name_generator_for_test(
-        mut self,
-        generate: impl Fn() -> String + Send + Sync + 'static,
-    ) -> Self {
-        self.name_generator = Arc::new(generate);
-        self
-    }
-
-    #[cfg(test)]
     async fn insert_starting_for_test(&self) -> String {
         let now = events::now_millis();
         let state = self
@@ -326,8 +326,7 @@ impl Subagents {
     async fn create(
         &self,
         prompt: String,
-        harness: Option<String>,
-        model: Option<String>,
+        options: CreateOptions,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -335,6 +334,11 @@ impl Subagents {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
         let id = session::new_id();
+        let CreateOptions {
+            name,
+            harness,
+            model,
+        } = options;
         let harness = harness.unwrap_or_else(|| self.config.default_harness.clone());
         if !self.config.harnesses.contains(&harness) {
             return Err(ChildError::Failed(format!(
@@ -351,7 +355,7 @@ impl Subagents {
         let state = self.insert_starting(
             id.clone(),
             State {
-                name: String::new(),
+                name: name.unwrap_or_default(),
                 status: SubagentStatus::Starting,
                 task: task_summary(&prompt),
                 generation: 1,
@@ -510,6 +514,7 @@ impl Subagents {
         &self,
         prior: SubagentValue,
         prompt: String,
+        name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
@@ -549,7 +554,7 @@ impl Subagents {
         let state = self.insert_starting(
             id.clone(),
             State {
-                name: String::new(),
+                name: name.unwrap_or_default(),
                 status: SubagentStatus::Starting,
                 task: task_summary(&prompt),
                 generation,
@@ -761,7 +766,8 @@ impl Subagents {
             .values()
             .map(|entry| entry.name.to_lowercase())
             .collect::<HashSet<_>>();
-        let name = allocate_name_with(&mut used, || (self.name_generator)());
+        let preferred = std::mem::take(&mut state.name);
+        let name = allocate_display_name(&mut used, Some(&preferred));
         state.name.clone_from(&name);
         let event = state.runtime_event(id.clone());
         let state = Arc::new(AsyncMutex::new(state));
@@ -998,6 +1004,9 @@ fn listing_schema() -> serde_json::Value {
 fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
+fn display_name_schema() -> serde_json::Value {
+    json!({"type":"string","maxLength":MAX_DISPLAY_NAME_LEN,"description":"Prefer a concise role-oriented display name based on the task, such as `Round 2 Implementer` or `Reviewer`. Kit falls back to `Agent N` when omitted or invalid."})
+}
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
 }
@@ -1008,7 +1017,7 @@ fn call_id_schema() -> serde_json::Value {
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, prompt it, and return its reusable session value. Kit assigns the handle a random display name. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"name":display_name_schema(),"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -1027,7 +1036,7 @@ impl PromptTool {
 }
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, assign the fork a fresh random display name, prompt it, and return the new session value.", continuation_schema()).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, preferably assign the fork a concise role-oriented display name, prompt it, and return the new session value.", json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"name":display_name_schema(),"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl SubagentsTool {
@@ -1067,6 +1076,7 @@ impl CloseTool {
 #[serde(deny_unknown_fields)]
 struct Input {
     prompt: String,
+    name: Option<String>,
     harness: Option<String>,
     model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
@@ -1085,6 +1095,7 @@ struct Continuation {
 struct ForkInput {
     subagent: SubagentValue,
     prompt: String,
+    name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -1200,8 +1211,11 @@ impl Tool for SubagentTool {
             self.manager
                 .create(
                     input.prompt,
-                    input.harness,
-                    input.model,
+                    CreateOptions {
+                        name: input.name,
+                        harness: input.harness,
+                        model: input.model,
+                    },
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -1257,6 +1271,7 @@ impl Tool for ForkTool {
                 .fork(
                     input.subagent,
                     input.prompt,
+                    input.name,
                     self.depth,
                     cancellation(context),
                     contract.as_ref(),
@@ -1275,85 +1290,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn faker_allocator_uses_the_first_valid_available_candidate_without_a_suffix() {
+    fn preferred_name_is_trimmed_and_reserved() {
         let mut used = HashSet::new();
-        let mut candidates = ["  Ada  "].into_iter();
 
         assert_eq!(
-            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
-            "Ada"
+            allocate_display_name(&mut used, Some("  Round 2 Implementer  ")),
+            "Round 2 Implementer"
+        );
+        assert!(used.contains("round 2 implementer"));
+    }
+
+    #[test]
+    fn preferred_name_collisions_receive_case_insensitive_numeric_suffixes() {
+        let mut used = HashSet::from(["round 2 reviewer".into(), "round 2 reviewer 2".into()]);
+
+        assert_eq!(
+            allocate_display_name(&mut used, Some("Round 2 Reviewer")),
+            "Round 2 Reviewer 3"
         );
     }
 
     #[test]
-    fn faker_allocator_rerolls_case_insensitive_clashes() {
-        let mut used = HashSet::from(["ada".into()]);
-        let mut candidates = ["aDa", "Grace"].into_iter();
+    fn collision_suffix_keeps_name_within_32_bytes() {
+        let base = "A1234567890123456789012345678901";
+        let mut used = HashSet::from([base.to_lowercase()]);
 
-        assert_eq!(
-            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
-            "Grace"
-        );
+        let allocated = allocate_display_name(&mut used, Some(base));
+
+        assert_eq!(allocated, "A12345678901234567890123456789 2");
+        assert_eq!(allocated.len(), 32);
     }
 
     #[test]
-    fn faker_allocator_rerolls_multiple_clashes() {
-        let mut used = HashSet::from(["ada".into(), "grace".into()]);
-        let mut candidates = ["Ada", "GRACE", "Linus"].into_iter();
-
-        assert_eq!(
-            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
-            "Linus"
-        );
-    }
-
-    #[test]
-    fn faker_allocator_rerolls_invalid_candidates() {
-        let mut used = HashSet::new();
-        let mut candidates = ["Agent 7", "Grace"].into_iter();
-
-        assert_eq!(
-            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
-            "Grace"
-        );
-    }
-
-    #[test]
-    fn exactly_64_failed_faker_attempts_use_the_lowest_agent_fallback() {
-        let mut used = HashSet::from(["agent 1".into()]);
-        let mut calls = 0;
-
-        let allocated = allocate_name_with(&mut used, || {
-            calls += 1;
-            "Agent 7".into()
-        });
-
-        assert_eq!(calls, MAX_RANDOM_NAME_ATTEMPTS);
-        assert_eq!(allocated, "Agent 2");
+    fn missing_or_invalid_preferred_name_uses_lowest_available_agent_fallback() {
+        for candidate in [None, Some(""), Some("bad\nname"), Some("évaluator")] {
+            let mut used = HashSet::from(["agent 1".into()]);
+            assert_eq!(allocate_display_name(&mut used, candidate), "Agent 2");
+        }
     }
 
     #[test]
     fn name_reservations_are_case_insensitive_and_reusable_after_release() {
         let mut used = HashSet::new();
-        assert!(reserve_name(&mut used, "Nimbus"));
-        assert!(!reserve_name(&mut used, "nImBuS"));
+        assert_eq!(
+            allocate_display_name(&mut used, Some("Reviewer")),
+            "Reviewer"
+        );
+        assert_eq!(
+            allocate_display_name(&mut used, Some("reviewer")),
+            "reviewer 2"
+        );
 
-        assert!(used.remove("nimbus"));
-        assert_eq!(allocate_name_with(&mut used, || "Nimbus".into()), "Nimbus");
-    }
-
-    #[test]
-    fn real_english_faker_first_names_are_safe_display_names() {
-        for _ in 0..32 {
-            assert!(normalize_display_name(&faker_first_name()).is_some());
-        }
+        assert!(used.remove("reviewer"));
+        assert_eq!(
+            allocate_display_name(&mut used, Some("Reviewer")),
+            "Reviewer"
+        );
     }
 
     #[tokio::test]
     async fn manager_name_allocation_is_atomic_across_concurrent_insertions() {
         let root = tempfile::tempdir().unwrap();
-        let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()])
-            .with_name_generator_for_test(|| "Ada".into());
+        let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
         let starts = (0..8)
             .map(|_| {
                 let manager = manager.clone();
@@ -1420,27 +1418,32 @@ mod tests {
     }
 
     #[test]
-    fn model_inputs_cannot_supply_subagent_names() {
-        assert!(
-            serde_json::from_value::<Input>(json!({
-                "prompt": "work", "name": "Waffles"
-            }))
-            .is_err()
-        );
+    fn model_inputs_prefer_optional_subagent_names() {
+        let input = serde_json::from_value::<Input>(json!({
+            "prompt": "work", "name": "Implementer"
+        }))
+        .unwrap();
+        assert_eq!(input.name.as_deref(), Some("Implementer"));
         assert!(
             serde_json::from_value::<ForkInput>(json!({
                 "subagent": {"id": "s", "output": null, "generation": 1},
                 "prompt": "fork work",
-                "name": "Mochi"
+                "name": "Round 2 Reviewer"
             }))
-            .is_err()
+            .is_ok()
         );
         let directory = tempfile::tempdir().unwrap();
-        let fork = ForkTool::new(
-            manager_with_generic_harness(directory.path(), Vec::new()),
-            1,
+        let manager = manager_with_generic_harness(directory.path(), Vec::new());
+        let subagent = SubagentTool::new(manager.clone(), 1);
+        let fork = ForkTool::new(manager, 1);
+        assert_eq!(
+            fork.spec.input_schema["properties"]["name"]["maxLength"],
+            32
         );
-        assert!(fork.spec.input_schema["properties"].get("name").is_none());
+        assert_eq!(
+            subagent.spec.input_schema["properties"]["name"]["maxLength"],
+            32
+        );
     }
 
     #[test]
@@ -1668,8 +1671,7 @@ mod tests {
         let handle = manager
             .create(
                 "base".into(),
-                None,
-                None,
+                CreateOptions::default(),
                 0,
                 TurnCancellation::default(),
                 None,
@@ -1873,8 +1875,7 @@ mod tests {
             let handle = manager
                 .create(
                     "base task".into(),
-                    None,
-                    None,
+                    CreateOptions::default(),
                     0,
                     TurnCancellation::default(),
                     None,
@@ -1963,8 +1964,7 @@ mod tests {
             let handle = manager
                 .create(
                     "create".into(),
-                    None,
-                    None,
+                    CreateOptions::default(),
                     0,
                     TurnCancellation::default(),
                     None,
@@ -2027,8 +2027,7 @@ mod tests {
             let handle = manager
                 .create(
                     "finish before exiting".into(),
-                    None,
-                    None,
+                    CreateOptions::default(),
                     0,
                     TurnCancellation::default(),
                     None,
@@ -2079,8 +2078,7 @@ mod tests {
                 failed
                     .create(
                         "create".into(),
-                        None,
-                        None,
+                        CreateOptions::default(),
                         0,
                         TurnCancellation::default(),
                         None
@@ -2121,8 +2119,7 @@ mod tests {
             failed_create
                 .create(
                     "create".into(),
-                    None,
-                    None,
+                    CreateOptions::default(),
                     0,
                     TurnCancellation::default(),
                     None,
@@ -2143,8 +2140,7 @@ mod tests {
         let source = failed_fork
             .create(
                 "source".into(),
-                None,
-                None,
+                CreateOptions::default(),
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2153,7 +2149,14 @@ mod tests {
             .unwrap();
         assert!(
             failed_fork
-                .fork(source, "fork".into(), 0, TurnCancellation::default(), None,)
+                .fork(
+                    source,
+                    "fork".into(),
+                    None,
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
                 .await
                 .is_err()
         );
@@ -2210,8 +2213,7 @@ mod tests {
         let handle = manager
             .create(
                 "base".into(),
-                None,
-                None,
+                CreateOptions::default(),
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2307,8 +2309,7 @@ mod tests {
             create_manager
                 .create(
                     "first prompt".into(),
-                    None,
-                    None,
+                    CreateOptions::default(),
                     0,
                     TurnCancellation::default(),
                     None,
@@ -2388,19 +2389,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_allocates_a_fresh_faker_name() {
+    async fn fork_uses_its_fresh_preferred_name() {
         let root = tempfile::tempdir().unwrap();
-        let candidates = Arc::new(Mutex::new(["Ada", "Grace"].into_iter().map(String::from)));
-        let manager = manager_with_generic_harness(root.path(), Vec::new())
-            .with_name_generator_for_test({
-                let candidates = Arc::clone(&candidates);
-                move || candidates.lock().unwrap().next().unwrap()
-            });
+        let manager = manager_with_generic_harness(root.path(), Vec::new());
         let source = manager
             .create(
                 "source".into(),
-                None,
-                None,
+                CreateOptions {
+                    name: Some("Implementer".into()),
+                    ..Default::default()
+                },
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2413,6 +2411,7 @@ mod tests {
             .fork(
                 source,
                 "branch".into(),
+                Some("Reviewer".into()),
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2420,8 +2419,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(source_name.as_deref(), Some("Ada"));
-        assert_eq!(fork.name.as_deref(), Some("Grace"));
+        assert_eq!(source_name.as_deref(), Some("Implementer"));
+        assert_eq!(fork.name.as_deref(), Some("Reviewer"));
     }
 
     #[tokio::test]
@@ -2457,8 +2456,7 @@ mod tests {
         let prior = manager
             .create(
                 "base".into(),
-                None,
-                None,
+                CreateOptions::default(),
                 0,
                 TurnCancellation::default(),
                 None,
@@ -2467,7 +2465,14 @@ mod tests {
             .unwrap();
 
         let error = manager
-            .fork(prior, "branch".into(), 0, TurnCancellation::default(), None)
+            .fork(
+                prior,
+                "branch".into(),
+                None,
+                0,
+                TurnCancellation::default(),
+                None,
+            )
             .await
             .unwrap_err();
 
