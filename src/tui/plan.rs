@@ -15,15 +15,23 @@ pub struct PlanNode {
     pub depth: usize,
     pub kind: PlanKind,
     pub label: String,
+    /// Zero-based source line containing this node.
+    #[allow(dead_code)]
+    pub source_line: usize,
+    /// Variable introduced by this node, when it represents a binding.
+    #[allow(dead_code)]
+    pub binding: Option<String>,
     /// Host tool this node dispatches, when it calls one.
     pub tool: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanKind {
+    Binding,
     Call,
     Loop,
     Fold,
+    After,
     Branch,
     Boundary,
     Return,
@@ -33,9 +41,11 @@ impl PlanKind {
     /// Glyph that marks the node's role in the program.
     pub const fn glyph(self) -> &'static str {
         match self {
+            Self::Binding => "=",
             Self::Call => "◆",
             Self::Loop => "⇉",
             Self::Fold => "∑",
+            Self::After => "→",
             Self::Branch => "◇",
             Self::Boundary => "⟳",
             Self::Return => "▸",
@@ -51,33 +61,45 @@ pub fn parse(script: &str) -> Vec<PlanNode> {
     };
     let mut nodes = Vec::new();
     for statement in &program.statements {
-        statement_nodes(statement, 0, &mut nodes);
+        statement_nodes(statement, 0, script, &mut nodes);
     }
-    if !expression(&program.result, 0, "return ", &mut nodes) {
+    if !expression(&program.result, 0, "return ", None, script, &mut nodes) {
         nodes.push(PlanNode {
             depth: 0,
             kind: PlanKind::Return,
             label: format!("return {}", summary(&program.result)),
+            source_line: source_line(script, program.result.span.start),
+            binding: None,
             tool: None,
         });
     }
     nodes
 }
 
-fn statement_nodes(statement: &Stmt, depth: usize, nodes: &mut Vec<PlanNode>) {
+fn statement_nodes(statement: &Stmt, depth: usize, script: &str, nodes: &mut Vec<PlanNode>) {
     match &statement.kind {
         StmtKind::Binding { name, value } => {
-            expression(value, depth, &format!("{name} = "), nodes);
+            let binding = (name != "_").then_some(name.as_str());
+            if !expression(value, depth, &format!("{name} = "), binding, script, nodes) {
+                nodes.push(PlanNode {
+                    depth,
+                    kind: PlanKind::Binding,
+                    label: format!("{name} = {}", summary(value)),
+                    source_line: source_line(script, statement.span.start),
+                    binding: binding.map(str::to_owned),
+                    tool: None,
+                });
+            }
         }
         StmtKind::Skip { condition } => {
             if let Some(condition) = condition {
-                expression(condition, depth, "", nodes);
+                expression(condition, depth, "", None, script, nodes);
             }
         }
         StmtKind::Assert { condition, message } => {
-            expression(condition, depth, "", nodes);
+            expression(condition, depth, "", None, script, nodes);
             if let Some(message) = message {
-                expression(message, depth, "", nodes);
+                expression(message, depth, "", None, script, nodes);
             }
         }
     }
@@ -85,42 +107,57 @@ fn statement_nodes(statement: &Stmt, depth: usize, nodes: &mut Vec<PlanNode>) {
 
 /// Emits nodes for the runtime-visible parts of `expr`.
 ///
-/// Returns whether anything was emitted: a binding whose value is pure
-/// arithmetic has no graph presence and is left out of the tree entirely.
-fn expression(expr: &Expr, depth: usize, prefix: &str, nodes: &mut Vec<PlanNode>) -> bool {
+/// Returns whether anything was emitted so a pure binding can add its own node.
+fn expression(
+    expr: &Expr,
+    depth: usize,
+    prefix: &str,
+    binding: Option<&str>,
+    script: &str,
+    nodes: &mut Vec<PlanNode>,
+) -> bool {
     match &expr.kind {
         ExprKind::Call { callee, arguments } => {
             let tool = callee_name(callee);
+            if is_intrinsic(&tool) {
+                return arguments.iter().fold(false, |emitted, argument| {
+                    expression(argument, depth, prefix, binding, script, nodes) || emitted
+                });
+            }
             nodes.push(PlanNode {
                 depth,
                 kind: PlanKind::Call,
                 label: format!("{prefix}{tool}({})", arguments_summary(arguments)),
+                source_line: source_line(script, expr.span.start),
+                binding: binding.map(str::to_owned),
                 tool: Some(tool),
             });
             for argument in arguments {
-                expression(argument, depth + 1, "", nodes);
+                expression(argument, depth + 1, "", None, script, nodes);
             }
             true
         }
         ExprKind::For {
-            binding,
+            binding: item_binding,
             collection,
             body,
         } => {
             nodes.push(PlanNode {
                 depth,
                 kind: PlanKind::Loop,
-                label: format!("{prefix}for {binding} in {}", summary(collection)),
+                label: format!("{prefix}for {item_binding} in {}", summary(collection)),
+                source_line: source_line(script, expr.span.start),
+                binding: binding.map(str::to_owned),
                 tool: None,
             });
-            expression(collection, depth + 1, "", nodes);
-            block(body, depth + 1, nodes);
+            expression(collection, depth + 1, "", None, script, nodes);
+            block(body, depth + 1, script, nodes);
             true
         }
         ExprKind::Fold {
             accumulator,
             init,
-            binding,
+            binding: item_binding,
             collection,
             body,
         } => {
@@ -128,14 +165,30 @@ fn expression(expr: &Expr, depth: usize, prefix: &str, nodes: &mut Vec<PlanNode>
                 depth,
                 kind: PlanKind::Fold,
                 label: format!(
-                    "{prefix}fold {accumulator} = {} for {binding} in {}",
+                    "{prefix}fold {accumulator} = {} for {item_binding} in {}",
                     summary(init),
                     summary(collection)
                 ),
+                source_line: source_line(script, expr.span.start),
+                binding: binding.map(str::to_owned),
                 tool: None,
             });
-            expression(collection, depth + 1, "", nodes);
-            block(body, depth + 1, nodes);
+            expression(init, depth + 1, "", None, script, nodes);
+            expression(collection, depth + 1, "", None, script, nodes);
+            block(body, depth + 1, script, nodes);
+            true
+        }
+        ExprKind::After { prerequisite, body } => {
+            nodes.push(PlanNode {
+                depth,
+                kind: PlanKind::After,
+                label: format!("{prefix}after {}", summary(prerequisite)),
+                source_line: source_line(script, expr.span.start),
+                binding: binding.map(str::to_owned),
+                tool: None,
+            });
+            expression(prerequisite, depth + 1, "", None, script, nodes);
+            block(body, depth + 1, script, nodes);
             true
         }
         ExprKind::Boundary {
@@ -148,16 +201,20 @@ fn expression(expr: &Expr, depth: usize, prefix: &str, nodes: &mut Vec<PlanNode>
                 depth,
                 kind: PlanKind::Boundary,
                 label: format!("{prefix}boundary retry {retries}"),
+                source_line: source_line(script, expr.span.start),
+                binding: binding.map(str::to_owned),
                 tool: None,
             });
-            block(body, depth + 1, nodes);
+            block(body, depth + 1, script, nodes);
             let mut fallback = Vec::new();
-            block(catch, depth + 2, &mut fallback);
+            block(catch, depth + 2, script, &mut fallback);
             if !fallback.is_empty() {
                 nodes.push(PlanNode {
                     depth: depth + 1,
                     kind: PlanKind::Branch,
                     label: format!("catch {error_binding}"),
+                    source_line: source_line(script, catch.span.start),
+                    binding: None,
                     tool: None,
                 });
                 nodes.append(&mut fallback);
@@ -173,18 +230,22 @@ fn expression(expr: &Expr, depth: usize, prefix: &str, nodes: &mut Vec<PlanNode>
                 depth,
                 kind: PlanKind::Branch,
                 label: format!("{prefix}if {}", summary(condition)),
+                source_line: source_line(script, expr.span.start),
+                binding: binding.map(str::to_owned),
                 tool: None,
             });
-            expression(condition, depth + 1, "", nodes);
-            block(then_block, depth + 1, nodes);
+            expression(condition, depth + 1, "", None, script, nodes);
+            block(then_block, depth + 1, script, nodes);
             if let Some(else_block) = else_block {
                 let mut alternative = Vec::new();
-                block(else_block, depth + 2, &mut alternative);
+                block(else_block, depth + 2, script, &mut alternative);
                 if !alternative.is_empty() {
                     nodes.push(PlanNode {
                         depth: depth + 1,
                         kind: PlanKind::Branch,
                         label: "else".into(),
+                        source_line: source_line(script, else_block.span.start),
+                        binding: None,
                         tool: None,
                     });
                     nodes.append(&mut alternative);
@@ -199,40 +260,58 @@ fn expression(expr: &Expr, depth: usize, prefix: &str, nodes: &mut Vec<PlanNode>
         } => [then_expr, condition, else_expr]
             .into_iter()
             .fold(false, |emitted, part| {
-                expression(part, depth, prefix, nodes) || emitted
+                expression(part, depth, prefix, binding, script, nodes) || emitted
             }),
         ExprKind::List(items) => items.iter().fold(false, |emitted, item| {
-            expression(item, depth, prefix, nodes) || emitted
+            expression(item, depth, prefix, binding, script, nodes) || emitted
         }),
         ExprKind::Object(entries) => entries.iter().fold(false, |emitted, (key, value)| {
             let key_emitted = match key {
-                ObjectKey::Computed(expr) => expression(expr, depth, prefix, nodes),
+                ObjectKey::Computed(expr) => {
+                    expression(expr, depth, prefix, binding, script, nodes)
+                }
                 ObjectKey::Static(_) => false,
             };
-            expression(value, depth, prefix, nodes) || key_emitted || emitted
+            expression(value, depth, prefix, binding, script, nodes) || key_emitted || emitted
         }),
-        ExprKind::Member { target, .. } => expression(target, depth, prefix, nodes),
-        ExprKind::Index { target, index } => {
-            let target_emitted = expression(target, depth, prefix, nodes);
-            expression(index, depth, prefix, nodes) || target_emitted
+        ExprKind::Member { target, .. } => {
+            expression(target, depth, prefix, binding, script, nodes)
         }
-        ExprKind::Unary { value, .. } => expression(value, depth, prefix, nodes),
+        ExprKind::Index { target, index } => {
+            let target_emitted = expression(target, depth, prefix, binding, script, nodes);
+            expression(index, depth, prefix, binding, script, nodes) || target_emitted
+        }
+        ExprKind::Unary { value, .. } => expression(value, depth, prefix, binding, script, nodes),
         ExprKind::Binary { left, right, .. } => {
-            let left_emitted = expression(left, depth, prefix, nodes);
-            expression(right, depth, prefix, nodes) || left_emitted
+            let left_emitted = expression(left, depth, prefix, binding, script, nodes);
+            expression(right, depth, prefix, binding, script, nodes) || left_emitted
         }
         ExprKind::Fail { arguments } => arguments.iter().fold(false, |emitted, argument| {
-            expression(argument, depth, prefix, nodes) || emitted
+            expression(argument, depth, prefix, binding, script, nodes) || emitted
         }),
         _ => false,
     }
 }
 
-fn block(body: &Block, depth: usize, nodes: &mut Vec<PlanNode>) {
+fn block(body: &Block, depth: usize, script: &str, nodes: &mut Vec<PlanNode>) {
     for statement in &body.statements {
-        statement_nodes(statement, depth, nodes);
+        statement_nodes(statement, depth, script, nodes);
     }
-    expression(&body.result, depth, "", nodes);
+    expression(&body.result, depth, "", None, script, nodes);
+}
+
+fn source_line(script: &str, byte_offset: usize) -> usize {
+    script.as_bytes()[..byte_offset.min(script.len())]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count()
+}
+
+fn is_intrinsic(name: &str) -> bool {
+    matches!(
+        name.split('.').next(),
+        Some("text" | "regex" | "list" | "json" | "number" | "time")
+    )
 }
 
 fn callee_name(callee: &Expr) -> String {
@@ -327,10 +406,84 @@ mod tests {
     }
 
     #[test]
-    fn leaves_out_bindings_with_no_runtime_work() {
+    fn includes_pure_bindings_with_variable_metadata() {
         let nodes = parse("total = 1 + 2\nreturn total");
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].kind, PlanKind::Return);
+
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].kind, PlanKind::Binding);
+        assert_eq!(nodes[0].label, "total = 1 … 2");
+        assert_eq!(nodes[0].binding.as_deref(), Some("total"));
+        assert_eq!(nodes[0].source_line, 0);
+        assert_eq!(nodes[1].kind, PlanKind::Return);
+        assert_eq!(nodes[1].binding, None);
+        assert_eq!(nodes[1].source_line, 1);
+    }
+
+    #[test]
+    fn records_source_lines_and_bindings_without_changing_nesting() {
+        let nodes = parse(
+            "first = shell({ command: \"líst\" })\n\
+             items = for item in first.items {\n\
+                 result = boundary retry 1 {\n\
+                     return shell({ command: item })\n\
+                 } catch error {\n\
+                     return log_error({ code: error.code })\n\
+                 }\n\
+                 return result\n\
+             }\n\
+             return items",
+        );
+
+        let metadata: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.depth,
+                    node.kind,
+                    node.source_line,
+                    node.binding.as_deref(),
+                    node.tool.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            metadata,
+            [
+                (0, PlanKind::Call, 0, Some("first"), Some("shell")),
+                (0, PlanKind::Loop, 1, Some("items"), None),
+                (1, PlanKind::Boundary, 2, Some("result"), None),
+                (2, PlanKind::Call, 3, None, Some("shell")),
+                (2, PlanKind::Branch, 4, None, None),
+                (3, PlanKind::Call, 5, None, Some("log_error")),
+                (0, PlanKind::Return, 9, None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn includes_after_bodies_fold_initializers_and_pure_intrinsics() {
+        let nodes = parse(
+            "config = json.parse(\"{}\")\n\
+             seed = shell({ command: \"prepare\" })\n\
+             published = after seed {\n\
+                 return edit({ op: \"delete\", path: \"old\" })\n\
+             }\n\
+             total = fold acc = shell({ command: \"init\" }) for item in [] {\n\
+                 return acc\n\
+             }\n\
+             return { config, published, total }",
+        );
+
+        assert_eq!(nodes[0].kind, PlanKind::Binding);
+        assert_eq!(nodes[0].binding.as_deref(), Some("config"));
+        assert!(nodes.iter().any(|node| node.kind == PlanKind::After));
+        assert_eq!(
+            nodes
+                .iter()
+                .filter_map(|node| node.tool.as_deref())
+                .collect::<Vec<_>>(),
+            ["shell", "edit", "shell"]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Client state: the transcript, the live runtime graph, and key handling.
+//! Client state: the transcript, live tool activity, and key handling.
 
 use std::{
     cmp::Reverse,
@@ -295,11 +295,15 @@ pub struct ToolCall {
     pub status: ToolCallStatus,
     pub started: Instant,
     pub finished: Option<Instant>,
+    /// Runlet source shown inline while this compose call is running.
+    pub script: String,
     pub plan: Vec<PlanNode>,
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
     pub expanded: bool,
+    /// The user explicitly chose the output's expanded or collapsed state.
+    pub expansion_explicit: bool,
     /// The call detached from its originating turn.
     pub backgrounded: bool,
 }
@@ -524,9 +528,7 @@ pub struct App {
     pub logs: Vec<String>,
     pub show_logs: bool,
     pub show_thoughts: bool,
-    /// `None` shows the graph while a tool runs; `Some` pins it open or shut.
-    pub graph_pinned: Option<bool>,
-    /// Tool card selected for the runtime graph.
+    /// Tool card selected for output toggling or background cancellation.
     pub focused_call_id: Option<String>,
     pub tick: usize,
     pub scroll: usize,
@@ -791,7 +793,6 @@ impl App {
             logs: Vec::new(),
             show_logs: false,
             show_thoughts: false,
-            graph_pinned: None,
             focused_call_id: None,
             tick: 0,
             scroll: 0,
@@ -816,7 +817,25 @@ impl App {
         self.phase != Phase::Idle
     }
 
+    fn collapse_last_tool_output(&mut self) {
+        let previous = self.blocks.len().checked_sub(1).filter(|&index| {
+            matches!(
+                &self.blocks[index],
+                Block::Tool(call) if call.expanded && !call.expansion_explicit
+            )
+        });
+        if let Some(index) = previous {
+            if let Block::Tool(call) = &mut self.blocks[index] {
+                call.expanded = false;
+            }
+            self.mark_block_dirty(index);
+        }
+    }
+
     fn push_block(&mut self, block: Block) {
+        if !matches!(block, Block::TurnDuration(_)) {
+            self.collapse_last_tool_output();
+        }
         let index = self.blocks.len();
         let thought = matches!(block, Block::Thought { .. });
         let dynamic = Self::block_is_dynamic(&block);
@@ -843,6 +862,14 @@ impl App {
         {
             self.set_focus_index(Some(index));
         }
+    }
+
+    fn call_is_latest_message(&self, id: &str) -> bool {
+        self.call_index(id).is_some_and(|index| {
+            self.blocks[index + 1..]
+                .iter()
+                .all(|block| matches!(block, Block::TurnDuration(_)))
+        })
     }
 
     fn block_is_dynamic(block: &Block) -> bool {
@@ -1039,6 +1066,12 @@ impl App {
                                 status: ToolCallStatus::Completed,
                                 started: Instant::now(),
                                 finished: Some(Instant::now()),
+                                script: call
+                                    .input
+                                    .get("script")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
                                 plan: call
                                     .input
                                     .get("script")
@@ -1047,7 +1080,8 @@ impl App {
                                     .unwrap_or_default(),
                                 children: Vec::new(),
                                 output: Vec::new(),
-                                expanded: false,
+                                expanded: call.name == agentkit_tool_compose::COMPOSE_TOOL_NAME,
+                                expansion_explicit: false,
                                 backgrounded: false,
                             })),
                             _ => {}
@@ -1116,13 +1150,6 @@ impl App {
         })
     }
 
-    pub fn show_graph(&self) -> bool {
-        match self.graph_pinned {
-            Some(pinned) => pinned,
-            None => self.focus_call().is_some_and(ToolCall::running),
-        }
-    }
-
     pub fn elapsed(&self) -> u64 {
         self.turn_started.map_or(0, |started| {
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -1154,6 +1181,9 @@ impl App {
         append: bool,
         role: MessageRole,
     ) {
+        if !text.is_empty() || !images.is_empty() {
+            self.collapse_last_tool_output();
+        }
         let mut images = images;
         let existing_index = self.message_blocks.get(&id).copied();
         if !append
@@ -1395,6 +1425,7 @@ impl App {
             } => {
                 self.close_thought();
                 self.prepare_focused_call(id.clone());
+                let expanded = title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
                 self.push_block(Block::Tool(ToolCall {
                     id,
                     title,
@@ -1403,9 +1434,11 @@ impl App {
                     started: Instant::now(),
                     finished: None,
                     plan: script.as_deref().map(parse_plan).unwrap_or_default(),
+                    script: script.unwrap_or_default(),
                     children: Vec::new(),
                     output: Vec::new(),
-                    expanded: false,
+                    expanded,
+                    expansion_explicit: false,
                     backgrounded,
                 }));
             }
@@ -1417,6 +1450,7 @@ impl App {
                 output,
                 backgrounded,
             } => {
+                let expand_compose = self.call_is_latest_message(&id);
                 let completed_background = {
                     let Some(call) = self.call_mut(&id) else {
                         return;
@@ -1424,6 +1458,7 @@ impl App {
                     let was_running = call.running();
                     if let Some(script) = script {
                         call.plan = parse_plan(&script);
+                        call.script = script;
                     }
                     if !output.is_empty() {
                         call.output = output;
@@ -1432,6 +1467,11 @@ impl App {
                     if let Some(status) = status {
                         call.status = status;
                         if !call.running() {
+                            if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                                && !call.expansion_explicit
+                            {
+                                call.expanded = expand_compose;
+                            }
                             call.finished = Some(Instant::now());
                             call.finish_running_children();
                         }
@@ -1465,10 +1505,17 @@ impl App {
                         backgrounded,
                     });
                 }
+                let expand_compose = self.call_is_latest_message(&id);
                 let Some(call) = self.call_mut(&id) else {
                     return;
                 };
                 if let Some(title) = title {
+                    if title == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && call.title != agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && !call.expansion_explicit
+                    {
+                        call.expanded = true;
+                    }
                     call.title = title;
                 }
                 if let Some(kind) = kind {
@@ -1476,6 +1523,7 @@ impl App {
                 }
                 if let Some(script) = script {
                     call.plan = parse_plan(&script);
+                    call.script = script;
                 }
                 if let Some(output) = output {
                     if append_output {
@@ -1489,6 +1537,11 @@ impl App {
                 if let Some(status) = status {
                     call.status = status;
                     if !call.running() {
+                        if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
+                            && !call.expansion_explicit
+                        {
+                            call.expanded = expand_compose;
+                        }
                         call.finished = Some(Instant::now());
                         call.finish_running_children();
                     }
@@ -1668,7 +1721,6 @@ impl App {
         self.compacting = false;
         self.usage = None;
         self.show_logs = false;
-        self.graph_pinned = None;
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
@@ -1705,6 +1757,10 @@ impl App {
     pub fn toggle_output(&mut self, id: &str) {
         if let Some(call) = self.call_mut(id) {
             call.expanded = !call.expanded;
+            call.expansion_explicit = true;
+        }
+        if let Some(index) = self.call_index(id) {
+            self.mark_block_dirty(index);
         }
     }
 
@@ -2176,9 +2232,6 @@ impl App {
             KeyCode::Char('f') if alt => self.editor.move_word_right(),
             KeyCode::Char('a') if control => self.editor.move_line_start(),
             KeyCode::Char('e') if control => self.editor.move_line_end(),
-            KeyCode::Char('g') if control => {
-                self.graph_pinned = Some(!self.show_graph());
-            }
             KeyCode::Char('l') if control => self.show_logs = !self.show_logs,
             KeyCode::Char('o') if control => self.toggle_last_output(),
             KeyCode::Char('t') if control => self.toggle_thoughts(),
@@ -2340,7 +2393,6 @@ impl App {
         }
         if let Some(Some(id)) = self.row_calls.get(offset).cloned() {
             self.focus_call_by_id(id.clone());
-            self.graph_pinned = Some(true);
             self.toggle_output(&id);
         }
         Action::None
@@ -3071,8 +3123,6 @@ mod tests {
             script: Some("return 1".into()),
             backgrounded: true,
         });
-        app.graph_pinned = Some(false);
-
         let action = app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL));
 
         assert!(matches!(
@@ -3341,14 +3391,12 @@ mod tests {
             .push(Block::User("old transcript".to_string().into()));
         app.logs.push("diagnostic".into());
         app.show_logs = true;
-        app.graph_pinned = Some(true);
         app.usage = Some(super::ContextUsage { used: 1, size: 2 });
         app.start_session("fresh".into());
         assert_eq!(app.session_id.as_deref(), Some("fresh"));
         assert!(app.blocks.is_empty());
         assert!(app.usage.is_none());
         assert!(!app.show_logs);
-        assert_eq!(app.graph_pinned, None);
         assert_eq!(app.logs, ["diagnostic"]);
     }
 

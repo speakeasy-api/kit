@@ -71,40 +71,6 @@ pub struct LinkHit {
     pub url: String,
 }
 
-/// Wraps rendered lines to `width` columns.
-pub fn wrap(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
-    let tagged: Vec<(Line<'static>, ())> = lines.iter().map(|line| (line.clone(), ())).collect();
-    wrap_tagged(&tagged, width)
-        .into_iter()
-        .map(|(line, ())| line)
-        .collect()
-}
-
-/// Wraps lines that carry a tag, copying each source line's tag onto every
-/// display row it produces. The client uses this to know which tool call a
-/// clicked row belongs to.
-pub fn wrap_tagged<T: Clone>(
-    lines: &[(Line<'static>, T)],
-    width: usize,
-) -> Vec<(Line<'static>, T)> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let mut wrapped = Vec::with_capacity(lines.len());
-    for (line, tag) in lines {
-        if line.width() <= width {
-            wrapped.push((line.clone(), tag.clone()));
-        } else {
-            wrapped.extend(
-                wrap_line(line, width)
-                    .into_iter()
-                    .map(|line| (line, tag.clone())),
-            );
-        }
-    }
-    wrapped
-}
-
 /// Wraps lines whose spans carry exact link identity, retaining that identity
 /// in the hit ranges for every display row produced. The final tuple field is
 /// source whitespace removed before that row, so copy can restore word wraps
@@ -124,61 +90,6 @@ pub fn wrap_linked_tagged<T: Clone>(
         }
     }
     wrapped
-}
-
-fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
-    let indent = hanging_indent(line, None).min(width / 2);
-    let mut lines = Vec::new();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0;
-
-    for (chunk, style) in chunks(line) {
-        let chunk_width = chunk.width();
-        let blank = chunk.trim().is_empty();
-        // Keep source indentation on the first display row. Whitespace at a
-        // wrap point is discarded, but its continuation indent is restored
-        // when the next word arrives.
-        if blank && spans.is_empty() && !lines.is_empty() {
-            continue;
-        }
-        if used + chunk_width > width && used > indent {
-            lines.push(flush(&mut spans));
-            used = 0;
-            if blank {
-                continue;
-            }
-            if indent > 0 {
-                spans.push(Span::raw(" ".repeat(indent)));
-                used = indent;
-            }
-        }
-        if spans.is_empty() && !lines.is_empty() && !blank && indent > 0 {
-            spans.push(Span::raw(" ".repeat(indent)));
-            used = indent;
-        }
-        if used + chunk_width <= width {
-            used += chunk_width;
-            spans.push(Span::styled(chunk, style));
-            continue;
-        }
-        // A single token longer than the line: break it at the margin.
-        for character in chunk.chars() {
-            let character_width = character.to_string().width();
-            if used + character_width > width {
-                lines.push(flush(&mut spans));
-                used = indent;
-                if indent > 0 {
-                    spans.push(Span::raw(" ".repeat(indent)));
-                }
-            }
-            used += character_width;
-            spans.push(Span::styled(character.to_string(), style));
-        }
-    }
-    if !spans.is_empty() {
-        lines.push(flush(&mut spans));
-    }
-    lines
 }
 
 /// Takes the pending spans as a line, without the trailing space that the
@@ -320,21 +231,6 @@ fn linked_chunks(line: &LinkedLine) -> Vec<(String, Style, Option<String>)> {
     chunks
 }
 
-fn flush(spans: &mut Vec<Span<'static>>) -> Line<'static> {
-    while spans
-        .last()
-        .is_some_and(|span| span.content.trim().is_empty())
-    {
-        spans.pop();
-    }
-    Line::from(std::mem::take(spans))
-}
-
-/// Splits a line into styled words and whitespace runs.
-fn chunks(line: &Line<'static>) -> Vec<(String, Style)> {
-    line.spans.iter().flat_map(span_chunks).collect()
-}
-
 fn span_chunks(span: &Span<'static>) -> Vec<(String, Style)> {
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -390,7 +286,34 @@ fn hanging_indent(line: &Line<'static>, leading_gutter: Option<bool>) -> usize {
 mod tests {
     use ratatui::text::{Line, Span};
 
-    use super::{LinkedLine, wrap, wrap_linked_tagged};
+    use super::{LinkedLine, wrap_linked_tagged};
+
+    fn wrap(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+        let linked = lines
+            .iter()
+            .cloned()
+            .map(|line| {
+                let has_gutter = line.spans.len() > 1
+                    && line
+                        .spans
+                        .first()
+                        .is_some_and(|span| !span.content.trim().is_empty());
+                let line = LinkedLine::plain(line);
+                (
+                    if has_gutter {
+                        line.with_leading_gutter()
+                    } else {
+                        line
+                    },
+                    (),
+                )
+            })
+            .collect::<Vec<_>>();
+        wrap_linked_tagged(&linked, width)
+            .into_iter()
+            .map(|(line, (), _, _)| line)
+            .collect()
+    }
 
     fn text(lines: &[Line<'static>]) -> Vec<String> {
         lines

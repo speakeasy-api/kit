@@ -1,4 +1,4 @@
-//! Frame drawing: header, transcript, runtime graph, prompt, status.
+//! Frame drawing: header, transcript, prompt, and status.
 
 use std::ops::Range;
 
@@ -32,12 +32,9 @@ use super::{
     markdown,
     plan::PlanKind,
     theme,
-    wrap::{LinkedLine, LinkedSpan, wrap, wrap_linked_tagged},
+    wrap::{LinkedLine, LinkedSpan, wrap_linked_tagged},
 };
 
-/// Width at which the graph moves beside the transcript instead of below it.
-const SIDE_BY_SIDE_WIDTH: u16 = 108;
-const GRAPH_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 const MAX_PENDING_STEER_ROWS: usize = 3;
 const START_MAX_WIDTH: u16 = 96;
@@ -75,8 +72,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
         && app.blocks.is_empty()
         && app.pending_steers.is_empty()
-        && !app.show_logs
-        && !app.show_graph();
+        && !app.show_logs;
 
     if show_start {
         app.prompt_width = start_prompt_width;
@@ -484,21 +480,7 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
-    if !app.show_graph() {
-        draw_transcript(frame, app, images, area);
-        return;
-    }
-    if area.width >= SIDE_BY_SIDE_WIDTH {
-        let [transcript, graph] =
-            Layout::horizontal([Constraint::Min(40), Constraint::Length(GRAPH_WIDTH)]).areas(area);
-        draw_transcript(frame, app, images, transcript);
-        draw_graph(frame, app, graph);
-    } else {
-        let [transcript, graph] =
-            Layout::vertical([Constraint::Min(6), Constraint::Percentage(45)]).areas(area);
-        draw_transcript(frame, app, images, transcript);
-        draw_graph(frame, app, graph);
-    }
+    draw_transcript(frame, app, images, area);
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
@@ -737,7 +719,6 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     app.transcript_dirty
         .extend(app.transcript_dynamic.iter().copied());
     let dirty = std::mem::take(&mut app.transcript_dirty);
-    let show_graph = !dirty.is_empty() && app.show_graph();
     let mut first_changed_count = app.blocks.len();
     for block_index in dirty {
         #[cfg(test)]
@@ -764,10 +745,7 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
             user_block_rows(message, width, images.enabled())
         } else {
             (
-                wrap_linked_tagged(
-                    &transcript_block_lines(app, block_index, show_graph, width),
-                    width,
-                ),
+                wrap_linked_tagged(&transcript_block_lines(app, block_index, width), width),
                 Vec::new(),
             )
         };
@@ -845,7 +823,6 @@ fn user_block_rows(
 fn transcript_block_lines(
     app: &App,
     block_index: usize,
-    show_graph: bool,
     width: usize,
 ) -> Vec<TaggedTranscriptLine> {
     let block = &app.blocks[block_index];
@@ -869,7 +846,6 @@ fn transcript_block_lines(
             uncopyable(plain_lines(tool_lines(
                 app,
                 call,
-                show_graph,
                 app.transcript_call_is_focused(block_index),
             ))),
             Some(call.id.clone()),
@@ -963,13 +939,13 @@ fn thought_lines(
         .collect()
 }
 
-fn tool_lines(app: &App, call: &ToolCall, show_graph: bool, active: bool) -> Vec<Line<'static>> {
+fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(tool_header(app, call, active))];
+    let compose = call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
     if call.running() {
-        // The live detail belongs in the graph pane, which is open while a
-        // call runs; repeating it here would just churn the transcript.
-        if !show_graph && let Some(child) = call.children.iter().rev().find(|child| child.running())
-        {
+        if compose && !call.script.is_empty() {
+            lines.extend(live_script_lines(app, call));
+        } else if let Some(child) = call.children.iter().rev().find(|child| child.running()) {
             lines.push(Line::from(vec![
                 Span::styled("   ↳ ", theme::faint()),
                 Span::styled(child.summary.clone(), theme::dim()),
@@ -977,17 +953,218 @@ fn tool_lines(app: &App, call: &ToolCall, show_graph: bool, active: bool) -> Vec
         }
         return lines;
     }
-    for child in call.children.iter().take(6) {
-        lines.push(Line::from(child_spans(app, child, "   ")));
-    }
-    if call.children.len() > 6 {
-        lines.push(Line::from(Span::styled(
-            format!("   … {} more calls", call.children.len() - 6),
-            theme::faint(),
-        )));
+    if !compose {
+        for child in call.children.iter().take(6) {
+            lines.push(Line::from(child_spans(app, child, "   ")));
+        }
+        if call.children.len() > 6 {
+            lines.push(Line::from(Span::styled(
+                format!("   … {} more calls", call.children.len() - 6),
+                theme::faint(),
+            )));
+        }
     }
     lines.extend(output_lines(call));
     lines
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProgramState {
+    Idle,
+    Resolved,
+    Failed,
+    Running,
+}
+
+fn live_script_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
+    call.script
+        .lines()
+        .enumerate()
+        .map(|(line_index, source)| {
+            let nodes: Vec<usize> = call
+                .plan
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| (node.source_line == line_index).then_some(index))
+                .collect();
+            let state = nodes
+                .iter()
+                .map(|&index| program_state(call, index))
+                .max()
+                .unwrap_or(ProgramState::Idle);
+            let (glyph, style) = match state {
+                ProgramState::Running => (
+                    theme::pulse(theme::Pulse::Child, app.tick),
+                    Style::default().fg(theme::running_color()),
+                ),
+                ProgramState::Failed => ("✗", Style::default().fg(theme::error_color())),
+                ProgramState::Resolved => ("✓", Style::default().fg(theme::success_color())),
+                ProgramState::Idle => ("·", theme::faint()),
+            };
+            let annotations: Vec<String> = nodes
+                .iter()
+                .map(|&index| program_annotation(call, index))
+                .filter(|text| !text.is_empty())
+                .collect();
+            let mut spans = vec![
+                Span::styled("   │ ", theme::faint()),
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(source.to_string(), style),
+            ];
+            if !annotations.is_empty() {
+                spans.push(Span::styled("  # ", theme::faint()));
+                spans.push(Span::styled(annotations.join(" · "), style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn program_state(call: &ToolCall, index: usize) -> ProgramState {
+    let node = &call.plan[index];
+    if node.kind == PlanKind::Binding {
+        return ProgramState::Resolved;
+    }
+    if node.kind == PlanKind::Return {
+        return ProgramState::Idle;
+    }
+    let end = subtree_end(call, index);
+    let children: Vec<&Child> = call
+        .children
+        .iter()
+        .filter(|child| {
+            child
+                .node
+                .is_some_and(|owner| owner >= index && owner < end)
+        })
+        .collect();
+    if children.iter().any(|child| child.running()) {
+        ProgramState::Running
+    } else if children.is_empty() {
+        ProgramState::Idle
+    } else if children.iter().any(|child| child.ok) {
+        ProgramState::Resolved
+    } else {
+        ProgramState::Failed
+    }
+}
+
+fn subtree_end(call: &ToolCall, index: usize) -> usize {
+    let depth = call.plan[index].depth;
+    call.plan
+        .iter()
+        .enumerate()
+        .skip(index + 1)
+        .find_map(|(next, node)| (node.depth <= depth).then_some(next))
+        .unwrap_or(call.plan.len())
+}
+
+fn program_annotation(call: &ToolCall, index: usize) -> String {
+    let node = &call.plan[index];
+    let state = program_state(call, index);
+    let variable = node.binding.as_ref().map(|name| {
+        let status = match state {
+            ProgramState::Resolved => "resolved",
+            ProgramState::Failed => "failed",
+            ProgramState::Idle | ProgramState::Running => "waiting",
+        };
+        format!("{name} {status}")
+    });
+    let detail = match node.kind {
+        PlanKind::Call => {
+            let attached: Vec<&Child> = call
+                .children
+                .iter()
+                .filter(|child| child.node == Some(index))
+                .collect();
+            let status = match state {
+                ProgramState::Idle => "idle",
+                ProgramState::Running => "running",
+                ProgramState::Resolved => "success",
+                ProgramState::Failed => "failure",
+            };
+            let target = node.tool.as_deref().unwrap_or(node.label.as_str());
+            let target = if target.is_empty() {
+                node.kind.glyph()
+            } else {
+                target
+            };
+            if attached.len() <= 1 {
+                Some(format!("{target} {status}"))
+            } else {
+                let running = attached.iter().filter(|child| child.running()).count();
+                let success = attached
+                    .iter()
+                    .filter(|child| !child.running() && child.ok)
+                    .count();
+                let failure = attached
+                    .iter()
+                    .filter(|child| !child.running() && !child.ok)
+                    .count();
+                let states = [
+                    (running, "running"),
+                    (success, "success"),
+                    (failure, "failure"),
+                ]
+                .into_iter()
+                .filter(|(count, _)| *count > 0)
+                .map(|(count, state)| format!("{count} {state}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+                Some(format!("{target}: {states}"))
+            }
+        }
+        PlanKind::Loop | PlanKind::Fold => Some(match direct_execution_count(call, index) {
+            Some(0) => "iteration waiting".into(),
+            Some(count) if state == ProgramState::Running => {
+                format!("iteration {count} running")
+            }
+            Some(count) => format!("{count} {}", plural("iteration", count)),
+            None if state == ProgramState::Idle => "iteration waiting".into(),
+            None => "iterations active".into(),
+        }),
+        PlanKind::Boundary => Some(match direct_execution_count(call, index) {
+            Some(0) => "attempt waiting".into(),
+            Some(attempt) => format!("attempt {attempt}"),
+            None if state == ProgramState::Idle => "attempt waiting".into(),
+            None => "boundary active".into(),
+        }),
+        PlanKind::After => Some(if state == ProgramState::Idle {
+            "dependency waiting".into()
+        } else {
+            "dependency ready".into()
+        }),
+        PlanKind::Branch => Some(if state == ProgramState::Idle {
+            "branch waiting".into()
+        } else {
+            "branch active".into()
+        }),
+        PlanKind::Return => Some("waiting to return".into()),
+        PlanKind::Binding => None,
+    };
+    [variable, detail]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Counts a construct only when one direct child call makes dispatch count a
+/// sound proxy. Nested loops/boundaries and branching bodies stay qualitative.
+fn direct_execution_count(call: &ToolCall, index: usize) -> Option<usize> {
+    let end = subtree_end(call, index);
+    let child_depth = call.plan[index].depth + 1;
+    let calls: Vec<usize> = (index + 1..end)
+        .filter(|&child| {
+            call.plan[child].depth == child_depth && call.plan[child].kind == PlanKind::Call
+        })
+        .collect();
+    (calls.len() == 1).then(|| {
+        call.children
+            .iter()
+            .filter(|child| child.node == calls.first().copied())
+            .count()
+    })
 }
 
 /// Raw tool output stays folded: it is machine-shaped, often thousands of
@@ -1008,6 +1185,14 @@ fn output_lines(call: &ToolCall) -> Vec<Line<'static>> {
             Span::styled("  click or ^o to open", theme::faint()),
         ])];
     }
+    expanded_output_lines(call)
+}
+
+fn expanded_output_lines(call: &ToolCall) -> Vec<Line<'static>> {
+    if call.output.is_empty() {
+        return Vec::new();
+    }
+    let count = call.output.len();
     let mut lines = vec![Line::from(vec![
         Span::styled("   ▾ ", theme::dim()),
         Span::styled("output", theme::dim()),
@@ -1143,122 +1328,6 @@ fn working_line(app: &App) -> Line<'static> {
         ),
         Span::styled("   esc interrupts", theme::faint()),
     ])
-}
-
-fn draw_graph(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let block = Panel::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme::faint())
-        .title(Span::styled(" runtime graph ", theme::accent()));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let Some(call) = app.focus_call() else {
-        frame.render_widget(
-            Paragraph::new(Span::styled("no tool calls yet", theme::faint())),
-            inner,
-        );
-        return;
-    };
-    let lines = wrap(&graph_lines(app, call), inner.width.max(1) as usize);
-    let offset = lines.len().saturating_sub(inner.height as usize);
-    frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
-        inner,
-    );
-}
-
-fn graph_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
-        Span::styled(call.title.clone(), theme::bold(theme::text_color())),
-        Span::styled(
-            format!("  {}", theme::duration(call.elapsed())),
-            theme::dim(),
-        ),
-    ])];
-    let done = call.children.len() - call.running_children();
-    let failed = call.children.iter().filter(|child| !child.ok).count();
-    let program = if call.running() {
-        "running"
-    } else if call.status == ToolCallStatus::Failed {
-        "failed"
-    } else {
-        "complete"
-    };
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{} plan nodes · {done} calls done · {} calls running{} · program {program}",
-            call.plan.len(),
-            call.running_children(),
-            if failed > 0 {
-                format!(" · {failed} calls failed")
-            } else {
-                String::new()
-            }
-        ),
-        theme::faint(),
-    )));
-    lines.push(Line::default());
-
-    if call.plan.is_empty() {
-        if call.children.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "waiting for the program to dispatch…",
-                theme::faint(),
-            )));
-        }
-        for child in call.children.iter().rev().take(20) {
-            lines.push(Line::from(child_spans(app, child, "")));
-        }
-        return lines;
-    }
-
-    for (index, node) in call.plan.iter().enumerate() {
-        let attached: Vec<&Child> = call
-            .children
-            .iter()
-            .filter(|child| child.node == Some(index))
-            .collect();
-        let indent = "  ".repeat(node.depth);
-        let style = node_style(node.kind, &attached);
-        let mut spans = vec![
-            Span::styled(format!("{indent}{} ", node.kind.glyph()), style),
-            Span::styled(node.label.clone(), style),
-        ];
-        if attached.len() > 1 {
-            spans.push(Span::styled(
-                format!("  ×{}", attached.len()),
-                theme::faint(),
-            ));
-        }
-        lines.push(Line::from(spans));
-        for child in attached.iter().rev().take(4) {
-            lines.push(Line::from(child_spans(app, child, &format!("{indent}  "))));
-        }
-        if attached.len() > 4 {
-            lines.push(Line::from(Span::styled(
-                format!("{indent}  … {} earlier", attached.len() - 4),
-                theme::faint(),
-            )));
-        }
-    }
-    lines
-}
-
-fn node_style(kind: PlanKind, attached: &[&Child]) -> Style {
-    if attached.iter().any(|child| child.running()) {
-        return theme::bold(theme::running_color());
-    }
-    if attached.iter().any(|child| !child.ok) {
-        return Style::default().fg(theme::error_color());
-    }
-    if !attached.is_empty() {
-        return Style::default().fg(theme::success_color());
-    }
-    match kind {
-        PlanKind::Call => theme::dim(),
-        _ => theme::faint(),
-    }
 }
 
 fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1488,7 +1557,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(theme::warn_color()),
         ));
     }
-    let hints = "⏎ send   ⇧⏎ newline   ^g graph   ^l log   ^c quit ";
+    let hints = "⏎ send   ⇧⏎ newline   ^l log   ^c quit ";
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
     let gap = (area.width as usize)
         .saturating_sub(used + hints.chars().count())
@@ -1526,9 +1595,9 @@ mod tests {
     use ratatui_image::picker::Picker;
 
     use super::{
-        MAX_PROMPT_ROWS, ModelDialogRow, draw, graph_lines, model_dialog_rows,
-        model_dialog_viewport, prompt_lines, refresh_transcript_cache,
-        refresh_transcript_cache_with_images, user_block_rows, user_line,
+        MAX_PROMPT_ROWS, ModelDialogRow, draw, model_dialog_rows, model_dialog_viewport,
+        prompt_lines, refresh_transcript_cache, refresh_transcript_cache_with_images,
+        user_block_rows, user_line,
     };
     use crate::{
         events::RuntimeEvent,
@@ -1774,61 +1843,184 @@ mod tests {
     }
 
     #[test]
-    fn draws_the_transcript_beside_a_live_runtime_graph() {
-        let frame = render(&mut sample(), 120, 30);
-        println!("{frame}");
-        assert!(frame.contains("kit"));
-        assert!(frame.contains("› check every source file"));
-        assert!(frame.contains("runtime graph"));
-        assert!(frame.contains("for file in files.lines"));
-        assert!(frame.contains("working"));
-    }
-
-    #[test]
-    fn stacks_the_graph_below_the_transcript_when_narrow() {
-        let frame = render(&mut sample(), 70, 30);
-        println!("{frame}");
-        assert!(frame.contains("runtime graph"));
-    }
-
-    #[test]
-    fn distinguishes_finished_child_calls_from_a_running_program() {
+    fn compose_script_runs_inline_with_live_annotations_at_full_width() {
         let mut app = sample();
-        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
-            call: "call-1:compose:two".into(),
+
+        let frame = render(&mut app, 120, 40);
+
+        assert!(
+            frame.contains("files = shell({ command: \"ls src\" })"),
+            "{frame}"
+        );
+        assert!(frame.contains("files resolved · shell success"), "{frame}");
+        assert!(
+            frame.contains("checked waiting · iteration 1 running"),
+            "{frame}"
+        );
+        assert!(frame.contains("shell running"), "{frame}");
+        assert!(app.transcript_width > 100, "{}", app.transcript_width);
+    }
+
+    #[test]
+    fn compose_script_annotates_idle_and_failed_calls_and_boundary_attempts() {
+        let script = "value = boundary retry 2 {\n\
+            return shell({ command: \"false\" })\n\
+        } catch err {\n\
+            return fail(\"FAILED\", err.message)\n\
+        }\n\
+        later = docs({ query: \"next\" })\n\
+        return value";
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.apply(Update::ToolStarted {
+            id: "call-1".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some(script.into()),
+            backgrounded: false,
+        });
+        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
+            call: "call-1:compose:failed".into(),
             tool: "shell".into(),
-            ok: true,
-            summary: "checked".into(),
-            millis: 240,
+            summary: "false".into(),
+            at: 0,
+        }));
+        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
+            call: "call-1:compose:failed".into(),
+            tool: "shell".into(),
+            ok: false,
+            summary: "exit code 1".into(),
+            millis: 10,
         }));
 
-        let summary = graph_lines(&app, app.focus_call().unwrap())[1]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(
-            summary,
-            "4 plan nodes · 2 calls done · 0 calls running · program running"
-        );
+        let frame = render(&mut app, 100, 30);
 
+        assert!(frame.contains("value = boundary retry 2 {"), "{frame}");
+        assert!(frame.contains("value failed · attempt 1"), "{frame}");
+        assert!(frame.contains("shell failure"), "{frame}");
+        assert!(frame.contains("later waiting · docs idle"), "{frame}");
+    }
+
+    #[test]
+    fn completed_compose_replaces_the_script_with_output() {
+        let mut app = sample();
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
-            output: Vec::new(),
+            output: vec!["compose result".into()],
             backgrounded: false,
         });
-        let summary = graph_lines(&app, app.focus_call().unwrap())[1]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(summary.ends_with("0 calls running · program complete"));
+
+        let frame = render(&mut app, 100, 30);
+
+        assert!(!frame.contains("files = shell"), "{frame}");
+        assert!(frame.contains("compose result"), "{frame}");
+
+        app.apply(Update::AgentMessage {
+            id: "test-agent".into(),
+            text: "Moving on.".into(),
+            append: true,
+        });
+        let continued = render(&mut app, 100, 30);
+        assert!(continued.contains("Moving on."), "{continued}");
+        assert!(continued.contains("1 line of output"), "{continued}");
+        assert!(!continued.contains("compose result"), "{continued}");
     }
 
     #[test]
-    fn only_the_graphs_active_call_shows_the_kill_hint() {
+    fn explicit_output_choice_survives_later_messages_and_tools() {
+        let mut app = sample();
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            script: None,
+            output: vec!["compose result".into()],
+            backgrounded: false,
+        });
+
+        app.toggle_last_output();
+        app.apply(Update::AgentMessage {
+            id: "after-compose".into(),
+            text: "Moving on.".into(),
+            append: true,
+        });
+        let compose_expanded = |app: &App| {
+            app.blocks.iter().any(
+                |block| matches!(block, Block::Tool(call) if call.id == "call-1" && call.expanded),
+            )
+        };
+        assert!(!compose_expanded(&app));
+
+        app.toggle_last_output();
+        app.apply(Update::ToolStarted {
+            id: "call-2".into(),
+            title: "shell".into(),
+            kind: ToolKind::Execute,
+            script: None,
+            backgrounded: false,
+        });
+        assert!(compose_expanded(&app));
+    }
+
+    #[test]
+    fn a_new_tool_collapses_the_previous_compose_output() {
+        let mut app = sample();
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            script: None,
+            output: vec!["compose result".into()],
+            backgrounded: false,
+        });
+        app.apply(Update::ToolStarted {
+            id: "call-2".into(),
+            title: "shell".into(),
+            kind: ToolKind::Execute,
+            script: None,
+            backgrounded: false,
+        });
+
+        let previous = app.blocks.iter().find_map(|block| match block {
+            Block::Tool(call) if call.id == "call-1" => Some(call),
+            _ => None,
+        });
+        assert!(previous.is_some_and(|call| !call.expanded));
+    }
+
+    #[test]
+    fn non_compose_running_child_summary_remains_inline() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.apply(Update::ToolStarted {
+            id: "call-1".into(),
+            title: "shell".into(),
+            kind: ToolKind::Execute,
+            script: None,
+            backgrounded: false,
+        });
+        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
+            call: "call-1:child".into(),
+            tool: "shell".into(),
+            summary: "cargo check".into(),
+            at: 0,
+        }));
+
+        let frame = render(&mut app, 80, 20);
+
+        assert!(frame.contains("↳ cargo check"), "{frame}");
+    }
+
+    #[test]
+    fn only_the_focused_call_shows_the_kill_hint() {
         let mut app = App::new(
             PathBuf::from("/tmp"),
             "openai-subscription".into(),
@@ -1869,7 +2061,6 @@ mod tests {
         assert!(initial[1].contains("^k kill"));
 
         app.focused_call_id = Some("first".into());
-        app.graph_pinned = Some(false);
         let selected = headers(&app);
         assert!(selected[0].contains("^k kill"));
         assert!(!selected[1].contains("^k kill"));
@@ -2034,6 +2225,10 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let mut app = sample();
+        if let Some(Block::Tool(call)) = app.blocks.last_mut() {
+            call.title = "shell".into();
+            call.expanded = false;
+        }
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
@@ -2648,7 +2843,7 @@ mod tests {
         ));
         assert!(frame.lines().any(|line| line.trim() == "▔".repeat(86)));
         assert!(frame.contains(" ready"));
-        assert!(frame.contains("⏎ send   ⇧⏎ newline   ^g graph   ^l log   ^c quit"));
+        assert!(frame.contains("⏎ send   ⇧⏎ newline   ^l log   ^c quit"));
         assert!(frame.contains("message kit"));
     }
 }
