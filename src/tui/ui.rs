@@ -2023,7 +2023,7 @@ mod tests {
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
         let initial = terminal.backend().buffer();
-        assert_eq!(buffer_cells(initial, 0, 1..16), " agent roster ");
+        assert_eq!(buffer_cells(initial, 0, 1..15), " agent roster ");
         assert_eq!(buffer_cells(initial, 1, 1..10), "○ Scout 0");
         assert_eq!(buffer_cells(initial, 2, 3..9), "Task 0");
         assert_eq!(buffer_cells(initial, 3, 1..10), "○ Scout 1");
