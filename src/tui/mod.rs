@@ -75,6 +75,52 @@ const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 /// Output lines kept per tool call; the fold shows the count either way.
 const MAX_OUTPUT_LINES: usize = 5_000;
 
+#[derive(Clone)]
+struct ActiveSessionRoute {
+    id: String,
+    generation: u64,
+}
+
+struct QueuedUpdate {
+    generation: Option<u64>,
+    update: Update,
+}
+
+impl QueuedUpdate {
+    fn global(update: Update) -> Self {
+        Self {
+            generation: None,
+            update,
+        }
+    }
+
+    fn for_session(generation: u64, update: Update) -> Self {
+        Self {
+            generation: Some(generation),
+            update,
+        }
+    }
+}
+
+fn transition_route(route: &Arc<Mutex<ActiveSessionRoute>>, id: String) {
+    if let Ok(mut route) = route.lock() {
+        route.id = id;
+        route.generation = route.generation.wrapping_add(1);
+    }
+}
+
+fn accept_queued_update(
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    queued: QueuedUpdate,
+) -> Option<Update> {
+    let accepted = queued.generation.is_none_or(|generation| {
+        route
+            .lock()
+            .is_ok_and(|route| route.generation == generation)
+    });
+    accepted.then_some(queued.update)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
 struct CancelBackgroundRequest {
@@ -295,7 +341,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let persisted_session_id = resume_session_id
         .clone()
         .unwrap_or_else(crate::session::new_id);
-    let active_persisted_id = Arc::new(Mutex::new(persisted_session_id.clone()));
+    let active_persisted_id = Arc::new(Mutex::new(ActiveSessionRoute {
+        id: persisted_session_id.clone(),
+        generation: 0,
+    }));
     let mut command = crate::acp_child::serve_command(
         root,
         model,
@@ -360,15 +409,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     Update::Log(line)
                 }
             };
-            if diagnostics.send(update).is_err() {
+            if diagnostics.send(QueuedUpdate::global(update)).is_err() {
                 return;
             }
         }
         // Stderr closing means the agent process is gone; stop any spinner
         // waiting on a turn that can no longer finish.
-        let _ = diagnostics.send(Update::ProcessExited(
+        let _ = diagnostics.send(QueuedUpdate::global(Update::ProcessExited(
             "the agent process exited — press ctrl+c to leave".into(),
-        ));
+        )));
     });
 
     // The child is watched from its own task, which also owns it: aborting that
@@ -396,12 +445,19 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         .v2()
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
-                let current = notification_session.lock().ok().map(|id| id.clone());
-                for update in current
-                    .as_deref()
-                    .map_or_else(Vec::new, |current| translate_for_session(notification, current))
-                {
-                    let _ = notifications.send(update);
+                let current = notification_session.lock().ok().map(|route| route.clone());
+                for update in current.as_ref().map_or_else(Vec::new, |route| {
+                    translate_for_session(notification, &route.id)
+                }) {
+                    let queued = if matches!(update, Update::AvailableCommands { .. }) {
+                        QueuedUpdate::global(update)
+                    } else {
+                        QueuedUpdate::for_session(
+                            current.as_ref().map_or(0, |route| route.generation),
+                            update,
+                        )
+                    };
+                    let _ = notifications.send(queued);
                 }
                 Ok(())
             },
@@ -485,7 +541,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             refresh_config_state(&mut app, Some(&config_options));
             app.can_steer = can_steer;
             if let Ok(mut active) = transition_session.lock() {
-                *active = active_session_id.clone();
+                active.id = active_session_id.clone();
             }
             app.start_session(active_session_id);
             let mut events = EventStream::new();
@@ -580,9 +636,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     let persisted_id = durable_session_id(&session_id).map_err(|error| {
                                         agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
                                     })?;
-                                    if let Ok(mut active) = transition_session.lock() {
-                                        *active = persisted_id.clone();
-                                    }
+                                    transition_route(&transition_session, persisted_id.clone());
                                     images.clear();
                                     app.start_session(persisted_id);
                                     refresh_config_state(&mut app, Some(&session.config_options));
@@ -599,22 +653,51 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         }
                                     }
                                 }
+                                Action::ListSessions => {
+                                    let Ok(route) = transition_session.lock() else {
+                                        app.note("could not start session catalog scan");
+                                        continue;
+                                    };
+                                    let generation = route.generation;
+                                    drop(route);
+                                    let root = root.clone();
+                                    let updates = updates_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            crate::session::catalog(&root)
+                                        })
+                                        .await
+                                        .map_err(|error| {
+                                            format!("session catalog worker failed: {error}")
+                                        })
+                                        .and_then(|result| result);
+                                        let _ = updates.send(QueuedUpdate::for_session(
+                                            generation,
+                                            Update::SessionCatalog(result),
+                                        ));
+                                    });
+                                }
                                 Action::Resume(requested_id) => {
                                     if let Err(error) = crate::session::validate_id(&requested_id) {
                                         app.note(format!("invalid session id: {error}"));
                                         continue;
                                     }
+                                    let Some(previous_persisted_id) =
+                                        previous_session_for_resume(&session_id, &requested_id)
+                                            .map_err(|error| {
+                                                agent_client_protocol::Error::into_internal_error(
+                                                    std::io::Error::other(error),
+                                                )
+                                            })?
+                                    else {
+                                        app.note(format!("session {requested_id} is already active"));
+                                        continue;
+                                    };
                                     if let Err(error) = crate::session::load(&root, &requested_id) {
                                         app.note(format!("could not resume session: {error}"));
                                         continue;
                                     }
                                     let previous_session_id = session_id.clone();
-                                    let previous_persisted_id = durable_session_id(&session_id)
-                                        .map_err(|error| {
-                                            agent_client_protocol::Error::into_internal_error(
-                                                std::io::Error::other(error),
-                                            )
-                                        })?;
                                     if let Err(error) = connection
                                         .send_request(CloseSessionRequest::new(session_id.clone()))
                                         .block_task()
@@ -627,9 +710,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         continue;
                                     }
                                     session_id = wire::SessionId::new(requested_id.clone());
-                                    if let Ok(mut active) = transition_session.lock() {
-                                        *active = requested_id.clone();
-                                    }
+                                    transition_route(&transition_session, requested_id.clone());
                                     images.clear();
                                     app.start_session(requested_id.clone());
                                     match request_resume(&connection, session_id.clone(), root.clone()).await {
@@ -639,9 +720,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         ),
                                         Err(error) => {
                                             session_id = previous_session_id;
-                                            if let Ok(mut active) = transition_session.lock() {
-                                                *active = previous_persisted_id.clone();
-                                            }
+                                            transition_route(
+                                                &transition_session,
+                                                previous_persisted_id.clone(),
+                                            );
                                             images.clear();
                                             app.start_session(previous_persisted_id);
                                             let restored = request_resume(
@@ -779,11 +861,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         },
                         update = updates_rx.recv() => match update {
                             Some(update) => {
-                                if let Update::ConfigOptions(options) = &update {
-                                    refresh_config_state(&mut app, Some(options));
+                                if let Some(update) = accept_queued_update(&transition_session, update) {
+                                    if let Update::ConfigOptions(options) = &update {
+                                        refresh_config_state(&mut app, Some(options));
+                                    }
+                                    app.apply(update);
                                 }
-                                app.apply(update);
                                 while let Ok(update) = updates_rx.try_recv() {
+                                    let Some(update) = accept_queued_update(&transition_session, update) else {
+                                        continue;
+                                    };
                                     if let Update::ConfigOptions(options) = &update {
                                         refresh_config_state(&mut app, Some(options));
                                     }
@@ -827,7 +914,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     // If the server failed before acknowledging CloseSession, reclaim only a
     // lock that is now provably stale; a live owner's OS lock is never stolen.
     if let Ok(active) = active_persisted_id.lock() {
-        let _ = crate::session::remove_stale_lock(&cleanup_root, &active);
+        let _ = crate::session::remove_stale_lock(&cleanup_root, &active.id);
     }
 
     result?;
@@ -1240,6 +1327,14 @@ fn durable_session_id(session_id: &wire::SessionId) -> Result<String, String> {
     Ok(session_id)
 }
 
+fn previous_session_for_resume(
+    current: &wire::SessionId,
+    requested: &str,
+) -> Result<Option<String>, String> {
+    let current = durable_session_id(current)?;
+    Ok((current != requested).then_some(current))
+}
+
 /// Maps one ACP session notification onto client updates.
 fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
     let session_id = notification.session_id.to_string();
@@ -1581,7 +1676,10 @@ fn readable(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use agent_client_protocol::schema::v2::{
         AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
@@ -1594,10 +1692,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        MAX_ATTACHMENTS, ModelChoice, attachments_from_paste, current_model_choice,
-        detach_from_controlling_terminal, durable_session_id, effort_state, handle, message_of,
-        osc52, prompt_blocks, readable, refresh_config_state, save_effort_default_to,
-        save_model_defaults_to, translate, translate_for_session, user_message_of, wire,
+        ActiveSessionRoute, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate, accept_queued_update,
+        attachments_from_paste, current_model_choice, detach_from_controlling_terminal,
+        durable_session_id, effort_state, handle, message_of, osc52, previous_session_for_resume,
+        prompt_blocks, readable, refresh_config_state, save_effort_default_to,
+        save_model_defaults_to, transition_route, translate, translate_for_session,
+        user_message_of, wire,
     };
     use crate::tui::app::{App, SubmittedPrompt, Update};
 
@@ -1614,6 +1714,52 @@ mod tests {
         assert_eq!(unsafe { libc::getsid(pid) }, pid);
         child.kill().await.unwrap();
         child.wait().await.unwrap();
+    }
+
+    #[test]
+    fn resuming_the_active_session_is_a_noop() {
+        let current = wire::SessionId::new("current");
+        assert_eq!(
+            previous_session_for_resume(&current, "current").unwrap(),
+            None
+        );
+        assert_eq!(
+            previous_session_for_resume(&current, "other")
+                .unwrap()
+                .as_deref(),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn queued_updates_from_previous_session_generations_are_dropped() {
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "first".into(),
+            generation: 0,
+        }));
+        let old = QueuedUpdate::for_session(0, Update::Log("old".into()));
+
+        transition_route(&route, "second".into());
+        assert!(accept_queued_update(&route, old).is_none());
+        transition_route(&route, "first".into());
+        assert!(
+            accept_queued_update(
+                &route,
+                QueuedUpdate::for_session(0, Update::Log("older attachment".into())),
+            )
+            .is_none()
+        );
+        assert!(
+            accept_queued_update(
+                &route,
+                QueuedUpdate::for_session(2, Update::Log("current".into())),
+            )
+            .is_some()
+        );
+        assert!(
+            accept_queued_update(&route, QueuedUpdate::global(Update::Log("global".into())))
+                .is_some()
+        );
     }
 
     #[test]

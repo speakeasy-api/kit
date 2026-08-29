@@ -113,7 +113,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         draw_prompt(frame, app, prompt);
         draw_status(frame, app, status);
     }
-    if app.model_dialog.is_some() {
+    if app.session_dialog.is_some() {
+        draw_session_dialog(frame, app);
+    } else if app.model_dialog.is_some() {
         draw_model_dialog(frame, app);
     } else if app.effort_dialog.is_some() {
         draw_effort_dialog(frame, app);
@@ -174,6 +176,72 @@ fn visible_query_tail(query: &str, width: usize) -> &str {
         tail = &tail[index..];
     }
     tail
+}
+
+fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
+    let outer = frame.area();
+    let width = if outer.width > 20 {
+        outer.width.saturating_sub(4).min(88)
+    } else {
+        outer.width
+    };
+    let height = outer
+        .height
+        .min((app.session_choices.len() as u16).saturating_add(3).min(22));
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let selected = app
+        .session_dialog
+        .as_ref()
+        .map_or(0, |dialog| dialog.selected);
+    let panel = Panel::bordered().title(" sessions ");
+    let inner = panel.inner(area);
+    let footer_rows = u16::from(inner.height > 1);
+    let [list, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).areas(inner);
+    let visible = list.height as usize;
+    let start = selected
+        .saturating_sub(visible / 2)
+        .min(app.session_choices.len().saturating_sub(visible));
+    let lines = app.session_choices[start..]
+        .iter()
+        .take(visible)
+        .enumerate()
+        .map(|(offset, entry)| {
+            let is_selected = start + offset == selected;
+            let label = entry
+                .title
+                .as_deref()
+                .or(entry.preview.as_deref())
+                .unwrap_or("untitled");
+            let updated = entry.updated_at_rfc3339();
+            Line::from(Span::styled(
+                format!(
+                    "{}{} · {} · {}",
+                    if is_selected { "› " } else { "  " },
+                    &updated[..10],
+                    entry.id,
+                    label
+                ),
+                if is_selected {
+                    theme::accent()
+                } else {
+                    theme::text()
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(Span::styled("enter resume · esc close", theme::dim())),
+        footer,
+    );
 }
 
 fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {

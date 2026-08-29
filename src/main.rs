@@ -405,6 +405,12 @@ enum Command {
         #[command(flatten)]
         credentials: CredentialArgs,
     },
+    /// List durable sessions for a workspace, newest first.
+    Sessions {
+        /// Working directory and project context (defaults to config or `.`).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Serve ACP on stdio with A2A, remote ACP, or both over HTTP.
     Serve {
         /// Working directory and project context (defaults to config or `.`).
@@ -532,6 +538,21 @@ fn initial_config(home: &Path) -> String {
     format!(
         "model = \"gpt-5.6-sol\"\nmcp_config = {mcp_config}\ncredential_store = \"file\"\ncredential_dir = {credential_dir}\n\n[plugins]\n"
     )
+}
+
+fn format_sessions(entries: &[kit::session::CatalogEntry]) -> String {
+    let mut output = String::from("UPDATED\tID\tTITLE\tPREVIEW\n");
+    for entry in entries {
+        output.push_str(&entry.updated_at_rfc3339());
+        output.push('\t');
+        output.push_str(&entry.id);
+        output.push('\t');
+        output.push_str(entry.title.as_deref().unwrap_or("-"));
+        output.push('\t');
+        output.push_str(entry.preview.as_deref().unwrap_or("-"));
+        output.push('\n');
+    }
+    output
 }
 
 fn write_if_missing(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -750,6 +771,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = Config::load_default()?;
+    if let Command::Sessions { root } = &cli.command {
+        let root = config.root(root.clone());
+        print!("{}", format_sessions(&kit::session::catalog(&root)?));
+        return Ok(());
+    }
     let openrouter_api_key =
         resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
             env::var(name).ok()
@@ -773,6 +799,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Init => unreachable!("init returns before loading runtime config"),
         Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
+        Command::Sessions { .. } => unreachable!("sessions returns before starting a runtime"),
         Command::Serve {
             root,
             model,
@@ -1014,9 +1041,10 @@ mod tests {
     use kit::tools::CredentialStorage;
 
     use super::{
-        AuthAction, AuthProvider, Cli, Config, CredentialArgs, CredentialStoreKind, McpArgs,
-        OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, init_config,
-        resolve_openrouter_api_key, supervise_serve_with_trigger, validate_auth_storage,
+        AuthAction, AuthProvider, Cli, Command, Config, CredentialArgs, CredentialStoreKind,
+        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, format_sessions,
+        init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
+        validate_auth_storage,
     };
 
     #[test]
@@ -1378,6 +1406,27 @@ future_option = true
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn sessions_command_accepts_a_workspace_root_and_formats_catalog_rows() {
+        let cli = Cli::try_parse_from(["kit", "sessions", "--root", "/tmp/project"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sessions { root: Some(root) }
+                if root.as_path() == std::path::Path::new("/tmp/project")
+        ));
+
+        let output = format_sessions(&[kit::session::CatalogEntry {
+            id: "session-1".into(),
+            title: Some("Fix tests".into()),
+            preview: Some("Fix tests in the catalog".into()),
+            updated_at: 0,
+        }]);
+        assert_eq!(
+            output,
+            "UPDATED\tID\tTITLE\tPREVIEW\n1970-01-01T00:00:00.000Z\tsession-1\tFix tests\tFix tests in the catalog\n"
+        );
     }
 
     #[test]

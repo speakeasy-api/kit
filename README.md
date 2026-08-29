@@ -99,11 +99,14 @@ remain resumable and are copied to the global location on resume. When reported
 context use reaches 80% of the model's window, Kit automatically checkpoints older
 history while preserving bootstrap instructions and a tool-safe recent tail; the
 replacement is persisted for resume.
-The session id is shown in the header. Resume it with:
+The session id is shown in the header. List workspace sessions or resume one with:
 
 ```sh
+cargo run -- sessions --root /path/to/project
 cargo run -- tui --root /path/to/project --resume <session-id>
 ```
+
+`kit sessions` prints the shared newest-first session catalog with ID, updated time, title, and preview.
 
 A per-session filesystem lock prevents two live Kit processes from mutating the
 same transcript. If a crashed process left its lock file behind, add `--force`;
@@ -583,6 +586,7 @@ child process with `KIT_RUNTIME_EVENTS=1`; other ACP hosts never see them.
 | --- | --- |
 | `⏎` | send |
 | `/new` | start a fresh persisted session (`/new prompt` sends its first prompt) |
+| `/sessions` | choose a workspace session and resume it |
 | `/compact` | compact context now (`/compact prompt` starts the next turn with `prompt`) |
 | `/effort` | choose `default`, `low`, `medium`, or `high`; Tab toggles saving the default |
 | `/model` | open the searchable provider-grouped model picker |
@@ -607,7 +611,7 @@ no credentials — the client exits with that agent's own last diagnostic rather
 than waiting on a handshake that will never finish.
 
 `/new` clears the visible transcript but leaves the prior persisted session
-intact and resumable. `/model` switches the main agent and compactor in the same
+intact and resumable. `/sessions` opens the newest-first workspace catalog; Enter resumes the selected session through the same path as `/resume <session-id>`. `/model` switches the main agent and compactor in the same
 live ACP session at the next safe turn boundary; it does not rewrite transcript
 history or restart the child process. The picker groups models by provider and
 ranks fuzzy matches as you type. Press `tab` before confirming to also replace the `provider`

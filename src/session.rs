@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agentkit_core::{Item, Timestamp};
+use agentkit_core::{Item, ItemKind, Part, Timestamp};
 use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,7 @@ pub const SCHEMA_VERSION: u32 = 3;
 const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
+const MAX_RFC3339_MILLIS: u64 = 253_402_300_799_999;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +42,24 @@ struct Record {
 pub struct OpenSession {
     pub transcript: Vec<Item>,
     pub observer: SessionObserver,
+}
+
+/// Read-only metadata for one durable session in a workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub title: Option<String>,
+    pub preview: Option<String>,
+    /// Last activity as milliseconds since the Unix epoch.
+    pub updated_at: u64,
+}
+
+impl CatalogEntry {
+    /// Formats the last activity as an RFC 3339 UTC timestamp.
+    #[must_use]
+    pub fn updated_at_rfc3339(&self) -> String {
+        timestamp_rfc3339(self.updated_at)
+    }
 }
 
 #[derive(Clone)]
@@ -251,7 +270,17 @@ fn open_with_initial_timestamps_in(
     if resume {
         let authority =
             authority.ok_or_else(|| format!("session {session_id:?} does not exist"))?;
-        establish_scoped_authority(&path, session_id, &workspace_root, &authority.items)?;
+        let title_seed = authority
+            .historical_items
+            .iter()
+            .find_map(|items| first_user_item_index(items).map(|index| items[..=index].to_vec()));
+        establish_scoped_authority(
+            &path,
+            session_id,
+            &workspace_root,
+            &authority.items,
+            title_seed.as_deref(),
+        )?;
         for legacy in authority.legacy_histories {
             redirect_legacy_transcript(&legacy, &path, session_id, &workspace_root)?;
         }
@@ -760,8 +789,17 @@ fn transcript_workspace_bytes(
                 index + 1
             ));
         }
-        if record.workspace_root.is_some() {
-            workspace = record.workspace_root;
+        if let Some(record_workspace) = record.workspace_root {
+            if workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace != &record_workspace)
+            {
+                return Err(format!(
+                    "conflicting workspace roots in transcript {}",
+                    path.display()
+                ));
+            }
+            workspace = Some(record_workspace);
         }
     }
     Ok(workspace)
@@ -780,9 +818,192 @@ fn ensure_workspace(path: &Path, session_id: &str, root: &Path) -> Result<(), St
     Ok(())
 }
 
-/// Lists durable transcript ids bound to one workspace without taking mutation locks.
-pub(crate) fn list_ids(root: &Path) -> Result<Vec<String>, String> {
-    list_ids_for_workspace(root, &default_directory()?)
+/// Lists durable sessions bound to one workspace, newest first, without taking mutation locks.
+pub fn catalog(root: &Path) -> Result<Vec<CatalogEntry>, String> {
+    catalog_for_workspace(root, &default_directory()?)
+}
+
+fn catalog_for_workspace(
+    root: &Path,
+    global_directory: &Path,
+) -> Result<Vec<CatalogEntry>, String> {
+    let root = root.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve workspace root {}: {error}",
+            root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "workspace root {} is not a directory",
+            root.display()
+        ));
+    }
+    let ids = list_ids_for_workspace(&root, global_directory)?;
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in ids {
+        // Discovery is best-effort per transcript: a damaged file or one caught
+        // mid-append must not hide every other session in the workspace.
+        let Ok(Some(authority)) = select_authority_with(global_directory, &root, &id, false) else {
+            continue;
+        };
+        let (title, preview) = catalog_text(&authority.historical_items, &authority.items);
+        let item_updated = authority
+            .items
+            .iter()
+            .filter_map(|item| {
+                item.created_at
+                    .map(|timestamp| timestamp.0)
+                    .filter(|timestamp| *timestamp <= MAX_RFC3339_MILLIS)
+            })
+            .max()
+            .unwrap_or(0);
+        let file_updated = fs::metadata(&authority.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        entries.push(CatalogEntry {
+            id,
+            title,
+            preview,
+            updated_at: item_updated.max(file_updated),
+        });
+    }
+    entries.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(entries)
+}
+
+fn catalog_text(
+    historical_items: &[Vec<Item>],
+    current_items: &[Item],
+) -> (Option<String>, Option<String>) {
+    let title = historical_items
+        .iter()
+        .map(Vec::as_slice)
+        .chain(std::iter::once(current_items))
+        .find_map(first_user_text)
+        .and_then(|text| {
+            text.lines()
+                .map(normalize_catalog_text)
+                .find(|line| !line.is_empty())
+        })
+        .map(|line| truncate_catalog_text(&line, 80));
+    let preview = first_user_text(current_items)
+        .map(normalize_catalog_text)
+        .filter(|text| !text.is_empty())
+        .map(|text| truncate_catalog_text(&text, 160));
+    (title, preview)
+}
+
+fn first_user_item_index(items: &[Item]) -> Option<usize> {
+    items.iter().position(|item| {
+        item.kind == ItemKind::User
+            && item.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    Part::Text(text) if !normalize_catalog_text(&text.text).is_empty()
+                )
+            })
+    })
+}
+
+fn first_user_item(items: &[Item]) -> Option<&Item> {
+    first_user_item_index(items).map(|index| &items[index])
+}
+
+fn first_user_text(items: &[Item]) -> Option<&str> {
+    first_user_item(items)?
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            Part::Text(text) if !normalize_catalog_text(&text.text).is_empty() => {
+                Some(text.text.as_str())
+            }
+            _ => None,
+        })
+}
+
+fn normalize_catalog_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            (!character.is_control() || character.is_whitespace())
+                && !is_default_ignorable(*character)
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_default_ignorable(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x00ad
+            | 0x034f
+            | 0x061c
+            | 0x115f..=0x1160
+            | 0x17b4..=0x17b5
+            | 0x180b..=0x180f
+            | 0x200b..=0x200f
+            | 0x202a..=0x202e
+            | 0x2060..=0x206f
+            | 0x3164
+            | 0xfe00..=0xfe0f
+            | 0xfeff
+            | 0xffa0
+            | 0xfff0..=0xfff8
+            | 0x1bca0..=0x1bca3
+            | 0x1d173..=0x1d17a
+            | 0xe0000..=0xe0fff
+    )
+}
+
+fn truncate_catalog_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut value = text
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    value.push('…');
+    value
+}
+
+fn timestamp_rfc3339(milliseconds: u64) -> String {
+    let milliseconds = milliseconds.min(MAX_RFC3339_MILLIS);
+    let seconds = milliseconds / 1_000;
+    let millis = milliseconds % 1_000;
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let day_seconds = seconds % 86_400;
+    let (year, month, day) = civil_date(days);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+// Gregorian civil date from days since 1970-01-01.
+fn civil_date(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn list_ids_for_workspace(root: &Path, global_directory: &Path) -> Result<Vec<String>, String> {
@@ -790,25 +1011,18 @@ fn list_ids_for_workspace(root: &Path, global_directory: &Path) -> Result<Vec<St
     let scoped_directory = workspace_storage_directory(global_directory, &root);
     let legacy_directory = workspace_directory(&root);
     let mut ids = Vec::new();
-    for id in list_ids_in(&scoped_directory)? {
-        let path = transcript_path(&scoped_directory, &id);
-        read_records(&path, &id)?;
-        ensure_workspace(&path, &id, &root)?;
-        ids.push(id);
-    }
+    ids.extend(list_ids_in(&scoped_directory)?);
     for id in list_ids_in(global_directory)? {
         let path = transcript_path(global_directory, &id);
-        read_records(&path, &id)?;
-        let stored_workspace = transcript_workspace(&path, &id)?;
-        if stored_workspace.as_deref() == Some(root.as_path()) || stored_workspace.is_none() {
+        if matches!(
+            transcript_workspace(&path, &id),
+            Ok(Some(stored)) if stored == root
+        ) {
             ids.push(id);
         }
     }
-    for id in list_ids_in(&legacy_directory)? {
-        let path = transcript_path(&legacy_directory, &id);
-        read_records(&path, &id)?;
-        ids.push(id);
-    }
+    // Its location scopes this pre-global-layout directory to the workspace.
+    ids.extend(list_ids_in(&legacy_directory)?);
     ids.sort();
     ids.dedup();
     Ok(ids)
@@ -841,12 +1055,14 @@ pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
     };
     let mut ids = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| format!("could not read session entry: {error}"))?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
-        if !entry
-            .file_type()
-            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
-            .is_file()
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file()
             || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
         {
             continue;
@@ -864,6 +1080,8 @@ pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
 
 struct Authority {
     items: Vec<Item>,
+    historical_items: Vec<Vec<Item>>,
+    path: PathBuf,
     legacy_histories: Vec<PathBuf>,
 }
 
@@ -884,11 +1102,21 @@ fn select_authority(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<Authority>, String> {
+    select_authority_with(directory, root, session_id, true)
+}
+
+fn select_authority_with(
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+    include_unbound_global: bool,
+) -> Result<Option<Authority>, String> {
     let scoped = transcript_path(&workspace_storage_directory(directory, root), session_id);
     let global = transcript_path(directory, session_id);
     let local = legacy_transcript(root, session_id);
     let mut histories = Vec::new();
     let mut legacy_histories = Vec::new();
+    let mut unbound_global = None;
 
     for (path, is_global, is_legacy) in [
         (&scoped, false, false),
@@ -902,9 +1130,13 @@ fn select_authority(
             continue;
         }
         let workspace = transcript_workspace(path, session_id)?;
-        if is_global && workspace.as_deref().is_some_and(|stored| stored != root) {
+        if is_global
+            && (workspace.as_deref().is_some_and(|stored| stored != root)
+                || workspace.is_none() && !include_unbound_global)
+        {
             continue;
         }
+        let is_unbound_global = is_global && workspace.is_none();
         if !is_global && workspace.as_deref().is_some_and(|stored| stored != root) {
             return Err(format!(
                 "session {session_id:?} belongs to workspace {}, not {}",
@@ -914,12 +1146,17 @@ fn select_authority(
         }
         match read_records_direct(path, session_id)? {
             StoredTranscript::History(history) => {
-                histories.push(HistoryCandidate {
+                let candidate = HistoryCandidate {
                     path: path.clone(),
                     history,
-                });
-                if is_legacy {
-                    legacy_histories.push(path.clone());
+                };
+                if is_unbound_global {
+                    unbound_global = Some(candidate);
+                } else {
+                    histories.push(candidate);
+                    if is_legacy {
+                        legacy_histories.push(path.clone());
+                    }
                 }
             }
             StoredTranscript::Redirect(target) => {
@@ -942,6 +1179,13 @@ fn select_authority(
                 });
             }
         }
+    }
+
+    if histories.is_empty()
+        && let Some(candidate) = unbound_global
+    {
+        legacy_histories.push(candidate.path.clone());
+        histories.push(candidate);
     }
 
     let mut authority: Option<HistoryCandidate> = None;
@@ -968,6 +1212,8 @@ fn select_authority(
     }
     Ok(authority.map(|candidate| Authority {
         items: candidate.history.items,
+        historical_items: candidate.history.states,
+        path: candidate.path,
         legacy_histories,
     }))
 }
@@ -1170,11 +1416,12 @@ fn establish_scoped_authority(
     session_id: &str,
     root: &Path,
     items: &[Item],
+    title_seed: Option<&[Item]>,
 ) -> Result<(), String> {
     let exists = path
         .try_exists()
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-    let generation = if exists {
+    let (mut generation, existing_items) = if exists {
         match read_records_direct(path, session_id)? {
             StoredTranscript::History(history)
                 if history.items == items
@@ -1182,10 +1429,13 @@ fn establish_scoped_authority(
             {
                 return Ok(());
             }
-            StoredTranscript::History(history) => history
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| "session generation overflowed".to_string())?,
+            StoredTranscript::History(history) => (
+                history
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| "session generation overflowed".to_string())?,
+                Some(history.items),
+            ),
             StoredTranscript::Redirect(_) => {
                 return Err(format!(
                     "scoped transcript {} is a redirect",
@@ -1194,8 +1444,30 @@ fn establish_scoped_authority(
             }
         }
     } else {
-        1
+        (1, None)
     };
+    let title_seed =
+        title_seed.filter(|seed| *seed != items && existing_items.as_deref() != Some(*seed));
+    let mut create = !exists;
+    if let Some(title_seed) = title_seed {
+        write_migration_record(
+            path,
+            &Record {
+                schema_version: SCHEMA_VERSION,
+                session_id: session_id.into(),
+                generation,
+                workspace_root: Some(root.to_path_buf()),
+                item: None,
+                replacement: Some(title_seed.to_vec()),
+                redirect: None,
+            },
+            create,
+        )?;
+        generation = generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?;
+        create = false;
+    }
     write_migration_record(
         path,
         &Record {
@@ -1207,7 +1479,7 @@ fn establish_scoped_authority(
             replacement: Some(items.to_vec()),
             redirect: None,
         },
-        !exists,
+        create,
     )
 }
 
@@ -2057,7 +2329,7 @@ mod tests {
             PREVIOUS_SCHEMA_VERSION,
             "abc",
             &["first", "newer"],
-            None,
+            Some(canonical_workspace(&project_root(root.path()))),
         );
 
         let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
@@ -2082,7 +2354,7 @@ mod tests {
             PREVIOUS_SCHEMA_VERSION,
             "abc",
             &["before-one", "before-two"],
-            None,
+            Some(canonical_workspace(&project_root(root.path()))),
         );
         let scoped = transcript_path(root.path(), "abc");
         write_history(
@@ -2150,7 +2422,13 @@ mod tests {
     fn torn_redirect_is_truncated_and_retried() {
         let root = tempfile::tempdir().unwrap();
         let global = super::transcript_path(&session_directory(root.path()), "abc");
-        let expected = write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["shared"], None);
+        let expected = write_history(
+            &global,
+            PREVIOUS_SCHEMA_VERSION,
+            "abc",
+            &["shared"],
+            Some(canonical_workspace(&project_root(root.path()))),
+        );
         let scoped = transcript_path(root.path(), "abc");
         write_history(
             &scoped,
@@ -2353,6 +2631,419 @@ mod tests {
         fs::create_dir(directory.path().join("nested.jsonl")).unwrap();
 
         assert_eq!(list_ids_in(directory.path()).unwrap(), ["alpha", "zeta"]);
+        let not_directory = directory.path().join("plain-file");
+        fs::write(&not_directory, "not a directory").unwrap();
+        assert!(
+            list_ids_in(&not_directory)
+                .unwrap_err()
+                .contains("could not list session directory")
+        );
+    }
+
+    #[test]
+    fn catalog_text_omits_terminal_controls_and_skips_control_only_parts() {
+        let items = vec![
+            Item::text(ItemKind::User, "\u{1b}\u{7}"),
+            Item::text(ItemKind::User, "Safe\u{1b}[31m title\u{7}"),
+        ];
+
+        let (title, preview) = catalog_text(&[], &items);
+        assert_eq!(title.as_deref(), Some("Safe[31m title"));
+        assert_eq!(preview.as_deref(), Some("Safe[31m title"));
+        assert!(
+            title
+                .iter()
+                .chain(&preview)
+                .all(|text| !text.chars().any(char::is_control))
+        );
+    }
+
+    #[test]
+    fn catalog_is_workspace_filtered_newest_first_and_extracts_display_text() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let now = Timestamp::now().0;
+
+        let older = open_in(
+            &first,
+            storage.path(),
+            "older",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(
+            &older.observer,
+            &Item::text(ItemKind::User, "  First title  \nwith a useful preview  ")
+                .with_created_at(Timestamp(now + 1_000)),
+        );
+        let newer = open_in(
+            &first,
+            storage.path(),
+            "newer",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(
+            &newer.observer,
+            &Item::text(ItemKind::User, "Newest session").with_created_at(Timestamp(now + 2_000)),
+        );
+        let other = open_in(
+            &second,
+            storage.path(),
+            "other",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Other workspace")],
+        )
+        .unwrap();
+
+        let entries = catalog_for_workspace(&first, storage.path()).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert_eq!(entries[1].title.as_deref(), Some("First title"));
+        assert_eq!(
+            entries[1].preview.as_deref(),
+            Some("First title with a useful preview")
+        );
+        assert!(entries[0].updated_at > entries[1].updated_at);
+        drop((older, newer, other));
+    }
+
+    #[test]
+    fn catalog_timestamps_are_rfc3339() {
+        assert_eq!(timestamp_rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            timestamp_rfc3339(1_709_164_800_123),
+            "2024-02-29T00:00:00.123Z"
+        );
+        assert_eq!(timestamp_rfc3339(u64::MAX), "9999-12-31T23:59:59.999Z");
+    }
+
+    #[test]
+    fn catalog_strips_bidi_and_default_ignorable_characters() {
+        let items = vec![Item::text(
+            ItemKind::User,
+            "safe\u{202e}txt\u{2066} zero\u{200b}width\u{ad} \
+             bom\u{feff} tag\u{e0021} variation\u{fe0f}",
+        )];
+
+        let (title, preview) = catalog_text(&[], &items);
+        assert_eq!(
+            title.as_deref(),
+            Some("safetxt zerowidth bom tag variation")
+        );
+        assert_eq!(title, preview);
+    }
+
+    #[test]
+    fn catalog_title_survives_transcript_replacement() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let root = roots.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let opened = open_in(
+            &root,
+            storage.path(),
+            "compacted",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        write(
+            &opened.observer,
+            &Item::text(ItemKind::User, "Original title"),
+        );
+        opened
+            .observer
+            .replace(&[
+                Item::text(ItemKind::System, "summary"),
+                Item::text(ItemKind::User, "Newer retained prompt"),
+            ])
+            .unwrap();
+
+        let entries = catalog_for_workspace(&root, storage.path()).unwrap();
+        assert_eq!(entries[0].title.as_deref(), Some("Original title"));
+        assert_eq!(entries[0].preview.as_deref(), Some("Newer retained prompt"));
+    }
+
+    #[test]
+    fn compacted_legacy_migration_preserves_earliest_user_title() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = "legacy-compacted";
+        let original_system = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: id.into(),
+            generation: 1,
+            workspace_root: None,
+            item: Some(Item::text(ItemKind::System, "system")),
+            replacement: None,
+            redirect: None,
+        };
+        let original_user = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: id.into(),
+            generation: 2,
+            workspace_root: None,
+            item: Some(Item::text(ItemKind::User, "Original title")),
+            replacement: None,
+            redirect: None,
+        };
+        let current = vec![
+            Item::text(ItemKind::System, "summary"),
+            Item::text(ItemKind::User, "Newer retained prompt"),
+        ];
+        let replacement = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: id.into(),
+            generation: 3,
+            workspace_root: None,
+            item: None,
+            replacement: Some(current.clone()),
+            redirect: None,
+        };
+        let legacy = super::transcript_path(storage.path(), id);
+        fs::write(
+            &legacy,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&original_system).unwrap(),
+                serde_json::to_string(&original_user).unwrap(),
+                serde_json::to_string(&replacement).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let resumed = open_in(root.path(), storage.path(), id, true, false, Vec::new()).unwrap();
+        assert_eq!(resumed.transcript, current);
+        drop(resumed);
+        assert!(matches!(
+            read_records_direct(&legacy, id).unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+        let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(entries[0].title.as_deref(), Some("Original title"));
+        assert_eq!(entries[0].preview.as_deref(), Some("Newer retained prompt"));
+    }
+
+    #[test]
+    fn catalog_skips_damaged_and_partially_appended_transcripts() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let root = roots.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let valid = open_in(
+            &root,
+            storage.path(),
+            "valid",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Valid session")],
+        )
+        .unwrap();
+        let directory = workspace_storage_directory(storage.path(), &canonical_workspace(&root));
+        fs::write(directory.join("malformed.jsonl"), b"not json\n").unwrap();
+        fs::write(directory.join("partial.jsonl"), b"{\"schema_version\":3").unwrap();
+
+        let entries = catalog_for_workspace(&root, storage.path()).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["valid"]
+        );
+        drop(valid);
+    }
+
+    #[test]
+    fn catalog_rejects_missing_and_non_directory_roots() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let missing = roots.path().join("missing");
+        assert!(catalog_for_workspace(&missing, storage.path()).is_err());
+
+        let file = roots.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(catalog_for_workspace(&file, storage.path()).is_err());
+    }
+
+    #[test]
+    fn unbound_global_is_hidden_until_explicit_resume_binds_it() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: "legacy".into(),
+            generation: 1,
+            workspace_root: None,
+            item: Some(Item::text(ItemKind::User, "private prompt")),
+            replacement: None,
+            redirect: None,
+        };
+        fs::write(
+            super::transcript_path(storage.path(), "legacy"),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert!(
+            catalog_for_workspace(&first, storage.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            catalog_for_workspace(&second, storage.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            item_text(&load_in(&first, storage.path(), "legacy").unwrap()[0]),
+            "private prompt"
+        );
+        let resumed = open_in(&first, storage.path(), "legacy", true, false, Vec::new()).unwrap();
+        drop(resumed);
+        assert_eq!(
+            catalog_for_workspace(&first, storage.path()).unwrap()[0].id,
+            "legacy"
+        );
+        assert!(
+            catalog_for_workspace(&second, storage.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_conflicting_workspace_metadata_without_hiding_valid_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let first = canonical_workspace(&first);
+        let second = canonical_workspace(&second);
+        let records = [
+            Record {
+                schema_version: SCHEMA_VERSION,
+                session_id: "conflict".into(),
+                generation: 1,
+                workspace_root: Some(first.clone()),
+                item: Some(Item::text(ItemKind::User, "first private prompt")),
+                replacement: None,
+                redirect: None,
+            },
+            Record {
+                schema_version: SCHEMA_VERSION,
+                session_id: "conflict".into(),
+                generation: 2,
+                workspace_root: Some(second.clone()),
+                item: Some(Item::text(ItemKind::User, "second private prompt")),
+                replacement: None,
+                redirect: None,
+            },
+        ];
+        let transcript = records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(
+            super::transcript_path(storage.path(), "conflict"),
+            transcript,
+        )
+        .unwrap();
+        let valid = open_in(
+            &first,
+            storage.path(),
+            "valid",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "valid")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            catalog_for_workspace(&first, storage.path()).unwrap()[0].id,
+            "valid"
+        );
+        assert!(
+            catalog_for_workspace(&second, storage.path())
+                .unwrap()
+                .is_empty()
+        );
+        drop(valid);
+    }
+
+    #[test]
+    fn load_and_resume_ignore_unbound_global_on_a_scoped_id_collision() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = "collision";
+        let global = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: id.into(),
+            generation: 1,
+            workspace_root: None,
+            item: Some(Item::text(ItemKind::User, "private global prompt")),
+            replacement: None,
+            redirect: None,
+        };
+        fs::write(
+            super::transcript_path(storage.path(), id),
+            format!("{}\n", serde_json::to_string(&global).unwrap()),
+        )
+        .unwrap();
+        let scoped_directory =
+            workspace_storage_directory(storage.path(), &canonical_workspace(root.path()));
+        fs::create_dir_all(&scoped_directory).unwrap();
+        let scoped = Record {
+            workspace_root: Some(canonical_workspace(root.path())),
+            item: Some(Item::text(ItemKind::User, "visible scoped prompt")),
+            ..global
+        };
+        fs::write(
+            super::transcript_path(&scoped_directory, id),
+            format!("{}\n", serde_json::to_string(&scoped).unwrap()),
+        )
+        .unwrap();
+
+        let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(entries[0].title.as_deref(), Some("visible scoped prompt"));
+        assert_eq!(
+            item_text(&load_in(root.path(), storage.path(), id).unwrap()[0]),
+            "visible scoped prompt"
+        );
+        let resumed = open_in(root.path(), storage.path(), id, true, false, Vec::new()).unwrap();
+        assert_eq!(item_text(&resumed.transcript[0]), "visible scoped prompt");
+        drop(resumed);
+
+        let StoredTranscript::History(history) =
+            read_records_direct(&super::transcript_path(storage.path(), id), id).unwrap()
+        else {
+            panic!("unbound global collision was redirected");
+        };
+        assert_eq!(item_text(&history.items[0]), "private global prompt");
     }
 
     #[test]

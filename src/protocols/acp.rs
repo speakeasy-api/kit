@@ -16,14 +16,14 @@ use agentkit_acp::{
     AudioContent, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
     BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ImageContent,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities,
-    PromptRequest, PromptResponse, ResourceLink, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
-    ToolCallUpdateFields,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, Notice,
+    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    TextContent, TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
 };
 use agentkit_core::{
     CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
@@ -52,6 +52,7 @@ use crate::{
 
 const MODEL_CONFIG_ID: &str = "model";
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+const SESSION_LIST_PAGE_SIZE: usize = 100;
 
 fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
     SessionNotification::new(
@@ -315,6 +316,21 @@ pub(crate) struct TurnStateNotification {
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     agent_client_protocol::util::internal_error(error.to_string())
+}
+
+#[derive(Debug)]
+enum ListSessionsError {
+    InvalidCursor,
+    Runtime(AcpRuntimeError),
+}
+
+fn list_sessions_error(error: ListSessionsError) -> agent_client_protocol::Error {
+    match error {
+        ListSessionsError::InvalidCursor => {
+            agent_client_protocol::Error::invalid_params().data("invalid session list cursor")
+        }
+        ListSessionsError::Runtime(error) => sdk_error(error),
+    }
 }
 
 enum Command {
@@ -696,6 +712,50 @@ impl Server {
         } = attached;
         let _ = activation.send(());
         Ok(NewSessionResponse::new(session_id).config_options(Some(config_options)))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, ListSessionsError> {
+        let cwd = self.runtime.root().to_path_buf();
+        let offset = request
+            .cursor
+            .as_deref()
+            .map(parse_session_list_cursor)
+            .transpose()?
+            .unwrap_or(0);
+        if request
+            .cwd
+            .as_ref()
+            .is_some_and(|requested| requested != &cwd)
+        {
+            return Ok(ListSessionsResponse::new(Vec::new()));
+        }
+        let root = self.runtime.root().to_path_buf();
+        let catalog = tokio::task::spawn_blocking(move || crate::session::catalog(&root))
+            .await
+            .map_err(|error| {
+                ListSessionsError::Runtime(AcpRuntimeError::Loop(format!(
+                    "session catalog worker failed: {error}"
+                )))
+            })?
+            .map_err(|error| ListSessionsError::Runtime(AcpRuntimeError::Loop(error)))?;
+        if offset > catalog.len() {
+            return Err(ListSessionsError::InvalidCursor);
+        }
+        let end = catalog.len().min(offset + SESSION_LIST_PAGE_SIZE);
+        let sessions = catalog[offset..end]
+            .iter()
+            .map(|entry| {
+                SessionInfo::new(entry.id.clone(), cwd.clone())
+                    .title(entry.title.clone())
+                    .updated_at(entry.updated_at_rfc3339())
+            })
+            .collect();
+        let mut response = ListSessionsResponse::new(sessions);
+        response.next_cursor = (end < catalog.len()).then(|| format!("offset:{end}"));
+        Ok(response)
     }
 
     async fn load_session(
@@ -1627,6 +1687,24 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: ListSessionsRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state
+                                .list_sessions(request)
+                                .await
+                                .map_err(list_sessions_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: PromptRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -1707,6 +1785,13 @@ fn component(
         ))
 }
 
+fn parse_session_list_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
+    cursor
+        .strip_prefix("offset:")
+        .and_then(|value| value.parse().ok())
+        .ok_or(ListSessionsError::InvalidCursor)
+}
+
 fn capabilities() -> agentkit_acp::AgentCapabilities {
     agentkit_acp::AgentCapabilities::new()
         .load_session(true)
@@ -1718,6 +1803,7 @@ fn capabilities() -> agentkit_acp::AgentCapabilities {
         )
         .session_capabilities(
             SessionCapabilities::new()
+                .list(SessionListCapabilities::new())
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
         )
@@ -3357,8 +3443,19 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn session_list_cursors_parse_offsets_and_reject_malformed_values() {
+        assert_eq!(parse_session_list_cursor("offset:100").unwrap(), 100);
+        assert!(parse_session_list_cursor("100").is_err());
+        assert!(parse_session_list_cursor("offset:nope").is_err());
+        assert_eq!(
+            list_sessions_error(ListSessionsError::InvalidCursor).code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
+    }
+
     #[tokio::test]
-    async fn kit_server_advertises_only_supported_session_restoration() {
+    async fn kit_server_advertises_supported_session_discovery_and_restoration() {
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let (client_transport, agent_transport) = Channel::duplex();
@@ -3374,9 +3471,25 @@ pub(super) mod tests {
                 assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
                 assert!(initialized.agent_capabilities.load_session);
                 let sessions = &initialized.agent_capabilities.session_capabilities;
-                assert!(sessions.list.is_none());
+                assert!(sessions.list.is_some());
                 assert!(sessions.resume.is_none());
                 assert!(sessions.fork.is_none());
+
+                let listed = connection
+                    .send_request(ListSessionsRequest::new().cwd(root.path().to_path_buf()))
+                    .block_task()
+                    .await?;
+                assert!(listed.sessions.is_empty());
+                let error = connection
+                    .send_request(
+                        ListSessionsRequest::new()
+                            .cwd(root.path().join("other"))
+                            .cursor("invalid"),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("malformed list cursor must fail");
+                assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
 
                 connection
                     .send_request(agentkit_acp::ForkSessionRequest::new(

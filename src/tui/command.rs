@@ -9,6 +9,7 @@ use std::ops::Range;
 enum Kind {
     New,
     Resume,
+    Sessions,
     Close,
     Model,
     Effort,
@@ -31,6 +32,10 @@ const LOCAL_COMMANDS: &[Spec] = &[
         kind: Kind::Resume,
     },
     Spec {
+        token: "/sessions",
+        kind: Kind::Sessions,
+    },
+    Spec {
         token: "/close",
         kind: Kind::Close,
     },
@@ -48,6 +53,7 @@ const LOCAL_COMMANDS: &[Spec] = &[
 pub enum Parsed<'a> {
     New { prompt: Option<&'a str> },
     Resume { session_id: Option<&'a str> },
+    Sessions,
     Close,
     Model { query: Option<&'a str> },
     Effort { value: Option<&'a str> },
@@ -79,6 +85,7 @@ pub fn parse(input: &str) -> Parsed<'_> {
     match spec.kind {
         Kind::New => Parsed::New { prompt },
         Kind::Resume => Parsed::Resume { session_id: prompt },
+        Kind::Sessions => Parsed::Sessions,
         Kind::Close => Parsed::Close,
         Kind::Model => Parsed::Model { query: prompt },
         Kind::Effort => Parsed::Effort { value: prompt },
@@ -111,6 +118,7 @@ mod tests {
                 session_id: Some("session-1")
             }
         );
+        assert_eq!(parse("/sessions"), Parsed::Sessions);
         assert_eq!(parse("/close"), Parsed::Close);
         assert_eq!(parse("/model"), Parsed::Model { query: None });
         assert_eq!(parse("/effort"), Parsed::Effort { value: None });
@@ -147,6 +155,7 @@ mod tests {
             assert_eq!(known_token(input, &[]), None);
         }
         assert_eq!(known_token("/new prompt", &[]), Some(0..4));
+        assert_eq!(known_token("/sessions", &[]), Some(0..9));
         assert_eq!(known_token("/model sonnet", &[]), Some(0..6));
         assert_eq!(known_token("/effort high", &[]), Some(0..7));
     }
