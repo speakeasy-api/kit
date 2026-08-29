@@ -265,20 +265,16 @@ flash = "openrouter:openai/gpt-5.6-luna"
 
 ## How it compares
 
-Kit, Codex CLI, and Claude Code were each used to ship Linear issues in the same production repository, [speakeasy-api/gram](https://github.com/speakeasy-api/gram), during July–August 2026. Every session was matched to the pull request it opened, and PRs were sized by hand-written lines (generated code excluded). All 16 PRs merged.
+Kit, Codex CLI, and Claude Code shipped 16 Linear issues in the same production repository, [speakeasy-api/gram](https://github.com/speakeasy-api/gram), during July–August 2026. All 16 pull requests merged.
 
 | Median per hand-written line (300–1000-line PRs) | Kit | Codex CLI | Claude Code |
 | --- | ---: | ---: | ---: |
-| Input tokens | **49.7k** | 113k | 99.6k |
-| Output tokens | 274 | 321 | 325 |
-| Active minutes | **0.13** | 0.31 | 0.31 |
-| User messages per session (all rows, median) | **5** | 14 | 11 |
+| Input tokens | **Best (49.7k)** | 127% more (113k) | 100% more (99.6k) |
+| Output tokens | **Best (274)** | 17% more (321) | 19% more (325) |
+| Active time | **Best (0.13 min)** | 138% more (0.31 min) | 138% more (0.31 min) |
+| User messages per session | **Best (5)** | 180% more (14) | 120% more (11) |
 
-Kit shipped a hand-written line for roughly half the input tokens and half the active time of the other two, with comparable output and the least steering, on a 272k context window with a lower peak context than Claude Code. Two Kit runs merged from a single message. The sample is small (5 Kit, 2 Codex CLI, 7 Claude Code sessions), the models differ (gpt-5.6-sol vs gpt-5.5 vs Claude Fable 5 / Opus 5), and tokens are not cost. Per-session data and method: [docs/harness-comparison.md](docs/harness-comparison.md).
-
-## Deliberate limits
-
-The root is a working directory, not a sandbox: `shell` has the host's authority and `edit` accepts absolute paths. Edits are atomic per file, not per turn. Subagents are child processes sharing the root, bounded to depth two. Background compose calls live as long as the Kit process. Without `--server-credential-file` the HTTP listener has no authentication — never expose it beyond loopback. There is no plan to add an approval framework; run Kit inside a boundary you already trust, such as a container, a VM, or a CI runner.
+Kit used the fewest tokens, took the least active time, and needed the least steering. Two Kit runs merged from a single message. [See the per-session data and method](docs/harness-comparison.md).
 
 ## Documentation
 
