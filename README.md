@@ -5,8 +5,8 @@
 <h1 align="center">Kit</h1>
 
 <p align="center">
-  A coding agent runtime that gives the model <strong>one tool</strong> and lets it write programs with it.<br>
-  Terminal client, ACP server, A2A endpoint, and subagent orchestrator in a single static binary.
+  Kit is a coding agent runtime. It gives the model <strong>one tool</strong> for writing and running programs.<br>
+  Kit provides a terminal client, an ACP server, an A2A endpoint, and a subagent orchestrator in one static binary.
 </p>
 
 <p align="center">
@@ -24,16 +24,16 @@ kit init && kit auth login openai && kit tui
 
 ## Why Kit
 
-Most agent harnesses expose many tools and pay one model round trip per call. Kit exposes **one tool, `compose`**, whose argument is a short program in [Runlet](https://github.com/danielkov/runlet). A single round trip can read several files, run the tests, apply an edit, retry a flaky command, delegate to subagents, and return one structured value.
+Most agent harnesses expose many tools and require one model round trip for each call. Kit exposes one tool: `compose`. The `compose` argument is a short program in [Runlet](https://github.com/danielkov/runlet). In one round trip, the program can read files, run tests, apply edits, retry failed commands, delegate work to subagents, and return structured data.
 
-Fewer round trips means less repeated context per task and more work done per request: on size-matched issues in a production repository, Kit shipped a hand-written line for about half the input tokens and half the active time of Codex CLI or Claude Code ([comparison](#how-it-compares)).
+Fewer model round trips repeat less context and complete more work in each request. In size-matched production tasks, Kit used approximately half the input tokens and active time per hand-written line of Codex CLI or Claude Code ([comparison](#how-it-compares)).
 
-- **One tool, unlimited composition.** `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool`, `auth`, `skill`, `a2a`, `docs` are the tools a `compose` program calls. Independent calls run concurrently; data dependencies and `after` blocks express ordering; `boundary retry N` and `fail()` handle errors in-program.
-- **Subagents are values, not fire-and-forget tasks.** Start one, prompt it again, fork it, require JSON that matches a schema, close it. Point it at another harness — Claude Code, Codex, Cursor, or Kit itself — over ACP.
-- **Speaks the open protocols.** ACP v1/v2 over stdio, HTTP/SSE, and WebSocket for editors and clients; A2A v1 in both directions; MCP with live config reload and reactive OAuth; Agent Skills and Agent Plugin packages.
-- **Built for long sessions.** Append-only JSONL transcripts synced before acceptance, automatic compaction at 80% of the context window, resumable from `tui`, `prompt`, or any ACP client, crash-safe locks, provider retries under a 24-hour deadline.
-- **Bring your own model.** ChatGPT subscription via native OAuth, OpenRouter, or the Speakeasy AI Control Plane. Switch with `/model` mid-session.
-- **Deliberately small.** No permissions framework, no sandbox, no web UI. `--root` is a working directory. Kit is a runtime, not a security boundary; run it inside one you already trust. [Trust model.](docs/user/security-limits-and-troubleshooting.md)
+- **One tool, unlimited composition.** The model receives one tool: `compose`. A `compose` program can call `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool`, `auth`, `skill`, `a2a`, and `docs`. Independent calls run concurrently. Use data dependencies or `after` blocks to control execution order. Use `boundary retry N` and `fail()` to handle errors in the program.
+- **Reusable subagents.** A subagent is a reusable value. You can continue, fork, inspect, and close a subagent. You can require JSON that matches a schema. You can also use Claude Code, Codex, Cursor, or Kit as the subagent harness over ACP.
+- **Open protocols.** Kit supports ACP v1 and v2 over stdio, HTTP/SSE, and WebSocket. Kit supports A2A v1 in both directions. It also supports MCP, Agent Skills, and Agent Plugin packages.
+- **Long sessions.** Kit synchronizes each append-only JSONL transcript item to disk before it accepts the item. It compacts context automatically at 80% of the context window. You can resume a session from `tui`, `prompt`, or any ACP client. Kit also uses crash-safe locks. It retries eligible `openai-subscription` failures for up to 24 hours.
+- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports models through OpenRouter and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
+- **Small runtime.** Kit has no permissions framework, sandbox, or web UI. The `--root` option sets the working directory. Kit is a runtime, not a security boundary. Run Kit inside a security boundary that you trust. See the [trust model](docs/user/security-limits-and-troubleshooting.md).
 
 ## Install
 
@@ -43,7 +43,7 @@ Fewer round trips means less repeated context per task and more work done per re
 curl -fsSL https://raw.githubusercontent.com/speakeasy-api/kit/main/install.sh | sh
 ```
 
-Downloads the release tarball, verifies it against `SHA256SUMS`, and installs to `~/.local/bin`. `KIT_VERSION=v0.1.108` pins a release; `KIT_INSTALL_DIR` changes the destination.
+The installation script downloads the release archive. It verifies the archive against `SHA256SUMS` and installs Kit in `~/.local/bin`. Set `KIT_VERSION=v0.1.108` to select a release. Set `KIT_INSTALL_DIR` to change the destination.
 
 <!-- PLACEHOLDER: record docs/media/install.gif — run the curl|sh line in a clean shell, then `kit --version`. The tape is in scripts/readme-media/install.tape; it only works once install.sh is on main. -->
 
@@ -61,7 +61,11 @@ docker run --rm -it -v "$PWD:/workspace" -v ~/.kit:/home/kit/.kit \
   ghcr.io/speakeasy-api/kit:latest tui --credential-store file
 ```
 
-Images are published for `linux/amd64` and `linux/arm64` in three flavors: `slim` (default, Debian slim), `bookworm`, and `alpine` (native musl build). Every release tags `v<version>`, `v<version>-slim`, `v<version>-bookworm`, `v<version>-alpine`; the newest stable release also moves `latest`, `slim`, `bookworm`, `alpine`. Images run as non-root `kit` (UID 1000) from `/workspace` and intentionally omit Git and language toolchains — extend them:
+Kit publishes images for `linux/amd64` and `linux/arm64`. Each image has three variants: `slim`, `bookworm`, and `alpine`. The default `slim` variant uses Debian slim. The `alpine` variant uses a native musl build.
+
+Each release adds the tags `v<version>`, `v<version>-slim`, `v<version>-bookworm`, and `v<version>-alpine`. The newest stable release also updates the `latest`, `slim`, `bookworm`, and `alpine` tags.
+
+Images run as the non-root `kit` user with UID 1000. The working directory is `/workspace`. Images do not include Git or language toolchains. Extend the image if you need these tools:
 
 ```dockerfile
 FROM ghcr.io/speakeasy-api/kit:latest
@@ -72,7 +76,7 @@ USER kit
 
 ### From source
 
-Requires the pinned Rust toolchain in `rust-toolchain.toml`.
+To build Kit from source, use the Rust toolchain specified in `rust-toolchain.toml`.
 
 ```sh
 git clone https://github.com/speakeasy-api/kit && cd kit
@@ -94,13 +98,13 @@ kit serve --root /path/to/project --remote-acp --no-a2a --no-stdio --http 0.0.0.
   --server-credential-file /private/token  # headless daemon
 ```
 
-OpenRouter and Speakeasy work the same way: `kit auth login openrouter`, `kit auth login speakeasy`, then `--provider openrouter --model anthropic/claude-sonnet-5`. Credentials are shared by providers and MCP servers through one backend (`--credential-store keychain|file|memory`).
+OpenRouter and Speakeasy use the same login process. Run `kit auth login openrouter` or `kit auth login speakeasy`. Then add `--provider openrouter --model anthropic/claude-sonnet-5` to the Kit command that you run. Providers and MCP servers share one credential backend (`--credential-store keychain|file|memory`).
 
 ## Feature tour
 
 ### One tool: `compose`
 
-The model writes a Runlet program. Kit renders the source live in the transcript while it runs — each call annotated idle/running/done, each binding waiting or resolved, loop and retry counters ticking — then replaces it with the result.
+The model writes a Runlet program. While the program runs, Kit shows the source in the transcript. Kit shows the status of each call and binding. Kit also shows loop and retry counters. When the program finishes, Kit replaces the source with the result.
 
 <p align="center"><img src="docs/media/compose-live.gif" alt="A compose program running with live call annotations" width="900"></p>
 
@@ -113,11 +117,11 @@ fixed   = after tests { return edit({ path: "calc.py", hunks: [ ... ] }) }
 return { tests: tests.success, counts, fixed }
 ```
 
-`tests` and `counts` run concurrently; `fixed` waits for `tests` via `after`. Hunk edits anchor on `context_before` / `old` / `context_after` and must match exactly once — no git required, atomic per file, permissions and CRLF preserved. Details: [Compose and local tools](docs/user/compose-and-local-tools.md).
+`tests` and `counts` run concurrently. The `fixed` binding waits for `tests` because it uses `after`. A hunk edit uses `context_before`, `old`, and `context_after` as anchors. The anchors must match exactly once. Hunk edits do not require Git. Each file edit is atomic and preserves permissions and CRLF line endings. See [Compose and local tools](docs/user/compose-and-local-tools.md).
 
 ### Subagents you can steer, continue, and fork
 
-A subagent is a Runlet value with an `id`, `output`, and `generation`. Continue the same session with `prompt`, branch it with `fork`, list with `subagents({})`, stop with `close`. A stale generation is rejected, so two continuations can never race one session silently.
+A subagent is a Runlet value with an `id`, `output`, and `generation`. Use `prompt` to continue the session. Use `fork` to create a branch. Use `subagents({})` to list active subagents. Use `close` to stop a subagent. Kit rejects a stale generation. This check prevents two continuations from updating one session at the same time.
 
 ```text
 review = subagent({
@@ -132,23 +136,23 @@ return { ranked: ranked.output, alt: alt.output, active: subagents({}) }
 
 <p align="center"><img src="docs/media/subagents.gif" alt="Kit orchestrating Claude Code and Codex subagents in parallel" width="900"></p>
 
-- **Any ACP harness.** `acp.kit` is built in. Add Claude Code, Codex, Cursor, or anything that speaks ACP v1 over stdio with four lines of TOML (below). Kit reads each harness's `initialize` response at runtime: native `session/fork` when advertised, isolated transcript fork for Kit children otherwise.
-- **Structured output.** `output_schema` on any turn-producing call; malformed replies return raw text with the generation advanced, so the next `prompt` can repair.
-- **Per-harness model aliases.** `[subagent.harnesses."acp.claude".models] architect = "opus"` lets the model ask for `model: "architect"` without knowing each harness's namespace; an `allow_model_overrides` list fences what it may pick.
-- **Bounded.** Depth 2, 120 live subagents per session, 30-second startup handshake, permission requests from headless children are rejected or cancelled — never auto-approved.
-- **Context is explicit.** Children start clean with the working directory, `AGENTS.md` chain, provider, MCP config, and credentials inherited (for `acp.kit`) and exactly the prompt you wrote. Skills load into a child on demand with `skill({ name })`.
+- **Any ACP harness.** Kit includes `acp.kit`. You can add Claude Code, Codex, Cursor, or another harness that supports ACP v1 over stdio. The TOML configuration below requires four lines. Kit reads each harness's `initialize` response at runtime. Kit uses native `session/fork` when the harness advertises it. Otherwise, Kit creates an isolated transcript fork for Kit children.
+- **Structured output.** Set `output_schema` on any call that produces a turn. If a reply does not match the schema, Kit returns the raw text and advances the generation. The next `prompt` can repair the reply.
+- **Per-harness model aliases.** `[subagent.harnesses."acp.claude".models] architect = "opus"` lets the model request `model: "architect"` without knowing the harness namespace. An `allow_model_overrides` list restricts the available models.
+- **Bounded resources.** Subagent depth is limited to 2. Each session can have 120 live subagents. The startup handshake has a 30-second limit. Kit rejects or cancels permission requests from headless children. Kit never approves these requests automatically.
+- **Explicit context.** Each child starts without the parent conversation history and receives only the prompt that you provide. An `acp.kit` child also inherits the working directory, `AGENTS.md` chain, provider, MCP configuration, and credentials. Skills load into a child on demand with `skill({ name })`.
 
-Docs: [Reusable subagents and ACP harnesses](docs/user/subagents-and-acp-harnesses.md).
+See [Reusable subagents and ACP harnesses](docs/user/subagents-and-acp-harnesses.md).
 
 ### Background work without losing the turn
 
-Add `background: true` to a `compose` call and the program detaches; `background: 60` runs in the foreground for a minute first. The turn ends, the conversation continues, and the result is delivered back into the session when it lands. `⌘B` in the TUI backgrounds the newest running call; `^K` kills a selected one; the model can `close({ call_id })`.
+Set `background: true` to detach a `compose` program immediately. Set `background: 60` to keep the program in the foreground for one minute before detachment. The turn ends, but the conversation continues. Kit adds the result to the session when the program finishes. In the TUI, use `⌘B` to move the newest running call to the background. Use `^K` to stop the selected call. The model can stop a call with `close({ call_id })`.
 
 <p align="center"><img src="docs/media/background.gif" alt="A background compose call completing after the turn already ended" width="900"></p>
 
 ### Steer a running turn
 
-Press `⏎` while the agent is working and the message is injected into the *current* turn (ACP v2 `steer`), not queued behind it. `esc` interrupts, `^c` clears then quits.
+While the agent works, press `Enter` to add a message to the *current* turn through ACP v2 `steer`. Kit does not queue the message for the next turn. Press `Esc` or `^C` to interrupt a running turn. When Kit is idle, press `^C` to clear a nonempty prompt. Press `^C` again to exit after the prompt is empty.
 
 <!-- PLACEHOLDER: record docs/media/steer.gif — start a longer task ("refactor calc.py into a class and add tests"), then while it is working type "actually keep it functional, just add docstrings" and press Enter. Capture the prompt placeholder changing from "message kit…" to "steer kit…" and the injected message appearing inside the running turn. -->
 
@@ -158,15 +162,17 @@ Press `⏎` while the agent is working and the message is injected into the *cur
 
 | Provider | Login | Notes |
 | --- | --- | --- |
-| `openai-subscription` | `kit auth login openai` | Native ChatGPT OAuth: PKCE + state + nonce, RS256 tokens validated against OpenAI's JWKS, loopback callback only. Refreshes five minutes before expiry, synchronized across processes. |
-| `openrouter` | `kit auth login openrouter` or `OPENROUTER_API_KEY` | Live model catalog with context-window lookup for the gauge and compaction. |
-| `speakeasy` | `kit auth login speakeasy` | Speakeasy AI Control Plane; Kit's session id maps to Gram's chat id so resumed conversations stay one thread. |
+| `openai-subscription` | `kit auth login openai` | Native ChatGPT OAuth uses PKCE, state, nonce, and RS256 tokens validated against OpenAI's JWKS. The callback uses loopback only. Kit refreshes tokens five minutes before expiry and synchronizes refreshes across processes. |
+| `openrouter` | `kit auth login openrouter` or `OPENROUTER_API_KEY` | Kit loads a live model catalog. It uses context-window data for the gauge and compaction. |
+| `speakeasy` | `kit auth login speakeasy` | Kit uses the Speakeasy AI Control Plane. Kit maps its session ID to the Gram chat ID so that a resumed conversation stays in one thread. |
 
-`/model sonnet` switches the live session at the next safe turn boundary; `tab` in the picker also rewrites `~/.kit/config.toml`. `/effort low|medium|high|default` does the same for reasoning effort.
+`/model sonnet` switches the live session at the next safe turn boundary. Press `Tab` in the picker to also update `~/.kit/config.toml`. Use `/effort low|medium|high|default` to change the reasoning effort.
 
-### MCP that loads itself
+### Live MCP configuration
 
-No restart to add a server. Kit reloads `mcp.json` before every `tool_search` and `auth` call, waits for new servers to settle, then ranks tools across all of them. OAuth is inferred from the server's Bearer challenge — no `auth` block needed; the model calls `auth({ name })`, hands you a URL, and the session resumes itself when the browser flow completes. A rejected call after token expiry refreshes and replays once.
+You do not need to restart Kit after you add a server. Kit reloads `mcp.json` before each `tool_search` and `auth` call. Kit waits for new servers to finish initialization. It then ranks tools from all configured servers.
+
+Kit detects OAuth from the server's Bearer challenge. An `auth` block is not necessary. The model calls `auth({ name })` and gives you a URL. After you complete the browser flow, Kit resumes the session. If an access token expires, Kit refreshes the token and repeats the rejected call once.
 
 <p align="center"><img src="docs/media/mcp.gif" alt="tool_search discovering an MCP web-search tool and calling it" width="900"></p>
 
@@ -177,11 +183,15 @@ No restart to add a server. Kit reloads `mcp.json` before every `tool_search` an
     "local":  { "command": "my-mcp-server", "args": ["--stdio"] } } }
 ```
 
-Docs: [MCP](docs/user/mcp.md).
+See [MCP](docs/user/mcp.md).
 
-### Agent Plugins and Skills
+### Agent Plugins and Agent Skills
 
-Kit loads validated [Agent Plugin](docs/user/agent-plugins.md) packages from a local directory or a SHA-256-pinned ZIP / tar.gz / tar URL — a GitHub tag archive works as-is. Plugin skills join the `skill` catalog; plugin `stdio` and `streamable-http` MCP servers come up without an `mcp.json`. [Agent Skills](https://agentskills.io/) are discovered from `<root>/.agents/skills` and `~/.agents/skills` and disclosed progressively: names and descriptions first, the full `SKILL.md` only when loaded.
+Kit loads validated [Agent Plugin](docs/user/agent-plugins.md) packages from a local directory or a SHA-256-pinned archive. Kit supports ZIP, tar.gz, tar, and GitHub tag archives.
+
+Plugin skills become available in the `skill` catalog. Kit starts plugin `stdio` and `streamable-http` MCP servers without an `mcp.json` file.
+
+Kit discovers [Agent Skills](https://agentskills.io/) in `<root>/.agents/skills` and `~/.agents/skills`. Kit initially shows only skill names and descriptions. Kit loads the full `SKILL.md` only when requested.
 
 ```toml
 [plugins.review]
@@ -197,9 +207,13 @@ subdir = "plugin"
 
 <!-- PLACEHOLDER: record docs/media/plugins.gif — with a plugin configured in ~/.kit/config.toml, start `kit tui` and ask "Which skills and MCP servers do you have from plugins? Load the review skill." Capture the skill catalog + plugin MCP server in tool_search's `mcp` status listing. -->
 
-### Sessions that persist, resume, and compact
+### Persistent sessions and context compaction
 
-Every conversation is an append-only JSONL transcript under `~/.kit/sessions`, synced to disk before Kit accepts the item into memory. Resume from the TUI, from `kit prompt --resume`, or from any ACP client with `session/load` / `session/resume`. When the provider reports context at 80% of the window, Kit checkpoints older history into a structured note, keeps the bootstrap instructions and a tool-safe tail, and persists the replacement — `/compact` does it on demand.
+Kit stores each conversation as an append-only JSONL transcript in `~/.kit/sessions`. Kit synchronizes each item to disk before it adds the item to memory.
+
+You can resume a session from the TUI or with the `--resume` option of `kit prompt`. ACP clients can use `session/load` or `session/resume`.
+
+When the provider reports 80% context-window use, Kit converts older history into a structured note. Kit persists the replacement. Kit retains the bootstrap instructions and a tool-safe tail. Use `/compact` to compact the history on demand.
 
 <p align="center"><img src="docs/media/sessions.png" alt="The /sessions picker" width="900"></p>
 <p align="center"><img src="docs/media/headless.gif" alt="kit prompt one-shot, then resuming the same session" width="900"></p>
@@ -208,26 +222,28 @@ Every conversation is an append-only JSONL transcript under `~/.kit/sessions`, s
 
 ### Long-running and headless by design
 
-- **Crash-safe.** One live process per session; a stale lock from a crashed process is reclaimed only when the OS proves nobody holds it (`--force`, or automatically when switching sessions in the TUI). An unanswered tool call is repaired with an explicit synthetic error result rather than a corrupted transcript.
-- **Patient with providers.** Transient failures (408/425/429/5xx, transport, pre-first-token stream drops) retry with deterministic full-jitter backoff under a 24-hour deadline, reusing the same idempotency key. Auth, quota, and post-output failures stop immediately.
-- **Daemon-friendly.** `kit serve --remote-acp --no-stdio` runs independently of stdin; `SIGINT`/`SIGTERM` stop new connections, interrupt live sessions, and drain for five seconds. One bearer token file guards the HTTP listener.
-- **Observable.** `otel_endpoint = "http://localhost:4317"` exports AgentKit GenAI spans over OTLP/gRPC for the main agent, ACP sessions, nested children, and the compactor. Message capture is off by default and bounded when on.
+- **Crash-safe.** Kit permits only one live process to modify each session. Kit reclaims a stale lock only when the operating system confirms that no process holds it. Use `--force` only with `--resume <session-id>` to reclaim a stale lock. The TUI also reclaims a stale lock when you switch sessions. Kit replaces an incomplete tool call with an explicit synthetic error result.
+- **OpenAI subscription retries.** Kit retries eligible transient failures with deterministic full-jitter backoff. Eligible failures include 408, 425, 429, 500, 502, 503, 504, and 529 responses. They also include transport failures and stream failures before the first token. The retry deadline is 24 hours. Kit reuses the same idempotency key. `openai-subscription` does not retry authentication failures, quota failures, or failures after output starts.
+- **Daemon operation.** `kit serve --remote-acp --no-stdio` runs independently of stdin. `SIGINT` and `SIGTERM` stop new connections, interrupt live sessions, and allow five seconds for draining. One bearer token file protects the HTTP listener.
+- **Observability.** Set `otel_endpoint = "http://localhost:4317"` to export AgentKit GenAI spans through OTLP/gRPC. Kit exports spans for the main agent, ACP sessions, nested children, and the compactor. Kit disables message-content capture by default. Kit limits captured message content when you enable it.
 
 <!-- PLACEHOLDER: screenshot docs/media/otel-trace.png — point otel_endpoint at a local Jaeger/Tempo, run a session with two subagents, screenshot the trace waterfall showing the nested gen_ai spans. -->
 
 ### Terminal client
 
-`kit tui` spawns `kit serve` and drives it over ACP — the client sees the same protocol any editor would. Highlights: drag-and-drop image and audio attachments (inline previews on Kitty/Sixel/iTerm2 terminals), click a code block to copy it, `^y` copies the last response as Markdown via OSC 52, `^l`/`^t` toggle the agent log and reasoning, `^o` folds tool output. Full key table in [TUI and sessions](docs/user/tui-and-sessions.md).
+`kit tui` starts `kit serve` and communicates with the server through ACP. The terminal client uses the same protocol as an editor. You can drag and drop image and audio attachments into the terminal. Terminals that support Kitty graphics, Sixel, or the iTerm2 inline image protocol show inline previews.
+
+Click a code block to copy its contents. Use `^y` to copy the last response as Markdown through OSC 52. Use `^l` and `^t` to toggle the agent log and reasoning views. Use `^o` to collapse tool output. See [TUI and sessions](docs/user/tui-and-sessions.md) for the complete key table.
 
 ### Editors and other clients over ACP
 
-Anything that speaks ACP can drive Kit: `kit acp` for stdio, or `kit serve --remote-acp` for HTTP/SSE and WebSocket at `/acp` (`/acp/v2` for v2-only clients). Kit also answers A2A v1 at the same listener and can call other A2A agents with `a2a({ url, prompt })`.
+Any ACP-compatible client can use Kit. Use `kit acp` for stdio. Use `kit serve --remote-acp` for HTTP/SSE or WebSocket connections at `/acp`. V2-only clients can use `/acp/v2`. Kit also supports A2A v1 on the same listener. Kit can call other A2A agents with `a2a({ url, prompt })`.
 
 <!-- PLACEHOLDER: screenshot docs/media/acp-editor.png — Kit running as an external agent inside an ACP-capable editor (e.g. Zed: add {"agent_servers": {"Kit": {"command": "kit", "args": ["acp", "--root", "."]}}} to settings.json). Show a prompt with a compose tool card rendered by the editor. -->
 
 ## Configuration
 
-`kit init` writes this; command-line flags override it.
+`kit init` writes this configuration. Command-line flags override the configuration.
 
 ```toml
 provider = "openai-subscription"   # openrouter | speakeasy
@@ -261,7 +277,7 @@ architect = "opus"
 flash = "openrouter:openai/gpt-5.6-luna"
 ```
 
-`AGENTS.md` files from the working directory and its ancestors are loaded as project instructions. Everything else: [Getting started and configuration](docs/user/getting-started-and-configuration.md).
+Kit loads `AGENTS.md` files from the working directory and its ancestors as project instructions. See [Getting started and configuration](docs/user/getting-started-and-configuration.md) for all other settings.
 
 ## How it compares
 
@@ -287,8 +303,8 @@ Kit used the fewest tokens, took the least active time, and needed the least ste
 - [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md)
 - [Releasing](docs/releasing.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
-The same docs are compiled into the binary; the agent searches them with `docs({ query })`.
+Kit compiles the same documentation into the binary. The agent searches this documentation with `docs({ query })`.
 
 ## Reporting issues
 
-[speakeasy-api/kit/issues](https://github.com/speakeasy-api/kit/issues). Include the Kit version and follow the [reporting guide](docs/user/reporting-kit-issues.md). Agents must ask before filing on your behalf.
+Report issues at [speakeasy-api/kit/issues](https://github.com/speakeasy-api/kit/issues). Include the Kit version and follow the [reporting guide](docs/user/reporting-kit-issues.md). An agent must ask for your permission before it files an issue for you.
