@@ -683,6 +683,20 @@ struct RunConfig {
     context: LaunchContext,
 }
 
+/// Keeps a nested harness's private runtime events out of the parent runtime.
+fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
+    if matches!(
+        crate::events::parse(line),
+        Some(
+            crate::events::RuntimeEvent::ChildStarted { .. }
+                | crate::events::RuntimeEvent::ChildFinished { .. }
+        )
+    ) {
+        return None;
+    }
+    Some(format!("ACP harness {label}: {line}"))
+}
+
 async fn run(
     run_config: RunConfig,
     rx: &mut mpsc::Receiver<Request>,
@@ -728,18 +742,8 @@ async fn run(
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if matches!(
-                crate::events::parse(&line),
-                Some(
-                    crate::events::RuntimeEvent::ChildStarted { .. }
-                        | crate::events::RuntimeEvent::ChildFinished { .. }
-                )
-            ) {
-                // Only nested tool events belong to this process's live script state.
-                // A harness's compaction changes its own transcript, not ours.
+            if let Some(line) = harness_diagnostic(&label, &line) {
                 eprintln!("{line}");
-            } else {
-                eprintln!("ACP harness {label}: {line}");
             }
         }
     });
@@ -1053,6 +1057,27 @@ mod tests {
 
     fn update(value: Value) -> SessionUpdate {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn nested_runtime_events_are_not_forwarded_as_parent_events() {
+        let event = crate::events::RuntimeEvent::ChildStarted {
+            call: "subagent-call:compose:shell".into(),
+            tool: "shell".into(),
+            summary: "inspect".into(),
+            at: 0,
+        };
+        let line = format!(
+            "{}{}",
+            crate::events::EVENT_MARKER,
+            serde_json::to_string(&event).unwrap()
+        );
+
+        assert_eq!(harness_diagnostic("kit", &line), None);
+        assert_eq!(
+            harness_diagnostic("kit", "ordinary diagnostic").as_deref(),
+            Some("ACP harness kit: ordinary diagnostic")
+        );
     }
 
     #[test]
