@@ -13,22 +13,33 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
-const MAX_PETNAME_ATTEMPTS: usize = 32;
+const MAX_RANDOM_NAME_ATTEMPTS: usize = 32;
+const AGENT_NAMES: &str = include_str!("agent_names.txt");
+
+fn agent_names() -> impl Iterator<Item = &'static str> {
+    AGENT_NAMES.lines()
+}
 
 fn allocate_name(used: &mut HashSet<String>) -> String {
-    allocate_name_with(used, || petname::petname(1, ""))
+    allocate_name_with(used, |catalog_len| {
+        let mut random = [0u8; size_of::<u64>()];
+        getrandom::fill(&mut random).ok()?;
+        Some((u64::from_ne_bytes(random) % catalog_len as u64) as usize)
+    })
 }
 
 fn allocate_name_with(
     used: &mut HashSet<String>,
-    mut candidate: impl FnMut() -> Option<String>,
+    mut random_index: impl FnMut(usize) -> Option<usize>,
 ) -> String {
-    for _ in 0..MAX_PETNAME_ATTEMPTS {
-        let Some(base) = candidate().and_then(|value| normalize_petname(&value)) else {
+    let catalog_len = agent_names().count();
+    for _ in 0..MAX_RANDOM_NAME_ATTEMPTS {
+        let Some(base) = random_index(catalog_len).and_then(|index| agent_names().nth(index))
+        else {
             continue;
         };
         for suffix in 1..=MAX_LIVE_SUBAGENTS + 1 {
-            let name = suffixed_name(&base, suffix);
+            let name = suffixed_name(base, suffix);
             if reserve_name(used, &name) {
                 return name;
             }
@@ -46,25 +57,6 @@ fn allocate_name_with(
 
 fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
     used.insert(name.to_lowercase())
-}
-
-fn normalize_petname(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.chars().count() > 32
-        || value
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-    {
-        return None;
-    }
-    let mut characters = value.chars();
-    let first = characters.next()?;
-    let normalized = first
-        .to_uppercase()
-        .chain(characters.flat_map(char::to_lowercase))
-        .collect::<String>();
-    (normalized.chars().count() <= 32).then_some(normalized)
 }
 
 fn suffixed_name(base: &str, suffix: usize) -> String {
@@ -995,6 +987,7 @@ impl CloseInput {
     }
 }
 
+#[cfg(test)]
 fn listing_id(value: &SubagentListing) -> &str {
     &value.id
 }
@@ -1288,50 +1281,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn petname_candidates_are_one_word_capitalized_and_collision_safe() {
-        let mut used = HashSet::from(["waffles".into()]);
-        let mut candidates = [Some("wAfFlEs".to_string())].into_iter();
+    fn curated_agent_name_catalog_has_exactly_350_valid_entries() {
+        let names = agent_names().collect::<Vec<_>>();
+        assert_eq!(names.len(), 350);
 
-        assert_eq!(
-            allocate_name_with(&mut used, || candidates.next().flatten()),
-            "Waffles 2"
-        );
+        let mut normalized = HashSet::new();
+        for name in names {
+            assert!((1..=16).contains(&name.len()), "invalid length: {name}");
+            assert!(
+                name.bytes().all(|byte| byte.is_ascii_alphabetic()),
+                "invalid characters: {name}"
+            );
+            assert!(
+                normalized.insert(name.to_ascii_lowercase()),
+                "duplicate: {name}"
+            );
+        }
     }
 
     #[test]
-    fn invalid_petname_candidates_are_bounded_before_agent_fallback() {
+    fn random_catalog_allocation_uses_selected_index() {
+        let mut used = HashSet::new();
+        let nimbus = agent_names().position(|name| name == "Nimbus").unwrap();
+        let mut calls = 0;
+
+        let allocated = allocate_name_with(&mut used, |catalog_len| {
+            calls += 1;
+            assert_eq!(catalog_len, 350);
+            Some(nimbus)
+        });
+
+        assert_eq!(calls, 1);
+        assert_eq!(allocated, "Nimbus");
+    }
+
+    #[test]
+    fn catalog_name_collisions_use_lowest_available_suffix() {
+        let mut used = HashSet::from(["nimbus".into(), "nimbus 2".into()]);
+        let nimbus = agent_names().position(|name| name == "Nimbus").unwrap();
+
+        assert_eq!(allocate_name_with(&mut used, |_| Some(nimbus)), "Nimbus 3");
+    }
+
+    #[test]
+    fn exhausted_random_catalog_allocation_uses_agent_fallback() {
         let mut used = HashSet::from(["agent 1".into()]);
         let mut calls = 0;
 
-        let allocated = allocate_name_with(&mut used, || {
+        let allocated = allocate_name_with(&mut used, |_| {
             calls += 1;
-            Some("not one word".into())
+            None
         });
 
-        assert_eq!(calls, MAX_PETNAME_ATTEMPTS);
+        assert_eq!(calls, MAX_RANDOM_NAME_ATTEMPTS);
         assert_eq!(allocated, "Agent 2");
     }
 
     #[test]
-    fn petname_allocation_retries_missing_names_and_accepts_a_valid_candidate() {
+    fn name_reservations_are_case_insensitive_and_reusable_after_release() {
         let mut used = HashSet::new();
-        let mut candidates = [None, Some("otter".to_string())].into_iter();
+        assert!(reserve_name(&mut used, "Nimbus"));
+        assert!(!reserve_name(&mut used, "nImBuS"));
 
-        assert_eq!(
-            allocate_name_with(&mut used, || candidates.next().flatten()),
-            "Otter"
-        );
-    }
-
-    #[test]
-    fn suffixes_remain_bounded_to_the_display_limit() {
-        let base = "x".repeat(32);
-        let mut used = HashSet::from([base.clone()]);
-        let mut candidates = [Some(base)].into_iter();
-        let allocated = allocate_name_with(&mut used, || candidates.next().flatten());
-
-        assert_eq!(allocated.chars().count(), 32);
-        assert!(allocated.ends_with(" 2"));
+        assert!(used.remove("nimbus"));
+        let nimbus = agent_names().position(|name| name == "Nimbus").unwrap();
+        assert_eq!(allocate_name_with(&mut used, |_| Some(nimbus)), "Nimbus");
     }
 
     #[tokio::test]
