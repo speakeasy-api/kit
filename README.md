@@ -265,7 +265,7 @@ flash = "openrouter:openai/gpt-5.6-luna"
 
 ## How it compares
 
-Kit, Codex CLI, and Claude Code shipped 16 Linear issues in the same production repository, [speakeasy-api/gram](https://github.com/speakeasy-api/gram), during July–August 2026. All 16 pull requests merged.
+Kit, Codex CLI, and Claude Code were used to complete production engineering tasks during July–August 2026. The observed work covered admin dashboards and billing flows, authentication and session fixes, telemetry, external integrations, and CI/build performance. All 16 resulting pull requests merged.
 
 | Median per hand-written line (300–1000-line PRs) | Kit | Codex CLI | Claude Code |
 | --- | ---: | ---: | ---: |
@@ -274,7 +274,7 @@ Kit, Codex CLI, and Claude Code shipped 16 Linear issues in the same production 
 | Active time | **Best (0.13 min)** | 138% more (0.31 min) | 138% more (0.31 min) |
 | User messages per session | **Best (5)** | 180% more (14) | 120% more (11) |
 
-Kit used the fewest tokens, took the least active time, and needed the least steering. Two Kit runs merged from a single message. [See the per-session data and method](docs/harness-comparison.md).
+Kit used the fewest tokens, took the least active time, and needed the least steering. Two Kit runs merged from a single message.
 
 ## Documentation
 
@@ -285,7 +285,6 @@ Kit used the fewest tokens, took the least active time, and needed the least ste
 - [Agent Plugins](docs/user/agent-plugins.md)
 - [TUI and sessions](docs/user/tui-and-sessions.md)
 - [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md)
-- [Harness comparison](docs/harness-comparison.md)
 - [Releasing](docs/releasing.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 The same docs are compiled into the binary; the agent searches them with `docs({ query })`.
