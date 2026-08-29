@@ -35,7 +35,7 @@ The calling model should give each new `subagent` and `fork` a concise role-orie
 
 Kit trims preferred names and accepts 1–32 bytes of printable ASCII. Names compare case-insensitively among one parent's direct live children; clashes receive the lowest available numeric suffix, with the base shortened as needed to stay within 32 bytes. The immutable `s-…` ID remains authoritative; names never select handles.
 
-A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Nested Kit processes allocate independently, so separate descendant branches can generate duplicate visible names in the agents roster even though each parent keeps its direct-child names unique.
+A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Nested Kit processes allocate independently, so separate descendant branches can generate duplicate visible names in the agent roster even though each parent keeps its direct-child names unique.
 
 Use `subagents({})` to inspect live direct children. Each row contains `id`, `name`, `status`, `generation`, and the bounded current task summary. Closed and terminally retired children are omitted.
 

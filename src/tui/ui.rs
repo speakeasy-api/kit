@@ -1486,7 +1486,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::faint())
-        .title(Span::styled(" agents roster ", theme::accent()));
+        .title(Span::styled(" agent roster ", theme::accent()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2023,7 +2023,7 @@ mod tests {
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
         let initial = terminal.backend().buffer();
-        assert_eq!(buffer_cells(initial, 0, 1..16), " agents roster ");
+        assert_eq!(buffer_cells(initial, 0, 1..16), " agent roster ");
         assert_eq!(buffer_cells(initial, 1, 1..10), "○ Scout 0");
         assert_eq!(buffer_cells(initial, 2, 3..9), "Task 0");
         assert_eq!(buffer_cells(initial, 3, 1..10), "○ Scout 1");
