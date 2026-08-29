@@ -37,7 +37,7 @@ A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` us
 | `Up` / `Down` | Move through prompt lines, then prompt history |
 | `Shift+Up` / `Shift+Down`, `PageUp` / `PageDown`, mouse wheel | Scroll the transcript |
 | `Ctrl+Home` / `Ctrl+End` | Jump to transcript top / bottom |
-| `Ctrl+R` / `Ctrl+L` / `Ctrl+T` | Toggle the Agents panel / agent log / reasoning |
+| `Ctrl+R` / `Ctrl+L` / `Ctrl+T` | Toggle the agents roster / agent log / reasoning |
 | `Ctrl+K` | Kill the selected running background tool call; otherwise delete to the end of the editor line |
 | `Ctrl+O`, or click a tool card | Fold or unfold raw tool output |
 | `Ctrl+Y` | Copy the latest agent response as original Markdown |
@@ -73,15 +73,15 @@ Press `Command+B` to detach the newest running foreground top-level compose call
 
 At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly discarding it and quitting in one step; press it again with the empty editor to quit.
 
-## Monitor subagents in the Agents panel
+## Monitor subagents in the agents roster
 
-Press `Ctrl+R` or enter the exact local command `/agents` while idle to toggle the Agents panel. The panel keeps its own visibility and scroll position. The roster covers every subagent observable to the current top-level Kit process tree, whether its call is foreground or background and regardless of the focused transcript block or tool call. Direct children are tree roots, and nested Kit descendants appear immediately beneath their parent at arbitrary depth in an always-expanded tree. Siblings retain lifecycle/creation/ID ordering within each parent, so an active child remains grouped beneath an idle parent instead of moving across subtrees. A descendant whose parent event has not arrived temporarily appears as a root with `Name · via Parent` and automatically reparents when the parent arrives. Generic ACP has no portable child-session enumeration, so agents created privately inside a generic harness cannot appear unless the harness forwards compatible Kit runtime events.
+Press `Ctrl+R` or enter the exact local command `/agents` while idle to toggle the agents roster. The roster keeps its own visibility and scroll position. The roster covers every subagent observable to the current top-level Kit process tree, whether its call is foreground or background and regardless of the focused transcript block or tool call. Direct children are tree roots, and nested Kit descendants appear immediately beneath their parent at arbitrary depth in an always-expanded tree. Siblings retain lifecycle/creation/ID ordering within each parent, so an active child remains grouped beneath an idle parent instead of moving across subtrees. A descendant whose parent event has not arrived temporarily appears as a root with `Name · via Parent` and automatically reparents when the parent arrives. Generic ACP has no portable child-session enumeration, so agents created privately inside a generic harness cannot appear unless the harness forwards compatible Kit runtime events.
 
 Each row uses two lines, with tree connectors and indentation continuing across both. The first contains a glyph and display name; the second contains the bounded task summary and a duration right-aligned to the panel's inner edge. When starting or forking a subagent, the parent model preferably supplies a concise role-oriented name such as `Round 2 Implementer` or `Reviewer`; omitted or invalid names fall back to `Agent N`, and case-insensitive sibling collisions receive a numeric suffix. Task text truncates before the reserved duration column. The glyph palette is yellow `Pulse::Child` for `starting`, cyan `Pulse::Tool` for `working`, and dim `○` for ordinary or successful `idle`. A failed reusable idle row shows a red `✗` for four seconds after its failure timestamp, then returns to dim `○`; a failed terminal or removed tombstone shows the red `✗` for four seconds, then its row is deleted. Active durations update on animation ticks, freeze when the generation becomes idle or fails, and restart for a later prompt.
 
 A fixed footer remains visible while rows scroll, for example `3 agents · 2 working · 1 idle`; it includes the total and only nonzero `starting`, `working`, and `idle` buckets. Foreground and background are not separate buckets. Footer accounting remains lifecycle-based during the four-second grace: reusable failures count as idle immediately, while closed and terminally retired handles leave the live total immediately even while a tombstone remains visible. Idle rows remain until their handles are closed.
 
-When the Agents panel is visible, terminals at least 108 columns wide show the transcript beside a fixed 46-column panel. Terminals at most 107 columns wide stack the transcript and panel with a 55/45 height split. Hiding Agents restores the transcript to the full main area.
+When the agents roster is visible, terminals at least 108 columns wide show the transcript beside a fixed 46-column panel. Terminals at most 107 columns wide stack the transcript and roster with a 55/45 height split. Hiding the roster restores the transcript to the full main area.
 
 ## Manage sessions and compact from the TUI
 
@@ -101,7 +101,7 @@ The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, a
 /agents
 ```
 
-These local commands are available only while the session is idle. `/agents` toggles the Agents panel without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace; Up and Down move, Enter uses the existing resume flow, and Esc closes the dialog. `/close` closes the current session and exits the TUI.
+These local commands are available only while the session is idle. `/agents` toggles the agents roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace; Up and Down move, Enter uses the existing resume flow, and Esc closes the dialog. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 

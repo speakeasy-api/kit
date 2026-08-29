@@ -1005,7 +1005,7 @@ fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
 fn display_name_schema() -> serde_json::Value {
-    json!({"type":"string","maxLength":MAX_DISPLAY_NAME_LEN,"description":"Prefer a concise role-oriented display name based on the task, such as `Round 2 Implementer` or `Reviewer`. Kit falls back to `Agent N` when omitted or invalid."})
+    json!({"type":"string","description":"Prefer a concise role-oriented display name based on the task, such as `Round 2 Implementer` or `Reviewer`. Valid names are 1-32 bytes of printable ASCII. Kit falls back to `Agent N` when omitted or invalid."})
 }
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
@@ -1436,14 +1436,16 @@ mod tests {
         let manager = manager_with_generic_harness(directory.path(), Vec::new());
         let subagent = SubagentTool::new(manager.clone(), 1);
         let fork = ForkTool::new(manager, 1);
-        assert_eq!(
-            fork.spec.input_schema["properties"]["name"]["maxLength"],
-            32
-        );
-        assert_eq!(
-            subagent.spec.input_schema["properties"]["name"]["maxLength"],
-            32
-        );
+        for schema in [&subagent.spec.input_schema, &fork.spec.input_schema] {
+            let name = &schema["properties"]["name"];
+            assert!(name.get("maxLength").is_none());
+            assert!(
+                name["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("1-32 bytes of printable ASCII")
+            );
+        }
     }
 
     #[test]
