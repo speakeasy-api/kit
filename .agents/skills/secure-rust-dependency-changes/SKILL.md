@@ -8,7 +8,9 @@ description: Use whenever a Rust dependency is added or updated, including direc
 ## Preconditions
 
 1. Resolve the repository root, requested base, worktree, branch, and dependency change. Classify it as an addition or an update. Inspect repository instructions, release/versioning rules, and contribution guidance before changing files.
-2. Require a clean target worktree unless the user explicitly authorizes mixing changes. If a fresh worktree was requested, fetch the base and create it first.
+2. Choose the worktree policy by change type:
+   - For a standalone dependency update, use a clean or isolated worktree. If a fresh worktree was requested, fetch the base and create it first.
+   - For a dependency introduced during feature development, use the existing feature worktree even when it contains in-progress changes. Never stash, reset, or discard that work. Record the current manifest and lockfile delta so the dependency can be audited without attributing unrelated feature edits to it.
 3. Locate every relevant manifest and lockfile entry. For updates, use `cargo tree -i <crate>@<version>` to identify direct and transitive users, exact pins, upper bounds, and active features.
 
 ## Security audit — every addition and update
