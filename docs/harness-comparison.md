@@ -1,6 +1,6 @@
 # Harness comparison: Kit vs Codex CLI vs Claude Code
 
-Observational numbers from one developer's local transcripts, parsed on 2026-08-29 with the scripts in [`scripts/harness-comparison/`](../scripts/harness-comparison/). This is not a benchmark: models, tasks, and time periods differ. Read the [caveats](#caveats) before quoting anything.
+Observational numbers from the session transcripts of one developer who used all three tools for day-to-day work, parsed on 2026-08-29 with the scripts in [`scripts/harness-comparison/`](../scripts/harness-comparison/). This is not a benchmark: models, tasks, and time periods differ. Read the [caveats](#caveats) before quoting anything.
 
 ## Corpora
 

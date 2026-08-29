@@ -13,7 +13,6 @@
   <a href="https://github.com/speakeasy-api/kit/releases"><img alt="Release" src="https://img.shields.io/github/v/release/speakeasy-api/kit?display_name=tag&sort=semver"></a>
   <a href="https://github.com/speakeasy-api/kit/pkgs/container/kit"><img alt="Container" src="https://img.shields.io/badge/ghcr.io-speakeasy--api%2Fkit-blue"></a>
   <a href="https://github.com/speakeasy-api/kit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/speakeasy-api/kit/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="docs/harness-comparison.md"><img alt="Median request size" src="https://img.shields.io/badge/median%20request-41k%20tokens-brightgreen"></a>
 </p>
 
 ```sh
@@ -25,16 +24,16 @@ kit init && kit auth login openai && kit tui
 
 ## Why Kit
 
-Most agent harnesses hand the model a bag of twenty tools and pay one model round trip per call. Kit hands it **one tool, `compose`**, whose argument is a small program in [Runlet](https://github.com/danielkov/runlet). One round trip can read three files, run the tests, apply a hunk edit, retry a flaky command, fan out to five subagents, and return a single structured value.
+Most agent harnesses expose many tools and pay one model round trip per call. Kit exposes **one tool, `compose`**, whose argument is a short program in [Runlet](https://github.com/danielkov/runlet). A single round trip can read several files, run the tests, apply an edit, retry a flaky command, delegate to subagents, and return one structured value.
 
-The effect on context is measurable. Across ~2,600 real sessions on this machine, the median API request under Kit carried **41k tokens** against 64k for Codex CLI and 85k for Claude Code; median peak context per session was **70k vs 96k vs 120k**. [Full comparison and caveats below.](#how-it-compares)
+This keeps requests small. In a comparison of real coding sessions run with Kit, Codex CLI, and Claude Code, the median API request under Kit carried **41k tokens** against 64k and 85k, and median peak context per session was **70k against 96k and 120k**. [How the comparison was made, and its limits.](#how-it-compares)
 
 - **One tool, unlimited composition.** `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool`, `auth`, `skill`, `a2a`, `docs` are the tools a `compose` program calls. Independent calls run concurrently; data dependencies and `after` blocks express ordering; `boundary retry N` and `fail()` handle errors in-program.
-- **Subagents are values, not fire-and-forget tasks.** Start one, prompt it again, fork it, demand JSON that matches a schema, close it. Point it at another harness — Claude Code, Codex, Cursor, or Kit itself — over ACP.
+- **Subagents are values, not fire-and-forget tasks.** Start one, prompt it again, fork it, require JSON that matches a schema, close it. Point it at another harness — Claude Code, Codex, Cursor, or Kit itself — over ACP.
 - **Speaks the open protocols.** ACP v1/v2 over stdio, HTTP/SSE, and WebSocket for editors and clients; A2A v1 in both directions; MCP with live config reload and reactive OAuth; Agent Skills and Agent Plugin packages.
-- **Built for sessions that outlive a coffee break.** Append-only JSONL transcripts synced before acceptance, automatic compaction at 80% of the context window, resumable from `tui`, `prompt`, or any ACP client, crash-safe locks, provider retries under a 24-hour deadline.
+- **Built for long sessions.** Append-only JSONL transcripts synced before acceptance, automatic compaction at 80% of the context window, resumable from `tui`, `prompt`, or any ACP client, crash-safe locks, provider retries under a 24-hour deadline.
 - **Bring your own model.** ChatGPT subscription via native OAuth, OpenRouter, or the Speakeasy AI Control Plane. Switch with `/model` mid-session.
-- **Deliberately small.** No permissions framework, no sandbox theater, no web UI. `--root` is a working directory. Kit is a runtime, not a security boundary — [read the trust model](docs/user/security-limits-and-troubleshooting.md).
+- **Deliberately small.** No permissions framework, no sandbox, no web UI. `--root` is a working directory. Kit is a runtime, not a security boundary; run it inside one you already trust. [Trust model.](docs/user/security-limits-and-troubleshooting.md)
 
 ## Install
 
@@ -143,7 +142,7 @@ Docs: [Reusable subagents and ACP harnesses](docs/user/subagents-and-acp-harness
 
 ### Background work without losing the turn
 
-Add `background: true` to a `compose` call and the program detaches; `background: 60` runs in the foreground for a minute first. The turn ends, the model keeps talking, and the result is delivered back into the session when it lands. `⌘B` in the TUI backgrounds the newest running call; `^K` kills a selected one; the model can `close({ call_id })`.
+Add `background: true` to a `compose` call and the program detaches; `background: 60` runs in the foreground for a minute first. The turn ends, the conversation continues, and the result is delivered back into the session when it lands. `⌘B` in the TUI backgrounds the newest running call; `^K` kills a selected one; the model can `close({ call_id })`.
 
 <p align="center"><img src="docs/media/background.gif" alt="A background compose call completing after the turn already ended" width="900"></p>
 
@@ -205,7 +204,7 @@ Every conversation is an append-only JSONL transcript under `~/.kit/sessions`, s
 <p align="center"><img src="docs/media/sessions.png" alt="The /sessions picker" width="900"></p>
 <p align="center"><img src="docs/media/headless.gif" alt="kit prompt one-shot, then resuming the same session" width="900"></p>
 
-<!-- PLACEHOLDER: record docs/media/long-session.png — resume one of your multi-hour sessions (e.g. the DNO-881 run with 11 compactions), send one small prompt, and screenshot the header once the gauge shows a high percentage (e.g. "78% 212k/272k"). Optionally a second frame right after the automatic checkpoint fires. -->
+<!-- PLACEHOLDER: record docs/media/long-session.png — resume a multi-hour session, send one small prompt, and screenshot the header once the gauge shows a high percentage (e.g. "78% 212k/272k"). Optionally a second frame right after the automatic checkpoint fires. -->
 
 ### Long-running and headless by design
 
@@ -214,7 +213,7 @@ Every conversation is an append-only JSONL transcript under `~/.kit/sessions`, s
 - **Daemon-friendly.** `kit serve --remote-acp --no-stdio` runs independently of stdin; `SIGINT`/`SIGTERM` stop new connections, interrupt live sessions, and drain for five seconds. One bearer token file guards the HTTP listener.
 - **Observable.** `otel_endpoint = "http://localhost:4317"` exports AgentKit GenAI spans over OTLP/gRPC for the main agent, ACP sessions, nested children, and the compactor. Message capture is off by default and bounded when on.
 
-In the local corpus, single Kit sessions have run for 4.7 hours of active work, 886 API requests, and 11 automatic compactions ([details](docs/harness-comparison.md)).
+Single Kit sessions have run for 4.7 hours of active work, 886 API requests, and 11 automatic compactions ([details](docs/harness-comparison.md)).
 
 <!-- PLACEHOLDER: screenshot docs/media/otel-trace.png — point otel_endpoint at a local Jaeger/Tempo, run a session with two subagents, screenshot the trace waterfall showing the nested gen_ai spans. -->
 
@@ -268,7 +267,7 @@ flash = "openrouter:openai/gpt-5.6-luna"
 
 ## How it compares
 
-Numbers below come from parsing every Kit, Codex CLI, and Claude Code transcript on one developer's machine (144 / 374 / 344 top-level sessions plus their subagents, 2025-10 → 2026-08). They are observational, not a benchmark: different models, different tasks, different months. The scripts and the full report with matched task families are in [docs/harness-comparison.md](docs/harness-comparison.md).
+The numbers below were computed from the session transcripts of one developer who used all three tools for day-to-day work: 144 Kit, 374 Codex CLI, and 344 Claude Code sessions plus their subagents, recorded between October 2025 and August 2026. They are observational, not a benchmark: different models, different tasks, different months. The scripts and the full report with matched task families are in [docs/harness-comparison.md](docs/harness-comparison.md).
 
 | Median per session | Kit | Codex CLI | Claude Code |
 | --- | ---: | ---: | ---: |
@@ -279,13 +278,13 @@ Numbers below come from parsing every Kit, Codex CLI, and Claude Code transcript
 | Sessions using subagents | **36%** | 2% | 18% |
 | Max subagent nesting observed | 2 | 2 | 1 |
 
-On the closest matched family — shipping a Linear issue end-to-end in the same repository — total spend was the same order of magnitude for all three (~45M input tokens median), while Kit's peak context stayed lowest (266k) despite the smallest window (272k) and 20–34 subagents per run. Kit is not cheaper per task in this sample; it spends the budget in smaller, more parallel requests. Read the [caveats](docs/harness-comparison.md#caveats) before quoting anything.
+On the closest matched family — shipping a Linear issue end-to-end in the same repository — total spend was the same order of magnitude for all three (~45M input tokens median), while Kit's peak context stayed lowest (266k) despite the smallest window (272k) and 20–34 subagents per run. Kit is not cheaper per task in this sample; it spends the budget in smaller, more parallel requests. See the [caveats](docs/harness-comparison.md#caveats) before drawing conclusions.
 
 <!-- PLACEHOLDER: optional chart docs/media/comparison.svg — bar chart of the "input tokens per API request" and "peak context" rows; generate from scripts/harness-comparison/analyze.py output. -->
 
 ## Deliberate limits
 
-The root is a working directory, not a sandbox: `shell` has the host's authority and `edit` accepts absolute paths. Edits are atomic per file, not per turn. Subagents are child processes sharing the root, bounded to depth two. Background compose calls live as long as the Kit process. Without `--server-credential-file` the HTTP listener has no authentication — never expose it beyond loopback. There is no plan to add an approval framework; put Kit inside the boundary you already trust (a container, a VM, a CI runner).
+The root is a working directory, not a sandbox: `shell` has the host's authority and `edit` accepts absolute paths. Edits are atomic per file, not per turn. Subagents are child processes sharing the root, bounded to depth two. Background compose calls live as long as the Kit process. Without `--server-credential-file` the HTTP listener has no authentication — never expose it beyond loopback. There is no plan to add an approval framework; run Kit inside a boundary you already trust, such as a container, a VM, or a CI runner.
 
 ## Documentation
 
