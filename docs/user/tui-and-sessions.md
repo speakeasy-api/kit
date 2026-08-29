@@ -10,11 +10,14 @@ Start an interactive session at a project root with the installed binary:
 kit tui --root /path/to/project
 ```
 
-Resume the ID shown in the header:
+List sessions for the workspace, then resume the ID shown in the header or catalog:
 
 ```sh
+kit sessions --root /path/to/project
 kit tui --root /path/to/project --resume <session-id>
 ```
+
+The catalog requires an existing directory and is workspace-filtered and newest-first. It reports each durable ID and updated time. The title comes from the earliest retained useful user text so compaction does not rename a session; the preview describes the current retained history. Display metadata removes terminal controls and Unicode default-ignorable formatting characters.
 
 A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
 
@@ -72,12 +75,13 @@ At an idle, non-empty editor, `Ctrl+C` clears the prompt instead of unexpectedly
 
 ## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/resume`, `/close`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, and `/effort` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
 /new Start by reviewing the tests
 /resume <session-id>
+/sessions
 /close
 /compact
 /compact Continue with the migration
@@ -86,7 +90,7 @@ The TUI handles `/new`, `/resume`, `/close`, `/model`, and `/effort` as exact lo
 /effort high
 ```
 
-These local commands are available only while the session is idle. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript. `/close` closes the current session and exits the TUI.
+These local commands are available only while the session is idle. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace; Up and Down move, Enter uses the existing resume flow, and Esc closes the dialog. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
@@ -97,10 +101,12 @@ The ACP server advertises `compact` for every new session. The TUI submits `/com
 Kit stores durable JSONL transcripts, locks, and session-associated fatal error logs in:
 
 ```text
-~/.kit/sessions/<session-id>.jsonl
-~/.kit/sessions/<session-id>.lock
+~/.kit/sessions/w-<workspace-hash>/<session-id>.jsonl
+~/.kit/sessions/w-<workspace-hash>/<session-id>.lock
 ~/.kit/errors/<session-id>/<event-id>.json
 ```
+
+The workspace hash is the BLAKE3 digest of the canonical workspace-root path. It keeps identical session IDs in different workspaces in separate storage directories.
 
 Fatal error records use their own versioned JSON schema and are not transcript content. Schema v2 adds optional structured transport diagnostics; schema v1 records remain readable. Transport diagnostics contain only bounded, allowlisted request/stream stage, retry, attempt, the provider's strictly validated `x-request-id` value, reqwest classification, and typed Hyper, HTTP/2, and I/O fields. Unknown or truncated source chains are identified without storing source text. Kit never stores raw error display/debug text, arbitrary headers, prompts, tool arguments, response bodies, credentials, URLs, or peer-controlled HTTP/2 debug text in these records. Files are written atomically with owner-only permissions on Unix, and Kit retains the newest 50 records per session. Cancellation is not a fatal error and does not create a record. When persistence succeeds, local prompt and ACP terminal errors include the log path; A2A records stay server-local.
 
@@ -108,13 +114,13 @@ Fatal error records use their own versioned JSON schema and are not transcript c
 
 Transcript records are versioned and have consecutive generations. Transcript schema v3 records the canonical workspace root so ACP discovery and resume cannot expose a session to another project; schema v1 and v2 records remain readable and gain that binding when they are next resumed. Normal items are appended and synced to disk before they are accepted into the in-memory conversation. Operations such as compaction append a replacement record; older records remain in the JSONL file, but readers treat the latest valid replacement as the canonical transcript.
 
-Older sessions under `<root>/.kit/sessions` remain readable. The first resume validates and copies a legacy transcript into `~/.kit/sessions`; a live legacy lock produces `legacy session is actively locked by another Kit instance ...; stop it before resuming with this Kit version`. When both locations contain the ID, the global transcript is preferred.
+Older sessions stored directly under `~/.kit/sessions` or under `<root>/.kit/sessions` remain readable. On resume, Kit compares workspace-hashed, workspace-bound global, and project-local candidates and selects the history that descends from the others; equivalent histories prefer the workspace-hashed copy, while divergent histories fail instead of choosing silently. An old global transcript without workspace metadata is a fallback only for an explicit resume when no workspace-hashed or project-local candidate has that ID. The first successful resume copies the authoritative history into the workspace-hashed directory and leaves redirects in applicable legacy files. A live legacy lock produces `legacy session is actively locked by another Kit instance ...; stop it before resuming with this Kit version`.
 
 ### ACP session loading
 
-ACP v1 clients restore a closed durable session with `session/load`. The v1 endpoint advertises only the protocol's top-level `loadSession` capability; it does not advertise `session/resume` or `session/list`. ACP v2 clients use `session/list` and `session/resume` instead. Both versions use the exact durable session ID and return the same model and reasoning configuration options as `session/new`.
+ACP v1 clients restore a closed durable session with `session/load` and discover sessions with the optional `session/list` capability. ACP v2 clients use `session/list` and `session/resume`. Both list variants use the same newest-first catalog, optional exact-cwd filter, and opaque `offset:<n>` pagination cursors, and return titles and RFC 3339 updated times. Both versions use the exact durable session ID and return the same model and reasoning configuration options as `session/new`.
 
-Session discovery and restoration are isolated to the server's canonical workspace root. A requested workspace must match that root, and additional directories are not accepted. Legacy transcripts under a project-local `.kit/sessions` directory follow the same migration and root checks as CLI resume; they do not make a same-named session visible from another workspace.
+Session discovery and restoration are isolated to the server's canonical workspace root. A requested workspace must match that root, and additional directories are not accepted. Legacy transcripts under a project-local `.kit/sessions` directory follow the same migration and root checks as CLI resume; they do not make a same-named session visible from another workspace. Old global transcripts without workspace metadata are excluded from discovery in every workspace, but an explicit resume by ID remains supported and binds the transcript to that workspace. An individually malformed or concurrently incomplete transcript is omitted from catalog results without preventing valid sessions from being listed; explicit resume remains strict and reports its error.
 
 An arbitrary ACP load or resume never applies the server process's configured `--force` setting. The one exception is the initial resume requested by `kit tui --resume <id> --force`: only that matching configured session may use the explicit stale-lock override. If another live Kit instance owns the session lock, restoration fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can restore it again.
 

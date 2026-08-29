@@ -42,6 +42,8 @@ use super::{
 pub enum Update {
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
+    /// Result of listing sessions without blocking the terminal event loop.
+    SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
     /// A steer was accepted but has not been delivered into the transcript yet.
     SteerAccepted { id: String, text: String },
     /// A user message delivered or replayed by the agent.
@@ -203,6 +205,10 @@ pub struct EffortDialog {
     pub save_defaults: bool,
 }
 
+pub struct SessionDialog {
+    pub selected: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentKind {
     Image,
@@ -238,6 +244,7 @@ pub enum Action {
         inject: bool,
     },
     New(Option<String>),
+    ListSessions,
     Resume(String),
     Close,
     SelectModel {
@@ -482,6 +489,8 @@ pub struct App {
     pub reasoning_effort: String,
     pub effort_choices: Vec<EffortChoice>,
     pub effort_dialog: Option<EffortDialog>,
+    pub session_choices: Vec<crate::session::CatalogEntry>,
+    pub session_dialog: Option<SessionDialog>,
     pub available_commands: Vec<String>,
     pub a2a: String,
     pub session_id: Option<String>,
@@ -750,6 +759,8 @@ impl App {
             reasoning_effort: "default".into(),
             effort_choices: Vec::new(),
             effort_dialog: None,
+            session_choices: Vec::new(),
+            session_dialog: None,
             available_commands: Vec::new(),
             a2a,
             session_id: None,
@@ -1328,6 +1339,16 @@ impl App {
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::A2aAddress(address) => self.a2a = address,
+            Update::SessionCatalog(result) => match result {
+                Ok(entries) if entries.is_empty() => {
+                    self.toast("no sessions found for this workspace");
+                }
+                Ok(entries) => {
+                    self.session_choices = entries;
+                    self.session_dialog = Some(SessionDialog { selected: 0 });
+                }
+                Err(error) => self.toast(format!("could not list sessions: {error}")),
+            },
             Update::AvailableCommands {
                 session_id,
                 commands,
@@ -1928,10 +1949,43 @@ impl App {
         Action::None
     }
 
+    fn handle_session_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => self.session_dialog = None,
+            KeyCode::Up => {
+                if let Some(dialog) = &mut self.session_dialog {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dialog) = &mut self.session_dialog {
+                    dialog.selected =
+                        (dialog.selected + 1).min(self.session_choices.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self
+                    .session_dialog
+                    .as_ref()
+                    .map_or(0, |dialog| dialog.selected);
+                if let Some(entry) = self.session_choices.get(selected) {
+                    let id = entry.id.clone();
+                    self.session_dialog = None;
+                    return Action::Resume(id);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if self.session_dialog.is_some() {
+            return self.handle_session_key(key);
         }
         if self.model_dialog.is_some() {
             return self.handle_model_key(key);
@@ -2040,6 +2094,7 @@ impl App {
                         self.toast("usage: /resume <session-id>");
                         Action::None
                     }
+                    Parsed::Sessions => Action::ListSessions,
                     Parsed::Close => Action::Close,
                     Parsed::Model { query: Some(query) } => match self.closest_model(query) {
                         Some(choice) => Action::SelectModel {
@@ -3498,6 +3553,54 @@ mod tests {
             model_choice("anthropic", "claude-3-7-sonnet"),
             model_choice("openrouter", "anthropic/claude-sonnet-4"),
         ]
+    }
+
+    #[test]
+    fn sessions_command_defers_catalog_work_to_the_event_loop() {
+        let mut app = app();
+        app.editor.insert_str("/sessions");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ListSessions
+        ));
+        assert!(app.session_dialog.is_none());
+    }
+
+    #[test]
+    fn session_catalog_update_opens_the_dialog() {
+        let mut app = app();
+        app.apply(Update::SessionCatalog(Ok(vec![
+            crate::session::CatalogEntry {
+                id: "saved".into(),
+                title: Some("Saved".into()),
+                preview: None,
+                updated_at: 0,
+            },
+        ])));
+        assert_eq!(app.session_choices[0].id, "saved");
+        assert!(app.session_dialog.is_some());
+    }
+
+    #[test]
+    fn session_dialog_selects_a_catalog_entry_for_existing_resume_flow() {
+        let mut app = app();
+        app.session_choices = ["newer", "older"]
+            .into_iter()
+            .map(|id| crate::session::CatalogEntry {
+                id: id.into(),
+                title: Some(format!("{id} title")),
+                preview: None,
+                updated_at: 0,
+            })
+            .collect();
+        app.session_dialog = Some(super::SessionDialog { selected: 0 });
+
+        assert!(matches!(app.handle_key(press(KeyCode::Down)), Action::None));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::Resume(id) if id == "older"
+        ));
+        assert!(app.session_dialog.is_none());
     }
 
     #[test]
