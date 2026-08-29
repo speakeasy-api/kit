@@ -26,8 +26,8 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 
 use super::{
     app::{
-        AgentRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage, CachedTranscriptRow,
-        Child, CodeHit, Phase, ToolCall, UserMessage,
+        AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
+        CachedTranscriptRow, Child, CodeHit, Phase, ToolCall, UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -1475,7 +1475,13 @@ fn agent_duration(millis: u64) -> String {
     duration
 }
 
-fn agent_lines(row: &AgentRow, tick: usize, now_unix_ms: u64, width: usize) -> [Line<'static>; 2] {
+fn agent_lines(
+    tree_row: &AgentTreeRow<'_>,
+    tick: usize,
+    now_unix_ms: u64,
+    width: usize,
+) -> [Line<'static>; 2] {
+    let row = tree_row.row;
     let failed = row.outcome == Some(GenerationOutcome::Failed)
         && row
             .generation_finished_at_unix_ms
@@ -1494,12 +1500,41 @@ fn agent_lines(row: &AgentRow, tick: usize, now_unix_ms: u64, width: usize) -> [
         }
         SubagentStatus::Idle | SubagentStatus::Removed => ("○", theme::dim()),
     };
-    let ancestry = row
-        .parent_name
-        .as_ref()
-        .map(|name| format!(" · via {name}"))
-        .unwrap_or_default();
+    let ancestry = if tree_row.missing_parent {
+        row.parent_name
+            .as_ref()
+            .map(|name| format!(" · via {name}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut first_prefix = String::new();
+    let mut second_prefix = String::new();
+    if tree_row.depth == 0 {
+        second_prefix.push_str(if tree_row.has_next_sibling {
+            "│ "
+        } else {
+            "  "
+        });
+    } else {
+        for has_next in &tree_row.ancestor_has_next_sibling {
+            let connector = if *has_next { "│  " } else { "   " };
+            first_prefix.push_str(connector);
+            second_prefix.push_str(connector);
+        }
+        first_prefix.push_str(if tree_row.has_next_sibling {
+            "├─ "
+        } else {
+            "└─ "
+        });
+        second_prefix.push_str(if tree_row.has_next_sibling {
+            "│  "
+        } else {
+            "   "
+        });
+    }
     let first = Line::from(vec![
+        Span::styled(first_prefix, theme::faint()),
         Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(row.name.clone(), theme::text()),
         Span::styled(ancestry, theme::faint()),
@@ -1515,17 +1550,18 @@ fn agent_lines(row: &AgentRow, tick: usize, now_unix_ms: u64, width: usize) -> [
         duration
     };
     let prefix_width = width.saturating_sub(duration_width);
-    let second = if prefix_width < 3 {
+    let tree_prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
+    let second = if prefix_width <= tree_prefix_width {
         Line::from(vec![
             Span::raw(" ".repeat(prefix_width)),
             Span::styled(displayed_duration, theme::faint()),
         ])
     } else {
-        let task_width = prefix_width - 3;
+        let task_width = prefix_width - tree_prefix_width - 1;
         let task = truncate_to_width(&row.task, task_width);
         let task_padding = task_width.saturating_sub(UnicodeWidthStr::width(task.as_str()));
         Line::from(vec![
-            Span::raw("  "),
+            Span::styled(second_prefix, theme::faint()),
             Span::styled(task, theme::dim()),
             Span::raw(" ".repeat(task_padding + 1)),
             Span::styled(displayed_duration, theme::faint()),
@@ -1547,11 +1583,11 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_agents_viewport(area, visible_rows);
     let now = crate::events::now_millis();
     let lines = app
-        .agents()
+        .agent_tree_rows()
         .into_iter()
         .skip(app.agents_scroll())
         .take(visible_rows)
-        .flat_map(|row| agent_lines(row, app.tick, now, inner.width as usize))
+        .flat_map(|row| agent_lines(&row, app.tick, now, inner.width as usize))
         .collect::<Vec<_>>();
     let rows_area = Rect {
         height: row_area_height,
@@ -1598,7 +1634,14 @@ fn draw_graph(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     };
-    let lines = wrap(&graph_lines(app, call), inner.width.max(1) as usize);
+    let graph = graph_lines(app, call)
+        .into_iter()
+        .map(|line| (LinkedLine::plain(line), ()))
+        .collect::<Vec<_>>();
+    let lines = wrap_linked_tagged(&graph, inner.width.max(1) as usize)
+        .into_iter()
+        .map(|(line, (), _, _)| line)
+        .collect::<Vec<_>>();
     let offset = lines.len().saturating_sub(inner.height as usize);
     frame.render_widget(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
@@ -1966,14 +2009,14 @@ mod tests {
 
     use super::{
         BodyLayout, MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
-        graph_lines, model_dialog_rows, model_dialog_viewport, prompt_lines,
-        refresh_transcript_cache, refresh_transcript_cache_with_images, user_block_rows, user_line,
+        model_dialog_rows, model_dialog_viewport, prompt_lines, refresh_transcript_cache,
+        refresh_transcript_cache_with_images, user_block_rows, user_line,
     };
     use crate::{
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         tui::app::{
-            Action, AgentRow, App, Block, EffortChoice, EffortDialog, ModelDialog, Update,
-            UserImage, UserMessage,
+            Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog, ModelDialog,
+            Update, UserImage, UserMessage,
         },
     };
 
@@ -2001,6 +2044,21 @@ mod tests {
         }
     }
 
+    fn tree_row(
+        row: &AgentRow,
+        ancestor_has_next_sibling: Vec<bool>,
+        has_next_sibling: bool,
+        missing_parent: bool,
+    ) -> AgentTreeRow<'_> {
+        AgentTreeRow {
+            row,
+            depth: ancestor_has_next_sibling.len(),
+            ancestor_has_next_sibling,
+            has_next_sibling,
+            missing_parent,
+        }
+    }
+
     fn line_text(line: &ratatui::text::Line<'_>) -> String {
         line.spans
             .iter()
@@ -2017,14 +2075,14 @@ mod tests {
             None,
             "Trace ACP lifecycle",
         );
-        let lines = agent_lines(&top, 0, 74_000, 48);
+        let lines = agent_lines(&tree_row(&top, vec![], false, false), 0, 74_000, 48);
         assert_eq!(line_text(&lines[0]), "⠋ Scout");
         let second = line_text(&lines[1]);
         assert_eq!(second, "  Trace ACP lifecycle                     1m 12s");
         assert_eq!(&second[42..48], "1m 12s");
         assert_eq!(unicode_width::UnicodeWidthStr::width(second.as_str()), 48);
         assert_eq!(
-            lines[0].spans[0].style.fg,
+            lines[0].spans[1].style.fg,
             Some(ratatui::style::Color::Cyan)
         );
 
@@ -2035,18 +2093,27 @@ mod tests {
             Some("Pip"),
             "Trace ACP lifecycle",
         );
-        let lines = agent_lines(&nested, 0, 74_000, 48);
+        let lines = agent_lines(&tree_row(&nested, vec![true], false, false), 0, 74_000, 48);
+        assert_eq!(line_text(&lines[0]), "│  └─ ⠁ Scout");
+        assert!(line_text(&lines[1]).starts_with("│     Trace ACP lifecycle"));
+
+        let lines = agent_lines(&tree_row(&nested, vec![false], true, false), 0, 74_000, 48);
+        assert_eq!(line_text(&lines[0]), "   ├─ ⠁ Scout");
+        assert!(line_text(&lines[1]).starts_with("   │  Trace ACP lifecycle"));
+
+        let lines = agent_lines(&tree_row(&nested, vec![], true, true), 0, 74_000, 48);
         assert_eq!(line_text(&lines[0]), "⠁ Scout · via Pip");
+        assert!(line_text(&lines[1]).starts_with("│ Trace ACP lifecycle"));
         assert_eq!(
-            lines[0].spans[0].style.fg,
+            lines[0].spans[1].style.fg,
             Some(ratatui::style::Color::Yellow)
         );
 
         let idle = test_agent("Scout", SubagentStatus::Idle, None, None, "done");
-        let idle_lines = agent_lines(&idle, 0, 74_000, 20);
+        let idle_lines = agent_lines(&tree_row(&idle, vec![], false, false), 0, 74_000, 20);
         assert_eq!(line_text(&idle_lines[0]), "○ Scout");
         assert!(
-            idle_lines[0].spans[0]
+            idle_lines[0].spans[1]
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::DIM)
@@ -2059,14 +2126,14 @@ mod tests {
             "failed",
         );
         failed.generation_finished_at_unix_ms = Some(72_000);
-        let failed_lines = agent_lines(&failed, 0, 74_000, 20);
+        let failed_lines = agent_lines(&tree_row(&failed, vec![], false, false), 0, 74_000, 20);
         assert_eq!(line_text(&failed_lines[0]), "✗ Scout");
         assert_eq!(
-            failed_lines[0].spans[0].style.fg,
+            failed_lines[0].spans[1].style.fg,
             Some(ratatui::style::Color::Red)
         );
         assert_eq!(
-            line_text(&agent_lines(&failed, 0, 77_000, 20)[0]),
+            line_text(&agent_lines(&tree_row(&failed, vec![], false, false), 0, 77_000, 20,)[0]),
             "○ Scout"
         );
     }
@@ -2080,14 +2147,14 @@ mod tests {
             None,
             "🦀🦀 lifecycle work",
         );
-        let lines = agent_lines(&row, 0, 3_500, 12);
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), 0, 3_500, 12);
         assert_eq!(line_text(&lines[1]), "  🦀🦀… 1.5s");
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
             12
         );
 
-        let lines = agent_lines(&row, 0, 3_500, 4);
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), 0, 3_500, 4);
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
             4
@@ -2483,6 +2550,7 @@ mod tests {
     #[test]
     fn compose_script_runs_inline_with_live_annotations_at_full_width() {
         let mut app = sample();
+        app.graph_pinned = Some(false);
 
         let frame = render(&mut app, 120, 40);
 
@@ -2833,6 +2901,7 @@ mod tests {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let mut app = sample();
+        app.graph_pinned = Some(false);
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()
@@ -2978,6 +3047,7 @@ mod tests {
         use crate::tui::app::Selection;
 
         let mut app = sample();
+        app.graph_pinned = Some(false);
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()
@@ -3088,6 +3158,7 @@ mod tests {
         };
 
         let mut app = sample();
+        app.graph_pinned = Some(false);
         let frame = render(&mut app, 100, 24);
         let row = frame
             .lines()

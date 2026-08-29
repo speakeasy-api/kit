@@ -1065,19 +1065,12 @@ async fn forward_stderr(
     mut output: impl FnMut(ForwardedStderr),
 ) {
     let mut lines = BufReader::new(stderr).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if crate::events::parse(&line).is_some_and(|event| event.forward_from_child()) {
-                    // Preserve recursively forwarded private runtime events byte-for-byte.
-                    output(ForwardedStderr::RuntimeLine(line));
-                } else {
-                    output(ForwardedStderr::Diagnostic(format!(
-                        "ACP harness {label}: {line}"
-                    )));
-                }
-            }
-            Ok(None) | Err(_) => break,
+    while let Ok(Some(line)) = lines.next_line().await {
+        if crate::events::parse(&line).is_some_and(|event| event.forward_from_child()) {
+            // Preserve recursively forwarded private runtime events byte-for-byte.
+            output(ForwardedStderr::RuntimeLine(line));
+        } else if let Some(line) = harness_diagnostic(label, &line) {
+            output(ForwardedStderr::Diagnostic(line));
         }
     }
     if let Some(ancestor_id) = ancestor_id {

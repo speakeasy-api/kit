@@ -501,6 +501,15 @@ pub struct AgentRow {
     pub generation_finished_at_unix_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTreeRow<'a> {
+    pub row: &'a AgentRow,
+    pub depth: usize,
+    pub ancestor_has_next_sibling: Vec<bool>,
+    pub has_next_sibling: bool,
+    pub missing_parent: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AgentCounts {
     pub total: usize,
@@ -1234,17 +1243,116 @@ impl App {
         self.clamp_agents_scroll();
     }
 
+    #[cfg(test)]
     pub fn agents(&self) -> Vec<&AgentRow> {
-        let mut rows: Vec<_> = self.agents.values().collect();
-        rows.sort_by_key(|row| {
-            let status = match row.status {
+        self.agent_tree_rows()
+            .into_iter()
+            .map(|tree_row| tree_row.row)
+            .collect()
+    }
+
+    pub fn agent_tree_rows(&self) -> Vec<AgentTreeRow<'_>> {
+        fn status_rank(status: SubagentStatus) -> u8 {
+            match status {
                 SubagentStatus::Starting => 0,
                 SubagentStatus::Working => 1,
                 SubagentStatus::Idle => 2,
                 SubagentStatus::Removed => 3,
-            };
-            (status, row.created_at_unix_ms, row.id.as_str())
-        });
+            }
+        }
+
+        fn compare_rows(left: &&AgentRow, right: &&AgentRow) -> std::cmp::Ordering {
+            (
+                status_rank(left.status),
+                left.created_at_unix_ms,
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    status_rank(right.status),
+                    right.created_at_unix_ms,
+                    right.id.as_str(),
+                ))
+        }
+
+        fn ancestry_is_acyclic(row: &AgentRow, agents: &HashMap<String, AgentRow>) -> bool {
+            let mut seen = HashSet::new();
+            let mut current = row;
+            while let Some(parent) = current
+                .parent_id
+                .as_deref()
+                .and_then(|parent_id| agents.get(parent_id))
+            {
+                if !seen.insert(current.id.as_str()) {
+                    return false;
+                }
+                current = parent;
+            }
+            seen.insert(current.id.as_str())
+        }
+
+        fn append_subtree<'a>(
+            row: &'a AgentRow,
+            children: &HashMap<&str, Vec<&'a AgentRow>>,
+            ancestor_has_next_sibling: &[bool],
+            has_next_sibling: bool,
+            missing_parent: bool,
+            rows: &mut Vec<AgentTreeRow<'a>>,
+        ) {
+            rows.push(AgentTreeRow {
+                row,
+                depth: ancestor_has_next_sibling.len(),
+                ancestor_has_next_sibling: ancestor_has_next_sibling.to_vec(),
+                has_next_sibling,
+                missing_parent,
+            });
+            if let Some(descendants) = children.get(row.id.as_str()) {
+                let mut child_ancestors = ancestor_has_next_sibling.to_vec();
+                child_ancestors.push(has_next_sibling);
+                for (index, descendant) in descendants.iter().enumerate() {
+                    append_subtree(
+                        descendant,
+                        children,
+                        &child_ancestors,
+                        index + 1 < descendants.len(),
+                        false,
+                        rows,
+                    );
+                }
+            }
+        }
+
+        let mut roots = Vec::new();
+        let mut children: HashMap<&str, Vec<&AgentRow>> = HashMap::new();
+        for row in self.agents.values() {
+            if ancestry_is_acyclic(row, &self.agents)
+                && let Some(parent_id) = row
+                    .parent_id
+                    .as_deref()
+                    .filter(|parent_id| self.agents.contains_key(*parent_id))
+            {
+                children.entry(parent_id).or_default().push(row);
+            } else {
+                roots.push(row);
+            }
+        }
+        roots.sort_by(compare_rows);
+        for siblings in children.values_mut() {
+            siblings.sort_by(compare_rows);
+        }
+
+        let mut rows = Vec::with_capacity(self.agents.len());
+        for (index, root) in roots.iter().enumerate() {
+            append_subtree(
+                root,
+                &children,
+                &[],
+                index + 1 < roots.len(),
+                root.parent_id
+                    .as_deref()
+                    .is_some_and(|parent_id| !self.agents.contains_key(parent_id)),
+                &mut rows,
+            );
+        }
         rows
     }
 
@@ -1936,6 +2044,7 @@ impl App {
         self.apply_agent_runtime_at(event, crate::events::now_millis());
     }
 
+    #[cfg(test)]
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
         match event {
             RuntimeEvent::SubagentStateChanged { .. }
@@ -3030,9 +3139,7 @@ mod tests {
                 Some(GenerationOutcome::Success),
                 1,
                 None,
-                10,
-                20,
-                Some(30),
+                (10, 20, Some(30)),
             ),
             100,
         );
@@ -4127,10 +4234,9 @@ mod tests {
         outcome: Option<crate::events::GenerationOutcome>,
         generation: u64,
         parent: Option<(&str, &str)>,
-        created: u64,
-        started: u64,
-        finished: Option<u64>,
+        timing: (u64, u64, Option<u64>),
     ) -> RuntimeEvent {
+        let (created, started, finished) = timing;
         RuntimeEvent::SubagentStateChanged {
             id: id.into(),
             name: name.into(),
@@ -4160,9 +4266,7 @@ mod tests {
                 Some(GenerationOutcome::Success),
                 1,
                 None,
-                10,
-                20,
-                Some(30),
+                (10, 20, Some(30)),
             ),
             100,
         );
@@ -4174,9 +4278,7 @@ mod tests {
                 None,
                 2,
                 Some(("idle", "Scout")),
-                11,
-                50,
-                None,
+                (11, 50, None),
             ),
             100,
         );
@@ -4188,9 +4290,7 @@ mod tests {
                 None,
                 1,
                 None,
-                9,
-                40,
-                None,
+                (9, 40, None),
             ),
             100,
         );
@@ -4200,7 +4300,7 @@ mod tests {
                 .iter()
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["starting", "working", "idle"]
+            vec!["starting", "idle", "working"]
         );
         assert_eq!(
             app.agents()
@@ -4227,9 +4327,7 @@ mod tests {
                 None,
                 1,
                 None,
-                11,
-                20,
-                None,
+                (11, 20, None),
             ),
             100,
         );
@@ -4241,9 +4339,7 @@ mod tests {
                 Some(GenerationOutcome::Success),
                 2,
                 Some(("idle", "Scout")),
-                11,
-                50,
-                Some(90),
+                (11, 50, Some(90)),
             ),
             100,
         );
@@ -4258,6 +4354,261 @@ mod tests {
     }
 
     #[test]
+    fn agents_render_roots_and_arbitrary_depth_in_tree_order() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("child", "Child")),
+                (4, 4, Some(5)),
+            ),
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "great",
+                "Great",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("grand", "Grand")),
+                (5, 5, Some(6)),
+            ),
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("root", "Root")),
+                (3, 3, Some(4)),
+            ),
+            agent_event(
+                "other",
+                "Other",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (2, 2, Some(3)),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "child", "grand", "great", "other"]
+        );
+        let tree = app.agent_tree_rows();
+        assert_eq!(tree[0].ancestor_has_next_sibling, Vec::<bool>::new());
+        assert!(tree[0].has_next_sibling);
+        assert_eq!(tree[1].ancestor_has_next_sibling, vec![true]);
+        assert_eq!(tree[2].ancestor_has_next_sibling, vec![true, false]);
+        assert_eq!(tree[3].ancestor_has_next_sibling, vec![true, false, false]);
+        assert!(!tree[4].has_next_sibling);
+    }
+
+    #[test]
+    fn agents_sort_siblings_but_keep_active_descendants_with_idle_parents() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "idle-root",
+                "Idle",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "late-child",
+                "Late",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("idle-root", "Idle")),
+                (4, 4, None),
+            ),
+            agent_event(
+                "early-child",
+                "Early",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("idle-root", "Idle")),
+                (3, 3, None),
+            ),
+            agent_event(
+                "starting-child",
+                "Starting",
+                SubagentStatus::Starting,
+                None,
+                1,
+                Some(("idle-root", "Idle")),
+                (5, 5, None),
+            ),
+            agent_event(
+                "active-root",
+                "Active",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (2, 2, None),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "active-root",
+                "idle-root",
+                "starting-child",
+                "early-child",
+                "late-child"
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_missing_parent_falls_back_to_root_then_reparents() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("parent", "Parent")),
+                (2, 2, None),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "other",
+                "Other",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (3, 3, Some(4)),
+            ),
+            100,
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child", "other"]
+        );
+        assert!(app.agent_tree_rows()[0].missing_parent);
+
+        app.apply_runtime_at(
+            agent_event(
+                "parent",
+                "Parent",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            100,
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "child", "other"]
+        );
+        assert!(!app.agent_tree_rows()[1].missing_parent);
+    }
+
+    #[test]
+    fn malformed_agent_parent_cycles_render_every_row_once_as_roots() {
+        use std::collections::HashSet;
+
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "a",
+                "A",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("b", "B")),
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "b",
+                "B",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("a", "A")),
+                (2, 2, Some(3)),
+            ),
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("a", "A")),
+                (3, 3, None),
+            ),
+            agent_event(
+                "self",
+                "Self",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("self", "Self")),
+                (4, 4, Some(5)),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        let tree = app.agent_tree_rows();
+        assert_eq!(tree.len(), 4);
+        assert!(tree.iter().all(|row| row.depth == 0));
+        let ids = tree
+            .iter()
+            .map(|row| row.row.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids, HashSet::from(["a", "b", "child", "self"]));
+    }
+
+    #[test]
     fn agents_remove_strict_descendants_and_expire_failed_tombstones() {
         use crate::events::{GenerationOutcome, SubagentStatus};
         let mut app = app();
@@ -4269,9 +4620,7 @@ mod tests {
                 None,
                 1,
                 None,
-                1,
-                1,
-                Some(2),
+                (1, 1, Some(2)),
             ),
             100,
         );
@@ -4283,9 +4632,7 @@ mod tests {
                 None,
                 1,
                 Some(("root", "Root")),
-                2,
-                2,
-                Some(3),
+                (2, 2, Some(3)),
             ),
             100,
         );
@@ -4297,9 +4644,7 @@ mod tests {
                 None,
                 1,
                 Some(("child", "Child")),
-                3,
-                3,
-                None,
+                (3, 3, None),
             ),
             100,
         );
@@ -4324,9 +4669,7 @@ mod tests {
                 None,
                 1,
                 Some(("root", "Root")),
-                2,
-                2,
-                Some(3),
+                (2, 2, Some(3)),
             ),
             100,
         );
@@ -4340,9 +4683,7 @@ mod tests {
                 Some(GenerationOutcome::Failed),
                 1,
                 None,
-                4,
-                10,
-                Some(1_000),
+                (4, 10, Some(1_000)),
             ),
             1_000,
         );
@@ -4361,9 +4702,7 @@ mod tests {
                 Some(GenerationOutcome::Success),
                 1,
                 None,
-                5,
-                10,
-                Some(20),
+                (5, 10, Some(20)),
             ),
             100,
         );
@@ -4376,9 +4715,7 @@ mod tests {
                 None,
                 1,
                 None,
-                5,
-                10,
-                None,
+                (5, 10, None),
             ),
             100,
         );
@@ -4397,9 +4734,7 @@ mod tests {
                 None,
                 1,
                 None,
-                1,
-                1,
-                Some(2),
+                (1, 1, Some(2)),
             ),
             agent_event(
                 "child",
@@ -4408,9 +4743,7 @@ mod tests {
                 None,
                 1,
                 Some(("root", "Root")),
-                2,
-                2,
-                None,
+                (2, 2, None),
             ),
             agent_event(
                 "grand",
@@ -4419,9 +4752,7 @@ mod tests {
                 None,
                 2,
                 Some(("child", "Child")),
-                3,
-                3,
-                None,
+                (3, 3, None),
             ),
             agent_event(
                 "great",
@@ -4430,9 +4761,7 @@ mod tests {
                 None,
                 3,
                 Some(("grand", "Grand")),
-                4,
-                4,
-                Some(5),
+                (4, 4, Some(5)),
             ),
         ] {
             app.apply_runtime_at(event, 100);
@@ -4454,9 +4783,7 @@ mod tests {
                 None,
                 1,
                 Some(("root", "Root")),
-                2,
-                2,
-                None,
+                (2, 2, None),
             ),
             agent_event(
                 "grand",
@@ -4465,9 +4792,7 @@ mod tests {
                 None,
                 2,
                 Some(("child", "Child")),
-                3,
-                3,
-                Some(90),
+                (3, 3, Some(90)),
             ),
             agent_event(
                 "great",
@@ -4476,9 +4801,7 @@ mod tests {
                 None,
                 4,
                 Some(("grand", "Grand")),
-                4,
-                80,
-                None,
+                (4, 80, None),
             ),
         ] {
             app.apply_runtime_at(event, 100);
@@ -4499,9 +4822,7 @@ mod tests {
                 None,
                 1,
                 None,
-                10,
-                10,
-                None,
+                (10, 10, None),
             ),
             100,
         );
@@ -4551,9 +4872,7 @@ mod tests {
                     None,
                     1,
                     None,
-                    index,
-                    1,
-                    Some(2),
+                    (index, 1, Some(2)),
                 ),
                 100,
             );
