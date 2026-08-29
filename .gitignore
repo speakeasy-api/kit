@@ -5,3 +5,4 @@
 /.kit-codesign-identity
 /.env
 .DS_Store
+scripts/harness-comparison/sessions.json
