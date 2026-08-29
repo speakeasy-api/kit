@@ -248,23 +248,23 @@ The optional serialized handle field is a backward-compatible schema addition. I
 
 Focused tests will cover:
 
-1. Exactly 350 ASCII alphabetic catalog entries, 1–16 characters long and case-insensitively unique.
-2. Random catalog selection, collision suffixing, bounded retries, and emergency `Agent N` fallback.
-3. Atomic case-insensitive allocation and collision suffixes under concurrent sibling starts.
+1. Real faker first names normalize to valid display names without asserting a specific random value.
+2. Invalid and case-insensitively reserved candidates reroll for exactly 64 attempts before the emergency `Agent N` fallback.
+3. Atomic case-insensitive allocation and rerolling under concurrent sibling starts, without numeric suffixes on successful faker names.
 4. Release after failed creation, explicit close, and terminal retirement.
-5. Name preservation across `prompt` and fresh random assignment across `fork`.
-7. Starting, working, idle, failed-reusable, retired, and closed transitions.
-8. Current handles with names and compatibility with old handles lacking names.
-9. Deterministic enriched direct-child `subagents({})` listings.
-10. Runtime-event serialization, parsing, background delivery, and transition ordering.
-11. Parent-context propagation and recursive forwarding across nested Kit runtimes.
-12. Top-level deduplication by immutable ID and strict-descendant cleanup after child or forwarding exit.
-13. Duplicate visible labels across branches remain separate internal rows.
-14. Reusable and terminal failure glyph grace, row retention, and footer accounting.
-15. `Ctrl+R` and `/agents` toggling without changing `Ctrl+G`.
-16. Two-column, three-column, and exact 40/30/30 narrow vertical layouts.
-17. Two-line rows, palette A indicators, right-justified duration, truncation, sorting, scrolling, and aggregate footer counts.
-18. Config documentation examples and relevant schema/snapshot expectations.
+5. Name preservation across `prompt` and fresh faker assignment across `fork`.
+6. Starting, working, idle, failed-reusable, retired, and closed transitions.
+7. Current handles with names and compatibility with old handles lacking names.
+8. Deterministic enriched direct-child `subagents({})` listings.
+9. Runtime-event serialization, parsing, background delivery, and transition ordering.
+10. Parent-context propagation and recursive forwarding across nested Kit runtimes.
+11. Top-level deduplication by immutable ID and strict-descendant cleanup after child or forwarding exit.
+12. Duplicate visible labels across independently allocating branches remain separate internal rows.
+13. Reusable and terminal failure glyph grace, row retention, and footer accounting.
+14. `Ctrl+R` and `/agents` toggling without changing `Ctrl+G`.
+15. Two-column, three-column, and exact 40/30/30 narrow vertical layouts.
+16. Two-line rows, palette A indicators, right-justified duration, truncation, sorting, scrolling, and aggregate footer counts.
+17. Documentation and relevant schema/snapshot expectations, including the absence of naming configuration or tool inputs.
 
 The smallest relevant unit and TUI tests should run during development, followed by the repository's standard targeted verification for the touched crates.
 
