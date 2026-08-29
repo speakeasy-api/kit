@@ -8,41 +8,40 @@ use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use fake::{Fake, faker::name::en::FirstName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
-const MAX_RANDOM_NAME_ATTEMPTS: usize = 32;
-const AGENT_NAMES: &str = include_str!("agent_names.txt");
+const MAX_RANDOM_NAME_ATTEMPTS: usize = 64;
 
-fn agent_names() -> impl Iterator<Item = &'static str> {
-    AGENT_NAMES.lines()
+type NameGenerator = Arc<dyn Fn() -> String + Send + Sync>;
+
+fn faker_first_name() -> String {
+    FirstName().fake()
 }
 
-fn allocate_name(used: &mut HashSet<String>) -> String {
-    allocate_name_with(used, |catalog_len| {
-        let mut random = [0u8; size_of::<u64>()];
-        getrandom::fill(&mut random).ok()?;
-        Some((u64::from_ne_bytes(random) % catalog_len as u64) as usize)
-    })
+fn normalize_display_name(candidate: &str) -> Option<String> {
+    let name = candidate.trim();
+    if (1..=32).contains(&name.len()) && name.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        Some(name.to_string())
+    } else {
+        None
+    }
 }
 
-fn allocate_name_with(
-    used: &mut HashSet<String>,
-    mut random_index: impl FnMut(usize) -> Option<usize>,
-) -> String {
-    let catalog_len = agent_names().count();
+fn allocate_name(used: &mut HashSet<String>, generate: &NameGenerator) -> String {
+    allocate_name_with(used, || generate())
+}
+
+fn allocate_name_with(used: &mut HashSet<String>, mut generate: impl FnMut() -> String) -> String {
     for _ in 0..MAX_RANDOM_NAME_ATTEMPTS {
-        let Some(base) = random_index(catalog_len).and_then(|index| agent_names().nth(index))
-        else {
+        let Some(name) = normalize_display_name(&generate()) else {
             continue;
         };
-        for suffix in 1..=MAX_LIVE_SUBAGENTS + 1 {
-            let name = suffixed_name(base, suffix);
-            if reserve_name(used, &name) {
-                return name;
-            }
+        if reserve_name(used, &name) {
+            return name;
         }
     }
 
@@ -57,15 +56,6 @@ fn allocate_name_with(
 
 fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
     used.insert(name.to_lowercase())
-}
-
-fn suffixed_name(base: &str, suffix: usize) -> String {
-    if suffix == 1 {
-        return base.to_string();
-    }
-    let suffix = format!(" {suffix}");
-    let keep = 32usize.saturating_sub(suffix.chars().count());
-    format!("{}{}", base.chars().take(keep).collect::<String>(), suffix)
 }
 
 fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
@@ -102,6 +92,7 @@ pub struct Subagents {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
+    name_generator: NameGenerator,
     #[cfg(test)]
     failed_removals: Arc<Mutex<Vec<FailedRemoval>>>,
     #[cfg(test)]
@@ -250,6 +241,7 @@ impl Subagents {
                 events::emit(event);
                 Ok(())
             }),
+            name_generator: Arc::new(faker_first_name),
             #[cfg(test)]
             failed_removals: Arc::default(),
             #[cfg(test)]
@@ -290,6 +282,15 @@ impl Subagents {
     #[cfg(test)]
     fn with_event_sink_for_test(mut self, event_sink: EventSink) -> Self {
         self.event_sink = event_sink;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_name_generator_for_test(
+        mut self,
+        generate: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.name_generator = Arc::new(generate);
         self
     }
 
@@ -764,7 +765,7 @@ impl Subagents {
             .values()
             .map(|entry| entry.name.to_lowercase())
             .collect::<HashSet<_>>();
-        let name = allocate_name(&mut used);
+        let name = allocate_name(&mut used, &self.name_generator);
         state.name.clone_from(&name);
         let event = state.runtime_event(id.clone());
         let state = Arc::new(AsyncMutex::new(state));
@@ -1281,56 +1282,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn curated_agent_name_catalog_has_exactly_350_valid_entries() {
-        let names = agent_names().collect::<Vec<_>>();
-        assert_eq!(names.len(), 350);
-
-        let mut normalized = HashSet::new();
-        for name in names {
-            assert!((1..=16).contains(&name.len()), "invalid length: {name}");
-            assert!(
-                name.bytes().all(|byte| byte.is_ascii_alphabetic()),
-                "invalid characters: {name}"
-            );
-            assert!(
-                normalized.insert(name.to_ascii_lowercase()),
-                "duplicate: {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn random_catalog_allocation_uses_selected_index() {
+    fn faker_allocator_uses_the_first_valid_available_candidate_without_a_suffix() {
         let mut used = HashSet::new();
-        let nimbus = agent_names().position(|name| name == "Nimbus").unwrap();
-        let mut calls = 0;
+        let mut candidates = ["  Ada  "].into_iter();
 
-        let allocated = allocate_name_with(&mut used, |catalog_len| {
-            calls += 1;
-            assert_eq!(catalog_len, 350);
-            Some(nimbus)
-        });
-
-        assert_eq!(calls, 1);
-        assert_eq!(allocated, "Nimbus");
+        assert_eq!(
+            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
+            "Ada"
+        );
     }
 
     #[test]
-    fn catalog_name_collisions_use_lowest_available_suffix() {
-        let mut used = HashSet::from(["nimbus".into(), "nimbus 2".into()]);
-        let nimbus = agent_names().position(|name| name == "Nimbus").unwrap();
+    fn faker_allocator_rerolls_case_insensitive_clashes() {
+        let mut used = HashSet::from(["ada".into()]);
+        let mut candidates = ["aDa", "Grace"].into_iter();
 
-        assert_eq!(allocate_name_with(&mut used, |_| Some(nimbus)), "Nimbus 3");
+        assert_eq!(
+            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
+            "Grace"
+        );
     }
 
     #[test]
-    fn exhausted_random_catalog_allocation_uses_agent_fallback() {
+    fn faker_allocator_rerolls_multiple_clashes() {
+        let mut used = HashSet::from(["ada".into(), "grace".into()]);
+        let mut candidates = ["Ada", "GRACE", "Linus"].into_iter();
+
+        assert_eq!(
+            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
+            "Linus"
+        );
+    }
+
+    #[test]
+    fn faker_allocator_rerolls_invalid_candidates() {
+        let mut used = HashSet::new();
+        let mut candidates = ["Agent 7", "Grace"].into_iter();
+
+        assert_eq!(
+            allocate_name_with(&mut used, || candidates.next().unwrap().into()),
+            "Grace"
+        );
+    }
+
+    #[test]
+    fn exactly_64_failed_faker_attempts_use_the_lowest_agent_fallback() {
         let mut used = HashSet::from(["agent 1".into()]);
         let mut calls = 0;
 
-        let allocated = allocate_name_with(&mut used, |_| {
+        let allocated = allocate_name_with(&mut used, || {
             calls += 1;
-            None
+            "Agent 7".into()
         });
 
         assert_eq!(calls, MAX_RANDOM_NAME_ATTEMPTS);
@@ -1344,14 +1346,21 @@ mod tests {
         assert!(!reserve_name(&mut used, "nImBuS"));
 
         assert!(used.remove("nimbus"));
-        let nimbus = agent_names().position(|name| name == "Nimbus").unwrap();
-        assert_eq!(allocate_name_with(&mut used, |_| Some(nimbus)), "Nimbus");
+        assert_eq!(allocate_name_with(&mut used, || "Nimbus".into()), "Nimbus");
+    }
+
+    #[test]
+    fn real_english_faker_first_names_are_safe_display_names() {
+        for _ in 0..32 {
+            assert!(normalize_display_name(&faker_first_name()).is_some());
+        }
     }
 
     #[tokio::test]
     async fn manager_name_allocation_is_atomic_across_concurrent_insertions() {
         let root = tempfile::tempdir().unwrap();
-        let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
+        let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()])
+            .with_name_generator_for_test(|| "Ada".into());
         let starts = (0..8)
             .map(|_| {
                 let manager = manager.clone();
@@ -2381,9 +2390,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_allocates_a_fresh_random_name() {
+    async fn fork_allocates_a_fresh_faker_name() {
         let root = tempfile::tempdir().unwrap();
-        let manager = manager_with_generic_harness(root.path(), Vec::new());
+        let candidates = Arc::new(Mutex::new(["Ada", "Grace"].into_iter().map(String::from)));
+        let manager = manager_with_generic_harness(root.path(), Vec::new())
+            .with_name_generator_for_test({
+                let candidates = Arc::clone(&candidates);
+                move || candidates.lock().unwrap().next().unwrap()
+            });
         let source = manager
             .create(
                 "source".into(),
@@ -2408,8 +2422,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(fork.name.is_some());
-        assert_ne!(fork.name, source_name);
+        assert_eq!(source_name.as_deref(), Some("Ada"));
+        assert_eq!(fork.name.as_deref(), Some("Grace"));
     }
 
     #[tokio::test]
