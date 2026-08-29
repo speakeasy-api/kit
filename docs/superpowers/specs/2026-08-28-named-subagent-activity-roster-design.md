@@ -2,7 +2,7 @@
 
 ## Summary
 
-Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated flat TUI Agents panel. Names come from a configurable pool first, then from an optional fallback suggested by the parent model without an extra model call. The existing immutable `s-…` ID remains authoritative.
+Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated flat TUI Agents panel. Kit generates each new handle's one-word display name internally with `petname`; callers and configuration do not supply names. The existing immutable `s-…` ID remains authoritative.
 
 The feature is backed by each Kit process's in-process subagent registry and recursively forwarded private runtime events. It does not claim that ACP provides portable parent/child session enumeration.
 
@@ -12,8 +12,8 @@ The feature is backed by each Kit process's in-process subagent registry and rec
 - Include foreground and background work independently of the currently focused tool call.
 - Aggregate observable nested descendants and show their immediate parent identity.
 - Keep one display identity across repeated prompts to the same reusable handle.
-- Let users replace Kit's built-in whimsical name pool.
-- Allow the parent model to suggest additional names after the pool is exhausted without a dedicated naming request.
+- Generate short, whimsical one-word names without configuration or model input.
+- Keep random generation bounded and retain a deterministic emergency fallback.
 - Expose useful direct-child lifecycle metadata through `subagents({})`.
 - Preserve compatibility with existing configuration and handles.
 
@@ -230,12 +230,12 @@ Idle handles remain visible until explicitly closed. Closing removes the live ro
 
 Live roster state is process-local and is not restored after a restart. Kit does not resurrect child ACP processes. Historical tool outputs may retain the assigned name through `SubagentValue`, but reconstructing full runtime child timing and lifecycle history remains outside this feature.
 
-The optional config field and optional serialized handle field are backward-compatible schema additions. Implementation must follow Kit's persistent-artifact schema workflow and explicitly test old handles without `name`. No config migration is necessary.
+The optional serialized handle field is a backward-compatible schema addition. Implementation must follow Kit's persistent-artifact schema workflow and explicitly test old handles without `name`. The unreleased `names` configuration experiment is removed and explicitly rejected so stale development configuration does not appear to work.
 
 ## Error handling
 
-- Invalid or duplicate configured names fail config loading with precise errors.
-- Invalid model fallbacks silently fall through to `Agent N`; naming metadata never blocks useful work.
+- Invalid `petname` candidates are discarded within a bounded retry loop.
+- Exhausted random retries fall through to the lowest available `Agent N`; naming never blocks useful work.
 - A failed initial child creation removes its registry entry and releases its name and capacity.
 - A failed reusable generation records the failed operation and returns the identity to idle.
 - A terminally retired child is omitted from listings and releases its name.
