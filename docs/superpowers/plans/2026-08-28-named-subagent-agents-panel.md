@@ -313,7 +313,7 @@ git commit -m "feat: render the subagent agents panel"
 
 **Interfaces:**
 - Consumes: all completed behavior
-- Produces: user-facing configuration/control documentation while retaining package version `0.1.104`
+- Produces: user-facing configuration/control documentation while retaining package version `0.1.109`
 
 - [ ] **Step 1: Update user documentation**
 
@@ -325,7 +325,7 @@ Extend existing command/config documentation tests to assert `/agents` and `Ctrl
 
 - [ ] **Step 3: Verify the package version**
 
-Keep the root package and lockfile package version exactly `0.1.104`; dependency lock changes must not alter it.
+Keep the root package and lockfile package version exactly `0.1.109`; dependency lock changes must not alter it.
 
 - [ ] **Step 4: Run formatting and targeted verification**
 
