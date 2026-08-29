@@ -2,13 +2,13 @@
 
 ## Summary
 
-Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated flat TUI Agents panel. Kit generates each new handle's one-word display name internally with `petname`; callers and configuration do not supply names. The existing immutable `s-…` ID remains authoritative.
+Kit will give parent-owned subagents stable, friendly display names and show every observable foreground, background, and nested descendant in a dedicated always-expanded tree TUI Agents panel. Kit randomly selects each new handle's one-word display name from a curated built-in catalog of exactly 350 whimsical names; callers and configuration do not supply names. The existing immutable `s-…` ID remains authoritative.
 
 The feature is backed by each Kit process's in-process subagent registry and recursively forwarded private runtime events. It does not claim that ACP provides portable parent/child session enumeration.
 
 ## Goals
 
-- Make concurrent subagents easy to recognize in a dedicated flat TUI panel.
+- Make concurrent subagents easy to recognize in a dedicated always-expanded tree TUI panel.
 - Include foreground and background work independently of the currently focused tool call.
 - Aggregate observable nested descendants and show their immediate parent identity.
 - Keep one display identity across repeated prompts to the same reusable handle.
@@ -35,7 +35,7 @@ Kit already owns authoritative parent-scoped state in `src/tools/subagent.rs::Su
 
 ## Name assignment and ownership
 
-Kit does not expose name configuration and does not ask a model or other AI to choose names. Every new `subagent` and `fork` independently requests a one-word English name from `petname` 3.2. Kit trims and normalizes the generated word to a capitalized display label, rejects invalid, multi-word, control-character, or over-32-character candidates, and retries within a fixed bound.
+Kit does not expose name configuration and does not ask a model or other AI to choose names. Every new `subagent` and `fork` independently selects a name at random from a compile-time built-in catalog of exactly 350 reviewed, whimsical codenames spanning cosmic, botanical, food, music, craft, weather, and playful themes. Every catalog entry is an ASCII alphabetic word of 1–16 characters and is unique case-insensitively.
 
 Names compare case-insensitively among one parent's direct live children. A collision uses the lowest available suffix (`Name 2`, `Name 3`, and so on), shortening the base if needed to keep the label within 32 Unicode scalar values. If bounded generation cannot produce an available valid candidate, Kit uses the lowest available `Agent N` label.
 
@@ -170,7 +170,7 @@ The ACP-facing transcript is not extended with a pretend portable child-session 
 
 ## TUI Agents panel
 
-The roster is a dedicated flat panel, independent from the existing graph.
+The roster is a dedicated always-expanded tree panel, independent from the existing graph.
 
 ### Visibility and layout
 
@@ -190,11 +190,12 @@ The Agents panel is global to the current top-level process tree. Its contents d
 Each agent occupies two terminal lines:
 
 ```text
-⠋ Scout · via Pip
-  Trace ACP lifecycle                         1m 12s
+○ Pip
+│  └─ ⠋ Scout
+│     Trace ACP lifecycle                     1m 12s
 ```
 
-The first line contains the state indicator and display name. Nested descendants append ` · via Parent` using the immediate parent's display name; top-level direct children omit it. The second line contains the bounded task summary and the current generation's elapsed time. Elapsed time is right-justified against the panel's inner edge. Task text truncates before the reserved duration column and never shifts the duration.
+The first line contains the state indicator and display name. Direct agents are roots and descendants render immediately beneath their parent at arbitrary depth. Tree connectors and indentation continue across both lines. A row whose parent has not arrived temporarily renders as a root with ` · via Parent`, then automatically reparents when the parent event arrives. The second line contains the bounded task summary and the current generation's elapsed time. Elapsed time is right-justified against the panel's inner edge. Task text truncates before the reserved duration column and never shifts the duration.
 
 Rows do not print textual status labels. State is communicated by the selected Kit-native indicator palette:
 
@@ -234,7 +235,7 @@ The optional serialized handle field is a backward-compatible schema addition. I
 
 ## Error handling
 
-- Invalid `petname` candidates are discarded within a bounded retry loop.
+- Random catalog selection is retried within a fixed bound if entropy is unavailable or a selected base cannot be used.
 - Exhausted random retries fall through to the lowest available `Agent N`; naming never blocks useful work.
 - A failed initial child creation removes its registry entry and releases its name and capacity.
 - A failed reusable generation records the failed operation and returns the identity to idle.
@@ -247,8 +248,8 @@ The optional serialized handle field is a backward-compatible schema addition. I
 
 Focused tests will cover:
 
-1. One-word petname normalization, capitalization, and length limits.
-2. Bounded retries and emergency `Agent N` fallback.
+1. Exactly 350 ASCII alphabetic catalog entries, 1–16 characters long and case-insensitively unique.
+2. Random catalog selection, collision suffixing, bounded retries, and emergency `Agent N` fallback.
 3. Atomic case-insensitive allocation and collision suffixes under concurrent sibling starts.
 4. Release after failed creation, explicit close, and terminal retirement.
 5. Name preservation across `prompt` and fresh random assignment across `fork`.

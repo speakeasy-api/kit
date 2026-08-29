@@ -27,9 +27,9 @@ The optional `harness` and `model` arguments belong only on `subagent`. `harness
 
 ## Inspect display names
 
-Kit assigns every new `subagent` and `fork` handle a random, one-word human-readable display name. Names are generated internally; there is no name configuration and no naming field in the `subagent`, `fork`, or `prompt` inputs. `prompt` preserves the existing handle name, while `fork` allocates a fresh random name for its distinct identity.
+Kit assigns every new `subagent` and `fork` handle a random, one-word human-readable display name selected from a curated built-in catalog of exactly 350 whimsical codenames. Names are selected internally; there is no name configuration and no naming field in the `subagent`, `fork`, or `prompt` inputs. `prompt` preserves the existing handle name, while `fork` allocates a fresh random name for its distinct identity.
 
-Generated words are normalized to a capitalized label no longer than 32 Unicode scalar values. Names compare case-insensitively among one parent's direct live children. A collision receives the lowest available suffix, such as `Otter 2` or `Otter 3`. If bounded generation unexpectedly cannot produce an available valid word, Kit uses the lowest available `Agent N` label. The immutable `s-…` ID remains authoritative; names never select handles.
+Catalog names are ASCII alphabetic words of 1–16 characters, such as `Nimbus`, `Pixel`, `Miso`, and `Juniper`. Names compare case-insensitively among one parent's direct live children. A collision receives the lowest available suffix, such as `Nimbus 2` or `Nimbus 3`. If bounded random selection unexpectedly cannot produce an available name, Kit uses the lowest available `Agent N` label. The immutable `s-…` ID remains authoritative; names never select handles.
 
 A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Case-insensitive uniqueness applies only among one parent's direct children. Separate descendant branches may reuse names, so the Agents panel can contain duplicate visible labels with different immutable IDs.
 

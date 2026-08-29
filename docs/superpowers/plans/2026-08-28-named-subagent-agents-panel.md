@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Give every Kit subagent a stable friendly name and show all observable foreground, background, and nested descendants in a dedicated flat TUI Agents panel.
+**Goal:** Give every Kit subagent a stable friendly name and show all observable foreground, background, and nested descendants in a dedicated always-expanded tree TUI Agents panel.
 
 **Architecture:** Keep direct-child truth in `Subagents.sessions`, emit structured process-safe lifecycle events, and recursively forward child Kit events to a top-level TUI reducer keyed by immutable agent ID. Render that reducer in an independently toggled 46-column panel without changing the existing graph.
 
@@ -15,13 +15,13 @@
 - Invoke `updating-artifact-schema` before changing `[subagent]` config or serialized `SubagentValue` handles.
 - Reject removed name configuration while preserving old serialized handles that omit `name`; current outputs always populate `name`.
 - Keep immutable `s-…` IDs authoritative; display names never select handles.
-- Allocate one-word random petnames internally; model inputs never provide names.
+- Randomly allocate one-word names from a curated built-in catalog of exactly 350 reviewed entries; model inputs never provide names.
 - Name uniqueness is case-insensitive only among one parent's direct children.
 - Runtime event timestamps are Unix epoch milliseconds.
 - Event delivery remains observational and cannot fail subagent work.
 - `Ctrl+G` and the existing graph remain unchanged; `Ctrl+R` and `/agents` toggle the new panel.
 - Wide three-panel layout begins at 154 columns; narrow three-panel layout is transcript/graph/Agents at 40/30/30 percent.
-- Keep the package version exactly `0.1.104` for this unreleased revision, including after dependency lock changes.
+- Keep the package version exactly `0.1.109` for this unreleased revision, including after dependency lock changes.
 
 ---
 
@@ -34,7 +34,7 @@
 - `src/acp_child.rs`: pass parent identity into child Kit processes and forward nested roster events/cleanup.
 - `src/tui/app.rs`: reduce roster events, hold sorting/counting/scroll state, and handle `Ctrl+R`.
 - `src/tui/command.rs`: parse and highlight `/agents`.
-- `src/tui/ui.rs`: render the two-line flat panel, footer, spinner palette, and responsive layouts.
+- `src/tui/ui.rs`: render the two-line always-expanded tree panel, footer, spinner palette, and responsive layouts.
 - `docs/user/subagents-and-acp-harnesses.md`: document random naming, emergency fallback, and observable descendants.
 - `docs/user/tui-and-sessions.md`: document the Agents panel, controls, states, and layout.
 - `Cargo.toml`, `Cargo.lock`: patch version bump.
@@ -46,8 +46,8 @@
 **Files:** `Cargo.toml`, `Cargo.lock`, `src/tools/subagent.rs`, `src/runtime.rs`, `src/main.rs`, and focused tests.
 
 - Inventory all name configuration, allocator, request-schema, serialized-handle, and lifecycle readers/writers before editing.
-- Add RED tests proving `[subagent].names` is unknown configuration, model inputs reject naming fields, generated candidates are one-word/capitalized, collisions use case-insensitive numeric suffixes, retries are bounded, and `Agent N` is the emergency fallback.
-- Replace the compiled/configured pool with `petname` 3.2 using only `default-rng` and `default-words` library features; do not enable `clap`.
+- Add RED tests proving `[subagent].names` is unknown configuration, model inputs reject naming fields, the catalog contains exactly 350 ASCII alphabetic 1–16 character entries that are case-insensitively unique, random selection works, collisions use case-insensitive numeric suffixes, retries are bounded, and `Agent N` is the emergency fallback.
+- Store exactly 350 reviewed names in a dedicated one-name-per-line resource, include it at compile time, and select randomly with the already-direct `getrandom` dependency; add no naming dependency or CLI feature baggage.
 - Allocate atomically while inserting the starting registry entry. Preserve names on `prompt`, allocate a fresh name on `fork`, and release reservations on failed creation, close, or terminal retirement.
 - Keep `SubagentValue.name` optional when reading legacy handles while populating it in current outputs. Keep immutable IDs authoritative and retain the strict listing shape.
 - Run focused allocator/config/schema tests, then the full subagent module before proceeding.
@@ -251,8 +251,9 @@ git commit -m "feat: track agents in the TUI"
 Use Ratatui `TestBackend` or existing line helpers to assert:
 
 ```text
-⠋ Scout · via Pip
-  Trace ACP lifecycle                         1m 12s
+○ Pip
+│  └─ ⠋ Scout
+│     Trace ACP lifecycle                     1m 12s
 ```
 
 Cover top-level omission of `via`, nested ancestry, same visible labels, task truncation before the timer, narrow inner widths, starting `Pulse::Child` yellow, working `Pulse::Tool` cyan, idle dim `○`, failed red `✗`, and Unicode-safe truncation.
