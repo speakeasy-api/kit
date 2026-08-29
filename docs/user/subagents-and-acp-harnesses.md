@@ -7,23 +7,37 @@ Kit can start parent-owned nested agents through the Agent Client Protocol (ACP)
 Use the object form of the hidden tools inside `compose`:
 
 ```text
-first = subagent({ prompt: "Inspect the parser and identify the smallest risk." })
+first = subagent({
+  name: "Implementer",
+  prompt: "Inspect the parser and identify the smallest risk."
+})
 second = prompt({
   subagent: first,
   prompt: "Now propose a minimal fix."
 })
 branch = fork({
   subagent: second,
+  name: "Alternative Reviewer",
   prompt: "Explore an alternative without changing the original session."
 })
 return { main: second.output, alternative: branch.output }
 ```
 
-Each successful turn returns a session value with `id`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and increments its generation. `fork` creates a different ID whose generation is one greater than the supplied source value; it does not advance the source session. `subagents({})` returns active sessions in ID order. A session whose initial prompt is still in progress appears as `{ id, status: "starting" }`; it can be closed by ID but cannot be prompted or forked until the initial `subagent` call returns its complete handle. Completed sessions retained for reuse appear as their latest values. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
+Each successful turn returns a session value with `id`, `name`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and name while incrementing its generation. `fork` creates a different ID and uses its own preferred or fallback name; its generation is one greater than the supplied source value, and it does not advance the source session. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
 
 Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
 
-The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
+The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has no naming input and preserves the session name. The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
+
+## Inspect display names
+
+The calling model should give each new `subagent` and `fork` a concise role-oriented display name based on its task, such as `Round 2 Implementer` or `Reviewer`. This uses the model already making the tool call; Kit does not make a separate naming request. The name is display metadata and never changes the prompt sent to the child. Omitting `name`, or supplying an invalid name, uses the lowest available `Agent N` label.
+
+Kit trims preferred names and accepts 1–32 bytes of printable ASCII. Names compare case-insensitively among one parent's direct live children; clashes receive the lowest available numeric suffix, with the base shortened as needed to stay within 32 bytes. The immutable `s-…` ID remains authoritative; names never select handles.
+
+A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Nested Kit processes allocate independently, so separate descendant branches can generate duplicate visible names in the agent roster even though each parent keeps its direct-child names unique.
+
+Use `subagents({})` to inspect live direct children. Each row contains `id`, `name`, `status`, `generation`, and the bounded current task summary. Closed and terminally retired children are omitted.
 
 ## Require structured JSON output with `output_schema`
 

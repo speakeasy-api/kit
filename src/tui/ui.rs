@@ -22,10 +22,12 @@ thread_local! {
     static VISITED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+use crate::events::{GenerationOutcome, SubagentStatus};
+
 use super::{
     app::{
-        App, Block, CachedTranscriptBlock, CachedTranscriptImage, CachedTranscriptRow, Child,
-        CodeHit, Phase, ToolCall, UserMessage,
+        AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
+        CachedTranscriptRow, Child, CodeHit, Phase, ToolCall, UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -35,6 +37,8 @@ use super::{
     wrap::{LinkedLine, LinkedSpan, wrap_linked_tagged},
 };
 
+const SIDE_BY_SIDE_WIDTH: u16 = 108;
+const AGENTS_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
 const MAX_PENDING_STEER_ROWS: usize = 3;
 const START_MAX_WIDTH: u16 = 96;
@@ -479,8 +483,26 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
     draw_status(frame, app, status);
 }
 
+fn body_layout(area: Rect, show_agents: bool) -> (Rect, Option<Rect>) {
+    if !show_agents {
+        return (area, None);
+    }
+    let [transcript, agents] = if area.width >= SIDE_BY_SIDE_WIDTH {
+        Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area)
+    } else {
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
+    };
+    (transcript, Some(agents))
+}
+
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
-    draw_transcript(frame, app, images, area);
+    let (transcript, agents) = body_layout(area, app.show_agents());
+    draw_transcript(frame, app, images, transcript);
+    if let Some(agents) = agents {
+        draw_agents(frame, app, agents);
+    } else {
+        app.set_agents_viewport(Rect::default(), 0);
+    }
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
@@ -1330,6 +1352,185 @@ fn working_line(app: &App) -> Line<'static> {
     ])
 }
 
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let content_width = width.saturating_sub(1);
+    let mut truncated = String::new();
+    for character in text.chars() {
+        let candidate_width = UnicodeWidthStr::width(truncated.as_str())
+            + unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if candidate_width > content_width {
+            break;
+        }
+        truncated.push(character);
+    }
+    truncated.push('…');
+    truncated
+}
+
+fn agent_duration(millis: u64) -> String {
+    let mut duration = theme::duration(millis);
+    if let Some(minutes_end) = duration.rfind('m').map(|index| index + 1)
+        && duration[minutes_end..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    {
+        duration.insert(minutes_end, ' ');
+    }
+    duration
+}
+
+fn agent_lines(
+    tree_row: &AgentTreeRow<'_>,
+    tick: usize,
+    now_unix_ms: u64,
+    width: usize,
+) -> [Line<'static>; 2] {
+    let row = tree_row.row;
+    let failed = row.outcome == Some(GenerationOutcome::Failed)
+        && row
+            .generation_finished_at_unix_ms
+            .is_some_and(|finished| now_unix_ms.saturating_sub(finished) < 4_000);
+    let (glyph, glyph_style) = match row.status {
+        SubagentStatus::Starting => (
+            theme::pulse(theme::Pulse::Child, tick),
+            Style::default().fg(theme::warn_color()),
+        ),
+        SubagentStatus::Working => (
+            theme::pulse(theme::Pulse::Tool, tick),
+            Style::default().fg(Color::Cyan),
+        ),
+        SubagentStatus::Idle | SubagentStatus::Removed if failed => {
+            ("✗", Style::default().fg(theme::error_color()))
+        }
+        SubagentStatus::Idle | SubagentStatus::Removed => ("○", theme::dim()),
+    };
+    let ancestry = if tree_row.missing_parent {
+        row.parent_name
+            .as_ref()
+            .map(|name| format!(" · via {name}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut first_prefix = String::new();
+    let mut second_prefix = String::new();
+    if tree_row.depth == 0 {
+        second_prefix.push_str(if tree_row.has_next_sibling {
+            "│ "
+        } else {
+            "  "
+        });
+    } else {
+        for has_next in &tree_row.ancestor_has_next_sibling {
+            let connector = if *has_next { "│  " } else { "   " };
+            first_prefix.push_str(connector);
+            second_prefix.push_str(connector);
+        }
+        first_prefix.push_str(if tree_row.has_next_sibling {
+            "├─ "
+        } else {
+            "└─ "
+        });
+        second_prefix.push_str(if tree_row.has_next_sibling {
+            "│  "
+        } else {
+            "   "
+        });
+    }
+    let first = Line::from(vec![
+        Span::styled(first_prefix, theme::faint()),
+        Span::styled(format!("{glyph} "), glyph_style),
+        Span::styled(row.name.clone(), theme::text()),
+        Span::styled(ancestry, theme::faint()),
+    ]);
+
+    let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
+    let duration = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
+    let duration_full_width = UnicodeWidthStr::width(duration.as_str());
+    let duration_width = duration_full_width.min(width);
+    let displayed_duration = if duration_width < duration_full_width {
+        visible_query_tail(&duration, duration_width).to_string()
+    } else {
+        duration
+    };
+    let prefix_width = width.saturating_sub(duration_width);
+    let tree_prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
+    let second = if prefix_width <= tree_prefix_width {
+        Line::from(vec![
+            Span::raw(" ".repeat(prefix_width)),
+            Span::styled(displayed_duration, theme::faint()),
+        ])
+    } else {
+        let task_width = prefix_width - tree_prefix_width - 1;
+        let task = truncate_to_width(&row.task, task_width);
+        let task_padding = task_width.saturating_sub(UnicodeWidthStr::width(task.as_str()));
+        Line::from(vec![
+            Span::styled(second_prefix, theme::faint()),
+            Span::styled(task, theme::dim()),
+            Span::raw(" ".repeat(task_padding + 1)),
+            Span::styled(displayed_duration, theme::faint()),
+        ])
+    };
+    [first, second]
+}
+
+fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let block = Panel::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::faint())
+        .title(Span::styled(" agent roster ", theme::accent()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let row_area_height = inner.height.saturating_sub(1);
+    let visible_rows = usize::from(row_area_height / 2);
+    app.set_agents_viewport(area, visible_rows);
+    let now = crate::events::now_millis();
+    let lines = app
+        .agent_tree_rows()
+        .into_iter()
+        .skip(app.agents_scroll())
+        .take(visible_rows)
+        .flat_map(|row| agent_lines(&row, app.tick, now, inner.width as usize))
+        .collect::<Vec<_>>();
+    let rows_area = Rect {
+        height: row_area_height,
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(lines), rows_area);
+
+    if inner.height > 0 {
+        let counts = app.agent_counts();
+        let mut parts = vec![format!("{} agents", counts.total)];
+        if counts.starting > 0 {
+            parts.push(format!("{} starting", counts.starting));
+        }
+        if counts.working > 0 {
+            parts.push(format!("{} working", counts.working));
+        }
+        if counts.idle > 0 {
+            parts.push(format!("{} idle", counts.idle));
+        }
+        let footer = Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(parts.join(" · "), theme::faint())),
+            footer,
+        );
+    }
+}
+
 fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
@@ -1591,21 +1792,284 @@ mod tests {
 
     use agent_client_protocol::schema::v2::ToolKind;
     use base64::Engine as _;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
     use ratatui_image::picker::Picker;
 
     use super::{
-        MAX_PROMPT_ROWS, ModelDialogRow, draw, model_dialog_rows, model_dialog_viewport,
-        prompt_lines, refresh_transcript_cache, refresh_transcript_cache_with_images,
-        user_block_rows, user_line,
+        MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
+        model_dialog_rows, model_dialog_viewport, prompt_lines, refresh_transcript_cache,
+        refresh_transcript_cache_with_images, user_block_rows, user_line,
     };
     use crate::{
-        events::RuntimeEvent,
+        events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         tui::app::{
-            Action, App, Block, EffortChoice, EffortDialog, ModelDialog, Update, UserImage,
-            UserMessage,
+            Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog, ModelDialog,
+            Update, UserImage, UserMessage,
         },
     };
+
+    fn test_agent(
+        name: &str,
+        status: SubagentStatus,
+        outcome: Option<GenerationOutcome>,
+        parent_name: Option<&str>,
+        task: &str,
+    ) -> AgentRow {
+        AgentRow {
+            id: format!("id-{name}"),
+            name: name.into(),
+            status,
+            outcome,
+            generation: 1,
+            task: task.into(),
+            parent_id: parent_name.map(|_| "parent-id".into()),
+            parent_name: parent_name.map(Into::into),
+            harness: "acp.kit".into(),
+            model: Some("test".into()),
+            created_at_unix_ms: 1_000,
+            generation_started_at_unix_ms: 2_000,
+            generation_finished_at_unix_ms: None,
+        }
+    }
+
+    fn tree_row(
+        row: &AgentRow,
+        ancestor_has_next_sibling: Vec<bool>,
+        has_next_sibling: bool,
+        missing_parent: bool,
+    ) -> AgentTreeRow<'_> {
+        AgentTreeRow {
+            row,
+            depth: ancestor_has_next_sibling.len(),
+            ancestor_has_next_sibling,
+            has_next_sibling,
+            missing_parent,
+        }
+    }
+
+    fn line_text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn agent_rows_render_two_lines_ancestry_duration_and_palette() {
+        let top = test_agent(
+            "Scout",
+            SubagentStatus::Working,
+            None,
+            None,
+            "Trace ACP lifecycle",
+        );
+        let lines = agent_lines(&tree_row(&top, vec![], false, false), 0, 74_000, 48);
+        assert_eq!(line_text(&lines[0]), "⠋ Scout");
+        let second = line_text(&lines[1]);
+        assert_eq!(second, "  Trace ACP lifecycle                     1m 12s");
+        assert_eq!(&second[42..48], "1m 12s");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(second.as_str()), 48);
+        assert_eq!(
+            lines[0].spans[1].style.fg,
+            Some(ratatui::style::Color::Cyan)
+        );
+
+        let nested = test_agent(
+            "Scout",
+            SubagentStatus::Starting,
+            None,
+            Some("Pip"),
+            "Trace ACP lifecycle",
+        );
+        let lines = agent_lines(&tree_row(&nested, vec![true], false, false), 0, 74_000, 48);
+        assert_eq!(line_text(&lines[0]), "│  └─ ⠁ Scout");
+        assert!(line_text(&lines[1]).starts_with("│     Trace ACP lifecycle"));
+
+        let lines = agent_lines(&tree_row(&nested, vec![false], true, false), 0, 74_000, 48);
+        assert_eq!(line_text(&lines[0]), "   ├─ ⠁ Scout");
+        assert!(line_text(&lines[1]).starts_with("   │  Trace ACP lifecycle"));
+
+        let lines = agent_lines(&tree_row(&nested, vec![], true, true), 0, 74_000, 48);
+        assert_eq!(line_text(&lines[0]), "⠁ Scout · via Pip");
+        assert!(line_text(&lines[1]).starts_with("│ Trace ACP lifecycle"));
+        assert_eq!(
+            lines[0].spans[1].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+
+        let idle = test_agent("Scout", SubagentStatus::Idle, None, None, "done");
+        let idle_lines = agent_lines(&tree_row(&idle, vec![], false, false), 0, 74_000, 20);
+        assert_eq!(line_text(&idle_lines[0]), "○ Scout");
+        assert!(
+            idle_lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        let mut failed = test_agent(
+            "Scout",
+            SubagentStatus::Idle,
+            Some(GenerationOutcome::Failed),
+            None,
+            "failed",
+        );
+        failed.generation_finished_at_unix_ms = Some(72_000);
+        let failed_lines = agent_lines(&tree_row(&failed, vec![], false, false), 0, 74_000, 20);
+        assert_eq!(line_text(&failed_lines[0]), "✗ Scout");
+        assert_eq!(
+            failed_lines[0].spans[1].style.fg,
+            Some(ratatui::style::Color::Red)
+        );
+        assert_eq!(
+            line_text(&agent_lines(&tree_row(&failed, vec![], false, false), 0, 77_000, 20,)[0]),
+            "○ Scout"
+        );
+    }
+
+    #[test]
+    fn agent_rows_truncate_unicode_before_reserved_duration() {
+        let row = test_agent(
+            "Scout",
+            SubagentStatus::Working,
+            None,
+            None,
+            "🦀🦀 lifecycle work",
+        );
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), 0, 3_500, 12);
+        assert_eq!(line_text(&lines[1]), "  🦀🦀… 1.5s");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
+            12
+        );
+
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), 0, 3_500, 4);
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
+            4
+        );
+    }
+
+    #[test]
+    fn agents_layout_obeys_hidden_and_107_108_boundaries() {
+        let area_107 = ratatui::layout::Rect::new(2, 3, 107, 20);
+        assert_eq!(body_layout(area_107, false), (area_107, None));
+        assert_eq!(
+            body_layout(area_107, true),
+            (
+                ratatui::layout::Rect::new(2, 3, 107, 11),
+                Some(ratatui::layout::Rect::new(2, 14, 107, 9)),
+            )
+        );
+
+        let area_108 = ratatui::layout::Rect::new(2, 3, 108, 20);
+        assert_eq!(
+            body_layout(area_108, true),
+            (
+                ratatui::layout::Rect::new(2, 3, 62, 20),
+                Some(ratatui::layout::Rect::new(64, 3, 46, 20)),
+            )
+        );
+    }
+
+    fn panel_app(agent_count: usize) -> App {
+        let mut app = App::new(
+            PathBuf::from("/tmp/project"),
+            "provider".into(),
+            "model".into(),
+            "127.0.0.1:7331".into(),
+        );
+        for index in 0..agent_count {
+            app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+                id: format!("agent-{index}"),
+                name: format!("Scout {index}"),
+                status: SubagentStatus::Idle,
+                outcome: Some(GenerationOutcome::Success),
+                generation: 1,
+                task: format!("Task {index}"),
+                parent_id: None,
+                parent_name: None,
+                harness: "acp.kit".into(),
+                model: Some("test".into()),
+                created_at_unix_ms: 1_000 + index as u64,
+                generation_started_at_unix_ms: 2_000,
+                generation_finished_at_unix_ms: Some(74_000),
+            }));
+        }
+        app
+    }
+
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+        (0..buffer.area.width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    fn buffer_cells(
+        buffer: &ratatui::buffer::Buffer,
+        row: u16,
+        columns: std::ops::Range<u16>,
+    ) -> String {
+        columns
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn agents_panel_keeps_footer_fixed_while_overflowing_rows_scroll() {
+        let mut app = panel_app(5);
+        let mut terminal = Terminal::new(TestBackend::new(46, 8)).expect("terminal");
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        let initial = terminal.backend().buffer();
+        assert_eq!(buffer_cells(initial, 0, 1..15), " agent roster ");
+        assert_eq!(buffer_cells(initial, 1, 1..10), "○ Scout 0");
+        assert_eq!(buffer_cells(initial, 2, 3..9), "Task 0");
+        assert_eq!(buffer_cells(initial, 3, 1..10), "○ Scout 1");
+        assert_eq!(buffer_cells(initial, 6, 1..18), "5 agents · 5 idle");
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.agents_scroll(), 3);
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        let scrolled = terminal.backend().buffer();
+        assert_eq!(buffer_cells(scrolled, 1, 1..10), "○ Scout 3");
+        assert_eq!(buffer_cells(scrolled, 3, 1..10), "○ Scout 4");
+        assert_eq!(buffer_cells(scrolled, 6, 1..18), "5 agents · 5 idle");
+        assert_eq!(
+            buffer_row(scrolled, 7),
+            "╰────────────────────────────────────────────╯"
+        );
+    }
+
+    #[test]
+    fn agents_panel_draws_zero_and_tiny_rectangles_without_panicking() {
+        let mut app = panel_app(5);
+        app.set_agents_viewport(ratatui::layout::Rect::new(0, 0, 2, 4), 1);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.agents_scroll(), 3);
+
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw_agents(frame, &mut app, ratatui::layout::Rect::default());
+                draw_agents(frame, &mut app, ratatui::layout::Rect::new(0, 0, 1, 1));
+            })
+            .expect("zero and tiny draws succeed");
+        assert_eq!(app.agents_scroll(), 3);
+    }
 
     fn model_choice(provider: &str, model: &str) -> crate::tui::app::ModelChoice {
         crate::tui::app::ModelChoice {
@@ -1840,6 +2304,31 @@ mod tests {
         }));
         let frame = render(&mut app, 80, 20);
         assert!(frame.contains("compacting context"));
+    }
+
+    #[test]
+    fn active_compose_keeps_the_full_transcript_layout() {
+        let mut app = sample();
+
+        render(&mut app, 120, 40);
+
+        assert!(app.transcript_width > 100, "{}", app.transcript_width);
+    }
+
+    #[test]
+    fn ctrl_g_does_not_toggle_a_runtime_graph_layout() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.push_user("keep the transcript full width".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        render(&mut app, 120, 20);
+
+        assert!(app.transcript_width > 100, "{}", app.transcript_width);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ops::Range,
     path::PathBuf,
     time::{Duration, Instant},
@@ -19,11 +19,11 @@ use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::text::Line;
+use ratatui::{layout::Rect, text::Line};
 
 #[cfg(test)]
 use crate::compaction::is_compaction_summary;
-use crate::events::RuntimeEvent;
+use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
@@ -484,6 +484,40 @@ enum MessageRole {
     Thought,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    pub status: SubagentStatus,
+    pub outcome: Option<GenerationOutcome>,
+    pub generation: u64,
+    pub task: String,
+    pub parent_id: Option<String>,
+    pub parent_name: Option<String>,
+    pub harness: String,
+    pub model: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub generation_started_at_unix_ms: u64,
+    pub generation_finished_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTreeRow<'a> {
+    pub row: &'a AgentRow,
+    pub depth: usize,
+    pub ancestor_has_next_sibling: Vec<bool>,
+    pub has_next_sibling: bool,
+    pub missing_parent: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentCounts {
+    pub total: usize,
+    pub starting: usize,
+    pub working: usize,
+    pub idle: usize,
+}
+
 pub struct App {
     pub root: PathBuf,
     pub provider: String,
@@ -528,6 +562,14 @@ pub struct App {
     pub logs: Vec<String>,
     pub show_logs: bool,
     pub show_thoughts: bool,
+    agents_visible: bool,
+    agents: HashMap<String, AgentRow>,
+    agent_versions: HashMap<String, (u64, u8)>,
+    /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
+    cleaned_agent_ids: HashSet<String>,
+    agents_scroll: usize,
+    agents_viewport: usize,
+    agents_area: Rect,
     /// Tool card selected for output toggling or background cancellation.
     pub focused_call_id: Option<String>,
     pub tick: usize,
@@ -750,6 +792,15 @@ fn persisted_output(output: &ToolOutput) -> Vec<String> {
     text.lines().map(str::to_string).collect()
 }
 
+fn agent_status_rank(status: SubagentStatus) -> u8 {
+    match status {
+        SubagentStatus::Starting => 0,
+        SubagentStatus::Working => 1,
+        SubagentStatus::Idle => 2,
+        SubagentStatus::Removed => 3,
+    }
+}
+
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
@@ -793,6 +844,13 @@ impl App {
             logs: Vec::new(),
             show_logs: false,
             show_thoughts: false,
+            agents_visible: false,
+            agents: HashMap::new(),
+            agent_versions: HashMap::new(),
+            cleaned_agent_ids: HashSet::new(),
+            agents_scroll: 0,
+            agents_viewport: 0,
+            agents_area: Rect::default(),
             focused_call_id: None,
             tick: 0,
             scroll: 0,
@@ -986,12 +1044,35 @@ impl App {
 
     /// Whether the periodic animation clock can change anything on screen.
     pub fn needs_redraw_tick(&self) -> bool {
-        self.working() || !self.transcript_dynamic.is_empty() || self.toast.is_some()
+        self.working()
+            || !self.transcript_dynamic.is_empty()
+            || self.toast.is_some()
+            || self.agents.values().any(|row| {
+                matches!(
+                    row.status,
+                    SubagentStatus::Starting | SubagentStatus::Working
+                ) || (row.outcome == Some(GenerationOutcome::Failed)
+                    && row.generation_finished_at_unix_ms.is_some_and(|finished| {
+                        crate::events::now_millis().saturating_sub(finished) < 4_000
+                    }))
+            })
     }
 
-    /// Advances animations and removes an expired toast on its final redraw.
+    /// Advances animations and removes expired transient state.
     pub fn tick(&mut self) {
+        self.tick_at(crate::events::now_millis());
+    }
+
+    fn tick_at(&mut self, now_unix_ms: u64) {
         self.tick = self.tick.wrapping_add(1);
+        self.agents.retain(|_, row| {
+            row.status != SubagentStatus::Removed
+                || row.outcome != Some(GenerationOutcome::Failed)
+                || row
+                    .generation_finished_at_unix_ms
+                    .is_some_and(|finished| now_unix_ms.saturating_sub(finished) < 4_000)
+        });
+        self.clamp_agents_scroll();
         if self
             .toast
             .as_ref()
@@ -1148,6 +1229,164 @@ impl App {
             }
             _ => None,
         })
+    }
+
+    pub fn show_agents(&self) -> bool {
+        self.agents_visible
+    }
+
+    pub fn toggle_agents(&mut self) {
+        self.agents_visible = !self.agents_visible;
+        self.clamp_agents_scroll();
+    }
+
+    #[cfg(test)]
+    pub fn agents(&self) -> Vec<&AgentRow> {
+        self.agent_tree_rows()
+            .into_iter()
+            .map(|tree_row| tree_row.row)
+            .collect()
+    }
+
+    pub fn agent_tree_rows(&self) -> Vec<AgentTreeRow<'_>> {
+        fn status_rank(status: SubagentStatus) -> u8 {
+            match status {
+                SubagentStatus::Starting => 0,
+                SubagentStatus::Working => 1,
+                SubagentStatus::Idle => 2,
+                SubagentStatus::Removed => 3,
+            }
+        }
+
+        fn compare_rows(left: &&AgentRow, right: &&AgentRow) -> std::cmp::Ordering {
+            (
+                status_rank(left.status),
+                left.created_at_unix_ms,
+                left.id.as_str(),
+            )
+                .cmp(&(
+                    status_rank(right.status),
+                    right.created_at_unix_ms,
+                    right.id.as_str(),
+                ))
+        }
+
+        fn ancestry_is_acyclic(row: &AgentRow, agents: &HashMap<String, AgentRow>) -> bool {
+            let mut seen = HashSet::new();
+            let mut current = row;
+            while let Some(parent) = current
+                .parent_id
+                .as_deref()
+                .and_then(|parent_id| agents.get(parent_id))
+            {
+                if !seen.insert(current.id.as_str()) {
+                    return false;
+                }
+                current = parent;
+            }
+            seen.insert(current.id.as_str())
+        }
+
+        fn append_subtree<'a>(
+            row: &'a AgentRow,
+            children: &HashMap<&str, Vec<&'a AgentRow>>,
+            ancestor_has_next_sibling: &[bool],
+            has_next_sibling: bool,
+            missing_parent: bool,
+            rows: &mut Vec<AgentTreeRow<'a>>,
+        ) {
+            rows.push(AgentTreeRow {
+                row,
+                depth: ancestor_has_next_sibling.len(),
+                ancestor_has_next_sibling: ancestor_has_next_sibling.to_vec(),
+                has_next_sibling,
+                missing_parent,
+            });
+            if let Some(descendants) = children.get(row.id.as_str()) {
+                let mut child_ancestors = ancestor_has_next_sibling.to_vec();
+                child_ancestors.push(has_next_sibling);
+                for (index, descendant) in descendants.iter().enumerate() {
+                    append_subtree(
+                        descendant,
+                        children,
+                        &child_ancestors,
+                        index + 1 < descendants.len(),
+                        false,
+                        rows,
+                    );
+                }
+            }
+        }
+
+        let mut roots = Vec::new();
+        let mut children: HashMap<&str, Vec<&AgentRow>> = HashMap::new();
+        for row in self.agents.values() {
+            if ancestry_is_acyclic(row, &self.agents)
+                && let Some(parent_id) = row
+                    .parent_id
+                    .as_deref()
+                    .filter(|parent_id| self.agents.contains_key(*parent_id))
+            {
+                children.entry(parent_id).or_default().push(row);
+            } else {
+                roots.push(row);
+            }
+        }
+        roots.sort_by(compare_rows);
+        for siblings in children.values_mut() {
+            siblings.sort_by(compare_rows);
+        }
+
+        let mut rows = Vec::with_capacity(self.agents.len());
+        for (index, root) in roots.iter().enumerate() {
+            append_subtree(
+                root,
+                &children,
+                &[],
+                index + 1 < roots.len(),
+                root.parent_id
+                    .as_deref()
+                    .is_some_and(|parent_id| !self.agents.contains_key(parent_id)),
+                &mut rows,
+            );
+        }
+        rows
+    }
+
+    pub fn agent_counts(&self) -> AgentCounts {
+        self.agents
+            .values()
+            .fold(AgentCounts::default(), |mut counts, row| {
+                match row.status {
+                    SubagentStatus::Starting => counts.starting += 1,
+                    SubagentStatus::Working => counts.working += 1,
+                    SubagentStatus::Idle => counts.idle += 1,
+                    SubagentStatus::Removed => return counts,
+                }
+                counts.total += 1;
+                counts
+            })
+    }
+
+    pub fn agents_scroll(&self) -> usize {
+        self.agents_scroll
+    }
+
+    pub fn set_agents_viewport(&mut self, area: Rect, visible_rows: usize) {
+        self.agents_area = area;
+        self.agents_viewport = visible_rows;
+        self.clamp_agents_scroll();
+    }
+
+    fn clamp_agents_scroll(&mut self) {
+        self.agents_scroll = self
+            .agents_scroll
+            .min(self.agents.len().saturating_sub(self.agents_viewport));
+    }
+
+    fn scroll_agents_by(&mut self, rows: isize) {
+        let top = self.agents.len().saturating_sub(self.agents_viewport);
+        self.agents_scroll = self.agents_scroll.saturating_add_signed(rows).min(top);
     }
 
     pub fn elapsed(&self) -> u64 {
@@ -1618,6 +1857,11 @@ impl App {
                 }
                 return;
             }
+            RuntimeEvent::SubagentStateChanged { .. }
+            | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
+                self.apply_agent_runtime(event);
+                return;
+            }
             event => event,
         };
         let parent = event.parent_call().map(str::to_string);
@@ -1647,7 +1891,9 @@ impl App {
             } => call.finish_child(&child_call, ok, summary, millis),
             RuntimeEvent::SessionStarted { .. }
             | RuntimeEvent::CompactionStarted { .. }
-            | RuntimeEvent::CompactionFinished { .. } => unreachable!("handled above"),
+            | RuntimeEvent::CompactionFinished { .. }
+            | RuntimeEvent::SubagentStateChanged { .. }
+            | RuntimeEvent::SubagentDescendantsRemoved { .. } => unreachable!("handled above"),
         }
         if let Some(index) = self.call_index(&owner_id) {
             self.reclassify_dynamic(index);
@@ -1724,6 +1970,12 @@ impl App {
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
+        self.agents.clear();
+        self.agent_versions.clear();
+        self.cleaned_agent_ids.clear();
+        self.agents_scroll = 0;
+        self.agents_viewport = 0;
+        self.agents_area = Rect::default();
         self.viewport = 0;
         self.total_lines = 0;
         self.transcript_top = 0;
@@ -1776,6 +2028,103 @@ impl App {
 
     pub fn note(&mut self, text: impl Into<String>) {
         self.push_block(Block::Notice(text.into()));
+    }
+
+    fn apply_agent_runtime(&mut self, event: RuntimeEvent) {
+        self.apply_agent_runtime_at(event, crate::events::now_millis());
+    }
+
+    #[cfg(test)]
+    fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+        match event {
+            RuntimeEvent::SubagentStateChanged { .. }
+            | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
+                self.apply_agent_runtime_at(event, now_unix_ms);
+            }
+            event => self.apply_runtime(event),
+        }
+    }
+
+    fn apply_agent_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+        match event {
+            RuntimeEvent::SubagentStateChanged {
+                id,
+                name,
+                status,
+                outcome,
+                generation,
+                task,
+                parent_id,
+                parent_name,
+                harness,
+                model,
+                created_at_unix_ms,
+                generation_started_at_unix_ms,
+                generation_finished_at_unix_ms,
+            } => {
+                if self.cleaned_agent_ids.contains(&id) {
+                    return;
+                }
+                let incoming_rank = agent_status_rank(status);
+                if self
+                    .agent_versions
+                    .get(&id)
+                    .is_some_and(|current| (generation, incoming_rank) <= *current)
+                {
+                    return;
+                }
+                self.agent_versions
+                    .insert(id.clone(), (generation, incoming_rank));
+                if status == SubagentStatus::Removed
+                    && (outcome != Some(GenerationOutcome::Failed)
+                        || generation_finished_at_unix_ms
+                            .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
+                {
+                    self.agents.remove(&id);
+                } else {
+                    self.agents.insert(
+                        id.clone(),
+                        AgentRow {
+                            id,
+                            name,
+                            status,
+                            outcome,
+                            generation,
+                            task,
+                            parent_id,
+                            parent_name,
+                            harness,
+                            model,
+                            created_at_unix_ms,
+                            generation_started_at_unix_ms,
+                            generation_finished_at_unix_ms,
+                        },
+                    );
+                }
+            }
+            RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
+                let mut removed = HashSet::new();
+                loop {
+                    let before = removed.len();
+                    for row in self.agents.values() {
+                        if row.id != ancestor_id
+                            && row.parent_id.as_deref().is_some_and(|parent| {
+                                parent == ancestor_id || removed.contains(parent)
+                            })
+                        {
+                            removed.insert(row.id.clone());
+                        }
+                    }
+                    if removed.len() == before {
+                        break;
+                    }
+                }
+                self.agents.retain(|id, _| !removed.contains(id));
+                self.cleaned_agent_ids.extend(removed);
+            }
+            _ => unreachable!("only subagent runtime events reach the roster reducer"),
+        }
+        self.clamp_agents_scroll();
     }
 
     pub fn scroll_by(&mut self, lines: isize) {
@@ -2152,6 +2501,10 @@ impl App {
                     }
                     Parsed::Sessions => Action::ListSessions,
                     Parsed::Close => Action::Close,
+                    Parsed::Agents => {
+                        self.toggle_agents();
+                        Action::None
+                    }
                     Parsed::Model { query: Some(query) } => match self.closest_model(query) {
                         Some(choice) => Action::SelectModel {
                             choice,
@@ -2232,6 +2585,7 @@ impl App {
             KeyCode::Char('f') if alt => self.editor.move_word_right(),
             KeyCode::Char('a') if control => self.editor.move_line_start(),
             KeyCode::Char('e') if control => self.editor.move_line_end(),
+            KeyCode::Char('r') if control => self.toggle_agents(),
             KeyCode::Char('l') if control => self.show_logs = !self.show_logs,
             KeyCode::Char('o') if control => self.toggle_last_output(),
             KeyCode::Char('t') if control => self.toggle_thoughts(),
@@ -2286,6 +2640,14 @@ impl App {
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
         match mouse.kind {
+            MouseEventKind::ScrollUp if self.mouse_in_agents(mouse.column, mouse.row) => {
+                self.scroll_agents_by(-3);
+                return Action::Redraw;
+            }
+            MouseEventKind::ScrollDown if self.mouse_in_agents(mouse.column, mouse.row) => {
+                self.scroll_agents_by(3);
+                return Action::Redraw;
+            }
             MouseEventKind::ScrollUp => {
                 self.scroll_by(-3);
                 return Action::Redraw;
@@ -2326,6 +2688,15 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    fn mouse_in_agents(&self, column: u16, row: u16) -> bool {
+        self.agents_area.width > 0
+            && self.agents_area.height > 0
+            && column >= self.agents_area.x
+            && column < self.agents_area.x.saturating_add(self.agents_area.width)
+            && row >= self.agents_area.y
+            && row < self.agents_area.y.saturating_add(self.agents_area.height)
     }
 
     pub(super) fn clear_transcript_interaction(&mut self) {
@@ -2739,6 +3110,41 @@ mod tests {
             at: 0,
         }));
         assert!(app.compacting);
+    }
+
+    #[test]
+    fn switching_sessions_clears_the_process_local_agent_roster() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+        use ratatui::layout::Rect;
+
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "stale",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(GenerationOutcome::Success),
+                1,
+                None,
+                (10, 20, Some(30)),
+            ),
+            100,
+        );
+        app.cleaned_agent_ids.insert("cleaned".into());
+        app.set_agents_viewport(Rect::new(20, 5, 10, 4), 2);
+
+        assert!(!app.agents.is_empty());
+        assert!(!app.agent_versions.is_empty());
+        assert!(!app.cleaned_agent_ids.is_empty());
+
+        app.start_session("replacement".into());
+
+        assert!(app.agents.is_empty());
+        assert!(app.agent_versions.is_empty());
+        assert!(app.cleaned_agent_ids.is_empty());
+        assert_eq!(app.agents_scroll, 0);
+        assert_eq!(app.agents_viewport, 0);
+        assert_eq!(app.agents_area, Rect::default());
     }
 
     #[test]
@@ -3806,5 +4212,671 @@ mod tests {
 
         app.set_model_choices(vec![model_choice("first", "fooo-bar-foo")]);
         assert_eq!(app.closest_model("foo bar").unwrap().model, "fooo-bar-foo");
+    }
+
+    fn agent_event(
+        id: &str,
+        name: &str,
+        status: crate::events::SubagentStatus,
+        outcome: Option<crate::events::GenerationOutcome>,
+        generation: u64,
+        parent: Option<(&str, &str)>,
+        timing: (u64, u64, Option<u64>),
+    ) -> RuntimeEvent {
+        let (created, started, finished) = timing;
+        RuntimeEvent::SubagentStateChanged {
+            id: id.into(),
+            name: name.into(),
+            status,
+            outcome,
+            generation,
+            task: format!("task for {id}"),
+            parent_id: parent.map(|(id, _)| id.into()),
+            parent_name: parent.map(|(_, name)| name.into()),
+            harness: "acp.kit".into(),
+            model: Some("test".into()),
+            created_at_unix_ms: created,
+            generation_started_at_unix_ms: started,
+            generation_finished_at_unix_ms: finished,
+        }
+    }
+
+    #[test]
+    fn agents_reduce_lifecycle_order_counts_and_duplicate_labels_by_id() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "idle",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(GenerationOutcome::Success),
+                1,
+                None,
+                (10, 20, Some(30)),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "working",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                2,
+                Some(("idle", "Scout")),
+                (11, 50, None),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "starting",
+                "Pip",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                (9, 40, None),
+            ),
+            100,
+        );
+
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["starting", "idle", "working"]
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .filter(|row| row.name == "Scout")
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.agent_counts(),
+            super::AgentCounts {
+                total: 3,
+                starting: 1,
+                working: 1,
+                idle: 1
+            }
+        );
+
+        app.apply_runtime_at(
+            agent_event(
+                "working",
+                "Scout",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                (11, 20, None),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "working",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(GenerationOutcome::Success),
+                2,
+                Some(("idle", "Scout")),
+                (11, 50, Some(90)),
+            ),
+            100,
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .find(|row| row.id == "working")
+                .unwrap()
+                .status,
+            SubagentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn agents_render_roots_and_arbitrary_depth_in_tree_order() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("child", "Child")),
+                (4, 4, Some(5)),
+            ),
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "great",
+                "Great",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("grand", "Grand")),
+                (5, 5, Some(6)),
+            ),
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("root", "Root")),
+                (3, 3, Some(4)),
+            ),
+            agent_event(
+                "other",
+                "Other",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (2, 2, Some(3)),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "child", "grand", "great", "other"]
+        );
+        let tree = app.agent_tree_rows();
+        assert_eq!(tree[0].ancestor_has_next_sibling, Vec::<bool>::new());
+        assert!(tree[0].has_next_sibling);
+        assert_eq!(tree[1].ancestor_has_next_sibling, vec![true]);
+        assert_eq!(tree[2].ancestor_has_next_sibling, vec![true, false]);
+        assert_eq!(tree[3].ancestor_has_next_sibling, vec![true, false, false]);
+        assert!(!tree[4].has_next_sibling);
+    }
+
+    #[test]
+    fn agents_sort_siblings_but_keep_active_descendants_with_idle_parents() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "idle-root",
+                "Idle",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "late-child",
+                "Late",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("idle-root", "Idle")),
+                (4, 4, None),
+            ),
+            agent_event(
+                "early-child",
+                "Early",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("idle-root", "Idle")),
+                (3, 3, None),
+            ),
+            agent_event(
+                "starting-child",
+                "Starting",
+                SubagentStatus::Starting,
+                None,
+                1,
+                Some(("idle-root", "Idle")),
+                (5, 5, None),
+            ),
+            agent_event(
+                "active-root",
+                "Active",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (2, 2, None),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "active-root",
+                "idle-root",
+                "starting-child",
+                "early-child",
+                "late-child"
+            ]
+        );
+    }
+
+    #[test]
+    fn agents_missing_parent_falls_back_to_root_then_reparents() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("parent", "Parent")),
+                (2, 2, None),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "other",
+                "Other",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (3, 3, Some(4)),
+            ),
+            100,
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child", "other"]
+        );
+        assert!(app.agent_tree_rows()[0].missing_parent);
+
+        app.apply_runtime_at(
+            agent_event(
+                "parent",
+                "Parent",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            100,
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "child", "other"]
+        );
+        assert!(!app.agent_tree_rows()[1].missing_parent);
+    }
+
+    #[test]
+    fn malformed_agent_parent_cycles_render_every_row_once_as_roots() {
+        use std::collections::HashSet;
+
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "a",
+                "A",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("b", "B")),
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "b",
+                "B",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("a", "A")),
+                (2, 2, Some(3)),
+            ),
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("a", "A")),
+                (3, 3, None),
+            ),
+            agent_event(
+                "self",
+                "Self",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("self", "Self")),
+                (4, 4, Some(5)),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        let tree = app.agent_tree_rows();
+        assert_eq!(tree.len(), 4);
+        assert!(tree.iter().all(|row| row.depth == 0));
+        let ids = tree
+            .iter()
+            .map(|row| row.row.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids, HashSet::from(["a", "b", "child", "self"]));
+    }
+
+    #[test]
+    fn agents_remove_strict_descendants_and_expire_failed_tombstones() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("root", "Root")),
+                (2, 2, Some(3)),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("child", "Child")),
+                (3, 3, None),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "root".into(),
+            },
+            100,
+        );
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Idle,
+                None,
+                1,
+                Some(("root", "Root")),
+                (2, 2, Some(3)),
+            ),
+            100,
+        );
+        assert!(app.agents().iter().all(|row| row.id != "child"));
+
+        app.apply_runtime_at(
+            agent_event(
+                "failed",
+                "Failed",
+                SubagentStatus::Removed,
+                Some(GenerationOutcome::Failed),
+                1,
+                None,
+                (4, 10, Some(1_000)),
+            ),
+            1_000,
+        );
+        assert_eq!(app.agent_counts().total, 1);
+        assert!(app.agents().iter().any(|row| row.id == "failed"));
+        app.tick_at(4_999);
+        assert!(app.agents().iter().any(|row| row.id == "failed"));
+        app.tick_at(5_000);
+        assert!(app.agents().iter().all(|row| row.id != "failed"));
+
+        app.apply_runtime_at(
+            agent_event(
+                "closed",
+                "Closed",
+                SubagentStatus::Removed,
+                Some(GenerationOutcome::Success),
+                1,
+                None,
+                (5, 10, Some(20)),
+            ),
+            100,
+        );
+        assert!(app.agents().iter().all(|row| row.id != "closed"));
+        app.apply_runtime_at(
+            agent_event(
+                "closed",
+                "Closed",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (5, 10, None),
+            ),
+            100,
+        );
+        assert!(app.agents().iter().all(|row| row.id != "closed"));
+    }
+
+    #[test]
+    fn agents_descendant_cleanup_terminally_suppresses_every_removed_depth() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        for event in [
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Starting,
+                None,
+                1,
+                Some(("root", "Root")),
+                (2, 2, None),
+            ),
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Working,
+                None,
+                2,
+                Some(("child", "Child")),
+                (3, 3, None),
+            ),
+            agent_event(
+                "great",
+                "Great",
+                SubagentStatus::Idle,
+                None,
+                3,
+                Some(("grand", "Grand")),
+                (4, 4, Some(5)),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "root".into(),
+            },
+            100,
+        );
+
+        // Delayed events advance rank and/or generation at every removed depth.
+        // Cleanup is terminal for immutable IDs, so none may recreate a row.
+        for event in [
+            agent_event(
+                "child",
+                "Child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("root", "Root")),
+                (2, 2, None),
+            ),
+            agent_event(
+                "grand",
+                "Grand",
+                SubagentStatus::Idle,
+                None,
+                2,
+                Some(("child", "Child")),
+                (3, 3, Some(90)),
+            ),
+            agent_event(
+                "great",
+                "Great",
+                SubagentStatus::Working,
+                None,
+                4,
+                Some(("grand", "Grand")),
+                (4, 80, None),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+        assert_eq!(
+            app.agents()
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
+
+        app.apply_runtime_at(
+            agent_event(
+                "unrelated",
+                "Unrelated",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                (10, 10, None),
+            ),
+            100,
+        );
+        assert!(app.agents().iter().any(|row| row.id == "unrelated"));
+    }
+
+    #[test]
+    fn agents_toggle_without_disturbing_editor() {
+        let mut app = app();
+        app.editor.insert_str("abc");
+        app.handle_key(modified_press(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(press(KeyCode::Char('X')));
+        assert_eq!(app.editor.text(), "Xabc");
+
+        assert!(!app.show_agents());
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert!(app.show_agents());
+
+        app.editor.clear();
+        app.editor.insert_str("/agents");
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(!app.show_agents());
+    }
+
+    #[test]
+    fn agents_mouse_scroll_is_independent_bounded_and_consumed() {
+        use crate::events::SubagentStatus;
+        use ratatui::layout::Rect;
+        let mut app = app();
+        for index in 0..5 {
+            app.apply_runtime_at(
+                agent_event(
+                    &format!("s-{index}"),
+                    "Agent",
+                    SubagentStatus::Idle,
+                    None,
+                    1,
+                    None,
+                    (index, 1, Some(2)),
+                ),
+                100,
+            );
+        }
+        app.set_agents_viewport(Rect::new(20, 5, 10, 4), 2);
+        app.scroll = 7;
+        let wheel = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            app.handle_mouse(wheel(MouseEventKind::ScrollDown, 20, 5)),
+            Action::Redraw
+        ));
+        assert_eq!(app.agents_scroll(), 3);
+        assert_eq!(app.scroll, 7);
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp, 29, 8));
+        assert_eq!(app.agents_scroll(), 0);
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown, 30, 8));
+        assert_eq!(app.agents_scroll(), 0);
     }
 }

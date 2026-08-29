@@ -13,6 +13,7 @@ enum Kind {
     Close,
     Model,
     Effort,
+    Agents,
 }
 
 struct Spec {
@@ -47,6 +48,10 @@ const LOCAL_COMMANDS: &[Spec] = &[
         token: "/effort",
         kind: Kind::Effort,
     },
+    Spec {
+        token: "/agents",
+        kind: Kind::Agents,
+    },
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +62,7 @@ pub enum Parsed<'a> {
     Close,
     Model { query: Option<&'a str> },
     Effort { value: Option<&'a str> },
+    Agents,
     Prompt(&'a str),
 }
 
@@ -89,12 +95,17 @@ pub fn parse(input: &str) -> Parsed<'_> {
         Kind::Close => Parsed::Close,
         Kind::Model => Parsed::Model { query: prompt },
         Kind::Effort => Parsed::Effort { value: prompt },
+        Kind::Agents if prompt.is_none() => Parsed::Agents,
+        Kind::Agents => Parsed::Prompt(input),
     }
 }
 
 /// Byte range of a local or agent-advertised command token.
 pub fn known_token(input: &str, advertised: &[String]) -> Option<Range<usize>> {
-    if let Some((_, token_end)) = recognized_local(input) {
+    if let Some((spec, token_end)) = recognized_local(input) {
+        if matches!(spec.kind, Kind::Agents) && !input[token_end..].trim().is_empty() {
+            return None;
+        }
         return Some(0..token_end);
     }
     let (token, token_end) = token(input);
@@ -158,6 +169,16 @@ mod tests {
         assert_eq!(known_token("/sessions", &[]), Some(0..9));
         assert_eq!(known_token("/model sonnet", &[]), Some(0..6));
         assert_eq!(known_token("/effort high", &[]), Some(0..7));
+    }
+
+    #[test]
+    fn agents_is_an_exact_highlighted_local_command() {
+        assert_eq!(parse("/agents"), Parsed::Agents);
+        assert_eq!(known_token("/agents", &[]), Some(0..7));
+        for input in ["/agents now", "/agentsx", " /agents"] {
+            assert_eq!(parse(input), Parsed::Prompt(input));
+        }
+        assert_eq!(known_token("/agents now", &["agents".into()]), None);
     }
 
     #[test]

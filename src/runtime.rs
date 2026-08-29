@@ -331,6 +331,8 @@ impl Runtime {
                 telemetry: Default::default(),
                 harnesses: AcpHarnesses::default(),
                 default_harness: BUILTIN_HARNESS.into(),
+                parent_id: None,
+                parent_name: None,
             },
             max_subagent_depth,
         );
@@ -462,6 +464,23 @@ impl Runtime {
         &self.root
     }
 
+    /// Sets private immediate-parent context inherited by this runtime's direct children.
+    pub fn with_subagent_parent_context(
+        runtime: Arc<Self>,
+        parent: Option<(String, String)>,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime).map_err(|_| {
+            "could not configure subagent parent context after runtime was shared".to_string()
+        })?;
+        let mut config = runtime.subagents.child_config();
+        (config.parent_id, config.parent_name) = match parent {
+            Some((id, name)) => (Some(id), Some(name)),
+            None => (None, None),
+        };
+        runtime.subagents = Subagents::new(config, runtime.max_subagent_depth);
+        Ok(Arc::new(runtime))
+    }
+
     /// Configures the trusted named ACP harnesses used by nested agents.
     pub fn with_acp_harnesses(
         runtime: Arc<Self>,
@@ -559,6 +578,8 @@ impl Runtime {
                 telemetry: previous.telemetry,
                 harnesses: previous.harnesses,
                 default_harness: previous.default_harness,
+                parent_id: previous.parent_id,
+                parent_name: previous.parent_name,
             },
             runtime.max_subagent_depth,
         );

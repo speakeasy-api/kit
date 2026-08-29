@@ -15,6 +15,31 @@ use super::{
     SessionSelection, background_route, load_initial_transcript,
 };
 
+#[tokio::test]
+async fn subagent_manager_survives_runtime_reconstruction() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime = Runtime::with_telemetry(runtime, Default::default()).unwrap();
+
+    let harnesses = crate::acp_child::AcpHarnesses::default();
+    let runtime =
+        Runtime::with_acp_harnesses(runtime, harnesses, crate::acp_child::BUILTIN_HARNESS.into())
+            .unwrap();
+
+    let mcp_path = root.path().join("mcp.json");
+    std::fs::write(&mcp_path, r#"{"mcpServers":{}}"#).unwrap();
+    let runtime = Runtime::with_mcp_config(
+        runtime,
+        Some(&mcp_path),
+        Vec::new(),
+        false,
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+    let _fresh = runtime.subagents.fresh();
+}
+
 #[test]
 fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
     let root = tempfile::tempdir().unwrap();

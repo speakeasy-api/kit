@@ -243,6 +243,15 @@ impl Config {
             .map_err(|error| format!("could not parse TOML: {error}"))
             .map(migrate_config)
             .and_then(|config| {
+                if config
+                    .get("subagent")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|subagent| subagent.contains_key("names"))
+                {
+                    return Err(
+                        "could not parse config: unknown field `names` in `subagent`".into(),
+                    );
+                }
                 toml::Value::Table(config)
                     .try_into()
                     .map_err(|error| format!("could not parse config: {error}"))
@@ -479,6 +488,10 @@ enum Command {
         force: bool,
         #[arg(long, default_value_t = 0, hide = true)]
         subagent_depth: usize,
+        #[arg(long, hide = true, requires = "subagent_parent_name")]
+        subagent_parent_id: Option<String>,
+        #[arg(long, hide = true, requires = "subagent_parent_id")]
+        subagent_parent_name: Option<String>,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
@@ -893,6 +906,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
             subagent_depth,
+            subagent_parent_id,
+            subagent_parent_name,
         } => {
             let root = config.root(root);
             let model = config.model(model);
@@ -928,6 +943,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
+            let runtime = kit::Runtime::with_subagent_parent_context(
+                runtime,
+                subagent_parent_id.zip(subagent_parent_name),
+            )?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
             let runtime = kit::Runtime::with_mcp_config(
@@ -1046,6 +1065,20 @@ mod tests {
         init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
         validate_auth_storage,
     };
+
+    #[test]
+    fn subagent_names_are_rejected_as_unknown_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "[subagent]\nharness = \"acp.kit\"\nnames = [\"Scout\"]\n",
+        )
+        .unwrap();
+
+        let error = Config::load(&path).expect_err("removed names key must fail config loading");
+        assert!(error.to_string().contains("unknown field `names`"));
+    }
 
     #[test]
     fn config_file_supplies_defaults_and_cli_values_win() {
@@ -1691,6 +1724,29 @@ review = "opus"
                 .unwrap_err()
                 .contains("not in allow_model_overrides")
         );
+    }
+
+    #[test]
+    fn acp_accepts_hidden_immediate_subagent_parent_context() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "acp",
+            "--subagent-parent-id",
+            "s-parent",
+            "--subagent-parent-name",
+            "偵察 🦀",
+        ])
+        .unwrap();
+        let Command::Acp {
+            subagent_parent_id,
+            subagent_parent_name,
+            ..
+        } = cli.command
+        else {
+            panic!("expected acp command");
+        };
+        assert_eq!(subagent_parent_id.as_deref(), Some("s-parent"));
+        assert_eq!(subagent_parent_name.as_deref(), Some("偵察 🦀"));
     }
 
     #[test]
