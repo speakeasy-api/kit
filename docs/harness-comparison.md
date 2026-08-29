@@ -1,4 +1,6 @@
-# Harness comparison: Kit vs Codex CLI vs Claude Code
+# Harness comparison: Kit vs Codex CLI vs Claude Code (preliminary)
+
+> Preliminary. Medians hide the long tail (the largest single request on record is 373k tokens for Kit and 708k for Claude Code), "active time" caps idle gaps at five minutes so a 12-hour session can show as a few hours, and token totals are not cost. Treat this as a method and a first data set, not a result.
 
 Observational numbers from the session transcripts of one developer who used all three tools for day-to-day work, parsed on 2026-08-29 with the scripts in [`scripts/harness-comparison/`](../scripts/harness-comparison/). This is not a benchmark: models, tasks, and time periods differ. Read the [caveats](#caveats) before quoting anything.
 
@@ -28,6 +30,8 @@ Kit sessions are dominated by work on the Kit repository itself; the other two c
 | **peak context** | **70k** | **96k** | **120k** |
 | wall-clock | 34m | 9m | 7m |
 | active time (gaps capped at 5m) | 18m | 9m | 7m |
+| max peak context in any session | 373k | 320k | 708k |
+| sessions with peak context ≥ 250k | 14 | 5 | 40 |
 | sessions with ≥1 compaction | 21% | 19% | 4% |
 | compactions / 100M input tokens | 5.2 | 4.9 | 0.4 |
 | sessions using subagents | 36% | 2% | 18% |
@@ -49,7 +53,7 @@ Same repository and same workflow (a shared skill or slash command), different i
 | Codex CLI | 1 | 2.3h | 4 | 696 | 45.4M | 149k | 241k | 3 | 3 |
 | Claude Code | 4 | 90m | 12 | 304 | 43.9M | 130k | 304k | 0 | 3–6 |
 
-Total spend is the same order of magnitude for all three. Kit's peak context stayed lowest despite the smallest window (272k vs 258k/1M) and by far the most subagents; it spent more output tokens (subagent reasoning included).
+Total input tokens are the same order of magnitude for all three; this is not a cost comparison. Kit's peak context stayed lowest despite the smallest window (272k vs 258k/1M) and by far the most subagents; it spent more output tokens (subagent reasoning included).
 
 ### Shepherd an existing PR to merge
 
@@ -81,12 +85,12 @@ The Kit run answered a narrower question ("summarize") than the other two ("revi
 | Claude Code | active time | 31.4h / 11.6h | 95 | 2,528 | 630.5M | 708k | 3 | 15 |
 | Claude Code | API requests | 42.8h / 9.0h | 53 | 5,794 | 1,255.9M | 570k | 3 | 75 |
 
-Kit sustains multi-hour agentic work through many compactions, but it is not the longest-running harness in this corpus; Codex and Claude Code both have longer single sessions.
+"Active" undercounts long sessions with waits (CI, reviews, sleeps); the longest Kit session by wall-clock is 68 hours. Kit sustains multi-hour agentic work through many compactions, and Codex and Claude Code both have longer single sessions on this data.
 
 ## Findings
 
 1. **Kit sends smaller requests.** Median context per API request is 41k under Kit vs 64k (Codex) and 85k (Claude Code); median peak context 70k vs 96k vs 120k. Consistent with `compose` batching several actions per round trip and with Kit delegating into many short subagent sessions.
-2. **Per-task spend is comparable.** On the ship-an-issue family all three land near 45M input tokens. Kit is not cheaper per task; it spends the budget in smaller, more parallel requests and more output.
+2. **Per-task input tokens are comparable.** On the ship-an-issue family all three land near 45M input tokens. Kit does not use fewer tokens per task; it uses them in smaller, more parallel requests and more output. No pricing is applied, so this says nothing about cost.
 3. **Kit uses subagents routinely** — 36% of sessions vs 2% / 18% — and nests two levels deep. Observed concurrency under one parent is modest (6) compared with Claude Code's parallel `Agent` calls (14).
 4. **Compaction rate per token is similar for Kit and Codex** (5.2 vs 4.9 per 100M input) and much lower for Claude Code, mostly because of 1M-context sessions.
 5. **Shepherding a PR is where Kit is lightest** (1–2 turns, 0.2–5.8M tokens), but n is tiny.

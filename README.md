@@ -26,7 +26,7 @@ kit init && kit auth login openai && kit tui
 
 Most agent harnesses expose many tools and pay one model round trip per call. Kit exposes **one tool, `compose`**, whose argument is a short program in [Runlet](https://github.com/danielkov/runlet). A single round trip can read several files, run the tests, apply an edit, retry a flaky command, delegate to subagents, and return one structured value.
 
-This keeps requests small. In a comparison of real coding sessions run with Kit, Codex CLI, and Claude Code, the median API request under Kit carried **41k tokens** against 64k and 85k, and median peak context per session was **70k against 96k and 120k**. [How the comparison was made, and its limits.](#how-it-compares)
+Fewer round trips means less repeated context per task and more work done per request.
 
 - **One tool, unlimited composition.** `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool`, `auth`, `skill`, `a2a`, `docs` are the tools a `compose` program calls. Independent calls run concurrently; data dependencies and `after` blocks express ordering; `boundary retry N` and `fail()` handle errors in-program.
 - **Subagents are values, not fire-and-forget tasks.** Start one, prompt it again, fork it, require JSON that matches a schema, close it. Point it at another harness — Claude Code, Codex, Cursor, or Kit itself — over ACP.
@@ -213,8 +213,6 @@ Every conversation is an append-only JSONL transcript under `~/.kit/sessions`, s
 - **Daemon-friendly.** `kit serve --remote-acp --no-stdio` runs independently of stdin; `SIGINT`/`SIGTERM` stop new connections, interrupt live sessions, and drain for five seconds. One bearer token file guards the HTTP listener.
 - **Observable.** `otel_endpoint = "http://localhost:4317"` exports AgentKit GenAI spans over OTLP/gRPC for the main agent, ACP sessions, nested children, and the compactor. Message capture is off by default and bounded when on.
 
-Single Kit sessions have run for 4.7 hours of active work, 886 API requests, and 11 automatic compactions ([details](docs/harness-comparison.md)).
-
 <!-- PLACEHOLDER: screenshot docs/media/otel-trace.png — point otel_endpoint at a local Jaeger/Tempo, run a session with two subagents, screenshot the trace waterfall showing the nested gen_ai spans. -->
 
 ### Terminal client
@@ -267,20 +265,7 @@ flash = "openrouter:openai/gpt-5.6-luna"
 
 ## How it compares
 
-The numbers below were computed from the session transcripts of one developer who used all three tools for day-to-day work: 144 Kit, 374 Codex CLI, and 344 Claude Code sessions plus their subagents, recorded between October 2025 and August 2026. They are observational, not a benchmark: different models, different tasks, different months. The scripts and the full report with matched task families are in [docs/harness-comparison.md](docs/harness-comparison.md).
-
-| Median per session | Kit | Codex CLI | Claude Code |
-| --- | ---: | ---: | ---: |
-| Input tokens per API request | **41k** | 64k | 85k |
-| Peak context | **70k** | 96k | 120k |
-| Input tokens per assistant turn | **460k** | 927k | 696k |
-| Tool calls per turn | 8.5 (compose; ~1.65 inner calls each) | 19.0 | 8.9 |
-| Sessions using subagents | **36%** | 2% | 18% |
-| Max subagent nesting observed | 2 | 2 | 1 |
-
-On the closest matched family — shipping a Linear issue end-to-end in the same repository — total spend was the same order of magnitude for all three (~45M input tokens median), while Kit's peak context stayed lowest (266k) despite the smallest window (272k) and 20–34 subagents per run. Kit is not cheaper per task in this sample; it spends the budget in smaller, more parallel requests. See the [caveats](docs/harness-comparison.md#caveats) before drawing conclusions.
-
-<!-- PLACEHOLDER: optional chart docs/media/comparison.svg — bar chart of the "input tokens per API request" and "peak context" rows; generate from scripts/harness-comparison/analyze.py output. -->
+A preliminary comparison of Kit, Codex CLI, and Claude Code, parsed from one developer's session transcripts, is in [docs/harness-comparison.md](docs/harness-comparison.md) together with the scripts that produced it. It is observational — different models, tasks, and periods — and its conclusions depend heavily on how turns, active time, and context are counted, so it is not summarized here.
 
 ## Deliberate limits
 
