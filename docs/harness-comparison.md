@@ -73,6 +73,49 @@ Total input tokens are the same order of magnitude for all three; this is not a 
 
 The Kit run answered a narrower question ("summarize") than the other two ("review"); treat it as illustrative only.
 
+## Matched by PR size: shipping an issue in speakeasy-api/gram
+
+The most controlled subset: top-level sessions in the `speakeasy-api/gram` repository whose prompt asked to ship an issue or raise a PR, and which demonstrably opened a PR (verified from each transcript's `gh pr create` result). PR size from `gh pr view`. Because three of the five Kit PRs are 72–90% generated code (Goa/OpenAPI output), rows are sized by **hand-written lines** (files under `server/gen/**`, `*.sql.go`, `client/sdk/**`, `openapi3.yaml`, `migrations/*.sql`, and lockfiles excluded). All 16 PRs merged. Produced by `scripts/harness-comparison/gram_compare.py`.
+
+| harness | PR | files / +/- | hand-written lines | model | wall | active | user msgs | API req | total input | uncached input | output | peak ctx | compactions | subagents |
+|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| claude | #4694 | 5 / +77/-18 | 87 | fable-5 | 44m | 44m | 5 | 104 | 14.0M | 357k | 46k | 215k | 0 | 3 |
+| claude | #5128 | 2 / +74/-54 | 128 | fable-5 | 89m | 53m | 11 | 124 | 17.5M | 162k | 38k | 184k | 0 | 0 |
+| kit | #5644 | 15 / +255/-38 | 281 | gpt-5.6-sol | 91m | 62m | 4 | 143 | 14.3M | 245k | 48k | 161k | 0 | 0 |
+| claude | #4987, #4997 | 8 / +215/-100 | 315 | fable-5 | 11.8h | 2.4h | 32 | 283 | 37.0M | 578k | 151k | 241k | 1 | 3 |
+| codex | #3116 (2 sessions) | 17 / +338/-35 | 339 | gpt-5.5 | 99m | 80m | 18 | 245 | 34.4M | 1.86M | 79k | 233k | 1 | 0 |
+| codex | #3901 | 4 / +344/-19 | 363 | gpt-5.5 | 3.8h | 2.3h | 10 | 380 | 45.4M | 2.03M | 149k | 241k | 3 | 3 |
+| kit | #5627 | 28 / +2363/-34 | 376 | gpt-5.6-sol | 69m | 53m | 1 | 162 | 15.7M | 344k | 57k | 162k | 0 | 1 |
+| claude | #5445 | 17 / +462/-98 | 560 | opus-5 | 3.9h | 93m | 9 | 247 | 45.7M | 1.02M | 96k | 355k | 0 | 4 |
+| kit | #5601 | 31 / +2930/-308 | 911 | gpt-5.6-sol | 2.5h | 2.0h | 5 | 668 | 57.2M | 5.24M | 298k | 266k | 3 | 34 |
+| kit | #5515 | 33 / +852/-323 | 930 | gpt-5.6-sol | 2.6h | 81m | 6 | 497 | 46.2M | 3.47M | 255k | 274k | 4 | 20 |
+| claude | #4855 | 18 / +1101/-60 | 1161 | fable-5 | 2.7h | 120m | 18 | 315 | 53.9M | 835k | 146k | 367k | 0 | 6 |
+| kit | #5460 | 43 / +14334/-3503 | 1791 | gpt-5.6-sol | 17.3h | 3.5h | 16 | 809 | 67.1M | 7.29M | 368k | 349k | 11 | 34 |
+| claude | #5230, #5229 | 45 / +4680/-308 | 1961 | fable-5 | 2.0h | 108m | 15 | 379 | 101.9M | 954k | 175k | 490k | 1 | 4 |
+| claude | #5827 | 20 / +1015/-1115 | 2130 | fable-5 | 61m | 61m | 1 | 228 | 50.8M | 637k | 115k | 379k | 0 | 3 |
+
+"Uncached input" is fresh input plus cache writes; Claude's raw fresh input is near zero in every session because everything is a cache read or cache write, so it is the only comparable column. Rows sized 300–1000 hand-written lines are the only bucket with all three harnesses:
+
+| per hand-written line, median (300–1000 bucket) | Kit (n=3) | Codex (n=2) | Claude (n=2) |
+|---|---:|---:|---:|
+| total input tokens | **49.7k** | 113k | 99.6k |
+| uncached input tokens | 3.7k | 5.5k | **1.8k** |
+| output tokens | 274 | 321 | 325 |
+| active minutes | **0.13** | 0.31 | 0.31 |
+| API requests per session | 497 | 312 | 265 |
+| peak context | 266k | 237k | 298k |
+| compactions | 3 | 2 | 0 |
+
+Across all rows the picture is the same: Kit ships a hand-written line for about half the total input tokens and half the active time of the others, at the cost of the most API requests and the most compactions; Claude Code has by far the lowest uncached input because nearly everything it sends is a cache hit.
+
+Outcome notes:
+
+- Two PRs needed a separate shepherd session to merge: Kit #5601 (a Claude session three days later) and Claude #5827 (a Claude session the next day). Kit #5601's row excludes that cost; the Codex and Claude rows that shepherded their own PR include the polling time (Codex #3901 3.8h wall, Claude #4987 11.8h wall).
+- No issue in the set was re-implemented in another harness afterwards.
+- User-message counts show how much steering each run needed: Kit #5627 and Claude #5827 were one-shot; Codex #3116 took 18 messages across two sessions, Claude #4987 took 32.
+
+Additional caveats for this subset: n is 5 / 2 / 7; models differ per row (gpt-5.6-sol vs gpt-5.5 vs fable-5/opus-5) and tokenizers differ, so token ratios are indicative, not price-comparable (Anthropic bills cache writes at 1.25× and reads at 0.1×; OpenAI bills cached input at 0.1–0.25×); the generated-file regex is heuristic; Linear estimates are unset on every issue, so PR size is the only available size proxy.
+
 ## Longest sessions
 
 | harness | criterion | wall / active | turns | API requests | input | peak ctx | compactions | subagents |
@@ -92,8 +135,9 @@ The Kit run answered a narrower question ("summarize") than the other two ("revi
 1. **Kit sends smaller requests.** Median context per API request is 41k under Kit vs 64k (Codex) and 85k (Claude Code); median peak context 70k vs 96k vs 120k. Consistent with `compose` batching several actions per round trip and with Kit delegating into many short subagent sessions.
 2. **Per-task input tokens are comparable.** On the ship-an-issue family all three land near 45M input tokens. Kit does not use fewer tokens per task; it uses them in smaller, more parallel requests and more output. No pricing is applied, so this says nothing about cost.
 3. **Kit uses subagents routinely** — 36% of sessions vs 2% / 18% — and nests two levels deep. Observed concurrency under one parent is modest (6) compared with Claude Code's parallel `Agent` calls (14).
-4. **Compaction rate per token is similar for Kit and Codex** (5.2 vs 4.9 per 100M input) and much lower for Claude Code, mostly because of 1M-context sessions.
-5. **Shepherding a PR is where Kit is lightest** (1–2 turns, 0.2–5.8M tokens), but n is tiny.
+4. **On size-matched gram issues, Kit used roughly half the total input tokens and half the active time per hand-written line** of Codex CLI or Claude Code, with more API requests and compactions. Small n; see the matched section.
+5. **Compaction rate per token is similar for Kit and Codex** (5.2 vs 4.9 per 100M input) and much lower for Claude Code, mostly because of 1M-context sessions.
+6. **Shepherding a PR is where Kit is lightest** (1–2 turns, 0.2–5.8M tokens), but n is tiny.
 
 ## Caveats
 

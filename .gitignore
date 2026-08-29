@@ -6,3 +6,4 @@
 /.env
 .DS_Store
 scripts/harness-comparison/sessions.json
+scripts/harness-comparison/prs.json
