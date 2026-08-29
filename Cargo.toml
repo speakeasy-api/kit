@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.108"
+version = "0.1.109"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -48,7 +48,6 @@ jsonschema = { version = "=0.52.0", default-features = false, features = ["idna"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
-petname = { version = "=3.2.0", default-features = false, features = ["default-rng", "default-words"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
