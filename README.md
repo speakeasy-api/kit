@@ -254,6 +254,15 @@ credential_dir = "~/.kit/credentials"
 mcp_config = "~/.kit/mcp.json"
 otel_endpoint = "http://localhost:4317"
 
+# Optional: explicit retry/time-out policy for the selected provider.
+[resilience]
+max_retries = 5
+retry_budget_ms = 60000
+attempt_timeout_ms = 30000
+stream_idle_timeout_ms = 30000
+initial_backoff_ms = 200
+max_backoff_ms = 10000
+
 [acp.claude]
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp@0.69.0"]

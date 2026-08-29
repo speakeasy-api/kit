@@ -62,6 +62,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const CLOCK_SKEW_SECONDS: i64 = 60;
 const REFRESH_WINDOW_SECONDS: i64 = 5 * 60;
 const JWKS_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_OAUTH_TIMEOUT: Duration = Duration::from_secs(300);
 static REFRESH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static JWKS_CACHE: LazyLock<Mutex<HashMap<String, CachedJwks>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -123,6 +124,12 @@ impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.detail)
     }
+}
+
+pub(crate) fn checked_deadline(timeout: Duration) -> Result<Instant, AuthError> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        AuthError::timeout("authentication deadline exceeds the monotonic clock range")
+    })
 }
 
 impl TokenRecord {
@@ -343,7 +350,7 @@ pub(crate) fn execute(
     timeout: Duration,
 ) -> Result<Output, AuthError> {
     let store = BackendCredentialStore::new(storage);
-    let deadline = Instant::now() + timeout.min(Duration::from_secs(300));
+    let deadline = checked_deadline(timeout.min(MAX_OAUTH_TIMEOUT))?;
     match command {
         AuthCommand::Login => login(&store, format, deadline),
         AuthCommand::Status => status(&store, format, deadline),

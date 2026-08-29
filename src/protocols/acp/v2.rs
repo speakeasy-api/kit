@@ -331,7 +331,7 @@ where
         }
         if matches!(
             &event.event,
-            AgentEvent::ContentDelta(delta) if crate::response_attempt::is_marker(delta)
+            AgentEvent::ContentDelta(delta) if agentkit_loop::response_attempt::is_marker(delta)
         ) {
             self.clear_current();
             return;
@@ -1985,7 +1985,7 @@ mod tests {
             part_id: agentkit_core::PartId::new("message-1"),
             chunk: "old answer".into(),
         }));
-        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
             unreachable!();
         };
         emit(AgentEvent::ContentDelta(marker));
@@ -2047,7 +2047,7 @@ mod tests {
         ));
         drop(updates);
 
-        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
             unreachable!();
         };
         emit(AgentEvent::ContentDelta(marker));
@@ -2085,7 +2085,7 @@ mod tests {
             session_id: loop_session_id.clone(),
             turn_id: agentkit_core::TurnId::new("turn-2"),
         });
-        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
             unreachable!();
         };
         emit(AgentEvent::ContentDelta(marker));
@@ -2177,7 +2177,7 @@ mod tests {
             session_id: loop_session_id.clone(),
             turn_id: agentkit_core::TurnId::new("turn-3"),
         });
-        let ModelTurnEvent::Delta(marker) = crate::response_attempt::marker_event() else {
+        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
             unreachable!();
         };
         emit(AgentEvent::ContentDelta(marker));
@@ -2282,7 +2282,7 @@ mod tests {
                 }),
                 2 => {
                     self.interrupt.interrupt();
-                    crate::response_attempt::marker_event()
+                    agentkit_loop::response_attempt::marker_event()
                 }
                 _ => return Ok(None),
             };

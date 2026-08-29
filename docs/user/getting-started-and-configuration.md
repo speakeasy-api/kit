@@ -191,7 +191,22 @@ url = "https://example.com/plugin.tar.gz"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-`root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
+`root`, `provider`, `model`, and credential settings apply to all four runtime commands.
+The optional `[resilience]` table applies one AgentKit retry and timeout policy to whichever provider is selected, including providers selected later with `/model` and built-in `acp.kit` children. Duration names include their units. The two timeout fields can be omitted to disable those timeouts; the other fields are required:
+
+```toml
+[resilience]
+max_retries = 5
+retry_budget_ms = 60000
+attempt_timeout_ms = 30000       # omit to disable the per-attempt timeout
+stream_idle_timeout_ms = 30000   # omit to disable the stream-idle timeout
+initial_backoff_ms = 200
+max_backoff_ms = 10000
+```
+
+Without this table, OpenRouter and Speakeasy remain single-attempt. OpenAI subscription retains Kit's built-in long-running policy: a 24-hour request budget, 10-minute attempt timeout, 5-minute stream-idle timeout, 60-second maximum exponential backoff, and 10-minute maximum server-directed retry delay. Invalid zero budgets/timeouts, unknown fields, and a maximum backoff smaller than the initial backoff fail configuration loading without rewriting the file.
+
+ Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
 
 `a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. If `mcp_config` is also set, its same-named entries override plugin servers, and live removal of an override restores the plugin server. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 

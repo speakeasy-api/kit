@@ -1,6 +1,5 @@
 mod adapter;
 pub mod chatgpt;
-mod credentials;
 mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;

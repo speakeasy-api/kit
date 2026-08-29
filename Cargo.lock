@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -151,7 +151,7 @@ dependencies = [
 [[package]]
 name = "agentkit-adapter-completions"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -169,7 +169,7 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "agentkit-compaction"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -193,7 +193,7 @@ dependencies = [
 [[package]]
 name = "agentkit-context"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "async-fs",
@@ -205,7 +205,7 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "futures-timer",
  "serde",
@@ -216,22 +216,26 @@ dependencies = [
 [[package]]
 name = "agentkit-http"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "async-trait",
  "bytes",
+ "fastrand",
+ "futures-timer",
  "futures-util",
  "http",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
 name = "agentkit-loop"
 version = "0.10.10"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -248,7 +252,7 @@ dependencies = [
 [[package]]
 name = "agentkit-mcp"
 version = "0.10.6"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -269,7 +273,7 @@ dependencies = [
 [[package]]
 name = "agentkit-plugins"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "http",
  "serde",
@@ -280,9 +284,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-provider-openai"
+version = "0.10.5"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
+dependencies = [
+ "agentkit-adapter-completions",
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "agentkit-provider-openrouter"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -297,7 +320,7 @@ dependencies = [
 [[package]]
 name = "agentkit-task-manager"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -309,7 +332,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tool-compose"
 version = "0.10.9"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -339,7 +362,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=eba802525e718223aa011788559e291267a96473#eba802525e718223aa011788559e291267a96473"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -2534,6 +2557,7 @@ dependencies = [
  "agentkit-loop",
  "agentkit-mcp",
  "agentkit-plugins",
+ "agentkit-provider-openai",
  "agentkit-provider-openrouter",
  "agentkit-task-manager",
  "agentkit-tool-compose",
@@ -2550,8 +2574,6 @@ dependencies = [
  "flate2",
  "futures-util",
  "getrandom 0.4.3",
- "h2",
- "httpdate",
  "hyper",
  "hyper-util",
  "image",
@@ -3736,7 +3758,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4405,7 +4427,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -5364,15 +5386,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

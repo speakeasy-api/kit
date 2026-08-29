@@ -9,7 +9,7 @@ mod fatal;
 pub mod plugins;
 pub mod protocols;
 pub mod provider;
-mod response_attempt;
+mod resilience;
 pub mod runtime;
 pub mod session;
 pub mod telemetry;
@@ -21,4 +21,5 @@ pub use acp_child::{
     AcpHarnessProfile, AcpHarnesses, AcpPermissionPolicy, BUILTIN_HARNESS, SubagentHarnessPolicy,
 };
 pub use provider::{ProviderKind, ReasoningEffort};
+pub use resilience::ResilienceConfig;
 pub use runtime::Runtime;

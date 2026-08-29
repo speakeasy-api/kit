@@ -331,6 +331,39 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     resume: Option<&str>,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_reasoning_effort_openrouter_key_and_resilience(
+        root,
+        model,
+        provider,
+        reasoning_effort,
+        a2a,
+        mcp_config,
+        credential_storage,
+        telemetry,
+        openrouter_api_key,
+        None,
+        resume,
+        force,
+    )
+    .await
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reasoning_effort_openrouter_key_and_resilience(
+    root: &Path,
+    model: &str,
+    provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
+    credential_storage: &CredentialStorage,
+    telemetry: &crate::telemetry::Settings,
+    openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    resilience: Option<&crate::ResilienceConfig>,
+    resume: Option<&str>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
     // the same path the agent accepts.
@@ -351,6 +384,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         provider,
         reasoning_effort,
         openrouter_api_key,
+        resilience,
         &persisted_session_id,
         resume_session_id.is_some(),
     )?;
@@ -2105,6 +2139,12 @@ a = [still text]
 
 [custom]
 "quoted.key" = "preserved"
+
+[resilience]
+max_retries = 2
+retry_budget_ms = 60000
+initial_backoff_ms = 200
+max_backoff_ms = 10000
 "#,
         )
         .unwrap();
@@ -2121,6 +2161,11 @@ a = [still text]
         assert_eq!(saved["model"].as_str(), Some("anthropic/claude-sonnet-4"));
         assert_eq!(saved["message"].as_str(), Some("a = [still text]\n"));
         assert_eq!(saved["custom"]["quoted.key"].as_str(), Some("preserved"));
+        assert_eq!(saved["resilience"]["max_retries"].as_integer(), Some(2));
+        assert_eq!(
+            saved["resilience"]["retry_budget_ms"].as_integer(),
+            Some(60_000)
+        );
     }
 
     #[test]
