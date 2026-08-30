@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -122,6 +123,7 @@ struct State {
     harness: String,
     model: Option<String>,
     kit: bool,
+    root: PathBuf,
     child: Option<ChildSession>,
     forking: Option<String>,
     permit: Option<OwnedSemaphorePermit>,
@@ -231,6 +233,7 @@ struct CreateOptions {
     name: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    cwd: Option<PathBuf>,
 }
 
 struct ForkSuccess {
@@ -248,6 +251,7 @@ struct ForkOperation {
     harness: String,
     model: Option<String>,
     kit: bool,
+    root: PathBuf,
     generation: u64,
     depth: usize,
     cancellation: TurnCancellation,
@@ -295,6 +299,30 @@ impl Subagents {
         self.config.harnesses.references()
     }
 
+    fn resolve_root(&self, cwd: Option<PathBuf>) -> Result<PathBuf, ChildError> {
+        let Some(cwd) = cwd else {
+            return Ok(self.config.root.clone());
+        };
+        let path = if cwd.is_absolute() {
+            cwd
+        } else {
+            self.config.root.join(cwd)
+        };
+        let root = path.canonicalize().map_err(|error| {
+            ChildError::Failed(format!(
+                "could not open subagent working directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !root.is_dir() {
+            return Err(ChildError::Failed(format!(
+                "subagent working directory is not a directory: {}",
+                root.display()
+            )));
+        }
+        Ok(root)
+    }
+
     async fn create(
         &self,
         prompt: String,
@@ -310,7 +338,9 @@ impl Subagents {
             name,
             harness,
             model,
+            cwd,
         } = options;
+        let root = self.resolve_root(cwd)?;
         let harness = harness.unwrap_or_else(|| self.config.default_harness.clone());
         if !self.config.harnesses.contains(&harness) {
             return Err(ChildError::Failed(format!(
@@ -341,6 +371,7 @@ impl Subagents {
                 harness: harness.clone(),
                 model: model.clone(),
                 kit,
+                root: root.clone(),
                 child: None,
                 forking: None,
                 permit: Some(permit),
@@ -350,6 +381,7 @@ impl Subagents {
         let child_config = self
             .config
             .clone()
+            .with_root(root)
             .with_parent_context(id.clone(), state.lock().await.name.clone());
         {
             let locked = state.lock().await;
@@ -557,6 +589,7 @@ impl Subagents {
             harness: source.harness.clone(),
             model: source.model.clone(),
             kit: source.kit,
+            root: source.root.clone(),
             generation,
             depth,
             cancellation,
@@ -610,6 +643,7 @@ impl Subagents {
             harness,
             model,
             kit,
+            root,
             generation,
             depth,
             cancellation,
@@ -640,6 +674,7 @@ impl Subagents {
                 harness: harness.clone(),
                 model: model.clone(),
                 kit,
+                root: root.clone(),
                 child: None,
                 forking: None,
                 permit: None,
@@ -652,11 +687,11 @@ impl Subagents {
         }
 
         if !native_fork {
-            let root = self.config.root.clone();
+            let transcript_root = root.clone();
             let source_id = source_id.clone();
             let branch_id = id.clone();
             let cloned = tokio::task::spawn_blocking(move || {
-                session::clone_completed(&root, &source_id, &branch_id)
+                session::clone_completed(&transcript_root, &source_id, &branch_id)
             })
             .await
             .map_err(|error| ChildError::Failed(format!("transcript clone task failed: {error}")))
@@ -674,6 +709,7 @@ impl Subagents {
         let child_config = self
             .config
             .clone()
+            .with_root(root)
             .with_parent_context(id.clone(), branch_name);
         let child_result = if native_fork {
             source_child.fork(model.as_deref(), &cancellation).await
@@ -1269,7 +1305,7 @@ fn call_id_schema() -> serde_json::Value {
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"name":display_name_schema(),"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.", json!({"type":"object","properties":{"prompt":{"type":"string"},"name":display_name_schema(),"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"cwd":{"type":"string","minLength":1,"description":"Working directory for the new subagent. Relative paths resolve from Kit's working directory."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
     }
 }
 impl PromptTool {
@@ -1331,6 +1367,7 @@ struct Input {
     name: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    cwd: Option<PathBuf>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -1467,6 +1504,7 @@ impl Tool for SubagentTool {
                         name: input.name,
                         harness: input.harness,
                         model: input.model,
+                        cwd: input.cwd,
                     },
                     self.depth,
                     cancellation(context),

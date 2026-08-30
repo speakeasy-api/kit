@@ -9,6 +9,7 @@ Use the object form of the hidden tools inside `compose`:
 ```text
 first = subagent({
   name: "Implementer",
+  cwd: "../parser-worktree",
   prompt: "Inspect the parser and identify the smallest risk."
 })
 second = prompt({
@@ -27,7 +28,7 @@ Each successful turn returns a session value with `id`, `name`, `output`, and `g
 
 Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
 
-The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has no naming input and preserves the session name. The optional `harness` and `model` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. Omit either argument to retain the configured preference. `prompt` and `fork` retain the original session's harness and model. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
+The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has no naming input and preserves the session name. The optional `harness`, `model`, and `cwd` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. `cwd` selects the new subagent's working directory; relative paths resolve from Kit's working directory, and missing paths or non-directories fail before startup. Omit an argument to retain its configured default. `prompt` and `fork` retain the original session's harness, model, and working directory. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
 
 ## Inspect display names
 
@@ -78,7 +79,7 @@ Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 K
 
 ## Choose the built-in `acp.kit` harness
 
-`acp.kit` is always available and is the default when `[subagent].harness` is not configured. By default Kit launches the installed `kit` executable as `kit acp`, whose default stdio protocol is ACP v1. A built-in child inherits Kit's working directory, provider, model, MCP configuration and credential storage, cancellation, and nesting depth. An explicit `subagent.model` selection overrides the inherited model for that ACP session. It does not start an A2A listener.
+`acp.kit` is always available and is the default when `[subagent].harness` is not configured. By default Kit launches the installed `kit` executable as `kit acp`, whose default stdio protocol is ACP v1. A built-in child uses `subagent.cwd` when provided and otherwise inherits Kit's working directory; it also inherits the provider, model, MCP configuration and credential storage, cancellation, and nesting depth. An explicit `subagent.model` selection overrides the inherited model for that ACP session. It does not start an A2A listener.
 
 You can override only the executable and base arguments while preserving built-in Kit behavior:
 
@@ -96,7 +97,7 @@ Built-in subagent transcripts are durable on disk, but their reusable parent-own
 
 ## Configure a generic ACP v1 harness
 
-Generic external child harnesses remain ACP v1: they must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from Kit's working directory and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
+Generic external child harnesses remain ACP v1: they must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from the subagent's selected working directory, which defaults to Kit's working directory, and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
 
 Configure trusted argv profiles in `~/.kit/config.toml`:
 
