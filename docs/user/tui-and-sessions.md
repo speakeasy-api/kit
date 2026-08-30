@@ -17,7 +17,7 @@ kit sessions --root /path/to/project
 kit tui --root /path/to/project --resume <session-id>
 ```
 
-The catalog requires an existing directory and is workspace-filtered and newest-first. It reports each durable ID and updated time. The title comes from the earliest retained useful user text so compaction does not rename a session; the preview describes the current retained history. Display metadata removes terminal controls and Unicode default-ignorable formatting characters.
+The catalog requires an existing directory and is workspace-filtered and newest-first. It reports each durable top-level session ID and updated time; sessions created as subagents are omitted based on structured origin metadata in their initial transcript. Sessions created before Kit recorded that metadata remain visible. Filtering affects discovery only; a known omitted ID can still be resumed explicitly. The title comes from the earliest retained useful user text so compaction does not rename a session; the preview describes the current retained history. Display metadata removes terminal controls and Unicode default-ignorable formatting characters.
 
 A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
 

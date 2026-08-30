@@ -1123,6 +1123,29 @@ fn cancel_all_covers_running_and_late_background_registration() {
     jobs.finish_for_test("next-turn");
 }
 
+#[tokio::test]
+async fn initial_transcript_records_structured_session_origin() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    for (depth, expected) in [
+        (0, crate::session::TOP_LEVEL_SESSION_ORIGIN),
+        (1, crate::session::SUBAGENT_SESSION_ORIGIN),
+        (
+            runtime.max_subagent_depth(),
+            crate::session::SUBAGENT_SESSION_ORIGIN,
+        ),
+    ] {
+        let transcript = runtime.initial_transcript(depth).await.unwrap();
+        assert_eq!(
+            transcript[0]
+                .metadata
+                .get(crate::session::SESSION_ORIGIN_METADATA_KEY),
+            Some(&Value::String(expected.into()))
+        );
+    }
+}
+
 #[test]
 fn system_prompt_guides_compose_and_subagent_hygiene() {
     let root = tempfile::tempdir().unwrap();
