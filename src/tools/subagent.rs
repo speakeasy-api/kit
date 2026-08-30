@@ -10,7 +10,7 @@ use agentkit_tools_core::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
 const MAX_DISPLAY_NAME_LEN: usize = 32;
@@ -27,12 +27,15 @@ fn normalize_display_name(candidate: &str) -> Option<String> {
     }
 }
 
-fn allocate_display_name(used: &mut HashSet<String>, preferred: Option<&str>) -> String {
+fn allocate_display_name(
+    used: &mut HashSet<String>,
+    preferred: Option<&str>,
+) -> Result<String, ChildError> {
     if let Some(name) = preferred.and_then(normalize_display_name) {
         if reserve_name(used, &name) {
-            return name;
+            return Ok(name);
         }
-        for number in 2usize.. {
+        for number in 2..=MAX_LIVE_SUBAGENTS + 1 {
             let suffix = format!(" {number}");
             let Some(max_base_len) = MAX_DISPLAY_NAME_LEN.checked_sub(suffix.len()) else {
                 break;
@@ -40,18 +43,23 @@ fn allocate_display_name(used: &mut HashSet<String>, preferred: Option<&str>) ->
             let base = name[..name.len().min(max_base_len)].trim_end();
             let candidate = format!("{base}{suffix}");
             if reserve_name(used, &candidate) {
-                return candidate;
+                return Ok(candidate);
             }
         }
     }
 
-    for number in 1usize.. {
+    // At most MAX_LIVE_SUBAGENTS names can be reserved, so one of these
+    // MAX_LIVE_SUBAGENTS + 1 generated names must be available. Keep the
+    // search bounded and report invariant violations instead of looping.
+    for number in 1..=MAX_LIVE_SUBAGENTS + 1 {
         let name = format!("Agent {number}");
         if reserve_name(used, &name) {
-            return name;
+            return Ok(name);
         }
     }
-    unreachable!("generated subagent name space is inexhaustible")
+    Err(ChildError::Failed(
+        "could not allocate a unique subagent display name".into(),
+    ))
 }
 
 fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
@@ -92,23 +100,11 @@ pub struct Subagents {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
-    #[cfg(test)]
-    failed_removals: Arc<Mutex<Vec<FailedRemoval>>>,
-    #[cfg(test)]
-    runtime_events: Arc<Mutex<Vec<events::RuntimeEvent>>>,
 }
 
 struct SessionEntry {
     name: String,
     state: Arc<AsyncMutex<State>>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct FailedRemoval {
-    status: SubagentStatus,
-    outcome: Option<GenerationOutcome>,
-    finished_at_unix_ms: Option<u64>,
 }
 
 struct State {
@@ -127,7 +123,8 @@ struct State {
     model: Option<String>,
     kit: bool,
     child: Option<ChildSession>,
-    _permit: OwnedSemaphorePermit,
+    forking: Option<String>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl State {
@@ -236,6 +233,29 @@ struct CreateOptions {
     model: Option<String>,
 }
 
+struct ForkSuccess {
+    value: SubagentValue,
+    acknowledge: oneshot::Sender<()>,
+}
+
+struct ForkOperation {
+    source_id: String,
+    source_state: Arc<AsyncMutex<State>>,
+    source_child: ChildSession,
+    id: String,
+    prompt: String,
+    name: Option<String>,
+    harness: String,
+    model: Option<String>,
+    kit: bool,
+    generation: u64,
+    depth: usize,
+    cancellation: TurnCancellation,
+    contract: Option<Arc<OutputContract>>,
+    permit: OwnedSemaphorePermit,
+    native_fork: bool,
+}
+
 impl Subagents {
     pub(crate) fn new(config: ChildConfig, max_depth: usize) -> Self {
         Self {
@@ -247,10 +267,6 @@ impl Subagents {
                 events::emit(event);
                 Ok(())
             }),
-            #[cfg(test)]
-            failed_removals: Arc::default(),
-            #[cfg(test)]
-            runtime_events: Arc::default(),
         }
     }
 
@@ -272,51 +288,7 @@ impl Subagents {
             *parent_id = self.config.parent_id.clone();
             *parent_name = self.config.parent_name.clone();
         }
-        #[cfg(test)]
-        if let Ok(mut emitted) = self.runtime_events.lock() {
-            emitted.push(event.clone());
-        }
         let _ = (self.event_sink)(&event);
-    }
-
-    #[cfg(test)]
-    fn runtime_events_for_test(&self) -> Vec<events::RuntimeEvent> {
-        self.runtime_events.lock().unwrap().clone()
-    }
-
-    #[cfg(test)]
-    fn with_event_sink_for_test(mut self, event_sink: EventSink) -> Self {
-        self.event_sink = event_sink;
-        self
-    }
-
-    #[cfg(test)]
-    async fn insert_starting_for_test(&self) -> String {
-        let now = events::now_millis();
-        let state = self
-            .insert_starting(
-                session::new_id(),
-                State {
-                    name: String::new(),
-                    status: SubagentStatus::Starting,
-                    task: "test".into(),
-                    generation: 1,
-                    handle_generation: 1,
-                    outcome: None,
-                    created_at_unix_ms: now,
-                    generation_started_at_unix_ms: now,
-                    generation_finished_at_unix_ms: None,
-                    output: Value::Null,
-                    updates: None,
-                    harness: crate::acp_child::BUILTIN_HARNESS.into(),
-                    model: None,
-                    kit: true,
-                    child: None,
-                    _permit: self.reserve().unwrap(),
-                },
-            )
-            .unwrap();
-        state.lock().await.name.clone()
     }
 
     fn harness_references(&self) -> Vec<String> {
@@ -370,7 +342,8 @@ impl Subagents {
                 model: model.clone(),
                 kit,
                 child: None,
-                _permit: permit,
+                forking: None,
+                permit: Some(permit),
             },
         )?;
         let persisted = kit.then(|| (id.clone(), false));
@@ -378,6 +351,10 @@ impl Subagents {
             .config
             .clone()
             .with_parent_context(id.clone(), state.lock().await.name.clone());
+        {
+            let locked = state.lock().await;
+            self.check_active(&locked)?;
+        }
         let child = match ChildSession::start(
             child_config,
             harness,
@@ -396,6 +373,18 @@ impl Subagents {
         };
         {
             let mut locked = state.lock().await;
+            if let Err(error) = self.check_active(&locked) {
+                drop(locked);
+                let error = self
+                    .reject_uninstalled_child_owned(
+                        id.clone(),
+                        Arc::clone(&state),
+                        child.clone(),
+                        error,
+                    )
+                    .await;
+                return Err(error);
+            }
             locked.status = SubagentStatus::Working;
             locked.child = Some(child.clone());
             self.emit_event(locked.runtime_event(id.clone()));
@@ -446,6 +435,11 @@ impl Subagents {
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_ready(&locked)?;
+        if locked.forking.is_some() {
+            return Err(ChildError::Failed(
+                "subagent session is being forked".into(),
+            ));
+        }
         self.check_generation(&prior, locked.handle_generation)?;
         let generation = locked
             .generation
@@ -495,15 +489,17 @@ impl Subagents {
                     self.fail_removed_and_remove(&prior.id, &state).await;
                 } else {
                     let mut locked = state.lock().await;
-                    locked.status = SubagentStatus::Idle;
-                    locked.outcome = Some(GenerationOutcome::Failed);
-                    locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                    // A failed call returns no replacement handle, so preserve the
-                    // accepted handle generation for a retry while keeping lifecycle
-                    // generations monotonic.
-                    let event = locked.runtime_event(prior.id.clone());
-                    drop(locked);
-                    self.emit_event(event);
+                    if locked.status != SubagentStatus::Removed {
+                        locked.status = SubagentStatus::Idle;
+                        locked.outcome = Some(GenerationOutcome::Failed);
+                        locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                        // A failed call returns no replacement handle, so preserve the
+                        // accepted handle generation for a retry while keeping lifecycle
+                        // generations monotonic.
+                        let event = locked.runtime_event(prior.id.clone());
+                        drop(locked);
+                        self.emit_event(event);
+                    }
                 }
                 Err(error)
             }
@@ -517,39 +513,115 @@ impl Subagents {
         name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
-        contract: Option<&OutputContract>,
+        contract: Option<Arc<OutputContract>>,
     ) -> Result<SubagentValue, ChildError> {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
         let source_state = self.lookup(&prior)?;
-        let source = tokio::select! {
+        let mut source = tokio::select! {
             source = source_state.lock() => source,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_ready(&source)?;
+        if source.forking.is_some() {
+            return Err(ChildError::Failed(
+                "subagent session is being forked".into(),
+            ));
+        }
         self.check_generation(&prior, source.handle_generation)?;
+
         let id = session::new_id();
-        let harness = source.harness.clone();
-        let model = source.model.clone();
-        let kit = source.kit;
         let source_child = source
             .child
             .clone()
             .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?;
         let native_fork = source_child.supports_native_fork();
-        if !native_fork && kit {
-            session::clone_completed(&self.config.root, &prior.id, &id)
-                .map_err(ChildError::Failed)?;
-        } else if !native_fork {
+        if !native_fork && !source.kit {
             return Err(ChildError::Failed(format!(
-                "ACP harness {harness:?} does not advertise session/fork; transcript fallback is only available for Kit"
+                "ACP harness {:?} does not advertise session/fork; transcript fallback is only available for Kit",
+                source.harness
             )));
         }
         let generation = source
             .generation
             .checked_add(1)
             .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
+        source.forking = Some(id.clone());
+        let operation = ForkOperation {
+            source_id: prior.id,
+            source_state: Arc::clone(&source_state),
+            source_child,
+            id: id.clone(),
+            prompt,
+            name,
+            harness: source.harness.clone(),
+            model: source.model.clone(),
+            kit: source.kit,
+            generation,
+            depth,
+            cancellation,
+            contract,
+            permit,
+            native_fork,
+        };
         drop(source);
+
+        let (reply, response) = oneshot::channel();
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let source_state = Arc::clone(&operation.source_state);
+            let reservation = operation.id.clone();
+            let result = manager.run_fork(operation, &reply).await;
+            manager.finish_forking(&source_state, &reservation).await;
+            match result {
+                Ok(value) => manager.handoff_fork_success(reply, value).await,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+        });
+        match response.await.map_err(|_| {
+            ChildError::Failed("subagent fork task stopped before returning a result".into())
+        })? {
+            Ok(success) => {
+                success.acknowledge.send(()).map_err(|_| {
+                    ChildError::Failed(
+                        "subagent fork task stopped before transferring ownership".into(),
+                    )
+                })?;
+                Ok(success.value)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn run_fork(
+        &self,
+        operation: ForkOperation,
+        reply: &oneshot::Sender<Result<ForkSuccess, ChildError>>,
+    ) -> Result<SubagentValue, ChildError> {
+        let ForkOperation {
+            source_id,
+            source_state,
+            source_child,
+            id,
+            prompt,
+            name,
+            harness,
+            model,
+            kit,
+            generation,
+            depth,
+            cancellation,
+            contract,
+            permit,
+            native_fork,
+        } = operation;
+
+        if reply.is_closed() {
+            return Err(ChildError::Cancelled);
+        }
+
         let now = events::now_millis();
         let state = self.insert_starting(
             id.clone(),
@@ -569,21 +641,48 @@ impl Subagents {
                 model: model.clone(),
                 kit,
                 child: None,
-                _permit: permit,
+                forking: None,
+                permit: None,
             },
         )?;
+        let branch_name = state.lock().await.name.clone();
+        if reply.is_closed() {
+            self.fail_removed_and_remove(&id, &state).await;
+            return Err(ChildError::Cancelled);
+        }
+
+        if !native_fork {
+            let root = self.config.root.clone();
+            let source_id = source_id.clone();
+            let branch_id = id.clone();
+            let cloned = tokio::task::spawn_blocking(move || {
+                session::clone_completed(&root, &source_id, &branch_id)
+            })
+            .await
+            .map_err(|error| ChildError::Failed(format!("transcript clone task failed: {error}")))
+            .and_then(|result| result.map_err(ChildError::Failed));
+            if let Err(error) = cloned {
+                self.fail_removed_and_remove(&id, &state).await;
+                return Err(error);
+            }
+        }
+        if reply.is_closed() {
+            self.fail_removed_and_remove(&id, &state).await;
+            return Err(ChildError::Cancelled);
+        }
+
         let child_config = self
             .config
             .clone()
-            .with_parent_context(id.clone(), state.lock().await.name.clone());
+            .with_parent_context(id.clone(), branch_name);
         let child_result = if native_fork {
             source_child.fork(model.as_deref(), &cancellation).await
         } else {
             ChildSession::start(
                 child_config,
-                harness,
+                harness.clone(),
                 Some((id.clone(), true)),
-                model,
+                model.clone(),
                 depth + 1,
                 cancellation.clone(),
             )
@@ -596,26 +695,68 @@ impl Subagents {
                 return Err(error);
             }
         };
+
+        if let Err(error) = self
+            .revalidate_fork_source(&source_id, &source_state, &id)
+            .await
+        {
+            self.fail_removed_and_remove(&id, &state).await;
+            return Err(self
+                .cleanup_uninstalled_child(child, Some(permit), error)
+                .await);
+        }
+        self.finish_forking(&source_state, &id).await;
+        if reply.is_closed() {
+            self.fail_removed_and_remove(&id, &state).await;
+            return Err(self
+                .cleanup_uninstalled_child(child, Some(permit), ChildError::Cancelled)
+                .await);
+        }
         {
             let mut locked = state.lock().await;
-            locked.status = SubagentStatus::Working;
+            if let Err(error) = self.check_active(&locked) {
+                drop(locked);
+                return Err(self
+                    .cleanup_uninstalled_child(child, Some(permit), error)
+                    .await);
+            }
             locked.child = Some(child.clone());
+            locked.permit = Some(permit);
+            locked.status = SubagentStatus::Working;
             self.emit_event(locked.runtime_event(id.clone()));
         }
         self.monitor_child_exit(id.clone(), &state, &child);
+
+        if reply.is_closed() {
+            return Err(self
+                .cleanup_installed_child(&id, &state, &child, ChildError::Cancelled)
+                .await);
+        }
         let output = match child
-            .prompt(structured_prompt(prompt, contract), cancellation)
+            .prompt(structured_prompt(prompt, contract.as_deref()), cancellation)
             .await
         {
             Ok(output) => output,
             Err(error) => {
-                self.fail_removed_and_remove(&id, &state).await;
-                let _ = child.close().await;
-                return Err(error);
+                return Err(self
+                    .cleanup_installed_child(&id, &state, &child, error)
+                    .await);
             }
         };
-        let (output, updates) = turn_output(output, contract);
+        let (output, updates) = turn_output(output, contract.as_deref());
         let mut locked = state.lock().await;
+        if reply.is_closed() {
+            drop(locked);
+            return Err(self
+                .cleanup_installed_child(&id, &state, &child, ChildError::Cancelled)
+                .await);
+        }
+        if let Err(error) = self.check_active(&locked) {
+            drop(locked);
+            return Err(self
+                .cleanup_installed_child(&id, &state, &child, error)
+                .await);
+        }
         locked.status = SubagentStatus::Idle;
         locked.outcome = Some(GenerationOutcome::Success);
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
@@ -632,29 +773,6 @@ impl Subagents {
             generation,
             updates,
         })
-    }
-
-    #[cfg(test)]
-    async fn clone_for_fork(
-        &self,
-        prior: &SubagentValue,
-        cancellation: &TurnCancellation,
-        directory: &std::path::Path,
-    ) -> Result<String, ChildError> {
-        let source = self.lookup(prior)?;
-        let source = tokio::select! {
-            source = source.lock() => source,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        };
-        self.check_ready(&source)?;
-        self.check_generation(prior, source.handle_generation)?;
-        let id = session::new_id();
-        session::clone_completed_in(&self.config.root, directory, &prior.id, &id)
-            .map_err(ChildError::Failed)?;
-        // This is the stable snapshot boundary. Returning drops the source
-        // guard before child startup or the branch prompt can begin.
-        drop(source);
-        Ok(id)
     }
 
     async fn list(
@@ -709,36 +827,22 @@ impl Subagents {
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         self.check_active(&locked)?;
-        let previous_status = locked.status;
         locked.status = SubagentStatus::Removed;
+        locked.forking = None;
         let child = locked.child.take();
         let event = locked.runtime_event(id.to_string());
         drop(locked);
+        self.remove_if_same(id, &state);
+        self.emit_event(event);
 
-        let result = match &child {
-            Some(child) => child.close().await,
-            None => Ok(()),
+        let Some(child) = child else {
+            return Ok(());
         };
-        match result {
-            Ok(()) => {
-                self.remove_if_same(id, &state);
-                self.emit_event(event);
-                Ok(())
-            }
+        match child.close().await {
+            Ok(()) => Ok(()),
+            Err(error) if child_error_is_terminal(&error, &child) => Err(error),
             Err(error) => {
-                let terminal = child
-                    .as_ref()
-                    .is_none_or(|child| child_error_is_terminal(&error, child));
-                if terminal || previous_status != SubagentStatus::Idle {
-                    self.remove_if_same(id, &state);
-                    self.emit_event(event);
-                } else {
-                    let mut locked = state.lock().await;
-                    if locked.status == SubagentStatus::Removed {
-                        locked.status = previous_status;
-                        locked.child = child;
-                    }
-                }
+                self.retain_permit_until_process_exit(&state, &child).await;
                 Err(error)
             }
         }
@@ -767,7 +871,7 @@ impl Subagents {
             .map(|entry| entry.name.to_lowercase())
             .collect::<HashSet<_>>();
         let preferred = std::mem::take(&mut state.name);
-        let name = allocate_display_name(&mut used, Some(&preferred));
+        let name = allocate_display_name(&mut used, Some(&preferred))?;
         state.name.clone_from(&name);
         let event = state.runtime_event(id.clone());
         let state = Arc::new(AsyncMutex::new(state));
@@ -799,6 +903,7 @@ impl Subagents {
                         state.outcome = Some(GenerationOutcome::Failed);
                     }
                     state.status = SubagentStatus::Removed;
+                    state.forking = None;
                     state
                         .generation_finished_at_unix_ms
                         .get_or_insert_with(events::now_millis);
@@ -816,6 +921,160 @@ impl Subagents {
                 "live subagent session limit ({MAX_LIVE_SUBAGENTS}) reached"
             ))
         })
+    }
+
+    async fn handoff_fork_success(
+        &self,
+        reply: oneshot::Sender<Result<ForkSuccess, ChildError>>,
+        value: SubagentValue,
+    ) {
+        let cleanup = value.clone();
+        let (acknowledge, acknowledged) = oneshot::channel();
+        let sent = reply.send(Ok(ForkSuccess { value, acknowledge })).is_ok();
+        if !sent || acknowledged.await.is_err() {
+            self.cleanup_abandoned_fork(&cleanup).await;
+        }
+    }
+
+    async fn cleanup_abandoned_fork(&self, value: &SubagentValue) {
+        let Ok(state) = self.lookup(value) else {
+            return;
+        };
+        let child = state.lock().await.child.clone();
+        if let Some(child) = child {
+            let _ = self
+                .cleanup_installed_child(&value.id, &state, &child, ChildError::Cancelled)
+                .await;
+        } else {
+            self.fail_removed_and_remove(&value.id, &state).await;
+        }
+    }
+
+    async fn revalidate_fork_source(
+        &self,
+        id: &str,
+        state: &Arc<AsyncMutex<State>>,
+        reservation: &str,
+    ) -> Result<(), ChildError> {
+        let registered = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
+            .get(id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.state, state));
+        if !registered {
+            return Err(ChildError::Failed("subagent session is retired".into()));
+        }
+        let locked = state.lock().await;
+        self.check_active(&locked)?;
+        if locked.forking.as_deref() != Some(reservation) {
+            return Err(ChildError::Failed(
+                "subagent fork reservation is no longer active".into(),
+            ));
+        }
+        if locked.child.as_ref().is_none_or(ChildSession::is_closed) {
+            return Err(ChildError::TerminalFailed(
+                "nested agent process is no longer running".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn cleanup_uninstalled_child(
+        &self,
+        child: ChildSession,
+        permit: Option<OwnedSemaphorePermit>,
+        error: ChildError,
+    ) -> ChildError {
+        match child.close().await {
+            Ok(()) => error,
+            Err(cleanup) if child_error_is_terminal(&cleanup, &child) => error,
+            Err(cleanup) => {
+                Self::watch_permit_until_process_exit(permit, &child);
+                ChildError::Failed(format!(
+                    "{error}; failed to clean up retired subagent session: {cleanup}"
+                ))
+            }
+        }
+    }
+
+    async fn cleanup_installed_child(
+        &self,
+        id: &str,
+        state: &Arc<AsyncMutex<State>>,
+        child: &ChildSession,
+        error: ChildError,
+    ) -> ChildError {
+        let mut locked = state.lock().await;
+        let event = if locked.status == SubagentStatus::Removed {
+            None
+        } else {
+            locked.status = SubagentStatus::Removed;
+            locked.forking = None;
+            locked.outcome = Some(GenerationOutcome::Failed);
+            locked.generation_finished_at_unix_ms = Some(events::now_millis());
+            Some(locked.runtime_event(id.to_string()))
+        };
+        drop(locked);
+        self.remove_if_same(id, state);
+        if let Some(event) = event {
+            self.emit_event(event);
+        }
+
+        match child.close().await {
+            Ok(()) => error,
+            Err(cleanup) if child_error_is_terminal(&cleanup, child) => error,
+            Err(cleanup) => {
+                self.retain_permit_until_process_exit(state, child).await;
+                ChildError::Failed(format!(
+                    "{error}; failed to clean up retired subagent session: {cleanup}"
+                ))
+            }
+        }
+    }
+
+    async fn reject_uninstalled_child_owned(
+        &self,
+        id: String,
+        state: Arc<AsyncMutex<State>>,
+        child: ChildSession,
+        error: ChildError,
+    ) -> ChildError {
+        let manager = self.clone();
+        match tokio::spawn(async move {
+            manager
+                .cleanup_installed_child(&id, &state, &child, error)
+                .await
+        })
+        .await
+        {
+            Ok(error) => error,
+            Err(error) => {
+                ChildError::Failed(format!("retired subagent cleanup task failed: {error}"))
+            }
+        }
+    }
+
+    async fn retain_permit_until_process_exit(
+        &self,
+        state: &Arc<AsyncMutex<State>>,
+        child: &ChildSession,
+    ) {
+        let permit = state.lock().await.permit.take();
+        Self::watch_permit_until_process_exit(permit, child);
+    }
+
+    fn watch_permit_until_process_exit(permit: Option<OwnedSemaphorePermit>, child: &ChildSession) {
+        let Some(permit) = permit else {
+            return;
+        };
+        let mut closed = child.closed_signal();
+        tokio::spawn(async move {
+            if !*closed.borrow() {
+                let _ = closed.changed().await;
+            }
+            drop(permit);
+        });
     }
 
     fn monitor_child_exit(&self, id: String, state: &Arc<AsyncMutex<State>>, child: &ChildSession) {
@@ -841,41 +1100,39 @@ impl Subagents {
             locked.outcome = Some(GenerationOutcome::Failed);
         }
         locked.status = SubagentStatus::Removed;
+        locked.forking = None;
         locked
             .generation_finished_at_unix_ms
             .get_or_insert_with(events::now_millis);
         let event = locked.runtime_event(id.clone());
         drop(locked);
         self.remove_if_same(&id, &state);
-        drop(state);
         self.emit_event(event);
     }
 
     async fn fail_removed_and_remove(&self, id: &str, state: &Arc<AsyncMutex<State>>) {
         let mut locked = state.lock().await;
-        if locked.status == SubagentStatus::Removed {
-            return;
-        }
-        locked.status = SubagentStatus::Removed;
-        locked.outcome = Some(GenerationOutcome::Failed);
-        locked.generation_finished_at_unix_ms = Some(events::now_millis());
-        #[cfg(test)]
-        if let Ok(mut transitions) = self.failed_removals.lock() {
-            transitions.push(FailedRemoval {
-                status: locked.status,
-                outcome: locked.outcome,
-                finished_at_unix_ms: locked.generation_finished_at_unix_ms,
-            });
-        }
-        let event = locked.runtime_event(id.to_string());
+        let event = if locked.status == SubagentStatus::Removed {
+            None
+        } else {
+            locked.status = SubagentStatus::Removed;
+            locked.forking = None;
+            locked.outcome = Some(GenerationOutcome::Failed);
+            locked.generation_finished_at_unix_ms = Some(events::now_millis());
+            Some(locked.runtime_event(id.to_string()))
+        };
         drop(locked);
         self.remove_if_same(id, state);
-        self.emit_event(event);
+        if let Some(event) = event {
+            self.emit_event(event);
+        }
     }
 
-    #[cfg(test)]
-    fn failed_removals_for_test(&self) -> Vec<FailedRemoval> {
-        self.failed_removals.lock().unwrap().clone()
+    async fn finish_forking(&self, state: &Arc<AsyncMutex<State>>, reservation: &str) {
+        let mut locked = state.lock().await;
+        if locked.forking.as_deref() == Some(reservation) {
+            locked.forking = None;
+        }
     }
 
     fn remove_if_same(&self, id: &str, expected: &Arc<AsyncMutex<State>>) {
@@ -990,11 +1247,6 @@ impl CloseInput {
     }
 }
 
-#[cfg(test)]
-fn listing_id(value: &SubagentListing) -> &str {
-    &value.id
-}
-
 fn value_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1},"updates":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean"}},"required":["items","truncated"],"additionalProperties":false}},"required":["id","output","generation"],"additionalProperties":false})
 }
@@ -1005,7 +1257,7 @@ fn continuation_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
 }
 fn display_name_schema() -> serde_json::Value {
-    json!({"type":"string","description":"Prefer a concise role-oriented display name based on the task, such as `Round 2 Implementer` or `Reviewer`. Valid names are 1-32 bytes of printable ASCII. Kit falls back to `Agent N` when omitted or invalid."})
+    json!({"type":"string","description":"Provide a concise role-oriented display name that is unique among live sibling subagents. Valid names are 1-32 bytes of printable ASCII. Kit allocates a unique fallback when the name is omitted or invalid."})
 }
 fn id_schema() -> serde_json::Value {
     json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
@@ -1274,7 +1526,7 @@ impl Tool for ForkTool {
                     input.name,
                     self.depth,
                     cancellation(context),
-                    contract.as_ref(),
+                    contract.map(Arc::new),
                 )
                 .await,
         )
@@ -1282,1205 +1534,5 @@ impl Tool for ForkTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use agentkit_core::{Item, ItemKind};
-
-    use super::*;
-
-    #[test]
-    fn preferred_name_is_trimmed_and_reserved() {
-        let mut used = HashSet::new();
-
-        assert_eq!(
-            allocate_display_name(&mut used, Some("  Round 2 Implementer  ")),
-            "Round 2 Implementer"
-        );
-        assert!(used.contains("round 2 implementer"));
-    }
-
-    #[test]
-    fn preferred_name_collisions_receive_case_insensitive_numeric_suffixes() {
-        let mut used = HashSet::from(["round 2 reviewer".into(), "round 2 reviewer 2".into()]);
-
-        assert_eq!(
-            allocate_display_name(&mut used, Some("Round 2 Reviewer")),
-            "Round 2 Reviewer 3"
-        );
-    }
-
-    #[test]
-    fn collision_suffix_keeps_name_within_32_bytes() {
-        let base = "A1234567890123456789012345678901";
-        let mut used = HashSet::from([base.to_lowercase()]);
-
-        let allocated = allocate_display_name(&mut used, Some(base));
-
-        assert_eq!(allocated, "A12345678901234567890123456789 2");
-        assert_eq!(allocated.len(), 32);
-    }
-
-    #[test]
-    fn missing_or_invalid_preferred_name_uses_lowest_available_agent_fallback() {
-        for candidate in [None, Some(""), Some("bad\nname"), Some("évaluator")] {
-            let mut used = HashSet::from(["agent 1".into()]);
-            assert_eq!(allocate_display_name(&mut used, candidate), "Agent 2");
-        }
-    }
-
-    #[test]
-    fn name_reservations_are_case_insensitive_and_reusable_after_release() {
-        let mut used = HashSet::new();
-        assert_eq!(
-            allocate_display_name(&mut used, Some("Reviewer")),
-            "Reviewer"
-        );
-        assert_eq!(
-            allocate_display_name(&mut used, Some("reviewer")),
-            "reviewer 2"
-        );
-
-        assert!(used.remove("reviewer"));
-        assert_eq!(
-            allocate_display_name(&mut used, Some("Reviewer")),
-            "Reviewer"
-        );
-    }
-
-    #[tokio::test]
-    async fn manager_name_allocation_is_atomic_across_concurrent_insertions() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
-        let starts = (0..8)
-            .map(|_| {
-                let manager = manager.clone();
-                tokio::spawn(async move { manager.insert_starting_for_test().await })
-            })
-            .collect::<Vec<_>>();
-        let mut allocated = HashSet::new();
-        for start in starts {
-            allocated.insert(start.await.unwrap().to_lowercase());
-        }
-
-        assert_eq!(allocated.len(), 8);
-        assert_eq!(manager.sessions.lock().unwrap().len(), 8);
-    }
-
-    #[test]
-    fn name_allocation_summarizes_tasks_as_single_bounded_lines() {
-        assert_eq!(task_summary("  trace\n\t the   flow  "), "trace the flow");
-        assert_eq!(task_summary(" \n\t "), "Untitled task");
-        let summary = task_summary(&"é".repeat(97));
-        assert_eq!(summary.chars().count(), 96);
-        assert!(summary.ends_with('…'));
-    }
-
-    #[test]
-    fn subagent_value_reads_legacy_and_current_handles_and_rejects_malformed_shapes() {
-        let legacy = serde_json::from_value::<SubagentValue>(json!({
-            "id": "s-old", "output": null, "generation": 1
-        }))
-        .expect("legacy handle remains readable");
-        assert_eq!(legacy.name, None);
-
-        let current = serde_json::from_value::<SubagentValue>(json!({
-            "id": "s-current", "name": "Scout", "output": "done", "generation": 2
-        }))
-        .expect("current handle remains readable");
-        assert_eq!(current.name.as_deref(), Some("Scout"));
-        assert!(
-            serde_json::from_value::<SubagentValue>(json!({
-                "id": "s-bad", "name": 42, "output": null, "generation": 1
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<SubagentValue>(json!({
-                "id": "s-bad", "output": null, "generation": 1, "extra": true
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn subagent_value_schema_accepts_legacy_and_current_handles() {
-        let validator = jsonschema::validator_for(&value_schema()).unwrap();
-        assert!(validator.is_valid(&json!({
-            "id": "s-old", "output": null, "generation": 1
-        })));
-        assert!(validator.is_valid(&json!({
-            "id": "s-new", "name": "Scout", "output": null, "generation": 1
-        })));
-        assert!(!validator.is_valid(&json!({
-            "id": "s-bad", "name": 7, "output": null, "generation": 1
-        })));
-    }
-
-    #[test]
-    fn model_inputs_prefer_optional_subagent_names() {
-        let input = serde_json::from_value::<Input>(json!({
-            "prompt": "work", "name": "Implementer"
-        }))
-        .unwrap();
-        assert_eq!(input.name.as_deref(), Some("Implementer"));
-        assert!(
-            serde_json::from_value::<ForkInput>(json!({
-                "subagent": {"id": "s", "output": null, "generation": 1},
-                "prompt": "fork work",
-                "name": "Round 2 Reviewer"
-            }))
-            .is_ok()
-        );
-        let directory = tempfile::tempdir().unwrap();
-        let manager = manager_with_generic_harness(directory.path(), Vec::new());
-        let subagent = SubagentTool::new(manager.clone(), 1);
-        let fork = ForkTool::new(manager, 1);
-        for schema in [&subagent.spec.input_schema, &fork.spec.input_schema] {
-            let name = &schema["properties"]["name"];
-            assert!(name.get("maxLength").is_none());
-            assert!(
-                name["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("1-32 bytes of printable ASCII")
-            );
-        }
-    }
-
-    #[test]
-    fn structured_output_is_parsed_and_validated() {
-        let contract = OutputContract::new(json!({
-            "type": "object",
-            "properties": {"approved": {"type": "boolean"}},
-            "required": ["approved"],
-            "additionalProperties": false
-        }))
-        .unwrap();
-
-        assert_eq!(
-            contract.parse(r#"{"approved":true}"#).unwrap(),
-            json!({"approved": true})
-        );
-        assert!(contract.parse(r#"{"approved":"yes"}"#).is_none());
-        assert!(contract.parse("```json\n{}\n```").is_none());
-    }
-
-    #[test]
-    fn invalid_output_schema_is_rejected() {
-        assert!(OutputContract::new(json!({"type": 42})).is_err());
-    }
-
-    #[test]
-    fn explicit_null_output_schema_is_rejected() {
-        assert!(
-            serde_json::from_value::<Input>(json!({"prompt": "test", "output_schema": null}))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn boolean_output_schema_is_supported() {
-        let contract = OutputContract::new(Value::Bool(true)).unwrap();
-        assert_eq!(contract.parse("[1, 2]").unwrap(), json!([1, 2]));
-    }
-
-    #[test]
-    fn unstructured_output_remains_text() {
-        assert_eq!(
-            structured_output("plain text".into(), None),
-            Value::String("plain text".into())
-        );
-    }
-
-    #[test]
-    fn text_only_values_keep_the_existing_json_shape() {
-        let value = SubagentValue {
-            id: "child".into(),
-            name: None,
-            output: Value::String("done".into()),
-            generation: 1,
-            updates: None,
-        };
-
-        assert_eq!(
-            serde_json::to_value(value).unwrap(),
-            json!({"id": "child", "output": "done", "generation": 1})
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_releases_source_before_child_work() {
-        let directory = tempfile::tempdir().unwrap();
-        let transcript = vec![Item::text(ItemKind::System, "system")];
-        let sessions = directory.path().join("sessions");
-        let opened = session::open_in(
-            directory.path(),
-            &sessions,
-            "source",
-            false,
-            false,
-            transcript,
-        )
-        .unwrap();
-        let manager = Subagents::new(
-            ChildConfig {
-                root: directory.path().to_path_buf(),
-                model: "test".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses: Default::default(),
-                default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
-        let state = Arc::new(AsyncMutex::new(State {
-            name: "Scout".into(),
-            status: SubagentStatus::Idle,
-            task: "done".into(),
-            generation: 1,
-            handle_generation: 1,
-            outcome: Some(GenerationOutcome::Success),
-            created_at_unix_ms: 1,
-            generation_started_at_unix_ms: 1,
-            generation_finished_at_unix_ms: Some(2),
-            output: Value::String("done".into()),
-            updates: None,
-            harness: crate::acp_child::BUILTIN_HARNESS.into(),
-            model: None,
-            kit: true,
-            child: Some(ChildSession::disconnected_for_test()),
-            _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
-        }));
-        manager.sessions.lock().unwrap().insert(
-            "source".into(),
-            SessionEntry {
-                name: "Scout".into(),
-                state: Arc::clone(&state),
-            },
-        );
-        let prior = SubagentValue {
-            id: "source".into(),
-            name: Some("Scout".into()),
-            output: Value::String("done".into()),
-            generation: 1,
-            updates: None,
-        };
-
-        let branch = manager
-            .clone_for_fork(&prior, &TurnCancellation::default(), &sessions)
-            .await
-            .unwrap();
-
-        assert!(
-            state.try_lock().is_ok(),
-            "source remained locked after snapshot"
-        );
-        assert!(session::load_in(directory.path(), &sessions, &branch).is_ok());
-        drop(opened);
-    }
-    fn manager_with_disconnected_session(
-        root: &Path,
-    ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.to_path_buf(),
-                model: "test".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses: Default::default(),
-                default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
-        let state = Arc::new(AsyncMutex::new(State {
-            name: "Scout".into(),
-            status: SubagentStatus::Idle,
-            task: "done".into(),
-            generation: 1,
-            handle_generation: 1,
-            outcome: Some(GenerationOutcome::Success),
-            created_at_unix_ms: 1,
-            generation_started_at_unix_ms: 1,
-            generation_finished_at_unix_ms: Some(2),
-            output: Value::String("done".into()),
-            updates: None,
-            harness: crate::acp_child::BUILTIN_HARNESS.into(),
-            model: None,
-            kit: true,
-            child: Some(ChildSession::disconnected_for_test()),
-            _permit: Arc::clone(&manager.capacity).try_acquire_owned().unwrap(),
-        }));
-        manager.sessions.lock().unwrap().insert(
-            "source".into(),
-            SessionEntry {
-                name: "Scout".into(),
-                state: Arc::clone(&state),
-            },
-        );
-        let prior = SubagentValue {
-            id: "source".into(),
-            name: Some("Scout".into()),
-            output: Value::String("done".into()),
-            generation: 1,
-            updates: None,
-        };
-        (manager, state, prior)
-    }
-
-    #[tokio::test]
-    async fn close_does_not_block_listings_or_allow_stale_reuse() {
-        let root = tempfile::tempdir().unwrap();
-        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
-        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "generic".into(),
-            crate::acp_child::AcpHarnessProfile {
-                command: "python3".into(),
-                args: vec![fixture, "--slow-close".into()],
-                permissions: Default::default(),
-            },
-        )]))
-        .unwrap();
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.path().to_path_buf(),
-                model: "unused".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses,
-                default_harness: "acp.generic".into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
-        let handle = manager
-            .create(
-                "base".into(),
-                CreateOptions::default(),
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap();
-        let close_manager = manager.clone();
-        let close_id = handle.id.clone();
-        let close = tokio::spawn(async move {
-            close_manager
-                .close(&close_id, &TurnCancellation::default())
-                .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let listing = tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            manager.list(&TurnCancellation::default()),
-        )
-        .await
-        .expect("listing blocked behind child close")
-        .unwrap();
-        assert!(listing.is_empty());
-        let reuse = tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            manager.prompt(
-                handle,
-                "stale reuse".into(),
-                TurnCancellation::default(),
-                None,
-            ),
-        )
-        .await
-        .expect("reuse blocked behind child close");
-        assert!(reuse.is_err());
-        close.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn listing_omits_closed_subagents() {
-        let directory = tempfile::tempdir().unwrap();
-        let (manager, state, prior) = manager_with_disconnected_session(directory.path());
-        let (child, closed) = ChildSession::closure_probe_for_test();
-        state.lock().await.child = Some(child);
-        drop(state);
-
-        let cancellation = TurnCancellation::default();
-        assert_eq!(manager.list(&cancellation).await.unwrap().len(), 1);
-        assert_eq!(
-            listing_id(&manager.list(&cancellation).await.unwrap()[0]),
-            prior.id
-        );
-        manager.close(&prior.id, &cancellation).await.unwrap();
-        assert!(manager.list(&cancellation).await.unwrap().is_empty());
-        assert!(manager.lookup(&prior).is_err());
-        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
-            .await
-            .expect("closing did not terminate the child actor")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn dropping_a_session_manager_terminates_its_children() {
-        let directory = tempfile::tempdir().unwrap();
-        let (manager, state, _) = manager_with_disconnected_session(directory.path());
-        let (child, closed) = ChildSession::closure_probe_for_test();
-        state.lock().await.child = Some(child);
-        drop(state);
-
-        drop(manager);
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), closed)
-            .await
-            .expect("manager drop did not terminate the child actor")
-            .unwrap();
-    }
-
-    #[test]
-    fn close_input_accepts_a_handle_subagent_id_or_background_call_id() {
-        let handle = json!({"id": "child", "output": "done", "generation": 1});
-        let id = json!({"id": "child"});
-        let call_id = json!({"call_id": "call_123"});
-        assert_eq!(
-            serde_json::from_value::<CloseInput>(handle)
-                .unwrap()
-                .target()
-                .0,
-            "child"
-        );
-        assert_eq!(
-            serde_json::from_value::<CloseInput>(id).unwrap().target().0,
-            "child"
-        );
-        assert_eq!(
-            serde_json::from_value::<CloseInput>(call_id)
-                .unwrap()
-                .target(),
-            ("call_123".into(), true)
-        );
-        assert!(
-            serde_json::from_value::<CloseInput>(json!({"id": "child", "extra": true})).is_err()
-        );
-    }
-
-    #[test]
-    fn live_session_limit_is_120_per_manager() {
-        let directory = tempfile::tempdir().unwrap();
-        let (manager, _, prior) = manager_with_disconnected_session(directory.path());
-        manager.sessions.lock().unwrap().remove(&prior.id);
-        let permits = (0..MAX_LIVE_SUBAGENTS)
-            .map(|_| manager.reserve().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(permits.len(), 120);
-        assert_eq!(
-            manager.reserve().unwrap_err().to_string(),
-            "live subagent session limit (120) reached"
-        );
-    }
-
-    #[test]
-    fn invalid_structured_output_remains_recoverable_as_text() {
-        let contract = OutputContract::new(json!({"type": "object"})).unwrap();
-
-        assert_eq!(
-            structured_output("not JSON".into(), Some(&contract)),
-            Value::String("not JSON".into())
-        );
-    }
-
-    fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
-        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
-        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "generic".into(),
-            crate::acp_child::AcpHarnessProfile {
-                command: "python3".into(),
-                args: std::iter::once(fixture).chain(args).collect(),
-                permissions: Default::default(),
-            },
-        )]))
-        .unwrap();
-        Subagents::new(
-            ChildConfig {
-                root: root.to_path_buf(),
-                model: "unused".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses,
-                default_harness: "acp.generic".into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        )
-    }
-
-    mod lifecycle_events {
-        use super::*;
-
-        fn transitions(manager: &Subagents) -> Vec<(SubagentStatus, Option<GenerationOutcome>)> {
-            manager
-                .runtime_events_for_test()
-                .into_iter()
-                .filter_map(|event| match event {
-                    events::RuntimeEvent::SubagentStateChanged {
-                        status, outcome, ..
-                    } => Some((status, outcome)),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        #[tokio::test]
-        async fn nested_runtime_events_include_only_the_immediate_parent() {
-            let root = tempfile::tempdir().unwrap();
-            let base = manager_with_generic_harness(root.path(), Vec::new());
-            let mut config = base.child_config();
-            config.parent_id = Some("s-parent".into());
-            config.parent_name = Some("偵察 🦀".into());
-            let manager = Subagents::new(config, 2);
-
-            manager.insert_starting_for_test().await;
-
-            assert!(matches!(
-                manager.runtime_events_for_test().as_slice(),
-                [events::RuntimeEvent::SubagentStateChanged {
-                    parent_id: Some(parent_id),
-                    parent_name: Some(parent_name),
-                    ..
-                }] if parent_id == "s-parent" && parent_name == "偵察 🦀"
-            ));
-        }
-
-        #[tokio::test]
-        async fn emits_committed_create_prompt_failure_and_close_transitions() {
-            let root = tempfile::tempdir().unwrap();
-            let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()]);
-            let handle = manager
-                .create(
-                    "base task".into(),
-                    CreateOptions::default(),
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                transitions(&manager),
-                vec![
-                    (SubagentStatus::Starting, None),
-                    (SubagentStatus::Working, None),
-                    (SubagentStatus::Idle, Some(GenerationOutcome::Success)),
-                ]
-            );
-
-            let handle = manager
-                .prompt(
-                    handle,
-                    "successful continuation".into(),
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                &transitions(&manager)[3..],
-                &[
-                    (SubagentStatus::Working, None),
-                    (SubagentStatus::Idle, Some(GenerationOutcome::Success)),
-                ]
-            );
-
-            let error = manager
-                .prompt(
-                    handle.clone(),
-                    "MOCK_REFUSAL".into(),
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(error.to_string(), "nested agent refused the prompt");
-            manager
-                .close(&handle.id, &TurnCancellation::default())
-                .await
-                .unwrap();
-
-            let emitted = manager.runtime_events_for_test();
-            assert_eq!(
-                &transitions(&manager)[5..],
-                &[
-                    (SubagentStatus::Working, None),
-                    (SubagentStatus::Idle, Some(GenerationOutcome::Failed)),
-                    (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
-                ]
-            );
-            assert!(emitted.iter().all(|event| event.parent_call().is_none()));
-            let generations = emitted
-                .iter()
-                .filter_map(|event| match event {
-                    events::RuntimeEvent::SubagentStateChanged { generation, .. } => {
-                        Some(*generation)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(generations, vec![1, 1, 1, 2, 2, 3, 3, 3]);
-            assert!(
-                matches!(emitted.last(), Some(events::RuntimeEvent::SubagentStateChanged { id, name, status: SubagentStatus::Removed, generation_finished_at_unix_ms: Some(_), .. }) if id.as_str() == handle.id.as_str() && Some(name.as_str()) == handle.name.as_deref())
-            );
-        }
-
-        #[tokio::test]
-        async fn failing_event_transport_does_not_change_subagent_operations() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-
-            let root = tempfile::tempdir().unwrap();
-            let attempts = Arc::new(AtomicUsize::new(0));
-            let sink_attempts = Arc::clone(&attempts);
-            let manager = manager_with_generic_harness(root.path(), vec!["--no-fork".into()])
-                .with_event_sink_for_test(Arc::new(move |_| {
-                    sink_attempts.fetch_add(1, Ordering::Relaxed);
-                    Err(())
-                }));
-
-            let handle = manager
-                .create(
-                    "create".into(),
-                    CreateOptions::default(),
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .expect("event failure must not fail create");
-            let handle = manager
-                .prompt(handle, "continue".into(), TurnCancellation::default(), None)
-                .await
-                .expect("event failure must not fail prompt");
-            assert_eq!(
-                manager.lookup(&handle).unwrap().lock().await.status,
-                SubagentStatus::Idle
-            );
-            manager
-                .close(&handle.id, &TurnCancellation::default())
-                .await
-                .expect("event failure must not fail close");
-            assert!(manager.lookup(&handle).is_err());
-            assert!(attempts.load(Ordering::Relaxed) >= 6);
-        }
-
-        #[tokio::test]
-        async fn closed_sessions_emit_one_removed_transition_before_name_reuse() {
-            for (working, expected_outcome) in [
-                (false, Some(GenerationOutcome::Success)),
-                (true, Some(GenerationOutcome::Failed)),
-            ] {
-                let root = tempfile::tempdir().unwrap();
-                let (manager, state, prior) = manager_with_disconnected_session(root.path());
-                if working {
-                    let mut state = state.lock().await;
-                    state.status = SubagentStatus::Working;
-                    state.outcome = None;
-                    state.generation_finished_at_unix_ms = None;
-                }
-
-                manager.insert_starting_for_test().await;
-                let removed = manager
-                    .runtime_events_for_test()
-                    .into_iter()
-                    .filter(|event| {
-                        matches!(event, events::RuntimeEvent::SubagentStateChanged { id, status: SubagentStatus::Removed, .. } if id == &prior.id)
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(removed.len(), 1);
-                assert!(matches!(
-                    &removed[0],
-                    events::RuntimeEvent::SubagentStateChanged { outcome, generation_finished_at_unix_ms: Some(_), .. } if *outcome == expected_outcome
-                ));
-                assert!(manager.lookup(&prior).is_err());
-            }
-        }
-
-        #[tokio::test]
-        async fn idle_child_exit_promptly_retires_the_direct_handle_once() {
-            let root = tempfile::tempdir().unwrap();
-            let manager =
-                manager_with_generic_harness(root.path(), vec!["--exit-after-prompt".into()]);
-            let handle = manager
-                .create(
-                    "finish before exiting".into(),
-                    CreateOptions::default(),
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .unwrap();
-
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                loop {
-                    if transitions(&manager).last()
-                        == Some(&(SubagentStatus::Removed, Some(GenerationOutcome::Success)))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("idle child exit did not emit direct removal promptly");
-
-            assert_eq!(
-                transitions(&manager),
-                vec![
-                    (SubagentStatus::Starting, None),
-                    (SubagentStatus::Working, None),
-                    (SubagentStatus::Idle, Some(GenerationOutcome::Success)),
-                    (SubagentStatus::Removed, Some(GenerationOutcome::Success)),
-                ]
-            );
-            assert!(manager.lookup(&handle).is_err());
-            assert_eq!(manager.capacity.available_permits(), MAX_LIVE_SUBAGENTS);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            assert_eq!(
-                transitions(&manager)
-                    .into_iter()
-                    .filter(|(status, _)| *status == SubagentStatus::Removed)
-                    .count(),
-                1
-            );
-            manager.insert_starting_for_test().await;
-        }
-
-        #[tokio::test]
-        async fn emits_removed_after_failed_creation_and_terminal_retirement() {
-            let root = tempfile::tempdir().unwrap();
-            let failed = manager_with_generic_harness(root.path(), vec!["--fail-start".into()]);
-            assert!(
-                failed
-                    .create(
-                        "create".into(),
-                        CreateOptions::default(),
-                        0,
-                        TurnCancellation::default(),
-                        None
-                    )
-                    .await
-                    .is_err()
-            );
-            assert_eq!(
-                transitions(&failed),
-                vec![
-                    (SubagentStatus::Starting, None),
-                    (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
-                ]
-            );
-
-            let (terminal, _, prior) = manager_with_disconnected_session(root.path());
-            assert!(
-                terminal
-                    .prompt(prior, "continue".into(), TurnCancellation::default(), None)
-                    .await
-                    .is_err()
-            );
-            assert_eq!(
-                transitions(&terminal),
-                vec![
-                    (SubagentStatus::Working, None),
-                    (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
-                ]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_create_and_fork_startup_record_failed_removed_transitions() {
-        let root = tempfile::tempdir().unwrap();
-        let failed_create = manager_with_generic_harness(root.path(), vec!["--fail-start".into()]);
-        assert!(
-            failed_create
-                .create(
-                    "create".into(),
-                    CreateOptions::default(),
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .is_err()
-        );
-        let create_transitions = failed_create.failed_removals_for_test();
-        assert_eq!(create_transitions.len(), 1);
-        assert_eq!(create_transitions[0].status, SubagentStatus::Removed);
-        assert_eq!(
-            create_transitions[0].outcome,
-            Some(GenerationOutcome::Failed)
-        );
-        assert!(create_transitions[0].finished_at_unix_ms.is_some());
-
-        let failed_fork = manager_with_generic_harness(root.path(), vec!["--fail-fork".into()]);
-        let source = failed_fork
-            .create(
-                "source".into(),
-                CreateOptions::default(),
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            failed_fork
-                .fork(
-                    source,
-                    "fork".into(),
-                    None,
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .is_err()
-        );
-        let fork_transitions = failed_fork.failed_removals_for_test();
-        assert_eq!(fork_transitions.len(), 1);
-        assert_eq!(fork_transitions[0].status, SubagentStatus::Removed);
-        assert_eq!(fork_transitions[0].outcome, Some(GenerationOutcome::Failed));
-        assert!(fork_transitions[0].finished_at_unix_ms.is_some());
-    }
-
-    #[tokio::test]
-    async fn terminal_child_errors_do_not_depend_on_channel_close_timing() {
-        let (child, _) = ChildSession::closure_probe_for_test();
-        assert!(child_error_is_terminal(
-            &ChildError::TerminalCancelled,
-            &child
-        ));
-        assert!(child_error_is_terminal(
-            &ChildError::TerminalFailed("transport ended".into()),
-            &child
-        ));
-    }
-
-    #[tokio::test]
-    async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
-        let root = tempfile::tempdir().unwrap();
-        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
-        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "generic".into(),
-            crate::acp_child::AcpHarnessProfile {
-                command: "python3".into(),
-                args: vec![fixture, "--no-fork".into()],
-                permissions: Default::default(),
-            },
-        )]))
-        .unwrap();
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.path().to_path_buf(),
-                model: "unused".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses,
-                default_harness: "acp.generic".into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
-        let handle = manager
-            .create(
-                "base".into(),
-                CreateOptions::default(),
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let error = manager
-            .prompt(
-                handle.clone(),
-                "MOCK_REFUSAL".into(),
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "nested agent refused the prompt");
-        let state = manager
-            .lookup(&handle)
-            .expect("live child remains reusable");
-        let state = state.lock().await;
-        assert_eq!(state.status, SubagentStatus::Idle);
-        assert_eq!(state.outcome, Some(GenerationOutcome::Failed));
-        assert!(state.generation_finished_at_unix_ms.is_some());
-        drop(state);
-
-        let original_name = handle.name.clone();
-        let retried = manager
-            .prompt(handle, "retry".into(), TurnCancellation::default(), None)
-            .await
-            .expect("failed reusable generation does not stale the last handle");
-        assert_eq!(retried.generation, 3);
-        assert_eq!(retried.name, original_name);
-    }
-
-    #[tokio::test]
-    async fn listing_omits_terminally_retired_subagents() {
-        let directory = tempfile::tempdir().unwrap();
-        let (manager, _, prior) = manager_with_disconnected_session(directory.path());
-
-        assert!(
-            manager
-                .prompt(
-                    prior.clone(),
-                    "continue".into(),
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-                .is_err()
-        );
-        assert!(manager.lookup(&prior).is_err());
-        assert!(
-            manager
-                .list(&TurnCancellation::default())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-    #[tokio::test]
-    async fn listing_includes_named_starting_and_idle_subagents() {
-        let root = tempfile::tempdir().unwrap();
-        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
-        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "generic".into(),
-            crate::acp_child::AcpHarnessProfile {
-                command: "python3".into(),
-                args: vec![fixture, "--no-fork".into()],
-                permissions: Default::default(),
-            },
-        )]))
-        .unwrap();
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.path().to_path_buf(),
-                model: "unused".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses,
-                default_harness: "acp.generic".into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
-        let create_manager = manager.clone();
-        let create = tokio::spawn(async move {
-            create_manager
-                .create(
-                    "first prompt".into(),
-                    CreateOptions::default(),
-                    0,
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-        });
-
-        let listing = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(listing) = manager
-                    .list(&TurnCancellation::default())
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                {
-                    break listing;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("starting subagent was not registered");
-        let allocated_name = listing.name.clone();
-        assert_eq!(listing.status, SubagentStatus::Starting);
-        assert_eq!(listing.generation, 1);
-        assert_eq!(listing.task, "first prompt");
-
-        let completed = create.await.unwrap().unwrap();
-        assert_eq!(completed.name.as_deref(), Some(allocated_name.as_str()));
-        let listings = manager.list(&TurnCancellation::default()).await.unwrap();
-        assert_eq!(listings[0].id, completed.id);
-        assert_eq!(listings[0].name, allocated_name);
-        assert_eq!(listings[0].status, SubagentStatus::Idle);
-        assert_eq!(listings[0].generation, 1);
-        assert_eq!(listings[0].task, "first prompt");
-        assert_eq!(
-            serde_json::to_value(&listings[0]).unwrap(),
-            json!({
-                "id": completed.id,
-                "name": allocated_name.clone(),
-                "status": "idle",
-                "generation": 1,
-                "task": "first prompt"
-            })
-        );
-
-        let mut informational_name = completed.clone();
-        informational_name.name = Some("Imposter".into());
-        let prompt_manager = manager.clone();
-        let continued = tokio::spawn(async move {
-            prompt_manager
-                .prompt(
-                    informational_name,
-                    "second prompt".into(),
-                    TurnCancellation::default(),
-                    None,
-                )
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let listing = manager.list(&TurnCancellation::default()).await.unwrap();
-                if listing[0].status == SubagentStatus::Working {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("working continuation was not listable");
-        let continued = continued.await.unwrap().unwrap();
-        assert_eq!(continued.name.as_deref(), Some(allocated_name.as_str()));
-        let listing = manager.list(&TurnCancellation::default()).await.unwrap();
-        assert_eq!(listing[0].generation, 2);
-        assert_eq!(listing[0].task, "second prompt");
-    }
-
-    #[tokio::test]
-    async fn fork_uses_its_fresh_preferred_name() {
-        let root = tempfile::tempdir().unwrap();
-        let manager = manager_with_generic_harness(root.path(), Vec::new());
-        let source = manager
-            .create(
-                "source".into(),
-                CreateOptions {
-                    name: Some("Implementer".into()),
-                    ..Default::default()
-                },
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap();
-        let source_name = source.name.clone();
-
-        let fork = manager
-            .fork(
-                source,
-                "branch".into(),
-                Some("Reviewer".into()),
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(source_name.as_deref(), Some("Implementer"));
-        assert_eq!(fork.name.as_deref(), Some("Reviewer"));
-    }
-
-    #[tokio::test]
-    async fn generic_harness_without_native_fork_returns_unsupported() {
-        let root = tempfile::tempdir().unwrap();
-        let fixture = format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR"));
-        let harnesses = crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
-            "generic".into(),
-            crate::acp_child::AcpHarnessProfile {
-                command: "python3".into(),
-                args: vec![fixture, "--no-fork".into()],
-                permissions: Default::default(),
-            },
-        )]))
-        .unwrap();
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.path().to_path_buf(),
-                model: "unused".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses,
-                default_harness: "acp.generic".into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
-        let prior = manager
-            .create(
-                "base".into(),
-                CreateOptions::default(),
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let error = manager
-            .fork(
-                prior,
-                "branch".into(),
-                None,
-                0,
-                TurnCancellation::default(),
-                None,
-            )
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
-        );
-    }
-}
+#[path = "subagent/tests.rs"]
+mod tests;

@@ -13,6 +13,7 @@ use ratatui::{
         ScrollbarState,
     },
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[cfg(test)]
@@ -75,6 +76,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     let show_start = frame.area().width >= 20
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
         && app.blocks.is_empty()
+        && !app.show_agents()
         && app.pending_steers.is_empty()
         && !app.show_logs;
 
@@ -483,9 +485,12 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
     draw_status(frame, app, status);
 }
 
-fn body_layout(area: Rect, show_agents: bool) -> (Rect, Option<Rect>) {
+fn body_layout(area: Rect, show_agents: bool, transcript_empty: bool) -> (Rect, Option<Rect>) {
     if !show_agents {
         return (area, None);
+    }
+    if transcript_empty {
+        return (Rect::new(area.x, area.y, area.width, 0), Some(area));
     }
     let [transcript, agents] = if area.width >= SIDE_BY_SIDE_WIDTH {
         Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area)
@@ -496,7 +501,7 @@ fn body_layout(area: Rect, show_agents: bool) -> (Rect, Option<Rect>) {
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
-    let (transcript, agents) = body_layout(area, app.show_agents());
+    let (transcript, agents) = body_layout(area, app.show_agents(), app.blocks.is_empty());
     draw_transcript(frame, app, images, transcript);
     if let Some(agents) = agents {
         draw_agents(frame, app, agents);
@@ -1362,13 +1367,13 @@ fn truncate_to_width(text: &str, width: usize) -> String {
 
     let content_width = width.saturating_sub(1);
     let mut truncated = String::new();
-    for character in text.chars() {
-        let candidate_width = UnicodeWidthStr::width(truncated.as_str())
-            + unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-        if candidate_width > content_width {
+    for grapheme in text.graphemes(true) {
+        let previous_len = truncated.len();
+        truncated.push_str(grapheme);
+        if UnicodeWidthStr::width(truncated.as_str()) > content_width {
+            truncated.truncate(previous_len);
             break;
         }
-        truncated.push(character);
     }
     truncated.push('…');
     truncated
@@ -1795,11 +1800,12 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
     use ratatui_image::picker::Picker;
+    use unicode_width::UnicodeWidthStr;
 
     use super::{
         MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
         model_dialog_rows, model_dialog_viewport, prompt_lines, refresh_transcript_cache,
-        refresh_transcript_cache_with_images, user_block_rows, user_line,
+        refresh_transcript_cache_with_images, truncate_to_width, user_block_rows, user_line,
     };
     use crate::{
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
@@ -1928,6 +1934,20 @@ mod tests {
     }
 
     #[test]
+    fn truncate_to_width_preserves_extended_grapheme_clusters() {
+        for (text, width, expected) in [
+            ("❤️x", 2, "…"),
+            ("❤️xx", 3, "❤️…"),
+            ("🇺🇸xx", 3, "🇺🇸…"),
+            ("e\u{301}xx", 2, "e\u{301}…"),
+            ("👩‍💻xx", 3, "👩‍💻…"),
+        ] {
+            assert_eq!(truncate_to_width(text, width), expected);
+            assert!(UnicodeWidthStr::width(expected) <= width);
+        }
+    }
+
+    #[test]
     fn agent_rows_truncate_unicode_before_reserved_duration() {
         let row = test_agent(
             "Scout",
@@ -1953,9 +1973,9 @@ mod tests {
     #[test]
     fn agents_layout_obeys_hidden_and_107_108_boundaries() {
         let area_107 = ratatui::layout::Rect::new(2, 3, 107, 20);
-        assert_eq!(body_layout(area_107, false), (area_107, None));
+        assert_eq!(body_layout(area_107, false, false), (area_107, None));
         assert_eq!(
-            body_layout(area_107, true),
+            body_layout(area_107, true, false),
             (
                 ratatui::layout::Rect::new(2, 3, 107, 11),
                 Some(ratatui::layout::Rect::new(2, 14, 107, 9)),
@@ -1964,7 +1984,7 @@ mod tests {
 
         let area_108 = ratatui::layout::Rect::new(2, 3, 108, 20);
         assert_eq!(
-            body_layout(area_108, true),
+            body_layout(area_108, true, false),
             (
                 ratatui::layout::Rect::new(2, 3, 62, 20),
                 Some(ratatui::layout::Rect::new(64, 3, 46, 20)),
@@ -2223,6 +2243,19 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn agents_panel_is_visible_before_the_first_transcript_block() {
+        let mut app = panel_app(1);
+        assert!(app.blocks.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+
+        for (width, height) in [(120, 30), (80, 12)] {
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("agent roster"), "{screen}");
+            assert!(screen.contains("Scout 0"), "{screen}");
+        }
     }
 
     #[test]
