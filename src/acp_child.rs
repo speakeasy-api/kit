@@ -280,6 +280,13 @@ impl AcpHarnesses {
         if resume {
             command.arg("--resume");
         }
+        if config.legacy_mcp_config {
+            command.arg("--internal-mcp-legacy");
+        } else if let Some(path) = &config.configured_mcp_config {
+            command.arg("--internal-mcp-config").arg(path);
+        } else if config.configured_mcp_config_inherited {
+            command.arg("--internal-no-mcp-config");
+        }
         if let Some(path) = &config.mcp_config {
             command.arg("--mcp-config").arg(path);
         }
@@ -353,6 +360,9 @@ pub(crate) struct ChildConfig {
     pub provider: crate::ProviderKind,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     pub openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
+    pub configured_mcp_config: Option<PathBuf>,
+    pub configured_mcp_config_inherited: bool,
+    pub legacy_mcp_config: bool,
     pub mcp_config: Option<PathBuf>,
     pub credential_storage: CredentialStorage,
     pub telemetry: crate::telemetry::Settings,
@@ -1227,6 +1237,9 @@ mod tests {
                 provider: crate::ProviderKind::OpenRouter,
                 reasoning_effort: None,
                 openrouter_api_key,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
                 mcp_config: None,
                 credential_storage: Default::default(),
                 telemetry: Default::default(),
@@ -1419,6 +1432,9 @@ mod tests {
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1479,6 +1495,9 @@ mod tests {
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1534,6 +1553,9 @@ mod tests {
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1567,12 +1589,19 @@ mod tests {
         assert!(harnesses.contains("acp.kit"));
         assert!(harnesses.is_kit("acp.kit"));
         let root = tempfile::tempdir().unwrap();
+        let configured_directory = tempfile::tempdir().unwrap();
+        let configured_mcp = configured_directory.path().join("configured.json");
+        assert!(configured_mcp.is_absolute());
+        assert!(!configured_mcp.starts_with(root.path()));
         let config = ChildConfig {
             root: root.path().to_path_buf(),
             model: "test-model".into(),
             provider: crate::ProviderKind::OpenRouter,
             reasoning_effort: Some(crate::ReasoningEffort::High),
             openrouter_api_key: Some(crate::provider::OpenRouterApiKey::new("child-secret")),
+            configured_mcp_config: Some(configured_mcp.clone()),
+            configured_mcp_config_inherited: true,
+            legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
             telemetry: crate::telemetry::Settings::try_new(
@@ -1619,6 +1648,10 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg == "--root"));
         assert!(args.iter().any(|arg| arg == "--resume"));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--internal-mcp-config" && pair[1] == configured_mcp.to_string_lossy()
+        }));
+        assert!(args.iter().all(|arg| arg != "--mcp-config"));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--credential-store", "file"])
@@ -1648,6 +1681,39 @@ mod tests {
         assert!(command.as_std().get_envs().any(|(name, value)| {
             name == "OPENROUTER_API_KEY" && value == Some(std::ffi::OsStr::new("child-secret"))
         }));
+
+        let mut no_configured = config.clone();
+        no_configured.configured_mcp_config = None;
+        let command = harnesses
+            .spawn("acp.kit", &no_configured, Some(("session", false)), 2)
+            .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--internal-no-mcp-config"));
+        assert!(args.iter().all(|arg| arg != "--internal-mcp-config"));
+
+        let mut legacy = config;
+        legacy.configured_mcp_config = None;
+        legacy.configured_mcp_config_inherited = false;
+        legacy.legacy_mcp_config = true;
+        legacy.mcp_config = Some(PathBuf::from("/legacy/explicit.json"));
+        let command = harnesses
+            .spawn("acp.kit", &legacy, Some(("session", false)), 2)
+            .unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--internal-mcp-legacy"));
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--mcp-config", "/legacy/explicit.json"] })
+        );
+        assert!(args.iter().all(|arg| arg != "--internal-no-mcp-config"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1668,6 +1734,9 @@ mod tests {
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1732,6 +1801,9 @@ mod tests {
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: Default::default(),
             telemetry: Default::default(),
@@ -1994,6 +2066,9 @@ mod tests {
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
                 mcp_config: None,
                 credential_storage: Default::default(),
                 telemetry: Default::default(),

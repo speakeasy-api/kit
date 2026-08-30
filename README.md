@@ -170,7 +170,7 @@ While the agent works, press `Enter` to add a message to the *current* turn thro
 
 ### Live MCP configuration
 
-You do not need to restart Kit after you add a server. Kit reloads `mcp.json` before each `tool_search` and `auth` call. Kit waits for new servers to finish initialization. It then ranks tools from all configured servers.
+You do not need to restart Kit after you add a server. Kit merges plugins, configured `mcp_config`, project-root `.mcp.json`, and `--mcp-config` in that order, then reloads every named file before each `tool_search` and `auth` call. Kit waits for new servers to finish initialization before ranking tools.
 
 Kit detects OAuth from the server's Bearer challenge. An `auth` block is not necessary. The model calls `auth({ name })` and gives you a URL. After you complete the browser flow, Kit resumes the session. If an access token expires, Kit refreshes the token and repeats the rejected call once.
 

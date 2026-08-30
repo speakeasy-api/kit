@@ -224,6 +224,14 @@ pub(crate) struct AcpDriver {
     pub canonical_transcript: Vec<Item>,
 }
 
+struct McpInstallSources {
+    sources: Vec<crate::tools::mcp::ConfigSource>,
+    configured_path: Option<PathBuf>,
+    explicit_path: Option<PathBuf>,
+    legacy: bool,
+    configured_inherited: bool,
+}
+
 pub struct Runtime {
     root: PathBuf,
     adapter: SelectableAdapter,
@@ -326,6 +334,9 @@ impl Runtime {
                 provider,
                 reasoning_effort,
                 openrouter_api_key: openrouter_api_key.clone(),
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: true,
                 mcp_config: None,
                 credential_storage: credential_storage.clone(),
                 telemetry: Default::default(),
@@ -542,8 +553,8 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    /// Registers validated plugin MCP servers and overlays an optional explicit
-    /// MCP file, then starts connecting all servers in the background.
+    /// Preserves the original single-file behavior. `path` is the explicit MCP
+    /// source and project-local configuration is not discovered.
     pub async fn with_mcp_config(
         runtime: Arc<Self>,
         path: Option<&Path>,
@@ -554,8 +565,105 @@ impl Runtime {
         if path.is_none() && plugin_mcps.is_empty() {
             return Ok(runtime);
         }
+        let sources = path
+            .map(|path| crate::tools::mcp::ConfigSource::required(path.to_path_buf()))
+            .into_iter()
+            .collect();
+        Self::install_mcp(
+            runtime,
+            McpInstallSources {
+                sources,
+                configured_path: None,
+                explicit_path: path.map(Path::to_path_buf),
+                legacy: true,
+                configured_inherited: false,
+            },
+            plugin_mcps,
+            interactive_oauth_enabled,
+            credential_storage,
+        )
+        .await
+    }
+
+    /// Registers plugin MCP servers and ordered configured, project-local, and
+    /// explicit MCP files, then starts connecting all servers in the background.
+    pub async fn with_mcp_sources(
+        runtime: Arc<Self>,
+        configured_path: Option<&Path>,
+        explicit_path: Option<&Path>,
+        plugin_mcps: Vec<crate::plugins::ResolvedPluginMcp>,
+        interactive_oauth_enabled: bool,
+        credential_storage: crate::tools::mcp::CredentialStorage,
+    ) -> Result<Arc<Self>, String> {
+        let launch_cwd = std::env::current_dir().map_err(|error| {
+            format!("could not resolve MCP paths from launch directory: {error}")
+        })?;
+        Self::with_mcp_sources_from_cwd(
+            runtime,
+            configured_path,
+            explicit_path,
+            &launch_cwd,
+            plugin_mcps,
+            interactive_oauth_enabled,
+            credential_storage,
+        )
+        .await
+    }
+
+    async fn with_mcp_sources_from_cwd(
+        runtime: Arc<Self>,
+        configured_path: Option<&Path>,
+        explicit_path: Option<&Path>,
+        launch_cwd: &Path,
+        plugin_mcps: Vec<crate::plugins::ResolvedPluginMcp>,
+        interactive_oauth_enabled: bool,
+        credential_storage: crate::tools::mcp::CredentialStorage,
+    ) -> Result<Arc<Self>, String> {
+        let resolve = |path: &Path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                launch_cwd.join(path)
+            }
+        };
+        let configured_path = configured_path.map(resolve);
+        let explicit_path = explicit_path.map(resolve);
+        let mut sources = Vec::new();
+        if let Some(path) = &configured_path {
+            sources.push(crate::tools::mcp::ConfigSource::required(path.clone()));
+        }
+        sources.push(crate::tools::mcp::ConfigSource::optional_project(
+            runtime.root.join(".mcp.json"),
+            runtime.root.clone(),
+        ));
+        if let Some(path) = &explicit_path {
+            sources.push(crate::tools::mcp::ConfigSource::required(path.clone()));
+        }
+        Self::install_mcp(
+            runtime,
+            McpInstallSources {
+                sources,
+                configured_path,
+                explicit_path,
+                legacy: false,
+                configured_inherited: true,
+            },
+            plugin_mcps,
+            interactive_oauth_enabled,
+            credential_storage,
+        )
+        .await
+    }
+
+    async fn install_mcp(
+        runtime: Arc<Self>,
+        install: McpInstallSources,
+        plugin_mcps: Vec<crate::plugins::ResolvedPluginMcp>,
+        interactive_oauth_enabled: bool,
+        credential_storage: crate::tools::mcp::CredentialStorage,
+    ) -> Result<Arc<Self>, String> {
         let mcp = crate::tools::mcp::connect(
-            path,
+            install.sources,
             &plugin_mcps,
             interactive_oauth_enabled,
             credential_storage.clone(),
@@ -573,7 +681,10 @@ impl Runtime {
                 provider: runtime.provider,
                 reasoning_effort: runtime.reasoning_effort,
                 openrouter_api_key: runtime.openrouter_api_key.clone(),
-                mcp_config: path.map(Path::to_path_buf),
+                configured_mcp_config: install.configured_path,
+                configured_mcp_config_inherited: install.configured_inherited,
+                legacy_mcp_config: install.legacy,
+                mcp_config: install.explicit_path,
                 credential_storage,
                 telemetry: previous.telemetry,
                 harnesses: previous.harnesses,

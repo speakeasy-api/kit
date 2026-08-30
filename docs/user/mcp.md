@@ -1,6 +1,6 @@
 # Configure and Use MCP Servers
 
-Kit connects to Model Context Protocol (MCP) servers supplied by configured Agent Plugins, an explicit JSON file, or both. Plugin-only operation does not require an MCP JSON file. Supply an explicit file with `--mcp-config` or set `mcp_config` in `~/.kit/config.toml`; command-line values override TOML values. Kit does not scan for MCP configuration from other locations. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
+Kit merges Model Context Protocol (MCP) servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
 
 ## Agent Plugin MCP configuration
 
@@ -8,16 +8,17 @@ Validated Agent Plugins can contribute `stdio` and `streamable-http` servers. De
 
 Plugin stdio declarations use the canonical plugin package as `PLUGIN_ROOT` and a persistent `<Kit-config-directory>/plugin-data/<plugin-manifest-name>` directory as `PLUGIN_DATA`. Kit injects both environment variables and replaces every occurrence of `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` in stdio arguments and plugin-supplied environment values. A `./` command is resolved beneath the plugin root. An omitted `cwd` leaves the transport default unchanged and inherits Kit's working directory; `./...` is plugin-root-relative; and `${PLUGIN_ROOT}` or `${PLUGIN_DATA}`, optionally with a validated contained suffix, selects that directory. Kit creates missing data-rooted working directories. These stdio placeholders are not expanded in streamable HTTP URLs or headers.
 
-When an explicit file contains the same server name as a plugin, the explicit entry wins. Kit reloads that file before each `tool_search` and `auth`; removing the explicit entry restores the plugin baseline in the live runtime. An invalid edit fails that call while retaining the last valid combined configuration. See [Agent Plugins](agent-plugins.md) for package configuration and ACP inheritance details.
+Higher-precedence JSON entries override same-named plugin servers. Kit reloads every named JSON layer before each `tool_search` and `auth`; removing an override restores the next lower layer in the live runtime. Creating or deleting the optional project file is detected the same way. An invalid edit fails that call while retaining the last valid combined configuration. See [Agent Plugins](agent-plugins.md) for package configuration and ACP inheritance details.
 
 ## MCP JSON configuration
 
-The top-level key is `mcpServers`; each key beneath it is the server name shown by `tool_search` and accepted by `auth`. The JSON schema is strict: unknown fields make the configuration invalid. Kit validates and registers this configuration at startup, then reloads it before each `tool_search` and `auth` call so live sessions see added, changed, and removed explicit servers—and restored plugin baselines—without a restart. An invalid edit makes the current call fail but retains the last valid configuration so it becomes usable again when the file is repaired. Every configured server begins connecting in the background when Kit starts, using stored credentials only; interactive OAuth is never started implicitly. Each `tool_search` call waits for servers that are still initializing—including servers just added by a reload—before searching, so results always reflect a settled configuration. Give every server a specific `description`: it appears in listings and search results, and it is how an agent recognizes a server that still needs authentication. Use the exact query `mcp` (case-insensitive) for a compact configured-server status list. If the response cap omits tail entries, `total_servers`, `returned_servers`, and `truncated` report the omission.
+The top-level key is `mcpServers`; each key beneath it is the server name shown by `tool_search` and accepted by `auth`. The JSON schema is strict: unknown fields, mixed `command`/`url` transports, and mismatched transport types are invalid. The optional `type` is `stdio` for a command server and `streamable-http` or `http` for a URL server; legacy entries without `type` remain valid. Kit validates every named layer before changing runtime state, then reloads them before each `tool_search` and `auth` call so live sessions see added, changed, and removed servers—and restored lower layers—without a restart. An invalid edit makes the current call fail but retains the last valid combined configuration so it becomes usable again when the file is repaired. Every configured server begins connecting in the background when Kit starts, using stored credentials only; interactive OAuth is never started implicitly. Each `tool_search` call waits for servers that are still initializing—including servers just added by a reload—before searching, so results always reflect a settled configuration. Give every server a specific `description`: it appears in listings and search results, and it is how an agent recognizes a server that still needs authentication. Use the exact query `mcp` (case-insensitive) for a compact configured-server status list. If the response cap omits tail entries, `total_servers`, `returned_servers`, and `truncated` report the omission.
 
 ```json
 {
   "mcpServers": {
     "local-files": {
+      "type": "stdio",
       "command": "my-mcp-server",
       "args": ["--stdio"],
       "cwd": "/path/to/project",
@@ -25,6 +26,7 @@ The top-level key is `mcpServers`; each key beneath it is the server name shown 
       "description": "Local file tools"
     },
     "projects": {
+      "type": "streamable-http",
       "url": "https://mcp.example.com/mcp",
       "description": "Issues and project management",
       "auth": {
@@ -35,6 +37,8 @@ The top-level key is `mcpServers`; each key beneath it is the server name shown 
   }
 }
 ```
+
+For a project-local stdio server, an omitted `cwd` defaults to the directory containing the root `.mcp.json`, and a relative `cwd` resolves from that directory. An absolute `cwd` is unchanged. Other layers preserve the existing transport behavior. Kit reads these files but never rewrites them.
 
 Start Kit with the installed binary:
 
@@ -112,7 +116,7 @@ Interactive browser authentication is enabled in the long-lived `kit tui`, `kit 
 
 ## ACP child behavior
 
-Nested built-in `acp.kit` children receive the explicit MCP path and credential settings from their parent and reload configured plugins from the same global Kit configuration. They therefore see plugin-only servers and the same explicit-over-plugin precedence. External ACP profiles are separate programs: Kit sends them standard ACP initialization and prompt traffic, but does not inject Kit plugin declarations or Kit MCP configuration. Configure MCP separately in an external agent if it supports that behavior.
+Nested built-in `acp.kit` children receive the configured and explicit MCP paths, credential settings, and effective project root from their parent. They rediscover the project `.mcp.json` and reload plugins from the same global Kit configuration, preserving the plugin → configured → project → explicit precedence. External ACP profiles are separate programs: Kit sends them standard ACP initialization and prompt traffic, but does not inject Kit plugin declarations or Kit MCP configuration. Configure MCP separately in an external agent if it supports that behavior.
 
 ## OAuth credential stores
 
@@ -165,7 +169,7 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 
 ### Configuration file errors
 
-- **`could not read MCP config ...`**: verify the explicitly selected `--mcp-config`/`mcp_config` path and file permissions. The file is optional when plugins provide all required servers; Kit does not scan for other MCP files.
+- **`could not read MCP config ...`**: verify the configured `mcp_config` or `--mcp-config` path and permissions; named files are required. Root `.mcp.json` is optional, and its absence is tracked for live creation.
 - **`invalid MCP config ...`**: validate JSON syntax, the exact `mcpServers` spelling, field types, and field names such as `bearerToken`, `clientId`, and `clientMetadataUrl`. Unknown fields are rejected.
 - **`MCP server names must not be empty`**, **`has an empty command`**, or **`has an empty URL`**: give every entry a non-blank name and its transport a non-blank `command` or `url`.
 - **`MCP server ... is declared by both plugins ...`**: rename one plugin server or disable one of the colliding plugins. Explicit-file entries may override plugin servers, but plugin/plugin collisions are errors.

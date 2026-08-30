@@ -106,16 +106,51 @@ impl CredentialArgs {
 
 #[derive(Args)]
 struct McpArgs {
-    /// Explicit MCP server configuration (never discovered automatically).
+    /// Highest-precedence MCP server configuration.
     #[arg(long)]
     mcp_config: Option<PathBuf>,
+    /// Resolved config.toml MCP path inherited by built-in Kit children.
+    #[arg(long = "internal-mcp-config", hide = true)]
+    configured_mcp_config: Option<PathBuf>,
+    /// Preserve inherited layered configuration without a configured source.
+    #[arg(long = "internal-no-mcp-config", hide = true)]
+    no_configured_mcp_config: bool,
+    /// Preserve legacy single-file MCP behavior in built-in Kit children.
+    #[arg(long = "internal-mcp-legacy", hide = true)]
+    legacy_mcp_config: bool,
     #[command(flatten)]
     credentials: CredentialArgs,
 }
 
 impl McpArgs {
-    fn config_path<'a>(&'a self, config: &'a Config) -> Option<&'a Path> {
-        self.mcp_config.as_deref().or(config.mcp_config.as_deref())
+    fn config_paths(&self, config: &Config) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
+        fn launch_path(path: &Path) -> io::Result<PathBuf> {
+            if path.is_absolute() {
+                Ok(path.to_path_buf())
+            } else {
+                Ok(env::current_dir()?.join(path))
+            }
+        }
+
+        if self.no_configured_mcp_config && self.configured_mcp_config.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inherited MCP configuration cannot be both present and absent",
+            ));
+        }
+        let configured = if self.no_configured_mcp_config {
+            None
+        } else {
+            self.configured_mcp_config
+                .as_deref()
+                .or(config.mcp_config.as_deref())
+                .map(launch_path)
+                .transpose()?
+        };
+        Ok((
+            configured,
+            self.mcp_config.as_deref().map(launch_path).transpose()?,
+        ))
     }
 }
 
@@ -835,6 +870,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
                 Some(id) => {
@@ -865,14 +901,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
-            let runtime = kit::Runtime::with_mcp_config(
-                runtime,
-                mcp.config_path(&config),
-                plugins.mcp_plugins,
-                true,
-                credential_storage,
-            )
-            .await?;
+            let runtime = if mcp.legacy_mcp_config {
+                kit::Runtime::with_mcp_config(
+                    runtime,
+                    explicit_mcp.as_deref(),
+                    plugins.mcp_plugins,
+                    true,
+                    credential_storage,
+                )
+                .await?
+            } else {
+                kit::Runtime::with_mcp_sources(
+                    runtime,
+                    configured_mcp.as_deref(),
+                    explicit_mcp.as_deref(),
+                    plugins.mcp_plugins,
+                    true,
+                    credential_storage,
+                )
+                .await?
+            };
             let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
             let serve_a2a = !no_a2a;
             let sessions = kit::protocols::acp::SessionRegistry::new();
@@ -914,6 +962,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
                 Some(id) => {
@@ -949,14 +998,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
-            let runtime = kit::Runtime::with_mcp_config(
-                runtime,
-                mcp.config_path(&config),
-                plugins.mcp_plugins,
-                true,
-                credential_storage,
-            )
-            .await?;
+            let runtime = if mcp.legacy_mcp_config {
+                kit::Runtime::with_mcp_config(
+                    runtime,
+                    explicit_mcp.as_deref(),
+                    plugins.mcp_plugins,
+                    true,
+                    credential_storage,
+                )
+                .await?
+            } else {
+                kit::Runtime::with_mcp_sources(
+                    runtime,
+                    configured_mcp.as_deref(),
+                    explicit_mcp.as_deref(),
+                    plugins.mcp_plugins,
+                    true,
+                    credential_storage,
+                )
+                .await?
+            };
             match protocol_version {
                 AcpProtocolVersion::V1 => kit::protocols::acp::serve(runtime).await?,
                 AcpProtocolVersion::V2 => kit::protocols::acp::v2::serve(runtime).await?,
@@ -977,6 +1038,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
             let plugins = config.resolve_plugins(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
             let runtime =
@@ -1001,14 +1063,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
-            let runtime = kit::Runtime::with_mcp_config(
-                runtime,
-                mcp.config_path(&config),
-                plugins.mcp_plugins,
-                false,
-                credential_storage,
-            )
-            .await?;
+            let runtime = if mcp.legacy_mcp_config {
+                kit::Runtime::with_mcp_config(
+                    runtime,
+                    explicit_mcp.as_deref(),
+                    plugins.mcp_plugins,
+                    false,
+                    credential_storage,
+                )
+                .await?
+            } else {
+                kit::Runtime::with_mcp_sources(
+                    runtime,
+                    configured_mcp.as_deref(),
+                    explicit_mcp.as_deref(),
+                    plugins.mcp_plugins,
+                    false,
+                    credential_storage,
+                )
+                .await?
+            };
             let output = runtime.run_persistent(prompt).await?;
             println!("{output}");
             println!("session_id: {session_id}");
@@ -1032,6 +1106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
+            let (_, explicit_mcp) = mcp.config_paths(&config)?;
             config.resolve_plugins(&root).await?;
             kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
@@ -1039,7 +1114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 provider,
                 reasoning_effort,
                 a2a.as_deref(),
-                mcp.config_path(&config),
+                explicit_mcp.as_deref(),
                 &credential_storage,
                 &telemetry_settings,
                 openrouter_api_key.as_ref().map(|(key, _)| key),
@@ -1169,15 +1244,76 @@ credential_dir = "/configured/credentials"
 
         let mcp = McpArgs {
             mcp_config: None,
+            configured_mcp_config: None,
+            no_configured_mcp_config: false,
+            legacy_mcp_config: false,
             credentials: CredentialArgs {
                 credential_store: None,
                 credential_dir: None,
             },
         };
         assert_eq!(
-            mcp.config_path(&config),
-            Some(std::path::Path::new("/configured/mcp.json"))
+            mcp.config_paths(&config).unwrap(),
+            (Some(PathBuf::from("/configured/mcp.json")), None)
         );
+        let cli_mcp = McpArgs {
+            mcp_config: Some(PathBuf::from("/cli/mcp.json")),
+            configured_mcp_config: None,
+            no_configured_mcp_config: false,
+            legacy_mcp_config: false,
+            credentials: CredentialArgs {
+                credential_store: None,
+                credential_dir: None,
+            },
+        };
+        assert_eq!(
+            cli_mcp.config_paths(&config).unwrap(),
+            (
+                Some(PathBuf::from("/configured/mcp.json")),
+                Some(PathBuf::from("/cli/mcp.json")),
+            )
+        );
+
+        let inherited_mcp = McpArgs {
+            mcp_config: None,
+            configured_mcp_config: Some(PathBuf::from("/parent/configured.json")),
+            no_configured_mcp_config: false,
+            legacy_mcp_config: false,
+            credentials: CredentialArgs {
+                credential_store: None,
+                credential_dir: None,
+            },
+        };
+        assert_eq!(
+            inherited_mcp.config_paths(&config).unwrap(),
+            (Some(PathBuf::from("/parent/configured.json")), None)
+        );
+        let inherited_without_config = McpArgs {
+            mcp_config: None,
+            configured_mcp_config: None,
+            no_configured_mcp_config: true,
+            legacy_mcp_config: false,
+            credentials: CredentialArgs {
+                credential_store: None,
+                credential_dir: None,
+            },
+        };
+        assert_eq!(
+            inherited_without_config.config_paths(&config).unwrap(),
+            (None, None)
+        );
+        let conflicting_inherited_mcp = McpArgs {
+            configured_mcp_config: Some(PathBuf::from("/parent/configured.json")),
+            ..inherited_without_config
+        };
+        assert_eq!(
+            conflicting_inherited_mcp
+                .config_paths(&config)
+                .unwrap_err()
+                .to_string(),
+            "inherited MCP configuration cannot be both present and absent"
+        );
+
         let storage = mcp.credentials.storage(&config).unwrap();
         assert_eq!(storage.cli_name(), "file");
         assert_eq!(
@@ -1187,6 +1323,9 @@ credential_dir = "/configured/credentials"
 
         let override_mcp = McpArgs {
             mcp_config: None,
+            configured_mcp_config: None,
+            no_configured_mcp_config: false,
+            legacy_mcp_config: false,
             credentials: CredentialArgs {
                 credential_store: Some(CredentialStoreKind::Memory),
                 credential_dir: None,
@@ -1373,6 +1512,9 @@ subdir = "packages/plugin"
     fn file_credentials_require_an_explicit_directory() {
         let missing = McpArgs {
             mcp_config: None,
+            configured_mcp_config: None,
+            no_configured_mcp_config: false,
+            legacy_mcp_config: false,
             credentials: CredentialArgs {
                 credential_store: Some(CredentialStoreKind::File),
                 credential_dir: None,
@@ -1382,6 +1524,9 @@ subdir = "packages/plugin"
 
         let stray = McpArgs {
             mcp_config: None,
+            configured_mcp_config: None,
+            no_configured_mcp_config: false,
+            legacy_mcp_config: false,
             credentials: CredentialArgs {
                 credential_store: Some(CredentialStoreKind::Memory),
                 credential_dir: Some("credentials".into()),
@@ -1727,10 +1872,12 @@ review = "opus"
     }
 
     #[test]
-    fn acp_accepts_hidden_immediate_subagent_parent_context() {
+    fn acp_accepts_hidden_inherited_context() {
         let cli = Cli::try_parse_from([
             "kit",
             "acp",
+            "--internal-mcp-config",
+            "/resolved/configured.json",
             "--subagent-parent-id",
             "s-parent",
             "--subagent-parent-name",
@@ -1738,6 +1885,7 @@ review = "opus"
         ])
         .unwrap();
         let Command::Acp {
+            mcp,
             subagent_parent_id,
             subagent_parent_name,
             ..
@@ -1745,8 +1893,44 @@ review = "opus"
         else {
             panic!("expected acp command");
         };
+        assert_eq!(
+            mcp.configured_mcp_config.as_deref(),
+            Some(std::path::Path::new("/resolved/configured.json"))
+        );
         assert_eq!(subagent_parent_id.as_deref(), Some("s-parent"));
         assert_eq!(subagent_parent_name.as_deref(), Some("偵察 🦀"));
+
+        let cli = Cli::try_parse_from(["kit", "acp", "--internal-no-mcp-config"]).unwrap();
+        let Command::Acp { mcp, .. } = cli.command else {
+            panic!("expected acp command");
+        };
+        assert!(mcp.no_configured_mcp_config);
+        assert!(
+            mcp.config_paths(&Config {
+                mcp_config: Some("/child/configured.json".into()),
+                ..Config::default()
+            })
+            .unwrap()
+            .0
+            .is_none()
+        );
+
+        let cli = Cli::try_parse_from([
+            "kit",
+            "acp",
+            "--internal-mcp-legacy",
+            "--mcp-config",
+            "/legacy/explicit.json",
+        ])
+        .unwrap();
+        let Command::Acp { mcp, .. } = cli.command else {
+            panic!("expected acp command");
+        };
+        assert!(mcp.legacy_mcp_config);
+        assert_eq!(
+            mcp.mcp_config.as_deref(),
+            Some(std::path::Path::new("/legacy/explicit.json"))
+        );
     }
 
     #[test]
