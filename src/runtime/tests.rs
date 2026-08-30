@@ -26,18 +26,178 @@ async fn subagent_manager_survives_runtime_reconstruction() {
         Runtime::with_acp_harnesses(runtime, harnesses, crate::acp_child::BUILTIN_HARNESS.into())
             .unwrap();
 
-    let mcp_path = root.path().join("mcp.json");
+    let configured_directory = tempfile::tempdir().unwrap();
+    let mcp_path = configured_directory.path().join("mcp.json");
     std::fs::write(&mcp_path, r#"{"mcpServers":{}}"#).unwrap();
-    let runtime = Runtime::with_mcp_config(
+    let runtime = Runtime::with_mcp_sources(
         runtime,
         Some(&mcp_path),
+        None,
         Vec::new(),
         false,
         crate::credentials::CredentialStorage::Memory,
     )
     .await
     .unwrap();
+    assert_eq!(
+        runtime
+            .subagents
+            .child_config()
+            .configured_mcp_config
+            .as_deref(),
+        Some(mcp_path.as_path())
+    );
+    assert!(
+        runtime
+            .subagents
+            .child_config()
+            .configured_mcp_config_inherited
+    );
+    assert!(runtime.subagents.child_config().mcp_config.is_none());
     let _fresh = runtime.subagents.fresh();
+}
+
+#[tokio::test]
+async fn legacy_with_mcp_config_remains_an_explicit_layer() {
+    let root = tempfile::tempdir().unwrap();
+    let explicit = root.path().join("explicit.json");
+    std::fs::write(&explicit, r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        root.path().join(".mcp.json"),
+        r#"{"mcpServers":{"project-only":{"command":"missing"}}}"#,
+    )
+    .unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime = Runtime::with_mcp_config(
+        runtime,
+        Some(&explicit),
+        Vec::new(),
+        false,
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        runtime
+            .subagents
+            .child_config()
+            .configured_mcp_config
+            .is_none()
+    );
+    assert_eq!(
+        runtime.subagents.child_config().mcp_config.as_deref(),
+        Some(explicit.as_path())
+    );
+    assert!(runtime.subagents.child_config().legacy_mcp_config);
+    assert!(
+        !runtime
+            .subagents
+            .child_config()
+            .configured_mcp_config_inherited
+    );
+    assert_eq!(
+        runtime.mcp.config_source_states().await,
+        vec![(explicit, true, true)]
+    );
+}
+
+#[tokio::test]
+async fn legacy_with_no_config_still_propagates_without_project_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join(".mcp.json"),
+        r#"{"mcpServers":{"project-only":{"command":"missing"}}}"#,
+    )
+    .unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let shared = Arc::clone(&runtime);
+    let runtime = Runtime::with_mcp_config(
+        runtime,
+        None,
+        Vec::new(),
+        false,
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+    assert!(Arc::ptr_eq(&runtime, &shared));
+    let child = runtime.subagents.child_config();
+
+    assert!(child.configured_mcp_config.is_none());
+    assert!(!child.configured_mcp_config_inherited);
+    assert!(child.legacy_mcp_config);
+    assert!(child.mcp_config.is_none());
+    assert!(runtime.mcp.config_source_states().await.is_empty());
+}
+
+#[tokio::test]
+async fn layered_relative_paths_use_captured_launch_cwd() {
+    let root = tempfile::tempdir().unwrap();
+    let launch = tempfile::tempdir().unwrap();
+    let configured = launch.path().join("configured.json");
+    let explicit = launch.path().join("explicit.json");
+    std::fs::write(&configured, r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(&explicit, r#"{"mcpServers":{}}"#).unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime = Runtime::with_mcp_sources_from_cwd(
+        runtime,
+        Some(std::path::Path::new("configured.json")),
+        Some(std::path::Path::new("explicit.json")),
+        launch.path(),
+        Vec::new(),
+        false,
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+    let child = runtime.subagents.child_config();
+
+    assert_eq!(
+        child.configured_mcp_config.as_deref(),
+        Some(configured.as_path())
+    );
+    assert!(child.configured_mcp_config_inherited);
+    assert!(!child.legacy_mcp_config);
+    assert_eq!(child.mcp_config.as_deref(), Some(explicit.as_path()));
+    assert_eq!(
+        runtime.mcp.config_source_states().await,
+        vec![
+            (configured, true, true),
+            (
+                root.path().canonicalize().unwrap().join(".mcp.json"),
+                false,
+                false
+            ),
+            (explicit, true, true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn project_mcp_source_is_canonical_root_and_tracks_absence() {
+    let root = tempfile::tempdir().unwrap();
+    let canonical_root = root.path().canonicalize().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let runtime = Runtime::with_mcp_sources(
+        runtime,
+        None,
+        None,
+        Vec::new(),
+        false,
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        runtime.mcp.config_source_states().await,
+        vec![(canonical_root.join(".mcp.json"), false, false)]
+    );
+    let child = runtime.subagents.child_config();
+    assert!(child.configured_mcp_config.is_none());
+    assert!(child.configured_mcp_config_inherited);
+    assert!(!child.legacy_mcp_config);
 }
 
 #[test]

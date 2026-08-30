@@ -26,7 +26,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore, mpsc, oneshot};
 
@@ -64,9 +64,37 @@ enum Server {
     Http(Http),
 }
 
+fn deserialize_transport_type<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+enum StdioType {
+    #[serde(rename = "stdio")]
+    Stdio,
+}
+
+#[derive(Deserialize)]
+enum HttpType {
+    #[serde(rename = "streamable-http")]
+    StreamableHttp,
+    #[serde(rename = "http")]
+    Http,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stdio {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_transport_type"
+    )]
+    _transport_type: Option<StdioType>,
     command: String,
     description: Option<String>,
     #[serde(default)]
@@ -79,6 +107,12 @@ struct Stdio {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Http {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_transport_type"
+    )]
+    _transport_type: Option<HttpType>,
     url: String,
     description: Option<String>,
     #[serde(rename = "bearerToken")]
@@ -123,11 +157,59 @@ struct ServerRecord {
 }
 
 struct ReloadState {
-    path: Option<PathBuf>,
-    raw: Vec<u8>,
+    sources: Vec<SourceState>,
     entries: BTreeMap<String, Vec<u8>>,
     plugins: BTreeMap<String, PreparedServer>,
     plugin_entries: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ConfigSource {
+    path: PathBuf,
+    required: bool,
+    default_stdio_cwd: Option<PathBuf>,
+}
+
+impl ConfigSource {
+    pub(crate) fn required(path: PathBuf) -> Self {
+        Self {
+            path,
+            required: true,
+            default_stdio_cwd: None,
+        }
+    }
+
+    pub(crate) fn optional_project(path: PathBuf, cwd: PathBuf) -> Self {
+        Self {
+            path,
+            required: false,
+            default_stdio_cwd: Some(cwd),
+        }
+    }
+}
+
+pub(crate) trait IntoConfigSources {
+    fn into_config_sources(self) -> Vec<ConfigSource>;
+}
+
+impl IntoConfigSources for Vec<ConfigSource> {
+    fn into_config_sources(self) -> Vec<ConfigSource> {
+        self
+    }
+}
+
+impl<P: AsRef<Path>> IntoConfigSources for Option<P> {
+    fn into_config_sources(self) -> Vec<ConfigSource> {
+        self.map(|path| ConfigSource::required(path.as_ref().to_path_buf()))
+            .into_iter()
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct SourceState {
+    source: ConfigSource,
+    raw: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -490,7 +572,21 @@ fn can_opportunistically_refresh(request: &AuthRequest, record: &ServerRecord) -
         && !challenge_requires_interactive_authorization(&request.challenge)
 }
 
-fn prepare_config(bytes: &[u8], path: &Path) -> Result<PreparedConfiguration, String> {
+fn resolve_stdio_cwd(cwd: Option<&Path>, default: Option<&Path>) -> Option<PathBuf> {
+    match cwd {
+        Some(cwd) if cwd.is_relative() => default
+            .map(|base| base.join(cwd))
+            .or_else(|| Some(cwd.to_path_buf())),
+        Some(cwd) => Some(cwd.to_path_buf()),
+        None => default.map(Path::to_path_buf),
+    }
+}
+
+fn prepare_config(
+    bytes: &[u8],
+    path: &Path,
+    default_stdio_cwd: Option<&Path>,
+) -> Result<PreparedConfiguration, String> {
     let config: Config = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid MCP config {}: {error}", path.display()))?;
     let value: Value = serde_json::from_slice(bytes)
@@ -499,7 +595,7 @@ fn prepare_config(bytes: &[u8], path: &Path) -> Result<PreparedConfiguration, St
         .get("mcpServers")
         .and_then(Value::as_object)
         .expect("strict Config parsing guarantees an mcpServers object");
-    let entries = raw_entries
+    let mut entries = raw_entries
         .iter()
         .map(|(name, value)| {
             (
@@ -513,8 +609,17 @@ fn prepare_config(bytes: &[u8], path: &Path) -> Result<PreparedConfiguration, St
         if id.trim().is_empty() {
             return Err("MCP server names must not be empty".into());
         }
-        let fingerprint = entries[&id].clone();
-        let (binding, record) = prepare_server(&id, server, fingerprint)?;
+        let mut fingerprint = entries[&id].clone();
+        let effective_cwd = match &server {
+            Server::Stdio(server) => resolve_stdio_cwd(server.cwd.as_deref(), default_stdio_cwd),
+            Server::Http(_) => None,
+        };
+        if let Some(cwd) = &effective_cwd {
+            fingerprint.push(0);
+            fingerprint.extend_from_slice(cwd.as_os_str().as_encoded_bytes());
+        }
+        entries.insert(id.clone(), fingerprint.clone());
+        let (binding, record) = prepare_server(&id, server, fingerprint, effective_cwd.as_deref())?;
         prepared.insert(
             id.clone(),
             PreparedServer {
@@ -544,6 +649,7 @@ fn prepare_server(
     id: &str,
     server: Server,
     fingerprint: Vec<u8>,
+    effective_stdio_cwd: Option<&Path>,
 ) -> Result<(McpTransportBinding, ServerRecord), String> {
     match server {
         Server::Stdio(server) => {
@@ -553,7 +659,7 @@ fn prepare_server(
             let mut transport = StdioTransportConfig::new(server.command);
             transport.args = server.args;
             transport.env = server.env.into_iter().collect();
-            transport.cwd = server.cwd;
+            transport.cwd = effective_stdio_cwd.map(Path::to_path_buf);
             Ok((
                 McpTransportBinding::Stdio(transport),
                 ServerRecord {
@@ -817,27 +923,53 @@ fn prepare_plugins(
     Ok((prepared, entries))
 }
 
-pub async fn connect(
-    path: Option<&Path>,
+async fn read_source(source: &ConfigSource) -> Result<Option<Vec<u8>>, String> {
+    match tokio::fs::read(&source.path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if !source.required && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not read MCP config {}: {error}",
+            source.path.display()
+        )),
+    }
+}
+
+fn prepare_sources(
+    sources: &[SourceState],
+    plugin_prepared: &PreparedServers,
+    plugin_entries: &ServerFingerprints,
+) -> Result<PreparedConfiguration, String> {
+    let mut prepared = plugin_prepared.clone();
+    let mut entries = plugin_entries.clone();
+    for state in sources {
+        let Some(bytes) = &state.raw else {
+            continue;
+        };
+        let (source_prepared, source_entries) = prepare_config(
+            bytes,
+            &state.source.path,
+            state.source.default_stdio_cwd.as_deref(),
+        )?;
+        prepared.extend(source_prepared);
+        entries.extend(source_entries);
+    }
+    Ok((prepared, entries))
+}
+
+pub(crate) async fn connect(
+    sources: impl IntoConfigSources,
     plugins: &[crate::plugins::ResolvedPluginMcp],
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
+    let sources = sources.into_config_sources();
     let (plugin_prepared, plugin_entries) = prepare_plugins(plugins)?;
-    let (bytes, explicit_prepared, explicit_entries) = match path {
-        Some(path) => {
-            let bytes = tokio::fs::read(path).await.map_err(|error| {
-                format!("could not read MCP config {}: {error}", path.display())
-            })?;
-            let (prepared, entries) = prepare_config(&bytes, path)?;
-            (bytes, prepared, entries)
-        }
-        None => (Vec::new(), BTreeMap::new(), BTreeMap::new()),
-    };
-    let mut prepared = plugin_prepared.clone();
-    prepared.extend(explicit_prepared);
-    let mut entries = plugin_entries.clone();
-    entries.extend(explicit_entries);
+    let mut source_states = Vec::with_capacity(sources.len());
+    for source in sources {
+        let raw = read_source(&source).await?;
+        source_states.push(SourceState { source, raw });
+    }
+    let (prepared, entries) = prepare_sources(&source_states, &plugin_prepared, &plugin_entries)?;
     validate_server_names(prepared.keys())?;
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let mut manager = McpServerManager::new();
@@ -871,8 +1003,7 @@ pub async fn connect(
         (oauth_sessions, active_replays),
         credential_storage,
         ReloadState {
-            path: path.map(Path::to_path_buf),
-            raw: bytes,
+            sources: source_states,
             entries,
             plugins: plugin_prepared,
             plugin_entries,
@@ -1038,6 +1169,24 @@ impl McpRuntime {
         self.publish_to(session_id, self.event_generation(session_id), event);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn config_source_states(&self) -> Vec<(PathBuf, bool, bool)> {
+        self.inner
+            .reload
+            .lock()
+            .await
+            .sources
+            .iter()
+            .map(|state| {
+                (
+                    state.source.path.clone(),
+                    state.source.required,
+                    state.raw.is_some(),
+                )
+            })
+            .collect()
+    }
+
     async fn reload_config(&self) -> Result<(), String> {
         let permit = Arc::clone(&self.inner.reload_flight)
             .acquire_owned()
@@ -1054,23 +1203,25 @@ impl McpRuntime {
 
     async fn reload_config_inner(&self) -> Result<(), String> {
         let mut state = self.inner.reload.lock().await;
-        let Some(path) = state.path.clone() else {
-            return Ok(());
-        };
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|error| format!("could not read MCP config {}: {error}", path.display()))?;
-        if bytes == state.raw {
+        let mut next_sources = Vec::with_capacity(state.sources.len());
+        for current in &state.sources {
+            next_sources.push(SourceState {
+                source: current.source.clone(),
+                raw: read_source(&current.source).await?,
+            });
+        }
+        if next_sources
+            .iter()
+            .zip(&state.sources)
+            .all(|(next, current)| next.raw == current.raw)
+        {
             return Ok(());
         }
 
-        // Validate explicit transports before changing live state, then layer
-        // them over the immutable plugin baseline.
-        let (explicit_prepared, explicit_entries) = prepare_config(&bytes, &path)?;
-        let mut prepared = state.plugins.clone();
-        prepared.extend(explicit_prepared);
-        let mut entries = state.plugin_entries.clone();
-        entries.extend(explicit_entries);
+        // Validate every source before changing live state, then layer them in
+        // declared precedence order over the immutable plugin baseline.
+        let (mut prepared, entries) =
+            prepare_sources(&next_sources, &state.plugins, &state.plugin_entries)?;
         validate_server_names(prepared.keys())?;
         let changed = state
             .entries
@@ -1080,7 +1231,7 @@ impl McpRuntime {
             .cloned()
             .collect::<BTreeSet<_>>();
         if changed.is_empty() {
-            state.raw = bytes;
+            state.sources = next_sources;
             return Ok(());
         }
         drop(state);
@@ -1106,11 +1257,12 @@ impl McpRuntime {
         }
         let mut state = self.inner.reload.lock().await;
         let _initialization = self.inner.initialization.lock().await;
-        let current_bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|error| format!("could not reread MCP config {}: {error}", path.display()))?;
-        if current_bytes != bytes {
-            return Err("MCP config changed while reload was waiting; retry the operation".into());
+        for expected in &next_sources {
+            if read_source(&expected.source).await? != expected.raw {
+                return Err(
+                    "MCP config changed while reload was waiting; retry the operation".into(),
+                );
+            }
         }
 
         {
@@ -1150,7 +1302,7 @@ impl McpRuntime {
                 active_replays.remove(name);
             }
         }
-        state.raw = bytes;
+        state.sources = next_sources;
         state.entries = entries;
         Ok(())
     }
@@ -2078,8 +2230,7 @@ pub fn empty() -> McpRuntime {
         (oauth_sessions, active_replays),
         credential_storage,
         ReloadState {
-            path: None,
-            raw: Vec::new(),
+            sources: Vec::new(),
             entries: BTreeMap::new(),
             plugins: BTreeMap::new(),
             plugin_entries: BTreeMap::new(),
@@ -2476,7 +2627,7 @@ fn render_search(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
     use agentkit_core::MetadataMap;
     use agentkit_mcp::{
@@ -2495,11 +2646,12 @@ mod tests {
     };
 
     use super::{
-        AuthRecorder, Config, CredentialStorage, McpTool, OAuthSession, OpportunisticRefresh,
-        PreparedQuery, PreparedSpec, ReplayCleanup, ServerRecord, ServerStatus,
-        agentkit_auth_not_applied, agentkit_replay_rejected, can_opportunistically_refresh,
-        challenge_requires_interactive_authorization, matched_score, prepare_plugins,
-        regular_term_score, serializes_tool_calls, validate_server_names,
+        AuthRecorder, Config, ConfigSource, CredentialStorage, McpTool, OAuthSession,
+        OpportunisticRefresh, PreparedQuery, PreparedSpec, ReplayCleanup, ServerRecord,
+        ServerStatus, agentkit_auth_not_applied, agentkit_replay_rejected,
+        can_opportunistically_refresh, challenge_requires_interactive_authorization, matched_score,
+        prepare_config, prepare_plugins, regular_term_score, serializes_tool_calls,
+        validate_server_names,
     };
     use crate::plugins::ResolvedPluginMcp;
 
@@ -3303,21 +3455,72 @@ mod tests {
     }
 
     #[test]
-    fn config_is_strict_and_accepts_oauth_servers() {
-        assert!(
-            serde_json::from_str::<Config>(
-                r#"{"mcpServers":{"ok":{"command":"server","args":["--stdio"],"env":{"A":"B"}}}}"#
-            )
-            .is_ok()
+    fn config_is_strict_and_accepts_compatible_transport_types() {
+        for config in [
+            r#"{"mcpServers":{"legacy":{"command":"server"}}}"#,
+            r#"{"mcpServers":{"typed":{"type":"stdio","command":"server"}}}"#,
+            r#"{"mcpServers":{"legacy":{"url":"https://mcp.example/mcp"}}}"#,
+            r#"{"mcpServers":{"typed":{"type":"streamable-http","url":"https://mcp.example/mcp"}}}"#,
+            r#"{"mcpServers":{"typed":{"type":"http","url":"https://mcp.example/mcp"}}}"#,
+        ] {
+            assert!(serde_json::from_str::<Config>(config).is_ok(), "{config}");
+        }
+        for config in [
+            r#"{"mcpServers":{},"extra":true}"#,
+            r#"{"mcpServers":{"bad":{"command":"x","url":"http://localhost"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":"http","command":"x"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":"stdio","url":"http://localhost"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":"sse","url":"http://localhost"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":1,"command":"x"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":null,"command":"x"}}}"#,
+            r#"{"mcpServers":{"bad":{"type":null,"url":"http://localhost"}}}"#,
+        ] {
+            assert!(serde_json::from_str::<Config>(config).is_err(), "{config}");
+        }
+    }
+
+    #[test]
+    fn project_stdio_resolves_cwd_before_transport_and_fingerprinting() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let path = first.path().join(".mcp.json");
+
+        let missing = br#"{"mcpServers":{"local":{"command":"server"}}}"#;
+        let (prepared, _) = prepare_config(missing, &path, Some(first.path())).unwrap();
+        let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(transport.cwd.as_deref(), Some(first.path()));
+
+        let relative = br#"{"mcpServers":{"local":{"command":"server","cwd":"tools"}}}"#;
+        let (prepared, first_entries) =
+            prepare_config(relative, &path, Some(first.path())).unwrap();
+        let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(
+            transport.cwd.as_deref(),
+            Some(first.path().join("tools").as_path())
         );
-        assert!(serde_json::from_str::<Config>(r#"{"mcpServers":{"linear":{"url":"https://mcp.example/mcp","description":"Issue tracking","auth":{"type":"oauth","scopes":[]}}}}"#).is_ok());
-        assert!(serde_json::from_str::<Config>(r#"{"mcpServers":{},"extra":true}"#).is_err());
-        assert!(
-            serde_json::from_str::<Config>(
-                r#"{"mcpServers":{"bad":{"command":"x","url":"http://localhost"}}}"#
-            )
-            .is_err()
-        );
+        let (_, second_entries) = prepare_config(relative, &path, Some(second.path())).unwrap();
+        assert_ne!(first_entries["local"], second_entries["local"]);
+
+        let absolute = first.path().join("absolute");
+        let absolute_config = serde_json::to_vec(&json!({
+            "mcpServers": {
+                "local": {"command": "server", "cwd": absolute}
+            }
+        }))
+        .unwrap();
+        let (prepared, first_entries) =
+            prepare_config(&absolute_config, &path, Some(first.path())).unwrap();
+        let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(transport.cwd.as_deref(), Some(absolute.as_path()));
+        let (_, second_entries) =
+            prepare_config(&absolute_config, &path, Some(second.path())).unwrap();
+        assert_eq!(first_entries["local"], second_entries["local"]);
     }
 
     async fn bearer_challenge_server(
@@ -3486,6 +3689,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_sources_merge_and_optional_deletion_reveals_lower_layers() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("configured.json");
+        let project = directory.path().join(".mcp.json");
+        let explicit = directory.path().join("explicit.json");
+        std::fs::write(
+            &configured,
+            r#"{"mcpServers":{"shared":{"command":"missing-configured","description":"configured"},"configured-only":{"command":"missing"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"shared":{"type":"stdio","command":"missing-project","description":"project"},"project-only":{"command":"missing"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &explicit,
+            r#"{"mcpServers":{"shared":{"command":"missing-explicit","description":"explicit"},"explicit-only":{"command":"missing"}}}"#,
+        )
+        .unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "shared".into(),
+                transport: PluginMcpTransport::Stdio {
+                    command: "missing-plugin".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    cwd: None,
+                },
+            }],
+        );
+        let sources = vec![
+            ConfigSource::required(configured.clone()),
+            ConfigSource::optional_project(project.clone(), directory.path().to_path_buf()),
+            ConfigSource::required(explicit.clone()),
+        ];
+        let runtime = super::connect(sources, &[plugin], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let servers = runtime.inner.servers.read().await;
+        assert_eq!(servers["shared"].description, "explicit");
+        for name in ["configured-only", "project-only", "explicit-only"] {
+            assert!(servers.contains_key(name));
+        }
+        drop(servers);
+
+        std::fs::write(&explicit, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "project"
+        );
+        std::fs::remove_file(&project).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "configured"
+        );
+        std::fs::write(&configured, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "tools-manifest plugin MCP server"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_required_source_fails_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.json");
+        let error = match super::connect(
+            vec![ConfigSource::required(path.clone())],
+            &[],
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        {
+            Ok(_) => panic!("missing required source was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains(&path.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn absent_optional_project_source_is_tracked_for_live_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join(".mcp.json");
+        let runtime = super::connect(
+            vec![ConfigSource::optional_project(
+                project.clone(),
+                directory.path().to_path_buf(),
+            )],
+            &[],
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(runtime.inner.servers.read().await.is_empty());
+
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"local":{"command":"missing"}}}"#,
+        )
+        .unwrap();
+        runtime.reload_config().await.unwrap();
+        assert!(runtime.inner.servers.read().await.contains_key("local"));
+    }
+
+    #[tokio::test]
+    async fn invalid_project_reload_preserves_state_until_optional_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("configured.json");
+        let project = directory.path().join(".mcp.json");
+        std::fs::write(
+            &configured,
+            r#"{"mcpServers":{"shared":{"command":"missing","description":"configured"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"shared":{"command":"missing","description":"project"}}}"#,
+        )
+        .unwrap();
+        let runtime = super::connect(
+            vec![
+                ConfigSource::required(configured),
+                ConfigSource::optional_project(project.clone(), directory.path().to_path_buf()),
+            ],
+            &[],
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"broken":{"type":"http","command":"x"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .reload_config()
+                .await
+                .unwrap_err()
+                .contains("invalid MCP config")
+        );
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "project"
+        );
+
+        std::fs::remove_file(&project).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadowed_source_edits_do_not_reconnect_effectively_unchanged_servers() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("configured.json");
+        let project = directory.path().join(".mcp.json");
+        std::fs::write(
+            &configured,
+            r#"{"mcpServers":{"shared":{"command":"lower-one"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"shared":{"command":"winner"}}}"#,
+        )
+        .unwrap();
+        let runtime = super::connect(
+            vec![
+                ConfigSource::required(configured.clone()),
+                ConfigSource::optional_project(project, directory.path().to_path_buf()),
+            ],
+            &[],
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .get_mut("shared")
+            .unwrap()
+            .status = ServerStatus::Connected;
+        let fingerprint = runtime.inner.servers.read().await["shared"]
+            .fingerprint
+            .clone();
+
+        std::fs::write(
+            &configured,
+            r#"{"mcpServers":{"shared":{"command":"lower-two"}}}"#,
+        )
+        .unwrap();
+        runtime.reload_config().await.unwrap();
+        let record = runtime.inner.servers.read().await["shared"].clone();
+        assert_eq!(record.fingerprint, fingerprint);
+        assert!(matches!(record.status, ServerStatus::Connected));
+    }
+
+    #[tokio::test]
     async fn explicit_reload_removal_restores_plugin_baseline() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
@@ -3534,7 +3951,7 @@ mod tests {
                 },
             }],
         );
-        let runtime = super::connect(None, &[plugin], true, CredentialStorage::Memory)
+        let runtime = super::connect(None::<&Path>, &[plugin], true, CredentialStorage::Memory)
             .await
             .unwrap();
         assert!(runtime.inner.servers.read().await.contains_key("remote"));
@@ -3762,6 +4179,7 @@ mod tests {
         let error = match super::prepare_config(
             br#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","headers":{"AUTHORIZATION":"Bearer static"},"auth":{"type":"oauth"}}}}"#,
             path,
+            None,
         ) {
             Ok(_) => panic!("OAuth and static authorization were accepted together"),
             Err(error) => error,
