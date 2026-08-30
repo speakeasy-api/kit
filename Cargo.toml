@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.110"
+version = "0.1.111"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -89,18 +89,12 @@ tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
 agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-adapter-completions = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-core = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-context = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-compaction = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-mcp = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-http = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-plugins = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-provider-openai = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-provider-openrouter = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-task-manager = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-tool-compose = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
-agentkit-tools-core = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
+
+[patch."https://github.com/danielkov/agentkit.git"]
+agentkit-capabilities = "=0.10.5"
+agentkit-core = "=0.10.5"
+agentkit-loop = "=0.10.11"
+agentkit-task-manager = "=0.10.7"
+agentkit-tools-core = "=0.10.5"

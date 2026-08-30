@@ -290,8 +290,6 @@ impl AcpHarnesses {
             command.arg("--credential-dir").arg(path);
         }
         config.telemetry.append_cli_args(&mut command);
-        append_resilience_cli_arg(&mut command, config.resilience.as_ref())
-            .map_err(|error| error.to_string())?;
         if let Some(api_key) = &config.openrouter_api_key {
             command.env("OPENROUTER_API_KEY", api_key.as_str());
         }
@@ -315,14 +313,12 @@ impl LaunchContext {
 }
 
 /// The combined `kit serve` command used by the TUI.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_command(
     root: &Path,
     model: &str,
     provider: crate::ProviderKind,
     reasoning_effort: Option<crate::ReasoningEffort>,
     openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
-    resilience: Option<&crate::ResilienceConfig>,
     session_id: &str,
     resume: bool,
 ) -> std::io::Result<Command> {
@@ -344,23 +340,10 @@ pub(crate) fn serve_command(
     if resume {
         command.arg("--resume");
     }
-    append_resilience_cli_arg(&mut command, resilience).map_err(std::io::Error::other)?;
     if let Some(api_key) = openrouter_api_key {
         command.env("OPENROUTER_API_KEY", api_key.as_str());
     }
     Ok(command)
-}
-
-fn append_resilience_cli_arg(
-    command: &mut Command,
-    resilience: Option<&crate::ResilienceConfig>,
-) -> Result<(), serde_json::Error> {
-    if let Some(resilience) = resilience {
-        command
-            .arg("--resilience-config")
-            .arg(serde_json::to_string(resilience)?);
-    }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -369,7 +352,6 @@ pub(crate) struct ChildConfig {
     pub model: String,
     pub provider: crate::ProviderKind,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
-    pub resilience: Option<crate::ResilienceConfig>,
     pub openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     pub mcp_config: Option<PathBuf>,
     pub credential_storage: CredentialStorage,
@@ -1184,7 +1166,6 @@ mod tests {
             crate::ProviderKind::OpenRouter,
             Some(crate::ReasoningEffort::Medium),
             Some(&crate::provider::OpenRouterApiKey::new("tui-secret")),
-            None,
             "session",
             true,
         )
@@ -1229,7 +1210,6 @@ mod tests {
                 model: "model".into(),
                 provider: crate::ProviderKind::OpenRouter,
                 reasoning_effort: None,
-                resilience: None,
                 openrouter_api_key,
                 mcp_config: None,
                 credential_storage: Default::default(),
@@ -1422,7 +1402,6 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
-            resilience: None,
             openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
@@ -1480,7 +1459,6 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
-            resilience: None,
             openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
@@ -1533,7 +1511,6 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
-            resilience: None,
             openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
@@ -1573,14 +1550,6 @@ mod tests {
             model: "test-model".into(),
             provider: crate::ProviderKind::OpenRouter,
             reasoning_effort: Some(crate::ReasoningEffort::High),
-            resilience: Some(crate::ResilienceConfig {
-                max_retries: 2,
-                retry_budget_ms: 5_000,
-                attempt_timeout_ms: Some(2_000),
-                stream_idle_timeout_ms: None,
-                initial_backoff_ms: 100,
-                max_backoff_ms: 1_000,
-            }),
             openrouter_api_key: Some(crate::provider::OpenRouterApiKey::new("child-secret")),
             mcp_config: None,
             credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
@@ -1628,14 +1597,6 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg == "--root"));
         assert!(args.iter().any(|arg| arg == "--resume"));
-        let propagated_resilience = args
-            .windows(2)
-            .find(|pair| pair[0] == "--resilience-config")
-            .map(|pair| &pair[1])
-            .unwrap();
-        let propagated_resilience: crate::ResilienceConfig =
-            serde_json::from_str(propagated_resilience).unwrap();
-        assert_eq!(propagated_resilience, config.resilience.clone().unwrap());
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--credential-store", "file"])
@@ -1684,7 +1645,6 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
-            resilience: None,
             openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
@@ -1746,7 +1706,6 @@ mod tests {
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
-            resilience: None,
             openrouter_api_key: None,
             mcp_config: None,
             credential_storage: Default::default(),
@@ -2009,7 +1968,6 @@ mod tests {
                 model: "model".into(),
                 provider: Default::default(),
                 reasoning_effort: None,
-                resilience: None,
                 openrouter_api_key: None,
                 mcp_config: None,
                 credential_storage: Default::default(),

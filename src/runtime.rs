@@ -230,7 +230,6 @@ pub struct Runtime {
     provider: ProviderKind,
     model: String,
     reasoning_effort: Option<crate::provider::ReasoningEffort>,
-    resilience: Option<crate::ResilienceConfig>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     telemetry: crate::telemetry::Settings,
@@ -300,28 +299,6 @@ impl Runtime {
         reasoning_effort: Option<crate::provider::ReasoningEffort>,
         openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ) -> Result<Arc<Self>, String> {
-        Self::new_with_provider_credentials_effort_openrouter_key_and_resilience(
-            root,
-            model,
-            provider,
-            credential_storage,
-            reasoning_effort,
-            openrouter_api_key,
-            None,
-        )
-    }
-
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_provider_credentials_effort_openrouter_key_and_resilience(
-        root: impl AsRef<Path>,
-        model: impl Into<String>,
-        provider: ProviderKind,
-        credential_storage: crate::credentials::CredentialStorage,
-        reasoning_effort: Option<crate::provider::ReasoningEffort>,
-        openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
-        resilience: Option<crate::ResilienceConfig>,
-    ) -> Result<Arc<Self>, String> {
         let root = root
             .as_ref()
             .canonicalize()
@@ -334,13 +311,12 @@ impl Runtime {
         }
         let skills = build_skill_tools(&root, &[], &[]);
         let model = model.into();
-        let adapter = SelectableAdapter::new_with_credentials_effort_openrouter_key_and_resilience(
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             provider,
             model.clone(),
             credential_storage.clone(),
             reasoning_effort,
             openrouter_api_key.clone(),
-            resilience.clone(),
         )?;
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
@@ -349,7 +325,6 @@ impl Runtime {
                 model: model.clone(),
                 provider,
                 reasoning_effort,
-                resilience: resilience.clone(),
                 openrouter_api_key: openrouter_api_key.clone(),
                 mcp_config: None,
                 credential_storage: credential_storage.clone(),
@@ -367,7 +342,6 @@ impl Runtime {
             provider,
             model,
             reasoning_effort,
-            resilience,
             credential_storage,
             openrouter_api_key,
             telemetry: Default::default(),
@@ -453,39 +427,14 @@ impl Runtime {
         reasoning_effort: Option<crate::provider::ReasoningEffort>,
         openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ) -> Result<Arc<Self>, String> {
-        Self::with_session_provider_credentials_effort_openrouter_key_and_resilience(
-            root,
-            model,
-            provider,
-            session,
-            credential_storage,
-            reasoning_effort,
-            openrouter_api_key,
-            None,
-        )
-    }
-
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_session_provider_credentials_effort_openrouter_key_and_resilience(
-        root: impl AsRef<Path>,
-        model: impl Into<String>,
-        provider: ProviderKind,
-        session: SessionRequest,
-        credential_storage: crate::credentials::CredentialStorage,
-        reasoning_effort: Option<crate::provider::ReasoningEffort>,
-        openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
-        resilience: Option<crate::ResilienceConfig>,
-    ) -> Result<Arc<Self>, String> {
         let mut runtime = Arc::try_unwrap(
-            Self::new_with_provider_credentials_effort_openrouter_key_and_resilience(
+            Self::new_with_provider_credentials_effort_and_openrouter_key(
                 root,
                 model,
                 provider,
                 credential_storage,
                 reasoning_effort,
                 openrouter_api_key,
-                resilience,
             )?,
         )
         .map_err(|_| "could not configure runtime session".to_string())?;
@@ -623,7 +572,6 @@ impl Runtime {
                 model: runtime.model.clone(),
                 provider: runtime.provider,
                 reasoning_effort: runtime.reasoning_effort,
-                resilience: runtime.resilience.clone(),
                 openrouter_api_key: runtime.openrouter_api_key.clone(),
                 mcp_config: path.map(Path::to_path_buf),
                 credential_storage,
@@ -980,13 +928,12 @@ impl Runtime {
         claim.mark_opened();
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
-        let adapter = SelectableAdapter::new_with_credentials_effort_openrouter_key_and_resilience(
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             self.provider,
             self.model.clone(),
             self.credential_storage.clone(),
             self.reasoning_effort,
             self.openrouter_api_key.clone(),
-            self.resilience.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();

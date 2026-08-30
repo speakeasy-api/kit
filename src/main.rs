@@ -17,8 +17,6 @@ struct Cli {
     telemetry: TelemetryArgs,
     #[command(flatten)]
     openrouter: OpenRouterArgs,
-    #[command(flatten)]
-    resilience: ResilienceArgs,
     #[command(subcommand)]
     command: Command,
 }
@@ -26,24 +24,6 @@ struct Cli {
 const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTEL_CAPTURE_MESSAGE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
 const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
-
-#[derive(Args)]
-struct ResilienceArgs {
-    #[arg(
-        long,
-        global = true,
-        hide = true,
-        value_parser = parse_resilience_config
-    )]
-    resilience_config: Option<kit::ResilienceConfig>,
-}
-
-fn parse_resilience_config(value: &str) -> Result<kit::ResilienceConfig, String> {
-    let config: kit::ResilienceConfig = serde_json::from_str(value)
-        .map_err(|error| format!("invalid propagated resilience config: {error}"))?;
-    agentkit_http::ResilienceConfig::try_from(&config)?;
-    Ok(config)
-}
 
 #[derive(Args)]
 struct OpenRouterArgs {
@@ -210,7 +190,6 @@ struct Config {
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
     reasoning_effort: Option<kit::ReasoningEffort>,
-    resilience: Option<kit::ResilienceConfig>,
     a2a: Option<String>,
     otel_endpoint: Option<String>,
     otel_capture_message_content: Option<bool>,
@@ -283,14 +262,6 @@ impl Config {
                 format!("invalid config {}: {error}", path.display()),
             )
         })?;
-        if let Some(resilience) = &config.resilience {
-            agentkit_http::ResilienceConfig::try_from(resilience).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid config {}: {error}", path.display()),
-                )
-            })?;
-        }
         config.config_dir = config_dir;
         Ok(config)
     }
@@ -813,11 +784,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = Config::load_default()?;
-    let resilience = cli
-        .resilience
-        .resilience_config
-        .clone()
-        .or_else(|| config.resilience.clone());
     if let Command::Sessions { root } = &cli.command {
         let root = config.root(root.clone());
         print!("{}", format_sessions(&kit::session::catalog(&root)?));
@@ -872,7 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
                 Some(id) => {
-                    kit::Runtime::with_session_provider_credentials_effort_openrouter_key_and_resilience(
+                    kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
                         &root,
                         model,
                         provider,
@@ -880,17 +846,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         credential_storage.clone(),
                         reasoning_effort,
                         openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    resilience.clone(),
                     )?
                 }
-                None => kit::Runtime::new_with_provider_credentials_effort_openrouter_key_and_resilience(
+                None => kit::Runtime::new_with_provider_credentials_effort_and_openrouter_key(
                     &root,
                     model,
                     provider,
                     credential_storage.clone(),
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    resilience.clone(),
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_skills(
@@ -953,7 +917,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let plugins = config.resolve_plugins(&root).await?;
             let runtime = match session_id {
                 Some(id) => {
-                    kit::Runtime::with_session_provider_credentials_effort_openrouter_key_and_resilience(
+                    kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
                         &root,
                         model,
                         provider,
@@ -961,17 +925,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         credential_storage.clone(),
                         reasoning_effort,
                         openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    resilience.clone(),
                     )?
                 }
-                None => kit::Runtime::new_with_provider_credentials_effort_openrouter_key_and_resilience(
+                None => kit::Runtime::new_with_provider_credentials_effort_and_openrouter_key(
                     &root,
                     model,
                     provider,
                     credential_storage.clone(),
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    resilience.clone(),
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_skills(
@@ -1018,7 +980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let plugins = config.resolve_plugins(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
             let runtime =
-                kit::Runtime::with_session_provider_credentials_effort_openrouter_key_and_resilience(
+                kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
                     &root,
                     model,
                     provider,
@@ -1030,7 +992,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     credential_storage.clone(),
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    resilience.clone(),
                 )?;
             let runtime = kit::Runtime::with_plugin_skills(
                 runtime,
@@ -1072,7 +1033,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             config.resolve_plugins(&root).await?;
-            kit::tui::run_with_reasoning_effort_openrouter_key_and_resilience(
+            kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
                 &model,
                 provider,
@@ -1082,7 +1043,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &credential_storage,
                 &telemetry_settings,
                 openrouter_api_key.as_ref().map(|(key, _)| key),
-                resilience.as_ref(),
                 resume.as_deref(),
                 force,
             )
@@ -1139,14 +1099,6 @@ otel_message_content_max_bytes = 200
 mcp_config = "/configured/mcp.json"
 credential_store = "file"
 credential_dir = "/configured/credentials"
-
-[resilience]
-max_retries = 3
-retry_budget_ms = 9000
-attempt_timeout_ms = 2500
-stream_idle_timeout_ms = 4000
-initial_backoff_ms = 100
-max_backoff_ms = 1500
 "#,
         )
         .unwrap();
@@ -1242,54 +1194,6 @@ max_backoff_ms = 1500
         };
         let storage = override_mcp.credentials.storage(&config).unwrap();
         assert_eq!(storage.cli_name(), "memory");
-        let resilience = config.resilience.as_ref().unwrap();
-        assert_eq!(resilience.max_retries, 3);
-        assert_eq!(resilience.retry_budget_ms, 9_000);
-        assert_eq!(resilience.attempt_timeout_ms, Some(2_500));
-        assert_eq!(resilience.stream_idle_timeout_ms, Some(4_000));
-        assert_eq!(resilience.initial_backoff_ms, 100);
-        assert_eq!(resilience.max_backoff_ms, 1_500);
-    }
-
-    #[test]
-    fn malformed_resilience_config_is_rejected() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            r#"
-[resilience]
-max_retries = 2
-retry_budget_ms = 5000
-initial_backoff_ms = 1000
-max_backoff_ms = 100
-"#,
-        )
-        .unwrap();
-
-        let error = Config::load(&path).unwrap_err().to_string();
-        assert!(error.contains("max_backoff_ms"));
-    }
-
-    #[test]
-    fn excessive_resilience_duration_is_rejected_from_toml() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            r#"
-[resilience]
-max_retries = 2
-retry_budget_ms = 9223372036854775807
-initial_backoff_ms = 100
-max_backoff_ms = 1000
-"#,
-        )
-        .unwrap();
-
-        let error = Config::load(&path).unwrap_err().to_string();
-        assert!(error.contains("retry_budget_ms"));
-        assert!(error.contains("maximum supported duration"));
     }
 
     #[test]
@@ -1338,7 +1242,6 @@ credential_store = "keychain"
         assert_eq!(config.model(None), "gpt-5.4");
         assert_eq!(config.provider(None), kit::ProviderKind::OpenAiSubscription);
         assert_eq!(config.reasoning_effort(None), None);
-        assert_eq!(config.resilience, None);
         assert_eq!(config.a2a(None), None);
         assert_eq!(
             config.otel_endpoint(None, Some("http://environment:4317".into())),
@@ -1642,7 +1545,6 @@ future_option = true
                 kit_dir.join("credentials").display(),
             )
         );
-        assert!(!fs::read_to_string(&path).unwrap().contains("[resilience]"));
         let mcp_path = kit_dir.join("mcp.json");
         assert_eq!(
             fs::read_to_string(&mcp_path).unwrap(),

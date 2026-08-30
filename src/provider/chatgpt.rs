@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use agentkit_core::{MetadataMap, Part};
 use agentkit_http::{
     Authentication, AuthenticationAttempt, AuthenticationProvider, HeaderMap, HeaderValue,
     HttpClient, HttpError, HttpRequest, HttpResponse, ResilienceConfig,
@@ -34,6 +35,8 @@ const MAX_ITEMS: usize = 10_000;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(10 * 60);
 const MAX_SUBSCRIPTION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
+const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 
 pub fn supported_model(model: &str) -> bool {
     matches!(
@@ -95,7 +98,6 @@ impl SubscriptionConfig {
 pub struct OpenAiSubscriptionAdapter {
     config: SubscriptionConfig,
     reasoning_effort: Option<super::adapter::ReasoningEffort>,
-    resilience: Option<ResilienceConfig>,
     catalog_client: reqwest::Client,
     responses_client: agentkit_http::Http,
     context_windows: Arc<tokio::sync::OnceCell<Arc<HashMap<String, u64>>>>,
@@ -103,13 +105,12 @@ pub struct OpenAiSubscriptionAdapter {
 
 impl OpenAiSubscriptionAdapter {
     pub fn new(config: SubscriptionConfig) -> Result<Self, String> {
-        Self::new_with_reasoning_effort_and_resilience(config, None, None)
+        Self::new_with_reasoning_effort(config, None)
     }
 
-    pub(crate) fn new_with_reasoning_effort_and_resilience(
+    pub(crate) fn new_with_reasoning_effort(
         config: SubscriptionConfig,
         reasoning_effort: Option<super::adapter::ReasoningEffort>,
-        resilience: Option<ResilienceConfig>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -123,7 +124,6 @@ impl OpenAiSubscriptionAdapter {
         Ok(Self {
             config,
             reasoning_effort,
-            resilience,
             catalog_client,
             responses_client,
             context_windows: Arc::new(tokio::sync::OnceCell::new()),
@@ -140,10 +140,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
         if session_id.is_empty() || session_id.len() > 256 || !session_id.is_ascii() {
             return Err(protocol("session ID is outside canonical bounds"));
         }
-        let resilience = self
-            .resilience
-            .clone()
-            .unwrap_or_else(subscription_resilience);
+        let resilience = subscription_resilience();
         let credentials = load_credentials(
             self.config.credential_storage.clone(),
             auth_timeout(&resilience),
@@ -152,6 +149,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
         let binding = credentials
             .binding()
             .map_err(|error| LoopError::Provider(error.to_string()))?;
+        let authentication_binding = binding_string(&binding);
         // Catalog discovery stays independent and best-effort.
         let context_windows = self
             .context_windows
@@ -173,9 +171,6 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
                 .with_endpoint(self.config.endpoint())
                 .with_originator("kit")
                 .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
-                .with_legacy_subscription_continuation_authenticator(
-                    legacy_continuation_matches_authentication,
-                )
                 .with_limits(OpenAIResponsesLimits {
                     max_request_bytes: MAX_REQUEST_BYTES,
                     max_attempt_bytes: MAX_ATTEMPT_BYTES,
@@ -194,6 +189,8 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
         Ok(OpenAiSubscriptionSession {
             inner,
             context_window: context_windows.get(&self.config.model).copied(),
+            model: self.config.model.clone(),
+            authentication_binding,
         })
     }
 
@@ -205,6 +202,8 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
 pub struct OpenAiSubscriptionSession {
     inner: OpenAIResponsesSession,
     context_window: Option<u64>,
+    model: String,
+    authentication_binding: String,
 }
 
 #[async_trait]
@@ -212,9 +211,10 @@ impl ModelSession for OpenAiSubscriptionSession {
     type Turn = OpenAiSubscriptionTurn;
     async fn begin_turn(
         &mut self,
-        request: TurnRequest,
+        mut request: TurnRequest,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
+        migrate_legacy_continuations(&mut request, &self.model, &self.authentication_binding)?;
         self.inner
             .begin_turn(request, cancellation)
             .await
@@ -418,6 +418,129 @@ fn legacy_continuation_matches_authentication(
         return false;
     };
     authentication_binding == format!("openai-chatgpt-v1:{account_digest}:{generation}")
+}
+
+fn migrate_legacy_continuations(
+    request: &mut TurnRequest,
+    model: &str,
+    authentication_binding: &str,
+) -> Result<(), LoopError> {
+    let session_id = request.session_id.to_string();
+    for item in &mut request.transcript {
+        for part in &mut item.parts {
+            let Some((metadata, expected_kind, encrypted_required)) =
+                continuation_metadata_mut(part)
+            else {
+                continue;
+            };
+            migrate_legacy_continuation(
+                metadata,
+                model,
+                &session_id,
+                authentication_binding,
+                expected_kind,
+                encrypted_required,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn continuation_metadata_mut(part: &mut Part) -> Option<(&mut MetadataMap, &'static str, bool)> {
+    match part {
+        Part::ToolCall(call) => Some((&mut call.metadata, "function_call", false)),
+        Part::Reasoning(reasoning) => Some((&mut reasoning.metadata, "reasoning", true)),
+        Part::Media(media) => Some((&mut media.metadata, "image_generation_call", false)),
+        _ => None,
+    }
+}
+
+fn migrate_legacy_continuation(
+    metadata: &mut MetadataMap,
+    model: &str,
+    session_id: &str,
+    authentication_binding: &str,
+    expected_kind: &str,
+    encrypted_required: bool,
+) -> Result<(), LoopError> {
+    if metadata.contains_key(CONTINUATION_METADATA) {
+        metadata.remove(LEGACY_CONTINUATION_METADATA);
+        return Ok(());
+    }
+    let Some(raw) = metadata.get(LEGACY_CONTINUATION_METADATA).cloned() else {
+        return Ok(());
+    };
+    let object = raw
+        .as_object()
+        .ok_or_else(|| protocol("legacy Responses continuation metadata is not an object"))?;
+    let expected_len = if encrypted_required { 9 } else { 8 };
+    if object.len() != expected_len
+        || object.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
+        || object.get("model").and_then(Value::as_str) != Some(model)
+        || object.get("session_id").and_then(Value::as_str) != Some(session_id)
+        || object.get("output_index").and_then(Value::as_u64).is_none()
+    {
+        return Err(protocol(
+            "legacy Responses continuation metadata binding is invalid",
+        ));
+    }
+    let account_binding = object
+        .get("account_binding")
+        .and_then(Value::as_object)
+        .filter(|binding| binding.len() == 2)
+        .ok_or_else(|| protocol("legacy Responses account binding is invalid"))?;
+    let digest = bounded_legacy_string(
+        account_binding.get("account_id_digest"),
+        "legacy account digest",
+    )?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(protocol("legacy Responses account digest is invalid"));
+    }
+    bounded_legacy_string(
+        account_binding.get("login_generation"),
+        "legacy login generation",
+    )?;
+    bounded_legacy_string(object.get("response_id"), "legacy response_id")?;
+    let item_id = bounded_legacy_string(object.get("item_id"), "legacy item_id")?;
+    let encrypted_content = object.get("encrypted_content").and_then(Value::as_str);
+    if encrypted_required
+        && encrypted_content.is_none_or(|value| value.is_empty() || value.len() > MAX_FIELD_BYTES)
+    {
+        return Err(protocol(
+            "legacy Responses encrypted continuation is invalid",
+        ));
+    }
+
+    metadata.remove(LEGACY_CONTINUATION_METADATA);
+    let account_binding = Value::Object(account_binding.clone());
+    if !legacy_continuation_matches_authentication(&account_binding, authentication_binding) {
+        return Ok(());
+    }
+    let mut migrated = serde_json::json!({
+        "schema_version": 3,
+        "authentication_binding": authentication_binding,
+        "model": model,
+        "session_id": session_id,
+        "item_id": item_id,
+        "kind": expected_kind,
+    });
+    if let Some(encrypted_content) = encrypted_content {
+        migrated["encrypted_content"] = Value::String(encrypted_content.to_owned());
+    }
+    metadata.insert(CONTINUATION_METADATA.into(), migrated);
+    Ok(())
+}
+
+fn bounded_legacy_string<'a>(value: Option<&'a Value>, name: &str) -> Result<&'a str, LoopError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| protocol(&format!("Responses continuation {name} is invalid")))
 }
 
 async fn load_credentials(
@@ -643,10 +766,41 @@ mod tests {
     }
 
     #[test]
-    fn public_subscription_constructor_keeps_resilience_internal() {
-        let config = SubscriptionConfig::new("gpt-5.4".into()).unwrap();
-        let adapter = OpenAiSubscriptionAdapter::new(config).unwrap();
-        assert!(adapter.resilience.is_none());
+    fn migrates_legacy_continuation_before_agentkit_encoding() {
+        let digest = "a".repeat(64);
+        let binding = format!("openai-chatgpt-v1:{digest}:generation-1");
+        let legacy = json!({
+            "schema_version": 1,
+            "account_binding": {
+                "account_id_digest": digest,
+                "login_generation": "generation-1",
+            },
+            "model": "gpt-5.4",
+            "session_id": "session-1",
+            "response_id": "response-1",
+            "item_id": "item-1",
+            "output_index": 0,
+            "kind": "function_call",
+        });
+        let mut metadata = MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), legacy)]);
+
+        migrate_legacy_continuation(
+            &mut metadata,
+            "gpt-5.4",
+            "session-1",
+            &binding,
+            "function_call",
+            false,
+        )
+        .unwrap();
+
+        assert!(!metadata.contains_key(LEGACY_CONTINUATION_METADATA));
+        assert_eq!(metadata[CONTINUATION_METADATA]["schema_version"], 3);
+        assert_eq!(
+            metadata[CONTINUATION_METADATA]["authentication_binding"],
+            binding
+        );
+        assert_eq!(metadata[CONTINUATION_METADATA]["item_id"], "item-1");
     }
 
     #[test]

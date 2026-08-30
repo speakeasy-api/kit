@@ -150,7 +150,6 @@ pub struct SelectableAdapter {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
-    resilience: Option<agentkit_http::ResilienceConfig>,
 }
 
 impl SelectableAdapter {
@@ -188,39 +187,16 @@ impl SelectableAdapter {
         reasoning_effort: Option<ReasoningEffort>,
         openrouter_api_key: Option<OpenRouterApiKey>,
     ) -> Result<Self, String> {
-        Self::new_with_credentials_effort_openrouter_key_and_resilience(
-            provider,
-            model,
-            credential_storage,
-            reasoning_effort,
-            openrouter_api_key,
-            None,
-        )
-    }
-
-    pub(crate) fn new_with_credentials_effort_openrouter_key_and_resilience(
-        provider: ProviderKind,
-        model: impl Into<String>,
-        credential_storage: crate::credentials::CredentialStorage,
-        reasoning_effort: Option<ReasoningEffort>,
-        openrouter_api_key: Option<OpenRouterApiKey>,
-        resilience: Option<crate::ResilienceConfig>,
-    ) -> Result<Self, String> {
-        let resilience = resilience
-            .as_ref()
-            .map(crate::ResilienceConfig::agentkit_config)
-            .transpose()?;
         let selection = ModelSelection::new(provider, model);
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new_with_credentials_effort_and_resilience(
+        KitAdapter::new_with_credentials_and_effort(
             selection.provider,
             selection.model.clone(),
             credential_storage.clone(),
             reasoning_effort,
             openrouter_api_key.as_ref(),
-            resilience.as_ref(),
         )?;
         Ok(Self {
             selection: Arc::new(Mutex::new(SessionSelection {
@@ -229,7 +205,6 @@ impl SelectableAdapter {
             })),
             credential_storage,
             openrouter_api_key,
-            resilience,
         })
     }
 
@@ -252,13 +227,12 @@ impl SelectableAdapter {
             return Err("model name is outside canonical bounds".into());
         }
         let reasoning_effort = self.reasoning_effort()?;
-        KitAdapter::new_with_credentials_effort_and_resilience(
+        KitAdapter::new_with_credentials_and_effort(
             selection.provider,
             selection.model.clone(),
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
-            self.resilience.as_ref(),
         )?;
         self.selection
             .lock()
@@ -272,13 +246,12 @@ impl SelectableAdapter {
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<(), String> {
         let model = self.selection()?;
-        KitAdapter::new_with_credentials_effort_and_resilience(
+        KitAdapter::new_with_credentials_and_effort(
             model.provider,
             model.model,
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
-            self.resilience.as_ref(),
         )?;
         self.selection
             .lock()
@@ -292,7 +265,6 @@ pub struct SelectableSession {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
-    resilience: Option<agentkit_http::ResilienceConfig>,
     config: SessionConfig,
     active: SessionSelection,
     inner: KitSession,
@@ -308,13 +280,12 @@ impl ModelAdapter for SelectableAdapter {
             .lock()
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
-        let inner = KitAdapter::new_with_credentials_effort_and_resilience(
+        let inner = KitAdapter::new_with_credentials_and_effort(
             active.model.provider,
             active.model.model.clone(),
             self.credential_storage.clone(),
             active.reasoning_effort,
             self.openrouter_api_key.as_ref(),
-            self.resilience.as_ref(),
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
@@ -323,7 +294,6 @@ impl ModelAdapter for SelectableAdapter {
             selection: Arc::clone(&self.selection),
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
-            resilience: self.resilience.clone(),
             config,
             active,
             inner,
@@ -373,13 +343,12 @@ impl ModelSession for SelectableSession {
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
         if selected != self.active {
-            let replacement = KitAdapter::new_with_credentials_effort_and_resilience(
+            let replacement = KitAdapter::new_with_credentials_and_effort(
                 selected.model.provider,
                 selected.model.model.clone(),
                 self.credential_storage.clone(),
                 selected.reasoning_effort,
                 self.openrouter_api_key.as_ref(),
-                self.resilience.as_ref(),
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
@@ -434,7 +403,6 @@ const SPEAKEASY_COMPLETIONS_URL: &str = "https://app.getgram.ai/chat/completions
 pub struct SpeakeasyKitAdapter {
     provider: SpeakeasyProvider,
     client: agentkit_http::Http,
-    resilience: Option<agentkit_http::ResilienceConfig>,
 }
 
 #[derive(Clone)]
@@ -529,33 +497,11 @@ impl KitAdapter {
         reasoning_effort: Option<ReasoningEffort>,
         openrouter_api_key: Option<&OpenRouterApiKey>,
     ) -> Result<Self, String> {
-        Self::new_with_credentials_effort_and_resilience(
-            provider,
-            model,
-            credential_storage,
-            reasoning_effort,
-            openrouter_api_key,
-            None,
-        )
-    }
-
-    fn new_with_credentials_effort_and_resilience(
-        provider: ProviderKind,
-        model: String,
-        credential_storage: crate::credentials::CredentialStorage,
-        reasoning_effort: Option<ReasoningEffort>,
-        openrouter_api_key: Option<&OpenRouterApiKey>,
-        resilience: Option<&agentkit_http::ResilienceConfig>,
-    ) -> Result<Self, String> {
         match provider {
             ProviderKind::OpenAiSubscription => {
                 let config =
                     SubscriptionConfig::new(model)?.with_credential_storage(credential_storage);
-                OpenAiSubscriptionAdapter::new_with_reasoning_effort_and_resilience(
-                    config,
-                    reasoning_effort,
-                    resilience.cloned(),
-                )
+                OpenAiSubscriptionAdapter::new_with_reasoning_effort(config, reasoning_effort)
             }
             .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
@@ -567,11 +513,9 @@ impl KitAdapter {
                 )?;
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
-                let mut inner =
-                    OpenRouterAdapter::new(config).map_err(|error| error.to_string())?;
-                if let Some(resilience) = resilience {
-                    inner = inner.with_resilience(resilience.clone());
-                }
+                let inner = OpenRouterAdapter::new(config)
+                    .map_err(|error| error.to_string())?
+                    .with_resilience(agentkit_http::ResilienceConfig::default());
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
@@ -608,7 +552,6 @@ impl KitAdapter {
                 Ok(Self::Speakeasy(Box::new(SpeakeasyKitAdapter {
                     provider,
                     client: agentkit_http::Http::new(client),
-                    resilience: resilience.cloned(),
                 })))
             }
         }
@@ -752,10 +695,8 @@ impl ModelAdapter for KitAdapter {
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
                 provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
-                let mut inner = CompletionsAdapter::with_client(provider, adapter.client.clone());
-                if let Some(resilience) = adapter.resilience.clone() {
-                    inner = inner.with_resilience(resilience);
-                }
+                let inner = CompletionsAdapter::with_client(provider, adapter.client.clone())
+                    .with_resilience(agentkit_http::ResilienceConfig::default());
                 inner.start_session(config).await.map(|inner| {
                     KitSession::Speakeasy(SpeakeasyKitSession {
                         inner,
@@ -1511,7 +1452,6 @@ mod tests {
         let adapter = KitAdapter::Speakeasy(Box::new(SpeakeasyKitAdapter {
             provider,
             client: agentkit_http::Http::new(client),
-            resilience: None,
         }));
         let mut session = adapter
             .start_session(SessionConfig::new("speakeasy-contract"))
@@ -1558,35 +1498,6 @@ mod tests {
     }
 
     #[test]
-    fn selectable_adapter_retains_resilience_across_dynamic_selection() {
-        let resilience = crate::ResilienceConfig {
-            max_retries: 2,
-            retry_budget_ms: 60_000,
-            attempt_timeout_ms: Some(30_000),
-            stream_idle_timeout_ms: Some(15_000),
-            initial_backoff_ms: 100,
-            max_backoff_ms: 1_000,
-        };
-        let adapter = SelectableAdapter::new_with_credentials_effort_openrouter_key_and_resilience(
-            ProviderKind::OpenRouter,
-            "openai/gpt-5.4",
-            Default::default(),
-            None,
-            Some(OpenRouterApiKey::new("test-key")),
-            Some(resilience.clone()),
-        )
-        .unwrap();
-        let expected = resilience.agentkit_config().unwrap();
-        adapter
-            .select(ModelSelection::new(
-                ProviderKind::OpenRouter,
-                "anthropic/claude-sonnet-4",
-            ))
-            .unwrap();
-        assert_eq!(adapter.resilience, Some(expected));
-    }
-
-    #[test]
     fn selectable_adapter_reports_its_concrete_initial_provider() {
         let adapter = SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
 
@@ -1614,7 +1525,6 @@ mod tests {
             selection: Arc::new(Mutex::new(active.clone())),
             credential_storage: Default::default(),
             openrouter_api_key: None,
-            resilience: None,
             config: SessionConfig::new("provider-identity-test"),
             active,
             inner,
