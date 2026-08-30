@@ -989,26 +989,10 @@ impl Runtime {
     }
 
     fn system_prompt(&self, depth: usize) -> String {
-        let subagent_section = if depth < self.max_subagent_depth {
-            let guidance = if depth == 1 {
-                concat!(
-                    "This task was delegated to you by the primary agent. Investigate it and carry out the work. ",
-                    "Only use subagents if you uncover independent workstreams whose parallel execution would yield quicker or better results. ",
-                    "Give each subagent a focused assignment based on what you discovered, and synthesize their findings into your response. ",
-                    "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n"
-                )
-            } else {
-                concat!(
-                    "When subagent tools are available and work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
-                    "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n"
-                )
-            };
-            format!(
-                "{guidance}Current subagent depth: {depth}/{}.",
-                self.max_subagent_depth
-            )
+        let delegation_context = if depth == 1 {
+            "This task was delegated to you by the primary agent. Investigate it and carry out the work.\n\n"
         } else {
-            String::new()
+            ""
         };
         format!(
             concat!(
@@ -1026,7 +1010,7 @@ impl Runtime {
             ),
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
-            subagent_section
+            delegation_context
         )
     }
 }
