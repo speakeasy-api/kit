@@ -38,13 +38,6 @@ const MAX_SUBSCRIPTION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 
-pub fn supported_model(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-5.6-sol" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex-spark"
-    )
-}
-
 fn subscription_resilience() -> ResilienceConfig {
     ResilienceConfig {
         max_retries: usize::MAX,
@@ -66,8 +59,8 @@ pub struct SubscriptionConfig {
 
 impl SubscriptionConfig {
     pub fn new(model: String) -> Result<Self, String> {
-        if !supported_model(&model) {
-            return Err("openai-subscription model is not in the supported model set".into());
+        if !valid_model_id(&model) {
+            return Err("model name is outside canonical bounds".into());
         }
         Ok(Self {
             model,
@@ -672,6 +665,12 @@ fn protocol(message: &str) -> LoopError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn subscription_config_accepts_models_without_a_client_release() {
+        assert!(SubscriptionConfig::new("gpt-future".into()).is_ok());
+        assert!(SubscriptionConfig::new("not a model".into()).is_err());
+    }
 
     #[test]
     fn subscription_caps_server_retry_hints_at_ten_minutes() {
