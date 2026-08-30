@@ -52,6 +52,8 @@ def log_request(request):
     entry = {"method": request.get("method")}
     if "sessionId" in params:
         entry["sessionId"] = params["sessionId"]
+    if request.get("method") in ("session/new", "session/fork"):
+        entry["cwd"] = params["cwd"]
     if request.get("method") == "session/prompt":
         entry["text"] = params["prompt"][0]["text"]
     with log_lock:
@@ -97,6 +99,8 @@ def prompt(request):
         time.sleep(0.01)
     if prompt_release is None:
         time.sleep(0.40)
+    if "MOCK_CWD" in text:
+        text = os.getcwd()
     if "MOCK_SELECTED_MODEL" in text:
         text = selected_models.get(session_id, model_ids[0])
     if "MOCK_STRUCTURED_OUTPUT" in text:

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 
@@ -48,6 +48,7 @@ impl Subagents {
                     harness: crate::acp_child::BUILTIN_HARNESS.into(),
                     model: None,
                     kit: true,
+                    root: self.config.root.clone(),
                     child: None,
                     forking: None,
                     permit: Some(self.reserve().unwrap()),
@@ -201,10 +202,13 @@ fn subagent_value_schema_accepts_legacy_and_current_handles() {
 #[test]
 fn model_inputs_prefer_optional_subagent_names() {
     let input = serde_json::from_value::<Input>(json!({
-        "prompt": "work", "name": "Implementer"
+        "prompt": "work",
+        "name": "Implementer",
+        "cwd": "../other-worktree"
     }))
     .unwrap();
     assert_eq!(input.name.as_deref(), Some("Implementer"));
+    assert_eq!(input.cwd, Some(PathBuf::from("../other-worktree")));
     assert!(
         serde_json::from_value::<ForkInput>(json!({
             "subagent": {"id": "s", "output": null, "generation": 1},
@@ -217,6 +221,17 @@ fn model_inputs_prefer_optional_subagent_names() {
     let manager = manager_with_generic_harness(directory.path(), Vec::new());
     let subagent = SubagentTool::new(manager.clone(), 1);
     let fork = ForkTool::new(manager, 1);
+    let cwd = &subagent.spec.input_schema["properties"]["cwd"];
+    assert_eq!(cwd["type"], "string");
+    assert_eq!(cwd["minLength"], 1);
+    assert!(
+        cwd["description"]
+            .as_str()
+            .unwrap()
+            .contains("Relative paths resolve from Kit's working directory")
+    );
+    assert!(fork.spec.input_schema["properties"].get("cwd").is_none());
+
     for schema in [&subagent.spec.input_schema, &fork.spec.input_schema] {
         let name = &schema["properties"]["name"];
         assert!(name.get("maxLength").is_none());
@@ -322,6 +337,7 @@ fn manager_with_disconnected_session(
         harness: crate::acp_child::BUILTIN_HARNESS.into(),
         model: None,
         kit: true,
+        root: root.to_path_buf(),
         child: Some(ChildSession::disconnected_for_test()),
         forking: None,
         permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
@@ -534,6 +550,150 @@ fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
     )
 }
 
+#[test]
+fn selected_root_keeps_inherited_relative_paths_based_on_parent_root() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = tempfile::tempdir().unwrap();
+    let mut config = manager_with_generic_harness(parent.path(), Vec::new()).child_config();
+    config.mcp_config = Some(PathBuf::from("config/mcp.json"));
+    config.credential_storage =
+        crate::credentials::CredentialStorage::Filesystem(PathBuf::from("credentials"));
+
+    let config = config.with_root(child.path().to_path_buf());
+
+    assert_eq!(
+        config.mcp_config,
+        Some(parent.path().join("config/mcp.json"))
+    );
+    assert_eq!(
+        config.credential_storage.directory(),
+        Some(parent.path().join("credentials").as_path())
+    );
+    assert_eq!(config.root, child.path());
+}
+
+#[tokio::test]
+async fn create_uses_requested_working_directory_without_changing_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let child_root = root.path().join("other-worktree");
+    std::fs::create_dir(&child_root).unwrap();
+    let child_root = child_root.canonicalize().unwrap();
+    let requests = root.path().join("requests.jsonl");
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec![fixture_path_arg("--request-log", &requests)],
+    );
+
+    let source = manager
+        .create(
+            "MOCK_CWD".into(),
+            CreateOptions {
+                cwd: Some(PathBuf::from("other-worktree")),
+                ..Default::default()
+            },
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        source.output,
+        Value::String(child_root.display().to_string())
+    );
+    assert_eq!(manager.config.root, root.path());
+    assert_eq!(
+        manager.lookup(&source).unwrap().lock().await.root,
+        child_root
+    );
+    wait_for_logged(
+        &requests,
+        |request| matches!(request, LoggedRequest::New { cwd } if cwd == &child_root),
+    )
+    .await;
+
+    let branch = manager
+        .fork(
+            source.clone(),
+            "MOCK_CWD".into(),
+            None,
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        branch.output,
+        Value::String(child_root.display().to_string())
+    );
+    assert_eq!(
+        manager.lookup(&branch).unwrap().lock().await.root,
+        child_root
+    );
+    wait_for_logged(
+        &requests,
+        |request| matches!(request, LoggedRequest::Fork { cwd, .. } if cwd == &child_root),
+    )
+    .await;
+
+    manager
+        .close(&branch.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    manager
+        .close(&source.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_rejects_invalid_requested_working_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("file");
+    std::fs::write(&file, "not a directory").unwrap();
+    let manager = manager_with_generic_harness(root.path(), Vec::new());
+
+    let missing = manager
+        .create(
+            "work".into(),
+            CreateOptions {
+                cwd: Some(PathBuf::from("missing")),
+                ..Default::default()
+            },
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("could not open subagent working directory")
+    );
+
+    let not_directory = manager
+        .create(
+            "work".into(),
+            CreateOptions {
+                cwd: Some(file),
+                ..Default::default()
+            },
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        not_directory
+            .to_string()
+            .contains("subagent working directory is not a directory")
+    );
+    assert_eq!(manager.capacity.available_permits(), MAX_LIVE_SUBAGENTS);
+}
+
 fn fixture_path_arg(name: &str, path: &Path) -> String {
     format!("{name}={}", path.display())
 }
@@ -542,11 +702,12 @@ fn fixture_path_arg(name: &str, path: &Path) -> String {
 #[serde(tag = "method")]
 enum LoggedRequest {
     #[serde(rename = "session/new")]
-    New,
+    New { cwd: PathBuf },
     #[serde(rename = "session/fork")]
     Fork {
         #[serde(rename = "sessionId")]
         session_id: String,
+        cwd: PathBuf,
     },
     #[serde(rename = "session/prompt")]
     Prompt {
@@ -1066,7 +1227,7 @@ async fn close_during_create_or_fork_prompt_cannot_publish_idle() {
             .await
     });
     create_scenario
-        .wait_for(|request| matches!(request, LoggedRequest::New))
+        .wait_for(|request| matches!(request, LoggedRequest::New { .. }))
         .await;
     let starting = create_scenario
         .manager

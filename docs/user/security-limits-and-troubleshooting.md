@@ -9,7 +9,7 @@ Kit is a coding agent runtime, not a security boundary. Treat the model, prompts
 The root does not confine processes:
 
 - `shell` starts the platform shell with the root as its current directory. The command can read or change anything allowed by the Kit process, including paths outside the root, the network, and inherited environment variables.
-- ACP subagents are child processes started directly from trusted local `command` and `args` profiles, with the same root as their current directory. They inherit normal child-process host access; selecting a harness is not isolation.
+- ACP subagents are child processes started directly from trusted local `command` and `args` profiles. Their current directory and ACP root are the optional `subagent.cwd`, or Kit's root when it is omitted. They inherit normal child-process host access; selecting a directory or harness is not isolation.
 - MCP stdio servers are local processes, while MCP HTTP servers and A2A agents are remote trust domains. Tool arguments, prompts, and returned data cross those boundaries.
 - `edit` resolves relative paths from Kit's working directory, but also accepts `..`, absolute paths, and paths through symlinks. It can change any filesystem path allowed by the Kit process.
 
