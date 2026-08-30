@@ -1612,7 +1612,7 @@ mod tests {
             adapter
                 .select(ModelSelection::new(
                     ProviderKind::OpenAiSubscription,
-                    "not-supported",
+                    "not supported",
                 ))
                 .is_err()
         );
