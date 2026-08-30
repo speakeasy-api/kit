@@ -989,6 +989,11 @@ impl Runtime {
     }
 
     fn system_prompt(&self, depth: usize) -> String {
+        let delegation_context = if depth == 1 {
+            "This task was delegated to you by the primary agent. Investigate it and carry out the work.\n\n"
+        } else {
+            ""
+        };
         format!(
             concat!(
                 "You are a coding agent using Kit version {} as your harness, working in {}. This is your cwd and project context, not a filesystem boundary. ",
@@ -1001,14 +1006,11 @@ impl Runtime {
                 "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
                 "After detaching, continue any independent work, including launching more detached work. When the remaining work depends on background results, yield; yielding continues the task with those results, so the user's answer need not be completed first. ",
                 "Keep work foregrounded when the next step needs its result in the current turn, and do not treat backgrounding as durable job execution.\n\n",
-                "When subagent tools are available and work changes phase or objective, start fresh subagents from concise summaries of prior results instead of carrying unrelated history. ",
-                "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed.\n\n",
-                "Current subagent depth: {depth}/{}."
+                "{}"
             ),
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
-            self.max_subagent_depth,
-            depth = depth
+            delegation_context
         )
     }
 }

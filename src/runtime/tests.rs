@@ -542,6 +542,23 @@ fn maximum_depth_compose_omits_depth_increasing_tools() {
         );
     }
 
+    let subagent_description = ToolSource::get(&below_maximum.compose, &ToolName::new("subagent"))
+        .unwrap()
+        .current_spec()
+        .unwrap()
+        .description;
+    assert!(subagent_description.contains(
+        "Use this only if you uncover independent workstreams whose parallel execution would yield quicker or better results."
+    ));
+    let fork_description = ToolSource::get(&below_maximum.compose, &ToolName::new("fork"))
+        .unwrap()
+        .current_spec()
+        .unwrap()
+        .description;
+    assert!(fork_description.contains(
+        "Use this only for an independent workstream whose parallel execution would yield quicker or better results"
+    ));
+
     let at_maximum = runtime.compose(max_depth);
     for name in ["subagent", "fork"] {
         assert!(
@@ -967,6 +984,11 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     );
     assert!(prompt.contains("keep intermediate results inside it"));
     assert!(prompt.contains("return only the bare minimum information necessary"));
-    assert!(prompt.contains("start fresh subagents from concise summaries"));
-    assert!(prompt.contains("close subagents when no longer needed"));
+    let delegated_prompt = runtime.system_prompt(1);
+    assert!(delegated_prompt.contains(
+        "This task was delegated to you by the primary agent. Investigate it and carry out the work."
+    ));
+    assert!(!prompt.contains("This task was delegated to you by the primary agent."));
+    let max_depth_prompt = runtime.system_prompt(runtime.max_subagent_depth());
+    assert!(!max_depth_prompt.contains("This task was delegated to you by the primary agent."));
 }
