@@ -1,6 +1,6 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
 
-use agentkit_core::{MetadataMap, Part};
+use agentkit_core::{DataRef, ItemKind, MetadataMap, Modality, Part, ToolOutput};
 use agentkit_http::{
     Authentication, AuthenticationAttempt, AuthenticationProvider, HeaderMap, HeaderValue,
     HttpClient, HttpError, HttpRequest, HttpResponse, ResilienceConfig,
@@ -13,7 +13,12 @@ use agentkit_provider_openai::{
     OpenAIResponsesSession, OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt as _;
+use image::{
+    DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgb, RgbImage,
+    codecs::jpeg::JpegEncoder, imageops::FilterType,
+};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -33,6 +38,13 @@ const MAX_ATTEMPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WIRE_BYTES: usize = 4 * MAX_ATTEMPT_BYTES;
 const MAX_ITEMS: usize = 10_000;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
+const MAX_SOURCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_DECODED_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 10_000_000;
+const MAX_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_TOOL_RESULT_DEPTH: usize = 8;
+const JPEG_DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
+const MAX_NORMALIZED_IMAGE_BYTES: usize = ((MAX_FIELD_BYTES - JPEG_DATA_URL_PREFIX.len()) / 4) * 3;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(10 * 60);
 const MAX_SUBSCRIPTION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
@@ -208,6 +220,12 @@ impl ModelSession for OpenAiSubscriptionSession {
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
         migrate_legacy_continuations(&mut request, &self.model, &self.authentication_binding)?;
+        let normalization_cancellation = cancellation.clone();
+        let request = tokio::task::spawn_blocking(move || {
+            normalize_openai_images(request, normalization_cancellation.as_ref())
+        })
+        .await
+        .map_err(|_| protocol("Responses image normalization task failed"))??;
         self.inner
             .begin_turn(request, cancellation)
             .await
@@ -221,6 +239,190 @@ impl ModelSession for OpenAiSubscriptionSession {
     }
     fn provider_name(&self) -> Option<&str> {
         Some("openai-subscription")
+    }
+}
+
+fn normalize_openai_images(
+    mut request: TurnRequest,
+    cancellation: Option<&agentkit_core::TurnCancellation>,
+) -> Result<TurnRequest, LoopError> {
+    for item in &mut request.transcript {
+        check_image_cancellation(cancellation)?;
+        if matches!(
+            item.kind,
+            ItemKind::User | ItemKind::Context | ItemKind::Tool
+        ) {
+            normalize_openai_parts(&mut item.parts, cancellation, 0)?;
+        }
+    }
+    Ok(request)
+}
+
+fn normalize_openai_parts(
+    parts: &mut [Part],
+    cancellation: Option<&agentkit_core::TurnCancellation>,
+    depth: usize,
+) -> Result<(), LoopError> {
+    if depth > MAX_TOOL_RESULT_DEPTH {
+        return Err(protocol("Responses tool-result media nesting is too deep"));
+    }
+    for part in parts {
+        check_image_cancellation(cancellation)?;
+        match part {
+            Part::Media(media) if media.modality == Modality::Image => {
+                if serialized_image_bytes(&media.data, &media.mime_type)
+                    .is_some_and(|bytes| bytes > MAX_FIELD_BYTES)
+                {
+                    let source = inline_image_bytes(&media.data, &media.mime_type)?
+                        .ok_or_else(|| protocol("Responses oversized image is not inline data"))?;
+                    let normalized = normalize_image_bytes(source, &media.mime_type, cancellation)?;
+                    media.mime_type = "image/jpeg".into();
+                    media.data = DataRef::InlineBytes(normalized);
+                }
+            }
+            Part::ToolResult(result) => {
+                if let ToolOutput::Parts(parts) = &mut result.output {
+                    normalize_openai_parts(parts, cancellation, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_image_cancellation(
+    cancellation: Option<&agentkit_core::TurnCancellation>,
+) -> Result<(), LoopError> {
+    if cancellation.is_some_and(agentkit_core::TurnCancellation::is_cancelled) {
+        Err(LoopError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn serialized_image_bytes(data: &DataRef, mime_type: &str) -> Option<usize> {
+    let prefix = format!("data:{mime_type};base64,").len();
+    match data {
+        DataRef::InlineBytes(bytes) => Some(prefix + bytes.len().div_ceil(3) * 4),
+        DataRef::InlineText(text) if text.starts_with("data:") => Some(text.len()),
+        DataRef::InlineText(text) => Some(prefix + text.len()),
+        DataRef::Uri(uri) if uri.starts_with("data:") => Some(uri.len()),
+        DataRef::Uri(_) | DataRef::Handle(_) => None,
+    }
+}
+
+fn inline_image_bytes(data: &DataRef, mime_type: &str) -> Result<Option<Vec<u8>>, LoopError> {
+    if let DataRef::InlineBytes(bytes) = data {
+        if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
+            return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+        }
+        return Ok(Some(bytes.clone()));
+    }
+
+    let text = match data {
+        DataRef::InlineText(text) | DataRef::Uri(text) if text.starts_with("data:") => text
+            .strip_prefix(&format!("data:{mime_type};base64,"))
+            .ok_or_else(|| protocol("Responses image data URL is not canonical base64"))?,
+        DataRef::InlineText(text) => text,
+        DataRef::Uri(_) | DataRef::Handle(_) => return Ok(None),
+        DataRef::InlineBytes(_) => unreachable!("handled above"),
+    };
+    let max_base64_bytes = MAX_SOURCE_IMAGE_BYTES.div_ceil(3) * 4;
+    if text.len() > max_base64_bytes {
+        return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+    }
+    let bytes = BASE64
+        .decode(text)
+        .map_err(|_| protocol("Responses image is not valid base64"))?;
+    if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
+        return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+    }
+    Ok(Some(bytes))
+}
+
+fn normalize_image_bytes(
+    bytes: Vec<u8>,
+    mime_type: &str,
+    cancellation: Option<&agentkit_core::TurnCancellation>,
+) -> Result<Vec<u8>, LoopError> {
+    check_image_cancellation(cancellation)?;
+    let mut reader = ImageReader::new(Cursor::new(bytes));
+    if let Some(format) = ImageFormat::from_mime_type(mime_type) {
+        reader.set_format(format);
+    } else {
+        reader = reader
+            .with_guessed_format()
+            .map_err(|_| protocol("Responses image format could not be detected"))?;
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_IMAGE_BYTES);
+    reader.limits(limits);
+
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|_| protocol("Responses image could not be decoded"))?;
+    let (width, height) = decoder.dimensions();
+    if width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+        || decoder.total_bytes() > MAX_DECODED_IMAGE_BYTES
+    {
+        return Err(protocol("Responses image dimensions are too large"));
+    }
+    let orientation = decoder
+        .orientation()
+        .map_err(|_| protocol("Responses image orientation could not be read"))?;
+    let mut image = DynamicImage::from_decoder(decoder)
+        .map_err(|_| protocol("Responses image could not be decoded"))?;
+    image.apply_orientation(orientation);
+    check_image_cancellation(cancellation)?;
+    let rgba = image.into_rgba8();
+    let rgb = RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let pixel = rgba.get_pixel(x, y).0;
+        let alpha = u16::from(pixel[3]);
+        let flatten =
+            |channel: u8| ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+        Rgb([flatten(pixel[0]), flatten(pixel[1]), flatten(pixel[2])])
+    });
+    encode_image_to_budget(DynamicImage::ImageRgb8(rgb), cancellation)
+}
+
+fn encode_image_to_budget(
+    mut image: DynamicImage,
+    cancellation: Option<&agentkit_core::TurnCancellation>,
+) -> Result<Vec<u8>, LoopError> {
+    const QUALITIES: [u8; 5] = [85, 75, 65, 55, 45];
+    loop {
+        let mut smallest = Vec::new();
+        for quality in QUALITIES {
+            check_image_cancellation(cancellation)?;
+            let mut encoded = Vec::new();
+            JpegEncoder::new_with_quality(&mut encoded, quality)
+                .encode_image(&image)
+                .map_err(|_| protocol("Responses image could not be encoded"))?;
+            if encoded.len() <= MAX_NORMALIZED_IMAGE_BYTES {
+                return Ok(encoded);
+            }
+            smallest = encoded;
+        }
+
+        let (width, height) = (image.width(), image.height());
+        if width == 1 && height == 1 {
+            return Err(protocol(
+                "Responses image could not be reduced to the media limit",
+            ));
+        }
+        let ratio = ((MAX_NORMALIZED_IMAGE_BYTES as f64 / smallest.len() as f64).sqrt() * 0.9)
+            .clamp(0.5, 0.85);
+        let next_width =
+            ((width as f64 * ratio).floor() as u32).clamp(1, width.saturating_sub(1).max(1));
+        let next_height =
+            ((height as f64 * ratio).floor() as u32).clamp(1, height.saturating_sub(1).max(1));
+        check_image_cancellation(cancellation)?;
+        image = image.resize(next_width, next_height, FilterType::Lanczos3);
     }
 }
 
@@ -670,6 +872,80 @@ mod tests {
     fn subscription_config_accepts_models_without_a_client_release() {
         assert!(SubscriptionConfig::new("gpt-future".into()).is_ok());
         assert!(SubscriptionConfig::new("not a model".into()).is_err());
+    }
+
+    #[test]
+    fn normalized_jpeg_budget_accounts_for_base64_expansion() {
+        let at_limit = DataRef::InlineBytes(vec![0; MAX_NORMALIZED_IMAGE_BYTES]);
+        let over_limit = DataRef::InlineBytes(vec![0; MAX_NORMALIZED_IMAGE_BYTES + 1]);
+
+        assert!(serialized_image_bytes(&at_limit, "image/jpeg").unwrap() <= MAX_FIELD_BYTES);
+        assert!(serialized_image_bytes(&over_limit, "image/jpeg").unwrap() > MAX_FIELD_BYTES);
+    }
+
+    #[test]
+    fn oversized_acp_png_is_normalized_before_responses_encoding() {
+        let png = noisy_png(600, 600);
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(&png));
+        assert!(data_url.len() > MAX_FIELD_BYTES);
+        let metadata = MetadataMap::from([("source".into(), json!("acp"))]);
+        let mut parts = vec![Part::Media(
+            agentkit_core::MediaPart::new(Modality::Image, "image/png", DataRef::Uri(data_url))
+                .with_metadata(metadata.clone()),
+        )];
+
+        normalize_openai_parts(&mut parts, None, 0).unwrap();
+
+        let Part::Media(media) = &parts[0] else {
+            panic!("expected normalized media");
+        };
+        assert_eq!(media.mime_type, "image/jpeg");
+        assert_eq!(media.metadata, metadata);
+        let DataRef::InlineBytes(bytes) = &media.data else {
+            panic!("expected normalized inline bytes");
+        };
+        assert!(bytes.len() <= MAX_NORMALIZED_IMAGE_BYTES);
+        assert!(serialized_image_bytes(&media.data, &media.mime_type).unwrap() <= MAX_FIELD_BYTES);
+        let decoded = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (600, 600));
+    }
+
+    #[test]
+    fn image_normalization_observes_turn_cancellation() {
+        let controller = agentkit_core::CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        controller.interrupt();
+        let mut parts = vec![Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![0; MAX_NORMALIZED_IMAGE_BYTES + 1]),
+        )];
+
+        assert!(matches!(
+            normalize_openai_parts(&mut parts, Some(&cancellation), 0),
+            Err(LoopError::Cancelled)
+        ));
+    }
+
+    fn noisy_png(width: u32, height: u32) -> Vec<u8> {
+        let image = RgbImage::from_fn(width, height, |x, y| {
+            let mut value = x
+                .wrapping_mul(747_796_405)
+                .wrapping_add(y.wrapping_mul(2_891_336_453))
+                .wrapping_add(2_891_336_453);
+            value = (value ^ (value >> 16)).wrapping_mul(2_246_822_519);
+            value ^= value >> 13;
+            Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
     }
 
     #[test]
