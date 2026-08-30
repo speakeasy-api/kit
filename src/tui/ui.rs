@@ -76,7 +76,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     let show_start = frame.area().width >= 20
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
         && app.blocks.is_empty()
-        && !app.show_agents()
         && app.pending_steers.is_empty()
         && !app.show_logs;
 
@@ -486,11 +485,8 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
 }
 
 fn body_layout(area: Rect, show_agents: bool, transcript_empty: bool) -> (Rect, Option<Rect>) {
-    if !show_agents {
+    if !show_agents || transcript_empty {
         return (area, None);
-    }
-    if transcript_empty {
-        return (Rect::new(area.x, area.y, area.width, 0), Some(area));
     }
     let [transcript, agents] = if area.width >= SIDE_BY_SIDE_WIDTH {
         Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area)
@@ -1974,6 +1970,7 @@ mod tests {
     fn agents_layout_obeys_hidden_and_107_108_boundaries() {
         let area_107 = ratatui::layout::Rect::new(2, 3, 107, 20);
         assert_eq!(body_layout(area_107, false, false), (area_107, None));
+        assert_eq!(body_layout(area_107, true, true), (area_107, None));
         assert_eq!(
             body_layout(area_107, true, false),
             (
@@ -2246,15 +2243,16 @@ mod tests {
     }
 
     #[test]
-    fn agents_panel_is_visible_before_the_first_transcript_block() {
+    fn agents_panel_is_hidden_before_the_first_transcript_block() {
         let mut app = panel_app(1);
         assert!(app.blocks.is_empty());
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
 
         for (width, height) in [(120, 30), (80, 12)] {
             let screen = render(&mut app, width, height);
-            assert!(screen.contains("agent roster"), "{screen}");
-            assert!(screen.contains("Scout 0"), "{screen}");
+            assert!(screen.contains("█▀▄ █  █▄"), "{screen}");
+            assert!(!screen.contains("agent roster"), "{screen}");
+            assert!(!screen.contains("Scout 0"), "{screen}");
         }
     }
 
