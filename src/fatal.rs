@@ -1,5 +1,4 @@
 use std::{
-    error::Error as _,
     fs::{self, File, OpenOptions},
     io::Write as _,
     path::{Path, PathBuf},
@@ -59,15 +58,6 @@ struct FatalRecord {
 pub(crate) enum TransportStage {
     Request,
     Stream,
-}
-
-impl TransportStage {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Request => "request",
-            Self::Stream => "stream",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -170,48 +160,6 @@ enum IoClassification {
     Unknown,
 }
 
-pub(crate) fn provider_transport_error(
-    stage: TransportStage,
-    error: &reqwest::Error,
-    retryable: bool,
-    attempt: usize,
-    response_request_id: Option<&str>,
-) -> LoopError {
-    let diagnostics =
-        TransportDiagnostics::capture(stage, error, retryable, attempt, response_request_id);
-    let message = format!(
-        "openai-subscription {} transport failed (timeout={}, connect={}, request={}, body={}, decode={})",
-        stage.as_str(),
-        error.is_timeout(),
-        error.is_connect(),
-        error.is_request(),
-        error.is_body(),
-        error.is_decode(),
-    );
-    LoopError::Provider(append_diagnostics(message, &diagnostics))
-}
-
-pub(crate) fn safe_response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    let value = headers.get("x-request-id")?.to_str().ok()?;
-    if value.is_empty()
-        || value.len() > MAX_RESPONSE_REQUEST_ID_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
-        return None;
-    }
-    Some(value.to_owned())
-}
-
-pub(crate) fn append_provider_context(message: String, context: &str) -> String {
-    if let Some(marker) = message.find(DIAGNOSTIC_MARKER) {
-        format!("{}{}{}", &message[..marker], context, &message[marker..])
-    } else {
-        format!("{message}{context}")
-    }
-}
-
 pub(crate) fn render_loop_error(error: &LoopError) -> String {
     match error {
         LoopError::Provider(message) => {
@@ -223,75 +171,6 @@ pub(crate) fn render_loop_error(error: &LoopError) -> String {
 }
 
 impl TransportDiagnostics {
-    fn capture(
-        stage: TransportStage,
-        error: &reqwest::Error,
-        retryable: bool,
-        attempt: usize,
-        response_request_id: Option<&str>,
-    ) -> Self {
-        let mut source_chain = Vec::new();
-        let mut source = error.source();
-        while let Some(current) = source {
-            if source_chain.len() == MAX_SOURCE_CHAIN {
-                break;
-            }
-            let diagnostic = if let Some(error) = current.downcast_ref::<hyper::Error>() {
-                TransportSource::Hyper {
-                    parse: error.is_parse(),
-                    user: error.is_user(),
-                    canceled: error.is_canceled(),
-                    closed: error.is_closed(),
-                    incomplete_message: error.is_incomplete_message(),
-                    body_write_aborted: error.is_body_write_aborted(),
-                    shutdown: error.is_shutdown(),
-                    timeout: error.is_timeout(),
-                }
-            } else if let Some(error) = current.downcast_ref::<h2::Error>() {
-                TransportSource::H2 {
-                    io: error.is_io(),
-                    go_away: error.is_go_away(),
-                    reset: error.is_reset(),
-                    remote: error.is_remote(),
-                    library: error.is_library(),
-                    reason: h2_reason(error.reason()),
-                    io_error: error.get_io().map(io_diagnostics),
-                }
-            } else if let Some(error) = current.downcast_ref::<std::io::Error>() {
-                let io = io_diagnostics(error);
-                TransportSource::Io {
-                    classification: io.classification,
-                    os_code: io.os_code,
-                }
-            } else {
-                TransportSource::Unknown
-            };
-            source_chain.push(diagnostic);
-            source = current.source();
-        }
-        let source_chain_unknown = source_chain
-            .iter()
-            .any(|source| matches!(source, TransportSource::Unknown));
-        Self {
-            stage,
-            retryable,
-            attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
-            response_request_id: response_request_id
-                .filter(|value| valid_response_request_id(value))
-                .map(str::to_owned),
-            reqwest: ReqwestDiagnostics {
-                timeout: error.is_timeout(),
-                connect: error.is_connect(),
-                request: error.is_request(),
-                body: error.is_body(),
-                decode: error.is_decode(),
-            },
-            source_chain,
-            source_chain_unknown,
-            source_chain_truncated: source.is_some(),
-        }
-    }
-
     fn valid(&self) -> bool {
         self.attempt > 0
             && self.attempt <= 1_000
@@ -312,67 +191,12 @@ impl TransportDiagnostics {
     }
 }
 
-fn h2_reason(reason: Option<h2::Reason>) -> H2Reason {
-    match reason {
-        None => H2Reason::None,
-        Some(h2::Reason::NO_ERROR) => H2Reason::NoError,
-        Some(h2::Reason::PROTOCOL_ERROR) => H2Reason::ProtocolError,
-        Some(h2::Reason::INTERNAL_ERROR) => H2Reason::InternalError,
-        Some(h2::Reason::FLOW_CONTROL_ERROR) => H2Reason::FlowControlError,
-        Some(h2::Reason::SETTINGS_TIMEOUT) => H2Reason::SettingsTimeout,
-        Some(h2::Reason::STREAM_CLOSED) => H2Reason::StreamClosed,
-        Some(h2::Reason::FRAME_SIZE_ERROR) => H2Reason::FrameSizeError,
-        Some(h2::Reason::REFUSED_STREAM) => H2Reason::RefusedStream,
-        Some(h2::Reason::CANCEL) => H2Reason::Cancel,
-        Some(h2::Reason::COMPRESSION_ERROR) => H2Reason::CompressionError,
-        Some(h2::Reason::CONNECT_ERROR) => H2Reason::ConnectError,
-        Some(h2::Reason::ENHANCE_YOUR_CALM) => H2Reason::EnhanceYourCalm,
-        Some(h2::Reason::INADEQUATE_SECURITY) => H2Reason::InadequateSecurity,
-        Some(h2::Reason::HTTP_1_1_REQUIRED) => H2Reason::Http11Required,
-        Some(_) => H2Reason::Unknown,
-    }
-}
-
-fn io_diagnostics(error: &std::io::Error) -> IoDiagnostics {
-    use std::io::ErrorKind;
-    let classification = match error.kind() {
-        ErrorKind::ConnectionRefused => IoClassification::ConnectionRefused,
-        ErrorKind::ConnectionReset => IoClassification::ConnectionReset,
-        ErrorKind::ConnectionAborted => IoClassification::ConnectionAborted,
-        ErrorKind::NotConnected => IoClassification::NotConnected,
-        ErrorKind::BrokenPipe => IoClassification::BrokenPipe,
-        ErrorKind::TimedOut => IoClassification::TimedOut,
-        ErrorKind::UnexpectedEof => IoClassification::UnexpectedEof,
-        ErrorKind::WouldBlock => IoClassification::WouldBlock,
-        ErrorKind::Interrupted => IoClassification::Interrupted,
-        ErrorKind::Other => IoClassification::Other,
-        _ => IoClassification::Unknown,
-    };
-    IoDiagnostics {
-        classification,
-        os_code: error.raw_os_error(),
-    }
-}
-
 fn valid_response_request_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_RESPONSE_REQUEST_ID_BYTES
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-}
-
-fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
-    let Ok(encoded) = serde_json::to_vec(diagnostics) else {
-        return message;
-    };
-    if encoded.len() > MAX_DIAGNOSTIC_BYTES {
-        return message;
-    }
-    format!(
-        "{message}{DIAGNOSTIC_MARKER}{}]",
-        URL_SAFE_NO_PAD.encode(encoded)
-    )
 }
 
 fn split_diagnostics(message: &str) -> (&str, Option<TransportDiagnostics>) {
@@ -401,12 +225,6 @@ fn split_diagnostics(message: &str) -> (&str, Option<TransportDiagnostics>) {
         return (plain, None);
     }
     (plain, Some(diagnostics))
-}
-
-#[cfg(test)]
-pub(crate) fn transport_diagnostics_json(message: &str) -> Option<serde_json::Value> {
-    let (_, diagnostics) = split_diagnostics(message);
-    serde_json::to_value(diagnostics?).ok()
 }
 
 pub(crate) fn record_loop_error(
@@ -464,6 +282,9 @@ fn classify(
                     diagnostics,
                 ))
             } else {
+                // TODO(agentkit): AgentKit 0.10 flattens OpenAI Responses status, transport,
+                // and protocol failures into LoopError::Provider(String). Keep this generic until
+                // the terminal API exposes a stable typed classification; do not parse its display.
                 Some((
                     "provider",
                     "provider_error",
@@ -751,10 +572,18 @@ mod tests {
     use super::{
         DIAGNOSTIC_MARKER, FatalRecord, H2Reason, IoClassification, MAX_DIAGNOSTIC_BYTES,
         MAX_RECORDS_PER_SESSION, ReqwestDiagnostics, Surface, TransportDiagnostics,
-        TransportSource, TransportStage, append_diagnostics, append_provider_context, bounded,
-        classify, event_order, record_loop_error, render_loop_error, safe_response_request_id,
-        split_diagnostics, write_in, write_in_with_diagnostics,
+        TransportSource, TransportStage, bounded, classify, event_order, record_loop_error,
+        render_loop_error, split_diagnostics, write_in, write_in_with_diagnostics,
     };
+
+    fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
+        let encoded = serde_json::to_vec(diagnostics).unwrap();
+        assert!(encoded.len() <= MAX_DIAGNOSTIC_BYTES);
+        format!(
+            "{message}{DIAGNOSTIC_MARKER}{}]",
+            URL_SAFE_NO_PAD.encode(encoded)
+        )
+    }
 
     fn sample_diagnostics() -> TransportDiagnostics {
         TransportDiagnostics {
@@ -873,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_marker_is_strict_and_suffix_context_preserves_it() {
+    fn diagnostics_marker_decoder_is_strict() {
         let base = "openai-subscription stream transport failed".to_owned();
         let marked = append_diagnostics(base.clone(), &sample_diagnostics());
         let (plain, diagnostics) = split_diagnostics(&marked);
@@ -886,12 +715,6 @@ mod tests {
         assert!(!message.contains(DIAGNOSTIC_MARKER));
         assert!(message.len() < 256);
         assert!(diagnostics.is_some());
-
-        let exhausted = append_provider_context(marked.clone(), " after 3 attempts");
-        let (plain, diagnostics) = split_diagnostics(&exhausted);
-        assert_eq!(plain, format!("{base} after 3 attempts"));
-        assert!(diagnostics.is_some());
-        assert!(exhausted.ends_with(']'));
 
         for malformed in [
             format!("{marked} trailing"),
@@ -910,21 +733,6 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
         let unknown = format!("{base}{DIAGNOSTIC_MARKER}{encoded}]");
         assert!(split_diagnostics(&unknown).1.is_none());
-    }
-
-    #[test]
-    fn response_request_ids_are_strictly_allowlisted() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("x-request-id", "req_ABC-123:iad".parse().unwrap());
-        assert_eq!(
-            safe_response_request_id(&headers).as_deref(),
-            Some("req_ABC-123:iad")
-        );
-        headers.insert(
-            "x-request-id",
-            "secret https://example.invalid".parse().unwrap(),
-        );
-        assert_eq!(safe_response_request_id(&headers), None);
     }
 
     #[test]
@@ -977,6 +785,17 @@ mod tests {
             assert!(!message.contains("secret"));
             assert!(!message.contains("example.invalid"));
         }
+    }
+
+    #[test]
+    fn erased_agentkit_provider_errors_use_sound_generic_fallback() {
+        let (_, code, message, diagnostics) = classify(&LoopError::Provider(
+            "OpenAI Responses returned HTTP 429 Too Many Requests".into(),
+        ))
+        .unwrap();
+        assert_eq!(code, "provider_error");
+        assert_eq!(message, "provider request failed");
+        assert!(diagnostics.is_none());
     }
 
     #[test]

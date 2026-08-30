@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "git+https://github.com/danielkov/agentkit.git?rev=64244da92cfe983d7da8bf5ecac20b54bce4677a#64244da92cfe983d7da8bf5ecac20b54bce4677a"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -150,8 +150,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-adapter-completions"
-version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+version = "0.10.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "279d6cd22661dc59e7745cb0a065e84d9221faba0195ce24914d5982c6fe645b"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -169,7 +170,8 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7193f4a771e30b61fbabecd90dba9a9bc16bdafc2cf717d086727871e9d0e3cf"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -181,7 +183,8 @@ dependencies = [
 [[package]]
 name = "agentkit-compaction"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "483b8de89e4d2de33370151c398c4d81bfd3267899cdc2caee4361c9dab052f2"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -193,7 +196,8 @@ dependencies = [
 [[package]]
 name = "agentkit-context"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b3c5c91fed4a5ceb3afa3584877aa94304c2bccb2b383ddb964b4c0024165e8"
 dependencies = [
  "agentkit-core",
  "async-fs",
@@ -205,7 +209,8 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2110778950cdd87cc8ea3f0697c0551eb515ef23841b9c5d255a01974be17798"
 dependencies = [
  "futures-timer",
  "serde",
@@ -215,23 +220,29 @@ dependencies = [
 
 [[package]]
 name = "agentkit-http"
-version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b818e27ef0aa35e4f11af6a7fb453b0a020b0e7f46025a870647c4823cf71e2"
 dependencies = [
  "async-trait",
  "bytes",
+ "fastrand",
+ "futures-timer",
  "futures-util",
  "http",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.10"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+version = "0.10.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f9deddd6431bb2368aebd5eb51f3b43256c8347bfde9769ff726804dbc86355"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -248,7 +259,8 @@ dependencies = [
 [[package]]
 name = "agentkit-mcp"
 version = "0.10.6"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c13599c05c4b036902b83fa22f05d0415d85b8e9ba52be6b5a50256241c8492"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -269,7 +281,8 @@ dependencies = [
 [[package]]
 name = "agentkit-plugins"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5081b285831d69d9304052ae12a3468dfb850e84732dc3ec4a726906d7592daa"
 dependencies = [
  "http",
  "serde",
@@ -280,9 +293,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-provider-openai"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68a666ab2c12b086546feb07a1219332e0266b2c5a9ec847ef8b509c5386fd9e"
+dependencies = [
+ "agentkit-adapter-completions",
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "agentkit-provider-openrouter"
-version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+version = "0.10.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "211948f3127537bcdb4dfc77c59a6bee447ec3eca9f75a21697dbea5d038276d"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -297,7 +331,8 @@ dependencies = [
 [[package]]
 name = "agentkit-task-manager"
 version = "0.10.7"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f893be1f3d14f060e141e6b50baa09338778f90764cc030295105e101d29c06"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -309,7 +344,8 @@ dependencies = [
 [[package]]
 name = "agentkit-tool-compose"
 version = "0.10.9"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "099026fd6086dc317e03759b3c099ddae5ba85f8811cd50e83aff138c0fac249"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -339,7 +375,8 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "git+https://github.com/danielkov/agentkit.git?rev=1204e2b31d77ca820c9302fab2769e0b5c0c1c10#1204e2b31d77ca820c9302fab2769e0b5c0c1c10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10b9a8af3f09c79fc0707ea87dc377edd40bdf65db11e6ebfb50783f4e8e8ff3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -2517,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.1.110"
+version = "0.1.111"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
@@ -2534,6 +2571,7 @@ dependencies = [
  "agentkit-loop",
  "agentkit-mcp",
  "agentkit-plugins",
+ "agentkit-provider-openai",
  "agentkit-provider-openrouter",
  "agentkit-task-manager",
  "agentkit-tool-compose",
@@ -2550,8 +2588,6 @@ dependencies = [
  "flate2",
  "futures-util",
  "getrandom 0.4.3",
- "h2",
- "httpdate",
  "hyper",
  "hyper-util",
  "image",

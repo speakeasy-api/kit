@@ -95,7 +95,7 @@ impl ModelSelection {
     }
 }
 
-fn valid_model_id(value: &str) -> bool {
+pub(super) fn valid_model_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value.is_ascii()
@@ -360,7 +360,7 @@ impl ModelSession for SelectableSession {
     }
 
     fn model_name(&self) -> Option<&str> {
-        Some(&self.active.model.model)
+        self.inner.model_name()
     }
 
     fn provider_name(&self) -> Option<&str> {
@@ -385,7 +385,7 @@ impl SelectableSession {
 pub enum KitAdapter {
     OpenAiSubscription(OpenAiSubscriptionAdapter),
     OpenRouter(OpenRouterKitAdapter),
-    Speakeasy(SpeakeasyKitAdapter),
+    Speakeasy(Box<SpeakeasyKitAdapter>),
 }
 
 #[derive(Clone)]
@@ -499,10 +499,9 @@ impl KitAdapter {
     ) -> Result<Self, String> {
         match provider {
             ProviderKind::OpenAiSubscription => {
-                OpenAiSubscriptionAdapter::new_with_reasoning_effort(
-                    SubscriptionConfig::new(model)?.with_credential_storage(credential_storage),
-                    reasoning_effort,
-                )
+                let config =
+                    SubscriptionConfig::new(model)?.with_credential_storage(credential_storage);
+                OpenAiSubscriptionAdapter::new_with_reasoning_effort(config, reasoning_effort)
             }
             .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
@@ -514,7 +513,9 @@ impl KitAdapter {
                 )?;
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
-                let inner = OpenRouterAdapter::new(config).map_err(|error| error.to_string())?;
+                let inner = OpenRouterAdapter::new(config)
+                    .map_err(|error| error.to_string())?
+                    .with_resilience(agentkit_http::ResilienceConfig::default());
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
@@ -548,10 +549,10 @@ impl KitAdapter {
                     .connect_timeout(Duration::from_secs(10))
                     .build()
                     .map_err(|_| "could not build Speakeasy completions client".to_string())?;
-                Ok(Self::Speakeasy(SpeakeasyKitAdapter {
+                Ok(Self::Speakeasy(Box::new(SpeakeasyKitAdapter {
                     provider,
                     client: agentkit_http::Http::new(client),
-                }))
+                })))
             }
         }
     }
@@ -694,15 +695,14 @@ impl ModelAdapter for KitAdapter {
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
                 provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
-                CompletionsAdapter::with_client(provider, adapter.client.clone())
-                    .start_session(config)
-                    .await
-                    .map(|inner| {
-                        KitSession::Speakeasy(SpeakeasyKitSession {
-                            inner,
-                            context_window: None,
-                        })
+                let inner = CompletionsAdapter::with_client(provider, adapter.client.clone())
+                    .with_resilience(agentkit_http::ResilienceConfig::default());
+                inner.start_session(config).await.map(|inner| {
+                    KitSession::Speakeasy(SpeakeasyKitSession {
+                        inner,
+                        context_window: None,
                     })
+                })
             }
         }
     }
@@ -816,22 +816,7 @@ impl ModelTurn for KitTurn {
                     rewrite_openrouter_media(delta, &mut turn.media_part, &mut turn.next_media);
                 }
                 if let Some(context_window) = turn.context_window {
-                    match &mut event {
-                        Some(ModelTurnEvent::Usage(usage)) => {
-                            add_context_window(usage, context_window);
-                        }
-                        Some(ModelTurnEvent::Finished(result)) => {
-                            if let Some(usage) = &mut result.usage {
-                                add_context_window(usage, context_window);
-                            }
-                            for item in &mut result.output_items {
-                                if let Some(usage) = &mut item.usage {
-                                    add_context_window(usage, context_window);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                    stamp_context_window(&mut event, context_window, "openrouter.context_length");
                 }
                 Ok(event)
             }
@@ -884,13 +869,33 @@ fn safe_media_uri(uri: &str) -> bool {
         && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
 }
 
-fn add_context_window(usage: &mut Usage, context_window: u64) {
-    usage
-        .metadata
-        .insert("context_window".into(), context_window.into());
-    usage
-        .metadata
-        .insert("openrouter.context_length".into(), context_window.into());
+pub(super) fn stamp_context_window(
+    event: &mut Option<ModelTurnEvent>,
+    context_window: u64,
+    provider_key: &'static str,
+) {
+    let stamp = |usage: &mut Usage| {
+        usage
+            .metadata
+            .insert("context_window".into(), context_window.into());
+        usage
+            .metadata
+            .insert(provider_key.into(), context_window.into());
+    };
+    match event {
+        Some(ModelTurnEvent::Usage(usage)) => stamp(usage),
+        Some(ModelTurnEvent::Finished(result)) => {
+            if let Some(usage) = &mut result.usage {
+                stamp(usage);
+            }
+            for item in &mut result.output_items {
+                if let Some(usage) = &mut item.usage {
+                    stamp(usage);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn models_url(completions_url: &str) -> Option<String> {
@@ -1097,10 +1102,14 @@ mod tests {
     };
 
     use agentkit_core::{
-        DataRef, Delta, Item, ItemKind, MediaPart, MetadataMap, Modality, Part, PartId, PartKind,
-        SessionId, TokenUsage, ToolCallId, ToolOutput, ToolResultPart, TurnId, Usage,
+        DataRef, Delta, FinishReason, Item, ItemKind, MediaPart, MetadataMap, Modality, Part,
+        PartId, PartKind, SessionId, TokenUsage, ToolCallId, ToolOutput, ToolResultPart, TurnId,
+        Usage,
     };
-    use agentkit_loop::{LoopError, ModelAdapter, ModelSession, SessionConfig, TurnRequest};
+    use agentkit_loop::{
+        LoopError, ModelAdapter, ModelSession, ModelTurnEvent, ModelTurnResult, SessionConfig,
+        TurnRequest,
+    };
     use agentkit_provider_openrouter::{
         OpenRouterAdapter, OpenRouterConfig, ReasoningEffort as OpenRouterReasoningEffort,
     };
@@ -1112,9 +1121,9 @@ mod tests {
         KitAdapter, KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterApiKey,
         OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter,
         SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
-        add_context_window, apply_openrouter_reasoning_effort, catalog_models_url,
-        expose_background_call_ids, gram_chat_id, models_url, openrouter_config_from_env,
-        parse_context_window, rewrite_openrouter_media,
+        apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
+        gram_chat_id, models_url, openrouter_config_from_env, parse_context_window,
+        rewrite_openrouter_media, stamp_context_window,
     };
 
     #[test]
@@ -1135,8 +1144,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openrouter_key_source_controls_custom_base_url_access() {
+    async fn assert_openrouter_bearer(config: &OpenRouterConfig, expected: &str) {
+        let attempt = config.authentication.authenticate(None).await.unwrap();
+        assert_eq!(
+            attempt.headers()["authorization"].to_str().unwrap(),
+            format!("Bearer {expected}"),
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_key_source_controls_custom_base_url_access() {
         let directory = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
         crate::provider::store_openrouter_test_credentials(&storage);
@@ -1145,7 +1162,7 @@ mod tests {
             Err(std::env::VarError::NotPresent)
         })
         .unwrap();
-        assert_eq!(config.api_key, "test-openrouter-key");
+        assert_openrouter_bearer(&config, "test-openrouter-key").await;
         assert_eq!(config.model, "selected/model");
 
         let canonical_base_url = OpenRouterConfig::new("", "").base_url;
@@ -1169,7 +1186,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(config.api_key, "test-openrouter-key");
+        assert_openrouter_bearer(&config, "test-openrouter-key").await;
         assert_eq!(config.model, "selected/model");
         assert_eq!(config.base_url, format!("{canonical_base_url}/"));
         assert_eq!(config.app_name.as_deref(), Some("env-app"));
@@ -1207,7 +1224,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(config.api_key, "environment-key");
+        assert_openrouter_bearer(&config, "environment-key").await;
         assert_eq!(config.model, "selected/model");
         assert_eq!(config.base_url, "https://example.com/v1");
 
@@ -1223,7 +1240,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(config.api_key, "explicit-key");
+        assert_openrouter_bearer(&config, "explicit-key").await;
         assert_eq!(config.base_url, "https://proxy.example/v1");
 
         let empty = OpenRouterApiKey::new("");
@@ -1432,10 +1449,10 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let adapter = KitAdapter::Speakeasy(SpeakeasyKitAdapter {
+        let adapter = KitAdapter::Speakeasy(Box::new(SpeakeasyKitAdapter {
             provider,
             client: agentkit_http::Http::new(client),
-        });
+        }));
         let mut session = adapter
             .start_session(SessionConfig::new("speakeasy-contract"))
             .await
@@ -1595,7 +1612,7 @@ mod tests {
             adapter
                 .select(ModelSelection::new(
                     ProviderKind::OpenAiSubscription,
-                    "not-supported",
+                    "not supported",
                 ))
                 .is_err()
         );
@@ -1631,12 +1648,29 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_context_window_is_stamped_on_usage() {
-        let mut usage = Usage::new(TokenUsage::default());
+    fn context_window_stamping_traverses_finished_usage() {
+        let mut item = Item::text(ItemKind::Assistant, "done");
+        item.usage = Some(Usage::new(TokenUsage::default()));
+        let mut event = Some(ModelTurnEvent::Finished(ModelTurnResult {
+            finish_reason: FinishReason::Completed,
+            output_items: vec![item],
+            usage: Some(Usage::new(TokenUsage::default())),
+            metadata: MetadataMap::new(),
+            model: None,
+            response_id: None,
+        }));
 
-        add_context_window(&mut usage, 200_000);
+        stamp_context_window(&mut event, 200_000, "openrouter.context_length");
 
-        assert_eq!(usage.metadata["context_window"], json!(200_000));
-        assert_eq!(usage.metadata["openrouter.context_length"], json!(200_000));
+        let Some(ModelTurnEvent::Finished(result)) = event else {
+            panic!("expected finished event");
+        };
+        for usage in [
+            result.usage.as_ref().unwrap(),
+            result.output_items[0].usage.as_ref().unwrap(),
+        ] {
+            assert_eq!(usage.metadata["context_window"], json!(200_000));
+            assert_eq!(usage.metadata["openrouter.context_length"], json!(200_000));
+        }
     }
 }

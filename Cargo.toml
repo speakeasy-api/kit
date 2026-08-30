@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.110"
+version = "0.1.111"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -13,15 +13,16 @@ agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork
 agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices"] }
 agent-client-protocol-http = { version = "=2.0.0", default-features = false, features = ["server"] }
 agentkit-acp = { version = "=0.10.11", features = ["unstable-inject"] }
-agentkit-adapter-completions = "=0.10.7"
+agentkit-adapter-completions = "=0.10.8"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.10.5"
-agentkit-loop = { version = "=0.10.10", features = ["otel"] }
+agentkit-loop = { version = "=0.10.11", features = ["otel"] }
 agentkit-mcp = "=0.10.6"
-agentkit-http = "=0.10.5"
+agentkit-http = "=0.10.6"
 agentkit-plugins = "=0.10.7"
-agentkit-provider-openrouter = "=0.10.7"
+agentkit-provider-openai = "=0.10.6"
+agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
 agentkit-tool-compose = { version = "=0.10.9", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
@@ -37,8 +38,6 @@ crossterm = { version = "=0.29.0", features = ["event-stream"] }
 flate2 = "=1.1.10"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
-h2 = "=0.4.19"
-httpdate = "=1.0.3"
 hyper = "=1.11.1"
 hyper-util = { version = "=0.1.20", features = ["server", "http1", "http2", "tokio"] }
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
@@ -89,18 +88,13 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-adapter-completions = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-core = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-context = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-compaction = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-mcp = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-http = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-plugins = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-provider-openrouter = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-task-manager = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-tool-compose = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
-agentkit-tools-core = { git = "https://github.com/danielkov/agentkit.git", rev = "1204e2b31d77ca820c9302fab2769e0b5c0c1c10" }
+agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
+
+[patch."https://github.com/danielkov/agentkit.git"]
+agentkit-capabilities = "=0.10.5"
+agentkit-core = "=0.10.5"
+agentkit-loop = "=0.10.11"
+agentkit-task-manager = "=0.10.7"
+agentkit-tools-core = "=0.10.5"
