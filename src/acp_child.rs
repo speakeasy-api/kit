@@ -275,8 +275,7 @@ impl AcpHarnesses {
             command
                 .arg("--subagent-parent-id")
                 .arg(parent_id)
-                .arg("--subagent-parent-name")
-                .arg(parent_name);
+                .arg(format!("--subagent-parent-name={parent_name}"));
         }
         if resume {
             command.arg("--resume");
@@ -2000,10 +1999,18 @@ mod tests {
                 args.windows(2)
                     .any(|pair| pair == ["--subagent-parent-id", "s-parent"])
             );
-            assert!(
-                args.windows(2)
-                    .any(|pair| pair == ["--subagent-parent-name", "偵察 🦀"])
-            );
+            assert!(args.contains(&"--subagent-parent-name=偵察 🦀".into()));
+        }
+
+        #[test]
+        fn kit_child_parent_name_is_safe_when_it_starts_with_a_hyphen() {
+            let config = config(Some("s-parent"), Some("--reviewer"));
+            let command = config
+                .harnesses
+                .spawn(BUILTIN_HARNESS, &config, Some(("session", false)), 1)
+                .unwrap();
+
+            assert!(args(&command).contains(&"--subagent-parent-name=--reviewer".into()));
         }
 
         #[test]

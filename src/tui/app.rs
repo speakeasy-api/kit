@@ -1047,14 +1047,15 @@ impl App {
         self.working()
             || !self.transcript_dynamic.is_empty()
             || self.toast.is_some()
-            || self.agents.values().any(|row| {
-                matches!(
-                    row.status,
-                    SubagentStatus::Starting | SubagentStatus::Working
-                ) || (row.outcome == Some(GenerationOutcome::Failed)
-                    && row.generation_finished_at_unix_ms.is_some_and(|finished| {
-                        crate::events::now_millis().saturating_sub(finished) < 4_000
-                    }))
+            || self.agents.values().any(|row| match row.status {
+                SubagentStatus::Starting | SubagentStatus::Working => true,
+                SubagentStatus::Removed => row.outcome == Some(GenerationOutcome::Failed),
+                SubagentStatus::Idle => {
+                    row.outcome == Some(GenerationOutcome::Failed)
+                        && row.generation_finished_at_unix_ms.is_some_and(|finished| {
+                            crate::events::now_millis().saturating_sub(finished) < 4_000
+                        })
+                }
             })
     }
 
@@ -1827,6 +1828,7 @@ impl App {
             Update::Stopped(reason) => self.finish_with_stop_reason(reason),
             Update::ProcessExited(error) => {
                 self.finish_turn_with_outcome(false, None);
+                self.retire_active_agents_at(crate::events::now_millis());
                 self.push_block(Block::Error(error));
             }
         }
@@ -2032,6 +2034,25 @@ impl App {
 
     fn apply_agent_runtime(&mut self, event: RuntimeEvent) {
         self.apply_agent_runtime_at(event, crate::events::now_millis());
+    }
+
+    fn retire_active_agents_at(&mut self, now_unix_ms: u64) {
+        for row in self.agents.values_mut() {
+            if matches!(
+                row.status,
+                SubagentStatus::Starting | SubagentStatus::Working
+            ) {
+                row.status = SubagentStatus::Removed;
+                row.outcome = Some(GenerationOutcome::Failed);
+                row.generation_finished_at_unix_ms
+                    .get_or_insert(now_unix_ms);
+                self.agent_versions.insert(
+                    row.id.clone(),
+                    (row.generation, agent_status_rank(SubagentStatus::Removed)),
+                );
+            }
+        }
+        self.clamp_agents_scroll();
     }
 
     #[cfg(test)]
@@ -4338,6 +4359,107 @@ mod tests {
                 .status,
             SubagentStatus::Idle
         );
+    }
+
+    #[test]
+    fn process_exit_retires_active_agents_without_overwriting_terminal_rows() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+
+        let mut app = app();
+        for event in [
+            agent_event(
+                "starting",
+                "Starting",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                (10, 20, None),
+            ),
+            agent_event(
+                "working",
+                "Working",
+                SubagentStatus::Working,
+                None,
+                2,
+                None,
+                (11, 21, None),
+            ),
+            agent_event(
+                "idle-failed",
+                "Idle failed",
+                SubagentStatus::Idle,
+                Some(GenerationOutcome::Failed),
+                1,
+                None,
+                (12, 22, Some(30)),
+            ),
+            agent_event(
+                "removed-failed",
+                "Removed failed",
+                SubagentStatus::Removed,
+                Some(GenerationOutcome::Failed),
+                1,
+                None,
+                (13, 23, Some(90)),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        app.apply(Update::ProcessExited("runtime exited".into()));
+
+        for id in ["starting", "working"] {
+            let row = app
+                .agents
+                .get(id)
+                .expect("active row remains as a tombstone");
+            assert_eq!(row.status, SubagentStatus::Removed);
+            assert_eq!(row.outcome, Some(GenerationOutcome::Failed));
+            assert!(row.generation_finished_at_unix_ms.is_some());
+        }
+        let idle = app.agents.get("idle-failed").unwrap();
+        assert_eq!(idle.status, SubagentStatus::Idle);
+        assert_eq!(idle.generation_finished_at_unix_ms, Some(30));
+        let removed = app.agents.get("removed-failed").unwrap();
+        assert_eq!(removed.status, SubagentStatus::Removed);
+        assert_eq!(removed.generation_finished_at_unix_ms, Some(90));
+        assert_eq!(app.agent_counts().starting, 0);
+        assert_eq!(app.agent_counts().working, 0);
+
+        let retired_at = app.agents["working"]
+            .generation_finished_at_unix_ms
+            .unwrap();
+        app.tick_at(retired_at + 4_000);
+        assert_eq!(
+            app.agents.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["idle-failed"]
+        );
+        assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
+    fn expired_failed_removed_agent_keeps_ticker_enabled_until_cleanup() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "failed",
+                "Failed",
+                SubagentStatus::Removed,
+                Some(GenerationOutcome::Failed),
+                1,
+                None,
+                (10, 20, Some(1_000)),
+            ),
+            1_000,
+        );
+
+        assert!(app.needs_redraw_tick());
+        app.tick_at(5_000);
+        assert!(!app.agents.contains_key("failed"));
+        assert!(!app.needs_redraw_tick());
     }
 
     #[test]
