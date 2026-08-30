@@ -13,16 +13,16 @@ agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork
 agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices"] }
 agent-client-protocol-http = { version = "=2.0.0", default-features = false, features = ["server"] }
 agentkit-acp = { version = "=0.10.11", features = ["unstable-inject"] }
-agentkit-adapter-completions = "=0.10.7"
+agentkit-adapter-completions = "=0.10.8"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.10.5"
-agentkit-loop = { version = "=0.10.10", features = ["otel"] }
+agentkit-loop = { version = "=0.10.11", features = ["otel"] }
 agentkit-mcp = "=0.10.6"
-agentkit-http = "=0.10.5"
+agentkit-http = "=0.10.6"
 agentkit-plugins = "=0.10.7"
-agentkit-provider-openai = "=0.10.5"
-agentkit-provider-openrouter = "=0.10.7"
+agentkit-provider-openai = "=0.10.6"
+agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
 agentkit-tool-compose = { version = "=0.10.9", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
@@ -88,19 +88,19 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-adapter-completions = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-core = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-context = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-compaction = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-mcp = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-http = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-plugins = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-provider-openai = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-provider-openrouter = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-task-manager = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-tool-compose = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
-agentkit-tools-core = { git = "https://github.com/danielkov/agentkit.git", rev = "eba802525e718223aa011788559e291267a96473" }
+agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-adapter-completions = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-core = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-context = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-compaction = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-mcp = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-http = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-plugins = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-provider-openai = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-provider-openrouter = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-task-manager = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-tool-compose = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-tools-core = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }

@@ -600,10 +600,7 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
-        if matches!(
-            &event.event,
-            AgentEvent::ContentDelta(delta) if agentkit_loop::response_attempt::is_marker(delta)
-        ) {
+        if matches!(&event.event, AgentEvent::ResponseAttemptSuperseded) {
             let notification = SessionNotification::new(
                 self.session_id.clone(),
                 SessionUpdate::Notice(Notice::new(
@@ -2153,11 +2150,7 @@ pub(super) mod tests {
                 event,
             });
         };
-        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
-            panic!("replacement marker must be a delta");
-        };
-
-        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ResponseAttemptSuperseded);
         emit(AgentEvent::ContentDelta(Delta::BeginPart {
             part_id: PartId::new("replacement"),
             kind: PartKind::Text,

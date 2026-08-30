@@ -1004,7 +1004,7 @@ impl Runtime {
         let canonical_transcript = opened.transcript.clone();
         let mut session_config = SessionConfig::new(session_id.clone()).without_cache();
         if context.response_attempt_replacement {
-            agentkit_loop::response_attempt::enable(&mut session_config);
+            session_config = session_config.with_response_attempt_supersession();
         }
         let driver = Agent::builder()
             .model(adapter.clone())

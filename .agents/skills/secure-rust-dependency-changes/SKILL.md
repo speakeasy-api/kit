@@ -1,6 +1,6 @@
 ---
 name: secure-rust-dependency-changes
-description: Use whenever a Rust dependency is added or updated, including direct, transitive, build, development, target-specific, and optional dependencies.
+description: Use when a Rust change alters the external Cargo dependency surface by adding a non-workspace dependency, selecting a different version, source, or revision of a non-workspace package, changing its enabled features, or introducing external transitive, build, development, target-specific, or optional dependency code.
 ---
 
 # Secure Rust Dependency Changes

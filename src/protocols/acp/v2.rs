@@ -329,10 +329,7 @@ where
             }
             return;
         }
-        if matches!(
-            &event.event,
-            AgentEvent::ContentDelta(delta) if agentkit_loop::response_attempt::is_marker(delta)
-        ) {
+        if matches!(&event.event, AgentEvent::ResponseAttemptSuperseded) {
             self.clear_current();
             return;
         }
@@ -1985,10 +1982,7 @@ mod tests {
             part_id: agentkit_core::PartId::new("message-1"),
             chunk: "old answer".into(),
         }));
-        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
-            unreachable!();
-        };
-        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ResponseAttemptSuperseded);
         emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
             part_id: agentkit_core::PartId::new("thought-2"),
             kind: agentkit_core::PartKind::Reasoning,
@@ -2047,10 +2041,7 @@ mod tests {
         ));
         drop(updates);
 
-        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
-            unreachable!();
-        };
-        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ResponseAttemptSuperseded);
         emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
             part_id: agentkit_core::PartId::new("message-3"),
             kind: agentkit_core::PartKind::Text,
@@ -2085,10 +2076,7 @@ mod tests {
             session_id: loop_session_id.clone(),
             turn_id: agentkit_core::TurnId::new("turn-2"),
         });
-        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
-            unreachable!();
-        };
-        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ResponseAttemptSuperseded);
         assert_eq!(recording.updates.lock().unwrap().len(), 9);
     }
 
@@ -2177,10 +2165,7 @@ mod tests {
             session_id: loop_session_id.clone(),
             turn_id: agentkit_core::TurnId::new("turn-3"),
         });
-        let ModelTurnEvent::Delta(marker) = agentkit_loop::response_attempt::marker_event() else {
-            unreachable!();
-        };
-        emit(AgentEvent::ContentDelta(marker));
+        emit(AgentEvent::ResponseAttemptSuperseded);
         emit_part(
             "message-3",
             agentkit_core::PartKind::Text,
@@ -2282,7 +2267,7 @@ mod tests {
                 }),
                 2 => {
                     self.interrupt.interrupt();
-                    agentkit_loop::response_attempt::marker_event()
+                    ModelTurnEvent::ResponseAttemptSuperseded
                 }
                 _ => return Ok(None),
             };
