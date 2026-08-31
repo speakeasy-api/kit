@@ -1096,7 +1096,17 @@ impl Runtime {
     }
 
     async fn initial_transcript(&self, depth: usize) -> Result<Vec<Item>, String> {
-        load_initial_transcript(&self.root, self.system_prompt(depth)).await
+        let mut transcript = load_initial_transcript(&self.root, self.system_prompt(depth)).await?;
+        let origin = if depth > 0 {
+            crate::session::SUBAGENT_SESSION_ORIGIN
+        } else {
+            crate::session::TOP_LEVEL_SESSION_ORIGIN
+        };
+        transcript[0].metadata.insert(
+            crate::session::SESSION_ORIGIN_METADATA_KEY.into(),
+            Value::String(origin.into()),
+        );
+        Ok(transcript)
     }
 
     fn system_prompt(&self, depth: usize) -> String {

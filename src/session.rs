@@ -21,6 +21,9 @@ const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const MAX_RFC3339_MILLIS: u64 = 253_402_300_799_999;
+pub(crate) const SESSION_ORIGIN_METADATA_KEY: &str = "dev.kit.session.origin";
+pub(crate) const SUBAGENT_SESSION_ORIGIN: &str = "subagent";
+pub(crate) const TOP_LEVEL_SESSION_ORIGIN: &str = "top_level";
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -847,6 +850,9 @@ fn catalog_for_workspace(
         let Ok(Some(authority)) = select_authority_with(global_directory, &root, &id, false) else {
             continue;
         };
+        if catalog_is_subagent(&authority.historical_items, &authority.items) {
+            continue;
+        }
         let (title, preview) = catalog_text(&authority.historical_items, &authority.items);
         let item_updated = authority
             .items
@@ -878,6 +884,22 @@ fn catalog_for_workspace(
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(entries)
+}
+
+fn catalog_is_subagent(historical_items: &[Vec<Item>], current_items: &[Item]) -> bool {
+    historical_items
+        .iter()
+        .map(Vec::as_slice)
+        .chain(std::iter::once(current_items))
+        .flatten()
+        .any(|item| {
+            item.kind == ItemKind::System
+                && item
+                    .metadata
+                    .get(SESSION_ORIGIN_METADATA_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    == Some(SUBAGENT_SESSION_ORIGIN)
+        })
 }
 
 fn catalog_text(
@@ -2720,6 +2742,47 @@ mod tests {
         );
         assert!(entries[0].updated_at > entries[1].updated_at);
         drop((older, newer, other));
+    }
+
+    #[test]
+    fn catalog_omits_only_structurally_marked_subagent_sessions() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let open_with_origin = |id: &str, origin: Option<serde_json::Value>| {
+            let mut item = Item::text(ItemKind::System, format!("{id} system prompt"));
+            if let Some(origin) = origin {
+                item.metadata
+                    .insert(SESSION_ORIGIN_METADATA_KEY.into(), origin);
+            }
+            open_in(root.path(), storage.path(), id, false, false, vec![item]).unwrap()
+        };
+        let legacy = open_with_origin("legacy", None);
+        let top_level = open_with_origin(
+            "top-level",
+            Some(serde_json::Value::String(TOP_LEVEL_SESSION_ORIGIN.into())),
+        );
+        let malformed = open_with_origin("malformed", Some(serde_json::Value::Bool(true)));
+        let subagent = open_with_origin(
+            "subagent",
+            Some(serde_json::Value::String(SUBAGENT_SESSION_ORIGIN.into())),
+        );
+        subagent
+            .observer
+            .replace(&[Item::text(ItemKind::System, "compacted system prompt")])
+            .unwrap();
+
+        let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        let ids = entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&"legacy"));
+        assert!(ids.contains(&"top-level"));
+        assert!(ids.contains(&"malformed"));
+        assert!(!ids.contains(&"subagent"));
+        drop((legacy, top_level, malformed, subagent));
     }
 
     #[test]
