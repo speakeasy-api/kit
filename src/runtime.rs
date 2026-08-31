@@ -21,7 +21,7 @@ use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, Task
 use agentkit_tool_compose::{
     BackendRun, ComposeBackend, ComposeConfig, ComposeOutcome, ComposeTool, RunletBackend,
 };
-use agentkit_tool_skills::SkillRegistry;
+use agentkit_tool_skills::{Skill, SkillRegistry};
 use agentkit_tools_core::{
     PermissionRequest, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolName, ToolRequest,
     ToolResult, ToolSource, ToolSpec,
@@ -217,6 +217,7 @@ impl Drop for SessionClaim {
 
 pub(crate) struct AcpDriver {
     pub driver: LoopDriver<SelectableSession>,
+    pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
     pub structured_completion: bool,
@@ -731,6 +732,17 @@ impl Runtime {
         )
     }
 
+    pub(crate) async fn current_skills(&self) -> Vec<Skill> {
+        let registry = build_skill_registry(
+            &self.root,
+            &self.skill_package_roots,
+            &self.skill_directories,
+        )
+        .discover_skills()
+        .await;
+        registry.skills().into_iter().cloned().collect()
+    }
+
     fn compose_with(&self, depth: usize, subagents: Subagents) -> ComposeOnly {
         self.compose_with_jobs(
             depth,
@@ -1051,6 +1063,7 @@ impl Runtime {
         )
         .map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
+        let skill_catalog = self.current_skills().await;
         let compactor = crate::compaction::automatic(
             adapter.clone(),
             self.agentkit_telemetry(),
@@ -1089,6 +1102,7 @@ impl Runtime {
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let driver = AcpDriver {
             driver,
+            skills: skill_catalog,
             tasks,
             background_jobs,
             structured_completion: self.base_depth > 0,
@@ -1144,6 +1158,14 @@ fn build_skill_tools(
     package_roots: &[PathBuf],
     skill_directories: &[PathBuf],
 ) -> Arc<SkillRegistry> {
+    Arc::new(build_skill_registry(root, package_roots, skill_directories))
+}
+
+fn build_skill_registry(
+    root: &Path,
+    package_roots: &[PathBuf],
+    skill_directories: &[PathBuf],
+) -> SkillRegistry {
     let default_roots = default_skill_roots(root);
     let canonical_defaults = default_roots
         .iter()
@@ -1159,26 +1181,24 @@ fn build_skill_tools(
         .collect::<Vec<_>>();
     let mut roots = default_roots;
     roots.extend(skill_directories.iter().cloned());
-    Arc::new(SkillRegistry::from_paths(roots).with_filter(
-        move |skill: &agentkit_tool_skills::Skill| {
-            let Ok(base) = skill.base_dir.canonicalize() else {
-                return false;
-            };
-            if canonical_defaults
+    SkillRegistry::from_paths(roots).with_filter(move |skill: &agentkit_tool_skills::Skill| {
+        let Ok(base) = skill.base_dir.canonicalize() else {
+            return false;
+        };
+        if canonical_defaults
+            .iter()
+            .any(|directory| base.starts_with(directory))
+        {
+            return true;
+        }
+        let Ok(location) = skill.location.canonicalize() else {
+            return false;
+        };
+        canonical_plugin_skills.contains(&base)
+            && canonical_package_roots
                 .iter()
-                .any(|directory| base.starts_with(directory))
-            {
-                return true;
-            }
-            let Ok(location) = skill.location.canonicalize() else {
-                return false;
-            };
-            canonical_plugin_skills.contains(&base)
-                && canonical_package_roots
-                    .iter()
-                    .any(|package| location.starts_with(package))
-        },
-    ))
+                .any(|package| location.starts_with(package))
+    })
 }
 
 fn default_skill_roots(root: &Path) -> Vec<PathBuf> {
