@@ -106,8 +106,11 @@ struct ContentView: View {
             ConversationView(controller: controller, title: title)
         } else {
             VStack(spacing: 14) {
-                Image(systemName: "chevron.left.forwardslash.chevron.right")
-                    .font(.system(size: 34, weight: .light)).foregroundStyle(.tertiary)
+                Image("KitMark")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 44, height: 44)
+                    .accessibilityHidden(true)
                 Text(model.selectedWorkspace == nil ? "Add a workspace to begin" : "What should we work on?")
                     .brandDisplay(30)
                 if model.selectedWorkspace != nil {
@@ -550,7 +553,11 @@ private struct ConversationView: View {
             ScrollView {
                 if controller.entries.isEmpty {
                     VStack(spacing: 14) {
-                        Image(systemName: "sparkles").font(.system(size: 30, weight: .light)).foregroundStyle(.tertiary)
+                        Image("KitMark")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 44, height: 44)
+                            .accessibilityHidden(true)
                         Text("What should we work on?").brandDisplay(30)
                     }.frame(maxWidth: .infinity).padding(.top, 150)
                 } else {

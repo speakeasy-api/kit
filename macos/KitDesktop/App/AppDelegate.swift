@@ -4,6 +4,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var shutdown: (((@escaping () -> Void) -> Void))?
     private var replySent = false
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+              let icon = NSImage(contentsOf: iconURL) else { return }
+        NSApplication.shared.applicationIconImage = icon
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let shutdown else { return .terminateNow }
         replySent = false

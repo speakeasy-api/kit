@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		02871F767925761E25F86B3E /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B3990BD2C27260A0E70B93A /* AppState.swift */; };
+		035DAB141A9BBEED5792F799 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 198107AA95E9C4E57B982AED /* Assets.xcassets */; };
 		0F21F855B7DA35AD722AC7D3 /* ACPProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A49E707898C1B36BB27BC121 /* ACPProtocolTests.swift */; };
 		19B3A6B5BBEE1564C7F4AC0B /* PersistenceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06F974BED9068ADA02CD72BC /* PersistenceStore.swift */; };
 		489E18B321109F8D9F512822 /* ACPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D1610600D0AFF53C50D6E59 /* ACPClient.swift */; };
@@ -20,6 +21,7 @@
 		AA4D62C2F061DA87F223B926 /* KitDesktopApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 612469AB29D1589621F28D29 /* KitDesktopApp.swift */; };
 		B03EA9D8EB2F591C684D3D3F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8F619B802566CBF11E36094 /* AppDelegate.swift */; };
 		B9AC4DF35B2F9D766761C7EB /* JSONLineParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0670A97F6D40D534E10DF6B /* JSONLineParserTests.swift */; };
+		CA8ABD25EAFDC87274999FA5 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 774A438C39CB539D322381BD /* AppIcon.icon */; };
 		D84D1F89B4EAA779010CFE3E /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAEBE305CCB3F66B4C6EFE46 /* AppModelTests.swift */; };
 		E0A3CEF798311F487DD36E56 /* PersistenceStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 319931620251E086D0C605C3 /* PersistenceStoreTests.swift */; };
 		E51D677C599E9529D12CC62C /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C69138F9241277AF871FBF68 /* AppModel.swift */; };
@@ -42,12 +44,14 @@
 		06F974BED9068ADA02CD72BC /* PersistenceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistenceStore.swift; sourceTree = "<group>"; };
 		0C0AB706DCD4E682E3D144F0 /* KitDesktopTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KitDesktopTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		11C475A19EDCF4F131882AF2 /* JSONLineParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONLineParser.swift; sourceTree = "<group>"; };
+		198107AA95E9C4E57B982AED /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2B3990BD2C27260A0E70B93A /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		319931620251E086D0C605C3 /* PersistenceStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistenceStoreTests.swift; sourceTree = "<group>"; };
 		5E2EABACCDFBFA37A3DB1077 /* ACPKitExtensions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ACPKitExtensions.swift; sourceTree = "<group>"; };
 		6086BB4FC00B47A7CFEDE75F /* ACPWireModels.generated.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ACPWireModels.generated.swift; sourceTree = "<group>"; };
 		612469AB29D1589621F28D29 /* KitDesktopApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitDesktopApp.swift; sourceTree = "<group>"; };
 		7673B303F19B3783B1B84A34 /* ACPProcessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ACPProcessTests.swift; sourceTree = "<group>"; };
+		774A438C39CB539D322381BD /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		7D1610600D0AFF53C50D6E59 /* ACPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ACPClient.swift; sourceTree = "<group>"; };
 		7FB0EE32A1CCC0464FF5D14E /* BrandTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrandTheme.swift; sourceTree = "<group>"; };
 		9B793DB8C6D3587B43CDC552 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -138,6 +142,8 @@
 		B364810B2CEDCAFDFF4E5FC3 /* KitDesktop */ = {
 			isa = PBXGroup;
 			children = (
+				774A438C39CB539D322381BD /* AppIcon.icon */,
+				198107AA95E9C4E57B982AED /* Assets.xcassets */,
 				C18AE6A3327A1061BE966290 /* App */,
 				FBF77A7F783AC8B3414EA1D4 /* Generated */,
 				41D6646C8AAC0B7036DB3442 /* Models */,
@@ -172,6 +178,7 @@
 			buildConfigurationList = 3A0D94AADBAA81ABC91E417F /* Build configuration list for PBXNativeTarget "KitDesktop" */;
 			buildPhases = (
 				E60384F9B9BF39AA6162E76D /* Sources */,
+				07E9050190D93905A1AC96D3 /* Resources */,
 				62A37A10346635E51D704C0B /* Copy Kit CLI */,
 			);
 			buildRules = (
@@ -239,6 +246,18 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		07E9050190D93905A1AC96D3 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CA8ABD25EAFDC87274999FA5 /* AppIcon.icon in Resources */,
+				035DAB141A9BBEED5792F799 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
 		62A37A10346635E51D704C0B /* Copy Kit CLI */ = {
