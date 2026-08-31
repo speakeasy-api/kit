@@ -118,13 +118,27 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s \
             -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Build and package
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build, archive, sign, notarize, and package
         shell: bash
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
           version=${GITHUB_REF_NAME#v}
-          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          scripts/generate-macos-project.sh
+          archive="$RUNNER_TEMP/Kit.xcarchive"
+          xcodebuild archive -quiet \
+            -project macos/KitDesktop.xcodeproj \
+            -scheme KitDesktop \
+            -configuration Release \
+            -archivePath "$archive" \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
           if [[ $SIGN_RELEASE == true ]]; then
@@ -143,13 +157,15 @@ jobs:
               --key-id "$APPLE_API_KEY_ID" \
               --issuer "$APPLE_API_ISSUER_ID" \
               --wait 2>&1 | tee "$notary_log"
-            if ! grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$notary_log"; then
-              echo "Apple did not accept the notarization submission." >&2
+            grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$notary_log" || {
+              echo "Apple did not accept the standalone Kit notarization." >&2
               exit 1
-            fi
+            }
           fi
           stage/kit --version
           tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" kit
+          scripts/package-macos-app.sh \
+            "$archive/Products/Applications/Kit.app" dist "$version"
       - uses: actions/upload-artifact@v4
         with:
           name: kit-macos-arm64
@@ -174,24 +190,24 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum kit-*.tar.gz > SHA256SUMS
+          sha256sum kit-*.tar.gz Kit-*.zip > SHA256SUMS
           prerelease=false
           if [[ $GITHUB_REF_NAME == *-pre* ]]; then
             prerelease=true
           fi
           if [[ $MACOS_SIGNED == true ]]; then
-            signing_note="The macOS binary is Developer ID signed and notarized."
+            signing_note="The macOS CLI and Kit.app are Developer ID signed and notarized; the app ticket is stapled and verified."
           else
-            signing_note="The macOS binary is unsigned and not notarized."
+            signing_note="The macOS CLI and Kit.app are unsigned and not notarized."
           fi
           title="Kit ${GITHUB_REF_NAME#v}"
           notes="Prebuilt Kit binaries. $signing_note"
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS \
+            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz Kit-*.zip SHA256SUMS \
               --clobber --repo "$GITHUB_REPOSITORY"
           else
             create_args=(
-              "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS
+              "$GITHUB_REF_NAME" kit-*.tar.gz Kit-*.zip SHA256SUMS
               --repo "$GITHUB_REPOSITORY"
               --title "$title"
               --notes "$notes"

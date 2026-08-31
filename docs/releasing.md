@@ -16,16 +16,21 @@ git push origin v0.1.83
 
 For a prerelease, use `-pre` or `-pre.N`, for example `v0.1.83-pre.1`.
 The release workflow verifies the tag against `Cargo.toml`, runs formatting,
-Clippy, and tests, builds Linux x86-64 and macOS arm64 archives, generates
-checksums, and publishes them to the tagged GitHub release. Prerelease tags are
+Clippy, and tests, builds Linux x86-64 and macOS arm64 CLI archives plus the
+ARM64 Kit.app ZIP, generates checksums, and publishes them to the tagged GitHub release. Prerelease tags are
 marked as prereleases on GitHub.
 
 ## macOS signing and notarization
 
 The release workflow signs the standalone Mach-O executable with the code-signing
-identifier `com.speakeasy.kit`, enables the hardened runtime, and submits it to
-Apple's notary service. This Developer ID distribution does not require an Apple
-App ID or provisioning profile.
+identifier `com.speakeasy.kit`. It also archives `Kit.app`, signs its bundled helper
+first with `com.speakeasy.kit`, and then signs the outer app with
+`com.speakeasy.kit.desktop`. Both signatures enable the Hardened Runtime and use
+an explicit empty entitlement set: the unsandboxed app and CLI need no Hardened
+Runtime exceptions. The workflow submits both products to Apple's notary service,
+staples and validates the app ticket, verifies nested signatures, and runs Gatekeeper
+assessment before packaging `Kit-vVERSION-aarch64-apple-darwin.zip`. This Developer
+ID distribution does not require an Apple App ID or provisioning profile.
 
 Create the credentials as follows:
 
@@ -67,8 +72,11 @@ printf %s 'issuer-uuid' | gh secret set APPLE_API_ISSUER_ID -R "$repo"
 ```
 
 The workflow fails on a partial configuration rather than silently publishing
-an unsigned build. With none of these secrets configured, it still publishes an
-unsigned, unnotarized archive and identifies it as such in the release notes.
+an unsigned build. With none of these secrets configured, it still publishes the
+standalone archive and Kit.app ZIP unsigned and unnotarized, and identifies the
+release as such in the release notes. XcodeGen 2.45.4 is downloaded with a pinned
+SHA-256 before the app archive is generated; the checked-in project is independently
+regenerated and drift-checked in CI.
 
 ## Verify a release
 

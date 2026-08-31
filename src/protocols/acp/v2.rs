@@ -1531,9 +1531,17 @@ fn set_v2_config(
 }
 
 fn catalog_session_info(entry: &crate::session::CatalogEntry, cwd: &Path) -> wire::SessionInfo {
-    wire::SessionInfo::new(wire::SessionId::new(entry.id.clone()), cwd.to_path_buf())
-        .title(entry.title.clone())
-        .updated_at(entry.updated_at_rfc3339())
+    let mut info =
+        wire::SessionInfo::new(wire::SessionId::new(entry.id.clone()), cwd.to_path_buf())
+            .title(entry.title.clone())
+            .updated_at(entry.updated_at_rfc3339());
+    if entry.is_subagent {
+        info = info.meta(serde_json::Map::from_iter([(
+            "dev.kit.subagent".into(),
+            serde_json::Value::Bool(true),
+        )]));
+    }
+    info
 }
 
 fn parse_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
@@ -3320,6 +3328,7 @@ mod tests {
                 id: "saved".into(),
                 title: Some("Saved session".into()),
                 preview: Some("Saved session preview".into()),
+                is_subagent: true,
                 updated_at: 0,
             },
             &PathBuf::from("/workspace"),
@@ -3329,6 +3338,7 @@ mod tests {
         assert_eq!(encoded["cwd"], "/workspace");
         assert_eq!(encoded["title"], "Saved session");
         assert_eq!(encoded["updatedAt"], "1970-01-01T00:00:00.000Z");
+        assert_eq!(encoded["_meta"]["dev.kit.subagent"], true);
     }
 
     #[test]

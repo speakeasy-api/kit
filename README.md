@@ -84,7 +84,7 @@ cargo build --release          # target/release/kit
 scripts/sign-release.sh        # macOS only: sign before using the Keychain credential store
 ```
 
-Release binaries for macOS are signed and notarized under `com.speakeasy.kit`. See [Releasing](docs/releasing.md).
+Release binaries for macOS are signed and notarized under `com.speakeasy.kit`; the outer desktop app uses `com.speakeasy.kit.desktop`. See [Releasing](docs/releasing.md).
 
 ## Quick start
 

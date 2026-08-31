@@ -1173,5 +1173,5 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     ));
     assert!(!prompt.contains("This task was delegated to you by the primary agent."));
     let max_depth_prompt = runtime.system_prompt(runtime.max_subagent_depth());
-    assert!(!max_depth_prompt.contains("This task was delegated to you by the primary agent."));
+    assert!(max_depth_prompt.contains("This task was delegated to you by the primary agent."));
 }

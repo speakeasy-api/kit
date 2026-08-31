@@ -18,3 +18,62 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --locked
+
+  macos-desktop:
+    runs-on: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: aarch64-apple-darwin
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Check generated Xcode project drift
+        shell: bash
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_generate_acp_swift.py
+          scripts/generate-acp-swift.py --check
+          PATH="$RUNNER_TEMP/bin:$PATH" scripts/generate-macos-project.sh
+          git diff --exit-code -- macos/Config/Version.xcconfig macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
+      - name: Build real debug helper
+        run: cargo build --locked --bin kit
+      - name: Run Swift tests and real Kit lifecycle smoke
+        shell: bash
+        run: |
+          derived="$RUNNER_TEMP/DesktopDerivedData"
+          stale="$derived/Build/Products/Debug/Kit.app/Contents/Helpers/kit"
+          mkdir -p "$(dirname "$stale")"
+          printf stale > "$stale"
+          chmod +x "$stale"
+          xcodebuild test -quiet \
+            -project macos/KitDesktop.xcodeproj \
+            -scheme KitDesktop \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$derived" \
+            KIT_BINARY="$GITHUB_WORKSPACE/target/debug/kit" \
+            CODE_SIGNING_ALLOWED=NO
+          cmp target/debug/kit "$stale"
+      - name: Validate Release archive and bundled helper
+        shell: bash
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          archive="$RUNNER_TEMP/Kit.xcarchive"
+          xcodebuild archive -quiet \
+            -project macos/KitDesktop.xcodeproj \
+            -scheme KitDesktop \
+            -configuration Release \
+            -archivePath "$archive" \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO
+          app="$archive/Products/Applications/Kit.app"
+          helper="$app/Contents/Helpers/kit"
+          test "$(lipo -archs "$app/Contents/MacOS/Kit")" = arm64
+          test "$(lipo -archs "$helper")" = arm64
+          cmp target/aarch64-apple-darwin/release/kit "$helper"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"

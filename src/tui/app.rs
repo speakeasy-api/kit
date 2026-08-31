@@ -4049,6 +4049,7 @@ mod tests {
                 id: "saved".into(),
                 title: Some("Saved".into()),
                 preview: None,
+                is_subagent: false,
                 updated_at: 0,
             },
         ])));
@@ -4065,6 +4066,7 @@ mod tests {
                 id: id.into(),
                 title: Some(format!("{id} title")),
                 preview: None,
+                is_subagent: false,
                 updated_at: 0,
             })
             .collect();
