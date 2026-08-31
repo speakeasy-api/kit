@@ -2,23 +2,25 @@
 
 Kit's source and binary releases are public at
 [`speakeasy-api/kit`](https://github.com/speakeasy-api/kit).
-GitHub Actions builds and publishes release artifacts from version tags.
+GitHub Actions builds and publishes release artifacts on demand.
 
 ## Publish a release
 
-Update `Cargo.toml` and `Cargo.lock` to the new version, commit the release, then
-push a matching tag:
+Update `Cargo.toml` and `Cargo.lock` to the new version and commit the release. In
+GitHub, open **Actions > release**, select **Run workflow**, choose the commit or
+branch to release, and run it. Do not create or push a release tag.
 
-```sh
-git tag v0.1.83
-git push origin v0.1.83
-```
+The workflow reads the version from `Cargo.toml` and stops if it matches the most
+recent published release or if its tag or release already exists. It runs formatting,
+Clippy, and tests, builds the Linux x86-64 and macOS arm64 CLI archives, the ARM64
+Kit.app ZIP, and all container images, then creates the `v<version>` tag and GitHub
+release. Versions with a SemVer prerelease suffix, such as `0.1.120-pre.1`, produce
+a prerelease.
 
-For a prerelease, use `-pre` or `-pre.N`, for example `v0.1.83-pre.1`.
-The release workflow verifies the tag against `Cargo.toml`, runs formatting,
-Clippy, and tests, builds Linux x86-64 and macOS arm64 CLI archives plus the
-ARM64 Kit.app ZIP, generates checksums, and publishes them to the tagged GitHub release. Prerelease tags are
-marked as prereleases on GitHub.
+The newly built Linux Kit CLI reviews every change since the previous release and
+writes the GitHub release notes before the workflow attaches the archives and
+checksums. Configure the repository Actions secret `OPENROUTER_API_KEY` for this
+step. Kit uses the `release-notes` skill with the `z-ai/glm-5.3` OpenRouter model.
 
 ## macOS signing and notarization
 

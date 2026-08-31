@@ -1,9 +1,7 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,25 +9,72 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   verify:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      previous_tag: ${{ steps.release.outputs.previous_tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
-      - name: Verify release tag matches Cargo version
+      - name: Resolve and verify release version
+        id: release
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          escaped_version=${version//./\.}
-          if [[ $GITHUB_REF_NAME != "v$version" \
-            && ! $GITHUB_REF_NAME =~ ^v${escaped_version}-pre(\.[0-9]+)?$ ]]; then
-            echo "expected v${version}, v${version}-pre, or v${version}-pre.N" >&2
+          if [[ -z $version ]]; then
+            echo "::error::Could not read the package version from Cargo.toml."
             exit 1
           fi
+          tag="v$version"
+          previous_tag=$(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName,isDraft \
+              --jq 'map(select(.isDraft | not))[0].tagName // ""'
+          )
+          if [[ -z $previous_tag ]]; then
+            echo "::error::Could not find a previous published release."
+            exit 1
+          fi
+          if [[ ${previous_tag#v} == "$version" ]]; then
+            echo "::error::Cargo.toml version $version is already the latest release."
+            exit 1
+          fi
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1
+          tag_status=$?
+          set -e
+          case $tag_status in
+            0)
+              echo "::error::Tag or release $tag already exists."
+              exit 1
+              ;;
+            2) ;;
+            *)
+              echo "::error::Could not check whether tag $tag already exists."
+              exit 1
+              ;;
+          esac
+          prerelease=false
+          if [[ $version == *-* ]]; then
+            prerelease=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
@@ -37,6 +82,8 @@ jobs:
   linux-x64:
     needs: verify
     runs-on: blacksmith-8vcpu-ubuntu-2404
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
@@ -46,7 +93,7 @@ jobs:
       - name: Build and package
         shell: bash
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=$RELEASE_VERSION
           cargo build --locked --release --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
@@ -123,7 +170,7 @@ jobs:
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${{ needs.verify.outputs.version }}
           cargo build --locked --release --target aarch64-apple-darwin --bin kit
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
@@ -226,7 +273,7 @@ jobs:
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=${{ needs.verify.outputs.version }}
           cargo build --locked --release --target aarch64-apple-darwin --bin kit
           scripts/generate-macos-project.sh
           archive="$RUNNER_TEMP/Kit.xcarchive"
@@ -246,45 +293,92 @@ jobs:
           path: dist/Kit-*
           if-no-files-found: error
 
+  release-notes:
+    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, container-build]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: useblacksmith/checkout@v1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-linux-x64
+          path: dist
+      - name: Generate release notes with the built Kit CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          mkdir -p release-kit
+          tar -xzf "dist/kit-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C release-kit
+          release-kit/kit --version
+          release-kit/kit prompt \
+            --root "$GITHUB_WORKSPACE" \
+            --provider openrouter \
+            --model z-ai/glm-5.3 \
+            "use release-notes skill respond only with release notes" > kit-output.txt
+          sed '$ { /^session_id: /d; }' kit-output.txt > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::Kit returned an empty release note."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
   publish:
-    needs: [linux-x64, macos-cli-arm64, macos-app-arm64]
+    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, release-notes]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      MACOS_SIGNED: ${{ needs.macos-cli-arm64.outputs.signed == 'true' && needs.macos-app-arm64.outputs.signed == 'true' }}
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      RELEASE_TAG: ${{ needs.verify.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: kit-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
       - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           cd dist
           sha256sum kit-*.tar.gz Kit-*.zip > SHA256SUMS
-          prerelease=false
-          if [[ $GITHUB_REF_NAME == *-pre* ]]; then
-            prerelease=true
-          fi
-          if [[ $MACOS_SIGNED == true ]]; then
-            signing_note="The macOS CLI and Kit.app are Developer ID signed and notarized; the app ticket is stapled and verified."
-          else
-            signing_note="The macOS CLI and Kit.app are unsigned and not notarized."
-          fi
-          title="Kit ${GITHUB_REF_NAME#v}"
-          notes="Prebuilt Kit binaries. $signing_note"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz Kit-*.zip SHA256SUMS \
+          prerelease=${{ needs.verify.outputs.prerelease }}
+          title="Kit $RELEASE_VERSION"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_target=$(
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json targetCommitish --jq .targetCommitish
+            )
+            if [[ $release_target != "$GITHUB_SHA" ]]; then
+              echo "::error::Existing release $RELEASE_TAG targets $release_target, not $GITHUB_SHA."
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" kit-*.tar.gz Kit-*.zip SHA256SUMS \
               --clobber --repo "$GITHUB_REPOSITORY"
           else
             create_args=(
-              "$GITHUB_REF_NAME" kit-*.tar.gz Kit-*.zip SHA256SUMS
+              "$RELEASE_TAG" kit-*.tar.gz Kit-*.zip SHA256SUMS
               --repo "$GITHUB_REPOSITORY"
+              --target "$GITHUB_SHA"
               --title "$title"
-              --notes "$notes"
+              --notes-file ../release-notes.md
             )
             if [[ $prerelease == true ]]; then
               create_args+=(--prerelease)
@@ -292,10 +386,10 @@ jobs:
             gh release create "${create_args[@]}"
           fi
           edit_args=(
-            "$GITHUB_REF_NAME"
+            "$RELEASE_TAG"
             --repo "$GITHUB_REPOSITORY"
             --title "$title"
-            --notes "$notes"
+            --notes-file ../release-notes.md
             --draft=false
             --prerelease="$prerelease"
           )
@@ -306,7 +400,7 @@ jobs:
                 --jq '.[] | select((.isDraft | not) and (.isPrerelease | not)) | .tagName' \
                 | sort -V | tail -1
             )
-            if [[ $GITHUB_REF_NAME == "$newest_stable" ]]; then
+            if [[ $RELEASE_TAG == "$newest_stable" ]]; then
               edit_args+=(--latest)
             fi
           fi
@@ -350,7 +444,7 @@ jobs:
       - name: Read container version
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${{ needs.verify.outputs.version }}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Log in to GitHub Container Registry
@@ -428,13 +522,14 @@ jobs:
 
   containers:
     name: Publish container image manifests
-    needs: [publish, container-build]
+    needs: [verify, publish, container-build]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     env:
       IMAGE: ghcr.io/${{ github.repository }}
+      RELEASE_TAG: ${{ needs.verify.outputs.tag }}
     steps:
       - name: Download image digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -448,7 +543,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if [[ $GITHUB_REF_NAME == *-pre* ]]; then
+          if [[ $RELEASE_TAG == *-* ]]; then
             echo "floating=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -458,7 +553,7 @@ jobs:
               --jq '.[] | select((.isDraft | not) and (.isPrerelease | not)) | .tagName' \
               | sort -V | tail -1
           )
-          if [[ $GITHUB_REF_NAME == "$newest_stable" ]]; then
+          if [[ $RELEASE_TAG == "$newest_stable" ]]; then
             echo "floating=true" >> "$GITHUB_OUTPUT"
           else
             echo "floating=false" >> "$GITHUB_OUTPUT"
@@ -479,8 +574,8 @@ jobs:
           images: ${{ env.IMAGE }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}
-            type=raw,value=${{ github.ref_name }}-slim
+            type=raw,value=${{ needs.verify.outputs.tag }}
+            type=raw,value=${{ needs.verify.outputs.tag }}-slim
             type=raw,value=latest,enable=${{ steps.release.outputs.floating == 'true' }}
             type=raw,value=slim,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish slim manifest
@@ -501,7 +596,7 @@ jobs:
           images: ${{ env.IMAGE }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}-bookworm
+            type=raw,value=${{ needs.verify.outputs.tag }}-bookworm
             type=raw,value=bookworm,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Bookworm manifest
         env:
@@ -521,7 +616,7 @@ jobs:
           images: ${{ env.IMAGE }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}-alpine
+            type=raw,value=${{ needs.verify.outputs.tag }}-alpine
             type=raw,value=alpine,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Alpine manifest
         env:
