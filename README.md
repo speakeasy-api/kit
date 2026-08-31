@@ -313,11 +313,12 @@ Report issues at [speakeasy-api/kit/issues](https://github.com/speakeasy-api/kit
 
 MIT
 
-<div align="center">
-  <p>kit built by</p>
+<p align="center">
+  kit built by
+  <br><br>
   <a href="https://speakeasy.com/">
     <img src="docs/media/speakeasy-icon.png" alt="Speakeasy" width="96">
   </a>
   <br>
   <a href="https://speakeasy.com/">speakeasy.com</a>
-</div>
+</p>
