@@ -1568,7 +1568,7 @@ fn set_v2_config(
 fn catalog_session_info(entry: &crate::session::CatalogEntry, cwd: &Path) -> wire::SessionInfo {
     let mut info =
         wire::SessionInfo::new(wire::SessionId::new(entry.id.clone()), cwd.to_path_buf())
-            .title(entry.title.clone())
+            .title(entry.title.as_deref().map(str::to_owned))
             .updated_at(entry.updated_at_rfc3339());
     if entry.is_subagent {
         info = info.meta(serde_json::Map::from_iter([(

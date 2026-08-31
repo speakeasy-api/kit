@@ -14,10 +14,12 @@ List sessions for the workspace, then resume the ID shown in the header or catal
 
 ```sh
 kit sessions --root /path/to/project
+kit sessions rename <session-id> "OAuth token bug" --root /path/to/project
+kit sessions rename <session-id> --clear --root /path/to/project
 kit tui --root /path/to/project --resume <session-id>
 ```
 
-The catalog requires an existing directory and is workspace-filtered and newest-first. It reports each durable top-level session ID and updated time; sessions created as subagents are omitted based on structured origin metadata in their initial transcript. Sessions created before Kit recorded that metadata remain visible. Filtering affects discovery only; a known omitted ID can still be resumed explicitly. The title comes from the earliest retained useful user text so compaction does not rename a session; the preview describes the current retained history. Display metadata removes terminal controls and Unicode default-ignorable formatting characters.
+The catalog requires an existing directory and is workspace-filtered and newest-first. It reports each durable top-level session ID and updated time; sessions created as subagents are omitted based on structured origin metadata in their initial transcript. Sessions created before Kit recorded that metadata remain visible. Filtering affects discovery only; a known omitted ID can still be resumed explicitly. The generated title comes from the earliest retained useful user text so compaction does not rename a session; the preview describes the current retained history. A custom display name overrides that title in CLI, TUI, and ACP listings without changing the immutable session ID or preview. Names may contain Unicode, are trimmed, may be at most 100 characters, and may not contain line breaks or terminal control characters. Use `--clear` to restore the generated title.
 
 A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
 
@@ -101,7 +103,7 @@ The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, a
 /agents
 ```
 
-These local commands are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace; Up and Down move, Enter uses the existing resume flow, and Esc closes the dialog. `/close` closes the current session and exits the TUI.
+These local commands are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
@@ -114,10 +116,11 @@ Kit stores durable JSONL transcripts, locks, and session-associated fatal error 
 ```text
 ~/.kit/sessions/w-<workspace-hash>/<session-id>.jsonl
 ~/.kit/sessions/w-<workspace-hash>/<session-id>.lock
+~/.kit/sessions/w-<workspace-hash>/<session-id>.metadata.json
 ~/.kit/errors/<session-id>/<event-id>.json
 ```
 
-The workspace hash is the BLAKE3 digest of the canonical workspace-root path. It keeps identical session IDs in different workspaces in separate storage directories.
+The workspace hash is the BLAKE3 digest of the canonical workspace-root path. It keeps identical session IDs in different workspaces in separate storage directories. The optional metadata sidecar stores only the custom display name, is replaced atomically, and does not modify or lock the append-only transcript. Missing or malformed metadata falls back to the generated title without hiding the session.
 
 Fatal error records use their own versioned JSON schema and are not transcript content. Schema v2 adds optional structured transport diagnostics; schema v1 records remain readable. Transport diagnostics contain only bounded, allowlisted request/stream stage, retry, attempt, the provider's strictly validated `x-request-id` value, reqwest classification, and typed Hyper, HTTP/2, and I/O fields. Unknown or truncated source chains are identified without storing source text. Kit never stores raw error display/debug text, arbitrary headers, prompts, tool arguments, response bodies, credentials, URLs, or peer-controlled HTTP/2 debug text in these records. Files are written atomically with owner-only permissions on Unix, and Kit retains the newest 50 records per session. Cancellation is not a fatal error and does not create a record. When persistence succeeds, local prompt and ACP terminal errors include the log path; A2A records stay server-local.
 
