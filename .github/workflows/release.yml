@@ -58,7 +58,7 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  macos-arm64:
+  macos-cli-arm64:
     needs: verify
     runs-on: blacksmith-6vcpu-macos-15
     outputs:
@@ -118,13 +118,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s \
             -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Build and package
+      - name: Build, sign, notarize, and package CLI
         shell: bash
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
           version=${GITHUB_REF_NAME#v}
-          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
           if [[ $SIGN_RELEASE == true ]]; then
@@ -143,27 +143,117 @@ jobs:
               --key-id "$APPLE_API_KEY_ID" \
               --issuer "$APPLE_API_ISSUER_ID" \
               --wait 2>&1 | tee "$notary_log"
-            if ! grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$notary_log"; then
-              echo "Apple did not accept the notarization submission." >&2
+            grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$notary_log" || {
+              echo "Apple did not accept the standalone Kit notarization." >&2
               exit 1
-            fi
+            }
           fi
           stage/kit --version
           tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" kit
       - uses: actions/upload-artifact@v4
         with:
-          name: kit-macos-arm64
-          path: dist/*
+          name: kit-macos-cli-arm64
+          path: dist/kit-*.tar.gz
+          if-no-files-found: error
+
+  macos-app-arm64:
+    needs: verify
+    runs-on: blacksmith-6vcpu-macos-15
+    outputs:
+      signed: ${{ steps.signing.outputs.enabled }}
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: aarch64-apple-darwin
+      - name: Check optional signing credentials
+        id: signing
+        shell: bash
+        run: |
+          credentials=(
+            MACOS_CERTIFICATE_P12_BASE64
+            MACOS_CERTIFICATE_PASSWORD
+            MACOS_SIGNING_IDENTITY
+            APPLE_API_KEY_P8_BASE64
+            APPLE_API_KEY_ID
+            APPLE_API_ISSUER_ID
+          )
+          configured=0
+          for name in "${credentials[@]}"; do
+            if [[ -n ${!name:-} ]]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [[ $configured -eq 0 ]]; then
+            echo "Apple credentials are not configured; building an unsigned macOS release."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [[ $configured -eq ${#credentials[@]} ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Apple signing credentials are only partially configured." >&2
+            exit 1
+          fi
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          keychain=$RUNNER_TEMP/kit-signing.keychain-db
+          certificate=$RUNNER_TEMP/kit-signing.p12
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -f pkcs12 -k "$keychain" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build, archive, sign, notarize, and package app
+        shell: bash
+        env:
+          SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          scripts/generate-macos-project.sh
+          archive="$RUNNER_TEMP/Kit.xcarchive"
+          xcodebuild archive -quiet \
+            -project macos/KitDesktop.xcodeproj \
+            -scheme KitDesktop \
+            -configuration Release \
+            -archivePath "$archive" \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO
+          mkdir -p dist
+          scripts/package-macos-app.sh \
+            "$archive/Products/Applications/Kit.app" dist "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kit-macos-app-arm64
+          path: dist/Kit-*
           if-no-files-found: error
 
   publish:
-    needs: [linux-x64, macos-arm64]
+    needs: [linux-x64, macos-cli-arm64, macos-app-arm64]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      MACOS_SIGNED: ${{ needs.macos-arm64.outputs.signed }}
+      MACOS_SIGNED: ${{ needs.macos-cli-arm64.outputs.signed == 'true' && needs.macos-app-arm64.outputs.signed == 'true' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -174,24 +264,24 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum kit-*.tar.gz > SHA256SUMS
+          sha256sum kit-*.tar.gz Kit-*.zip > SHA256SUMS
           prerelease=false
           if [[ $GITHUB_REF_NAME == *-pre* ]]; then
             prerelease=true
           fi
           if [[ $MACOS_SIGNED == true ]]; then
-            signing_note="The macOS binary is Developer ID signed and notarized."
+            signing_note="The macOS CLI and Kit.app are Developer ID signed and notarized; the app ticket is stapled and verified."
           else
-            signing_note="The macOS binary is unsigned and not notarized."
+            signing_note="The macOS CLI and Kit.app are unsigned and not notarized."
           fi
           title="Kit ${GITHUB_REF_NAME#v}"
           notes="Prebuilt Kit binaries. $signing_note"
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS \
+            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz Kit-*.zip SHA256SUMS \
               --clobber --repo "$GITHUB_REPOSITORY"
           else
             create_args=(
-              "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS
+              "$GITHUB_REF_NAME" kit-*.tar.gz Kit-*.zip SHA256SUMS
               --repo "$GITHUB_REPOSITORY"
               --title "$title"
               --notes "$notes"
@@ -224,7 +314,7 @@ jobs:
 
   container-build:
     name: Build container images (${{ matrix.arch }}, ${{ matrix.family }})
-    needs: publish
+    needs: verify
     runs-on: ${{ matrix.runner }}
     concurrency:
       group: release-container-cache-${{ matrix.arch }}-${{ matrix.family }}

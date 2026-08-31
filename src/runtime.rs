@@ -232,6 +232,9 @@ struct McpInstallSources {
     configured_inherited: bool,
 }
 
+pub(crate) const SUBAGENT_SYSTEM_PROMPT_MARKER: &str =
+    "This task was delegated to you by the primary agent.";
+
 pub struct Runtime {
     root: PathBuf,
     adapter: SelectableAdapter,
@@ -1110,10 +1113,10 @@ impl Runtime {
     }
 
     fn system_prompt(&self, depth: usize) -> String {
-        let delegation_context = if depth == 1 {
-            "This task was delegated to you by the primary agent. Investigate it and carry out the work.\n\n"
+        let delegation_context = if depth > 0 {
+            format!("{SUBAGENT_SYSTEM_PROMPT_MARKER} Investigate it and carry out the work.\n\n")
         } else {
-            ""
+            String::new()
         };
         format!(
             concat!(

@@ -1,8 +1,13 @@
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/media/kit-lockup-inverse.png">
+    <img src="docs/media/kit-lockup.png" alt="Kit" width="226">
+  </picture>
+</h1>
+
 <p align="center">
   <img src="docs/media/hero.gif" alt="Kit fixing a failing test suite from the terminal" width="900">
 </p>
-
-<h1 align="center">Kit</h1>
 
 <p align="center">
   Kit is a coding agent runtime. It gives the model <strong>one tool</strong> for writing and running programs.<br>
@@ -84,7 +89,7 @@ cargo build --release          # target/release/kit
 scripts/sign-release.sh        # macOS only: sign before using the Keychain credential store
 ```
 
-Release binaries for macOS are signed and notarized under `com.speakeasy.kit`. See [Releasing](docs/releasing.md).
+Release binaries for macOS are signed and notarized under `com.speakeasy.kit`; the outer desktop app uses `com.speakeasy.kit.desktop`. See [Releasing](docs/releasing.md).
 
 ## Quick start
 

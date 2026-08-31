@@ -1599,6 +1599,7 @@ future_option = true
             id: "session-1".into(),
             title: Some("Fix tests".into()),
             preview: Some("Fix tests in the catalog".into()),
+            is_subagent: false,
             updated_at: 0,
         }]);
         assert_eq!(
