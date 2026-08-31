@@ -723,9 +723,10 @@ final class ACPClient {
             posix_spawn_file_actions_addclose(&actions, stderrWrite),
         ]
         guard actionResults.allSatisfy({ $0 == 0 }) else { throw ACPClientError.process("Unable to configure process pipes") }
+        // Use the extension declared by every SDK supported by CI and our macOS 14 deployment target.
+        // macOS 26 retains this symbol even though its SDK renames it to the standardized spelling.
         let chdirResult = workingDirectory.withCString { directory in
-            if #available(macOS 26, *) { posix_spawn_file_actions_addchdir(&actions, directory) }
-            else { posix_spawn_file_actions_addchdir_np(&actions, directory) }
+            posix_spawn_file_actions_addchdir_np(&actions, directory)
         }
         guard chdirResult == 0,
               posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)) == 0,
