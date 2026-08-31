@@ -16,7 +16,8 @@ use agentkit_acp::{
     },
 };
 use agentkit_core::{
-    CancellationController, FinishReason, Item, ItemKind, Part, SessionId, ToolOutput, Usage,
+    CancellationController, Delta, FinishReason, Item, ItemKind, Part, PartId, PartKind, SessionId,
+    ToolOutput, Usage,
 };
 use agentkit_loop::{
     AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
@@ -38,6 +39,7 @@ use super::{
 
 const PAGE_SIZE: usize = 100;
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_THOUGHT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn available_commands_update(session_id: wire::SessionId) -> wire::UpdateSessionNotification {
     wire::UpdateSessionNotification::new(
@@ -131,7 +133,9 @@ impl AcpSessionUpdateSink for ConnectionSink {
 #[derive(Default)]
 struct CurrentReplacementMessages {
     agent: Option<wire::MessageId>,
-    thought: Option<wire::MessageId>,
+    thoughts: Vec<wire::MessageId>,
+    thought_parts: HashMap<PartId, wire::MessageId>,
+    pending_thought: Option<wire::MessageId>,
     replacement: Option<ReplacementGeneration>,
 }
 
@@ -179,6 +183,40 @@ impl<S> ResponseReplacementSink<S> {
         }
     }
 
+    // AgentKit's ACP v2 adapter groups every reasoning part between tool boundaries
+    // under one message ID. Carry the current PartId across its synchronous observer-to-sink
+    // call so clients can render each reasoning part as a separate thought block.
+    fn prepare_content_delta(&self, delta: &Delta) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        current.pending_thought = match delta {
+            Delta::BeginPart {
+                part_id,
+                kind: PartKind::Reasoning,
+            } => {
+                current
+                    .thought_parts
+                    .entry(part_id.clone())
+                    .or_insert_with(|| {
+                        let sequence = NEXT_THOUGHT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
+                        wire::MessageId::new(format!("kit-thought-{sequence}"))
+                    });
+                None
+            }
+            Delta::AppendText { part_id, .. } => current.thought_parts.get(part_id).cloned(),
+            _ => None,
+        };
+    }
+
+    fn clear_pending_thought(&self) {
+        self.current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending_thought = None;
+    }
+
     fn rewrite_and_track(&self, notification: &mut wire::UpdateSessionNotification) {
         let mut current = self
             .current
@@ -192,10 +230,14 @@ impl<S> ResponseReplacementSink<S> {
                 current.agent = Some(chunk.message_id.clone());
             }
             wire::SessionUpdate::AgentThoughtChunk(chunk) => {
-                if let Some(replacement) = current.replacement.as_mut() {
+                if let Some(message_id) = current.pending_thought.take() {
+                    chunk.message_id = message_id;
+                } else if let Some(replacement) = current.replacement.as_mut() {
                     chunk.message_id = replacement.message_id("thought");
                 }
-                current.thought = Some(chunk.message_id.clone());
+                if !current.thoughts.contains(&chunk.message_id) {
+                    current.thoughts.push(chunk.message_id.clone());
+                }
             }
             _ => {}
         }
@@ -211,17 +253,19 @@ impl<S> ResponseReplacementSink<S> {
 
 impl<S: AcpSessionUpdateSink> ResponseReplacementSink<S> {
     fn clear_current(&self, session_id: &wire::SessionId) -> Vec<Result<(), AcpRuntimeError>> {
-        let (agent, thought) = {
+        let (agent, thoughts) = {
             let mut current = self
                 .current
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let agent = current.agent.take();
-            let thought = current.thought.take();
+            let thoughts = std::mem::take(&mut current.thoughts);
+            current.thought_parts.clear();
+            current.pending_thought = None;
             current.replacement = Some(ReplacementGeneration::new());
-            (agent, thought)
+            (agent, thoughts)
         };
-        let mut results = Vec::with_capacity(2);
+        let mut results = Vec::with_capacity(usize::from(agent.is_some()) + thoughts.len());
         if let Some(message_id) = agent {
             results.push(self.inner.update(wire::UpdateSessionNotification::new(
                 session_id.clone(),
@@ -230,7 +274,7 @@ impl<S: AcpSessionUpdateSink> ResponseReplacementSink<S> {
                 ),
             )));
         }
-        if let Some(message_id) = thought {
+        for message_id in thoughts {
             results.push(self.inner.update(wire::UpdateSessionNotification::new(
                 session_id.clone(),
                 wire::SessionUpdate::AgentThought(
@@ -349,7 +393,11 @@ where
         ) {
             self.sink.reset();
         }
+        if let AgentEvent::ContentDelta(delta) = &event.event {
+            self.sink.prepare_content_delta(delta);
+        }
         self.inner.handle_event(event);
+        self.sink.clear_pending_thought();
     }
 }
 
@@ -1969,6 +2017,62 @@ mod tests {
         assert_eq!(usage.used, 53_000);
         assert_eq!(usage.size, 272_000);
         assert!(usage.cost.is_none());
+    }
+
+    #[test]
+    fn reasoning_parts_use_separate_thought_message_ids() {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("thought-session");
+        let loop_session_id = SessionId::new("thought-loop");
+        let _handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let observer = ResponseReplacementObserver::new(integration, sink, session_id);
+        let emit = |delta| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_session_id.clone()),
+                event: AgentEvent::ContentDelta(delta),
+            });
+        };
+
+        let first = PartId::new("reasoning-1");
+        let second = PartId::new("reasoning-2");
+        emit(Delta::BeginPart {
+            part_id: first.clone(),
+            kind: PartKind::Reasoning,
+        });
+        for chunk in ["first", " continued"] {
+            emit(Delta::AppendText {
+                part_id: first.clone(),
+                chunk: chunk.into(),
+            });
+        }
+        emit(Delta::BeginPart {
+            part_id: second.clone(),
+            kind: PartKind::Reasoning,
+        });
+        emit(Delta::AppendText {
+            part_id: second,
+            chunk: "second".into(),
+        });
+
+        let updates = recording.updates.lock().unwrap();
+        let ids = updates
+            .iter()
+            .map(|notification| match &notification.update {
+                wire::SessionUpdate::AgentThoughtChunk(chunk) => chunk.message_id.clone(),
+                update => panic!("expected thought chunk, got {update:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2]);
     }
 
     #[test]
