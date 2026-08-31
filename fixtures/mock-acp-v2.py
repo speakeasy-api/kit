@@ -217,7 +217,17 @@ def prompt(request):
             {
                 "sessionUpdate": "agent_thought_chunk",
                 "messageId": "thought-1",
-                "content": {"type": "text", "text": "internal"},
+                "content": {"type": "text", "text": "outdated thought"},
+            },
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought-2",
+                "content": {"type": "text", "text": "latest "},
+            },
+            {
+                "sessionUpdate": "agent_thought_chunk",
+                "messageId": "thought-2",
+                "content": {"type": "text", "text": "thought"},
             },
             {
                 "sessionUpdate": "agent_message_chunk",

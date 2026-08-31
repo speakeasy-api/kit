@@ -204,14 +204,24 @@ struct TurnDurationPresentation: Equatable {
     let milliseconds: Int
 }
 
+struct ThoughtPresentation: Equatable {
+    let milliseconds: Int
+}
+
 enum TranscriptPresentation: Equatable {
     case user(UserMessagePresentation)
+    case thought(ThoughtPresentation)
     case tool(ToolPresentation)
     case turnDuration(TurnDurationPresentation)
 
     var userMessage: UserMessagePresentation? {
         guard case .user(let message) = self else { return nil }
         return message
+    }
+
+    var thought: ThoughtPresentation? {
+        guard case .thought(let thought) = self else { return nil }
+        return thought
     }
 
     var tool: ToolPresentation? {

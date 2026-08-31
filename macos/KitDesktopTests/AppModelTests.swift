@@ -256,7 +256,54 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
+    func testReselectingLockedConversationAttemptsClaim() async throws {
+        let directory = temporaryDirectory()
+        let store = PersistenceStore(fileURL: directory.appendingPathComponent("state.json"))
+        let workspace = Workspace(name: "Project", path: repositoryRoot.path)
+        let activeConversation = Conversation(workspaceID: workspace.id)
+        let lockedConversation = Conversation(workspaceID: workspace.id, sessionID: "locked-session")
+        try store.save(PersistedAppState(
+            workspaces: [workspace], conversations: [activeConversation, lockedConversation]
+        ))
+        let fixture = repositoryRoot.appendingPathComponent("fixtures/mock-acp-v2.py")
+        let pidFile = directory.appendingPathComponent("stale-helper-pids")
+        let launch = ACPClient.LaunchOverride(
+            executable: URL(fileURLWithPath: "/usr/bin/python3"),
+            prefixArguments: [fixture.path, "--models"],
+            environment: [
+                "MOCK_STALE_LOCK": "1", "MOCK_STALE_LOCK_PID_FILE": pidFile.path,
+            ]
+        )
+        let model = AppModel(
+            store: store, catalogLoader: nil,
+            controllerFactory: { conversation, path in
+                ConversationController(
+                    conversation: conversation, workspacePath: path,
+                    client: ACPClient(launchOverride: launch, requestTimeout: 2, promptTimeout: 2)
+                )
+            },
+            requestNotificationAuthorization: false
+        )
+
+        model.selectedConversationID = activeConversation.id
+        model.selectConversation(lockedConversation.id)
+        try await waitUntil("lock state was not published") { model.lockedConversationIDs.contains(lockedConversation.id) }
+        XCTAssertEqual(model.selectedConversationID, activeConversation.id)
+
+        model.selectConversation(lockedConversation.id)
+        try await waitUntil("claimed conversation was not selected") {
+            model.selectedConversationID == lockedConversation.id
+                && !model.lockedConversationIDs.contains(lockedConversation.id)
+        }
+
+        let closed = expectation(description: "closed")
+        model.closeAll { closed.fulfill() }
+        await fulfillment(of: [closed], timeout: 4)
+    }
+
+    @MainActor
     private func waitUntil(
+        _ message: String = "Condition was not met before timeout",
         timeout: TimeInterval = 6, condition: @escaping @MainActor () -> Bool
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
@@ -264,7 +311,7 @@ final class AppModelTests: XCTestCase {
             if condition() { return }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        XCTFail("Condition was not met before timeout")
+        XCTFail(message)
         throw NSError(domain: "AppModelTests", code: 1)
     }
 

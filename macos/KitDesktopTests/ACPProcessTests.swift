@@ -306,7 +306,11 @@ final class ACPProcessTests: XCTestCase {
         controller.send()
         wait(for: [finished], timeout: 3)
 
-        XCTAssertTrue(controller.entries.contains { $0.role == .thought })
+        let thoughts = controller.entries.filter { $0.role == .thought }
+        XCTAssertEqual(thoughts.count, 1)
+        XCTAssertEqual(thoughts.first?.text, "latest thought")
+        XCTAssertNotNil(thoughts.first?.presentation?.thought)
+        XCTAssertFalse(thoughts.first?.isStreaming ?? true)
         XCTAssertTrue(controller.entries.contains {
             $0.role == .tool && $0.title == "Inspect files" && !$0.isStreaming && $0.presentation?.tool?.status == .completed
         })
@@ -612,7 +616,7 @@ final class ACPProcessTests: XCTestCase {
     }
 
     @MainActor
-    func testStaleLockRecoveryWaitsForFailedHelperThenForcesOneRetry() throws {
+    func testLockedSessionWaitsForExplicitClaimBeforeForcingOneRetry() throws {
         let pidFile = temporaryDirectory().appendingPathComponent("stale-helper-pids")
         let client = makeClient(promptTimeout: 2, environment: [
             "MOCK_STALE_LOCK": "1", "MOCK_STALE_LOCK_PID_FILE": pidFile.path,
@@ -621,7 +625,9 @@ final class ACPProcessTests: XCTestCase {
         let controller = ConversationController(
             conversation: conversation, workspacePath: repositoryRoot.path, client: client
         )
-        let ready = expectation(description: "recovered")
+        let locked = expectation(description: "locked")
+        controller.onLockChanged = { if $0 { locked.fulfill() } }
+        let ready = expectation(description: "claimed")
         controller.onSessionReady = { sessionID, _ in
             XCTAssertEqual(sessionID, "locked-session")
             ready.fulfill()
@@ -629,8 +635,17 @@ final class ACPProcessTests: XCTestCase {
 
         controller.start()
 
+        wait(for: [locked], timeout: 4)
+        XCTAssertTrue(controller.isLocked)
+        XCTAssertFalse(controller.isReady)
+        let initialLaunches = try String(contentsOf: pidFile, encoding: .utf8).split(whereSeparator: \.isNewline)
+        XCTAssertEqual(initialLaunches.count, 1)
+        XCTAssertTrue(initialLaunches[0].hasSuffix(":normal"))
+
+        controller.claimLockedSession()
         wait(for: [ready], timeout: 7)
         XCTAssertTrue(controller.isReady)
+        XCTAssertFalse(controller.isLocked)
         XCTAssertFalse(controller.isRetryable)
         XCTAssertEqual(controller.entries.filter { $0.role == .user }.last?.text, "replayed user")
         let launches = try String(contentsOf: pidFile, encoding: .utf8).split(whereSeparator: \.isNewline)

@@ -23,6 +23,7 @@ final class ConversationController: ObservableObject {
     @Published var transcriptRevision = 0
     @Published private(set) var pendingAttachmentReceipts = 0
     @Published private(set) var isRetryable = false
+    @Published private(set) var isLocked = false
     @Published private(set) var agentRoster = AgentRoster()
     @Published private(set) var runtimeSessionID: String?
     @Published private(set) var pendingSteers: [PendingSteer] = []
@@ -91,6 +92,10 @@ final class ConversationController: ObservableObject {
     private var messageEntryIDs: [String: UUID] = [:]
     private var planEntryIDs: [String: UUID] = [:]
     private var toolStates: [String: DesktopToolUpdate] = [:]
+    private var activeThoughtEntryID: UUID?
+    private var activeThoughtStartedAt: ContinuousClock.Instant?
+    private var thoughtTexts: [String: String] = [:]
+    private var thoughtBlocks: [String: [DesktopContentBlock]] = [:]
     private let clock = ContinuousClock()
     private var foregroundStartedAt: ContinuousClock.Instant?
     private var autonomousStartedAt: [Int: ContinuousClock.Instant] = [:]
@@ -110,6 +115,7 @@ final class ConversationController: ObservableObject {
     var onTurnFinished: ((String) -> Void)?
     var onTitleChanged: ((String) -> Void)?
     var onActivityChanged: ((Bool) -> Void)?
+    var onLockChanged: ((Bool) -> Void)?
     var onConfigChanged: ((String, String, String, Bool) -> Void)?
 
     init(conversation: Conversation, workspacePath: String, client: ACPClient = ACPClient()) {
@@ -125,11 +131,23 @@ final class ConversationController: ObservableObject {
     func start() { start(force: false) }
 
     func retryIfNeeded() {
+        if isLocked {
+            claimLockedSession()
+            return
+        }
         guard isRetryable, !retrying, !shuttingDown else { return }
         retrying = true
         isRetryable = false
         status = "Reconnecting…"
         replaceClientAfterClosing(force: false)
+    }
+
+    func claimLockedSession() {
+        guard isLocked, !retrying, !shuttingDown else { return }
+        retrying = true
+        setLocked(false)
+        status = "Claiming thread…"
+        replaceClientAfterClosing(force: true)
     }
 
     private func start(force: Bool) {
@@ -176,14 +194,17 @@ final class ConversationController: ObservableObject {
             switch result {
             case .failure(let error):
                 self.startupUpdates = nil
-                if persisted != nil, !force, Self.isStaleLockError(error) {
-                    self.retryAfterStaleLock()
+                if persisted != nil, Self.isSessionLockError(error) {
+                    self.isRetryable = false
+                    self.setLocked(true)
+                    self.status = "Thread is open in another process"
                 } else {
                     self.isRetryable = true
                     self.fail(error)
                 }
             case .success(let payload):
                 self.isRetryable = false
+                self.setLocked(false)
                 self.configOptions = Self.parseConfigOptions(payload["configOptions"])
                 if let replay = self.startupUpdates {
                     self.replaceTranscript(with: replay)
@@ -344,12 +365,22 @@ final class ConversationController: ObservableObject {
 
     private func apply(_ update: DesktopUpdate) {
         switch update {
-        case .userMessage(let message): applyMessage(message, role: .user)
-        case .agentMessage(let message): applyMessage(message, role: .assistant)
-        case .agentThought(let message): applyMessage(message, role: .thought)
-        case .toolCall(let update), .toolCallUpdate(let update): updateTool(update)
-        case .toolCallContent(let id, let content): appendToolContent(id: id, content: content)
-        case .plan(let plan): applyPlan(plan)
+        case .userMessage(let message):
+            finishActiveThought()
+            applyMessage(message, role: .user)
+        case .agentMessage(let message):
+            finishActiveThought()
+            applyMessage(message, role: .assistant)
+        case .agentThought(let message): applyThought(message)
+        case .toolCall(let update), .toolCallUpdate(let update):
+            finishActiveThought()
+            updateTool(update)
+        case .toolCallContent(let id, let content):
+            finishActiveThought()
+            appendToolContent(id: id, content: content)
+        case .plan(let plan):
+            finishActiveThought()
+            applyPlan(plan)
         case .planRemoved(let id): removePlan(id: id)
         case .usage(let usage): contextUsed = usage.used; contextSize = usage.size
         case .tokenUsage(let usage): tokenUsage = usage
@@ -359,16 +390,49 @@ final class ConversationController: ObservableObject {
         case .state(let state): applySessionState(state)
         case .turnState(let state): applyTurnState(state)
         case .notice(let notice):
+            finishActiveThought()
             status = notice.title
             appendEntry(TranscriptEntry(role: .status, title: notice.severity?.capitalized ?? "Notice", text: notice.description ?? notice.title))
         case .compaction(let compaction):
+            finishActiveThought()
             status = compaction.error ?? "Compaction " + compaction.status.replacingOccurrences(of: "_", with: " ")
             let text = compaction.summary?.map(Self.contentText).joined() ?? status
             upsertSingleton(role: .status, title: "Compaction", text: text)
-        case .compactionChunk(_, let content): appendChunk(role: .status, content: content)
+        case .compactionChunk(_, let content):
+            finishActiveThought()
+            appendChunk(role: .status, content: content)
         case .currentMode: break
         case .unknown: break
         }
+    }
+
+    private func applyThought(_ message: DesktopMessageUpdate) {
+        let blocks = message.content
+        let text = blocks.map(Self.contentText).joined()
+        let currentText = message.replace
+            ? text
+            : (thoughtTexts[message.messageId] ?? "") + text
+        let currentBlocks = message.replace
+            ? blocks
+            : (thoughtBlocks[message.messageId] ?? []) + blocks
+        thoughtTexts[message.messageId] = String(currentText.suffix(256 * 1024))
+        thoughtBlocks[message.messageId] = currentBlocks
+
+        if activeThoughtEntryID == nil {
+            let entry = TranscriptEntry(role: .thought, text: "", isStreaming: true)
+            appendEntry(entry)
+            activeThoughtEntryID = entry.id
+            activeThoughtStartedAt = clock.now
+            streamingEntryIDs.insert(entry.id)
+        }
+        guard let entryID = activeThoughtEntryID,
+              let index = entries.firstIndex(where: { $0.id == entryID }) else { return }
+        entries[index].text = thoughtTexts[message.messageId] ?? ""
+        entries[index].contentBlocks = thoughtBlocks[message.messageId] ?? []
+        entries[index].formatted = nil
+        entries[index].isStreaming = true
+        messageEntryIDs[message.messageId] = entryID
+        transcriptRevision += 1
     }
 
     private func applyMessage(_ message: DesktopMessageUpdate, role: TranscriptRole) {
@@ -545,6 +609,7 @@ final class ConversationController: ObservableObject {
     }
 
     private func appendTurnDuration(since start: ContinuousClock.Instant?) {
+        finishActiveThought()
         guard let start else { return }
         appendEntry(TranscriptEntry(
             role: .duration, text: "",
@@ -616,7 +681,26 @@ final class ConversationController: ObservableObject {
         transcriptRevision += 1
     }
 
+    private func finishActiveThought() {
+        guard let entryID = activeThoughtEntryID else { return }
+        if let index = entries.firstIndex(where: { $0.id == entryID }) {
+            let elapsed = activeThoughtStartedAt.map { $0.duration(to: clock.now) } ?? .zero
+            entries[index].isStreaming = false
+            entries[index].formatted = Self.markdown(entries[index].text)
+            entries[index].presentation = .thought(ThoughtPresentation(
+                milliseconds: Self.turnDuration(elapsed).milliseconds
+            ))
+        }
+        streamingEntryIDs.remove(entryID)
+        activeThoughtEntryID = nil
+        activeThoughtStartedAt = nil
+        thoughtTexts.removeAll(keepingCapacity: true)
+        thoughtBlocks.removeAll(keepingCapacity: true)
+        transcriptRevision += 1
+    }
+
     private func finishStreamingEntries(preservingBackgroundWork: Bool) {
+        finishActiveThought()
         var retained: Set<UUID> = []
         for id in streamingEntryIDs {
             guard let index = entries.firstIndex(where: { $0.id == id }) else { continue }
@@ -822,17 +906,15 @@ final class ConversationController: ObservableObject {
         messageEntryIDs.removeAll()
         planEntryIDs.removeAll()
         toolStates.removeAll()
+        activeThoughtEntryID = nil
+        activeThoughtStartedAt = nil
+        thoughtTexts.removeAll(keepingCapacity: true)
+        thoughtBlocks.removeAll(keepingCapacity: true)
         latestAssistantSource = ""
         contextUsed = nil
         contextSize = nil
         transcriptRevision += 1
         for update in updates { apply(update) }
-    }
-
-    private func retryAfterStaleLock() {
-        guard !retrying, !shuttingDown else { return }
-        retrying = true
-        replaceClientAfterClosing(force: true)
     }
 
     private func replaceClientAfterClosing(force: Bool) {
@@ -852,12 +934,23 @@ final class ConversationController: ObservableObject {
         client === candidate && clientGeneration == generation
     }
 
-    private static func isStaleLockError(_ error: Error) -> Bool {
+    private static func isSessionLockError(_ error: Error) -> Bool {
         guard case ACPClientError.remote(_, let message) = error else { return false }
-        return message.contains("use --force to override a stale lock")
+        let normalized = message.lowercased()
+        return normalized.contains("session is locked")
+            || normalized.contains("session is actively locked")
+            || normalized.contains("thread is locked")
+            || normalized.contains("locked by another process")
+    }
+
+    private func setLocked(_ locked: Bool) {
+        guard isLocked != locked else { return }
+        isLocked = locked
+        onLockChanged?(locked)
     }
 
     private func fail(_ error: Error) {
+        finishActiveThought()
         status = "Error: \(error.localizedDescription)"
         appendEntry(TranscriptEntry(role: .error, text: error.localizedDescription, formatted: Self.markdown(error.localizedDescription)))
     }

@@ -10,6 +10,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var state: PersistedAppState
     @Published private(set) var controllers: [UUID: ConversationController] = [:]
     @Published private(set) var activity: [UUID: Bool] = [:]
+    @Published private(set) var lockedConversationIDs: Set<UUID> = []
     @Published var selectedWorkspaceID: UUID?
     @Published var selectedConversationID: UUID?
     @Published var persistenceError: String?
@@ -227,6 +228,7 @@ final class AppModel: ObservableObject {
         for id in removedIDs {
             controllers.removeValue(forKey: id)?.close()
             activity.removeValue(forKey: id)
+            lockedConversationIDs.remove(id)
         }
         if let selectedConversationID, removedIDs.contains(selectedConversationID) {
             self.selectedConversationID = replacements[selectedConversationID]
@@ -285,6 +287,11 @@ final class AppModel: ObservableObject {
         controller.onTurnFinished = { [weak self] reason in self?.turnFinished(id: id, reason: reason) }
         controller.onTitleChanged = { [weak self] title in self?.updateConversation(id) { $0.title = title } }
         controller.onActivityChanged = { [weak self] active in self?.activity[id] = active }
+        controller.onLockChanged = { [weak self] locked in
+            guard let self else { return }
+            if locked { self.lockedConversationIDs.insert(id) }
+            else { self.lockedConversationIDs.remove(id) }
+        }
         controller.onConfigChanged = { [weak self] provider, model, effort, userSelected in
             self?.updateConversation(id) { item in
                 item.provider = provider

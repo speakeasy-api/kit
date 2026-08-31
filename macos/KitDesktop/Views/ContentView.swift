@@ -58,7 +58,8 @@ struct ContentView: View {
                                 ConversationRow(
                                     conversation: conversation,
                                     selected: conversation.id == model.selectedConversationID,
-                                    running: model.activity[conversation.id] == true
+                                    running: model.activity[conversation.id] == true,
+                                    locked: model.lockedConversationIDs.contains(conversation.id)
                                 )
                             }.buttonStyle(.plain)
                         }
@@ -104,6 +105,7 @@ struct ContentView: View {
         if let controller = model.selectedController {
             let title = model.state.conversations.first(where: { $0.id == model.selectedConversationID })?.title ?? "Conversation"
             ConversationView(controller: controller, title: title)
+                .id(controller.conversationID)
         } else {
             VStack(spacing: 14) {
                 Image("KitMark")
@@ -382,6 +384,7 @@ private struct ConversationRow: View {
     let conversation: Conversation
     let selected: Bool
     let running: Bool
+    let locked: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -404,7 +407,13 @@ private struct ConversationRow: View {
     }
 
     @ViewBuilder private var statusMark: some View {
-        if running { ProgressView().controlSize(.mini).frame(width: 9, height: 9) }
+        if locked {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 9, height: 9)
+                .help("Thread is open in another process. Click to try to claim it.")
+        } else if running { ProgressView().controlSize(.mini).frame(width: 9, height: 9) }
         else if conversation.awaitingUser { Circle().fill(Brand.ember).frame(width: 7, height: 7) }
         else if conversation.unread { Circle().fill(Brand.vermilion).frame(width: 7, height: 7) }
         else { Circle().fill(.clear).frame(width: 7, height: 7) }
@@ -569,12 +578,15 @@ private struct ConversationView: View {
                                 cancelBackground: { if let id = entry.toolCallID { controller.cancelBackground(callID: id) } }
                             ).id(entry.id)
                         }
-                        Color.clear.frame(height: 1).id("bottom")
                     }
                     .frame(maxWidth: 820, alignment: .leading)
                     .padding(.horizontal, 30).padding(.top, 28).padding(.bottom, 24)
                     .frame(maxWidth: .infinity)
                 }
+                Color.clear.frame(height: 1).id("bottom")
+            }
+            .onAppear {
+                DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .onChange(of: controller.transcriptRevision) { _, _ in
                 if followTranscript { withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo("bottom", anchor: .bottom) } }
@@ -1060,21 +1072,42 @@ private struct ThoughtCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } } label: {
+            if entry.isStreaming {
                 HStack(spacing: 9) {
-                    Image(systemName: "brain.head.profile").foregroundStyle(Brand.primary)
-                    Text(entry.isStreaming ? "Thinking…" : "Reasoning").font(.callout.weight(.medium))
+                    ProgressView().controlSize(.small).frame(width: 16, height: 16)
+                    Text("Thinking…").font(.callout.weight(.medium))
                     Spacer()
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.caption2).foregroundStyle(.tertiary)
-                }.contentShape(Rectangle())
-            }.buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 10)
-            if expanded {
+                }
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Thinking")
+            } else {
+                Button { withAnimation(.easeInOut(duration: 0.16)) { expanded.toggle() } } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "brain.head.profile").foregroundStyle(Brand.primary)
+                        Text(completedLabel).font(.callout.weight(.medium))
+                        Spacer()
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }.contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 10)
+            }
+            if entry.isStreaming || expanded {
                 Divider().opacity(0.55)
                 MessageText(entry: entry).foregroundStyle(.secondary).padding(12)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .animation(.easeInOut(duration: 0.18), value: entry.isStreaming)
         .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: Brand.Radius.medium))
         .overlay { RoundedRectangle(cornerRadius: Brand.Radius.medium).stroke(Brand.hairline) }
+    }
+
+    private var completedLabel: String {
+        guard let milliseconds = entry.presentation?.thought?.milliseconds else { return "Thought" }
+        let seconds = max(1, Int((Double(milliseconds) / 1_000).rounded()))
+        return "Thought for \(seconds) \(seconds == 1 ? "second" : "seconds")"
     }
 }
 

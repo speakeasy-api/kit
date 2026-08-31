@@ -75,5 +75,6 @@ jobs:
           test "$(lipo -archs "$app/Contents/MacOS/Kit")" = arm64
           test "$(lipo -archs "$helper")" = arm64
           cmp target/aarch64-apple-darwin/release/kit "$helper"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.speakeasy.kit.desktop
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
