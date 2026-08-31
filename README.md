@@ -308,3 +308,17 @@ Kit compiles the same documentation into the binary. The agent searches this doc
 ## Reporting issues
 
 Report issues at [speakeasy-api/kit/issues](https://github.com/speakeasy-api/kit/issues). Include the Kit version and follow the [reporting guide](docs/user/reporting-kit-issues.md). An agent must ask for your permission before it files an issue for you.
+
+## License
+
+MIT
+
+<p align="center">
+  kit built by
+  <br><br>
+  <a href="https://speakeasy.com/">
+    <img src="docs/media/speakeasy-icon.png" alt="Speakeasy" width="96">
+  </a>
+  <br>
+  <a href="https://speakeasy.com/">speakeasy.com</a>
+</p>
