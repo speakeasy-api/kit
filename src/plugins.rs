@@ -113,13 +113,149 @@ struct PluginRuntimeInner {
     cache_root: PathBuf,
     skill_cache_root: PathBuf,
     data_root: PathBuf,
-    published: RwLock<Arc<ResolvedPlugins>>,
+    git_mode: GitResolverMode,
+    published: RwLock<PublishedPlugins>,
     generation_barrier: Arc<tokio::sync::RwLock<()>>,
+}
+
+#[derive(Clone)]
+enum GitResolverMode {
+    Https,
+    #[cfg(test)]
+    Local {
+        repository: PathBuf,
+        activity: Arc<GitActivity>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct GitActivity {
+    probes: std::sync::atomic::AtomicUsize,
+    fetches: std::sync::atomic::AtomicUsize,
+    archives: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone)]
+struct PublishedPlugins {
+    resolved: Arc<ResolvedPlugins>,
+    source_fingerprint: Option<SourceFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedGitRevision {
+    fetch_revision: GitRevision,
+    raw_oid: String,
+    commit_oid: String,
+}
+
+enum GitSourceRevision<'a> {
+    Unplanned(&'a GitRevision),
+    Planned(&'a PlannedGitRevision),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceFingerprint {
+    candidate: blake3::Hash,
+    resolved: blake3::Hash,
+}
+
+#[derive(Clone)]
+struct PlannedPathSource {
+    canonical_root: PathBuf,
+    tree_fingerprint: blake3::Hash,
+}
+
+#[derive(Clone)]
+struct SourcePlan {
+    candidate_fingerprint: blake3::Hash,
+    path_sources: BTreeMap<String, PlannedPathSource>,
+    git_revisions: BTreeMap<String, PlannedGitRevision>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedGitRevision {
+    raw_oid: String,
+    commit_oid: String,
+}
+
+#[derive(Debug)]
+struct ResolvedGitSource {
+    root: PathBuf,
+    revision: ResolvedGitRevision,
+}
+
+struct BlockingResolution {
+    resolved: ResolvedPlugins,
+    git_revisions: BTreeMap<String, ResolvedGitRevision>,
 }
 
 #[derive(Debug)]
 pub(crate) struct StagedPlugins {
-    pub(crate) resolved: ResolvedPlugins,
+    pub(crate) resolved: Arc<ResolvedPlugins>,
+    source_fingerprint: SourceFingerprint,
+}
+
+impl SourcePlan {
+    fn verify_path_fingerprints(
+        &self,
+        configs: &BTreeMap<String, PluginConfig>,
+        runtime_root: &Path,
+    ) -> Result<(), String> {
+        let configured_paths = configs
+            .values()
+            .filter(|config| matches!(config, PluginConfig::Path { .. }))
+            .count();
+        if configured_paths != self.path_sources.len() {
+            return Err("not all staged plugin paths have fingerprints".into());
+        }
+        for (alias, config) in configs {
+            let PluginConfig::Path { path } = config else {
+                continue;
+            };
+            let expected = self
+                .path_sources
+                .get(alias)
+                .ok_or_else(|| format!("path fingerprint for plugin {alias:?} was not retained"))?;
+            let verification_error =
+                || format!("plugin path for {alias:?} could not be verified after staging");
+            let root = resolve_path(path, runtime_root).map_err(|_| verification_error())?;
+            let actual = local_plugin_tree_fingerprint(&root).map_err(|_| verification_error())?;
+            if root != expected.canonical_root || actual != expected.tree_fingerprint {
+                return Err(format!("plugin path for {alias:?} changed during staging"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verified_fingerprint(
+        &self,
+        resolved: &BTreeMap<String, ResolvedGitRevision>,
+    ) -> Result<SourceFingerprint, String> {
+        if resolved.len() != self.git_revisions.len() {
+            return Err("not all staged Git revisions were verified".into());
+        }
+        let mut fingerprint = blake3::Hasher::new();
+        fingerprint.update(b"kit-plugin-resolved-sources-v1");
+        fingerprint.update(self.candidate_fingerprint.as_bytes());
+        for (alias, planned) in &self.git_revisions {
+            let verified = resolved
+                .get(alias)
+                .ok_or_else(|| format!("Git revision for plugin {alias:?} was not verified"))?;
+            if verified.raw_oid != planned.raw_oid || verified.commit_oid != planned.commit_oid {
+                return Err(format!(
+                    "Git revision for plugin {alias:?} moved during staging"
+                ));
+            }
+            hash_fingerprint_field(&mut fingerprint, alias.as_bytes());
+            hash_fingerprint_field(&mut fingerprint, verified.raw_oid.as_bytes());
+            hash_fingerprint_field(&mut fingerprint, verified.commit_oid.as_bytes());
+        }
+        Ok(SourceFingerprint {
+            candidate: self.candidate_fingerprint,
+            resolved: fingerprint.finalize(),
+        })
+    }
 }
 
 impl PluginRuntime {
@@ -137,7 +273,7 @@ impl PluginRuntime {
             ResolvedPlugins::default(),
         );
         let staged = runtime.stage().await?;
-        runtime.publish(staged.resolved);
+        runtime.publish(staged);
         Ok(runtime)
     }
 
@@ -174,18 +310,39 @@ impl PluginRuntime {
                 cache_root,
                 skill_cache_root,
                 data_root,
-                published: RwLock::new(Arc::new(initial)),
+                git_mode: GitResolverMode::Https,
+                published: RwLock::new(PublishedPlugins {
+                    resolved: Arc::new(initial),
+                    source_fingerprint: None,
+                }),
                 generation_barrier: Arc::new(tokio::sync::RwLock::new(())),
             }),
         }
     }
 
+    #[cfg(test)]
+    fn with_local_git_mode(mut self, repository: &Path, activity: Arc<GitActivity>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.git_mode = GitResolverMode::Local {
+                repository: repository.to_path_buf(),
+                activity,
+            };
+        }
+        self
+    }
+
     pub fn snapshot(&self) -> Arc<ResolvedPlugins> {
-        self.inner
-            .published
-            .read()
-            .expect("plugin generation lock poisoned")
-            .clone()
+        match self.inner.published.read() {
+            Ok(published) => published.resolved.clone(),
+            Err(poisoned) => poisoned.into_inner().resolved.clone(),
+        }
+    }
+
+    fn published(&self) -> PublishedPlugins {
+        match self.inner.published.read() {
+            Ok(published) => published.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     pub(crate) async fn stage(&self) -> Result<StagedPlugins, String> {
@@ -212,40 +369,41 @@ impl PluginRuntime {
                 .plugins
         };
         cleanup_runtime_skill_generations(&self.inner.skill_cache_root, &self.snapshot());
-        let resolved = resolve_with_skill_cache(
+        stage_with_skill_cache(
             &configs,
             &self.inner.runtime_root,
             &self.inner.cache_root,
             &self.inner.skill_cache_root,
             &self.inner.data_root,
+            self.inner.git_mode.clone(),
+            self.published(),
         )
         .await
-        .map_err(bounded_diagnostic)?;
-        Ok(StagedPlugins { resolved })
+        .map_err(bounded_diagnostic)
     }
 
     pub(crate) async fn generation_lease(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.inner.generation_barrier.clone().read_owned().await
     }
 
-    pub(crate) fn try_generation_lease(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
-        self.inner.generation_barrier.clone().try_read_owned().ok()
-    }
-
     pub(crate) async fn generation_writer(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         self.inner.generation_barrier.clone().write_owned().await
     }
 
-    pub(crate) fn publish(&self, resolved: ResolvedPlugins) {
-        let mut published = self
-            .inner
-            .published
-            .write()
-            .expect("plugin generation lock poisoned");
-        if resolved_generation_key(&published) != resolved_generation_key(&resolved) {
-            *published = Arc::new(resolved);
+    pub(crate) fn publish(&self, staged: StagedPlugins) {
+        let mut published = match self.inner.published.write() {
+            Ok(published) => published,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let unchanged = published
+            .source_fingerprint
+            .is_some_and(|current| current.resolved == staged.source_fingerprint.resolved)
+            && Arc::ptr_eq(&published.resolved, &staged.resolved);
+        if !unchanged {
+            published.resolved = staged.resolved;
         }
-        let current = published.clone();
+        published.source_fingerprint = Some(staged.source_fingerprint);
+        let current = published.resolved.clone();
         drop(published);
         cleanup_runtime_skill_generations(&self.inner.skill_cache_root, &current);
     }
@@ -256,20 +414,6 @@ impl Drop for PluginRuntimeInner {
         make_tree_writable(&self.skill_cache_root);
         let _ = fs::remove_dir_all(&self.skill_cache_root);
     }
-}
-
-fn resolved_generation_key(resolved: &ResolvedPlugins) -> blake3::Hash {
-    let mut key = blake3::Hasher::new();
-    for root in &resolved.package_roots {
-        key.update(root.as_os_str().as_encoded_bytes());
-        key.update(&[0]);
-    }
-    for directory in &resolved.skill_directories {
-        key.update(directory.as_os_str().as_encoded_bytes());
-        key.update(&[0]);
-    }
-    key.update(format!("{:?}", resolved.mcp_plugins).as_bytes());
-    key.finalize()
 }
 
 pub(crate) fn bounded_diagnostic(mut message: String) -> String {
@@ -307,22 +451,103 @@ async fn resolve_with_skill_cache(
     let cache_root = cache_root.to_path_buf();
     let skill_cache_root = skill_cache_root.to_path_buf();
     let data_root = data_root.to_path_buf();
-    let mut resolved = tokio::task::spawn_blocking(move || {
+    let resolution = tokio::task::spawn_blocking(move || {
         resolve_blocking(
             &configs,
             &runtime_root,
             &cache_root,
             &skill_cache_root,
             &data_root,
+            &GitResolverMode::Https,
+            None,
         )
     })
     .await
     .map_err(|error| format!("plugin resolver task failed: {error}"))??;
+    let mut resolved = resolution.resolved;
     let registry = SkillRegistry::from_skill_dirs(resolved.skill_directories.clone())
         .discover_skills()
         .await;
     resolved.skills = registry.skills().into_iter().cloned().collect();
     Ok(resolved)
+}
+
+enum BlockingStage {
+    Reused {
+        resolved: Arc<ResolvedPlugins>,
+        source_fingerprint: SourceFingerprint,
+    },
+    Fresh {
+        resolved: ResolvedPlugins,
+        source_fingerprint: SourceFingerprint,
+    },
+}
+
+async fn stage_with_skill_cache(
+    configs: &BTreeMap<String, PluginConfig>,
+    runtime_root: &Path,
+    cache_root: &Path,
+    skill_cache_root: &Path,
+    data_root: &Path,
+    git_mode: GitResolverMode,
+    published: PublishedPlugins,
+) -> Result<StagedPlugins, String> {
+    let configs = configs.clone();
+    let runtime_root = runtime_root.to_path_buf();
+    let cache_root = cache_root.to_path_buf();
+    let skill_cache_root = skill_cache_root.to_path_buf();
+    let data_root = data_root.to_path_buf();
+    let staged = tokio::task::spawn_blocking(move || -> Result<BlockingStage, String> {
+        let source_plan = source_plan(&configs, &runtime_root, &cache_root, &git_mode)?;
+        if let Some(source_fingerprint) = published
+            .source_fingerprint
+            .filter(|fingerprint| fingerprint.candidate == source_plan.candidate_fingerprint)
+        {
+            return Ok(BlockingStage::Reused {
+                resolved: published.resolved,
+                source_fingerprint,
+            });
+        }
+        let resolution = resolve_blocking(
+            &configs,
+            &runtime_root,
+            &cache_root,
+            &skill_cache_root,
+            &data_root,
+            &git_mode,
+            Some(&source_plan),
+        )?;
+        source_plan.verify_path_fingerprints(&configs, &runtime_root)?;
+        let source_fingerprint = source_plan.verified_fingerprint(&resolution.git_revisions)?;
+        Ok(BlockingStage::Fresh {
+            resolved: resolution.resolved,
+            source_fingerprint,
+        })
+    })
+    .await
+    .map_err(|error| format!("plugin resolver task failed: {error}"))??;
+    match staged {
+        BlockingStage::Reused {
+            resolved,
+            source_fingerprint,
+        } => Ok(StagedPlugins {
+            resolved,
+            source_fingerprint,
+        }),
+        BlockingStage::Fresh {
+            mut resolved,
+            source_fingerprint,
+        } => {
+            let registry = SkillRegistry::from_skill_dirs(resolved.skill_directories.clone())
+                .discover_skills()
+                .await;
+            resolved.skills = registry.skills().into_iter().cloned().collect();
+            Ok(StagedPlugins {
+                resolved: Arc::new(resolved),
+                source_fingerprint,
+            })
+        }
+    }
 }
 
 fn resolve_blocking(
@@ -331,8 +556,11 @@ fn resolve_blocking(
     cache_root: &Path,
     skill_cache_root: &Path,
     data_root: &Path,
-) -> Result<ResolvedPlugins, String> {
+    git_mode: &GitResolverMode,
+    source_plan: Option<&SourcePlan>,
+) -> Result<BlockingResolution, String> {
     let mut resolved = ResolvedPlugins::default();
+    let mut verified_git_revisions = BTreeMap::new();
     let mut manifest_names = BTreeSet::new();
     let mut loaded_generations = Vec::new();
     for (alias, config) in configs {
@@ -344,9 +572,18 @@ fn resolve_blocking(
                 sha256,
                 subdir,
             } => resolve_archive(url, sha256, subdir.as_deref(), cache_root)?,
-            PluginConfig::Git { url, rev, subdir } => {
-                resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root)?
-            }
+            PluginConfig::Git { url, rev, subdir } => match source_plan {
+                Some(source_plan) => {
+                    let planned = source_plan.git_revisions.get(alias).ok_or_else(|| {
+                        format!("missing staged Git revision for plugin {alias:?}")
+                    })?;
+                    let verified =
+                        resolve_git_planned(url, subdir.as_deref(), cache_root, git_mode, planned)?;
+                    verified_git_revisions.insert(alias.clone(), verified.revision);
+                    verified.root
+                }
+                None => resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root)?,
+            },
         };
         let plugin = AgentPlugin::load(&root).map_err(|error| {
             format!(
@@ -417,7 +654,10 @@ fn resolve_blocking(
     }
     resolved.package_roots = package_roots;
     resolved.skill_directories = skill_directories;
-    Ok(resolved)
+    Ok(BlockingResolution {
+        resolved,
+        git_revisions: verified_git_revisions,
+    })
 }
 
 fn plugin_semantic_key(plugin: &AgentPlugin) -> blake3::Hash {
@@ -467,9 +707,13 @@ fn snapshot_skills(
                     directory.display()
                 )
             })?;
-            let relative = directory
-                .strip_prefix(package)
-                .expect("owning package is a prefix");
+            let relative = directory.strip_prefix(package).map_err(|error| {
+                format!(
+                    "could not resolve plugin skill {} relative to package {}: {error}",
+                    directory.display(),
+                    package.display()
+                )
+            })?;
             let target = PathBuf::from(index.to_string()).join(relative);
             collect_skill_inventory(
                 package,
@@ -716,9 +960,13 @@ fn collect_skill_inventory(
             directory.display()
         ));
     }
-    let relative = directory
-        .strip_prefix(package_root)
-        .expect("validated skill directory is in its package");
+    let relative = directory.strip_prefix(package_root).map_err(|error| {
+        format!(
+            "could not resolve plugin skill {} relative to package {}: {error}",
+            directory.display(),
+            package_root.display()
+        )
+    })?;
     inventory.insert(target_root.join(relative), CachedEntry::Directory);
     let entries = fs::read_dir(directory).map_err(|error| {
         format!(
@@ -741,9 +989,13 @@ fn collect_skill_inventory(
         if metadata.is_dir() {
             collect_skill_inventory(package_root, &path, target_root, inventory, captured_bytes)?;
         } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(package_root)
-                .expect("skill inventory remains under its package");
+            let relative = path.strip_prefix(package_root).map_err(|error| {
+                format!(
+                    "could not resolve plugin skill entry {} relative to package {}: {error}",
+                    path.display(),
+                    package_root.display()
+                )
+            })?;
             capture_snapshot_file(
                 package_root,
                 &path,
@@ -1181,16 +1433,10 @@ fn publish_cached_directory(
             parent.display()
         )
     })?;
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).map_err(|error| error.to_string())?;
-    let staging = parent.join(format!(
-        ".{}-{:x}.tmp",
-        std::process::id(),
-        u64::from_le_bytes(random)
-    ));
-    fs::create_dir(&staging)
-        .map_err(|error| format!("could not create {context} staging directory: {error}"))?;
-    let result = build(&staging).and_then(|()| match fs::rename(&staging, destination) {
+    let staging_guard = StagingDirectory::create(parent, ".cache-", context)?;
+    let staging = staging_guard.path();
+    build(staging)?;
+    match fs::rename(staging, destination) {
         Ok(()) => Ok(()),
         Err(_)
             if fs::symlink_metadata(destination)
@@ -1199,11 +1445,7 @@ fn publish_cached_directory(
             Ok(())
         }
         Err(error) => Err(format!("could not publish {context}: {error}")),
-    });
-    if staging.exists() {
-        let _ = fs::remove_dir_all(&staging);
     }
-    result
 }
 
 fn validate_plugin_diagnostics(alias: &str, plugin: &AgentPlugin) -> Result<(), String> {
@@ -1250,6 +1492,265 @@ fn resolve_path(path: &Path, runtime_root: &Path) -> Result<PathBuf, String> {
     };
     path.canonicalize()
         .map_err(|error| format!("could not resolve plugin path {}: {error}", path.display()))
+}
+
+fn hash_fingerprint_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn source_plan(
+    configs: &BTreeMap<String, PluginConfig>,
+    runtime_root: &Path,
+    cache_root: &Path,
+    git_mode: &GitResolverMode,
+) -> Result<SourcePlan, String> {
+    let mut fingerprint = blake3::Hasher::new();
+    let mut path_sources = BTreeMap::new();
+    let mut git_revisions = BTreeMap::new();
+    fingerprint.update(b"kit-plugin-sources-v2");
+    for (alias, config) in configs {
+        validate_alias(alias)?;
+        hash_fingerprint_field(&mut fingerprint, alias.as_bytes());
+        match config {
+            PluginConfig::Path { path } => {
+                fingerprint.update(&[0]);
+                let root = resolve_path(path, runtime_root)?;
+                hash_fingerprint_field(&mut fingerprint, root.as_os_str().as_encoded_bytes());
+                let tree_fingerprint = local_plugin_tree_fingerprint(&root)?;
+                hash_fingerprint_field(&mut fingerprint, tree_fingerprint.as_bytes());
+                path_sources.insert(
+                    alias.clone(),
+                    PlannedPathSource {
+                        canonical_root: root,
+                        tree_fingerprint,
+                    },
+                );
+            }
+            PluginConfig::Archive {
+                url,
+                sha256,
+                subdir,
+            } => {
+                fingerprint.update(&[1]);
+                let url = Url::parse(url)
+                    .map_err(|error| format!("invalid plugin archive URL: {error}"))?;
+                validate_download_url(&url)?;
+                let digest = parse_sha256(sha256)?;
+                let subdir = subdir.as_deref().map(validate_relative_path).transpose()?;
+                hash_fingerprint_field(&mut fingerprint, url.as_str().as_bytes());
+                hash_fingerprint_field(&mut fingerprint, &digest);
+                if let Some(subdir) = subdir {
+                    hash_fingerprint_field(&mut fingerprint, subdir.as_os_str().as_encoded_bytes());
+                } else {
+                    hash_fingerprint_field(&mut fingerprint, &[]);
+                }
+            }
+            PluginConfig::Git { url, rev, subdir } => {
+                fingerprint.update(&[2]);
+                let url = validate_git_url(url)?;
+                let revision = rev
+                    .as_deref()
+                    .map(validate_git_revision)
+                    .transpose()?
+                    .unwrap_or(GitRevision::DefaultBranch);
+                let subdir = subdir.as_deref().map(validate_git_subdir).transpose()?;
+                hash_fingerprint_field(&mut fingerprint, url.as_str().as_bytes());
+                if let Some(subdir) = subdir {
+                    hash_fingerprint_field(&mut fingerprint, subdir.as_os_str().as_encoded_bytes());
+                } else {
+                    hash_fingerprint_field(&mut fingerprint, &[]);
+                }
+                let planned = match &revision {
+                    GitRevision::Commit(oid) => PlannedGitRevision {
+                        fetch_revision: revision.clone(),
+                        raw_oid: oid.clone(),
+                        commit_oid: oid.clone(),
+                    },
+                    GitRevision::Ref(_) | GitRevision::DefaultBranch => match git_mode {
+                        GitResolverMode::Https => probe_git_revision(
+                            OsStr::new(url.as_str()),
+                            &sha256_text(url.as_str()),
+                            &revision,
+                            cache_root,
+                            GitProtocol::Https,
+                            &SystemGitRunner::default(),
+                        )?,
+                        #[cfg(test)]
+                        GitResolverMode::Local {
+                            repository,
+                            activity,
+                        } => probe_git_revision(
+                            repository.as_os_str(),
+                            &sha256_text(&repository.to_string_lossy()),
+                            &revision,
+                            cache_root,
+                            GitProtocol::Local,
+                            &TrackingGitRunner {
+                                inner: SystemGitRunner::default(),
+                                activity: activity.clone(),
+                            },
+                        )?,
+                    },
+                };
+                fingerprint.update(&[1]);
+                hash_fingerprint_field(&mut fingerprint, planned.raw_oid.as_bytes());
+                hash_fingerprint_field(&mut fingerprint, planned.commit_oid.as_bytes());
+                git_revisions.insert(alias.clone(), planned);
+            }
+        }
+    }
+    Ok(SourcePlan {
+        candidate_fingerprint: fingerprint.finalize(),
+        path_sources,
+        git_revisions,
+    })
+}
+
+fn local_plugin_tree_fingerprint(root: &Path) -> Result<blake3::Hash, String> {
+    let mut fingerprint = blake3::Hasher::new();
+    fingerprint.update(b"kit-plugin-path-tree-v1");
+    hash_local_plugin_tree(root, &mut fingerprint)?;
+    Ok(fingerprint.finalize())
+}
+
+fn hash_local_plugin_tree(root: &Path, fingerprint: &mut blake3::Hasher) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("could not inspect plugin path {}: {error}", root.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "plugin path is not a real directory: {}",
+            root.display()
+        ));
+    }
+    let mut pending = vec![PathBuf::new()];
+    let mut entries_seen = 0usize;
+    let mut bytes_seen = 0u64;
+    while let Some(relative_directory) = pending.pop() {
+        let directory = root.join(&relative_directory);
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|error| {
+                format!(
+                    "could not read plugin path {}: {error}",
+                    directory.display()
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("could not read plugin path entry: {error}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            entries_seen = entries_seen
+                .checked_add(1)
+                .filter(|count| *count <= MAX_ARCHIVE_ENTRIES)
+                .ok_or_else(|| "plugin path exceeds entry limit".to_string())?;
+            let relative = relative_directory.join(entry.file_name());
+            hash_fingerprint_field(fingerprint, relative.as_os_str().as_encoded_bytes());
+            let path = entry.path();
+            let before = fs::symlink_metadata(&path).map_err(|error| {
+                format!("could not inspect plugin path {}: {error}", path.display())
+            })?;
+            if before.file_type().is_dir() {
+                fingerprint.update(&[0]);
+                child_directories.push(relative);
+            } else if before.file_type().is_file() {
+                fingerprint.update(&[1]);
+                if before.len() > MAX_FILE_BYTES {
+                    return Err(format!(
+                        "plugin path file exceeds size limit: {}",
+                        path.display()
+                    ));
+                }
+                bytes_seen = bytes_seen
+                    .checked_add(before.len())
+                    .filter(|total| *total <= MAX_EXPANDED_BYTES)
+                    .ok_or_else(|| "plugin path exceeds expanded size limit".to_string())?;
+                fingerprint.update(&before.len().to_le_bytes());
+                let mut file = File::open(&path).map_err(|error| {
+                    format!(
+                        "could not open plugin path file {}: {error}",
+                        path.display()
+                    )
+                })?;
+                let opened = file.metadata().map_err(|error| {
+                    format!(
+                        "could not inspect plugin path file {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if !opened.is_file()
+                    || !same_file(&before, &opened)
+                    || !same_file_state(&before, &opened)
+                {
+                    return Err(format!(
+                        "plugin path changed while being fingerprinted: {}",
+                        path.display()
+                    ));
+                }
+                let mut remaining = before.len();
+                let mut buffer = [0u8; 32 * 1024];
+                while remaining != 0 {
+                    let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                        .map_err(|_| "plugin path read limit is too large".to_string())?;
+                    let read = file.read(&mut buffer[..limit]).map_err(|error| {
+                        format!(
+                            "could not read plugin path file {}: {error}",
+                            path.display()
+                        )
+                    })?;
+                    if read == 0 {
+                        return Err(format!(
+                            "plugin path file changed while being fingerprinted: {}",
+                            path.display()
+                        ));
+                    }
+                    fingerprint.update(&buffer[..read]);
+                    remaining -= read as u64;
+                }
+                let mut extra = [0u8; 1];
+                if file.read(&mut extra).map_err(|error| {
+                    format!(
+                        "could not recheck plugin path file {}: {error}",
+                        path.display()
+                    )
+                })? != 0
+                {
+                    return Err(format!(
+                        "plugin path file changed while being fingerprinted: {}",
+                        path.display()
+                    ));
+                }
+                let after = fs::symlink_metadata(&path).map_err(|error| {
+                    format!(
+                        "could not recheck plugin path file {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if !after.is_file()
+                    || !same_file(&before, &after)
+                    || !same_file_state(&before, &after)
+                {
+                    return Err(format!(
+                        "plugin path changed while being fingerprinted: {}",
+                        path.display()
+                    ));
+                }
+            } else if before.file_type().is_symlink() {
+                return Err(format!(
+                    "plugin path fingerprinting does not allow symlinks: {}",
+                    path.display()
+                ));
+            } else {
+                return Err(format!(
+                    "plugin path contains an unsupported entry: {}",
+                    path.display()
+                ));
+            }
+        }
+        child_directories.reverse();
+        pending.extend(child_directories);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1537,6 +2038,44 @@ impl GitRunner for SystemGitRunner {
     }
 }
 
+#[cfg(test)]
+struct TrackingGitRunner {
+    inner: SystemGitRunner,
+    activity: Arc<GitActivity>,
+}
+
+#[cfg(test)]
+impl GitRunner for TrackingGitRunner {
+    fn run(&self, request: GitRunRequest<'_>) -> Result<Vec<u8>, GitFailure> {
+        if request
+            .args
+            .iter()
+            .any(|argument| argument == OsStr::new("--exit-code"))
+        {
+            self.activity
+                .probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if request
+            .args
+            .iter()
+            .any(|argument| argument == OsStr::new("fetch"))
+        {
+            self.activity
+                .fetches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.run(request)
+    }
+
+    fn archive(&self, request: GitRunRequest<'_>, destination: &Path) -> Result<(), GitFailure> {
+        self.activity
+            .archives
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.archive(request, destination)
+    }
+}
+
 fn read_bounded(mut reader: impl Read, limit: u64) -> Result<Vec<u8>, GitFailure> {
     let mut bytes = Vec::new();
     reader
@@ -1654,12 +2193,21 @@ struct StagingDirectory {
 }
 
 impl StagingDirectory {
-    fn create(parent: &Path, prefix: &str) -> Result<Self, String> {
+    fn create(parent: &Path, prefix: &str, context: &str) -> Result<Self, String> {
         cleanup_stale_staging(parent, prefix, STALE_STAGING_AGE)?;
-        let path = parent.join(format!("{prefix}{}", random_suffix()?));
-        create_private_directory(&path)
-            .map_err(|error| format!("could not create plugin staging directory: {error}"))?;
-        Ok(Self { path })
+        for _ in 0..4 {
+            let path = parent.join(format!("{prefix}{}", random_suffix()?));
+            match create_private_directory(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not create {context} staging directory: {error}"
+                    ));
+                }
+            }
+        }
+        Err(format!("could not allocate {context} staging directory"))
     }
 
     fn path(&self) -> &Path {
@@ -1735,12 +2283,51 @@ fn resolve_git(
     resolve_git_source(
         OsStr::new(source),
         &source_key,
-        &revision,
+        GitSourceRevision::Unplanned(&revision),
         subdir.as_deref(),
         cache_root,
         GitProtocol::Https,
         &SystemGitRunner::default(),
     )
+    .map(|resolved| resolved.root)
+}
+
+fn resolve_git_planned(
+    value: &str,
+    subdir: Option<&str>,
+    cache_root: &Path,
+    mode: &GitResolverMode,
+    planned: &PlannedGitRevision,
+) -> Result<ResolvedGitSource, String> {
+    let url = validate_git_url(value)?;
+    let subdir = subdir.map(validate_git_subdir).transpose()?;
+    match mode {
+        GitResolverMode::Https => resolve_git_source(
+            OsStr::new(url.as_str()),
+            &sha256_text(url.as_str()),
+            GitSourceRevision::Planned(planned),
+            subdir.as_deref(),
+            cache_root,
+            GitProtocol::Https,
+            &SystemGitRunner::default(),
+        ),
+        #[cfg(test)]
+        GitResolverMode::Local {
+            repository,
+            activity,
+        } => resolve_git_source(
+            repository.as_os_str(),
+            &sha256_text(&repository.to_string_lossy()),
+            GitSourceRevision::Planned(planned),
+            subdir.as_deref(),
+            cache_root,
+            GitProtocol::Local,
+            &TrackingGitRunner {
+                inner: SystemGitRunner::default(),
+                activity: activity.clone(),
+            },
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1782,12 +2369,13 @@ fn resolve_git_local_revision(
     resolve_git_source(
         repository.as_os_str(),
         &source_key,
-        &revision,
+        GitSourceRevision::Unplanned(&revision),
         subdir.as_deref(),
         cache_root,
         GitProtocol::Local,
         runner,
     )
+    .map(|resolved| resolved.root)
 }
 
 fn validate_git_url(value: &str) -> Result<Url, String> {
@@ -2047,15 +2635,177 @@ fn describe_git_failure(operation: &str, failure: GitFailure) -> String {
     }
 }
 
-fn resolve_git_source(
+fn probe_git_revision(
     remote: &OsStr,
     source_key: &str,
     revision: &GitRevision,
+    cache_root: &Path,
+    protocol: GitProtocol,
+    runner: &dyn GitRunner,
+) -> Result<PlannedGitRevision, String> {
+    let source_root = cache_root.join(GIT_CACHE_VERSION).join(source_key);
+    fs::create_dir_all(&source_root)
+        .map_err(|error| format!("could not create Git plugin cache: {error}"))?;
+    let staging_guard =
+        StagingDirectory::create(&source_root, ".probe-", "Git plugin revision probe")?;
+    let staging = staging_guard.path();
+    let hooks = staging.join("hooks");
+    let attributes = staging.join("attributes");
+    fs::create_dir(&hooks)
+        .map_err(|error| format!("could not create Git plugin revision probe hooks: {error}"))?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&attributes)
+        .map_err(|error| {
+            format!("could not create Git plugin revision probe attributes: {error}")
+        })?;
+    let remote_config = match protocol {
+        GitProtocol::Https => Some(
+            remote
+                .to_str()
+                .ok_or("plugin Git URL must be valid Unicode")?,
+        ),
+        #[cfg(test)]
+        GitProtocol::Local => None,
+    };
+    let git = GitCommandContext {
+        runner,
+        protocol,
+        hooks: &hooks,
+        attributes: &attributes,
+        remote: remote_config,
+    };
+    verify_git_effective_url(&git, staging, remote)?;
+    let references = match revision {
+        GitRevision::Ref(reference) if reference.starts_with("refs/") => {
+            vec![reference.clone()]
+        }
+        GitRevision::Ref(reference) => vec![
+            format!("refs/heads/{reference}"),
+            format!("refs/tags/{reference}"),
+        ],
+        GitRevision::DefaultBranch => vec!["HEAD".to_string()],
+        GitRevision::Commit(_) => {
+            return Err("immutable Git commits do not require a revision probe".into());
+        }
+    };
+    let queries = references
+        .iter()
+        .flat_map(|reference| [reference.clone(), format!("{reference}^{{}}")])
+        .collect::<Vec<_>>();
+    let mut arguments = vec![
+        OsString::from("ls-remote"),
+        OsString::from("--exit-code"),
+        OsString::from("--"),
+        remote.to_os_string(),
+    ];
+    arguments.extend(queries.iter().map(OsString::from));
+    let argument_refs = arguments
+        .iter()
+        .map(OsString::as_os_str)
+        .collect::<Vec<_>>();
+    let output = git.run(
+        "revision probe",
+        staging,
+        &argument_refs,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        None,
+    )?;
+    parse_git_probe(&output, revision, &references)
+}
+
+fn parse_git_probe(
+    output: &[u8],
+    revision: &GitRevision,
+    references: &[String],
+) -> Result<PlannedGitRevision, String> {
+    let mut records = BTreeMap::new();
+    for raw in output.split(|byte| *byte == b'\n') {
+        let record = match raw.strip_suffix(b"\r") {
+            Some(record) => record,
+            None => raw,
+        };
+        if record.is_empty() {
+            continue;
+        }
+        let Some(separator) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err("Git plugin revision probe returned malformed output".into());
+        };
+        let (oid, reference_with_separator) = record.split_at(separator);
+        let reference = std::str::from_utf8(&reference_with_separator[1..])
+            .map_err(|_| "Git plugin revision probe returned malformed output")?;
+        let advertised_reference = reference.strip_suffix("^{}").unwrap_or(reference);
+        if oid.len() != 40
+            || !oid.iter().all(u8::is_ascii_hexdigit)
+            || !references
+                .iter()
+                .any(|expected| expected == advertised_reference)
+        {
+            return Err("Git plugin revision probe returned an unexpected reference".into());
+        }
+        let oid = std::str::from_utf8(oid)
+            .map_err(|_| "Git plugin revision probe returned malformed output")?
+            .to_ascii_lowercase();
+        if records.insert(reference.to_string(), oid).is_some() {
+            return Err("Git plugin revision probe returned a duplicate reference".into());
+        }
+    }
+    let selected = references
+        .iter()
+        .filter(|reference| records.contains_key(*reference))
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err(match revision {
+            GitRevision::Ref(reference) if !reference.starts_with("refs/") => {
+                "Git plugin short revision is missing or ambiguous".into()
+            }
+            _ => "Git plugin revision probe did not return exactly one reference".into(),
+        });
+    }
+    let reference = selected[0];
+    let raw_oid = records
+        .remove(reference)
+        .ok_or("Git plugin revision probe returned no object ID")?;
+    let peeled_reference = format!("{reference}^{{}}");
+    let commit_oid = records
+        .remove(&peeled_reference)
+        .unwrap_or_else(|| raw_oid.clone());
+    if !records.is_empty() {
+        return Err("Git plugin revision probe returned an unexpected reference".into());
+    }
+    let fetch_revision = match revision {
+        GitRevision::DefaultBranch => {
+            if reference != "HEAD" {
+                return Err("Git plugin default revision probe did not return HEAD".into());
+            }
+            GitRevision::DefaultBranch
+        }
+        GitRevision::Ref(_) => GitRevision::Ref(reference.clone()),
+        GitRevision::Commit(_) => {
+            return Err("immutable Git commits do not require a revision probe".into());
+        }
+    };
+    Ok(PlannedGitRevision {
+        fetch_revision,
+        raw_oid,
+        commit_oid,
+    })
+}
+
+fn resolve_git_source(
+    remote: &OsStr,
+    source_key: &str,
+    source_revision: GitSourceRevision<'_>,
     subdir: Option<&Path>,
     cache_root: &Path,
     protocol: GitProtocol,
     runner: &dyn GitRunner,
-) -> Result<PathBuf, String> {
+) -> Result<ResolvedGitSource, String> {
+    let (revision, expected_revision) = match source_revision {
+        GitSourceRevision::Unplanned(revision) => (revision, None),
+        GitSourceRevision::Planned(planned) => (&planned.fetch_revision, Some(planned)),
+    };
     let subdir_text = subdir.map(path_to_git_string).transpose()?;
     let subdir_key = sha256_text(subdir_text.as_deref().unwrap_or("."));
     let source_root = cache_root.join(GIT_CACHE_VERSION).join(source_key);
@@ -2067,7 +2817,34 @@ fn resolve_git_source(
         if let Ok(root) =
             validate_git_cache_entry(&destination, source_key, oid, &subdir_key, subdir)
         {
-            return Ok(root);
+            return Ok(ResolvedGitSource {
+                root,
+                revision: ResolvedGitRevision {
+                    raw_oid: oid.clone(),
+                    commit_oid: oid.clone(),
+                },
+            });
+        }
+    }
+
+    if let Some(planned) = expected_revision
+        && matches!(
+            &planned.fetch_revision,
+            GitRevision::Ref(_) | GitRevision::DefaultBranch
+        )
+    {
+        let oid = &planned.commit_oid;
+        let destination = git_cache_destination(&source_root, oid, &subdir_key);
+        if let Ok(root) =
+            validate_git_cache_entry(&destination, source_key, oid, &subdir_key, subdir)
+        {
+            return Ok(ResolvedGitSource {
+                root,
+                revision: ResolvedGitRevision {
+                    raw_oid: planned.raw_oid.clone(),
+                    commit_oid: oid.clone(),
+                },
+            });
         }
     }
 
@@ -2080,7 +2857,7 @@ fn resolve_git_source(
         #[cfg(test)]
         GitProtocol::Local => None,
     };
-    let staging_guard = StagingDirectory::create(&source_root, ".staging-")?;
+    let staging_guard = StagingDirectory::create(&source_root, ".staging-", "Git plugin")?;
     let staging = staging_guard.path();
     let hooks = staging.join("hooks");
     let attributes = staging.join("attributes");
@@ -2147,6 +2924,23 @@ fn resolve_git_source(
         Some(&git_dir.join("objects")),
     )?;
     enforce_git_staging_metadata(&git_dir, remote)?;
+    let fetched_raw = git.run(
+        "raw object verification",
+        &git_dir,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--end-of-options"),
+            OsStr::new(GIT_PRIVATE_FETCH_REF),
+        ],
+        128,
+        None,
+    )?;
+    let fetched_raw =
+        parse_git_oid(&fetched_raw).ok_or("Git plugin revision is not an object ID")?;
+    if expected_revision.is_some_and(|expected| fetched_raw != expected.raw_oid) {
+        return Err("Git plugin revision moved while its generation was being staged".into());
+    }
     let private_commit = format!("{GIT_PRIVATE_FETCH_REF}^{{commit}}");
     let fetched = git.run(
         "commit verification",
@@ -2161,6 +2955,9 @@ fn resolve_git_source(
         None,
     )?;
     let fetched = parse_git_oid(&fetched).ok_or("Git plugin revision is not a commit")?;
+    if expected_revision.is_some_and(|expected| fetched != expected.commit_oid) {
+        return Err("Git plugin revision moved while its generation was being staged".into());
+    }
     if let GitRevision::Commit(expected) = revision
         && fetched != *expected
     {
@@ -2172,7 +2969,13 @@ fn resolve_git_source(
     if let Ok(root) =
         validate_git_cache_entry(&destination, source_key, &fetched, &subdir_key, subdir)
     {
-        return Ok(root);
+        return Ok(ResolvedGitSource {
+            root,
+            revision: ResolvedGitRevision {
+                raw_oid: fetched_raw,
+                commit_oid: fetched,
+            },
+        });
     }
 
     let oid = OsStr::new(&fetched);
@@ -2227,7 +3030,14 @@ fn resolve_git_source(
             .is_ok() => {}
         Err(error) => return Err(format!("could not publish Git plugin cache: {error}")),
     }
-    validate_git_cache_entry(&destination, source_key, &fetched, &subdir_key, subdir)
+    let root = validate_git_cache_entry(&destination, source_key, &fetched, &subdir_key, subdir)?;
+    Ok(ResolvedGitSource {
+        root,
+        revision: ResolvedGitRevision {
+            raw_oid: fetched_raw,
+            commit_oid: fetched,
+        },
+    })
 }
 
 fn verify_git_effective_url(
@@ -2486,8 +3296,20 @@ fn resolve_archive(
         &cache_root.join("archive-blobs").join(&digest),
     )?;
     let destination = cache_root.join(&digest);
-    if destination.exists() {
-        verify_cached_archive(&destination, &bytes)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            verify_cached_archive(&destination, &bytes)?;
+        }
+        Ok(_) => {
+            return Err(format!(
+                "plugin archive cache entry is not a real directory: {}",
+                destination.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("could not inspect plugin archive cache: {error}"));
+        }
     }
     publish_cached_directory(&destination, "plugin archive", |staging| {
         extract_archive(&bytes, staging)?;
@@ -2500,6 +3322,7 @@ fn resolve_archive(
         })?;
         Ok(())
     })?;
+    verify_cached_archive(&destination, &bytes)?;
     select_package_root(&destination, subdir.as_deref())
 }
 
@@ -2576,18 +3399,11 @@ fn verify_cached_archive(destination: &Path, bytes: &[u8]) -> Result<(), String>
     let parent = destination
         .parent()
         .ok_or_else(|| "plugin archive cache path has no parent".to_string())?;
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).map_err(|error| error.to_string())?;
-    let staging = parent.join(format!(
-        ".verify-{}-{:x}.tmp",
-        std::process::id(),
-        u64::from_le_bytes(random)
-    ));
-    fs::create_dir(&staging).map_err(|error| {
-        format!("could not create plugin archive verification directory: {error}")
-    })?;
-    let result = extract_archive(bytes, &staging).and_then(|()| {
-        let expected = read_directory_inventory(&staging)?;
+    let staging_guard =
+        StagingDirectory::create(parent, ".verify-", "plugin archive verification")?;
+    let staging = staging_guard.path();
+    extract_archive(bytes, staging).and_then(|()| {
+        let expected = read_directory_inventory(staging)?;
         let actual = read_directory_inventory(destination)?;
         if actual == expected {
             Ok(())
@@ -2597,9 +3413,7 @@ fn verify_cached_archive(destination: &Path, bytes: &[u8]) -> Result<(), String>
                 destination.display()
             ))
         }
-    });
-    let _ = fs::remove_dir_all(staging);
-    result
+    })
 }
 
 fn read_directory_inventory(root: &Path) -> Result<BTreeMap<PathBuf, CachedEntry>, String> {
@@ -3141,6 +3955,87 @@ mod tests {
         assert!(error.contains("without following links"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_tree_fingerprint_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("plugin.json"), MANIFEST).unwrap();
+        fs::write(directory.path().join("target"), "body").unwrap();
+        symlink("target", directory.path().join("link")).unwrap();
+        let mut fingerprint = blake3::Hasher::new();
+        let error = hash_local_plugin_tree(directory.path(), &mut fingerprint).unwrap_err();
+        assert!(error.contains("does not allow symlinks"));
+    }
+
+    #[test]
+    fn path_source_plan_verification_rejects_tree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("plugin");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "local".to_string(),
+            PluginConfig::Path {
+                path: package.clone(),
+            },
+        );
+        let plan = source_plan(
+            &configs,
+            directory.path(),
+            directory.path(),
+            &GitResolverMode::Https,
+        )
+        .unwrap();
+
+        fs::write(package.join("plugin.json"), "changed").unwrap();
+
+        let error = plan
+            .verify_path_fingerprints(&configs, directory.path())
+            .unwrap_err();
+        assert_eq!(error, "plugin path for \"local\" changed during staging");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_source_plan_verification_rejects_root_symlink_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(second.join("plugin.json"), MANIFEST).unwrap();
+        let configured = directory.path().join("current");
+        symlink(&first, &configured).unwrap();
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "local".to_string(),
+            PluginConfig::Path {
+                path: configured.clone(),
+            },
+        );
+        let plan = source_plan(
+            &configs,
+            directory.path(),
+            directory.path(),
+            &GitResolverMode::Https,
+        )
+        .unwrap();
+
+        fs::remove_file(&configured).unwrap();
+        symlink(&second, &configured).unwrap();
+
+        let error = plan
+            .verify_path_fingerprints(&configs, directory.path())
+            .unwrap_err();
+        assert_eq!(error, "plugin path for \"local\" changed during staging");
+    }
+
     #[tokio::test]
     async fn poisoned_unpublished_skill_generation_is_rebuilt() {
         let directory = tempfile::tempdir().unwrap();
@@ -3272,6 +4167,457 @@ mod tests {
         mcp.refresh().await.unwrap();
         assert!(runtime.snapshot().package_roots.is_empty());
         assert!(runtime.snapshot().skill_directories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_path_reuses_published_generation_and_edits_refresh_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        let skill = package.join("skills/live-skill");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Live skill.\n---\nfirst\n",
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let published = runtime.snapshot();
+        let unchanged = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&published, &unchanged.resolved));
+
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Live skill.\n---\nsecond\n",
+        )
+        .unwrap();
+        let changed = runtime.stage().await.unwrap();
+        assert!(!Arc::ptr_eq(&published, &changed.resolved));
+        assert_eq!(changed.resolved.skills[0].body, "second");
+        runtime.publish(changed);
+        let republished = runtime.snapshot();
+        let unchanged_again = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&republished, &unchanged_again.resolved));
+    }
+
+    #[tokio::test]
+    async fn unchanged_archive_reuses_published_generation() {
+        let bytes = tar_with_file("plugin/plugin.json", MANIFEST.as_bytes());
+        let digest = sha256_hex(&bytes);
+        let (url, server) = serve_once(bytes);
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        fs::write(
+            &config,
+            format!("[plugins.archive]\nsource = 'archive'\nurl = '{url}'\nsha256 = '{digest}'\n"),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::load(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        let published = runtime.snapshot();
+        let unchanged = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&published, &unchanged.resolved));
+    }
+
+    async fn stage_local_git_runtime(
+        config: PathBuf,
+        root: &Path,
+        repository: &Path,
+    ) -> (PluginRuntime, Arc<GitActivity>) {
+        let activity = Arc::new(GitActivity::default());
+        let runtime = PluginRuntime::new(
+            config,
+            root.to_path_buf(),
+            root.join("cache"),
+            root.join("data"),
+            ResolvedPlugins::default(),
+        )
+        .with_local_git_mode(repository, activity.clone());
+        let staged = runtime.stage().await.unwrap();
+        runtime.publish(staged);
+        (runtime, activity)
+    }
+
+    #[tokio::test]
+    async fn full_commit_stage_reuses_published_arc_before_git_resolution() {
+        let repository = TestRepository::new();
+        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
+        let commit = repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
+            "skill",
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "[plugins.commit]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\nrev = '{commit}'\n"
+            ),
+        )
+        .unwrap();
+        let (runtime, activity) =
+            stage_local_git_runtime(config, directory.path(), repository.path()).await;
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let published = runtime.snapshot();
+        let unchanged = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&published, &unchanged.resolved));
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mutable_default_head_stage_reuses_then_refreshes_on_movement() {
+        let repository = TestRepository::new();
+        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
+        repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
+            "skill",
+        );
+        repository.git(&["branch", "-M", "main"]);
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.head]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\n",
+        )
+        .unwrap();
+        let (runtime, activity) =
+            stage_local_git_runtime(config, directory.path(), repository.path()).await;
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let published = runtime.snapshot();
+        let unchanged = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&published, &unchanged.resolved));
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nsecond\n",
+            "move head",
+        );
+        let changed = runtime.stage().await.unwrap();
+        assert!(!Arc::ptr_eq(&published, &changed.resolved));
+        assert_eq!(changed.resolved.skills[0].body, "second");
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        runtime.publish(changed);
+        let republished = runtime.snapshot();
+        let unchanged_again = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&republished, &unchanged_again.resolved));
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_cache_reuses_probed_mutable_head_then_refreshes_on_movement() {
+        let repository = TestRepository::new();
+        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
+        repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
+            "skill",
+        );
+        repository.git(&["branch", "-M", "main"]);
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.head]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\n",
+        )
+        .unwrap();
+        let (_first_runtime, first_activity) =
+            stage_local_git_runtime(config.clone(), directory.path(), repository.path()).await;
+        assert_eq!(
+            first_activity
+                .probes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            first_activity
+                .fetches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            first_activity
+                .archives
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let (runtime, activity) =
+            stage_local_git_runtime(config, directory.path(), repository.path()).await;
+        assert_eq!(
+            activity.probes.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(runtime.snapshot().skills[0].body, "first");
+        let published = runtime.snapshot();
+
+        repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nsecond\n",
+            "move head",
+        );
+        let changed = runtime.stage().await.unwrap();
+        assert!(!Arc::ptr_eq(&published, &changed.resolved));
+        assert_eq!(changed.resolved.skills[0].body, "second");
+        assert_eq!(
+            activity.probes.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_cache_reuses_probed_annotated_tag_without_resolution() {
+        let repository = TestRepository::new();
+        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
+        let commit = repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
+            "skill",
+        );
+        repository.git(&["tag", "-a", "stable", "-m", "stable"]);
+        assert_ne!(repository.git(&["rev-parse", "stable"]), commit);
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.tag]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\nrev = 'refs/tags/stable'\n",
+        )
+        .unwrap();
+        let (_first_runtime, first_activity) =
+            stage_local_git_runtime(config.clone(), directory.path(), repository.path()).await;
+        assert_eq!(
+            first_activity
+                .probes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            first_activity
+                .fetches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            first_activity
+                .archives
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let (runtime, activity) =
+            stage_local_git_runtime(config, directory.path(), repository.path()).await;
+        assert_eq!(
+            activity.probes.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(runtime.snapshot().skills[0].body, "first");
+    }
+
+    #[test]
+    fn full_commit_fingerprint_is_stable_without_network() {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "commit".to_string(),
+            PluginConfig::Git {
+                url: "https://plugins.example/repository.git".to_string(),
+                rev: Some("ab".repeat(20)),
+                subdir: Some("plugin".to_string()),
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let fingerprint = |configs: &BTreeMap<String, PluginConfig>| {
+            source_plan(
+                configs,
+                directory.path(),
+                directory.path(),
+                &GitResolverMode::Https,
+            )
+            .unwrap()
+            .candidate_fingerprint
+        };
+        let first = fingerprint(&configs);
+        let second = fingerprint(&configs);
+        assert_eq!(first, second);
+        if let Some(PluginConfig::Git { rev, .. }) = configs.get_mut("commit") {
+            *rev = Some("cd".repeat(20));
+        }
+        assert_ne!(first, fingerprint(&configs));
+    }
+
+    #[test]
+    fn mutable_default_head_probe_changes_only_when_remote_oid_changes() {
+        let repository = TestRepository::new();
+        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "first");
+        repository.git(&["branch", "-M", "main"]);
+        let cache = tempfile::tempdir().unwrap();
+        let source_key = sha256_text(&repository.path().to_string_lossy());
+        let first = probe_git_revision(
+            repository.path().as_os_str(),
+            &source_key,
+            &GitRevision::DefaultBranch,
+            cache.path(),
+            GitProtocol::Local,
+            &SystemGitRunner::default(),
+        )
+        .unwrap();
+        let unchanged = probe_git_revision(
+            repository.path().as_os_str(),
+            &source_key,
+            &GitRevision::DefaultBranch,
+            cache.path(),
+            GitProtocol::Local,
+            &SystemGitRunner::default(),
+        )
+        .unwrap();
+        assert_eq!(first, unchanged);
+        repository.commit_file("version.txt", b"second", "second");
+        let changed = probe_git_revision(
+            repository.path().as_os_str(),
+            &source_key,
+            &GitRevision::DefaultBranch,
+            cache.path(),
+            GitProtocol::Local,
+            &SystemGitRunner::default(),
+        )
+        .unwrap();
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn short_git_probe_rejects_branch_tag_ambiguity() {
+        let branch = "11".repeat(20);
+        let tag = "22".repeat(20);
+        let output = format!("{branch}\trefs/heads/stable\n{tag}\trefs/tags/stable\n");
+        let error = parse_git_probe(
+            output.as_bytes(),
+            &GitRevision::Ref("stable".into()),
+            &["refs/heads/stable".into(), "refs/tags/stable".into()],
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"));
+    }
+
+    #[test]
+    fn planned_annotated_tag_rejects_movement_before_fetch() {
+        let repository = TestRepository::new();
+        let first = repository.commit_file("plugin.json", MANIFEST.as_bytes(), "first");
+        repository.git(&["tag", "-a", "stable", "-m", "stable", &first]);
+        let cache = tempfile::tempdir().unwrap();
+        let source_key = sha256_text(&repository.path().to_string_lossy());
+        let planned = probe_git_revision(
+            repository.path().as_os_str(),
+            &source_key,
+            &GitRevision::Ref("refs/tags/stable".into()),
+            cache.path(),
+            GitProtocol::Local,
+            &SystemGitRunner::default(),
+        )
+        .unwrap();
+        let second = repository.commit_file("version.txt", b"second", "second");
+        repository.git(&["tag", "--force", "stable", &second]);
+        let error = resolve_git_planned(
+            "https://plugins.example/repository.git",
+            None,
+            cache.path(),
+            &GitResolverMode::Local {
+                repository: repository.path().to_path_buf(),
+                activity: Arc::new(GitActivity::default()),
+            },
+            &planned,
+        )
+        .unwrap_err();
+        assert!(error.contains("moved while"));
     }
 
     #[test]
@@ -3725,7 +5071,7 @@ mod tests {
         let error = resolve_git_source(
             OsStr::new(remote),
             &source_key,
-            &GitRevision::Commit("01".repeat(20)),
+            GitSourceRevision::Unplanned(&GitRevision::Commit("01".repeat(20))),
             None,
             cache.path(),
             GitProtocol::Https,
@@ -3757,9 +5103,15 @@ mod tests {
 
         let active_path;
         {
-            let staging = StagingDirectory::create(parent.path(), ".staging-").unwrap();
+            let staging = StagingDirectory::create(parent.path(), ".staging-", "test").unwrap();
             active_path = staging.path().to_path_buf();
             assert!(active_path.is_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&active_path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
         }
         assert!(!active_path.exists());
     }
@@ -4124,7 +5476,7 @@ mod tests {
             let error = resolve_git_source(
                 OsStr::new(url.as_str()),
                 &source_key,
-                &GitRevision::Ref("refs/tags/stable".into()),
+                GitSourceRevision::Unplanned(&GitRevision::Ref("refs/tags/stable".into())),
                 None,
                 cache.path(),
                 GitProtocol::Https,

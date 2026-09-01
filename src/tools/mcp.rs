@@ -1383,28 +1383,33 @@ impl McpRuntime {
                 drop(waited);
                 continue;
             }
+            let mut initialization_guard = None;
+            if !changed.is_empty() {
+                initialization_guard = Some(self.inner.initialization.lock().await);
+            }
+            if !changed.is_empty() {
+                let mut manager = self.inner.manager.lock().await;
+                for name in &changed {
+                    let _ = manager.unregister_server(&McpServerId::new(name)).await;
+                }
+                for name in &changed {
+                    if let Some(server) = prepared.get(name) {
+                        manager.register_server_with_options(
+                            server.config.clone(),
+                            McpServerOptions::new().with_timeout(CONNECT_TIMEOUT),
+                        );
+                    }
+                }
+            }
+
+            // The generation writer only covers publication. Staging and MCP
+            // manager initialization above may await without hiding the last
+            // published skill and MCP generation from readers.
             let generation_writer = match &plugin_source {
                 Some(source) => Some(source.generation_writer().await),
                 None => None,
             };
-            let mut initialization_guard = None;
             if !changed.is_empty() {
-                initialization_guard = Some(self.inner.initialization.lock().await);
-
-                {
-                    let mut manager = self.inner.manager.lock().await;
-                    for name in &changed {
-                        let _ = manager.unregister_server(&McpServerId::new(name)).await;
-                    }
-                    for name in &changed {
-                        if let Some(server) = prepared.get(name) {
-                            manager.register_server_with_options(
-                                server.config.clone(),
-                                McpServerOptions::new().with_timeout(CONNECT_TIMEOUT),
-                            );
-                        }
-                    }
-                }
                 {
                     let mut servers = self.inner.servers.write().await;
                     for name in &changed {
@@ -1437,11 +1442,11 @@ impl McpRuntime {
                 state.plugins = plugin_prepared;
                 state.plugin_entries = plugin_entries;
                 if let (Some(source), Some(staged)) = (&plugin_source, staged_plugins) {
-                    source.publish(staged.resolved);
+                    source.publish(staged);
                 }
             }
-            drop(initialization_guard);
             drop(generation_writer);
+            drop(initialization_guard);
             if !deleted.is_empty() {
                 let mut operations = self.inner.operations.lock().await;
                 for name in deleted {
@@ -3357,6 +3362,74 @@ mod tests {
         // boundary observes an edit that arrived during the wait.
         reloading.await.unwrap().unwrap();
         runtime.reload_config().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_generation_reads_remain_available_while_initialization_is_blocked() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"blocked-plugin"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"live":{"type":"streamable-http","url":"https://example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(&config, "").unwrap();
+        let plugins = PluginRuntime::new(
+            config.clone(),
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        let runtime = super::connect_dynamic(
+            None::<&Path>,
+            plugins.clone(),
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[plugins.blocked]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+
+        let initialization = runtime.inner.initialization.lock().await;
+        let gate = runtime.operation_gate("live").await;
+        let reloading = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.reload_config().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if gate.clone().try_read_owned().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reload did not reach the initialization guard");
+
+        let generation =
+            tokio::time::timeout(Duration::from_millis(100), plugins.generation_lease())
+                .await
+                .expect("plugin generation reads were blocked by MCP initialization");
+        drop(generation);
+        drop(initialization);
+        reloading.await.unwrap().unwrap();
+        assert_eq!(plugins.snapshot().mcp_plugins.len(), 1);
     }
 
     #[tokio::test]

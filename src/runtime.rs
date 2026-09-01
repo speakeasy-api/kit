@@ -254,6 +254,7 @@ pub struct Runtime {
     session: Mutex<SessionSelection>,
     mcp: crate::tools::mcp::McpRuntime,
     plugin_runtime: Option<crate::plugins::PluginRuntime>,
+    dynamic_skill_tool: Option<Arc<dyn Tool>>,
     skills: Arc<SkillRegistry>,
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
@@ -368,6 +369,7 @@ impl Runtime {
             session: Mutex::new(SessionSelection::default()),
             mcp: crate::tools::mcp::empty(),
             plugin_runtime: None,
+            dynamic_skill_tool: None,
             skills,
             skill_package_roots: Vec::new(),
             skill_directories: Vec::new(),
@@ -569,6 +571,10 @@ impl Runtime {
             return Ok(runtime);
         };
         let snapshot = plugins.snapshot();
+        let dynamic_skill_tool: Arc<dyn Tool> = Arc::new(DynamicSkillTool::new(
+            runtime.root.clone(),
+            plugins.clone(),
+        )?);
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure plugins after runtime was shared".to_string())?;
         runtime.skills = build_skill_tools(
@@ -579,6 +585,7 @@ impl Runtime {
         runtime.skill_package_roots = snapshot.package_roots.clone();
         runtime.skill_directories = snapshot.skill_directories.clone();
         runtime.plugin_runtime = Some(plugins);
+        runtime.dynamic_skill_tool = Some(dynamic_skill_tool);
         Ok(Arc::new(runtime))
     }
 
@@ -857,10 +864,8 @@ impl Runtime {
             .register(Observed::new(ToolSearch::new(self.mcp.clone())))
             .register(Observed::new(AuthTool::new(self.mcp.clone())))
             .register(Observed::new(McpTool::new(self.mcp.clone())));
-        if let Some(plugins) = &self.plugin_runtime {
-            let skill_tool: Arc<dyn Tool> =
-                Arc::new(DynamicSkillTool::new(self.root.clone(), plugins.clone()));
-            children.register(observe_shared(skill_tool));
+        if let Some(skill_tool) = &self.dynamic_skill_tool {
+            children.register(observe_shared(Arc::clone(skill_tool)));
         } else {
             let skill_tools = skills.tool_registry();
             if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
@@ -1258,16 +1263,20 @@ struct DynamicSkillTool {
 }
 
 impl DynamicSkillTool {
-    fn new(root: PathBuf, plugins: crate::plugins::PluginRuntime) -> Self {
-        let tool = default_skill_tool(&root);
-        Self {
+    fn new(root: PathBuf, plugins: crate::plugins::PluginRuntime) -> Result<Self, String> {
+        let tool = default_skill_tool(&root)?;
+        let mut spec = tool.spec().clone();
+        if let Some(name) = spec.input_schema["properties"]["name"].as_object_mut() {
+            name.remove("enum");
+        }
+        Ok(Self {
             root,
             plugins,
-            spec: tool.spec().clone(),
-        }
+            spec,
+        })
     }
 
-    fn base(&self) -> Arc<dyn Tool> {
+    fn base(&self) -> Result<Arc<dyn Tool>, String> {
         default_skill_tool(&self.root)
     }
 
@@ -1292,38 +1301,41 @@ impl DynamicSkillTool {
             .collect()
     }
 
-    fn merged_spec(&self) -> Option<ToolSpec> {
-        let base = self.base();
-        let base_spec = base.current_spec();
-        let mut names = Self::base_names(&base);
+    fn merged_spec(&self) -> ToolSpec {
+        let base = self.base().ok();
+        let base_spec = base.as_ref().and_then(|tool| tool.current_spec());
+        let mut names = base.as_ref().map(Self::base_names).unwrap_or_default();
         let snapshot = self.plugins.snapshot();
         let plugin_skills = snapshot
             .skills
             .iter()
             .filter(|skill| names.insert(skill.name.clone()))
             .collect::<Vec<_>>();
-        if names.is_empty() {
-            return None;
-        }
         let mut spec = base_spec.unwrap_or_else(|| self.spec.clone());
-        let mut names = names.into_iter().map(Value::String).collect::<Vec<_>>();
-        names.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
-        spec.input_schema["properties"]["name"]["enum"] = Value::Array(names);
+        if names.is_empty() {
+            if let Some(name) = spec.input_schema["properties"]["name"].as_object_mut() {
+                name.remove("enum");
+            }
+        } else {
+            let mut names = names.into_iter().map(Value::String).collect::<Vec<_>>();
+            names.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            spec.input_schema["properties"]["name"]["enum"] = Value::Array(names);
+        }
         if !plugin_skills.is_empty() {
             spec.description.push_str("\n\nAgent Plugin skills:\n");
             for skill in plugin_skills {
                 let _ = writeln!(spec.description, "- {}: {}", skill.name, skill.description);
             }
         }
-        Some(spec)
+        spec
     }
 }
 
-fn default_skill_tool(root: &Path) -> Arc<dyn Tool> {
+fn default_skill_tool(root: &Path) -> Result<Arc<dyn Tool>, String> {
     build_skill_registry(root, &[], &[])
         .tool_registry()
         .get(&ToolName::new("skill"))
-        .expect("default skill registry always provides the skill tool")
+        .ok_or_else(|| "default skill registry did not provide the skill tool".to_owned())
 }
 
 #[async_trait]
@@ -1333,20 +1345,14 @@ impl Tool for DynamicSkillTool {
     }
 
     fn current_spec(&self) -> Option<ToolSpec> {
-        let _generation = self.plugins.try_generation_lease()?;
-        self.merged_spec()
+        Some(self.merged_spec())
     }
 
     fn proposed_requests(
         &self,
         request: &ToolRequest,
     ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
-        let _generation = self.plugins.try_generation_lease().ok_or_else(|| {
-            ToolError::Unavailable(
-                "plugin generation is being refreshed; retry the skill call".into(),
-            )
-        })?;
-        let base = self.base();
+        let base = self.base().map_err(ToolError::Unavailable)?;
         if Self::base_names(&base).contains(Self::requested_name(request)?) {
             base.proposed_requests(request)
         } else {
@@ -1361,7 +1367,7 @@ impl Tool for DynamicSkillTool {
     ) -> Result<ToolResult, ToolError> {
         let _generation = self.plugins.generation_lease().await;
         let name = Self::requested_name(&request)?.to_owned();
-        let base = self.base();
+        let base = self.base().map_err(ToolError::Unavailable)?;
         if Self::base_names(&base).contains(&name) {
             return base.invoke(request, context).await;
         }

@@ -1105,23 +1105,20 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         let _ = reply.send(Err(error));
         return Ok(());
     }
-    let current;
+    let mut current = None;
     let skills = match skill_source {
         #[cfg(test)]
-        PromptSkillSource::Static(skills) => {
-            current = None;
-            skills
-        }
+        PromptSkillSource::Static(skills) => skills,
         PromptSkillSource::Runtime(runtime) => {
-            current = match runtime.current_skills().await {
-                Ok(current) => Some(current),
+            let loaded = match runtime.current_skills().await {
+                Ok(current) => current,
                 Err(error) => {
                     handle.stop_injection_turn();
                     let _ = reply.send(Err(AcpRuntimeError::Loop(error)));
                     return Ok(());
                 }
             };
-            &current.as_ref().expect("runtime skills were loaded").skills
+            &current.insert(loaded).skills
         }
     };
     background_jobs.begin_turn();

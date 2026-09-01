@@ -604,7 +604,7 @@ fn project_skills_take_precedence_over_plugin_skills() {
 }
 
 #[tokio::test]
-async fn live_plugin_skill_tool_adds_changes_and_removes_skills() {
+async fn initially_empty_live_plugin_skill_tool_becomes_actionable_and_tracks_changes() {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("config.toml");
     std::fs::write(&config, "").unwrap();
@@ -631,14 +631,20 @@ async fn live_plugin_skill_tool_adds_changes_and_removes_skills() {
     .await
     .unwrap();
     let compose = runtime.compose(0);
-    let tool = DynamicSkillTool::new(root.path().to_path_buf(), plugins.clone());
-    assert!(
-        !tool
-            .current_spec()
-            .map(|spec| spec.input_schema.to_string())
-            .unwrap_or_default()
-            .contains("live-skill")
+    let tool = DynamicSkillTool::new(root.path().to_path_buf(), plugins.clone()).unwrap();
+    assert_eq!(
+        tool.spec().input_schema["properties"]["name"]["type"],
+        "string"
     );
+    assert!(
+        tool.spec().input_schema["properties"]["name"]
+            .get("enum")
+            .is_none()
+    );
+    let initial = tool
+        .current_spec()
+        .expect("the skill tool remains visible with an empty plugin catalog");
+    assert!(!initial.input_schema.to_string().contains("live-skill"));
 
     let package = root.path().join("plugin");
     let skill = package.join("skills/live-skill");
@@ -671,6 +677,12 @@ async fn live_plugin_skill_tool_adds_changes_and_removes_skills() {
             .input_schema
             .to_string()
             .contains("live-skill")
+    );
+    assert!(
+        tool.spec().input_schema["properties"]["name"]
+            .get("enum")
+            .is_none(),
+        "the frozen model schema remains open as the catalog changes"
     );
     assert!(compose.specs()[0].description.contains("live-skill"));
 
@@ -747,6 +759,53 @@ async fn live_plugin_skill_tool_adds_changes_and_removes_skills() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn dynamic_skill_catalog_reads_survive_a_held_generation_writer() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("plugin");
+    let skill = package.join("skills/plugin-skill");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"plugin"}"#,
+    )
+    .unwrap();
+    write_skill(&skill, "plugin-skill", "Plugin skill.", "plugin body");
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+            package.display()
+        ),
+    )
+    .unwrap();
+    let plugins = crate::plugins::PluginRuntime::load(
+        config,
+        root.path().to_path_buf(),
+        root.path().join("cache"),
+        root.path().join("data"),
+    )
+    .await
+    .unwrap();
+    let tool = DynamicSkillTool::new(root.path().to_path_buf(), plugins.clone()).unwrap();
+    let request = ToolRequest::new(
+        ToolCallId::new("call"),
+        ToolName::new("skill"),
+        json!({"name": "plugin-skill"}),
+        SessionId::new("session"),
+        TurnId::new("turn"),
+    );
+
+    let generation_writer = plugins.generation_writer().await;
+    let current = tool
+        .current_spec()
+        .expect("a writer must not hide the last published skill catalog");
+    assert!(current.input_schema.to_string().contains("plugin-skill"));
+    assert!(tool.proposed_requests(&request).is_ok());
+    drop(generation_writer);
 }
 
 #[tokio::test]
