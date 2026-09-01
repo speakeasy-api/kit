@@ -1868,7 +1868,7 @@ mod tests {
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         tui::app::{
             Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog, ModelDialog,
-            Update, UserImage, UserMessage,
+            Phase, Update, UserImage, UserMessage,
         },
     };
 
@@ -2317,7 +2317,8 @@ mod tests {
         assert!(start.contains("/model"), "{start}");
         assert!(start.contains("Choose a model"), "{start}");
 
-        app.show_logs = true;
+        app.blocks.push(Block::Agent("session response".into()));
+        app.phase = Phase::Working;
         let compact = render(&mut app, 80, 24);
         assert!(compact.contains("/model"), "{compact}");
         assert!(compact.contains("Choose a model"), "{compact}");
