@@ -1,0 +1,26 @@
+name: Check out release candidate
+description: Materialize the unpushed release commit prepared by the release workflow
+inputs:
+  release-sha:
+    description: Expected release candidate commit
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: release-candidate
+        path: ${{ runner.temp }}/release-candidate
+    - shell: bash
+      env:
+        RELEASE_SHA: ${{ inputs.release-sha }}
+      run: |
+        git fetch \
+          "$RUNNER_TEMP/release-candidate/release-candidate.bundle" \
+          refs/heads/release-candidate:refs/remotes/release-candidate
+        candidate=$(git rev-parse refs/remotes/release-candidate)
+        if [[ $candidate != "$RELEASE_SHA" ]]; then
+          echo "Release candidate $candidate does not match expected commit $RELEASE_SHA." >&2
+          exit 1
+        fi
+        git checkout --detach "$RELEASE_SHA"
