@@ -2,6 +2,16 @@
 
 Kit merges Model Context Protocol (MCP) servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
 
+## Ask the agent to add a server
+
+Kit does not provide an MCP-specific slash command. In a `kit tui` session, describe the server and the scope that you want:
+
+> Add the Linear MCP server at `https://mcp.linear.app/mcp` for this project. Preserve the existing entries in `.mcp.json`, add a description that will help you find its tools, validate the file, and help me authenticate.
+
+For a server that should be available in every project, ask the agent to update the file selected by `mcp_config` in `~/.kit/config.toml` instead. The agent should inspect the existing file before editing it, preserve unrelated servers, and never put a credential in the file unless you explicitly require static secret configuration. You can ask it to show the compact MCP status listing after the edit. New and changed servers load on the next `tool_search` or `auth` call without a restart.
+
+Files are not the only installation route. An Agent Plugin can contribute MCP servers, and `--mcp-config` can add an explicit JSON layer for one launch. The rest of this guide documents each route and the strict JSON format for manual edits.
+
 ## Agent Plugin MCP configuration
 
 Validated Agent Plugins can contribute `stdio` and `streamable-http` servers. Deprecated `sse` servers are skipped with a stderr diagnostic naming the plugin and server. Supported server names must be unique across plugins; a collision stops startup and identifies both plugin aliases.

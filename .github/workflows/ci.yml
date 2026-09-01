@@ -38,7 +38,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_generate_acp_swift.py
           scripts/generate-acp-swift.py --check
           PATH="$RUNNER_TEMP/bin:$PATH" scripts/generate-macos-project.sh
-          git diff --exit-code -- macos/Config/Version.xcconfig macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
+          git diff --exit-code -- macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
       - name: Build real debug helper
         run: cargo build --locked --bin kit
       - name: Run Swift tests and real Kit lifecycle smoke

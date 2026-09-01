@@ -4,5 +4,6 @@
 /.kit/
 /worktrees/
 /.kit-codesign-identity
+/macos/Config/Version.xcconfig
 /.env
 .DS_Store

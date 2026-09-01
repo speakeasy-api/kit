@@ -1,6 +1,47 @@
 # Reusable subagents and ACP harnesses
 
-Kit can start parent-owned nested agents through the Agent Client Protocol (ACP). A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, branch its completed context with `fork`, list retained handles with `subagents({})`, or terminate one with `close`.
+Kit can start parent-owned nested agents through the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/get-started/introduction). ACP is an open interface between an agent client and an agent runtime. That separation lets Kit orchestrate Kit, Claude Code, Codex, Cursor, and other compatible harnesses through one lifecycle instead of maintaining a custom integration for each one.
+
+A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, branch its completed context with `fork`, list retained handles with `subagents({})`, or terminate one with `close`.
+
+## Why use another harness from Kit?
+
+Keep Kit as the orchestrator and route only a bounded task to a specialist. The parent can start independent specialists concurrently, give each child explicit context, require structured output, continue a useful session, or fork an alternative. This makes the specialist's result composable with shell commands, edits, tests, MCP calls, and other agents in the same Runlet program.
+
+An external harness remains a separate program with its own configuration, tools, account, and usage limits. Kit does not turn a Claude subscription into provider credentials for the built-in `acp.kit` harness. The `@agentclientprotocol/claude-agent-acp` package includes the Claude Agent SDK CLI, so it does not require a separate Claude Code installation. Authenticate that adapter out of band with either a Claude subscription or Anthropic Console. With `--claudeai`, work counts against subscription limits instead of metered Console API billing; whether that costs less depends on the workload and plan. This also lets you choose a model for work where it is particularly effective—for example, Claude Opus for visual and graphic design—without moving the whole coding session out of Kit.
+
+Configure a descriptive alias for that route:
+
+```toml
+[acp.claude]
+command = "npx"
+args = ["-y", "@agentclientprotocol/claude-agent-acp@0.69.0"]
+permissions = "deny"
+
+[subagent.harnesses."acp.claude".models]
+designer = "opus"
+```
+
+Then ask for the configured specialist explicitly:
+
+```text
+design = subagent({
+  name: "Visual Designer",
+  harness: "acp.claude",
+  model: "designer",
+  prompt: "Review the existing dashboard and propose a coherent visual direction for the new analytics view. Return design guidance, not code."
+})
+return design.output
+```
+
+`designer` is a Kit-side alias for the model ID advertised by that ACP adapter. The external harness must accept the configured ID. Before starting the first Claude subagent, authenticate the adapter outside Kit:
+
+```sh
+npx -y @agentclientprotocol/claude-agent-acp@0.69.0 --cli auth login --claudeai  # Claude subscription
+# Use --console instead for Anthropic Console API billing.
+```
+
+Kit does not perform this login. You can start Kit before authenticating the adapter; authentication only needs to finish before the subagent starts.
 
 ## Start, prompt, and fork a reusable subagent
 

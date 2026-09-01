@@ -11,7 +11,8 @@
 
 <p align="center">
   Kit is a coding agent runtime. It gives the model <strong>one tool</strong> for writing and running programs.<br>
-  Kit provides a terminal client, an ACP server, an A2A endpoint, and a subagent orchestrator in one static binary.
+  Kit provides a terminal client, an <a href="https://agentclientprotocol.com/get-started/introduction">Agent Client Protocol (ACP)</a> server, an A2A endpoint, and a subagent orchestrator in one static binary.<br>
+  ACP separates agent clients from agent runtimes, so Kit works in compatible editors and can orchestrate other harnesses without custom integrations.
 </p>
 
 <p align="center">
@@ -105,6 +106,14 @@ kit serve --root /path/to/project --remote-acp --no-a2a --no-stdio --http 0.0.0.
 
 OpenRouter and Speakeasy use the same login process. Run `kit auth login openrouter` or `kit auth login speakeasy`. Then add `--provider openrouter --model anthropic/claude-sonnet-5` to the Kit command that you run. Providers and MCP servers share one credential backend (`--credential-store keychain|file|memory`).
 
+### Coming from Claude Code or Codex
+
+Read [Migrate from Claude Code or Codex](docs/user/migrating-from-claude-code-and-codex.md) for the file mappings, safety boundaries, and settings that need manual review. Or start `kit tui` in the existing project and paste this prompt:
+
+> Help me migrate my Claude Code and Codex project instructions, skills, and MCP servers into Kit. Consult your version-matched bundled documentation for the migration procedure. Preserve my source files, do not copy credentials, and show me any conflicts before changing an existing Kit file.
+
+Kit does not need an import slash command. The agent can find the same guide in its bundled docs, inspect the source configuration, translate compatible settings, and validate the result.
+
 ## Feature tour
 
 ### One tool: `compose`
@@ -126,24 +135,30 @@ return { tests: tests.success, counts, fixed }
 
 ### Subagents you can steer, continue, and fork
 
+Kit remains the orchestrator while a bounded task runs in the harness or model best suited to it. For example, you can send visual-direction work to Claude Opus through the Claude ACP adapter, keep implementation in Kit, run independent specialists concurrently, and bring their structured results back into one workflow. External harnesses retain their own configuration and authentication. Kit cannot use a Claude subscription as provider credentials for its built-in `acp.kit` harness; the Claude adapter authenticates separately and uses either subscription limits or Anthropic Console API billing.
+
+The example below assumes the `[acp.claude]` profile, `designer` model alias, and adapter login shown in [Configuration](#configuration).
+
 A subagent is a Runlet value with an `id`, `output`, and `generation`. Use `prompt` to continue the session. Use `fork` to create a branch. Use `subagents({})` to list active subagents. Use `close` to stop a subagent. Kit rejects a stale generation. This check prevents two continuations from updating one session at the same time.
 
 ```text
-review = subagent({
+design = subagent({
+  name: "Visual Designer",
   harness: "acp.claude",
-  prompt: "Review calc.py for edge cases.",
-  output_schema: { type: "object", properties: { issues: { type: "array", items: { type: "string" } } }, required: ["issues"] }
+  model: "designer",
+  prompt: "Act as the visual designer. Inspect the existing dashboard and propose one coherent direction.",
+  output_schema: { type: "object", properties: { direction: { type: "string" }, risks: { type: "array", items: { type: "string" } } }, required: ["direction", "risks"] }
 })
-ranked = prompt({ subagent: review, prompt: "Rank those issues by severity." })
-alt    = fork({ subagent: ranked, prompt: "Now argue the opposite ranking." })
-return { ranked: ranked.output, alt: alt.output, active: subagents({}) }
+refined = prompt({ subagent: design, prompt: "Make the direction concrete enough for an implementer." })
+alt     = fork({ subagent: refined, prompt: "Explore a bolder alternative without changing the original." })
+return { refined: refined.output, alternative: alt.output, active: subagents({}) }
 ```
 
-<p align="center"><img src="docs/media/subagents.gif" alt="Kit orchestrating Claude Code and Codex subagents in parallel" width="900"></p>
+<p align="center"><img src="docs/media/subagents.gif" alt="Kit orchestrating Claude and Codex ACP subagents in parallel" width="900"></p>
 
-- **Any ACP harness.** Kit includes `acp.kit`. You can add Claude Code, Codex, Cursor, or another harness that supports ACP v1 over stdio. The TOML configuration below requires four lines. Kit reads each harness's `initialize` response at runtime. Kit uses native `session/fork` when the harness advertises it. Otherwise, Kit creates an isolated transcript fork for Kit children.
+- **Any ACP harness.** Kit includes `acp.kit`. You can add Claude, Codex, Cursor, or another harness that supports ACP v1 over stdio. The TOML configuration below requires four lines. Kit reads each harness's `initialize` response at runtime. Kit uses native `session/fork` when the harness advertises it. Otherwise, Kit creates an isolated transcript fork for Kit children.
 - **Structured output.** Set `output_schema` on any call that produces a turn. If a reply does not match the schema, Kit returns the raw text and advances the generation. The next `prompt` can repair the reply.
-- **Per-harness model aliases.** `[subagent.harnesses."acp.claude".models] architect = "opus"` lets the model request `model: "architect"` without knowing the harness namespace. An `allow_model_overrides` list restricts the available models.
+- **Per-harness model aliases.** `[subagent.harnesses."acp.claude".models] designer = "opus"` gives visual-design work an intentional route without exposing harness-specific model IDs in prompts. An `allow_model_overrides` list restricts explicit model overrides.
 - **Bounded resources.** Subagent depth is limited to 2. Each session can have 120 live subagents. The startup handshake has a 30-second limit. Kit rejects or cancels permission requests from headless children. Kit never approves these requests automatically.
 - **Explicit context.** Each child starts without the parent conversation history and receives only the prompt that you provide. An `acp.kit` child also inherits the working directory, `AGENTS.md` chain, provider, MCP configuration, and credentials. Skills load into a child on demand with `skill({ name })`.
 
@@ -151,13 +166,13 @@ See [Reusable subagents and ACP harnesses](docs/user/subagents-and-acp-harnesses
 
 ### Background work without losing the turn
 
-Set `background: true` to detach a `compose` program immediately. Set `background: 60` to keep the program in the foreground for one minute before detachment. The turn ends, but the conversation continues. Kit adds the result to the session when the program finishes. In the TUI, use `⌘B` to move the newest running call to the background. Use `^K` to stop the selected call. The model can stop a call with `close({ call_id })`.
+Set `background: true` to detach a `compose` program immediately. Set `background: 60` to keep the program in the foreground for one minute before detachment. The turn ends, but the conversation continues. Kit adds the result to the session when the program finishes. In the TUI, use `⌘B` to move the newest running call to the background. Use `^K` to stop the selected call. The model can stop a call with `close({ call_id })`. See [Compose and local tools](docs/user/compose-and-local-tools.md#run-compose-in-the-background).
 
 <p align="center"><img src="docs/media/background.gif" alt="A background compose call completing after the turn already ended" width="900"></p>
 
 ### Steer a running turn
 
-While the agent works, press `Enter` to add a message to the *current* turn through ACP v2 `steer`. Kit does not queue the message for the next turn. Press `Esc` or `^C` to interrupt a running turn. When Kit is idle, press `^C` to clear a nonempty prompt. Press `^C` again to exit after the prompt is empty.
+While the agent works, press `Enter` to add a message to the *current* turn through ACP v2 `steer`. Kit does not queue the message for the next turn. Press `Esc` or `^C` to interrupt a running turn. When Kit is idle, press `^C` to clear a nonempty prompt. Press `^C` again to exit after the prompt is empty. See [TUI interaction and sessions](docs/user/tui-and-sessions.md#tui-keys-prompt-editing-and-navigation).
 
 <!-- PLACEHOLDER: record docs/media/steer.gif — start a longer task ("refactor calc.py into a class and add tests"), then while it is working type "actually keep it functional, just add docstrings" and press Enter. Capture the prompt placeholder changing from "message kit…" to "steer kit…" and the injected message appearing inside the running turn. -->
 
@@ -171,11 +186,15 @@ While the agent works, press `Enter` to add a message to the *current* turn thro
 | `openrouter` | `kit auth login openrouter` or `OPENROUTER_API_KEY` | Kit loads a live model catalog. It uses context-window data for the gauge and compaction. |
 | `speakeasy` | `kit auth login speakeasy` | Kit uses the Speakeasy AI Control Plane. Kit maps its session ID to the Gram chat ID so that a resumed conversation stays in one thread. |
 
-`/model sonnet` switches the live session at the next safe turn boundary. Press `Tab` in the picker to also update `~/.kit/config.toml`. Use `/effort low|medium|high|default` to change the reasoning effort.
+`/model sonnet` switches the live session at the next safe turn boundary. Press `Tab` in the picker to also update `~/.kit/config.toml`. Use `/effort low|medium|high|default` to change the reasoning effort. See [Getting started and configuration](docs/user/getting-started-and-configuration.md#choose-a-provider-and-authenticate).
 
 ### Live MCP configuration
 
-You do not need to restart Kit after you add a server. Kit merges plugins, configured `mcp_config`, project-root `.mcp.json`, and `--mcp-config` in that order, then reloads every named file before each `tool_search` and `auth` call. Kit waits for new servers to finish initialization before ranking tools.
+Kit has no MCP-specific slash command. Ask the agent instead:
+
+> Add the Linear MCP server at `https://mcp.linear.app/mcp` for this project. Preserve the existing servers in `.mcp.json`, add a useful description, validate the configuration, and help me authenticate.
+
+The agent can edit the project-root `.mcp.json` or your configured global file while the session is running. You can also edit either file yourself, pass a file with `--mcp-config`, or install an Agent Plugin that contributes MCP servers. You do not need to restart Kit after you add a server. Kit merges plugins, configured `mcp_config`, project-root `.mcp.json`, and `--mcp-config` in that order, then reloads every named file before each `tool_search` and `auth` call. Kit waits for new servers to finish initialization before ranking tools.
 
 Kit detects OAuth from the server's Bearer challenge. An `auth` block is not necessary. The model calls `auth({ name })` and gives you a URL. After you complete the browser flow, Kit resumes the session. If an access token expires, Kit refreshes the token and repeats the rejected call once.
 
@@ -196,7 +215,7 @@ Kit loads validated [Agent Plugin](docs/user/agent-plugins.md) packages from a l
 
 Plugin skills become available in the `skill` catalog. Kit starts plugin `stdio` and `streamable-http` MCP servers without an `mcp.json` file.
 
-Kit discovers [Agent Skills](https://agentskills.io/) in `<root>/.agents/skills` and `~/.agents/skills`. Kit initially shows only skill names and descriptions. Kit loads the full `SKILL.md` only when requested.
+Kit discovers [Agent Skills](https://agentskills.io/) in `<root>/.agents/skills` and `~/.agents/skills`. Kit initially shows only skill names and descriptions. Kit loads the full `SKILL.md` only when requested. See [Getting started and configuration](docs/user/getting-started-and-configuration.md#agent-skills) for Kit-specific discovery and setup.
 
 ```toml
 [plugins.review]
@@ -224,7 +243,7 @@ Kit stores each conversation as an append-only JSONL transcript in `~/.kit/sessi
 
 You can resume a session from the TUI or with the `--resume` option of `kit prompt`. ACP clients can use `session/load` or `session/resume`.
 
-When the provider reports 80% context-window use, Kit converts older history into a structured note. Kit persists the replacement. Kit retains the bootstrap instructions and a tool-safe tail. Use `/compact` to compact the history on demand.
+When the provider reports 80% context-window use, Kit converts older history into a structured note. Kit persists the replacement. Kit retains the bootstrap instructions and a tool-safe tail. Use `/compact` to compact the history on demand. See [TUI interaction and sessions](docs/user/tui-and-sessions.md#manage-sessions-and-compact-from-the-tui).
 
 <p align="center"><img src="docs/media/sessions.png" alt="The /sessions picker" width="900"></p>
 <p align="center"><img src="docs/media/headless.gif" alt="kit prompt one-shot, then resuming the same session" width="900"></p>
@@ -238,6 +257,8 @@ When the provider reports 80% context-window use, Kit converts older history int
 - **Daemon operation.** `kit serve --remote-acp --no-stdio` runs independently of stdin. `SIGINT` and `SIGTERM` stop new connections, interrupt live sessions, and allow five seconds for draining. One bearer token file protects the HTTP listener.
 - **Observability.** Set `otel_endpoint = "http://localhost:4317"` to export AgentKit GenAI spans through OTLP/gRPC. Kit exports spans for the main agent, ACP sessions, nested children, and the compactor. Kit disables message-content capture by default. Kit limits captured message content when you enable it.
 
+See [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md) for the trust model, operational limits, and recovery guidance.
+
 <!-- PLACEHOLDER: screenshot docs/media/otel-trace.png — point otel_endpoint at a local Jaeger/Tempo, run a session with two subagents, screenshot the trace waterfall showing the nested gen_ai spans. -->
 
 ### Terminal client
@@ -248,7 +269,7 @@ Click a code block to copy its contents. Use `^y` to copy the last response as M
 
 ### Editors and other clients over ACP
 
-Any ACP-compatible client can use Kit. Use `kit acp` for stdio. Use `kit serve --remote-acp` for HTTP/SSE or WebSocket connections at `/acp`. V2-only clients can use `/acp/v2`. Kit also supports A2A v1 on the same listener. Kit can call other A2A agents with `a2a({ url, prompt })`.
+Any ACP-compatible client can use Kit. Use `kit acp` for stdio. Use `kit serve --remote-acp` for HTTP/SSE or WebSocket connections at `/acp`. V2-only clients can use `/acp/v2`. Kit also supports A2A v1 on the same listener. Kit can call other A2A agents with `a2a({ url, prompt })`. See [Getting started and configuration](docs/user/getting-started-and-configuration.md#acp-and-a2a-server-commands).
 
 <!-- PLACEHOLDER: screenshot docs/media/acp-editor.png — Kit running as an external agent inside an ACP-capable editor (e.g. Zed: add {"agent_servers": {"Kit": {"command": "kit", "args": ["acp", "--root", "."]}}} to settings.json). Show a prompt with a compose tool card rendered by the editor. -->
 
@@ -282,13 +303,13 @@ args = ["acp"]
 harness = "acp.kit"
 
 [subagent.harnesses."acp.claude".models]
-architect = "opus"
+designer = "opus"
 
 [subagent.harnesses."acp.kit".models]
 flash = "openrouter:openai/gpt-5.6-luna"
 ```
 
-Kit loads `AGENTS.md` files from the working directory and its ancestors as project instructions. See [Getting started and configuration](docs/user/getting-started-and-configuration.md) for all other settings.
+Before the first Claude subagent, authenticate the adapter with `npx -y @agentclientprotocol/claude-agent-acp@0.69.0 --cli auth login --claudeai` for a Claude subscription, or use `--console` for Anthropic Console API billing. Kit loads `AGENTS.md` files from the working directory and its ancestors as project instructions. See [Getting started and configuration](docs/user/getting-started-and-configuration.md) for all other settings.
 
 ## How it compares
 
@@ -306,6 +327,7 @@ Kit used the fewest tokens, took the least active time, and needed the least ste
 ## Documentation
 
 - [Getting started and configuration](docs/user/getting-started-and-configuration.md)
+- [Migrate from Claude Code or Codex](docs/user/migrating-from-claude-code-and-codex.md)
 - [Compose and local tools](docs/user/compose-and-local-tools.md)
 - [Reusable subagents and ACP harnesses](docs/user/subagents-and-acp-harnesses.md)
 - [MCP](docs/user/mcp.md)
