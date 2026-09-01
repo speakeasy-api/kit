@@ -1,6 +1,6 @@
 # Agent Plugins
 
-Kit can load Agent Plugin packages from a local directory or a checksum-pinned online archive. Source resolution happens at startup. Kit uses `agentkit-plugins` to validate the resolved package, exposes its valid Agent Skills through the existing `skill` tool, and registers its supported MCP servers. A plugin-only configuration works without `--mcp-config` or `mcp_config`.
+Kit can load Agent Plugin packages from a local directory, a checksum-pinned online archive, or a revision-pinned Git repository. Source resolution happens at startup. Kit uses `agentkit-plugins` to validate the resolved package, exposes its valid Agent Skills through the existing `skill` tool, and registers its supported MCP servers. A plugin-only configuration works without `--mcp-config` or `mcp_config`.
 
 ## Configure a source
 
@@ -16,15 +16,25 @@ source = "archive"
 url = "https://github.com/owner/repo/archive/refs/tags/v1.2.0.tar.gz"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 subdir = "optional/plugin/path"
+
+[plugins.git-plugin]
+source = "git"
+url = "https://plugins.example.com/marketplace/opaque-id.git"
+rev = "0123456789abcdef0123456789abcdef01234567"
+subdir = "agent-plugins/example"
 ```
 
 Aliases must contain 1–64 lowercase ASCII letters, digits, or single hyphens, with an alphanumeric first and last character. Duplicate plugin manifest names are an error.
 
 A relative `path` is resolved against Kit's working directory, not the configuration directory. An absolute path is used directly. Local packages are validated on every startup and remain mutable local content.
 
-For an `archive`, provide the final archive URL. Kit does not clone Git repositories, translate forge URLs, select branches or tags, or automatically update plugins. `sha256` is mandatory and identifies the exact downloaded bytes. HTTPS is required, except that explicit loopback HTTP URLs are accepted for local testing. Redirects from HTTPS must remain HTTPS. URL credentials and fragments are rejected.
+For an `archive`, provide the final archive URL. Kit does not translate forge URLs or automatically update archive sources. `sha256` is mandatory and identifies the exact downloaded bytes. HTTPS is required, except that explicit loopback HTTP URLs are accepted for local testing. Redirects from HTTPS must remain HTTPS. URL credentials and fragments are rejected.
 
 Kit recognizes ZIP, gzip-compressed tar, and plain tar by content. Archives may contain `plugin.json` at the extraction root or one top-level directory, as forge-generated archives commonly do. `subdir`, when present, is applied below that selected base. Archive paths must be contained relative paths; links, special files, duplicate normalized paths, and extraction-limit violations are rejected. Executable mode bits are not preserved in this release.
+
+For `git`, `url` and `rev` are required and `subdir` is optional. The URL must be an absolute HTTPS URL without user information, a query, or a fragment. Local, SCP-like, SSH, `git`, file, and external-helper transports are rejected. `rev` accepts either an exact 40-hex SHA-1 commit ID or a validated tag name such as `v1.2.0` or `refs/tags/v1.2.0`; abbreviated object IDs, branches, revision expressions, and refspecs are rejected. A hexadecimal-only tag that could look like an abbreviated object ID must use the full `refs/tags/` form. A full commit is the reproducible choice. Tags are resolved and fetched again on every startup, so a moved tag can select a new commit.
+
+Kit invokes the installed `git` executable without a shell. It preserves normal system and user Git configuration so configured noninteractive HTTPS credential helpers can authenticate private repositories, but it disables Git terminal and configured askpass prompts, sets standard GUI credential-helper controls to noninteractive, and rejects credentials in the configured URL. Before network access, Kit verifies that `url.*.insteadOf` configuration did not rewrite the validated origin. System and uncommitted attribute files are disabled with controlled empty files; committed `.gitattributes` remains effective. Git diagnostics and configured URLs are not included in errors or written to temporary files. The selected portable `subdir` is archived with literal path semantics. Kit does not check out a worktree or run repository hooks, filters, Git LFS, or submodules; symlinks and submodules in the selected tree are rejected.
 
 ## Plugin MCP servers
 
@@ -54,7 +64,15 @@ Archive content is downloaded, checked against `sha256`, validated, and extracte
 ~/.kit/plugin-cache/<lowercase-sha256>
 ```
 
-The cache is local state protected by the permissions of `~/.kit`; it is not a sandbox or a publisher-identity check. Remove a damaged cache entry to force a verified download. The configured checksum proves archive-byte integrity, not who published those bytes.
+Git packages are fetched into an isolated bare staging repository, validated, and atomically published under:
+
+```text
+~/.kit/plugin-cache/git-v1/<sha256-url>/<resolved-commit>-<sha256-subdir>/repo
+```
+
+A validated full-commit cache entry can be reused without network access. Tags are still resolved remotely on every startup before a matching resolved-commit cache entry is reused. Concurrent publishers can duplicate fetch work, but publication remains atomic: losers validate the completed winner and attempt to remove their own staging directories. Kit also removes only exactly named staging directories under the relevant cache key when they are at least 24 hours old; it does not age out published cache entries. Git commands have a 120-second timeout, hard-bounded pipe output, backoff-based live object-store checks, and a final 256 MiB object-store validation. Git archives stream directly into bounded hardened tar extraction.
+
+The cache is local state protected by the permissions of `~/.kit`; it is not a sandbox or a publisher-identity check. Remove a damaged cache entry to force a verified download. The configured archive checksum proves archive-byte integrity, while a Git commit identifies repository content; neither proves who published it.
 
 Resolution or package-validation failures stop startup. Non-fatal package diagnostics are written to stderr with the plugin alias. Supported validated MCP declarations are registered and begin connecting in the background at startup; unsupported SSE declarations produce the skip diagnostic described above.
 

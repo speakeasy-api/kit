@@ -189,6 +189,12 @@ path = "./plugins/local-plugin"
 source = "archive"
 url = "https://example.com/plugin.tar.gz"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[plugins.git-plugin]
+source = "git"
+url = "https://plugins.example.com/repository.git"
+rev = "0123456789abcdef0123456789abcdef01234567"
+subdir = "agent-plugins/example"
 ```
 
 `root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
@@ -251,7 +257,7 @@ If startup reports `could not load AGENTS.md context`, inspect the `AGENTS.md` f
 
 ## Agent Skills
 
-Kit discovers [Agent Skills](https://agentskills.io/) recursively from `<root>/.agents/skills` and `~/.agents/skills`. Validated [Agent Plugins](agent-plugins.md) can add exact skill directories and supported MCP servers from local packages or checksum-pinned archives. Collision precedence for skills is project skills, user skills, then plugins in lexical alias order. Project skills therefore override user and plugin skills with the same name. Each skill lives in a directory containing `SKILL.md`; its frontmatter must include a `name` using lowercase letters, digits, and hyphens that matches the directory name and a non-empty `description`.
+Kit discovers [Agent Skills](https://agentskills.io/) recursively from `<root>/.agents/skills` and `~/.agents/skills`. Validated [Agent Plugins](agent-plugins.md) can add exact skill directories and supported MCP servers from local packages, checksum-pinned archives, or HTTPS Git sources pinned to a full commit or validated tag. Collision precedence for skills is project skills, user skills, then plugins in lexical alias order. Project skills therefore override user and plugin skills with the same name. Each skill lives in a directory containing `SKILL.md`; its frontmatter must include a `name` using lowercase letters, digits, and hyphens that matches the directory name and a non-empty `description`.
 
 ```markdown
 ---

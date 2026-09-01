@@ -192,7 +192,7 @@ See [MCP](docs/user/mcp.md).
 
 ### Agent Plugins and Agent Skills
 
-Kit loads validated [Agent Plugin](docs/user/agent-plugins.md) packages from a local directory or a SHA-256-pinned archive. Kit supports ZIP, tar.gz, tar, and GitHub tag archives.
+Kit loads validated [Agent Plugin](docs/user/agent-plugins.md) packages from a local directory, a SHA-256-pinned archive, or an HTTPS Git repository pinned to a full commit or validated tag. Kit supports ZIP, tar.gz, tar, and GitHub tag archives.
 
 Plugin skills become available in the `skill` catalog. Kit starts plugin `stdio` and `streamable-http` MCP servers without an `mcp.json` file.
 
@@ -208,6 +208,12 @@ source = "archive"
 url = "https://github.com/speakeasy-api/gram-plugin/archive/refs/tags/v1.2.0.tar.gz"
 sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 subdir = "plugin"
+
+[plugins.git-review]
+source = "git"
+url = "https://plugins.example.com/review.git"
+rev = "0123456789abcdef0123456789abcdef01234567"
+subdir = "agent-plugin"
 ```
 
 <!-- PLACEHOLDER: record docs/media/plugins.gif — with a plugin configured in ~/.kit/config.toml, start `kit tui` and ask "Which skills and MCP servers do you have from plugins? Load the review skill." Capture the skill catalog + plugin MCP server in tool_search's `mcp` status listing. -->

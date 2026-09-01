@@ -68,7 +68,7 @@ LABEL org.opencontainers.image.title="Kit" \
       org.opencontainers.image.revision="${REVISION}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 kit \
     && useradd --uid 1000 --gid 1000 --create-home --no-log-init --shell /bin/sh kit \
@@ -99,7 +99,7 @@ LABEL org.opencontainers.image.title="Kit" \
       org.opencontainers.image.revision="${REVISION}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 kit \
     && useradd --uid 1000 --gid 1000 --create-home --no-log-init --shell /bin/sh kit \
@@ -131,7 +131,7 @@ LABEL org.opencontainers.image.title="Kit" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates git \
     && addgroup -S -g 1000 kit \
     && adduser -S -D -u 1000 -G kit -h /home/kit -s /bin/sh kit \
     && mkdir -p /workspace \
