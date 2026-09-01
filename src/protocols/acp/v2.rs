@@ -34,7 +34,7 @@ use crate::{
 
 use super::{
     CancelBackgroundRequest, CancelBackgroundResponse, DetachComposeRequest, DetachComposeResponse,
-    SessionRegistry,
+    SessionRegistry, skill_catalog,
 };
 
 const PAGE_SIZE: usize = 100;
@@ -675,6 +675,8 @@ impl Server {
         let catalog = model_catalog(&current).await;
         let config_options = v2_config_options(&current, reasoning, &catalog);
         let canonical_transcript = driver.canonical_transcript;
+        let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
+            .map_err(|error| AcpRuntimeError::Loop(format!("skill catalog error: {error}")))?;
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
         let structured_completion = driver.structured_completion;
@@ -683,6 +685,7 @@ impl Server {
         let busy = Arc::new(AtomicBool::new(false));
         let actor = SessionActor {
             session_id: session_id.clone(),
+            runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
             handle: handle.clone(),
             busy: Arc::clone(&busy),
@@ -692,6 +695,7 @@ impl Server {
             tasks: driver.tasks,
             background_jobs: background_jobs.clone(),
             structured_completion,
+            skill_catalog,
             adapter: driver.adapter,
             catalog,
             commands: rx,
@@ -947,6 +951,7 @@ impl Server {
 
 struct SessionActor<S: ModelSession> {
     session_id: wire::SessionId,
+    runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     handle: AcpSessionHandle,
     busy: Arc<AtomicBool>,
@@ -956,6 +961,7 @@ struct SessionActor<S: ModelSession> {
     tasks: TaskManagerHandle,
     background_jobs: BackgroundJobs,
     structured_completion: bool,
+    skill_catalog: skill_catalog::SkillCatalogMonitor,
     adapter: SelectableAdapter,
     catalog: Vec<crate::provider::ModelGroup>,
     commands: mpsc::Receiver<Command>,
@@ -965,6 +971,7 @@ struct SessionActor<S: ModelSession> {
 async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
     let SessionActor {
         session_id,
+        runtime,
         integration,
         handle,
         busy,
@@ -974,6 +981,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         tasks,
         background_jobs,
         structured_completion,
+        mut skill_catalog,
         adapter,
         catalog,
         mut commands,
@@ -985,10 +993,13 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             biased;
             command = commands.recv() => match command {
                 Some(Command::Prompt(command)) => {
+                    let skills = runtime.current_skills().await;
                     let result = prepare_prompt(
                         &session_id,
+                        &skills,
                         &integration,
                         &handle,
+                        &mut skill_catalog,
                         &mut driver,
                         command,
                         &sink,
@@ -1066,8 +1077,10 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
 #[allow(clippy::too_many_arguments)]
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
+    skills: &[agentkit_tool_skills::Skill],
     integration: &AcpIntegration,
     handle: &AcpSessionHandle,
+    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
     driver: &mut LoopDriver<S>,
     command: PromptCommand,
     sink: &impl AcpSessionUpdateSink,
@@ -1089,9 +1102,14 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     }
     background_jobs.begin_turn();
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
-        driver
-            .submit_input(items)
-            .map_err(|error| map_loop_error(session_id, &error))?;
+        skill_catalog
+            .submit(skills, items, |items| driver.submit_input(items))
+            .map_err(|error| match error {
+                skill_catalog::SubmitError::Catalog(error) => {
+                    AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
+                }
+                skill_catalog::SubmitError::Submit(error) => map_loop_error(session_id, &error),
+            })?;
         integration.begin_prompt(session_id)
     });
     let user_message_id = match prepared {
@@ -2684,11 +2702,14 @@ mod tests {
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
+                &[],
                 &integration,
                 &handle,
+                &mut skill_catalog,
                 &mut driver,
                 command,
                 &sink,
