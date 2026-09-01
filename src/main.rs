@@ -231,6 +231,7 @@ struct Config {
     otel_message_content_max_messages: Option<usize>,
     otel_message_content_max_bytes: Option<usize>,
     mcp_config: Option<PathBuf>,
+    #[allow(dead_code)]
     #[serde(default)]
     plugins: BTreeMap<String, kit::plugins::PluginConfig>,
     credential_store: Option<CredentialStoreKind>,
@@ -240,6 +241,8 @@ struct Config {
     subagent: Option<SubagentConfig>,
     #[serde(skip)]
     config_dir: PathBuf,
+    #[serde(skip)]
+    config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,12 +261,18 @@ impl Config {
     }
 
     fn load(path: &Path) -> io::Result<Self> {
-        let config_dir = absolute_parent(path)?;
+        let config_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()?.join(path)
+        };
+        let config_dir = absolute_parent(&config_path)?;
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self {
                     config_dir,
+                    config_path: Some(config_path),
                     ..Self::default()
                 });
             }
@@ -298,20 +307,26 @@ impl Config {
             )
         })?;
         config.config_dir = config_dir;
+        config.config_path = Some(config_path);
         Ok(config)
     }
 
-    async fn resolve_plugins(
+    async fn plugin_runtime(
         &self,
         runtime_root: &Path,
-    ) -> Result<kit::plugins::ResolvedPlugins, String> {
-        kit::plugins::resolve(
-            &self.plugins,
-            runtime_root,
-            &self.config_dir.join("plugin-cache"),
-            &self.config_dir.join("plugin-data"),
-        )
-        .await
+    ) -> Result<Option<kit::plugins::PluginRuntime>, String> {
+        let Some(config_path) = &self.config_path else {
+            return Ok(None);
+        };
+        Ok(Some(
+            kit::plugins::PluginRuntime::load(
+                config_path.clone(),
+                runtime_root.to_path_buf(),
+                self.config_dir.join("plugin-cache"),
+                self.config_dir.join("plugin-data"),
+            )
+            .await?,
+        ))
     }
 
     fn root(&self, value: Option<PathBuf>) -> PathBuf {
@@ -871,7 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
-            let plugins = config.resolve_plugins(&root).await?;
+            let plugins = config.plugin_runtime(&root).await?;
             let runtime = match session_id {
                 Some(id) => {
                     kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
@@ -893,11 +908,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
-            let runtime = kit::Runtime::with_plugin_skills(
-                runtime,
-                plugins.package_roots,
-                plugins.skill_directories,
-            )?;
+            let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -905,7 +916,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kit::Runtime::with_mcp_config(
                     runtime,
                     explicit_mcp.as_deref(),
-                    plugins.mcp_plugins,
+                    Vec::new(),
                     true,
                     credential_storage,
                 )
@@ -915,7 +926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     runtime,
                     configured_mcp.as_deref(),
                     explicit_mcp.as_deref(),
-                    plugins.mcp_plugins,
+                    Vec::new(),
                     true,
                     credential_storage,
                 )
@@ -963,7 +974,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let credential_storage = mcp.credentials.storage(&config)?;
             let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
-            let plugins = config.resolve_plugins(&root).await?;
+            let plugins = config.plugin_runtime(&root).await?;
             let runtime = match session_id {
                 Some(id) => {
                     kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
@@ -985,11 +996,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
-            let runtime = kit::Runtime::with_plugin_skills(
-                runtime,
-                plugins.package_roots,
-                plugins.skill_directories,
-            )?;
+            let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
             let runtime = kit::Runtime::with_subagent_parent_context(
@@ -1002,7 +1009,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kit::Runtime::with_mcp_config(
                     runtime,
                     explicit_mcp.as_deref(),
-                    plugins.mcp_plugins,
+                    Vec::new(),
                     true,
                     credential_storage,
                 )
@@ -1012,7 +1019,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     runtime,
                     configured_mcp.as_deref(),
                     explicit_mcp.as_deref(),
-                    plugins.mcp_plugins,
+                    Vec::new(),
                     true,
                     credential_storage,
                 )
@@ -1039,7 +1046,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let credential_storage = mcp.credentials.storage(&config)?;
             let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
-            let plugins = config.resolve_plugins(&root).await?;
+            let plugins = config.plugin_runtime(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
             let runtime =
                 kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
@@ -1055,11 +1062,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?;
-            let runtime = kit::Runtime::with_plugin_skills(
-                runtime,
-                plugins.package_roots,
-                plugins.skill_directories,
-            )?;
+            let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
             let runtime = kit::Runtime::with_acp_harnesses(runtime, harnesses, default_harness)?;
@@ -1067,7 +1070,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kit::Runtime::with_mcp_config(
                     runtime,
                     explicit_mcp.as_deref(),
-                    plugins.mcp_plugins,
+                    Vec::new(),
                     false,
                     credential_storage,
                 )
@@ -1077,7 +1080,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     runtime,
                     configured_mcp.as_deref(),
                     explicit_mcp.as_deref(),
-                    plugins.mcp_plugins,
+                    Vec::new(),
                     false,
                     credential_storage,
                 )
@@ -1107,7 +1110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
-            config.resolve_plugins(&root).await?;
+            let _ = config.plugin_runtime(&root).await?;
             kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
                 &model,
@@ -1153,6 +1156,20 @@ mod tests {
 
         let error = Config::load(&path).expect_err("removed names key must fail config loading");
         assert!(error.to_string().contains("unknown field `names`"));
+    }
+
+    #[tokio::test]
+    async fn missing_config_path_can_start_empty_and_reload_plugins_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-config.toml");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.config_path.as_deref(), Some(path.as_path()));
+        let plugins = config
+            .plugin_runtime(directory.path())
+            .await
+            .unwrap()
+            .expect("an exact missing config path still supports live reload");
+        assert!(plugins.snapshot().package_roots.is_empty());
     }
 
     #[test]

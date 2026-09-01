@@ -993,10 +993,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             biased;
             command = commands.recv() => match command {
                 Some(Command::Prompt(command)) => {
-                    let skills = runtime.current_skills().await;
                     let result = prepare_prompt(
                         &session_id,
-                        &skills,
+                        PromptSkillSource::Runtime(&runtime),
                         &integration,
                         &handle,
                         &mut skill_catalog,
@@ -1074,10 +1073,16 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     }
 }
 
+enum PromptSkillSource<'a> {
+    #[cfg(test)]
+    Static(&'a [agentkit_tool_skills::Skill]),
+    Runtime(&'a Arc<Runtime>),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
-    skills: &[agentkit_tool_skills::Skill],
+    skill_source: PromptSkillSource<'_>,
     integration: &AcpIntegration,
     handle: &AcpSessionHandle,
     skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
@@ -1100,6 +1105,22 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         let _ = reply.send(Err(error));
         return Ok(());
     }
+    let mut current = None;
+    let skills = match skill_source {
+        #[cfg(test)]
+        PromptSkillSource::Static(skills) => skills,
+        PromptSkillSource::Runtime(runtime) => {
+            let loaded = match runtime.current_skills().await {
+                Ok(current) => current,
+                Err(error) => {
+                    handle.stop_injection_turn();
+                    let _ = reply.send(Err(AcpRuntimeError::Loop(error)));
+                    return Ok(());
+                }
+            };
+            &current.insert(loaded).skills
+        }
+    };
     background_jobs.begin_turn();
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
         skill_catalog
@@ -1112,6 +1133,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
             })?;
         integration.begin_prompt(session_id)
     });
+    drop(current);
     let user_message_id = match prepared {
         Ok(message_id) => message_id,
         Err(error) => {
@@ -2706,7 +2728,7 @@ mod tests {
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
-                &[],
+                PromptSkillSource::Static(&[]),
                 &integration,
                 &handle,
                 &mut skill_catalog,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::{
@@ -12,7 +12,8 @@ use std::{
 use agentkit_acp::{AcpIntegration, AcpRuntimeError};
 use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
-    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, Part,
+    CancellationController, CancellationHandle, FinishReason, Item, ItemKind, MetadataMap, Part,
+    ToolOutput, ToolResultPart,
 };
 use agentkit_loop::{
     Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
@@ -252,6 +253,8 @@ pub struct Runtime {
     /// Later ACP sessions receive their own persisted ids.
     session: Mutex<SessionSelection>,
     mcp: crate::tools::mcp::McpRuntime,
+    plugin_runtime: Option<crate::plugins::PluginRuntime>,
+    dynamic_skill_tool: Option<Arc<dyn Tool>>,
     skills: Arc<SkillRegistry>,
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
@@ -365,6 +368,8 @@ impl Runtime {
             subagents,
             session: Mutex::new(SessionSelection::default()),
             mcp: crate::tools::mcp::empty(),
+            plugin_runtime: None,
+            dynamic_skill_tool: None,
             skills,
             skill_package_roots: Vec::new(),
             skill_directories: Vec::new(),
@@ -557,6 +562,33 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
+    /// Installs a live Agent Plugin generation shared by MCP and skill tools.
+    pub fn with_plugin_runtime(
+        runtime: Arc<Self>,
+        plugins: Option<crate::plugins::PluginRuntime>,
+    ) -> Result<Arc<Self>, String> {
+        let Some(plugins) = plugins else {
+            return Ok(runtime);
+        };
+        let snapshot = plugins.snapshot();
+        let dynamic_skill_tool: Arc<dyn Tool> = Arc::new(DynamicSkillTool::new(
+            runtime.root.clone(),
+            plugins.clone(),
+        )?);
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure plugins after runtime was shared".to_string())?;
+        runtime.skills = build_skill_tools(
+            &runtime.root,
+            &snapshot.package_roots,
+            &snapshot.skill_directories,
+        );
+        runtime.skill_package_roots = snapshot.package_roots.clone();
+        runtime.skill_directories = snapshot.skill_directories.clone();
+        runtime.plugin_runtime = Some(plugins);
+        runtime.dynamic_skill_tool = Some(dynamic_skill_tool);
+        Ok(Arc::new(runtime))
+    }
+
     /// Preserves the original single-file behavior. `path` is the explicit MCP
     /// source and project-local configuration is not discovered.
     pub async fn with_mcp_config(
@@ -566,7 +598,7 @@ impl Runtime {
         interactive_oauth_enabled: bool,
         credential_storage: crate::tools::mcp::CredentialStorage,
     ) -> Result<Arc<Self>, String> {
-        if path.is_none() && plugin_mcps.is_empty() {
+        if path.is_none() && plugin_mcps.is_empty() && runtime.plugin_runtime.is_none() {
             return Ok(runtime);
         }
         let sources = path
@@ -666,13 +698,26 @@ impl Runtime {
         interactive_oauth_enabled: bool,
         credential_storage: crate::tools::mcp::CredentialStorage,
     ) -> Result<Arc<Self>, String> {
-        let mcp = crate::tools::mcp::connect(
-            install.sources,
-            &plugin_mcps,
-            interactive_oauth_enabled,
-            credential_storage.clone(),
-        )
-        .await?;
+        let mcp = match runtime.plugin_runtime.clone() {
+            Some(plugins) => {
+                crate::tools::mcp::connect_dynamic(
+                    install.sources,
+                    plugins,
+                    interactive_oauth_enabled,
+                    credential_storage.clone(),
+                )
+                .await?
+            }
+            None => {
+                crate::tools::mcp::connect(
+                    install.sources,
+                    &plugin_mcps,
+                    interactive_oauth_enabled,
+                    credential_storage.clone(),
+                )
+                .await?
+            }
+        };
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure MCP after runtime was shared".to_string())?;
         runtime.mcp = mcp;
@@ -724,23 +769,57 @@ impl Runtime {
         self.compose_with(depth, self.subagents.fresh())
     }
 
-    fn fresh_skills(&self) -> Arc<SkillRegistry> {
-        build_skill_tools(
-            &self.root,
-            &self.skill_package_roots,
-            &self.skill_directories,
+    fn current_skill_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        self.plugin_runtime.as_ref().map_or_else(
+            || {
+                (
+                    self.skill_package_roots.clone(),
+                    self.skill_directories.clone(),
+                )
+            },
+            |plugins| {
+                let snapshot = plugins.snapshot();
+                (
+                    snapshot.package_roots.clone(),
+                    snapshot.skill_directories.clone(),
+                )
+            },
         )
     }
 
-    pub(crate) async fn current_skills(&self) -> Vec<Skill> {
-        let registry = build_skill_registry(
-            &self.root,
-            &self.skill_package_roots,
-            &self.skill_directories,
-        )
-        .discover_skills()
-        .await;
-        registry.skills().into_iter().cloned().collect()
+    fn fresh_skills(&self) -> Arc<SkillRegistry> {
+        let (package_roots, skill_directories) = self.current_skill_paths();
+        build_skill_tools(&self.root, &package_roots, &skill_directories)
+    }
+
+    pub(crate) async fn current_skills(&self) -> Result<CurrentSkills, String> {
+        if self.plugin_runtime.is_some() {
+            self.mcp.refresh().await?;
+        }
+        let _generation = match &self.plugin_runtime {
+            Some(plugins) => Some(plugins.generation_lease().await),
+            None => None,
+        };
+        let registry = build_skill_registry(&self.root, &[], &[])
+            .discover_skills()
+            .await;
+        let mut skills = registry.skills().into_iter().cloned().collect::<Vec<_>>();
+        if let Some(plugins) = &self.plugin_runtime {
+            let mut names = skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect::<BTreeSet<_>>();
+            for skill in &plugins.snapshot().skills {
+                if names.insert(skill.name.clone()) {
+                    skills.push(skill.clone());
+                }
+            }
+        }
+        Ok(CurrentSkills {
+            skills,
+            _generation,
+            _plugin_runtime: self.plugin_runtime.clone(),
+        })
     }
 
     fn compose_with(&self, depth: usize, subagents: Subagents) -> ComposeOnly {
@@ -785,30 +864,28 @@ impl Runtime {
             .register(Observed::new(ToolSearch::new(self.mcp.clone())))
             .register(Observed::new(AuthTool::new(self.mcp.clone())))
             .register(Observed::new(McpTool::new(self.mcp.clone())));
-        let mut child_specs = children.specs();
-        let skill_tools = skills.tool_registry();
-        if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
-            let frozen_skill_spec = skill_spec_with_open_name(
-                skill_tool
-                    .current_spec()
-                    .unwrap_or_else(|| skill_tool.spec().clone()),
-            );
-            children.register(observe_shared(skill_tool));
-            child_specs.push(frozen_skill_spec);
+        if let Some(skill_tool) = &self.dynamic_skill_tool {
+            children.register(observe_shared(Arc::clone(skill_tool)));
+        } else {
+            let skill_tools = skills.tool_registry();
+            if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
+                children.register(observe_shared(skill_tool));
+            }
         }
+        let hidden_tools = children.clone();
         let compose = ComposeTool::wrap(children)
-            .with_source(self.mcp.catalog().unadvertised())
             .with_config(
                 ComposeConfig::new()
                     .with_max_nested_tool_calls(128)
                     .with_max_result_bytes(MAX_COMPOSE_RESULT_BYTES),
             )
-            .with_backend(HiddenRunletBackend(child_specs));
+            .with_backend(HiddenRunletBackend(hidden_tools.clone()));
         ComposeOnly {
             backgroundable: BackgroundableCompose::new(
                 compose.clone(),
                 background_jobs,
                 self.root.clone(),
+                hidden_tools,
             ),
             compose,
         }
@@ -828,6 +905,16 @@ impl Runtime {
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
         let session_id = request.id.clone();
+        if self.plugin_runtime.is_some() {
+            self.mcp.refresh().await.map_err(|error| {
+                record_runtime_failure(
+                    &session_id,
+                    crate::fatal::Surface::Prompt,
+                    "plugin_refresh",
+                    error,
+                )
+            })?;
+        }
         let initial = if request.resume {
             vec![Item::text(ItemKind::System, self.system_prompt(0))]
         } else {
@@ -948,6 +1035,9 @@ impl Runtime {
         depth: usize,
         cancellation: Option<CancellationHandle>,
     ) -> Result<String, LoopError> {
+        if self.plugin_runtime.is_some() {
+            self.mcp.refresh().await.map_err(LoopError::InvalidState)?;
+        }
         let session = format!("run-{}", NEXT_SESSION.fetch_add(1, Ordering::Relaxed));
         let transcript = self
             .initial_transcript(depth)
@@ -1068,8 +1158,9 @@ impl Runtime {
             self.openrouter_api_key.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
+        let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
-        let skill_catalog = self.current_skills().await;
+        let skill_catalog = current_skills.skills;
         let compactor = crate::compaction::automatic(
             adapter.clone(),
             self.agentkit_telemetry(),
@@ -1156,6 +1247,158 @@ impl Runtime {
             self.root.display(),
             delegation_context
         )
+    }
+}
+
+pub(crate) struct CurrentSkills {
+    pub(crate) skills: Vec<Skill>,
+    _generation: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _plugin_runtime: Option<crate::plugins::PluginRuntime>,
+}
+
+struct DynamicSkillTool {
+    root: PathBuf,
+    plugins: crate::plugins::PluginRuntime,
+    spec: ToolSpec,
+}
+
+impl DynamicSkillTool {
+    fn new(root: PathBuf, plugins: crate::plugins::PluginRuntime) -> Result<Self, String> {
+        let tool = default_skill_tool(&root)?;
+        let mut spec = tool.spec().clone();
+        if let Some(name) = spec.input_schema["properties"]["name"].as_object_mut() {
+            name.remove("enum");
+        }
+        Ok(Self {
+            root,
+            plugins,
+            spec,
+        })
+    }
+
+    fn base(&self) -> Result<Arc<dyn Tool>, String> {
+        default_skill_tool(&self.root)
+    }
+
+    fn requested_name(request: &ToolRequest) -> Result<&str, ToolError> {
+        request
+            .input
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("skill name must be a string".into()))
+    }
+
+    fn base_names(tool: &Arc<dyn Tool>) -> BTreeSet<String> {
+        tool.current_spec()
+            .and_then(|spec| {
+                spec.input_schema["properties"]["name"]["enum"]
+                    .as_array()
+                    .cloned()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn merged_spec(&self) -> ToolSpec {
+        let base = self.base().ok();
+        let base_spec = base.as_ref().and_then(|tool| tool.current_spec());
+        let mut names = base.as_ref().map(Self::base_names).unwrap_or_default();
+        let snapshot = self.plugins.snapshot();
+        let plugin_skills = snapshot
+            .skills
+            .iter()
+            .filter(|skill| names.insert(skill.name.clone()))
+            .collect::<Vec<_>>();
+        let mut spec = base_spec.unwrap_or_else(|| self.spec.clone());
+        if names.is_empty() {
+            if let Some(name) = spec.input_schema["properties"]["name"].as_object_mut() {
+                name.remove("enum");
+            }
+        } else {
+            let mut names = names.into_iter().map(Value::String).collect::<Vec<_>>();
+            names.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+            spec.input_schema["properties"]["name"]["enum"] = Value::Array(names);
+        }
+        if !plugin_skills.is_empty() {
+            spec.description.push_str("\n\nAgent Plugin skills:\n");
+            for skill in plugin_skills {
+                let _ = writeln!(spec.description, "- {}: {}", skill.name, skill.description);
+            }
+        }
+        spec
+    }
+}
+
+fn default_skill_tool(root: &Path) -> Result<Arc<dyn Tool>, String> {
+    build_skill_registry(root, &[], &[])
+        .tool_registry()
+        .get(&ToolName::new("skill"))
+        .ok_or_else(|| "default skill registry did not provide the skill tool".to_owned())
+}
+
+#[async_trait]
+impl Tool for DynamicSkillTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn current_spec(&self) -> Option<ToolSpec> {
+        Some(self.merged_spec())
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        let base = self.base().map_err(ToolError::Unavailable)?;
+        if Self::base_names(&base).contains(Self::requested_name(request)?) {
+            base.proposed_requests(request)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        context: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let _generation = self.plugins.generation_lease().await;
+        let name = Self::requested_name(&request)?.to_owned();
+        let base = self.base().map_err(ToolError::Unavailable)?;
+        if Self::base_names(&base).contains(&name) {
+            return base.invoke(request, context).await;
+        }
+        let snapshot = self.plugins.snapshot();
+        let skill = snapshot
+            .skills
+            .iter()
+            .find(|skill| skill.name == name)
+            .ok_or_else(|| ToolError::InvalidInput(format!("unknown skill: {name}")))?;
+        let mut response = format!(
+            "skill: {}\ndir: {}\n\n{}",
+            skill.name,
+            skill.base_dir.display(),
+            skill.body
+        );
+        if !skill.resources.is_empty() {
+            response.push_str("\n\nresources:\n");
+            for resource in &skill.resources {
+                let _ = writeln!(response, "  - {}", resource.display());
+            }
+        }
+        Ok(ToolResult {
+            result: ToolResultPart {
+                call_id: request.call_id,
+                output: ToolOutput::Text(response),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            },
+            duration: None,
+            metadata: MetadataMap::new(),
+        })
     }
 }
 
@@ -1549,16 +1792,23 @@ struct BackgroundableCompose {
     spec: ToolSpec,
     background_jobs: BackgroundJobs,
     root: PathBuf,
+    hidden_tools: agentkit_tools_core::ToolRegistry,
 }
 
 impl BackgroundableCompose {
-    fn new(inner: ComposeTool, background_jobs: BackgroundJobs, root: PathBuf) -> Self {
+    fn new(
+        inner: ComposeTool,
+        background_jobs: BackgroundJobs,
+        root: PathBuf,
+        hidden_tools: agentkit_tools_core::ToolRegistry,
+    ) -> Self {
         let spec = backgroundable_spec(inner.spec().clone());
         Self {
             inner,
             spec,
             background_jobs,
             root,
+            hidden_tools,
         }
     }
 
@@ -1588,7 +1838,10 @@ impl Tool for BackgroundableCompose {
     }
 
     fn current_spec(&self) -> Option<ToolSpec> {
-        self.inner.current_spec().map(backgroundable_spec)
+        self.inner.current_spec().map(|mut spec| {
+            spec.description = HiddenRunletBackend(self.hidden_tools.clone()).description(None);
+            backgroundable_spec(spec)
+        })
     }
 
     fn proposed_requests(
@@ -1780,7 +2033,23 @@ fn skill_spec_with_open_name(mut spec: ToolSpec) -> ToolSpec {
     spec
 }
 
-struct HiddenRunletBackend(Vec<ToolSpec>);
+struct HiddenRunletBackend(agentkit_tools_core::ToolRegistry);
+
+impl HiddenRunletBackend {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.0
+            .specs()
+            .into_iter()
+            .map(|spec| {
+                if spec.name == ToolName::new("skill") {
+                    skill_spec_with_open_name(spec)
+                } else {
+                    spec
+                }
+            })
+            .collect()
+    }
+}
 
 #[async_trait]
 impl ComposeBackend for HiddenRunletBackend {
@@ -1794,7 +2063,7 @@ impl ComposeBackend for HiddenRunletBackend {
             "\n\nHidden callable tools. Each entry includes the exact compact JSON schemas \
              used by Runlet for input checking and output typing:",
         );
-        for spec in &self.0 {
+        for spec in self.specs() {
             let _ = write!(
                 description,
                 "\n\n- `{}`: {}\n  Input JSON schema: `{}`\n  Output JSON schema: `{}`",
@@ -1812,7 +2081,7 @@ impl ComposeBackend for HiddenRunletBackend {
     }
 
     async fn execute(&self, mut run: BackendRun) -> Result<Value, ComposeOutcome> {
-        run.visible_specs.clone_from(&self.0);
+        run.visible_specs = self.specs();
         RunletBackend.execute(run).await
     }
 }
