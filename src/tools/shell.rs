@@ -204,9 +204,12 @@ impl Tool for ShellTool {
                 }
             }
         }
-        let status = status.expect("shell status is complete");
-        let stdout = stdout.expect("shell stdout is complete");
-        let stderr = stderr.expect("shell stderr is complete");
+        let status =
+            status.ok_or_else(|| ToolError::Internal("shell status was not collected".into()))?;
+        let stdout =
+            stdout.ok_or_else(|| ToolError::Internal("shell stdout was not collected".into()))?;
+        let stderr =
+            stderr.ok_or_else(|| ToolError::Internal("shell stderr was not collected".into()))?;
         let output = json!({
             "exit_code": status.code(),
             "success": status.success(),

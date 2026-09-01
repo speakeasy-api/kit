@@ -51,7 +51,9 @@ impl<R: Read> Read for LimitedReader<R> {
                 "plugin tar stream exceeds expanded size limit",
             ));
         }
-        let limit = usize::try_from(self.remaining.min(buffer.len() as u64)).unwrap();
+        let limit = usize::try_from(self.remaining.min(buffer.len() as u64)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "plugin read limit is too large")
+        })?;
         let read = self.inner.read(&mut buffer[..limit])?;
         self.remaining -= read as u64;
         Ok(read)
@@ -71,7 +73,7 @@ pub enum PluginConfig {
     },
     Git {
         url: String,
-        rev: String,
+        rev: Option<String>,
         subdir: Option<String>,
     },
 }
@@ -127,7 +129,7 @@ fn resolve_blocking(
                 subdir,
             } => resolve_archive(url, sha256, subdir.as_deref(), cache_root)?,
             PluginConfig::Git { url, rev, subdir } => {
-                resolve_git(url, rev, subdir.as_deref(), cache_root)?
+                resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root)?
             }
         };
         let plugin = AgentPlugin::load(&root).map_err(|error| {
@@ -217,7 +219,8 @@ fn resolve_path(path: &Path, runtime_root: &Path) -> Result<PathBuf, String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GitRevision {
     Commit(String),
-    Tag(String),
+    Ref(String),
+    DefaultBranch,
 }
 
 #[derive(Clone, Copy)]
@@ -681,12 +684,15 @@ fn cleanup_stale_staging(parent: &Path, prefix: &str, age: Duration) -> Result<(
 
 fn resolve_git(
     value: &str,
-    rev: &str,
+    rev: Option<&str>,
     subdir: Option<&str>,
     cache_root: &Path,
 ) -> Result<PathBuf, String> {
     let url = validate_git_url(value)?;
-    let revision = validate_git_revision(rev)?;
+    let revision = rev
+        .map(validate_git_revision)
+        .transpose()?
+        .unwrap_or(GitRevision::DefaultBranch);
     let subdir = subdir.map(validate_git_subdir).transpose()?;
     let source = url.as_str();
     let source_key = sha256_text(source);
@@ -709,10 +715,26 @@ fn resolve_git_local(
     cache_root: &Path,
     runner: &dyn GitRunner,
 ) -> Result<PathBuf, String> {
+    resolve_git_local_revision(
+        repository,
+        validate_git_revision(rev)?,
+        subdir,
+        cache_root,
+        runner,
+    )
+}
+
+#[cfg(test)]
+fn resolve_git_local_revision(
+    repository: &Path,
+    revision: GitRevision,
+    subdir: Option<&Path>,
+    cache_root: &Path,
+    runner: &dyn GitRunner,
+) -> Result<PathBuf, String> {
     let repository = repository
         .canonicalize()
         .map_err(|error| format!("could not resolve test Git repository: {error}"))?;
-    let revision = validate_git_revision(rev)?;
     let subdir = subdir
         .map(|path| {
             path.to_str()
@@ -750,39 +772,29 @@ fn validate_git_url(value: &str) -> Result<Url, String> {
 }
 
 fn validate_git_revision(value: &str) -> Result<GitRevision, String> {
-    if value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        if value.len() == 40 {
-            return Ok(GitRevision::Commit(value.to_ascii_lowercase()));
-        }
-        return Err("plugin Git commit must be a full 40-character object ID".into());
+    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(GitRevision::Commit(value.to_ascii_lowercase()));
     }
-    let tag = if let Some(tag) = value.strip_prefix("refs/tags/") {
-        tag
-    } else if value.starts_with("refs/") {
-        return Err("plugin Git revision must be a full commit or tag".into());
-    } else {
-        value
-    };
-    if !valid_git_tag(tag) {
-        return Err("invalid plugin Git tag".into());
+    if value == "HEAD" {
+        return Ok(GitRevision::DefaultBranch);
     }
-    Ok(GitRevision::Tag(format!("refs/tags/{tag}")))
+    if !valid_git_ref_name(value) {
+        return Err("invalid plugin Git revision name".into());
+    }
+    Ok(GitRevision::Ref(value.to_owned()))
 }
 
-fn valid_git_tag(tag: &str) -> bool {
-    if tag.is_empty()
-        || tag.len() > 1024
-        || matches!(
-            tag,
-            "@" | "HEAD" | "FETCH_HEAD" | "ORIG_HEAD" | "MERGE_HEAD"
-        )
-        || tag.starts_with(['/', '-', '+'])
-        || tag.ends_with('/')
-        || tag.ends_with('.')
-        || tag.contains("//")
-        || tag.contains("..")
-        || tag.contains("@{")
-        || tag.bytes().any(|byte| {
+fn valid_git_ref_name(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 1024
+        || value == "@"
+        || value.starts_with(['/', '-', '+'])
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("//")
+        || value.contains("..")
+        || value.contains("@{")
+        || value.bytes().any(|byte| {
             byte <= b' '
                 || byte == 0x7f
                 || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
@@ -790,7 +802,7 @@ fn valid_git_tag(tag: &str) -> bool {
     {
         return false;
     }
-    tag.split('/').all(|component| {
+    value.split('/').all(|component| {
         !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
     })
 }
@@ -1055,36 +1067,6 @@ fn resolve_git_source(
 
     verify_git_effective_url(&git, staging, remote)?;
 
-    let advertised = match revision {
-        GitRevision::Commit(oid) => oid.clone(),
-        GitRevision::Tag(tag) => {
-            let peeled = format!("{tag}^{{}}");
-            let output = git.run(
-                "tag resolution",
-                staging,
-                &[
-                    OsStr::new("ls-remote"),
-                    OsStr::new("--exit-code"),
-                    OsStr::new("--tags"),
-                    OsStr::new("--"),
-                    remote,
-                    OsStr::new(tag),
-                    OsStr::new(&peeled),
-                ],
-                MAX_GIT_TREE_BYTES,
-                None,
-            )?;
-            parse_remote_tag(&output, tag)?
-        }
-    };
-
-    let destination = git_cache_destination(&source_root, &advertised, &subdir_key);
-    if let Ok(root) =
-        validate_git_cache_entry(&destination, source_key, &advertised, &subdir_key, subdir)
-    {
-        return Ok(root);
-    }
-
     git.run(
         "repository initialization",
         &git_dir,
@@ -1107,8 +1089,8 @@ fn resolve_git_source(
         .map_err(|error| format!("could not create empty Git info attributes: {error}"))?;
     verify_git_effective_url(&git, &git_dir, remote)?;
     let fetch_revision = match revision {
-        GitRevision::Commit(oid) => oid.as_str(),
-        GitRevision::Tag(tag) => tag.as_str(),
+        GitRevision::Commit(oid) | GitRevision::Ref(oid) => oid.as_str(),
+        GitRevision::DefaultBranch => "HEAD",
     };
     let fetch_refspec = format!("{fetch_revision}:{GIT_PRIVATE_FETCH_REF}");
     git.run(
@@ -1143,10 +1125,19 @@ fn resolve_git_source(
         None,
     )?;
     let fetched = parse_git_oid(&fetched).ok_or("Git plugin revision is not a commit")?;
-    if fetched != advertised {
-        return Err("Git plugin revision changed while it was fetched".into());
+    if let GitRevision::Commit(expected) = revision
+        && fetched != *expected
+    {
+        return Err("Git plugin fetch returned a different commit".into());
     }
     enforce_git_object_store_limit(&git_dir.join("objects"))?;
+
+    let destination = git_cache_destination(&source_root, &fetched, &subdir_key);
+    if let Ok(root) =
+        validate_git_cache_entry(&destination, source_key, &fetched, &subdir_key, subdir)
+    {
+        return Ok(root);
+    }
 
     let oid = OsStr::new(&fetched);
     let mut tree_args = vec![
@@ -1229,35 +1220,6 @@ fn verify_git_effective_url(
         return Err("plugin Git URL is rewritten by Git configuration".into());
     }
     Ok(())
-}
-
-fn parse_remote_tag(output: &[u8], tag: &str) -> Result<String, String> {
-    let text = std::str::from_utf8(output).map_err(|_| "invalid Git tag response")?;
-    let peeled_name = format!("{tag}^{{}}");
-    let mut direct = None;
-    let mut peeled = None;
-    for line in text.lines() {
-        let Some((oid, name)) = line.split_once('\t') else {
-            return Err("invalid Git tag response".into());
-        };
-        let oid = parse_git_oid(oid.as_bytes()).ok_or("invalid Git tag response")?;
-        let slot = if name == tag {
-            &mut direct
-        } else if name == peeled_name {
-            &mut peeled
-        } else {
-            return Err("invalid Git tag response".into());
-        };
-        if slot
-            .replace(oid.clone())
-            .is_some_and(|previous| previous != oid)
-        {
-            return Err("ambiguous Git tag response".into());
-        }
-    }
-    peeled
-        .or(direct)
-        .ok_or_else(|| "Git plugin tag was not found".into())
 }
 
 fn parse_git_oid(output: &[u8]) -> Option<String> {
@@ -1551,8 +1513,10 @@ fn parse_sha256(value: &str) -> Result<[u8; 32], String> {
     }
     let mut digest = [0u8; 32];
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let text = std::str::from_utf8(pair).expect("hexadecimal is UTF-8");
-        digest[index] = u8::from_str_radix(text, 16).expect("hexadecimal pair parses");
+        let text = std::str::from_utf8(pair)
+            .map_err(|error| format!("could not parse plugin archive sha256: {error}"))?;
+        digest[index] = u8::from_str_radix(text, 16)
+            .map_err(|error| format!("could not parse plugin archive sha256: {error}"))?;
     }
     Ok(digest)
 }
@@ -1975,7 +1939,11 @@ mod tests {
             "source = 'git'\nurl = 'https://plugins.example/repository.git'\nrev = 'v1'\nsubdir = 'plugins/example'",
         )
         .unwrap();
-        assert!(matches!(git, PluginConfig::Git { .. }));
+        assert!(matches!(git, PluginConfig::Git { rev: Some(_), .. }));
+        let git_default: PluginConfig =
+            toml::from_str("source = 'git'\nurl = 'https://plugins.example/repository.git'")
+                .unwrap();
+        assert!(matches!(git_default, PluginConfig::Git { rev: None, .. }));
         assert!(matches!(
             toml::from_str::<PluginConfig>("source = 'path'\npath = '.'\nfuture_option = true"),
             Ok(PluginConfig::Path { .. })
@@ -2013,20 +1981,33 @@ mod tests {
         );
         assert_eq!(
             validate_git_revision("v1.2.3").unwrap(),
-            GitRevision::Tag("refs/tags/v1.2.3".into())
+            GitRevision::Ref("v1.2.3".into())
         );
-        assert!(validate_git_revision("abc123").is_err());
+        assert_eq!(
+            validate_git_revision("abc123").unwrap(),
+            GitRevision::Ref("abc123".into())
+        );
         assert_eq!(
             validate_git_revision("refs/tags/abc123").unwrap(),
-            GitRevision::Tag("refs/tags/abc123".into())
+            GitRevision::Ref("refs/tags/abc123".into())
         );
-        assert!(validate_git_revision("HEAD").is_err());
+        assert_eq!(
+            validate_git_revision("HEAD").unwrap(),
+            GitRevision::DefaultBranch
+        );
+        assert_eq!(
+            validate_git_revision("main").unwrap(),
+            GitRevision::Ref("main".into())
+        );
+        assert_eq!(
+            validate_git_revision("refs/heads/main").unwrap(),
+            GitRevision::Ref("refs/heads/main".into())
+        );
         assert_eq!(
             validate_git_revision("refs/tags/releases/v1").unwrap(),
-            GitRevision::Tag("refs/tags/releases/v1".into())
+            GitRevision::Ref("refs/tags/releases/v1".into())
         );
         for invalid in [
-            "refs/heads/main",
             "+refs/tags/v1:refs/tags/pwned",
             "-v1",
             "v1^{}",
@@ -2460,6 +2441,52 @@ mod tests {
     }
 
     #[test]
+    fn resolves_default_branch_and_main_to_commits() {
+        let repository = TestRepository::new();
+        let first = repository.commit_file("plugin.json", MANIFEST.as_bytes(), "plugin");
+        repository.git(&["branch", "-M", "main"]);
+        let cache = tempfile::tempdir().unwrap();
+
+        let default_root = resolve_git_local_revision(
+            repository.path(),
+            GitRevision::DefaultBranch,
+            None,
+            cache.path(),
+            &SystemGitRunner::default(),
+        )
+        .unwrap();
+        assert!(
+            default_root
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&first)
+        );
+
+        let second = repository.commit_file("version.txt", b"second", "second");
+        let main_root = resolve_git_local(
+            repository.path(),
+            "main",
+            None,
+            cache.path(),
+            &SystemGitRunner::default(),
+        )
+        .unwrap();
+        assert!(
+            main_root
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&second)
+        );
+        assert_eq!(fs::read(main_root.join("version.txt")).unwrap(), b"second");
+    }
+
+    #[test]
     fn resolves_git_commit_and_reuses_it_offline() {
         let repository = TestRepository::new();
         let commit = repository.commit_file("plugin.json", MANIFEST.as_bytes(), "plugin");
@@ -2773,7 +2800,7 @@ mod tests {
             let error = resolve_git_source(
                 OsStr::new(url.as_str()),
                 &source_key,
-                &GitRevision::Tag("refs/tags/stable".into()),
+                &GitRevision::Ref("refs/tags/stable".into()),
                 None,
                 cache.path(),
                 GitProtocol::Https,

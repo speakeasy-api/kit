@@ -212,7 +212,7 @@ subdir = "plugin"
 [plugins.git-review]
 source = "git"
 url = "https://plugins.example.com/review.git"
-rev = "0123456789abcdef0123456789abcdef01234567"
+rev = "main"
 subdir = "agent-plugin"
 ```
 

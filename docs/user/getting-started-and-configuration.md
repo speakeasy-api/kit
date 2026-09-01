@@ -193,7 +193,7 @@ sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 [plugins.git-plugin]
 source = "git"
 url = "https://plugins.example.com/repository.git"
-rev = "0123456789abcdef0123456789abcdef01234567"
+rev = "main"
 subdir = "agent-plugins/example"
 ```
 

@@ -102,7 +102,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 
 ### Kit does not start or the TUI exits before opening a session
 
-1. Run `kit --version` and `kit <command> --help` to verify the installed binary and command syntax. For a Git plugin error, confirm that `git` is installed, the HTTPS credential helper can authenticate noninteractively, and the configured full commit or tag exists; Kit intentionally omits remote Git diagnostics because they can contain secrets.
+1. Run `kit --version` and `kit <command> --help` to verify the installed binary and command syntax. For a Git plugin error, confirm that `git` is installed, the HTTPS credential helper can authenticate noninteractively, and the configured commit or ref exists (or that the remote has a default branch when `rev` is omitted); Kit intentionally omits remote Git diagnostics because they can contain secrets.
 2. If the diagnostic says `could not open working directory` or `working directory is not a directory`, verify that `--root` exists, is a directory, and is accessible to the Kit process.
 3. If A2A binding fails or the port is taken, omit the fixed address to get an available loopback port, choose another loopback port, or use `kit acp` when HTTP is unnecessary.
 4. If the failure mentions OpenAI subscription credentials, run status and login with the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` used by the runtime; standalone login rejects `memory`. Ensure loopback port 1455 or 1457 is available. Retry without pasting secrets into the prompt.

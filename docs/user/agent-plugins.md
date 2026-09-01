@@ -1,6 +1,6 @@
 # Agent Plugins
 
-Kit can load Agent Plugin packages from a local directory, a checksum-pinned online archive, or a revision-pinned Git repository. Source resolution happens at startup. Kit uses `agentkit-plugins` to validate the resolved package, exposes its valid Agent Skills through the existing `skill` tool, and registers its supported MCP servers. A plugin-only configuration works without `--mcp-config` or `mcp_config`.
+Kit can load Agent Plugin packages from a local directory, a checksum-pinned online archive, or a Git repository. Source resolution happens at startup. Kit uses `agentkit-plugins` to validate the resolved package, exposes its valid Agent Skills through the existing `skill` tool, and registers its supported MCP servers. A plugin-only configuration works without `--mcp-config` or `mcp_config`.
 
 ## Configure a source
 
@@ -20,7 +20,7 @@ subdir = "optional/plugin/path"
 [plugins.git-plugin]
 source = "git"
 url = "https://plugins.example.com/marketplace/opaque-id.git"
-rev = "0123456789abcdef0123456789abcdef01234567"
+rev = "main"
 subdir = "agent-plugins/example"
 ```
 
@@ -32,7 +32,7 @@ For an `archive`, provide the final archive URL. Kit does not translate forge UR
 
 Kit recognizes ZIP, gzip-compressed tar, and plain tar by content. Archives may contain `plugin.json` at the extraction root or one top-level directory, as forge-generated archives commonly do. `subdir`, when present, is applied below that selected base. Archive paths must be contained relative paths; links, special files, duplicate normalized paths, and extraction-limit violations are rejected. Executable mode bits are not preserved in this release.
 
-For `git`, `url` and `rev` are required and `subdir` is optional. The URL must be an absolute HTTPS URL without user information, a query, or a fragment. Local, SCP-like, SSH, `git`, file, and external-helper transports are rejected. `rev` accepts either an exact 40-hex SHA-1 commit ID or a validated tag name such as `v1.2.0` or `refs/tags/v1.2.0`; abbreviated object IDs, branches, revision expressions, and refspecs are rejected. A hexadecimal-only tag that could look like an abbreviated object ID must use the full `refs/tags/` form. A full commit is the reproducible choice. Tags are resolved and fetched again on every startup, so a moved tag can select a new commit.
+For `git`, `url` is required, while `rev` and `subdir` are optional. When `rev` is omitted, Kit fetches the remote's `HEAD`, which selects its default branch. `rev` can be an exact 40-hex SHA-1 commit ID or a safe Git ref name such as `main`, `v1.2.0`, `refs/heads/main`, or `refs/tags/v1.2.0`. Git options, refspecs, revision expressions, control characters, and malformed ref names are rejected. Kit fetches the selected name into a private Kit-controlled ref, resolves it to a full commit ID, and uses that immutable ID for archive validation and the cache. A full commit is the reproducible choice; omitted or named revisions are fetched again on every startup and can select a new commit when the remote ref moves. The URL must be an absolute HTTPS URL without user information, a query, or a fragment. Local, SCP-like, SSH, `git`, file, and external-helper transports are rejected.
 
 Kit invokes the installed `git` executable without a shell. It preserves normal system and user Git configuration so configured noninteractive HTTPS credential helpers can authenticate private repositories, but it disables Git terminal and configured askpass prompts, sets standard GUI credential-helper controls to noninteractive, and rejects credentials in the configured URL. Before network access, Kit verifies that `url.*.insteadOf` configuration did not rewrite the validated origin. System and uncommitted attribute files are disabled with controlled empty files; committed `.gitattributes` remains effective. Git diagnostics and configured URLs are not included in errors or written to temporary files. The selected portable `subdir` is archived with literal path semantics. Kit does not check out a worktree or run repository hooks, filters, Git LFS, or submodules; symlinks and submodules in the selected tree are rejected.
 
