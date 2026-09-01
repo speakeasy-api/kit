@@ -410,6 +410,7 @@ mod tests {
                 "docs/user/compose-and-local-tools.md",
                 "docs/user/getting-started-and-configuration.md",
                 "docs/user/mcp.md",
+                "docs/user/migrating-from-claude-code-and-codex.md",
                 "docs/user/reporting-kit-issues.md",
                 "docs/user/security-limits-and-troubleshooting.md",
                 "docs/user/subagents-and-acp-harnesses.md",

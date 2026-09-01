@@ -57,7 +57,7 @@ xcodebuild \
   build
 ```
 
-Project generation rejects other XcodeGen builds, including a same-version Homebrew binary, unless they came from the checksum-pinned archive installed by the repository script. CI regenerates both the version configuration and checked-in project and fails on drift.
+Project generation rejects other XcodeGen builds, including a same-version Homebrew binary, unless they came from the checksum-pinned archive installed by the repository script. The generated `Config/Version.xcconfig` is intentionally untracked: every project generation derives it from `Cargo.toml`, so a package version bump does not require a second manual edit. CI regenerates that local version configuration and fails only when the checked-in Swift models or Xcode project drift.
 
 The build phase always removes the previous helper before atomically copying the selected executable to `Kit.app/Contents/Helpers/kit`; dependency analysis cannot preserve a stale copy. Release ignores `KIT_BINARY` and requires the exact `target/aarch64-apple-darwin/release/kit` output. When no bundled helper exists, runtime lookup honors `KIT_BINARY`, the inherited `PATH`, common Homebrew locations, `~/.cargo/bin`, and the user's login-shell `PATH`. Debug builds also check the repository's `target/debug/kit`.
 
