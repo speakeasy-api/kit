@@ -9,6 +9,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::{io::AsyncReadExt, process::Command};
 
+use crate::process_tree::{isolate_tokio_process_tree, terminate_tokio_process_tree};
+
 const MAX_INTERNAL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -83,10 +85,13 @@ impl Tool for ShellTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        isolate_process_tree(&mut command);
+        isolate_tokio_process_tree(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| ToolError::Internal("spawned shell did not have a process ID".into()))?;
         let stdout = child
             .stdout
             .take()
@@ -97,21 +102,13 @@ impl Tool for ShellTool {
             .ok_or_else(|| ToolError::Internal("shell stderr was not piped".into()))?;
         let mut stdout_task = tokio::spawn(read_output(stdout));
         let mut stderr_task = tokio::spawn(read_output(stderr));
-        let execution = async {
-            let status = child
-                .wait()
-                .await
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-            let stdout = (&mut stdout_task)
-                .await
-                .map_err(|error| ToolError::Internal(error.to_string()))?
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-            let stderr = (&mut stderr_task)
-                .await
-                .map_err(|error| ToolError::Internal(error.to_string()))?
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-            Ok::<_, ToolError>((status, stdout, stderr))
-        };
+        let mut stdout_finished = false;
+        let mut stderr_finished = false;
+        let mut status = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        let timeout = tokio::time::sleep(Duration::from_secs(input.timeout_seconds));
+        tokio::pin!(timeout);
         // A cancelled turn must not wait out the command: the loop awaits this
         // invocation, so an uncooperative tool keeps the whole turn alive until
         // the timeout, however long the caller asked for.
@@ -121,26 +118,98 @@ impl Tool for ShellTool {
                 None => std::future::pending().await,
             }
         };
-        let finished = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(input.timeout_seconds), execution) => Some(result),
-            () = interrupted => None,
-        };
-        // The command's futures are dropped with the select, so the child is
-        // ours to kill again.
-        let (status, stdout, stderr) = match finished {
-            Some(Ok(result)) => result?,
-            outcome => {
-                kill_process_tree(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                return Err(match outcome {
-                    Some(_) => ToolError::ExecutionFailed("shell command timed out".into()),
-                    None => ToolError::Cancelled,
-                });
+        tokio::pin!(interrupted);
+
+        while status.is_none() || stdout.is_none() || stderr.is_none() {
+            let event = tokio::select! {
+                result = child.wait(), if status.is_none() => ShellEvent::Wait(result),
+                result = &mut stdout_task, if !stdout_finished => ShellEvent::Stdout(result),
+                result = &mut stderr_task, if !stderr_finished => ShellEvent::Stderr(result),
+                () = &mut timeout => ShellEvent::Timeout,
+                () = &mut interrupted => ShellEvent::Cancelled,
+            };
+            match event {
+                ShellEvent::Wait(Ok(exit_status)) => status = Some(exit_status),
+                ShellEvent::Wait(Err(error)) => {
+                    terminate_shell(
+                        &mut child,
+                        pid,
+                        &mut stdout_task,
+                        stdout_finished,
+                        &mut stderr_task,
+                        stderr_finished,
+                    )
+                    .await;
+                    return Err(ToolError::ExecutionFailed(error.to_string()));
+                }
+                ShellEvent::Stdout(result) => {
+                    stdout_finished = true;
+                    match output_task_result(result) {
+                        Ok(output) => stdout = Some(output),
+                        Err(error) => {
+                            terminate_shell(
+                                &mut child,
+                                pid,
+                                &mut stdout_task,
+                                stdout_finished,
+                                &mut stderr_task,
+                                stderr_finished,
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                }
+                ShellEvent::Stderr(result) => {
+                    stderr_finished = true;
+                    match output_task_result(result) {
+                        Ok(output) => stderr = Some(output),
+                        Err(error) => {
+                            terminate_shell(
+                                &mut child,
+                                pid,
+                                &mut stdout_task,
+                                stdout_finished,
+                                &mut stderr_task,
+                                stderr_finished,
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                }
+                ShellEvent::Timeout => {
+                    terminate_shell(
+                        &mut child,
+                        pid,
+                        &mut stdout_task,
+                        stdout_finished,
+                        &mut stderr_task,
+                        stderr_finished,
+                    )
+                    .await;
+                    return Err(ToolError::ExecutionFailed("shell command timed out".into()));
+                }
+                ShellEvent::Cancelled => {
+                    terminate_shell(
+                        &mut child,
+                        pid,
+                        &mut stdout_task,
+                        stdout_finished,
+                        &mut stderr_task,
+                        stderr_finished,
+                    )
+                    .await;
+                    return Err(ToolError::Cancelled);
+                }
             }
-        };
+        }
+        let status =
+            status.ok_or_else(|| ToolError::Internal("shell status was not collected".into()))?;
+        let stdout =
+            stdout.ok_or_else(|| ToolError::Internal("shell stdout was not collected".into()))?;
+        let stderr =
+            stderr.ok_or_else(|| ToolError::Internal("shell stderr was not collected".into()))?;
         let output = json!({
             "exit_code": status.code(),
             "success": status.success(),
@@ -154,35 +223,42 @@ impl Tool for ShellTool {
     }
 }
 
-#[cfg(unix)]
-fn isolate_process_tree(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    // A shell is only the group leader; cancelling it must also stop pipelines,
-    // sleeps, and other descendants it launched.
-    command.as_std_mut().process_group(0);
+type OutputTask = tokio::task::JoinHandle<std::io::Result<String>>;
+
+enum ShellEvent {
+    Wait(std::io::Result<std::process::ExitStatus>),
+    Stdout(Result<std::io::Result<String>, tokio::task::JoinError>),
+    Stderr(Result<std::io::Result<String>, tokio::task::JoinError>),
+    Timeout,
+    Cancelled,
 }
 
-#[cfg(windows)]
-fn isolate_process_tree(_command: &mut Command) {}
+fn output_task_result(
+    result: Result<std::io::Result<String>, tokio::task::JoinError>,
+) -> Result<String, ToolError> {
+    result
+        .map_err(|error| ToolError::Internal(error.to_string()))?
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))
+}
 
-async fn kill_process_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id()
-        && let Ok(pid) = i32::try_from(pid)
-    {
-        // The child was created as its own process-group leader.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+async fn terminate_shell(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    stdout_task: &mut OutputTask,
+    stdout_finished: bool,
+    stderr_task: &mut OutputTask,
+    stderr_finished: bool,
+) {
+    terminate_tokio_process_tree(child, pid).await;
+    abort_output_task(stdout_task, stdout_finished).await;
+    abort_output_task(stderr_task, stderr_finished).await;
+}
+
+async fn abort_output_task(task: &mut OutputTask, finished: bool) {
+    if !finished {
+        task.abort();
+        let _ = task.await;
     }
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .await;
-    }
-    let _ = child.kill().await;
 }
 
 async fn read_output(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
@@ -224,11 +300,68 @@ const fn default_timeout() -> u64 {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use agentkit_core::{MetadataMap, SessionId, TurnId};
+    use agentkit_tools_core::{
+        AllowAllPermissions, OwnedToolContext, Tool as _, ToolError, ToolRequest,
+    };
+    use serde_json::json;
     use tokio::io::AsyncWriteExt as _;
 
-    use super::{isolate_process_tree, kill_process_tree, read_output, shell_command};
+    use super::{MAX_INTERNAL_OUTPUT_BYTES, ShellTool, read_output, shell_command};
+    use crate::process_tree::{isolate_tokio_process_tree, terminate_tokio_process_tree};
+
+    async fn invoke_shell(
+        root: &std::path::Path,
+        command: &str,
+        timeout_seconds: u64,
+    ) -> Result<(), ToolError> {
+        let tool = ShellTool::new(root.to_path_buf());
+        let context = OwnedToolContext {
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+            execution_scope: None,
+            approved_request: None,
+        };
+        let request = ToolRequest::new(
+            "call",
+            "shell",
+            json!({
+                "command": command,
+                "timeout_seconds": timeout_seconds,
+            }),
+            "session",
+            "turn",
+        );
+        tool.invoke(request, &mut context.borrowed())
+            .await
+            .map(|_| ())
+    }
+
+    fn assert_output_limit(error: ToolError) {
+        let ToolError::ExecutionFailed(message) = error else {
+            panic!("unexpected shell error: {error}");
+        };
+        assert_eq!(
+            message,
+            format!("shell output exceeds {MAX_INTERNAL_OUTPUT_BYTES} bytes")
+        );
+    }
+
+    async fn assert_process_exited(pid: i32) {
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("process {pid} survived shell termination");
+    }
 
     #[tokio::test]
     async fn oversized_output_stays_complete() {
@@ -254,6 +387,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdout_output_limit_terminates_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            invoke_shell(directory.path(), "yes stdout", 5),
+        )
+        .await
+        .expect("stdout output limit did not stop the shell")
+        .unwrap_err();
+
+        assert_output_limit(error);
+    }
+
+    #[tokio::test]
+    async fn stderr_output_limit_terminates_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            invoke_shell(directory.path(), "yes stderr >&2", 5),
+        )
+        .await
+        .expect("stderr output limit did not stop the shell")
+        .unwrap_err();
+
+        assert_output_limit(error);
+    }
+
+    #[tokio::test]
+    async fn parent_exit_with_descendant_pipe_times_out_and_kills_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("descendant.pid");
+        let command = format!("sleep 30 & echo $! > {}", pid_file.display());
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke_shell(directory.path(), &command, 1),
+        )
+        .await
+        .expect("descendant pipe kept the shell invocation alive")
+        .unwrap_err();
+        let ToolError::ExecutionFailed(message) = error else {
+            panic!("unexpected shell error: {error}");
+        };
+        assert_eq!(message, "shell command timed out");
+        let descendant = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        assert_process_exited(descendant).await;
+    }
+
+    #[tokio::test]
     async fn cancellation_kills_shell_descendants() {
         let directory = tempfile::tempdir().unwrap();
         let pid_file = directory.path().join("child.pid");
@@ -261,8 +447,9 @@ mod tests {
             "sleep 30 & echo $! > {}; wait",
             pid_file.display()
         ));
-        isolate_process_tree(&mut command);
+        isolate_tokio_process_tree(&mut command);
         let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
         let descendant = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&pid_file)
@@ -276,14 +463,8 @@ mod tests {
         .await
         .expect("shell did not report its descendant PID");
 
-        kill_process_tree(&mut child).await;
+        terminate_tokio_process_tree(&mut child, pid).await;
 
-        for _ in 0..100 {
-            if unsafe { libc::kill(descendant, 0) } != 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("shell descendant {descendant} survived cancellation");
+        assert_process_exited(descendant).await;
     }
 }

@@ -1485,11 +1485,16 @@ source = "archive"
 url = "https://example.com/plugin.tar.gz"
 sha256 = "{}"
 subdir = "packages/plugin"
+
+[plugins.git-plugin]
+source = "git"
+url = "https://example.com/repo"
+future_option = true
 "#,
             "ab".repeat(32)
         ))
         .unwrap();
-        assert_eq!(configured.plugins.len(), 2);
+        assert_eq!(configured.plugins.len(), 3);
         assert!(matches!(
             configured.plugins["local-plugin"],
             kit::plugins::PluginConfig::Path { .. }
@@ -1498,10 +1503,14 @@ subdir = "packages/plugin"
             configured.plugins["remote-plugin"],
             kit::plugins::PluginConfig::Archive { .. }
         ));
+        assert!(matches!(
+            configured.plugins["git-plugin"],
+            kit::plugins::PluginConfig::Git { rev: None, .. }
+        ));
         assert!(Config::default().plugins.is_empty());
 
         for invalid in [
-            "[plugins.bad]\nsource = 'git'\nurl = 'https://example.com/repo'",
+            "[plugins.bad]\nsource = 'git'\nrev = 'main'",
             "[plugins.bad]\nsource = 'archive'\nurl = 'https://example.com/plugin.zip'",
         ] {
             assert!(toml::from_str::<Config>(invalid).is_err(), "{invalid}");
