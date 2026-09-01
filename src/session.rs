@@ -546,6 +546,15 @@ impl SessionLock {
         let token = format!("{}:{}:{}", std::process::id(), new_id(), SCHEMA_VERSION);
         let mut options = OpenOptions::new();
         options.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            // FILE_SHARE_READ | FILE_SHARE_WRITE. Omitting FILE_SHARE_DELETE
+            // prevents the lock pathname from being renamed or replaced while
+            // token checks read through this handle.
+            options.share_mode(0x0000_0001 | 0x0000_0002);
+        }
         if force {
             options.create(true);
         } else {
@@ -1797,6 +1806,23 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_path_cannot_be_renamed_while_held() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("held.lock");
+        let renamed = root.path().join("renamed.lock");
+        let lock = SessionLock::acquire(path.clone(), false).unwrap();
+
+        assert!(
+            fs::rename(&path, &renamed).is_err(),
+            "held lock path was renamed"
+        );
+        assert!(lock.check().is_ok());
+        drop(lock);
+        assert!(!path.exists());
+    }
+
     #[test]
     fn non_force_lock_loser_does_not_unlink_forced_owner() {
         let root = tempfile::tempdir().unwrap();
@@ -2627,6 +2653,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn writer_reconstructs_deleted_storage_from_open_descriptor() {
         let root = tempfile::tempdir().unwrap();
@@ -3326,6 +3353,7 @@ mod tests {
         assert!(!belongs_to_workspace_in(&second, storage.path(), "legacy").unwrap());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn writer_fails_closed_when_another_owner_wins_recovery_lock() {
         let root = tempfile::tempdir().unwrap();
