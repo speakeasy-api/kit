@@ -2,22 +2,43 @@ use std::collections::BTreeMap;
 
 use agentkit_core::Item;
 use agentkit_tool_skills::Skill;
-use serde_json::json;
+use serde::Serialize;
 
 const MAX_NOTIFICATION_BYTES: usize = 2_048;
 const MAX_REPORTED_CHANGES: usize = 64;
 
 type Catalog = BTreeMap<String, blake3::Hash>;
 
+#[derive(Debug)]
+pub(super) enum SubmitError<E> {
+    Catalog(serde_json::Error),
+    Submit(E),
+}
+
+#[derive(Serialize)]
+struct Fingerprint<'a> {
+    description: &'a str,
+    body: &'a str,
+    frontmatter: FingerprintFrontmatter<'a>,
+}
+
+#[derive(Serialize)]
+struct FingerprintFrontmatter<'a> {
+    license: Option<&'a str>,
+    compatibility: Option<&'a str>,
+    metadata: &'a BTreeMap<String, String>,
+    allowed_tools: Option<&'a str>,
+}
+
 pub(super) struct SkillCatalogMonitor {
     baseline: Catalog,
 }
 
 impl SkillCatalogMonitor {
-    pub(super) fn new(skills: &[Skill]) -> Self {
-        Self {
-            baseline: catalog(skills),
-        }
+    pub(super) fn new(skills: &[Skill]) -> serde_json::Result<Self> {
+        Ok(Self {
+            baseline: catalog(skills)?,
+        })
     }
 
     pub(super) fn submit<E>(
@@ -25,51 +46,49 @@ impl SkillCatalogMonitor {
         skills: &[Skill],
         mut user_items: Vec<Item>,
         submit: impl FnOnce(Vec<Item>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let current = catalog(skills);
+    ) -> Result<(), SubmitError<E>> {
+        let current = catalog(skills).map_err(SubmitError::Catalog)?;
         if let Some(notification) = notification(&self.baseline, &current) {
             user_items.insert(0, Item::notification(notification));
         }
-        submit(user_items)?;
+        submit(user_items).map_err(SubmitError::Submit)?;
         self.baseline = current;
         Ok(())
     }
 }
 
-fn catalog(skills: &[Skill]) -> Catalog {
+fn catalog(skills: &[Skill]) -> serde_json::Result<Catalog> {
     skills
         .iter()
-        .map(|skill| (skill.name.clone(), fingerprint(skill)))
+        .map(|skill| Ok((skill.name.clone(), fingerprint(skill)?)))
         .collect()
 }
 
-fn fingerprint(skill: &Skill) -> blake3::Hash {
+fn fingerprint(skill: &Skill) -> serde_json::Result<blake3::Hash> {
     let mut resources = skill
         .resources
         .iter()
         .map(|path| path.strip_prefix(&skill.base_dir).unwrap_or(path))
         .collect::<Vec<_>>();
     resources.sort();
-    let semantic = json!({
-        "description": skill.description,
-        "body": skill.body,
-        "frontmatter": {
-            "license": skill.frontmatter.license,
-            "compatibility": skill.frontmatter.compatibility,
-            "metadata": skill.frontmatter.metadata,
-            "allowed_tools": skill.frontmatter.allowed_tools,
+    let semantic = Fingerprint {
+        description: &skill.description,
+        body: &skill.body,
+        frontmatter: FingerprintFrontmatter {
+            license: skill.frontmatter.license.as_deref(),
+            compatibility: skill.frontmatter.compatibility.as_deref(),
+            metadata: &skill.frontmatter.metadata,
+            allowed_tools: skill.frontmatter.allowed_tools.as_deref(),
         },
-    });
+    };
     let mut fingerprint = blake3::Hasher::new();
-    fingerprint.update(
-        &serde_json::to_vec(&semantic).expect("skill fingerprint data is JSON serializable"),
-    );
+    fingerprint.update(&serde_json::to_vec(&semantic)?);
     for resource in resources {
         let path = resource.as_os_str().as_encoded_bytes();
         fingerprint.update(&(path.len() as u64).to_le_bytes());
         fingerprint.update(path);
     }
-    fingerprint.finalize()
+    Ok(fingerprint.finalize())
 }
 
 fn notification(previous: &Catalog, current: &Catalog) -> Option<String> {
@@ -195,29 +214,44 @@ mod tests {
 
         let mut reordered = original.clone();
         reordered.resources.reverse();
-        assert_eq!(fingerprint(&original), fingerprint(&reordered));
+        assert_eq!(
+            fingerprint(&original).unwrap(),
+            fingerprint(&reordered).unwrap()
+        );
 
         let mut changed = original.clone();
         changed.description.push_str(" changed");
-        assert_ne!(fingerprint(&original), fingerprint(&changed));
+        assert_ne!(
+            fingerprint(&original).unwrap(),
+            fingerprint(&changed).unwrap()
+        );
         changed = original.clone();
         changed.body.push_str(" changed");
-        assert_ne!(fingerprint(&original), fingerprint(&changed));
+        assert_ne!(
+            fingerprint(&original).unwrap(),
+            fingerprint(&changed).unwrap()
+        );
         changed = original.clone();
         changed
             .frontmatter
             .metadata
             .insert("key".into(), "value".into());
-        assert_ne!(fingerprint(&original), fingerprint(&changed));
+        assert_ne!(
+            fingerprint(&original).unwrap(),
+            fingerprint(&changed).unwrap()
+        );
         changed = original.clone();
         changed.resources.push(changed.base_dir.join("new.txt"));
-        assert_ne!(fingerprint(&original), fingerprint(&changed));
+        assert_ne!(
+            fingerprint(&original).unwrap(),
+            fingerprint(&changed).unwrap()
+        );
     }
 
     #[test]
     fn baseline_and_unchanged_catalog_do_not_notify() {
         let skills = vec![skill("existing", "body")];
-        let mut monitor = SkillCatalogMonitor::new(&skills);
+        let mut monitor = SkillCatalogMonitor::new(&skills).unwrap();
         monitor
             .submit(
                 &skills,
@@ -235,7 +269,7 @@ mod tests {
     fn reports_added_changed_and_removed_names_in_the_user_batch() {
         let before = vec![skill("removed", "old"), skill("changed", "old")];
         let after = vec![skill("added", "new"), skill("changed", "new")];
-        let mut monitor = SkillCatalogMonitor::new(&before);
+        let mut monitor = SkillCatalogMonitor::new(&before).unwrap();
         monitor
             .submit(&after, vec![Item::text(ItemKind::User, "hello")], |items| {
                 assert_eq!(items.len(), 2);
@@ -257,7 +291,7 @@ mod tests {
             .rev()
             .map(|index| skill(&format!("skill-{index:03}"), "body"))
             .collect::<Vec<_>>();
-        let mut monitor = SkillCatalogMonitor::new(&[]);
+        let mut monitor = SkillCatalogMonitor::new(&[]).unwrap();
         monitor
             .submit(&after, vec![Item::text(ItemKind::User, "hello")], |items| {
                 let text = notification_text(&items).unwrap();
@@ -272,7 +306,7 @@ mod tests {
     #[test]
     fn failed_submission_does_not_advance_baseline() {
         let after = vec![skill("added", "body")];
-        let mut monitor = SkillCatalogMonitor::new(&[]);
+        let mut monitor = SkillCatalogMonitor::new(&[]).unwrap();
         assert!(
             monitor
                 .submit(&after, vec![Item::text(ItemKind::User, "first")], |_| Err(

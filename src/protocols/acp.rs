@@ -850,7 +850,8 @@ impl Server {
         let tasks = driver.tasks.clone();
         let structured_completion = driver.structured_completion;
         let canonical_transcript = driver.canonical_transcript;
-        let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills);
+        let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
+            .map_err(|error| record_acp_runtime_failure(&session_id, "skill_catalog", error))?;
         let (tx, rx) = mpsc::channel(8);
         let actor = SessionActor {
             session_id: session_id.clone(),
@@ -1450,7 +1451,14 @@ async fn drive_prompt<S: ModelSession>(
     let items = integration.input_port().prompt_to_items(&request)?;
     skill_catalog
         .submit(skills, items, |items| driver.submit_input(items))
-        .map_err(|error| record_acp_loop_failure(session_id, &error))?;
+        .map_err(|error| match error {
+            skill_catalog::SubmitError::Catalog(error) => {
+                record_acp_runtime_failure(session_id, "skill_catalog", error)
+            }
+            skill_catalog::SubmitError::Submit(error) => {
+                record_acp_loop_failure(session_id, &error)
+            }
+        })?;
     let response = match drive_until_pause(
         session_id,
         integration,
@@ -2719,7 +2727,7 @@ pub(super) mod tests {
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
-        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]);
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
         let response = drive_prompt(
             &acp_session_id,
             &[],
@@ -2805,7 +2813,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let background_jobs = BackgroundJobs::default();
-        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]);
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
         let request = PromptRequest::new(
             acp_session_id.clone(),
             vec![agentkit_acp::ContentBlock::Text(
@@ -2960,7 +2968,7 @@ pub(super) mod tests {
             tasks: tasks.clone(),
             background_jobs: background_jobs.clone(),
             structured_completion: false,
-            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&skills),
+            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&skills).unwrap(),
             adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
                 .unwrap(),
             catalog: Vec::new(),

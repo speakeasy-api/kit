@@ -675,7 +675,8 @@ impl Server {
         let catalog = model_catalog(&current).await;
         let config_options = v2_config_options(&current, reasoning, &catalog);
         let canonical_transcript = driver.canonical_transcript;
-        let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills);
+        let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
+            .map_err(|error| AcpRuntimeError::Loop(format!("skill catalog error: {error}")))?;
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
         let structured_completion = driver.structured_completion;
@@ -1103,7 +1104,12 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
         skill_catalog
             .submit(skills, items, |items| driver.submit_input(items))
-            .map_err(|error| map_loop_error(session_id, &error))?;
+            .map_err(|error| match error {
+                skill_catalog::SubmitError::Catalog(error) => {
+                    AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
+                }
+                skill_catalog::SubmitError::Submit(error) => map_loop_error(session_id, &error),
+            })?;
         integration.begin_prompt(session_id)
     });
     let user_message_id = match prepared {
@@ -2696,7 +2702,7 @@ mod tests {
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
-        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]);
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
