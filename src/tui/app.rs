@@ -882,9 +882,7 @@ impl App {
     }
 
     fn command_completion_prefix(&self) -> Option<&str> {
-        (self.phase == Phase::Idle)
-            .then(|| command::completion_prefix(self.editor.text(), self.editor.cursor()))
-            .flatten()
+        command::completion_prefix(self.editor.text(), self.editor.cursor())
     }
 
     pub fn command_completions(&self) -> Vec<SlashCommand> {
@@ -3844,7 +3842,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_is_hidden_after_arguments_and_while_working() {
+    fn completion_is_hidden_after_arguments_but_available_while_working() {
         let mut app = app();
         app.paste("/model sonnet");
         assert!(app.command_completions().is_empty());
@@ -3852,7 +3850,7 @@ mod tests {
         app.editor.clear();
         app.paste("/mo");
         app.phase = Phase::Working;
-        assert!(app.command_completions().is_empty());
+        assert_eq!(app.command_completions()[0].name, "/model");
     }
 
     #[test]
