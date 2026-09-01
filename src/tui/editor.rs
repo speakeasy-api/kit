@@ -23,6 +23,25 @@ impl Editor {
         &self.text
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replaces the initial slash-command token and leaves following text intact.
+    pub fn replace_command_token(&mut self, replacement: &str) -> bool {
+        if !self.text.starts_with('/') {
+            return false;
+        }
+        let end = self
+            .text
+            .char_indices()
+            .find_map(|(index, character)| character.is_whitespace().then_some(index))
+            .unwrap_or(self.text.len());
+        self.text.replace_range(..end, replacement);
+        self.cursor = replacement.len();
+        true
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
     }
@@ -471,5 +490,22 @@ mod tests {
         editor.move_right();
         editor.delete_forward();
         assert_eq!(editor.text(), "hllo");
+    }
+
+    #[test]
+    fn replaces_the_command_token_and_preserves_following_text() {
+        let mut editor = editor("/mødel trailing text");
+        assert!(editor.replace_command_token("/model"));
+        assert_eq!(editor.text(), "/model trailing text");
+        assert_eq!(editor.cursor(), 6);
+        editor.insert_char('!');
+        assert_eq!(editor.text(), "/model! trailing text");
+    }
+
+    #[test]
+    fn refuses_to_replace_a_non_command_prompt() {
+        let mut editor = editor("hello");
+        assert!(!editor.replace_command_token("/model"));
+        assert_eq!(editor.text(), "hello");
     }
 }
