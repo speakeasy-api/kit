@@ -48,7 +48,7 @@ impl SkillCatalogMonitor {
         submit: impl FnOnce(Vec<Item>) -> Result<(), E>,
     ) -> Result<(), SubmitError<E>> {
         let current = catalog(skills).map_err(SubmitError::Catalog)?;
-        if let Some(notification) = notification(&self.baseline, &current) {
+        if let Some(notification) = notification(&self.baseline, &current, skills) {
             user_items.insert(0, Item::notification(notification));
         }
         submit(user_items).map_err(SubmitError::Submit)?;
@@ -91,20 +91,32 @@ fn fingerprint(skill: &Skill) -> serde_json::Result<blake3::Hash> {
     Ok(fingerprint.finalize())
 }
 
-fn notification(previous: &Catalog, current: &Catalog) -> Option<String> {
+fn notification(previous: &Catalog, current: &Catalog, skills: &[Skill]) -> Option<String> {
     if previous == current {
         return None;
     }
 
+    let descriptions = skills
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill.description.as_str()))
+        .collect::<BTreeMap<_, _>>();
     let added = current
         .keys()
         .filter(|name| !previous.contains_key(*name))
-        .map(String::as_str)
+        .filter_map(|name| {
+            descriptions
+                .get(name.as_str())
+                .map(|description| (name.as_str(), *description))
+        })
         .collect::<Vec<_>>();
     let changed = current
         .iter()
         .filter(|(name, fingerprint)| previous.get(*name).is_some_and(|old| old != *fingerprint))
-        .map(|(name, _)| name.as_str())
+        .filter_map(|(name, _)| {
+            descriptions
+                .get(name.as_str())
+                .map(|description| (name.as_str(), *description))
+        })
         .collect::<Vec<_>>();
     let removed = previous
         .keys()
@@ -112,34 +124,75 @@ fn notification(previous: &Catalog, current: &Catalog) -> Option<String> {
         .map(String::as_str)
         .collect::<Vec<_>>();
     let total = added.len() + changed.len() + removed.len();
-    let omission_reserve = format!("; {total} more change(s) omitted").len();
+    let omission_reserve = format!("\n{total} more change(s) omitted").len();
     let content_limit = MAX_NOTIFICATION_BYTES.saturating_sub(omission_reserve);
     let mut message = String::from("Skill catalog update (informational).");
     let mut reported = 0;
-    append_group(&mut message, "Added", &added, &mut reported, content_limit);
-    append_group(
+    append_skill_group(
         &mut message,
-        "Changed",
+        "Added skills",
+        &added,
+        &mut reported,
+        content_limit,
+    );
+    append_skill_group(
+        &mut message,
+        "Changed skills",
         &changed,
         &mut reported,
         content_limit,
     );
-    append_group(
-        &mut message,
-        "Removed",
-        &removed,
-        &mut reported,
-        content_limit,
-    );
+    append_removed_group(&mut message, &removed, &mut reported, content_limit);
     if reported < total {
-        message.push_str(&format!("; {} more change(s) omitted", total - reported));
+        message.push_str(&format!("\n{} more change(s) omitted", total - reported));
     }
     Some(message)
 }
 
-fn append_group(
+fn append_skill_group(
     message: &mut String,
     label: &str,
+    skills: &[(&str, &str)],
+    reported: &mut usize,
+    content_limit: usize,
+) {
+    if skills.is_empty() || *reported >= MAX_REPORTED_CHANGES {
+        return;
+    }
+    let heading = format!("\n{label}:");
+    if message.len() + heading.len() > content_limit {
+        return;
+    }
+    let heading_start = message.len();
+    message.push_str(&heading);
+    let mut group_count = 0;
+    for (name, description) in skills
+        .iter()
+        .take(MAX_REPORTED_CHANGES.saturating_sub(*reported))
+    {
+        const ROW_OVERHEAD: usize = "\n- name: \"\"\n  description: \"\"".len();
+        if message.len() + ROW_OVERHEAD + name.len() + description.len() > content_limit {
+            continue;
+        }
+        let row = format!(
+            "\n- name: {}\n  description: {}",
+            serde_json::Value::String((*name).to_owned()),
+            serde_json::Value::String((*description).to_owned())
+        );
+        if message.len() + row.len() > content_limit {
+            continue;
+        }
+        message.push_str(&row);
+        group_count += 1;
+        *reported += 1;
+    }
+    if group_count == 0 {
+        message.truncate(heading_start);
+    }
+}
+
+fn append_removed_group(
+    message: &mut String,
     names: &[&str],
     reported: &mut usize,
     content_limit: usize,
@@ -147,23 +200,25 @@ fn append_group(
     if names.is_empty() || *reported >= MAX_REPORTED_CHANGES {
         return;
     }
-    let heading = format!("; {label}: ");
-    if message.len() + heading.len() > content_limit {
+    const HEADING: &str = "\nRemoved skills:";
+    if message.len() + HEADING.len() > content_limit {
         return;
     }
     let heading_start = message.len();
-    message.push_str(&heading);
+    message.push_str(HEADING);
     let mut group_count = 0;
-    for name in names {
-        if *reported >= MAX_REPORTED_CHANGES {
-            break;
+    for name in names
+        .iter()
+        .take(MAX_REPORTED_CHANGES.saturating_sub(*reported))
+    {
+        let row = format!(
+            "\n- name: {}",
+            serde_json::Value::String((*name).to_owned())
+        );
+        if message.len() + row.len() > content_limit {
+            continue;
         }
-        let separator = if group_count == 0 { "" } else { ", " };
-        if message.len() + separator.len() + name.len() > content_limit {
-            break;
-        }
-        message.push_str(separator);
-        message.push_str(name);
+        message.push_str(&row);
         group_count += 1;
         *reported += 1;
     }
@@ -277,9 +332,13 @@ mod tests {
                 assert_eq!(items[1].kind, ItemKind::User);
                 let text = notification_text(&items).unwrap();
                 assert!(text.starts_with("Skill catalog update (informational)."));
-                assert!(text.contains("Added: added"));
-                assert!(text.contains("Changed: changed"));
-                assert!(text.contains("Removed: removed"));
+                assert!(text.contains(
+                    "Added skills:\n- name: \"added\"\n  description: \"Description for added\""
+                ));
+                assert!(text.contains(
+                    "Changed skills:\n- name: \"changed\"\n  description: \"Description for changed\""
+                ));
+                assert!(text.contains("Removed skills:\n- name: \"removed\""));
                 Ok::<_, ()>(())
             })
             .unwrap();
@@ -316,7 +375,11 @@ mod tests {
         );
         monitor
             .submit(&after, vec![Item::text(ItemKind::User, "retry")], |items| {
-                assert!(notification_text(&items).unwrap().contains("Added: added"));
+                assert!(
+                    notification_text(&items)
+                        .unwrap()
+                        .contains("Added skills:\n- name: \"added\"")
+                );
                 Ok::<_, ()>(())
             })
             .unwrap();

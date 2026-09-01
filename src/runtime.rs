@@ -785,11 +785,17 @@ impl Runtime {
             .register(Observed::new(ToolSearch::new(self.mcp.clone())))
             .register(Observed::new(AuthTool::new(self.mcp.clone())))
             .register(Observed::new(McpTool::new(self.mcp.clone())));
+        let mut child_specs = children.specs();
         let skill_tools = skills.tool_registry();
         if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
+            let frozen_skill_spec = skill_spec_with_open_name(
+                skill_tool
+                    .current_spec()
+                    .unwrap_or_else(|| skill_tool.spec().clone()),
+            );
             children.register(observe_shared(skill_tool));
+            child_specs.push(frozen_skill_spec);
         }
-        let child_specs = children.specs();
         let compose = ComposeTool::wrap(children)
             .with_source(self.mcp.catalog().unadvertised())
             .with_config(
@@ -1761,6 +1767,17 @@ fn background_route(request: &ToolRequest) -> RoutingDecision {
             .unwrap_or(RoutingDecision::Foreground),
         _ => RoutingDecision::Foreground,
     }
+}
+
+fn skill_spec_with_open_name(mut spec: ToolSpec) -> ToolSpec {
+    if let Some(name_schema) = spec
+        .input_schema
+        .pointer_mut("/properties/name")
+        .and_then(Value::as_object_mut)
+    {
+        name_schema.remove("enum");
+    }
+    spec
 }
 
 struct HiddenRunletBackend(Vec<ToolSpec>);

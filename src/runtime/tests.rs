@@ -604,7 +604,7 @@ fn project_skills_take_precedence_over_plugin_skills() {
 }
 
 #[tokio::test]
-async fn compose_can_load_a_skill_repeatedly() {
+async fn compose_can_load_a_skill_added_after_its_spec_is_frozen() {
     let root = tempfile::tempdir().unwrap();
     write_skill(
         &root.path().join(".agents/skills/reusable"),
@@ -614,6 +614,15 @@ async fn compose_can_load_a_skill_repeatedly() {
     );
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
     let compose = runtime.compose(0);
+    let frozen_description = &compose.specs()[0].description;
+    assert!(frozen_description.contains("- name: reusable"));
+    assert!(!frozen_description.contains(r#""enum":["reusable"]"#));
+    write_skill(
+        &root.path().join(".agents/skills/added-later"),
+        "added-later",
+        "Added after the Compose schema was frozen.",
+        "new instructions",
+    );
     let source: Arc<dyn ToolSource> = Arc::new(compose.compose.clone());
     let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([source]));
     let permissions = Arc::new(AllowAllPermissions);
@@ -644,7 +653,7 @@ async fn compose_can_load_a_skill_repeatedly() {
                 ToolCallId::new("call"),
                 ToolName::new("compose"),
                 json!({
-                    "script": "first = skill({ name: \"reusable\" })\nsecond = skill({ name: \"reusable\" })\nreturn [first, second]"
+                    "script": "first = skill({ name: \"reusable\" })\nsecond = skill({ name: \"reusable\" })\nthird = skill({ name: \"added-later\" })\nreturn [first, second, third]"
                 }),
                 session_id,
                 turn_id,
@@ -660,12 +669,17 @@ async fn compose_can_load_a_skill_repeatedly() {
         panic!("compose did not return structured output");
     };
     let loaded = loaded.as_array().expect("compose returned an array");
-    assert_eq!(loaded.len(), 2);
-    assert!(loaded.iter().all(|skill| {
+    assert_eq!(loaded.len(), 3);
+    assert!(loaded[..2].iter().all(|skill| {
         skill
             .as_str()
             .is_some_and(|text| text.contains("full instructions"))
     }));
+    assert!(
+        loaded[2]
+            .as_str()
+            .is_some_and(|text| text.contains("new instructions"))
+    );
 }
 
 #[test]
