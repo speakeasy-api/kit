@@ -6,16 +6,22 @@ GitHub Actions builds and publishes release artifacts on demand.
 
 ## Publish a release
 
-Update `Cargo.toml` and `Cargo.lock` to the new version and commit the release. In
-GitHub, open **Actions > release**, select **Run workflow**, choose the commit or
-branch to release, and run it. Do not create or push a release tag.
+Ordinary pull requests do not update release versions. In GitHub, open
+**Actions > release**, select **Run workflow** on `main`, and run it. Do not create
+or push the release tag first.
 
-The workflow reads the version from `Cargo.toml` and stops if it matches the most
-recent published release or if its tag or release already exists. It runs formatting,
-Clippy, and tests, builds the Linux x86-64 and macOS arm64 CLI archives, the ARM64
-Kit.app ZIP, and all container images, then creates the `v<version>` tag and GitHub
-release. Versions with a SemVer prerelease suffix, such as `0.1.120-pre.1`, produce
-a prerelease.
+The workflow verifies that the version in `Cargo.toml` matches the latest release
+tag, then examines commits since that tag. Any breaking commit advances the minor
+version; other commits advance the patch version. It prepares a release commit that
+updates `Cargo.toml` and `Cargo.lock`, then runs
+formatting, Clippy, tests, artifact builds, and release-note generation against that
+exact commit.
+
+After every required build succeeds, the workflow atomically advances `main` to the
+release commit and creates the release tag. If `main` advances while the workflow is
+running, the release stops without updating either ref and must be run again. A
+rerun of the failed jobs resumes publication when the release commit and tag were
+pushed but a later publishing step failed.
 
 The newly built Linux Kit CLI reviews every change since the previous release and
 writes the GitHub release notes before the workflow attaches the archives and
