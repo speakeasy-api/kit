@@ -1491,7 +1491,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             commands: update
                 .available_commands
                 .into_iter()
-                .map(|command| command.name)
+                .map(|available| command::Command::new(available.name, available.description))
                 .collect(),
         }],
         SessionUpdate::ConfigOptionUpdate(update) => {
@@ -1735,7 +1735,7 @@ mod tests {
 
     use super::{
         ActiveSessionRoute, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate, accept_queued_update,
-        attachments_from_paste, current_model_choice, detach_from_controlling_terminal,
+        attachments_from_paste, command, current_model_choice, detach_from_controlling_terminal,
         durable_session_id, effort_state, handle, message_of, osc52, previous_session_for_resume,
         prompt_blocks, readable, refresh_config_state, save_effort_default_to,
         save_model_defaults_to, transition_route, translate, translate_for_session,
@@ -1816,7 +1816,9 @@ mod tests {
         assert!(matches!(
             updates.as_slice(),
             [Update::AvailableCommands { session_id, commands }]
-                if session_id == "session" && commands == &["compact"]
+                if session_id == "session"
+                    && commands.as_slice()
+                        == [command::Command::new("compact", "Compact context")]
         ));
     }
 

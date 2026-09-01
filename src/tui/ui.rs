@@ -112,6 +112,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         }
         draw_pending_steers(frame, app, pending);
         draw_prompt(frame, app, prompt);
+        draw_command_popup(frame, app, prompt);
         draw_status(frame, app, status);
         (prompt, false)
     };
@@ -596,6 +597,7 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) ->
 
     let prompt = Rect::new(x, y, width, prompt_rows);
     draw_start_prompt(frame, app, prompt);
+    draw_command_popup(frame, app, prompt);
     let status = Rect::new(x, y + prompt_rows, width, 1);
     draw_status(frame, app, status);
     prompt
@@ -1737,6 +1739,65 @@ fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+fn draw_command_popup(frame: &mut Frame<'_>, app: &App, anchor: Rect) {
+    const MAX_ROWS: usize = 7;
+
+    let commands = app.command_completions();
+    let available = anchor.y.saturating_sub(frame.area().y);
+    if commands.is_empty() || available < 3 || anchor.width < 4 {
+        return;
+    }
+    let rows = commands
+        .len()
+        .min(MAX_ROWS)
+        .min(available.saturating_sub(2) as usize);
+    if rows == 0 {
+        return;
+    }
+    let selected = app
+        .command_completion_selected
+        .min(commands.len().saturating_sub(1));
+    let first = selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(commands.len().saturating_sub(rows));
+    let area = Rect::new(
+        anchor.x,
+        anchor.y - rows as u16 - 2,
+        anchor
+            .width
+            .min(frame.area().right().saturating_sub(anchor.x)),
+        rows as u16 + 2,
+    );
+    let panel = Panel::bordered()
+        .title(" commands ")
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent());
+    let inner = panel.inner(area);
+    let lines = commands
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(index, command)| {
+            let marker = if index == selected { "› " } else { "  " };
+            let line = Line::from(vec![
+                Span::styled(marker, theme::accent()),
+                Span::styled(command.name.clone(), theme::accent()),
+                Span::styled("  ".to_string(), theme::text()),
+                Span::styled(command.description.clone(), theme::faint()),
+            ]);
+            if index == selected {
+                line.style(theme::selection())
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
         Style::default().fg(theme::accent_color())
@@ -1824,7 +1885,7 @@ fn draw_prompt_editor(frame: &mut Frame<'_>, app: &App, area: Rect, placeholder_
 fn prompt_lines(
     rows: Vec<String>,
     input: &str,
-    available_commands: &[String],
+    available_commands: &[command::Command],
 ) -> Vec<Line<'static>> {
     let mut highlighted =
         command::known_token(input, available_commands).map_or(0, |range| range.len());
@@ -1924,7 +1985,7 @@ mod tests {
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         tui::app::{
             Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog,
-            FilePickerDialog, FilePickerStatus, ModelDialog, Update, UserImage, UserMessage,
+            FilePickerDialog, FilePickerStatus, ModelDialog, Phase, Update, UserImage, UserMessage,
         },
         tui::file_search::FileMatch,
     };
@@ -2437,6 +2498,42 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn command_popup_renders_in_start_and_compact_layouts() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openai".into(),
+            "gpt".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.paste("/mo");
+        let start = render(&mut app, 80, 24);
+        assert!(start.contains("commands"), "{start}");
+        assert!(start.contains("/model"), "{start}");
+        assert!(start.contains("Choose a model"), "{start}");
+
+        app.blocks.push(Block::Agent("session response".into()));
+        app.phase = Phase::Working;
+        let compact = render(&mut app, 80, 24);
+        assert!(compact.contains("/model"), "{compact}");
+        assert!(compact.contains("Choose a model"), "{compact}");
+    }
+
+    #[test]
+    fn command_popup_handles_tiny_terminals_and_disappears_after_dismissal() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openai".into(),
+            "gpt".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.paste("/");
+        let _ = render(&mut app, 8, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let dismissed = render(&mut app, 80, 24);
+        assert!(!dismissed.contains(" commands "), "{dismissed}");
     }
 
     #[test]
@@ -3286,7 +3383,10 @@ mod tests {
         assert_eq!(unknown[0].spans.len(), 1);
         assert_eq!(unknown[0].spans[0].style, crate::tui::theme::text());
 
-        let advertised = vec!["compact".to_string()];
+        let advertised = vec![crate::tui::command::Command::new(
+            "compact",
+            "Compact context",
+        )];
         let dynamic = prompt_lines(
             vec!["/compact prompt".into()],
             "/compact prompt",

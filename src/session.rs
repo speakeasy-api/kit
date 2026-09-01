@@ -53,6 +53,7 @@ pub struct CatalogEntry {
     pub id: String,
     pub title: Option<String>,
     pub preview: Option<String>,
+    pub is_subagent: bool,
     /// Last activity as milliseconds since the Unix epoch.
     pub updated_at: u64,
 }
@@ -853,6 +854,7 @@ fn catalog_for_workspace(
         if catalog_is_subagent(&authority.historical_items, &authority.items) {
             continue;
         }
+        let is_subagent = false;
         let (title, preview) = catalog_text(&authority.historical_items, &authority.items);
         let item_updated = authority
             .items
@@ -874,6 +876,7 @@ fn catalog_for_workspace(
             id,
             title,
             preview,
+            is_subagent,
             updated_at: item_updated.max(file_updated),
         });
     }

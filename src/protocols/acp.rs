@@ -43,6 +43,7 @@ use tokio::{
     time::timeout,
 };
 
+mod skill_catalog;
 pub mod v2;
 
 use crate::{
@@ -849,15 +850,19 @@ impl Server {
         let tasks = driver.tasks.clone();
         let structured_completion = driver.structured_completion;
         let canonical_transcript = driver.canonical_transcript;
+        let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
+            .map_err(|error| record_acp_runtime_failure(&session_id, "skill_catalog", error))?;
         let (tx, rx) = mpsc::channel(8);
         let actor = SessionActor {
             session_id: session_id.clone(),
+            runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
             binding,
             driver: driver.driver,
             tasks: driver.tasks,
             background_jobs: background_jobs.clone(),
             structured_completion,
+            skill_catalog,
             adapter: driver.adapter,
             catalog,
             commands: rx,
@@ -1077,12 +1082,14 @@ pub(super) async fn detach_compose_call(
 
 struct SessionActor<S: ModelSession> {
     session_id: agentkit_acp::SessionId,
+    runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     binding: SessionBindingGuard,
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
     background_jobs: BackgroundJobs,
     structured_completion: bool,
+    skill_catalog: skill_catalog::SkillCatalogMonitor,
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
@@ -1093,12 +1100,14 @@ struct SessionActor<S: ModelSession> {
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
         session_id,
+        runtime,
         integration,
         binding,
         mut driver,
         tasks,
         background_jobs,
         structured_completion,
+        mut skill_catalog,
         adapter,
         catalog,
         mut commands,
@@ -1114,9 +1123,11 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
             biased;
             command = commands.recv() => match command {
                 Some(Command::Prompt { request, reply }) => {
-                    let result = drive_prompt(
+                    let result = drive_runtime_prompt(
                         &session_id,
+                        &runtime,
                         &integration,
+                        &mut skill_catalog,
                         &mut driver,
                         request,
                         &tasks,
@@ -1420,9 +1431,13 @@ fn record_acp_loop_failure(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn drive_prompt<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
+    skills: &[agentkit_tool_skills::Skill],
     integration: &AcpIntegration,
+    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
     driver: &mut LoopDriver<S>,
     request: PromptRequest,
     tasks: &TaskManagerHandle,
@@ -1434,9 +1449,78 @@ async fn drive_prompt<S: ModelSession>(
     }
     background_jobs.begin_turn();
     let items = integration.input_port().prompt_to_items(&request)?;
-    driver
-        .submit_input(items)
-        .map_err(|error| record_acp_loop_failure(session_id, &error))?;
+    skill_catalog
+        .submit(skills, items, |items| driver.submit_input(items))
+        .map_err(|error| match error {
+            skill_catalog::SubmitError::Catalog(error) => {
+                record_acp_runtime_failure(session_id, "skill_catalog", error)
+            }
+            skill_catalog::SubmitError::Submit(error) => {
+                record_acp_loop_failure(session_id, &error)
+            }
+        })?;
+    drive_submitted_prompt(
+        session_id,
+        integration,
+        driver,
+        tasks,
+        background_jobs,
+        structured_completion,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_runtime_prompt<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    runtime: &Arc<Runtime>,
+    integration: &AcpIntegration,
+    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
+    driver: &mut LoopDriver<S>,
+    request: PromptRequest,
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+    structured_completion: bool,
+) -> Result<PromptResponse, AcpRuntimeError> {
+    if structured_completion {
+        let _ = settle_background_jobs(tasks, background_jobs).await?;
+    }
+    let current = runtime
+        .current_skills()
+        .await
+        .map_err(AcpRuntimeError::Loop)?;
+    background_jobs.begin_turn();
+    let items = integration.input_port().prompt_to_items(&request)?;
+    skill_catalog
+        .submit(&current.skills, items, |items| driver.submit_input(items))
+        .map_err(|error| match error {
+            skill_catalog::SubmitError::Catalog(error) => {
+                record_acp_runtime_failure(session_id, "skill_catalog", error)
+            }
+            skill_catalog::SubmitError::Submit(error) => {
+                record_acp_loop_failure(session_id, &error)
+            }
+        })?;
+    drop(current);
+    drive_submitted_prompt(
+        session_id,
+        integration,
+        driver,
+        tasks,
+        background_jobs,
+        structured_completion,
+    )
+    .await
+}
+
+async fn drive_submitted_prompt<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    integration: &AcpIntegration,
+    driver: &mut LoopDriver<S>,
+    tasks: &TaskManagerHandle,
+    background_jobs: &BackgroundJobs,
+    structured_completion: bool,
+) -> Result<PromptResponse, AcpRuntimeError> {
     let response = match drive_until_pause(
         session_id,
         integration,
@@ -2705,9 +2789,12 @@ pub(super) mod tests {
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
         let response = drive_prompt(
             &acp_session_id,
+            &[],
             &integration,
+            &mut skill_catalog,
             &mut driver,
             PromptRequest::new(
                 acp_session_id.clone(),
@@ -2723,6 +2810,122 @@ pub(super) mod tests {
         .expect("cancellation must be an ACP response, not an RPC error");
 
         assert_eq!(response.stop_reason, StopReason::Cancelled);
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn live_prompt_boundary_refreshes_plugin_skill_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let plugins = crate::plugins::PluginRuntime::load(
+            config.clone(),
+            root.path().to_path_buf(),
+            root.path().join("cache"),
+            root.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let runtime = Runtime::with_plugin_runtime(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            Some(plugins),
+        )
+        .unwrap();
+        let runtime = Runtime::with_mcp_config(
+            runtime,
+            None,
+            Vec::new(),
+            false,
+            crate::tools::mcp::CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        let baseline = runtime.current_skills().await.unwrap();
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&baseline.skills).unwrap();
+        drop(baseline);
+
+        let package = root.path().join("plugin");
+        let skill = package.join("skills/live-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"live-plugin"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Live skill.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+
+        let integration = Arc::new(
+            AcpIntegration::builder()
+                .name("plugin-refresh-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+        );
+        let acp_session_id = agentkit_acp::SessionId::new("s-plugin-refresh");
+        let agentkit_session_id = AgentkitSessionId::new("s-plugin-refresh");
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                acp_session_id.clone(),
+                agentkit_session_id.clone(),
+                client,
+            ))
+            .unwrap();
+        let drain = tokio::spawn(async move {
+            while let Some(message) = messages.recv().await {
+                if let AcpClientMessage::Flush { response } = message {
+                    let _ = response.send(());
+                }
+            }
+        });
+        let turns = Arc::new(AtomicUsize::new(2));
+        let notification_items_seen = Arc::new(AtomicUsize::new(0));
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns,
+                user_items_seen: Arc::new(AtomicUsize::new(0)),
+                notification_items_seen: Arc::clone(&notification_items_seen),
+            })
+            .observer(integration.as_ref().clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(agentkit_session_id).without_cache())
+            .await
+            .unwrap();
+        let task_manager = AsyncTaskManager::new();
+        let tasks = task_manager.handle();
+        let response = drive_runtime_prompt(
+            &acp_session_id,
+            &runtime,
+            &integration,
+            &mut skill_catalog,
+            &mut driver,
+            PromptRequest::new(
+                acp_session_id.clone(),
+                vec![agentkit_acp::ContentBlock::Text(
+                    agentkit_acp::TextContent::new("use the new skill"),
+                )],
+            ),
+            &tasks,
+            &BackgroundJobs::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(notification_items_seen.load(Ordering::SeqCst), 1);
         drain.abort();
     }
 
@@ -2788,6 +2991,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let background_jobs = BackgroundJobs::default();
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
         let request = PromptRequest::new(
             acp_session_id.clone(),
             vec![agentkit_acp::ContentBlock::Text(
@@ -2796,7 +3000,9 @@ pub(super) mod tests {
         );
         let prompt = drive_prompt(
             &acp_session_id,
+            &[],
             &integration,
+            &mut skill_catalog,
             &mut driver,
             request,
             &tasks,
@@ -2928,14 +3134,19 @@ pub(super) mod tests {
         let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
         let test_mcp = crate::tools::mcp::empty();
         let mcp_events = test_mcp.subscribe(acp_session_id.to_string());
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let skills = runtime.current_skills().await.unwrap();
         let actor = tokio::spawn(session_actor(SessionActor {
             session_id: acp_session_id.clone(),
+            runtime,
             integration: Arc::clone(&integration),
             binding: SessionBindingGuard::new(Arc::clone(&integration), acp_session_id.clone()),
             driver,
             tasks: tasks.clone(),
             background_jobs: background_jobs.clone(),
             structured_completion: false,
+            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&skills.skills).unwrap(),
             adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
                 .unwrap(),
             catalog: Vec::new(),

@@ -31,7 +31,7 @@ const MAX_IMAGE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 use super::{
-    command::{Parsed, known_token, parse},
+    command::{self, Command as SlashCommand, Parsed, known_token, parse},
     editor::Editor,
     file_search::FileMatch,
     plan::{PlanNode, parse as parse_plan},
@@ -101,7 +101,7 @@ pub enum Update {
     /// Agent-advertised slash commands for one session.
     AvailableCommands {
         session_id: String,
-        commands: Vec<String>,
+        commands: Vec<SlashCommand>,
     },
     /// Full session configuration snapshot.
     ConfigOptions(Vec<agent_client_protocol::schema::v2::SessionConfigOption>),
@@ -553,7 +553,10 @@ pub struct App {
     pub session_choices: Vec<crate::session::CatalogEntry>,
     pub session_dialog: Option<SessionDialog>,
     pub file_picker: Option<FilePickerDialog>,
-    pub available_commands: Vec<String>,
+    pub available_commands: Vec<SlashCommand>,
+    pub command_completion_selected: usize,
+    command_completion_query: Option<String>,
+    command_completion_dismissed: Option<String>,
     pub a2a: String,
     pub session_id: Option<String>,
     /// Session currently associated with the ordered runtime side channel.
@@ -841,6 +844,9 @@ impl App {
             session_dialog: None,
             file_picker: None,
             available_commands: Vec::new(),
+            command_completion_selected: 0,
+            command_completion_query: None,
+            command_completion_dismissed: None,
             a2a,
             session_id: None,
             runtime_session_id: None,
@@ -900,6 +906,42 @@ impl App {
 
     pub fn working(&self) -> bool {
         self.phase != Phase::Idle
+    }
+
+    fn command_completion_prefix(&self) -> Option<&str> {
+        command::completion_prefix(self.editor.text(), self.editor.cursor())
+    }
+
+    pub fn command_completions(&self) -> Vec<SlashCommand> {
+        let Some(prefix) = self.command_completion_prefix() else {
+            return Vec::new();
+        };
+        if self.command_completion_dismissed.as_deref() == Some(prefix) {
+            return Vec::new();
+        }
+        command::completions(
+            self.editor.text(),
+            self.editor.cursor(),
+            &self.available_commands,
+        )
+    }
+
+    fn sync_command_completion(&mut self) {
+        let query = self.command_completion_prefix().map(str::to_string);
+        if query != self.command_completion_query {
+            self.command_completion_selected = 0;
+            self.command_completion_dismissed = None;
+            self.command_completion_query = query;
+        }
+        let count = command::completions(
+            self.editor.text(),
+            self.editor.cursor(),
+            &self.available_commands,
+        )
+        .len();
+        self.command_completion_selected = self
+            .command_completion_selected
+            .min(count.saturating_sub(1));
     }
 
     fn collapse_last_tool_output(&mut self) {
@@ -1675,6 +1717,8 @@ impl App {
             } => {
                 if self.session_id.as_deref() == Some(session_id.as_str()) {
                     self.available_commands = commands;
+                    self.command_completion_dismissed = None;
+                    self.sync_command_completion();
                 }
             }
             Update::SteerAccepted { id, text } => {
@@ -2000,6 +2044,9 @@ impl App {
         self.session_id = Some(session_id);
         self.file_picker = None;
         self.available_commands.clear();
+        self.command_completion_selected = 0;
+        self.command_completion_query = None;
+        self.command_completion_dismissed = None;
         self.blocks.clear();
         self.transcript_cache.clear();
         self.transcript_revisions.clear();
@@ -2286,6 +2333,7 @@ impl App {
     pub fn paste(&mut self, text: &str) {
         self.file_picker = None;
         self.editor.insert_str(text);
+        self.sync_command_completion();
         let lines = text.lines().count();
         if lines > 1 {
             self.toast(format!("pasted {lines} lines"));
@@ -2613,6 +2661,39 @@ impl App {
         let word = alt || control;
         let line = command || control;
 
+        self.sync_command_completion();
+        let completions = self.command_completions();
+        if !completions.is_empty() && key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.command_completion_dismissed =
+                        self.command_completion_prefix().map(str::to_string);
+                    return Action::None;
+                }
+                KeyCode::Up => {
+                    self.command_completion_selected =
+                        self.command_completion_selected.saturating_sub(1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.command_completion_selected = (self.command_completion_selected + 1)
+                        .min(completions.len().saturating_sub(1));
+                    return Action::None;
+                }
+                KeyCode::Tab => {
+                    let selected = self
+                        .command_completion_selected
+                        .min(completions.len().saturating_sub(1));
+                    let replacement = completions[selected].name.clone();
+                    self.editor.replace_command_token(&replacement);
+                    self.command_completion_query = Some(replacement.clone());
+                    self.command_completion_dismissed = Some(replacement);
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('b') if key.modifiers == KeyModifiers::SUPER => {
                 let Some(call_id) = self.newest_foreground_compose().map(|call| call.id.clone())
@@ -2830,6 +2911,7 @@ impl App {
             KeyCode::Char(character) if !control && !command => self.editor.insert_char(character),
             _ => {}
         }
+        self.sync_command_completion();
         if self.follow {
             self.scroll = usize::MAX;
         }
@@ -3967,13 +4049,25 @@ mod tests {
             session_id: "one".into(),
             commands: vec!["compact".into()],
         });
-        assert_eq!(app.available_commands, ["compact"]);
+        assert_eq!(
+            app.available_commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["compact"]
+        );
 
         app.apply(Update::AvailableCommands {
             session_id: "stale".into(),
             commands: vec!["ignored".into()],
         });
-        assert_eq!(app.available_commands, ["compact"]);
+        assert_eq!(
+            app.available_commands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["compact"]
+        );
 
         app.apply(Update::AvailableCommands {
             session_id: "one".into(),
@@ -4037,6 +4131,53 @@ mod tests {
             app.handle_key(press(KeyCode::Enter)),
             Action::New(Some(prompt)) if prompt == "begin fresh"
         ));
+    }
+
+    #[test]
+    fn tab_completes_a_slash_command_without_submitting() {
+        let mut app = app();
+        app.paste("/mo");
+        assert_eq!(app.command_completions()[0].name, "/model");
+
+        assert!(matches!(app.handle_key(press(KeyCode::Tab)), Action::None));
+        assert_eq!(app.editor.text(), "/model");
+        assert!(app.command_completions().is_empty());
+    }
+
+    #[test]
+    fn completion_keys_select_and_dismiss_before_normal_editor_actions() {
+        let mut app = app();
+        app.paste("/");
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.editor.text(), "/resume");
+
+        app.editor.clear();
+        app.paste("/m");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.command_completions().is_empty());
+        app.handle_key(press(KeyCode::Char('o')));
+        assert_eq!(app.command_completions()[0].name, "/model");
+    }
+
+    #[test]
+    fn tab_keeps_inserting_spaces_without_an_active_completion() {
+        let mut app = app();
+        app.paste("plain");
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.editor.text(), "plain    ");
+    }
+
+    #[test]
+    fn completion_is_hidden_after_arguments_but_available_while_working() {
+        let mut app = app();
+        app.paste("/model sonnet");
+        assert!(app.command_completions().is_empty());
+
+        app.editor.clear();
+        app.paste("/mo");
+        app.phase = Phase::Working;
+        assert_eq!(app.command_completions()[0].name, "/model");
     }
 
     #[test]
@@ -4376,6 +4517,7 @@ mod tests {
                 id: "saved".into(),
                 title: Some("Saved".into()),
                 preview: None,
+                is_subagent: false,
                 updated_at: 0,
             },
         ])));
@@ -4392,6 +4534,7 @@ mod tests {
                 id: id.into(),
                 title: Some(format!("{id} title")),
                 preview: None,
+                is_subagent: false,
                 updated_at: 0,
             })
             .collect();

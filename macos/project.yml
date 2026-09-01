@@ -1,0 +1,98 @@
+name: KitDesktop
+options:
+  bundleIdPrefix: com.speakeasy.kit
+  deploymentTarget:
+    macOS: "14.0"
+configFiles:
+  Debug: Config/Version.xcconfig
+  Release: Config/Version.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: NO
+    CODE_SIGN_STYLE: Manual
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  KitDesktop:
+    type: application
+    platform: macOS
+    productName: Kit
+    sources:
+      - KitDesktop
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.speakeasy.kit.desktop
+        PRODUCT_NAME: Kit
+        PRODUCT_MODULE_NAME: Kit
+        DEFINES_MODULE: YES
+        MARKETING_VERSION: "$(KIT_VERSION)"
+        CURRENT_PROJECT_VERSION: 1
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kit
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Config/KitDesktop.entitlements
+      configs:
+        Debug:
+          ENABLE_TESTABILITY: YES
+    postBuildScripts:
+      - name: Copy Kit CLI
+        # Always run so a missing or changed source helper cannot leave an old copy in the app.
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          helper_dir="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+          destination="${helper_dir}/kit"
+          temporary="${destination}.tmp.$$"
+          trap 'rm -f "${temporary}"' EXIT
+          rm -f "${destination}" "${temporary}"
+          mkdir -p "${helper_dir}"
+          if [ "${CONFIGURATION}" = "Release" ]; then
+            # Production is intentionally ARM64-only, matching Kit's current macOS release target.
+            source_binary="${SRCROOT}/../target/aarch64-apple-darwin/release/kit"
+          else
+            source_binary="${KIT_BINARY:-${SRCROOT}/../target/debug/kit}"
+          fi
+          if [ ! -x "${source_binary}" ]; then
+            if [ "${CONFIGURATION}" = "Release" ]; then
+              echo "error: Release requires target/aarch64-apple-darwin/release/kit. Run: cargo build --locked --release --target aarch64-apple-darwin --bin kit" >&2
+              exit 1
+            fi
+            echo "warning: Debug Kit helper unavailable; KIT_BINARY/source-tree/PATH runtime fallback remains enabled."
+            exit 0
+          fi
+          helper_arches="$(lipo -archs "${source_binary}")"
+          if [ "${helper_arches}" != "arm64" ]; then
+            echo "error: Kit helper must be a thin arm64 Mach-O; found: ${helper_arches}" >&2
+            exit 1
+          fi
+          cp "${source_binary}" "${temporary}"
+          chmod +x "${temporary}"
+          mv -f "${temporary}" "${destination}"
+  KitDesktopTests:
+    type: bundle.unit-test
+    platform: macOS
+    productName: KitDesktopTests
+    sources:
+      - KitDesktopTests
+    dependencies:
+      - target: KitDesktop
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.speakeasy.kit.desktop.tests
+        PRODUCT_MODULE_NAME: KitDesktopTests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Kit.app/Contents/MacOS/Kit"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  KitDesktop:
+    build:
+      targets:
+        KitDesktop: all
+        KitDesktopTests: [test]
+    test:
+      targets:
+        - KitDesktopTests

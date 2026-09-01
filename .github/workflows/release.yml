@@ -1,9 +1,7 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,34 +9,181 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   verify:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      previous_tag: ${{ steps.release.outputs.previous_tag }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
-      - name: Verify release tag matches Cargo version
+      - name: Prepare release candidate
+        id: release
         shell: bash
         run: |
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          escaped_version=${version//./\.}
-          if [[ $GITHUB_REF_NAME != "v$version" \
-            && ! $GITHUB_REF_NAME =~ ^v${escaped_version}-pre(\.[0-9]+)?$ ]]; then
-            echo "expected v${version}, v${version}-pre, or v${version}-pre.N" >&2
+          if [[ $GITHUB_REF != refs/heads/main ]]; then
+            echo "::error::Releases must run from main, not $GITHUB_REF."
             exit 1
           fi
+
+          published_tags=()
+          while IFS= read -r published_tag; do
+            published_tags+=("$published_tag")
+          done < <(
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName,isDraft \
+              --jq '.[] | select(.isDraft | not) | .tagName'
+          )
+          if [[ ${#published_tags[@]} -eq 0 ]]; then
+            echo "::error::Could not find a previous published release."
+            exit 1
+          fi
+
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [[ ! $cargo_version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Cargo.toml contains invalid release version $cargo_version."
+            exit 1
+          fi
+
+          current_tag="v$cargo_version"
+          latest_published=${published_tags[0]}
+          current_tag_sha=$(git rev-parse -q --verify "$current_tag^{commit}" 2>/dev/null || true)
+          workflow_sha=$(git rev-parse HEAD)
+          resume=false
+
+          if [[ $latest_published == "$current_tag" && $current_tag_sha != "$workflow_sha" ]]; then
+            previous_tag=$current_tag
+            source_sha=$workflow_sha
+          elif [[ -n $current_tag_sha && $current_tag_sha == "$workflow_sha" ]]; then
+            resume=true
+            release_sha=$current_tag_sha
+            source_sha=$(git rev-parse "$release_sha^")
+            if [[ $latest_published == "$current_tag" ]]; then
+              if [[ ${#published_tags[@]} -lt 2 ]]; then
+                echo "::error::Could not find the release before $current_tag."
+                exit 1
+              fi
+              previous_tag=${published_tags[1]}
+            else
+              previous_tag=$latest_published
+            fi
+          elif [[ -n $current_tag_sha && $latest_published != "$current_tag" ]] &&
+               git merge-base --is-ancestor "$current_tag_sha" "$workflow_sha"; then
+            resume=true
+            release_sha=$current_tag_sha
+            source_sha=$(git rev-parse "$release_sha^")
+            previous_tag=$latest_published
+          else
+            echo "::error::Cargo.toml version $cargo_version does not match latest release $latest_published."
+            exit 1
+          fi
+
+          if [[ $resume == true ]]; then
+            subject=$(git show -s --format=%s "$release_sha")
+            if [[ $subject != "chore(release): $current_tag" ]]; then
+              echo "::error::$current_tag does not point to a Kit release commit."
+              exit 1
+            fi
+            expected=$(scripts/next-release-version.sh \
+              "${previous_tag#v}" "$previous_tag" "$source_sha")
+            if [[ $expected != "$cargo_version" ]]; then
+              echo "::error::Release commit version $cargo_version should be $expected."
+              exit 1
+            fi
+            version=$cargo_version
+            tag=$current_tag
+          else
+            if ! git merge-base --is-ancestor "$previous_tag" "$source_sha"; then
+              echo "::error::Previous release $previous_tag is not an ancestor of $source_sha."
+              exit 1
+            fi
+            version=$(scripts/next-release-version.sh \
+              "$cargo_version" "$previous_tag" "$source_sha")
+            tag="v$version"
+            if git rev-parse -q --verify "$tag^{commit}" >/dev/null; then
+              echo "::error::Tag $tag already exists."
+              exit 1
+            fi
+
+            CURRENT_VERSION=$cargo_version NEXT_VERSION=$version python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          current = re.escape(os.environ["CURRENT_VERSION"])
+          replacement = os.environ["NEXT_VERSION"]
+
+          def update(path, pattern):
+              source = Path(path).read_text()
+              changed, count = re.subn(pattern, lambda match: match.group(1) + replacement + match.group(2), source)
+              if count != 1:
+                  raise SystemExit(f"expected one version entry in {path}, found {count}")
+              Path(path).write_text(changed)
+
+          update("Cargo.toml", rf'(?ms)(^\[package\].*?^version = "){current}(")')
+          update("Cargo.lock", rf'(?m)(^\[\[package\]\]\nname = "kit"\nversion = "){current}(")')
+          PY
+            cargo metadata --locked --no-deps --format-version 1 >/dev/null
+            git diff --check
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore(release): $tag"
+            release_sha=$(git rev-parse HEAD)
+          fi
+
+          git branch -f release-candidate "$release_sha"
+          git bundle create "$RUNNER_TEMP/release-candidate.bundle" \
+            release-candidate "^$source_sha"
+          git bundle verify "$RUNNER_TEMP/release-candidate.bundle"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "prerelease=false" >> "$GITHUB_OUTPUT"
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: ${{ runner.temp }}/release-candidate.bundle
+          if-no-files-found: error
+          retention-days: 1
 
   linux-x64:
     needs: verify
     runs-on: blacksmith-8vcpu-ubuntu-2404
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-release-candidate
+        with:
+          release-sha: ${{ needs.verify.outputs.release_sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
@@ -46,7 +191,7 @@ jobs:
       - name: Build and package
         shell: bash
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=$RELEASE_VERSION
           cargo build --locked --release --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
@@ -58,7 +203,7 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  macos-arm64:
+  macos-cli-arm64:
     needs: verify
     runs-on: blacksmith-6vcpu-macos-15
     outputs:
@@ -72,6 +217,12 @@ jobs:
       APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
     steps:
       - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-release-candidate
+        with:
+          release-sha: ${{ needs.verify.outputs.release_sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
@@ -118,13 +269,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s \
             -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Build and package
+      - name: Build, sign, notarize, and package CLI
         shell: bash
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
-          version=${GITHUB_REF_NAME#v}
-          cargo build --locked --release --target aarch64-apple-darwin
+          version=${{ needs.verify.outputs.version }}
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
           if [[ $SIGN_RELEASE == true ]]; then
@@ -143,58 +294,238 @@ jobs:
               --key-id "$APPLE_API_KEY_ID" \
               --issuer "$APPLE_API_ISSUER_ID" \
               --wait 2>&1 | tee "$notary_log"
-            if ! grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$notary_log"; then
-              echo "Apple did not accept the notarization submission." >&2
+            grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$notary_log" || {
+              echo "Apple did not accept the standalone Kit notarization." >&2
               exit 1
-            fi
+            }
           fi
           stage/kit --version
           tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" kit
       - uses: actions/upload-artifact@v4
         with:
-          name: kit-macos-arm64
-          path: dist/*
+          name: kit-macos-cli-arm64
+          path: dist/kit-*.tar.gz
+          if-no-files-found: error
+
+  macos-app-arm64:
+    needs: verify
+    runs-on: blacksmith-6vcpu-macos-15
+    outputs:
+      signed: ${{ steps.signing.outputs.enabled }}
+    env:
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+    steps:
+      - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-release-candidate
+        with:
+          release-sha: ${{ needs.verify.outputs.release_sha }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: aarch64-apple-darwin
+      - name: Check optional signing credentials
+        id: signing
+        shell: bash
+        run: |
+          credentials=(
+            MACOS_CERTIFICATE_P12_BASE64
+            MACOS_CERTIFICATE_PASSWORD
+            MACOS_SIGNING_IDENTITY
+            APPLE_API_KEY_P8_BASE64
+            APPLE_API_KEY_ID
+            APPLE_API_ISSUER_ID
+          )
+          configured=0
+          for name in "${credentials[@]}"; do
+            if [[ -n ${!name:-} ]]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if [[ $configured -eq 0 ]]; then
+            echo "Apple credentials are not configured; building an unsigned macOS release."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [[ $configured -eq ${#credentials[@]} ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Apple signing credentials are only partially configured." >&2
+            exit 1
+          fi
+      - name: Import Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          keychain=$RUNNER_TEMP/kit-signing.keychain-db
+          certificate=$RUNNER_TEMP/kit-signing.p12
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -f pkcs12 -k "$keychain" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+      - name: Install pinned XcodeGen
+        shell: bash
+        run: |
+          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build, archive, sign, notarize, and package app
+        shell: bash
+        env:
+          SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
+        run: |
+          version=${{ needs.verify.outputs.version }}
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          scripts/generate-macos-project.sh
+          archive="$RUNNER_TEMP/Kit.xcarchive"
+          xcodebuild archive -quiet \
+            -project macos/KitDesktop.xcodeproj \
+            -scheme KitDesktop \
+            -configuration Release \
+            -archivePath "$archive" \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO
+          mkdir -p dist
+          scripts/package-macos-app.sh \
+            "$archive/Products/Applications/Kit.app" dist "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kit-macos-app-arm64
+          path: dist/Kit-*
+          if-no-files-found: error
+
+  release-notes:
+    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, container-build]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-release-candidate
+        with:
+          release-sha: ${{ needs.verify.outputs.release_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-linux-x64
+          path: dist
+      - name: Generate release notes with the built Kit CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          mkdir -p release-kit
+          tar -xzf "dist/kit-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C release-kit
+          release-kit/kit --version
+          release-kit/kit prompt \
+            --root "$GITHUB_WORKSPACE" \
+            --provider openrouter \
+            --model z-ai/glm-5.3 \
+            "use release-notes skill for ${{ needs.verify.outputs.previous_tag }}..${{ needs.verify.outputs.release_sha }}; respond only with release notes" \
+            > kit-output.txt
+          sed '$ { /^session_id: /d; }' kit-output.txt > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::Kit returned an empty release note."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
           if-no-files-found: error
 
   publish:
-    needs: [linux-x64, macos-arm64]
+    needs: [verify, linux-x64, macos-cli-arm64, macos-app-arm64, release-notes]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      MACOS_SIGNED: ${{ needs.macos-arm64.outputs.signed }}
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      RELEASE_TAG: ${{ needs.verify.outputs.tag }}
     steps:
+      - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+      - uses: ./.github/actions/checkout-release-candidate
+        with:
+          release-sha: ${{ needs.verify.outputs.release_sha }}
+      - name: Advance main and create release tag
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          RELEASE_SHA: ${{ needs.verify.outputs.release_sha }}
+        shell: bash
+        run: |
+          remote_main=$(
+            git ls-remote --heads origin refs/heads/main | cut -f1
+          )
+          remote_tag=$(
+            git ls-remote --tags --refs origin "refs/tags/$RELEASE_TAG" | cut -f1
+          )
+
+          if [[ $remote_main == "$SOURCE_SHA" && -z $remote_tag ]]; then
+            git push --atomic \
+              --force-with-lease="refs/heads/main:$SOURCE_SHA" \
+              --force-with-lease="refs/tags/$RELEASE_TAG:" \
+              origin \
+              "$RELEASE_SHA:refs/heads/main" \
+              "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
+          elif [[ $remote_tag == "$RELEASE_SHA" ]]; then
+            git fetch --no-tags origin "refs/heads/main:refs/remotes/origin/release-main"
+            if ! git merge-base --is-ancestor \
+              "$RELEASE_SHA" refs/remotes/origin/release-main; then
+              echo "::error::Tag $RELEASE_TAG is not contained in main."
+              exit 1
+            fi
+            echo "Release refs already exist; resuming publication."
+          else
+            echo "::error::main or $RELEASE_TAG changed while the release was building."
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           pattern: kit-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
       - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           cd dist
-          sha256sum kit-*.tar.gz > SHA256SUMS
-          prerelease=false
-          if [[ $GITHUB_REF_NAME == *-pre* ]]; then
-            prerelease=true
-          fi
-          if [[ $MACOS_SIGNED == true ]]; then
-            signing_note="The macOS binary is Developer ID signed and notarized."
-          else
-            signing_note="The macOS binary is unsigned and not notarized."
-          fi
-          title="Kit ${GITHUB_REF_NAME#v}"
-          notes="Prebuilt Kit binaries. $signing_note"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS \
+          sha256sum kit-*.tar.gz Kit-*.zip > SHA256SUMS
+          prerelease=${{ needs.verify.outputs.prerelease }}
+          title="Kit $RELEASE_VERSION"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" kit-*.tar.gz Kit-*.zip SHA256SUMS \
               --clobber --repo "$GITHUB_REPOSITORY"
           else
             create_args=(
-              "$GITHUB_REF_NAME" kit-*.tar.gz SHA256SUMS
+              "$RELEASE_TAG" kit-*.tar.gz Kit-*.zip SHA256SUMS
               --repo "$GITHUB_REPOSITORY"
+              --verify-tag
               --title "$title"
-              --notes "$notes"
+              --notes-file ../release-notes.md
             )
             if [[ $prerelease == true ]]; then
               create_args+=(--prerelease)
@@ -202,21 +533,19 @@ jobs:
             gh release create "${create_args[@]}"
           fi
           edit_args=(
-            "$GITHUB_REF_NAME"
+            "$RELEASE_TAG"
             --repo "$GITHUB_REPOSITORY"
             --title "$title"
-            --notes "$notes"
+            --notes-file ../release-notes.md
             --draft=false
             --prerelease="$prerelease"
           )
           if [[ $prerelease == false ]]; then
-            newest_stable=$(
-              gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-                --json tagName,isDraft,isPrerelease \
-                --jq '.[] | select((.isDraft | not) and (.isPrerelease | not)) | .tagName' \
-                | sort -V | tail -1
+            latest_tag=$(
+              gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name
             )
-            if [[ $GITHUB_REF_NAME == "$newest_stable" ]]; then
+            if git merge-base --is-ancestor "$latest_tag" \
+              "${{ needs.verify.outputs.release_sha }}"; then
               edit_args+=(--latest)
             fi
           fi
@@ -224,7 +553,7 @@ jobs:
 
   container-build:
     name: Build container images (${{ matrix.arch }}, ${{ matrix.family }})
-    needs: publish
+    needs: verify
     runs-on: ${{ matrix.runner }}
     concurrency:
       group: release-container-cache-${{ matrix.arch }}-${{ matrix.family }}
@@ -257,10 +586,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-release-candidate
+        with:
+          release-sha: ${{ needs.verify.outputs.release_sha }}
       - name: Read container version
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${{ needs.verify.outputs.version }}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Log in to GitHub Container Registry
@@ -279,7 +614,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ github.sha }}
+            REVISION=${{ needs.verify.outputs.release_sha }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
       - name: Build and push Bookworm image by digest
@@ -292,7 +627,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ github.sha }}
+            REVISION=${{ needs.verify.outputs.release_sha }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -306,7 +641,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ github.sha }}
+            REVISION=${{ needs.verify.outputs.release_sha }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -338,13 +673,14 @@ jobs:
 
   containers:
     name: Publish container image manifests
-    needs: [publish, container-build]
+    needs: [verify, publish, container-build]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     env:
       IMAGE: ghcr.io/${{ github.repository }}
+      RELEASE_TAG: ${{ needs.verify.outputs.tag }}
     steps:
       - name: Download image digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -358,17 +694,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if [[ $GITHUB_REF_NAME == *-pre* ]]; then
+          if [[ $RELEASE_TAG == *-* ]]; then
             echo "floating=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           newest_stable=$(
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
-              --json tagName,isDraft,isPrerelease \
-              --jq '.[] | select((.isDraft | not) and (.isPrerelease | not)) | .tagName' \
-              | sort -V | tail -1
+            gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name
           )
-          if [[ $GITHUB_REF_NAME == "$newest_stable" ]]; then
+          if [[ $RELEASE_TAG == "$newest_stable" ]]; then
             echo "floating=true" >> "$GITHUB_OUTPUT"
           else
             echo "floating=false" >> "$GITHUB_OUTPUT"
@@ -389,8 +722,8 @@ jobs:
           images: ${{ env.IMAGE }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}
-            type=raw,value=${{ github.ref_name }}-slim
+            type=raw,value=${{ needs.verify.outputs.tag }}
+            type=raw,value=${{ needs.verify.outputs.tag }}-slim
             type=raw,value=latest,enable=${{ steps.release.outputs.floating == 'true' }}
             type=raw,value=slim,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish slim manifest
@@ -411,7 +744,7 @@ jobs:
           images: ${{ env.IMAGE }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}-bookworm
+            type=raw,value=${{ needs.verify.outputs.tag }}-bookworm
             type=raw,value=bookworm,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Bookworm manifest
         env:
@@ -431,7 +764,7 @@ jobs:
           images: ${{ env.IMAGE }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}-alpine
+            type=raw,value=${{ needs.verify.outputs.tag }}-alpine
             type=raw,value=alpine,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Alpine manifest
         env:

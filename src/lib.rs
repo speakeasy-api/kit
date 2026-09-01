@@ -7,6 +7,7 @@ pub mod docs;
 pub mod events;
 mod fatal;
 pub mod plugins;
+pub(crate) mod process_tree;
 pub mod protocols;
 pub mod provider;
 pub mod runtime;
