@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -28,7 +28,9 @@ use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore, mpsc, oneshot};
+use tokio::sync::{
+    Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, mpsc, oneshot,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -136,11 +138,13 @@ struct Inner {
     oauth_sessions: OAuthSessions,
     active_replays: ActiveReplays,
     credential_storage: CredentialStorage,
+    plugin_source: Option<crate::plugins::PluginRuntime>,
     reload: Mutex<ReloadState>,
     reload_flight: Arc<Semaphore>,
+    reload_epoch: AtomicU64,
     initialization: Mutex<()>,
     auth_setup: Mutex<()>,
-    operations: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    operations: Mutex<BTreeMap<String, Weak<RwLock<()>>>>,
     event_routes: EventRoutes,
     next_event_route: AtomicU64,
     interactive_oauth_enabled: bool,
@@ -153,6 +157,7 @@ struct ServerRecord {
     oauth: Option<auth::Config>,
     static_authorization: bool,
     fingerprint: Vec<u8>,
+    plugin_owned: bool,
     status: ServerStatus,
 }
 
@@ -161,6 +166,7 @@ struct ReloadState {
     entries: BTreeMap<String, Vec<u8>>,
     plugins: BTreeMap<String, PreparedServer>,
     plugin_entries: BTreeMap<String, Vec<u8>>,
+    plugin_source: Option<crate::plugins::PluginRuntime>,
 }
 
 #[derive(Clone)]
@@ -668,6 +674,7 @@ fn prepare_server(
                     oauth: None,
                     static_authorization: false,
                     fingerprint,
+                    plugin_owned: false,
                     status: ServerStatus::Uninitialized,
                 },
             ))
@@ -703,6 +710,7 @@ fn prepare_server(
                     oauth: server.auth,
                     static_authorization,
                     fingerprint,
+                    plugin_owned: false,
                     status: ServerStatus::Uninitialized,
                 },
             ))
@@ -793,11 +801,10 @@ fn prepare_plugins(
         let data = plugin_text(&plugin.data_dir, "data", &plugin.alias)?;
         for server in &plugin.servers {
             if matches!(server.transport, PluginMcpTransport::Sse { .. }) {
-                eprintln!(
-                    "plugin {}: MCP server {:?} uses unsupported SSE transport; skipping",
+                return Err(format!(
+                    "plugin {}: MCP server {:?} uses unsupported SSE transport",
                     plugin.alias, server.name
-                );
-                continue;
+                ));
             }
             if let Some(owner) = owners.insert(server.name.clone(), plugin.alias.clone()) {
                 return Err(format!(
@@ -806,8 +813,6 @@ fn prepare_plugins(
                 ));
             }
             let description = format!("{} plugin MCP server", plugin.manifest_name);
-            let fingerprint =
-                format!("plugin:{}:{:?}", plugin.alias, server.transport).into_bytes();
             let (binding, url, static_authorization) = match &server.transport {
                 PluginMcpTransport::Stdio {
                     command,
@@ -901,8 +906,13 @@ fn prepare_plugins(
                             .any(|name| name.eq_ignore_ascii_case("authorization")),
                     )
                 }
-                PluginMcpTransport::Sse { .. } => unreachable!("SSE was skipped above"),
+                PluginMcpTransport::Sse { .. } => unreachable!("SSE was rejected above"),
             };
+            let fingerprint = format!(
+                "plugin:v2:{:?}:{:?}:{:?}:{:?}:{binding:?}:{url:?}:{static_authorization}",
+                plugin.alias, plugin.manifest_name, plugin.root, plugin.data_dir
+            )
+            .into_bytes();
             entries.insert(server.name.clone(), fingerprint.clone());
             prepared.insert(
                 server.name.clone(),
@@ -914,6 +924,7 @@ fn prepare_plugins(
                         oauth: None,
                         static_authorization,
                         fingerprint,
+                        plugin_owned: true,
                         status: ServerStatus::Uninitialized,
                     },
                 },
@@ -962,7 +973,40 @@ pub(crate) async fn connect(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
-    let sources = sources.into_config_sources();
+    connect_inner(
+        sources.into_config_sources(),
+        plugins,
+        None,
+        interactive_oauth_enabled,
+        credential_storage,
+    )
+    .await
+}
+
+pub(crate) async fn connect_dynamic(
+    sources: impl IntoConfigSources,
+    plugins: crate::plugins::PluginRuntime,
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+) -> Result<McpRuntime, String> {
+    let snapshot = plugins.snapshot();
+    connect_inner(
+        sources.into_config_sources(),
+        &snapshot.mcp_plugins,
+        Some(plugins),
+        interactive_oauth_enabled,
+        credential_storage,
+    )
+    .await
+}
+
+async fn connect_inner(
+    sources: Vec<ConfigSource>,
+    plugins: &[crate::plugins::ResolvedPluginMcp],
+    plugin_source: Option<crate::plugins::PluginRuntime>,
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+) -> Result<McpRuntime, String> {
     let (plugin_prepared, plugin_entries) = prepare_plugins(plugins)?;
     let mut source_states = Vec::with_capacity(sources.len());
     for source in sources {
@@ -1007,6 +1051,7 @@ pub(crate) async fn connect(
             entries,
             plugins: plugin_prepared,
             plugin_entries,
+            plugin_source,
         },
         interactive_oauth_enabled,
     );
@@ -1026,6 +1071,7 @@ impl McpRuntime {
     ) -> Self {
         let catalog = manager.source();
         let (oauth_sessions, active_replays) = oauth;
+        let plugin_source = reload.plugin_source.clone();
         Self {
             inner: Arc::new(Inner {
                 manager: Mutex::new(manager),
@@ -1036,8 +1082,10 @@ impl McpRuntime {
                 oauth_sessions,
                 active_replays,
                 credential_storage,
+                plugin_source,
                 reload: Mutex::new(reload),
                 reload_flight: Arc::new(Semaphore::new(1)),
+                reload_epoch: AtomicU64::new(0),
                 initialization: Mutex::new(()),
                 auth_setup: Mutex::new(()),
                 operations: Mutex::new(BTreeMap::new()),
@@ -1052,17 +1100,18 @@ impl McpRuntime {
         self.inner.catalog.clone()
     }
 
-    async fn operation_gate(&self, server: &str) -> Arc<Mutex<()>> {
-        self.inner
-            .operations
-            .lock()
-            .await
-            .entry(server.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    async fn operation_gate(&self, server: &str) -> Arc<RwLock<()>> {
+        let mut operations = self.inner.operations.lock().await;
+        operations.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = operations.get(server).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(RwLock::new(()));
+        operations.insert(server.to_string(), Arc::downgrade(&gate));
+        gate
     }
 
-    async fn server_for_tool(&self, tool: &str) -> Option<(String, Vec<u8>, bool)> {
+    async fn server_for_tool(&self, tool: &str) -> Option<(String, Vec<u8>, bool, bool)> {
         self.inner
             .servers
             .read()
@@ -1075,8 +1124,43 @@ impl McpRuntime {
                     server.clone(),
                     record.fingerprint.clone(),
                     serializes_tool_calls(record),
+                    record.plugin_owned,
                 )
             })
+    }
+
+    async fn acquire_invocation(&self, tool: &str) -> Result<McpInvocationLease, ToolError> {
+        let Some((server, fingerprint, serializes, plugin_owned)) =
+            self.server_for_tool(tool).await
+        else {
+            return Err(ToolError::Unavailable(format!(
+                "MCP tool is no longer available: {tool}"
+            )));
+        };
+        let gate = self.operation_gate(&server).await;
+        let operation = if serializes {
+            McpOperationGuard::Exclusive(gate.write_owned().await)
+        } else {
+            McpOperationGuard::Shared(gate.read_owned().await)
+        };
+        let generation = match (&self.inner.plugin_source, plugin_owned) {
+            (Some(source), true) => Some(source.generation_lease().await),
+            _ => None,
+        };
+        let current = self.server_for_tool(tool).await;
+        if !current.is_some_and(|(current_server, current_fingerprint, _, _)| {
+            current_server == server && current_fingerprint == fingerprint
+        }) {
+            return Err(ToolError::Unavailable(
+                "MCP configuration changed while the tool was waiting; retry the call".into(),
+            ));
+        }
+        Ok(McpInvocationLease {
+            server,
+            fingerprint,
+            _operation: operation,
+            _generation: generation,
+        })
     }
 
     async fn finish_tool_call(
@@ -1187,124 +1271,186 @@ impl McpRuntime {
             .collect()
     }
 
+    pub(crate) async fn refresh(&self) -> Result<(), String> {
+        self.reload_config().await
+    }
+
     async fn reload_config(&self) -> Result<(), String> {
         let permit = Arc::clone(&self.inner.reload_flight)
             .acquire_owned()
             .await
             .map_err(|_| "MCP config reload coordinator closed".to_string())?;
+        let current = self.inner.reload_epoch.load(Ordering::Acquire);
         let runtime = self.clone();
         tokio::spawn(async move {
+            // The spawned task owns completion so caller cancellation cannot
+            // strand the reload permit. Every waiter reruns after acquiring the
+            // permit: a change can arrive after the preceding reload staged its
+            // inputs but before that reload publishes.
             let _permit = permit;
-            runtime.reload_config_inner().await
+            let result = runtime
+                .reload_config_inner()
+                .await
+                .map_err(crate::plugins::bounded_diagnostic);
+            runtime
+                .inner
+                .reload_epoch
+                .store(current.wrapping_add(1), Ordering::Release);
+            result
         })
         .await
         .map_err(|error| format!("MCP config reload task failed: {error}"))?
     }
 
     async fn reload_config_inner(&self) -> Result<(), String> {
-        let mut state = self.inner.reload.lock().await;
-        let mut next_sources = Vec::with_capacity(state.sources.len());
-        for current in &state.sources {
-            next_sources.push(SourceState {
-                source: current.source.clone(),
-                raw: read_source(&current.source).await?,
-            });
-        }
-        if next_sources
-            .iter()
-            .zip(&state.sources)
-            .all(|(next, current)| next.raw == current.raw)
-        {
-            return Ok(());
-        }
+        loop {
+            // Snapshot the published generation, then perform all config reads,
+            // downloads, and package resolution without holding runtime locks.
+            let (
+                current_sources,
+                current_entries,
+                current_plugins,
+                current_plugin_entries,
+                plugin_source,
+            ) = {
+                let state = self.inner.reload.lock().await;
+                (
+                    state.sources.clone(),
+                    state.entries.clone(),
+                    state.plugins.clone(),
+                    state.plugin_entries.clone(),
+                    state.plugin_source.clone(),
+                )
+            };
+            let staged_plugins = match &plugin_source {
+                Some(source) => Some(source.stage().await?),
+                None => None,
+            };
+            let (plugin_prepared, plugin_entries) = match &staged_plugins {
+                Some(staged) => prepare_plugins(&staged.resolved.mcp_plugins)?,
+                None => (current_plugins, current_plugin_entries),
+            };
+            let mut next_sources = Vec::with_capacity(current_sources.len());
+            for current in &current_sources {
+                next_sources.push(SourceState {
+                    source: current.source.clone(),
+                    raw: read_source(&current.source).await?,
+                });
+            }
 
-        // Validate every source before changing live state, then layer them in
-        // declared precedence order over the immutable plugin baseline.
-        let (mut prepared, entries) =
-            prepare_sources(&next_sources, &state.plugins, &state.plugin_entries)?;
-        validate_server_names(prepared.keys())?;
-        let changed = state
-            .entries
-            .keys()
-            .chain(entries.keys())
-            .filter(|name| state.entries.get(*name) != entries.get(*name))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if changed.is_empty() {
-            state.sources = next_sources;
-            return Ok(());
-        }
-        drop(state);
-        let gates = {
-            let mut operations = self.inner.operations.lock().await;
-            changed
-                .iter()
-                .map(|name| {
-                    operations
-                        .entry(name.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut operation_guards = Vec::with_capacity(gates.len());
-        for gate in &gates {
-            operation_guards.push(
-                tokio::time::timeout(CONNECT_TIMEOUT, gate.lock())
+            // Configured, project, and explicit files retain their declared
+            // precedence over the newly staged plugin baseline.
+            let (mut prepared, entries) =
+                prepare_sources(&next_sources, &plugin_prepared, &plugin_entries)?;
+            validate_server_names(prepared.keys())?;
+            let changed = current_entries
+                .keys()
+                .chain(entries.keys())
+                .filter(|name| current_entries.get(*name) != entries.get(*name))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let deleted = current_entries
+                .keys()
+                .filter(|name| !entries.contains_key(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let gates = if changed.is_empty() {
+                Vec::new()
+            } else {
+                let mut gates = Vec::with_capacity(changed.len());
+                for name in &changed {
+                    gates.push(self.operation_gate(name).await);
+                }
+                gates
+            };
+            let mut operation_guards = Vec::with_capacity(gates.len());
+            let mut blocked = None;
+            for gate in &gates {
+                match gate.clone().try_write_owned() {
+                    Ok(guard) => operation_guards.push(guard),
+                    Err(_) => {
+                        blocked = Some(gate.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(gate) = blocked {
+                drop(operation_guards);
+                let waited = tokio::time::timeout(CONNECT_TIMEOUT, gate.write_owned())
                     .await
-                    .map_err(|_| "timed out waiting for an in-flight MCP operation".to_string())?,
-            );
-        }
-        let mut state = self.inner.reload.lock().await;
-        let _initialization = self.inner.initialization.lock().await;
-        for expected in &next_sources {
-            if read_source(&expected.source).await? != expected.raw {
-                return Err(
-                    "MCP config changed while reload was waiting; retry the operation".into(),
-                );
+                    .map_err(|_| "timed out waiting for an in-flight MCP operation".to_string())?;
+                drop(waited);
+                continue;
             }
-        }
+            let generation_writer = match &plugin_source {
+                Some(source) => Some(source.generation_writer().await),
+                None => None,
+            };
+            let mut initialization_guard = None;
+            if !changed.is_empty() {
+                initialization_guard = Some(self.inner.initialization.lock().await);
 
-        {
-            let mut manager = self.inner.manager.lock().await;
-            for name in &changed {
-                let _ = manager.unregister_server(&McpServerId::new(name)).await;
-            }
-            for name in &changed {
-                if let Some(server) = prepared.get(name) {
-                    manager.register_server_with_options(
-                        server.config.clone(),
-                        McpServerOptions::new().with_timeout(CONNECT_TIMEOUT),
-                    );
+                {
+                    let mut manager = self.inner.manager.lock().await;
+                    for name in &changed {
+                        let _ = manager.unregister_server(&McpServerId::new(name)).await;
+                    }
+                    for name in &changed {
+                        if let Some(server) = prepared.get(name) {
+                            manager.register_server_with_options(
+                                server.config.clone(),
+                                McpServerOptions::new().with_timeout(CONNECT_TIMEOUT),
+                            );
+                        }
+                    }
+                }
+                {
+                    let mut servers = self.inner.servers.write().await;
+                    for name in &changed {
+                        servers.remove(name);
+                        if let Some(server) = prepared.remove(name) {
+                            servers.insert(name.clone(), server.record);
+                        }
+                    }
+                }
+                {
+                    let mut challenges = self.inner.challenges.lock().await;
+                    let mut pending = self.inner.pending.lock().await;
+                    let mut oauth_sessions = self.inner.oauth_sessions.lock().await;
+                    let mut active_replays = self.inner.active_replays.lock().await;
+                    for name in &changed {
+                        challenges.remove(name);
+                        if let Some(pending) = pending.remove(name) {
+                            pending.abort.abort();
+                        }
+                        oauth_sessions.remove(name);
+                        active_replays.remove(name);
+                    }
                 }
             }
-        }
-        {
-            let mut servers = self.inner.servers.write().await;
-            for name in &changed {
-                servers.remove(name);
-                if let Some(server) = prepared.remove(name) {
-                    servers.insert(name.clone(), server.record);
+
+            {
+                let mut state = self.inner.reload.lock().await;
+                state.sources = next_sources;
+                state.entries = entries;
+                state.plugins = plugin_prepared;
+                state.plugin_entries = plugin_entries;
+                if let (Some(source), Some(staged)) = (&plugin_source, staged_plugins) {
+                    source.publish(staged.resolved);
                 }
             }
-        }
-        {
-            let mut challenges = self.inner.challenges.lock().await;
-            let mut pending = self.inner.pending.lock().await;
-            let mut oauth_sessions = self.inner.oauth_sessions.lock().await;
-            let mut active_replays = self.inner.active_replays.lock().await;
-            for name in &changed {
-                challenges.remove(name);
-                if let Some(pending) = pending.remove(name) {
-                    pending.abort.abort();
+            drop(initialization_guard);
+            drop(generation_writer);
+            if !deleted.is_empty() {
+                let mut operations = self.inner.operations.lock().await;
+                for name in deleted {
+                    operations.remove(&name);
                 }
-                oauth_sessions.remove(name);
-                active_replays.remove(name);
             }
+            drop(operation_guards);
+            return Ok(());
         }
-        state.sources = next_sources;
-        state.entries = entries;
-        Ok(())
     }
 
     fn spawn_eager_initialization(&self) {
@@ -1505,8 +1651,9 @@ impl McpRuntime {
 
     async fn authorize(&self, name: &str, session_id: String) -> Result<Value, ToolError> {
         self.reload_config().await.map_err(ToolError::Unavailable)?;
+        self.initialize_uninitialized().await;
         let operation = self.operation_gate(name).await;
-        let _operation = tokio::time::timeout(CONNECT_TIMEOUT, operation.lock())
+        let _operation = tokio::time::timeout(CONNECT_TIMEOUT, operation.write())
             .await
             .map_err(|_| {
                 ToolError::Unavailable(format!(
@@ -1518,7 +1665,6 @@ impl McpRuntime {
                 "interactive MCP authentication requires the tui, serve, or acp command".into(),
             ));
         }
-        let _reload = self.inner.reload.lock().await;
         self.initialize_servers(&[name.to_string()]).await;
         let _setup = self.inner.auth_setup.lock().await;
         if let Some(pending) = self.inner.pending.lock().await.get(name).cloned() {
@@ -1664,7 +1810,7 @@ impl McpRuntime {
     ) {
         let finished = auth::finish(pending).await;
         let operation = self.operation_gate(&server).await;
-        let _operation = operation.lock().await;
+        let _operation = operation.write().await;
         let _reload = self.inner.reload.lock().await;
         let current = self
             .inner
@@ -1948,11 +2094,24 @@ pub struct McpTool {
     spec: ToolSpec,
 }
 
+#[allow(dead_code)]
+enum McpOperationGuard {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
+struct McpInvocationLease {
+    server: String,
+    fingerprint: Vec<u8>,
+    _operation: McpOperationGuard,
+    _generation: Option<OwnedRwLockReadGuard<()>>,
+}
+
 struct ExecutedMcpCall {
     outcome: ToolExecutionOutcome,
     replay: ReplayCleanup,
     server: Option<(String, Vec<u8>)>,
-    _operation: Option<OwnedMutexGuard<()>>,
+    _invocation: Option<McpInvocationLease>,
 }
 
 impl McpTool {
@@ -2081,26 +2240,18 @@ impl McpTool {
         tool_name: ToolName,
         args: Value,
     ) -> ExecutedMcpCall {
-        let initial_server = self.runtime.server_for_tool(&name).await;
-        let server_name = initial_server.as_ref().map(|(server, _, _)| server.clone());
-        let operation = match initial_server.as_ref() {
-            Some((server, _, true)) => Some(self.runtime.operation_gate(server).await),
-            _ => None,
+        let invocation = match self.runtime.acquire_invocation(&name).await {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                return ExecutedMcpCall {
+                    outcome: ToolExecutionOutcome::FailedBeforeInvocation(error),
+                    replay: ReplayCleanup::new(None, self.runtime.clone(), None),
+                    server: None,
+                    _invocation: None,
+                };
+            }
         };
-        let operation = match operation {
-            Some(operation) => Some(operation.lock_owned().await),
-            None => None,
-        };
-        let server = self
-            .runtime
-            .server_for_tool(&name)
-            .await
-            .filter(|(server, _, _)| {
-                server_name
-                    .as_ref()
-                    .is_some_and(|expected| server == expected)
-            })
-            .map(|(server, fingerprint, _)| (server, fingerprint));
+        let server = Some((invocation.server.clone(), invocation.fingerprint.clone()));
         let replay = ReplayCleanup::new(
             match server.as_ref() {
                 Some((server, _)) => self
@@ -2132,7 +2283,7 @@ impl McpTool {
             outcome,
             replay,
             server,
-            _operation: operation,
+            _invocation: Some(invocation),
         }
     }
 
@@ -2141,7 +2292,7 @@ impl McpTool {
             outcome,
             replay,
             server,
-            _operation,
+            _invocation,
         } = call;
         let succeeded = matches!(outcome, ToolExecutionOutcome::Completed(_));
         let error = match &outcome {
@@ -2234,6 +2385,7 @@ pub fn empty() -> McpRuntime {
             entries: BTreeMap::new(),
             plugins: BTreeMap::new(),
             plugin_entries: BTreeMap::new(),
+            plugin_source: None,
         },
         true,
     )
@@ -2627,7 +2779,12 @@ fn render_search(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        path::Path,
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
     use agentkit_core::MetadataMap;
     use agentkit_mcp::{
@@ -2653,7 +2810,7 @@ mod tests {
         prepare_config, prepare_plugins, regular_term_score, serializes_tool_calls,
         validate_server_names,
     };
-    use crate::plugins::ResolvedPluginMcp;
+    use crate::plugins::{PluginRuntime, ResolvedPluginMcp, ResolvedPlugins};
 
     fn spec(name: &str, description: &str) -> ToolSpec {
         ToolSpec::new(ToolName::new(name), description, json!({"type": "object"}))
@@ -2683,6 +2840,7 @@ mod tests {
             oauth: None,
             static_authorization: false,
             fingerprint: vec![1],
+            plugin_owned: false,
             status: ServerStatus::Connected,
         }
     }
@@ -3048,18 +3206,73 @@ mod tests {
         let first = runtime.operation_gate("first").await;
         let same = runtime.operation_gate("first").await;
         let other = runtime.operation_gate("other").await;
-        let _held = first.lock().await;
+        let _held = first.write().await;
 
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), other.lock())
+            tokio::time::timeout(std::time::Duration::from_millis(25), other.write())
                 .await
                 .is_ok()
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), same.lock())
+            tokio::time::timeout(std::time::Duration::from_millis(25), same.write())
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_safe_invocations_share_the_reload_gate() {
+        let runtime = super::empty();
+        let mut record = connected_oauth_record();
+        record.url = None;
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("same".into(), record);
+        let first = runtime.acquire_invocation("mcp_same_read").await.unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_millis(25),
+            runtime.acquire_invocation("mcp_same_other"),
+        )
+        .await
+        .expect("concurrent-safe MCP invocation was serialized")
+        .unwrap();
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn same_name_fingerprint_change_rejects_waiting_invocation() {
+        let runtime = super::empty();
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("same".into(), connected_oauth_record());
+        let gate = runtime.operation_gate("same").await;
+        let held = gate.write().await;
+        let waiting = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.acquire_invocation("mcp_same_write").await })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .get_mut("same")
+            .unwrap()
+            .fingerprint = vec![2];
+        drop(held);
+
+        let error = match waiting.await.unwrap() {
+            Ok(_) => panic!("waiting invocation accepted a changed fingerprint"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("configuration changed"));
     }
 
     #[tokio::test]
@@ -3109,7 +3322,7 @@ mod tests {
             .await
             .unwrap();
         let gate = runtime.operation_gate("local").await;
-        let held = gate.lock().await;
+        let held = gate.write().await;
         std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"unused"}}}"#).unwrap();
         let reloading = {
             let runtime = runtime.clone();
@@ -3139,8 +3352,126 @@ mod tests {
         )
         .unwrap();
         drop(held);
-        let error = reloading.await.unwrap().unwrap_err();
-        assert!(error.contains("changed while reload was waiting"));
+        // The staged snapshot may publish after the gate clears, but config I/O
+        // never runs while runtime or operation locks are held. The next
+        // boundary observes an edit that arrived during the wait.
+        reloading.await.unwrap().unwrap();
+        runtime.reload_config().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_reload_rereads_changes_that_arrived_during_the_prior_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"queued-plugin"}"#,
+        )
+        .unwrap();
+        std::fs::write(&config, "").unwrap();
+        let plugins = PluginRuntime::new(
+            config.clone(),
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        let runtime = super::connect_dynamic(
+            None::<&Path>,
+            plugins.clone(),
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        let write_mcp = |url: &str| {
+            std::fs::write(
+                package.join("mcp.json"),
+                format!(
+                    r#"{{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{{"live":{{"type":"streamable-http","url":"{url}"}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write_mcp("https://example.com/first");
+        std::fs::write(
+            &config,
+            format!(
+                "[plugins.queued]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+
+        let generation = plugins.generation_lease().await;
+        let gate = runtime.operation_gate("live").await;
+        let first = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.reload_config().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if gate.clone().try_read_owned().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first reload did not reach plugin publication");
+
+        write_mcp("https://example.com/second");
+        let second = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.reload_config().await })
+        };
+        drop(generation);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(
+            runtime.inner.servers.read().await["live"].url.as_deref(),
+            Some("https://example.com/second")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_reload_caller_does_not_strand_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let gate = runtime.operation_gate("local").await;
+        let held = gate.write().await;
+        std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"unused"}}}"#).unwrap();
+        let epoch = runtime.inner.reload_epoch.load(Ordering::Acquire);
+        let caller = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.reload_config().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.reload_flight.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        caller.abort();
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.reload_epoch.load(Ordering::Acquire) == epoch {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached reload completion did not publish its epoch");
+        assert!(runtime.inner.servers.read().await.contains_key("local"));
         runtime.reload_config().await.unwrap();
     }
 
@@ -3193,6 +3524,7 @@ mod tests {
             oauth: None,
             static_authorization: false,
             fingerprint: vec![1],
+            plugin_owned: false,
             status,
         }
     }
@@ -3564,36 +3896,26 @@ mod tests {
     }
 
     #[test]
-    fn plugin_mcp_expands_stdio_paths_and_skips_sse() {
+    fn plugin_mcp_expands_stdio_paths() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let plugin = plugin(
             "tools",
             directory.path(),
-            vec![
-                PluginMcpServer {
-                    name: "local".into(),
-                    transport: PluginMcpTransport::Stdio {
-                        command: "./bin/server".into(),
-                        args: vec!["${PLUGIN_DATA}/db".into()],
-                        env: std::collections::BTreeMap::from([(
-                            "ROOT_COPY".into(),
-                            "${PLUGIN_ROOT}".into(),
-                        )]),
-                        cwd: Some("${PLUGIN_DATA}/work".into()),
-                    },
+            vec![PluginMcpServer {
+                name: "local".into(),
+                transport: PluginMcpTransport::Stdio {
+                    command: "./bin/server".into(),
+                    args: vec!["${PLUGIN_DATA}/db".into()],
+                    env: std::collections::BTreeMap::from([(
+                        "ROOT_COPY".into(),
+                        "${PLUGIN_ROOT}".into(),
+                    )]),
+                    cwd: Some("${PLUGIN_DATA}/work".into()),
                 },
-                PluginMcpServer {
-                    name: "legacy".into(),
-                    transport: PluginMcpTransport::Sse {
-                        url: "https://example.com/sse".into(),
-                        headers: Default::default(),
-                    },
-                },
-            ],
+            }],
         );
         let (prepared, _) = prepare_plugins(&[plugin]).unwrap();
-        assert!(!prepared.contains_key("legacy"));
         let McpTransportBinding::Stdio(transport) = &prepared["local"].config.transport else {
             panic!("expected stdio transport");
         };
@@ -3613,6 +3935,23 @@ mod tests {
                 .env
                 .contains(&("ROOT_COPY".into(), root.to_str().unwrap().into()))
         );
+    }
+
+    #[test]
+    fn plugin_mcp_rejects_sse_without_partial_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "legacy".into(),
+                transport: PluginMcpTransport::Sse {
+                    url: "https://example.com/sse".into(),
+                    headers: Default::default(),
+                },
+            }],
+        );
+        assert!(prepare_plugins(&[plugin]).is_err());
     }
 
     #[test]
@@ -3938,6 +4277,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_server_operation_gate_is_reclaimed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{"removed":{"command":"unused"}}}"#).unwrap();
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        drop(runtime.operation_gate("removed").await);
+        assert!(
+            runtime
+                .inner
+                .operations
+                .lock()
+                .await
+                .contains_key("removed")
+        );
+
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert!(
+            !runtime
+                .inner
+                .operations
+                .lock()
+                .await
+                .contains_key("removed")
+        );
+    }
+
+    #[tokio::test]
     async fn plugin_only_mcp_configuration_is_registered() {
         let directory = tempfile::tempdir().unwrap();
         let plugin = plugin(
@@ -3955,6 +4324,147 @@ mod tests {
             .await
             .unwrap();
         assert!(runtime.inner.servers.read().await.contains_key("remote"));
+    }
+
+    #[tokio::test]
+    async fn live_plugins_add_change_fail_closed_and_remove_through_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"live-plugin"}"#,
+        )
+        .unwrap();
+        std::fs::write(&config, "").unwrap();
+        let plugins = PluginRuntime::new(
+            config.clone(),
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        let runtime = super::connect_dynamic(
+            None::<&Path>,
+            plugins.clone(),
+            true,
+            CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(runtime.inner.servers.read().await.is_empty());
+
+        let write_mcp = |name: &str| {
+            std::fs::write(
+                package.join("mcp.json"),
+                format!(
+                    r#"{{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{{"{name}":{{"type":"stdio","command":"kit-test-missing-plugin-command"}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write_mcp("first");
+        std::fs::write(
+            &config,
+            format!(
+                "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        runtime.search("mcp").await.unwrap();
+        assert!(matches!(
+            runtime.inner.servers.read().await["first"].status,
+            ServerStatus::Error(_)
+        ));
+
+        write_mcp("second");
+        runtime.search("mcp").await.unwrap();
+        let servers = runtime.inner.servers.read().await;
+        assert!(!servers.contains_key("first"));
+        assert!(matches!(servers["second"].status, ServerStatus::Error(_)));
+        drop(servers);
+
+        std::fs::write(&config, "[plugins.live\n").unwrap();
+        assert!(runtime.search("mcp").await.is_err());
+        assert!(runtime.inner.servers.read().await.contains_key("second"));
+        assert_eq!(plugins.snapshot().mcp_plugins.len(), 1);
+
+        std::fs::write(&config, "").unwrap();
+        runtime.search("mcp").await.unwrap();
+        assert!(runtime.inner.servers.read().await.is_empty());
+        assert!(plugins.snapshot().mcp_plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_plugin_baseline_respects_and_recovers_from_explicit_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let explicit = directory.path().join("mcp.json");
+        let package = directory.path().join("plugin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"override-plugin"}"#,
+        )
+        .unwrap();
+        std::fs::write(&config, "").unwrap();
+        std::fs::write(
+            &explicit,
+            r#"{"mcpServers":{"shared":{"command":"explicit","description":"Explicit"}}}"#,
+        )
+        .unwrap();
+        let plugins = PluginRuntime::new(
+            config.clone(),
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        let runtime =
+            super::connect_dynamic(Some(&explicit), plugins, true, CredentialStorage::Memory)
+                .await
+                .unwrap();
+
+        std::fs::write(
+            package.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"shared":{"type":"streamable-http","url":"https://example.com/latest"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[plugins.override]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        runtime.reload_config().await.unwrap();
+        assert_eq!(
+            runtime.inner.servers.read().await["shared"].description,
+            "Explicit"
+        );
+        assert!(!runtime.inner.servers.read().await["shared"].plugin_owned);
+
+        let invocation = runtime.acquire_invocation("mcp_shared_read").await.unwrap();
+        std::fs::write(
+            package.join("mcp.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"shared":{"type":"streamable-http","url":"https://example.com/newest"}}}"#,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), runtime.reload_config())
+            .await
+            .expect("explicit MCP invocation blocked plugin generation publication")
+            .unwrap();
+        drop(invocation);
+
+        std::fs::write(&explicit, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        let record = runtime.inner.servers.read().await["shared"].clone();
+        assert_eq!(record.description, "override-plugin plugin MCP server");
+        assert_eq!(record.url.as_deref(), Some("https://example.com/newest"));
+        assert!(record.plugin_owned);
     }
 
     #[tokio::test]

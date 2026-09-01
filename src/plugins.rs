@@ -3,15 +3,16 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{Arc, RwLock, mpsc},
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
-use agentkit_plugins::{AgentPlugin, PluginMcpServer};
+use agentkit_plugins::{AgentPlugin, PluginDiagnosticKind, PluginMcpServer};
+use agentkit_tool_skills::{Skill, SkillRegistry};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -91,7 +92,198 @@ pub struct ResolvedPluginMcp {
 pub struct ResolvedPlugins {
     pub package_roots: Vec<PathBuf>,
     pub skill_directories: Vec<PathBuf>,
+    pub skills: Vec<Skill>,
     pub mcp_plugins: Vec<ResolvedPluginMcp>,
+}
+
+#[derive(Deserialize)]
+struct PluginConfigFile {
+    #[serde(default)]
+    plugins: BTreeMap<String, PluginConfig>,
+}
+
+#[derive(Clone)]
+pub struct PluginRuntime {
+    inner: Arc<PluginRuntimeInner>,
+}
+
+struct PluginRuntimeInner {
+    config_path: PathBuf,
+    runtime_root: PathBuf,
+    cache_root: PathBuf,
+    skill_cache_root: PathBuf,
+    data_root: PathBuf,
+    published: RwLock<Arc<ResolvedPlugins>>,
+    generation_barrier: Arc<tokio::sync::RwLock<()>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StagedPlugins {
+    pub(crate) resolved: ResolvedPlugins,
+}
+
+impl PluginRuntime {
+    pub async fn load(
+        config_path: PathBuf,
+        runtime_root: PathBuf,
+        cache_root: PathBuf,
+        data_root: PathBuf,
+    ) -> Result<Self, String> {
+        let runtime = Self::new(
+            config_path,
+            runtime_root,
+            cache_root,
+            data_root,
+            ResolvedPlugins::default(),
+        );
+        let staged = runtime.stage().await?;
+        runtime.publish(staged.resolved);
+        Ok(runtime)
+    }
+
+    pub fn new(
+        config_path: PathBuf,
+        runtime_root: PathBuf,
+        cache_root: PathBuf,
+        data_root: PathBuf,
+        initial: ResolvedPlugins,
+    ) -> Self {
+        static NEXT_RUNTIME_CACHE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let cache_id = NEXT_RUNTIME_CACHE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut random = [0_u8; 16];
+        let suffix = if getrandom::fill(&mut random).is_ok() {
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        } else {
+            format!(
+                "{}-{cache_id}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos())
+            )
+        };
+        let skill_cache_root = cache_root.join("runtime-skill-generations").join(suffix);
+        Self {
+            inner: Arc::new(PluginRuntimeInner {
+                config_path,
+                runtime_root,
+                cache_root,
+                skill_cache_root,
+                data_root,
+                published: RwLock::new(Arc::new(initial)),
+                generation_barrier: Arc::new(tokio::sync::RwLock::new(())),
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<ResolvedPlugins> {
+        self.inner
+            .published
+            .read()
+            .expect("plugin generation lock poisoned")
+            .clone()
+    }
+
+    pub(crate) async fn stage(&self) -> Result<StagedPlugins, String> {
+        let contents = match tokio::fs::read_to_string(&self.inner.config_path).await {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(bounded_diagnostic(format!(
+                    "could not read plugin config {}: {error}",
+                    self.inner.config_path.display()
+                )));
+            }
+        };
+        let configs = if contents.is_empty() {
+            BTreeMap::new()
+        } else {
+            toml::from_str::<PluginConfigFile>(&contents)
+                .map_err(|error| {
+                    bounded_diagnostic(format!(
+                        "invalid plugin config {}: {error}",
+                        self.inner.config_path.display()
+                    ))
+                })?
+                .plugins
+        };
+        cleanup_runtime_skill_generations(&self.inner.skill_cache_root, &self.snapshot());
+        let resolved = resolve_with_skill_cache(
+            &configs,
+            &self.inner.runtime_root,
+            &self.inner.cache_root,
+            &self.inner.skill_cache_root,
+            &self.inner.data_root,
+        )
+        .await
+        .map_err(bounded_diagnostic)?;
+        Ok(StagedPlugins { resolved })
+    }
+
+    pub(crate) async fn generation_lease(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.inner.generation_barrier.clone().read_owned().await
+    }
+
+    pub(crate) fn try_generation_lease(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.inner.generation_barrier.clone().try_read_owned().ok()
+    }
+
+    pub(crate) async fn generation_writer(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.inner.generation_barrier.clone().write_owned().await
+    }
+
+    pub(crate) fn publish(&self, resolved: ResolvedPlugins) {
+        let mut published = self
+            .inner
+            .published
+            .write()
+            .expect("plugin generation lock poisoned");
+        if resolved_generation_key(&published) != resolved_generation_key(&resolved) {
+            *published = Arc::new(resolved);
+        }
+        let current = published.clone();
+        drop(published);
+        cleanup_runtime_skill_generations(&self.inner.skill_cache_root, &current);
+    }
+}
+
+impl Drop for PluginRuntimeInner {
+    fn drop(&mut self) {
+        make_tree_writable(&self.skill_cache_root);
+        let _ = fs::remove_dir_all(&self.skill_cache_root);
+    }
+}
+
+fn resolved_generation_key(resolved: &ResolvedPlugins) -> blake3::Hash {
+    let mut key = blake3::Hasher::new();
+    for root in &resolved.package_roots {
+        key.update(root.as_os_str().as_encoded_bytes());
+        key.update(&[0]);
+    }
+    for directory in &resolved.skill_directories {
+        key.update(directory.as_os_str().as_encoded_bytes());
+        key.update(&[0]);
+    }
+    key.update(format!("{:?}", resolved.mcp_plugins).as_bytes());
+    key.finalize()
+}
+
+pub(crate) fn bounded_diagnostic(mut message: String) -> String {
+    const LIMIT: usize = 2_048;
+    const ELLIPSIS: &str = "...";
+    if message.len() > LIMIT {
+        let mut end = LIMIT - ELLIPSIS.len();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push_str(ELLIPSIS);
+    }
+    message
 }
 
 pub async fn resolve(
@@ -100,25 +292,49 @@ pub async fn resolve(
     cache_root: &Path,
     data_root: &Path,
 ) -> Result<ResolvedPlugins, String> {
+    resolve_with_skill_cache(configs, runtime_root, cache_root, cache_root, data_root).await
+}
+
+async fn resolve_with_skill_cache(
+    configs: &BTreeMap<String, PluginConfig>,
+    runtime_root: &Path,
+    cache_root: &Path,
+    skill_cache_root: &Path,
+    data_root: &Path,
+) -> Result<ResolvedPlugins, String> {
     let configs = configs.clone();
     let runtime_root = runtime_root.to_path_buf();
     let cache_root = cache_root.to_path_buf();
+    let skill_cache_root = skill_cache_root.to_path_buf();
     let data_root = data_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        resolve_blocking(&configs, &runtime_root, &cache_root, &data_root)
+    let mut resolved = tokio::task::spawn_blocking(move || {
+        resolve_blocking(
+            &configs,
+            &runtime_root,
+            &cache_root,
+            &skill_cache_root,
+            &data_root,
+        )
     })
     .await
-    .map_err(|error| format!("plugin resolver task failed: {error}"))?
+    .map_err(|error| format!("plugin resolver task failed: {error}"))??;
+    let registry = SkillRegistry::from_skill_dirs(resolved.skill_directories.clone())
+        .discover_skills()
+        .await;
+    resolved.skills = registry.skills().into_iter().cloned().collect();
+    Ok(resolved)
 }
 
 fn resolve_blocking(
     configs: &BTreeMap<String, PluginConfig>,
     runtime_root: &Path,
     cache_root: &Path,
+    skill_cache_root: &Path,
     data_root: &Path,
 ) -> Result<ResolvedPlugins, String> {
     let mut resolved = ResolvedPlugins::default();
     let mut manifest_names = BTreeSet::new();
+    let mut loaded_generations = Vec::new();
     for (alias, config) in configs {
         validate_alias(alias)?;
         let root = match config {
@@ -144,17 +360,7 @@ fn resolve_blocking(
                 plugin.manifest().name
             ));
         }
-        for diagnostic in plugin.diagnostics() {
-            let path = diagnostic
-                .path
-                .as_deref()
-                .map(|path| format!(" at {}", path.display()))
-                .unwrap_or_default();
-            eprintln!(
-                "plugin {alias} ({:?}){path}: {}",
-                diagnostic.kind, diagnostic.message
-            );
-        }
+        validate_plugin_diagnostics(alias, &plugin)?;
         if !plugin.mcp_servers().is_empty() {
             let data_dir = data_root.join(&plugin.manifest().name);
             fs::create_dir_all(&data_dir).map_err(|error| {
@@ -184,8 +390,838 @@ fn resolve_blocking(
         resolved
             .skill_directories
             .extend(plugin.skill_directories());
+        loaded_generations.push((
+            alias.clone(),
+            plugin.root().to_path_buf(),
+            plugin_semantic_key(&plugin),
+        ));
     }
+    let (package_roots, skill_directories) = snapshot_skills(
+        &resolved.package_roots,
+        &resolved.skill_directories,
+        skill_cache_root,
+    )?;
+    for (alias, root, expected) in loaded_generations {
+        let plugin = AgentPlugin::load(&root).map_err(|error| {
+            format!(
+                "could not revalidate plugin {alias:?} from {}: {error}",
+                root.display()
+            )
+        })?;
+        validate_plugin_diagnostics(&alias, &plugin)?;
+        if plugin_semantic_key(&plugin) != expected {
+            return Err(format!(
+                "plugin {alias:?} changed while its generation was being staged"
+            ));
+        }
+    }
+    resolved.package_roots = package_roots;
+    resolved.skill_directories = skill_directories;
     Ok(resolved)
+}
+
+fn plugin_semantic_key(plugin: &AgentPlugin) -> blake3::Hash {
+    let mut key = blake3::Hasher::new();
+    key.update(plugin.manifest().name.as_bytes());
+    key.update(format!("{:?}", plugin.mcp_servers()).as_bytes());
+    for skill in plugin.skill_directories() {
+        key.update(skill.as_os_str().as_encoded_bytes());
+        key.update(&[0]);
+    }
+    key.finalize()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CachedEntry {
+    Directory,
+    File(Vec<u8>),
+}
+
+fn snapshot_skills(
+    package_roots: &[PathBuf],
+    skill_directories: &[PathBuf],
+    cache_root: &Path,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    if skill_directories.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut inventory = BTreeMap::<PathBuf, CachedEntry>::new();
+    let mut captured_bytes = 0_u64;
+    for (index, package) in package_roots.iter().enumerate() {
+        let target = PathBuf::from(index.to_string());
+        inventory.insert(target.clone(), CachedEntry::Directory);
+        capture_snapshot_file(
+            package,
+            &package.join("plugin.json"),
+            &target.join("plugin.json"),
+            &mut inventory,
+            &mut captured_bytes,
+        )?;
+    }
+    let expected_skills = skill_directories
+        .iter()
+        .map(|directory| {
+            let (index, package) = owning_package(package_roots, directory).ok_or_else(|| {
+                format!(
+                    "plugin skill {} is outside its package",
+                    directory.display()
+                )
+            })?;
+            let relative = directory
+                .strip_prefix(package)
+                .expect("owning package is a prefix");
+            let target = PathBuf::from(index.to_string()).join(relative);
+            collect_skill_inventory(
+                package,
+                directory,
+                &PathBuf::from(index.to_string()),
+                &mut inventory,
+                &mut captured_bytes,
+            )?;
+            Ok(target)
+        })
+        .collect::<Result<BTreeSet<_>, String>>()?;
+
+    // A second complete capture rejects in-place edits and inventory changes
+    // that race the first directory traversal.
+    let mut verification = BTreeMap::<PathBuf, CachedEntry>::new();
+    let mut verification_bytes = 0_u64;
+    for (index, package) in package_roots.iter().enumerate() {
+        let target = PathBuf::from(index.to_string());
+        verification.insert(target.clone(), CachedEntry::Directory);
+        capture_snapshot_file(
+            package,
+            &package.join("plugin.json"),
+            &target.join("plugin.json"),
+            &mut verification,
+            &mut verification_bytes,
+        )?;
+    }
+    for directory in skill_directories {
+        let (index, package) = owning_package(package_roots, directory).ok_or_else(|| {
+            format!(
+                "plugin skill {} is outside its package",
+                directory.display()
+            )
+        })?;
+        collect_skill_inventory(
+            package,
+            directory,
+            &PathBuf::from(index.to_string()),
+            &mut verification,
+            &mut verification_bytes,
+        )?;
+    }
+    if verification != inventory {
+        return Err("plugin skills changed while their generation was being captured".into());
+    }
+
+    let paths = inventory.keys().cloned().collect::<Vec<_>>();
+    for path in paths {
+        let mut parent = path.parent();
+        while let Some(relative) = parent.filter(|parent| !parent.as_os_str().is_empty()) {
+            match inventory.get(relative) {
+                Some(CachedEntry::File(_)) => {
+                    return Err(format!(
+                        "plugin skill inventory uses a file as a directory: {}",
+                        relative.display()
+                    ));
+                }
+                Some(CachedEntry::Directory) => {}
+                None => {
+                    inventory.insert(relative.to_path_buf(), CachedEntry::Directory);
+                }
+            }
+            parent = relative.parent();
+        }
+    }
+
+    let mut fingerprint = blake3::Hasher::new();
+    for root in package_roots {
+        fingerprint.update(root.as_os_str().as_encoded_bytes());
+        fingerprint.update(&[0]);
+    }
+    for (relative, entry) in &inventory {
+        fingerprint.update(&(relative.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+        fingerprint.update(relative.as_os_str().as_encoded_bytes());
+        match entry {
+            CachedEntry::Directory => {
+                fingerprint.update(&[0]);
+            }
+            CachedEntry::File(bytes) => {
+                fingerprint.update(&[1]);
+                fingerprint.update(&(bytes.len() as u64).to_le_bytes());
+                fingerprint.update(bytes);
+            }
+        }
+    }
+    let parent = cache_root.join("skill-generations");
+    let destination = parent.join(fingerprint.finalize().to_hex().as_str());
+    publish_cached_directory(&destination, "plugin skill generation", |staging| {
+        write_cached_inventory(staging, &inventory)?;
+        validate_skill_snapshot(staging, package_roots.len(), &expected_skills).map(|_| ())
+    })?;
+    validate_cached_inventory(&destination, &inventory)?;
+    let published = validate_skill_snapshot(&destination, package_roots.len(), &expected_skills)?;
+    make_tree_read_only(&destination)?;
+    Ok(published)
+}
+
+fn cleanup_runtime_skill_generations(root: &Path, current: &ResolvedPlugins) {
+    let generations = root.join("skill-generations");
+    let current = current
+        .package_roots
+        .iter()
+        .filter_map(|package| package.parent().map(Path::to_path_buf))
+        .collect::<BTreeSet<_>>();
+    let Ok(entries) = fs::read_dir(&generations) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !current.contains(&path) {
+            make_tree_writable(&path);
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn make_tree_read_only(root: &Path) -> Result<(), String> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < paths.len() {
+        let path = paths[index].clone();
+        index += 1;
+        if path.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|error| {
+                format!(
+                    "could not inspect plugin snapshot {}: {error}",
+                    path.display()
+                )
+            })? {
+                paths.push(
+                    entry
+                        .map_err(|error| format!("could not inspect plugin snapshot: {error}"))?
+                        .path(),
+                );
+            }
+        }
+    }
+    for path in paths.into_iter().rev() {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "could not inspect plugin snapshot {}: {error}",
+                path.display()
+            )
+        })?;
+        let permissions = read_only_permissions(&metadata);
+        fs::set_permissions(&path, permissions).map_err(|error| {
+            format!(
+                "could not make plugin snapshot read-only {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn make_tree_writable(root: &Path) {
+    let mut paths = vec![root.to_path_buf()];
+    let mut index = 0;
+    while index < paths.len() {
+        let path = paths[index].clone();
+        index += 1;
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.permissions().readonly() {
+            let _ = fs::set_permissions(&path, writable_permissions(&metadata));
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = fs::read_dir(&path)
+        {
+            paths.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn make_tree_writable_for_test(root: &Path) {
+    make_tree_writable(root);
+}
+
+#[cfg(unix)]
+fn read_only_permissions(metadata: &fs::Metadata) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    fs::Permissions::from_mode(metadata.permissions().mode() & !0o222)
+}
+
+#[cfg(not(unix))]
+fn read_only_permissions(metadata: &fs::Metadata) -> fs::Permissions {
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(true);
+    permissions
+}
+
+#[cfg(unix)]
+fn writable_permissions(metadata: &fs::Metadata) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    fs::Permissions::from_mode(metadata.permissions().mode() | 0o200)
+}
+
+#[cfg(not(unix))]
+fn writable_permissions(metadata: &fs::Metadata) -> fs::Permissions {
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    permissions
+}
+
+fn owning_package<'a>(package_roots: &'a [PathBuf], path: &Path) -> Option<(usize, &'a Path)> {
+    package_roots
+        .iter()
+        .enumerate()
+        .filter(|(_, package)| path.starts_with(package))
+        .max_by_key(|(_, package)| package.as_os_str().as_encoded_bytes().len())
+        .map(|(index, package)| (index, package.as_path()))
+}
+
+fn collect_skill_inventory(
+    package_root: &Path,
+    directory: &Path,
+    target_root: &Path,
+    inventory: &mut BTreeMap<PathBuf, CachedEntry>,
+    captured_bytes: &mut u64,
+) -> Result<(), String> {
+    let canonical = directory.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve plugin skill {}: {error}",
+            directory.display()
+        )
+    })?;
+    if !canonical.starts_with(package_root) {
+        return Err(format!(
+            "plugin skill path resolves outside its package: {}",
+            directory.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+        format!(
+            "could not inspect plugin skill {}: {error}",
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "plugin skill path is not a real directory: {}",
+            directory.display()
+        ));
+    }
+    let relative = directory
+        .strip_prefix(package_root)
+        .expect("validated skill directory is in its package");
+    inventory.insert(target_root.join(relative), CachedEntry::Directory);
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "could not read plugin skill {}: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not read plugin skill entry: {error}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!("could not inspect plugin skill {}: {error}", path.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "plugin skill path is a symlink: {}",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            collect_skill_inventory(package_root, &path, target_root, inventory, captured_bytes)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(package_root)
+                .expect("skill inventory remains under its package");
+            capture_snapshot_file(
+                package_root,
+                &path,
+                &target_root.join(relative),
+                inventory,
+                captured_bytes,
+            )?;
+        } else {
+            return Err(format!(
+                "plugin skill path is not a regular file: {}",
+                path.display()
+            ));
+        }
+    }
+    let after = fs::symlink_metadata(directory).map_err(|error| {
+        format!(
+            "could not recheck plugin skill {}: {error}",
+            directory.display()
+        )
+    })?;
+    let canonical_after = directory.canonicalize().map_err(|error| {
+        format!(
+            "could not re-resolve plugin skill {}: {error}",
+            directory.display()
+        )
+    })?;
+    if !after.is_dir()
+        || after.file_type().is_symlink()
+        || !same_file_state(&metadata, &after)
+        || canonical_after != canonical
+    {
+        return Err(format!(
+            "plugin skill directory changed while it was being captured: {}",
+            directory.display()
+        ));
+    }
+    Ok(())
+}
+
+fn capture_snapshot_file(
+    package_root: &Path,
+    source: &Path,
+    target: &Path,
+    inventory: &mut BTreeMap<PathBuf, CachedEntry>,
+    captured_bytes: &mut u64,
+) -> Result<(), String> {
+    let canonical = source.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    if !canonical.starts_with(package_root) {
+        return Err(format!(
+            "plugin skill path resolves outside its package: {}",
+            source.display()
+        ));
+    }
+    let before = fs::symlink_metadata(source).map_err(|error| {
+        format!(
+            "could not inspect plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(format!(
+            "plugin skill path is not a real file: {}",
+            source.display()
+        ));
+    }
+    let mut file = open_snapshot_file(package_root, source)?;
+    let opened = file.metadata().map_err(|error| {
+        format!(
+            "could not inspect open plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    let after = fs::symlink_metadata(source).map_err(|error| {
+        format!(
+            "could not recheck plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    if after.file_type().is_symlink()
+        || !opened.is_file()
+        || !after.is_file()
+        || !same_file(&before, &opened)
+        || !same_file(&opened, &after)
+    {
+        return Err(format!(
+            "plugin skill changed while it was being captured: {}",
+            source.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read plugin skill {}: {error}", source.display()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "plugin skill file exceeds size limit: {}",
+            source.display()
+        ));
+    }
+    file.rewind().map_err(|error| {
+        format!(
+            "could not recheck plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    let mut second = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut second)
+        .map_err(|error| {
+            format!(
+                "could not recheck plugin skill {}: {error}",
+                source.display()
+            )
+        })?;
+    let opened_after = file.metadata().map_err(|error| {
+        format!(
+            "could not recheck open plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    let path_after = fs::symlink_metadata(source).map_err(|error| {
+        format!(
+            "could not recheck plugin skill {}: {error}",
+            source.display()
+        )
+    })?;
+    if bytes != second
+        || !same_file_state(&before, &opened_after)
+        || !same_file_state(&opened_after, &path_after)
+    {
+        return Err(format!(
+            "plugin skill changed while it was being captured: {}",
+            source.display()
+        ));
+    }
+    *captured_bytes = captured_bytes
+        .checked_add(bytes.len() as u64)
+        .filter(|bytes| *bytes <= MAX_EXPANDED_BYTES)
+        .ok_or_else(|| "plugin skills exceed expanded size limit".to_string())?;
+    inventory.insert(target.to_path_buf(), CachedEntry::File(bytes));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_snapshot_file(package_root: &Path, source: &Path) -> Result<fs::File, String> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let relative = source
+        .strip_prefix(package_root)
+        .map_err(|_| format!("plugin skill is outside its package: {}", source.display()))?;
+    let root = CString::new(package_root.as_os_str().as_bytes())
+        .map_err(|_| "plugin package path contains a NUL byte".to_string())?;
+    // SAFETY: `root` is NUL terminated and the returned descriptor is owned.
+    let descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(format!(
+            "could not open plugin package {} without following links: {}",
+            package_root.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `descriptor` was returned uniquely by `open` above.
+    let mut current = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(format!("invalid plugin skill path: {}", source.display()));
+        };
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| "plugin skill path contains a NUL byte".to_string())?;
+        let last = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if last { 0 } else { libc::O_DIRECTORY };
+        // SAFETY: both the directory descriptor and component C string are valid.
+        let descriptor = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
+        if descriptor < 0 {
+            return Err(format!(
+                "could not open plugin skill {} without following links: {}",
+                source.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `descriptor` was returned uniquely by `openat` above.
+        current = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    }
+    Ok(fs::File::from(current))
+}
+
+#[cfg(not(unix))]
+fn open_snapshot_file(_package_root: &Path, source: &Path) -> Result<fs::File, String> {
+    OpenOptions::new()
+        .read(true)
+        .open(source)
+        .map_err(|error| format!("could not open plugin skill {}: {error}", source.display()))
+}
+
+fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    same_file(left, right)
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+fn write_cached_inventory(
+    root: &Path,
+    inventory: &BTreeMap<PathBuf, CachedEntry>,
+) -> Result<(), String> {
+    for (relative, entry) in inventory {
+        let path = root.join(relative);
+        match entry {
+            CachedEntry::Directory => fs::create_dir_all(&path).map_err(|error| {
+                format!(
+                    "could not create cached plugin directory {}: {error}",
+                    path.display()
+                )
+            })?,
+            CachedEntry::File(bytes) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "could not create cached plugin directory {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                fs::write(&path, bytes).map_err(|error| {
+                    format!(
+                        "could not write cached plugin file {}: {error}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cached_inventory(
+    root: &Path,
+    expected: &BTreeMap<PathBuf, CachedEntry>,
+) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut actual = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "could not read immutable plugin skill snapshot {}: {error}",
+                directory.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!("could not read immutable plugin skill snapshot entry: {error}")
+            })?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|_| {
+                format!(
+                    "immutable plugin skill snapshot entry escaped its root: {}",
+                    path.display()
+                )
+            })?;
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "could not inspect immutable plugin skill snapshot {}: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "immutable plugin skill snapshot contains a symlink: {}",
+                    path.display()
+                ));
+            }
+            if actual.len() >= MAX_ARCHIVE_ENTRIES {
+                return Err("immutable plugin skill snapshot exceeds entry limit".into());
+            }
+            actual.insert(relative.to_path_buf());
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if !metadata.is_file() {
+                return Err(format!(
+                    "immutable plugin skill snapshot entry is not a regular file: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if actual != expected.keys().cloned().collect() {
+        return Err(
+            "immutable plugin skill snapshot inventory does not match its fingerprint".into(),
+        );
+    }
+    for (relative, expected_entry) in expected {
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "could not inspect immutable plugin skill snapshot {}: {error}",
+                path.display()
+            )
+        })?;
+        match expected_entry {
+            CachedEntry::Directory if metadata.is_dir() => {}
+            CachedEntry::File(expected_bytes) if metadata.is_file() => {
+                if metadata.len() > MAX_FILE_BYTES {
+                    return Err(format!(
+                        "immutable plugin skill snapshot file exceeds size limit: {}",
+                        path.display()
+                    ));
+                }
+                let bytes = fs::read(&path).map_err(|error| {
+                    format!(
+                        "could not read immutable plugin skill snapshot {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if &bytes != expected_bytes {
+                    return Err(format!(
+                        "immutable plugin skill snapshot does not match its fingerprint: {}",
+                        path.display()
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "immutable plugin skill snapshot has the wrong entry type: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_skill_snapshot(
+    root: &Path,
+    package_count: usize,
+    expected_skills: &BTreeSet<PathBuf>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve immutable plugin skill snapshot {}: {error}",
+            root.display()
+        )
+    })?;
+    let mut package_roots = Vec::new();
+    let mut skill_directories = Vec::new();
+    let mut actual_skills = BTreeSet::new();
+    for index in 0..package_count {
+        let package = root.join(index.to_string());
+        let plugin = AgentPlugin::load(&package).map_err(|error| {
+            format!(
+                "could not validate immutable plugin skill snapshot {}: {error}",
+                package.display()
+            )
+        })?;
+        validate_plugin_diagnostics(&index.to_string(), &plugin)?;
+        if !plugin.skill_directories().is_empty() {
+            package_roots.push(package.clone());
+        }
+        for skill in plugin.skill_directories() {
+            let relative = skill.strip_prefix(&canonical_root).map_err(|_| {
+                format!(
+                    "immutable plugin skill escaped its snapshot root: {}",
+                    skill.display()
+                )
+            })?;
+            actual_skills.insert(relative.to_path_buf());
+            skill_directories.push(root.join(relative));
+        }
+    }
+    if &actual_skills != expected_skills {
+        return Err("plugin skills changed while the immutable generation was being built".into());
+    }
+    Ok((package_roots, skill_directories))
+}
+
+fn publish_cached_directory(
+    destination: &Path,
+    context: &str,
+    build: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(format!(
+                "{context} cache entry is not a real directory: {}",
+                destination.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect {context} cache entry: {error}")),
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("{context} cache path has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create {context} cache {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|error| error.to_string())?;
+    let staging = parent.join(format!(
+        ".{}-{:x}.tmp",
+        std::process::id(),
+        u64::from_le_bytes(random)
+    ));
+    fs::create_dir(&staging)
+        .map_err(|error| format!("could not create {context} staging directory: {error}"))?;
+    let result = build(&staging).and_then(|()| match fs::rename(&staging, destination) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if fs::symlink_metadata(destination)
+                .is_ok_and(|metadata| metadata.file_type().is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("could not publish {context}: {error}")),
+    });
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn validate_plugin_diagnostics(alias: &str, plugin: &AgentPlugin) -> Result<(), String> {
+    for diagnostic in plugin.diagnostics() {
+        if matches!(diagnostic.kind, PluginDiagnosticKind::UnknownManifestField) {
+            continue;
+        }
+        let path = diagnostic
+            .path
+            .as_deref()
+            .map(|path| format!(" at {}", path.display()))
+            .unwrap_or_default();
+        return Err(format!(
+            "plugin {alias} ({:?}){path}: {}",
+            diagnostic.kind, diagnostic.message
+        ));
+    }
+    Ok(())
 }
 
 fn validate_alias(alias: &str) -> Result<(), String> {
@@ -1444,51 +2480,176 @@ fn resolve_archive(
             cache_root.display()
         )
     })?;
+    let bytes = cached_archive_bytes(
+        &url,
+        &expected,
+        &cache_root.join("archive-blobs").join(&digest),
+    )?;
     let destination = cache_root.join(&digest);
-    match fs::symlink_metadata(&destination) {
-        Ok(metadata) if !metadata.file_type().is_dir() => {
+    if destination.exists() {
+        verify_cached_archive(&destination, &bytes)?;
+    }
+    publish_cached_directory(&destination, "plugin archive", |staging| {
+        extract_archive(&bytes, staging)?;
+        let candidate = select_package_root(staging, subdir.as_deref())?;
+        AgentPlugin::load(&candidate).map_err(|error| {
+            format!(
+                "invalid plugin archive package at {}: {error}",
+                candidate.display()
+            )
+        })?;
+        Ok(())
+    })?;
+    select_package_root(&destination, subdir.as_deref())
+}
+
+fn cached_archive_bytes(url: &Url, expected: &[u8; 32], blob: &Path) -> Result<Vec<u8>, String> {
+    let bytes = match fs::symlink_metadata(blob) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= MAX_DOWNLOAD_BYTES => {
+            fs::read(blob).map_err(|error| {
+                format!(
+                    "could not read cached plugin archive {}: {error}",
+                    blob.display()
+                )
+            })?
+        }
+        Ok(_) => {
             return Err(format!(
-                "plugin cache entry is not a directory: {}",
-                destination.display()
+                "cached plugin archive is not a bounded regular file: {}",
+                blob.display()
             ));
         }
-        Ok(_) => return validate_archive_cache_entry(&destination, subdir.as_deref()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not inspect plugin cache entry: {error}")),
-    }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let bytes = download(url)?;
+            verify_archive_digest(url, expected, &bytes)?;
+            publish_cached_file(blob, &bytes, "plugin archive blob")?;
+            return cached_archive_bytes(url, expected, blob);
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect cached plugin archive {}: {error}",
+                blob.display()
+            ));
+        }
+    };
+    verify_archive_digest(url, expected, &bytes)?;
+    Ok(bytes)
+}
 
-    let prefix = format!(".{digest}.staging-");
-    let staging_guard = StagingDirectory::create(cache_root, &prefix)?;
-    let staging = staging_guard.path();
-    let bytes = download(&url)?;
-    let actual = Sha256::digest(&bytes);
+fn verify_archive_digest(url: &Url, expected: &[u8; 32], bytes: &[u8]) -> Result<(), String> {
+    let actual = Sha256::digest(bytes);
     if actual.as_slice() != expected {
         return Err(format!("SHA-256 mismatch for plugin archive {url}"));
     }
-    extract_archive(&bytes, staging)?;
-    let candidate = select_package_root(staging, subdir.as_deref())?;
-    AgentPlugin::load(&candidate).map_err(|error| {
-        format!(
-            "invalid plugin archive package at {}: {error}",
-            candidate.display()
-        )
-    })?;
-    match fs::rename(staging, &destination) {
-        Ok(()) => {}
-        Err(_) if validate_archive_cache_entry(&destination, subdir.as_deref()).is_ok() => {}
-        Err(error) => return Err(format!("could not publish plugin archive: {error}")),
-    }
-    validate_archive_cache_entry(&destination, subdir.as_deref())
+    Ok(())
 }
 
-fn validate_archive_cache_entry(
-    destination: &Path,
-    subdir: Option<&Path>,
-) -> Result<PathBuf, String> {
-    let root = select_package_root(destination, subdir)?;
-    AgentPlugin::load(&root)
-        .map_err(|error| format!("invalid cached plugin archive package: {error}"))?;
-    Ok(root)
+fn publish_cached_file(destination: &Path, bytes: &[u8], context: &str) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("{context} cache path has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create {context} cache {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|error| error.to_string())?;
+    let staging = parent.join(format!(
+        ".{}-{:x}.tmp",
+        std::process::id(),
+        u64::from_le_bytes(random)
+    ));
+    fs::write(&staging, bytes)
+        .map_err(|error| format!("could not write {context} staging file: {error}"))?;
+    let result = match fs::rename(&staging, destination) {
+        Ok(()) => Ok(()),
+        Err(_) if destination.is_file() => Ok(()),
+        Err(error) => Err(format!("could not publish {context}: {error}")),
+    };
+    let _ = fs::remove_file(staging);
+    result
+}
+
+fn verify_cached_archive(destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "plugin archive cache path has no parent".to_string())?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|error| error.to_string())?;
+    let staging = parent.join(format!(
+        ".verify-{}-{:x}.tmp",
+        std::process::id(),
+        u64::from_le_bytes(random)
+    ));
+    fs::create_dir(&staging).map_err(|error| {
+        format!("could not create plugin archive verification directory: {error}")
+    })?;
+    let result = extract_archive(bytes, &staging).and_then(|()| {
+        let expected = read_directory_inventory(&staging)?;
+        let actual = read_directory_inventory(destination)?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "cached plugin archive does not match its SHA-256 source: {}",
+                destination.display()
+            ))
+        }
+    });
+    let _ = fs::remove_dir_all(staging);
+    result
+}
+
+fn read_directory_inventory(root: &Path) -> Result<BTreeMap<PathBuf, CachedEntry>, String> {
+    let mut inventory = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut bytes_read = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("could not read plugin archive cache: {error}"))?
+        {
+            let entry =
+                entry.map_err(|error| format!("could not read plugin archive entry: {error}"))?;
+            if inventory.len() >= MAX_ARCHIVE_ENTRIES {
+                return Err("plugin archive cache exceeds entry limit".into());
+            }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| "plugin archive entry escaped its root".to_string())?
+                .to_path_buf();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("could not inspect plugin archive entry: {error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "plugin archive cache contains a symlink: {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                inventory.insert(relative, CachedEntry::Directory);
+                pending.push(path);
+            } else if metadata.is_file() && metadata.len() <= MAX_FILE_BYTES {
+                bytes_read = bytes_read
+                    .checked_add(metadata.len())
+                    .filter(|total| *total <= MAX_EXPANDED_BYTES)
+                    .ok_or_else(|| {
+                        "plugin archive cache exceeds expanded size limit".to_string()
+                    })?;
+                let bytes = fs::read(&path)
+                    .map_err(|error| format!("could not read plugin archive entry: {error}"))?;
+                inventory.insert(relative, CachedEntry::File(bytes));
+            } else {
+                return Err(format!(
+                    "plugin archive cache contains an invalid entry: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(inventory)
 }
 
 fn validate_download_url(url: &Url) -> Result<(), String> {
@@ -1948,6 +3109,169 @@ mod tests {
             toml::from_str::<PluginConfig>("source = 'path'\npath = '.'\nfuture_option = true"),
             Ok(PluginConfig::Path { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_directory_symlink_mutation_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("plugin");
+        let original = package.join("skills/live-skill");
+        fs::create_dir_all(&original).unwrap();
+        fs::write(original.join("SKILL.md"), "safe").unwrap();
+        let canonical_package = package.canonicalize().unwrap();
+        let source = canonical_package.join("skills/live-skill/SKILL.md");
+        assert!(
+            source
+                .canonicalize()
+                .unwrap()
+                .starts_with(&canonical_package)
+        );
+
+        let moved = package.join("skills-original");
+        fs::rename(package.join("skills"), &moved).unwrap();
+        let outside = directory.path().join("outside/live-skill");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), "outside").unwrap();
+        symlink(outside.parent().unwrap(), package.join("skills")).unwrap();
+
+        let error = open_snapshot_file(&canonical_package, &source).unwrap_err();
+        assert!(error.contains("without following links"));
+    }
+
+    #[tokio::test]
+    async fn poisoned_unpublished_skill_generation_is_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        let skill = package.join("skills/live-skill");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Live skill.\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        let staged = runtime.stage().await.unwrap();
+        let generation = staged.resolved.package_roots[0]
+            .parent()
+            .expect("snapshot package has a generation root");
+        let cached_skill = staged.resolved.skill_directories[0].join("SKILL.md");
+        assert!(fs::write(&cached_skill, "blocked mutation").is_err());
+        make_tree_writable(generation);
+        fs::write(&cached_skill, "poisoned").unwrap();
+
+        let rebuilt = runtime.stage().await.unwrap();
+        assert_eq!(rebuilt.resolved.skills[0].body, "body");
+        assert!(!rebuilt.resolved.skills[0].body.contains("poisoned"));
+        assert!(runtime.snapshot().skill_directories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_runtime_stages_add_remove_and_retains_last_valid_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let package = directory.path().join("plugin");
+        let skill = package.join("skills/live-skill");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Live skill.\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(&config, "").unwrap();
+        let runtime = PluginRuntime::load(
+            config.clone(),
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let mcp = crate::tools::mcp::connect_dynamic(
+            None::<&Path>,
+            runtime.clone(),
+            false,
+            crate::tools::mcp::CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        assert!(runtime.snapshot().package_roots.is_empty());
+
+        fs::write(
+            &config,
+            format!(
+                "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+                package.display()
+            ),
+        )
+        .unwrap();
+        mcp.refresh().await.unwrap();
+        assert_eq!(runtime.snapshot().package_roots.len(), 1);
+        assert_eq!(runtime.snapshot().skill_directories.len(), 1);
+        let first_skill = runtime.snapshot().skill_directories[0].join("SKILL.md");
+        assert!(fs::read_to_string(&first_skill).unwrap().contains("body"));
+
+        write!(
+            fs::File::create(package.join("mcp.json")).unwrap(),
+            "{{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json\",\"mcpServers\":{{}},\"extra\":true}}"
+        )
+        .unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: Changed skill.\n---\nchanged body\n",
+        )
+        .unwrap();
+        assert!(mcp.refresh().await.is_err());
+        assert_eq!(
+            runtime.snapshot().skill_directories[0].join("SKILL.md"),
+            first_skill
+        );
+        assert!(
+            !fs::read_to_string(&first_skill)
+                .unwrap()
+                .contains("changed body")
+        );
+
+        fs::remove_file(package.join("mcp.json")).unwrap();
+        mcp.refresh().await.unwrap();
+        assert_ne!(
+            runtime.snapshot().skill_directories[0].join("SKILL.md"),
+            first_skill
+        );
+        assert!(
+            fs::read_to_string(runtime.snapshot().skill_directories[0].join("SKILL.md"))
+                .unwrap()
+                .contains("changed body")
+        );
+
+        fs::write(&config, "[plugins.live\n").unwrap();
+        let error = mcp.refresh().await.unwrap_err();
+        assert!(error.contains("invalid plugin config"));
+        assert_eq!(runtime.snapshot().package_roots.len(), 1);
+
+        fs::write(&config, "").unwrap();
+        mcp.refresh().await.unwrap();
+        assert!(runtime.snapshot().package_roots.is_empty());
+        assert!(runtime.snapshot().skill_directories.is_empty());
     }
 
     #[test]
@@ -2936,6 +4260,12 @@ mod tests {
         assert_eq!(
             resolve_archive(&url, &digest, None, cache.path()).unwrap(),
             root
+        );
+        fs::write(root.join("plugin.json"), "poisoned").unwrap();
+        assert!(
+            resolve_archive(&url, &digest, None, cache.path())
+                .unwrap_err()
+                .contains("does not match its SHA-256 source")
         );
 
         let other_cache = tempfile::tempdir().unwrap();

@@ -11,8 +11,8 @@ use agentkit_tools_core::{
 use serde_json::{Value, json};
 
 use super::{
-    BackgroundJobs, BackgroundableCompose, DetachRegistration, Runtime, SessionRequest,
-    SessionSelection, background_route, load_initial_transcript,
+    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool, Runtime,
+    SessionRequest, SessionSelection, background_route, load_initial_transcript,
 };
 
 #[tokio::test]
@@ -604,6 +604,152 @@ fn project_skills_take_precedence_over_plugin_skills() {
 }
 
 #[tokio::test]
+async fn live_plugin_skill_tool_adds_changes_and_removes_skills() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let plugins = crate::plugins::PluginRuntime::load(
+        config.clone(),
+        root.path().to_path_buf(),
+        root.path().join("cache"),
+        root.path().join("data"),
+    )
+    .await
+    .unwrap();
+    let runtime = Runtime::with_plugin_runtime(
+        Runtime::new(root.path(), "gpt-5.4").unwrap(),
+        Some(plugins.clone()),
+    )
+    .unwrap();
+    let runtime = Runtime::with_mcp_config(
+        runtime,
+        None,
+        Vec::new(),
+        false,
+        crate::tools::mcp::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+    let compose = runtime.compose(0);
+    let tool = DynamicSkillTool::new(root.path().to_path_buf(), plugins.clone());
+    assert!(
+        !tool
+            .current_spec()
+            .map(|spec| spec.input_schema.to_string())
+            .unwrap_or_default()
+            .contains("live-skill")
+    );
+
+    let package = root.path().join("plugin");
+    let skill = package.join("skills/live-skill");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"live-plugin"}"#,
+    )
+    .unwrap();
+    write_skill(&skill, "live-skill", "Live skill.", "first body");
+    std::fs::write(
+        &config,
+        format!(
+            "[plugins.live]\nsource = 'path'\npath = '{}'\n",
+            package.display()
+        ),
+    )
+    .unwrap();
+    let refreshed = runtime.current_skills().await.unwrap();
+    assert!(
+        refreshed
+            .skills
+            .iter()
+            .any(|skill| skill.name == "live-skill")
+    );
+    drop(refreshed);
+    assert!(
+        tool.current_spec()
+            .unwrap()
+            .input_schema
+            .to_string()
+            .contains("live-skill")
+    );
+    assert!(compose.specs()[0].description.contains("live-skill"));
+
+    let session_id = SessionId::new("session");
+    let turn_id = TurnId::new("turn");
+    let owned = OwnedToolContext {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        metadata: MetadataMap::new(),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation: None,
+        execution_scope: None,
+        approved_request: None,
+    };
+    let invoke = |id: &str| {
+        ToolRequest::new(
+            ToolCallId::new(id),
+            ToolName::new("skill"),
+            json!({"name": "live-skill"}),
+            session_id.clone(),
+            turn_id.clone(),
+        )
+    };
+    let first = tool
+        .invoke(invoke("first"), &mut owned.borrowed())
+        .await
+        .unwrap();
+    assert!(format!("{:?}", first.result.output).contains("first body"));
+
+    let published = plugins.snapshot();
+    let generation = published.package_roots[0]
+        .parent()
+        .expect("snapshot package has a generation root");
+    crate::plugins::make_tree_writable_for_test(generation);
+    std::fs::write(
+        published.skill_directories[0].join("SKILL.md"),
+        "poisoned cache body",
+    )
+    .unwrap();
+    let still_immutable = tool
+        .invoke(invoke("cache-poison"), &mut owned.borrowed())
+        .await
+        .unwrap();
+    assert!(format!("{:?}", still_immutable.result.output).contains("first body"));
+    assert!(!format!("{:?}", still_immutable.result.output).contains("poisoned"));
+    drop(published);
+
+    write_skill(&skill, "live-skill", "Live skill.", "second body");
+    let still_first = tool
+        .invoke(invoke("before-refresh"), &mut owned.borrowed())
+        .await
+        .unwrap();
+    assert!(format!("{:?}", still_first.result.output).contains("first body"));
+    let refreshed = runtime.current_skills().await.unwrap();
+    assert!(
+        refreshed
+            .skills
+            .iter()
+            .any(|skill| skill.body.contains("second body"))
+    );
+    drop(refreshed);
+    let second = tool
+        .invoke(invoke("second"), &mut owned.borrowed())
+        .await
+        .unwrap();
+    assert!(format!("{:?}", second.result.output).contains("second body"));
+
+    std::fs::write(&config, "").unwrap();
+    drop(runtime.current_skills().await.unwrap());
+    assert!(!compose.specs()[0].description.contains("live-skill"));
+    assert!(
+        tool.invoke(invoke("removed"), &mut owned.borrowed())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn compose_can_load_a_skill_added_after_its_spec_is_frozen() {
     let root = tempfile::tempdir().unwrap();
     write_skill(
@@ -700,6 +846,43 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     assert!(specs[0].description.contains("`auth`"));
     assert!(specs[0].description.contains("`tool`"));
     assert!(!specs[0].description.contains("mcp_filesystem_read_file"));
+}
+
+#[tokio::test]
+async fn exact_mcp_name_cannot_bypass_the_tool_meta_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    assert!(ToolSource::get(&compose.compose, &ToolName::new("mcp_exact_tool")).is_none());
+    let session_id = SessionId::new("session");
+    let turn_id = TurnId::new("turn");
+    let owned = OwnedToolContext {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        metadata: MetadataMap::new(),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation: None,
+        execution_scope: None,
+        approved_request: None,
+    };
+    let outcome = compose
+        .backgroundable
+        .invoke_outcome(
+            ToolRequest::new(
+                ToolCallId::new("call"),
+                ToolName::new("compose"),
+                json!({"script": "return mcp_exact_tool({})"}),
+                session_id,
+                turn_id,
+            ),
+            &mut owned.borrowed(),
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        ToolExecutionOutcome::FailedBeforeInvocation(_) | ToolExecutionOutcome::Failed(_)
+    ));
 }
 
 #[test]
