@@ -132,7 +132,7 @@ fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below
     let width = prompt.width.min(88);
     let rows = match dialog.status {
         FilePickerStatus::Ready => dialog.matches.len().max(1),
-        FilePickerStatus::Indexing | FilePickerStatus::Searching => 1,
+        FilePickerStatus::Loading => 1,
     };
     let desired_height = (rows as u16).saturating_add(3).min(22);
     let below_y = prompt.y.saturating_add(prompt.height);
@@ -165,14 +165,11 @@ fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below
         .saturating_sub(visible / 2)
         .min(dialog.matches.len().saturating_sub(visible));
     let lines = match dialog.status {
-        FilePickerStatus::Indexing => {
+        FilePickerStatus::Loading => {
             vec![Line::from(Span::styled(
                 "indexing workspace files…",
                 theme::dim(),
             ))]
-        }
-        FilePickerStatus::Searching => {
-            vec![Line::from(Span::styled("searching…", theme::dim()))]
         }
         FilePickerStatus::Ready if dialog.matches.is_empty() => {
             vec![Line::from(Span::styled("no matching files", theme::dim()))]
@@ -2308,7 +2305,7 @@ mod tests {
             revision: 1,
             selected: 0,
             matches: Vec::new(),
-            status: FilePickerStatus::Indexing,
+            status: FilePickerStatus::Loading,
         });
         let indexing = render(&mut app, 60, 12);
         assert!(indexing.contains("files"), "{indexing}");
@@ -2368,7 +2365,9 @@ mod tests {
         let screen = render(&mut active, 80, 24);
         let prompt_row = screen
             .lines()
-            .rposition(|line| line.contains('@'))
+            .enumerate()
+            .filter_map(|(row, line)| line.contains('@').then_some(row))
+            .last()
             .expect("prompt row");
         let picker_row = screen
             .lines()

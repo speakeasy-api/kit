@@ -1,4 +1,4 @@
-use std::{fmt, ops::Range, path::PathBuf, time::Duration};
+use std::{ops::Range, path::PathBuf, time::Duration};
 
 use fff_search::{
     FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, ParserConfig,
@@ -14,21 +14,9 @@ pub struct FileMatch {
     pub match_byte_offsets: Vec<Range<usize>>,
 }
 
-#[derive(Clone)]
 pub struct WorkspaceFileSearch {
     picker: SharedFilePicker,
 }
-
-#[derive(Debug)]
-pub struct FileSearchError(String);
-
-impl fmt::Display for FileSearchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for FileSearchError {}
 
 #[derive(Debug, Clone, Copy)]
 struct LiteralPathConfig;
@@ -64,17 +52,17 @@ impl ParserConfig for LiteralPathConfig {
 }
 
 impl WorkspaceFileSearch {
-    pub fn start(root: PathBuf) -> Result<Self, FileSearchError> {
+    pub fn start(root: PathBuf) -> Result<Self, String> {
         if !root.is_dir() {
-            return Err(FileSearchError(format!(
+            return Err(format!(
                 "workspace root is not a directory: {}",
                 root.display()
-            )));
+            ));
         }
         let base_path = root
             .into_os_string()
             .into_string()
-            .map_err(|_| FileSearchError("workspace root is not valid UTF-8".into()))?;
+            .map_err(|_| "workspace root is not valid UTF-8".to_string())?;
         let picker = SharedFilePicker::default();
         FilePicker::new_with_shared_state(
             picker.clone(),
@@ -85,26 +73,22 @@ impl WorkspaceFileSearch {
                 ..FilePickerOptions::default()
             },
         )
-        .map_err(|error| {
-            FileSearchError(format!("could not start workspace file index: {error}"))
-        })?;
+        .map_err(|error| format!("could not start workspace file index: {error}"))?;
         Ok(Self { picker })
     }
 
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<FileMatch>, FileSearchError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+    pub fn search(&self, query: &str) -> Result<Vec<FileMatch>, String> {
         if !self.picker.wait_for_scan(INDEX_TIMEOUT) {
-            return Err(FileSearchError("workspace file index timed out".into()));
+            return Err("workspace file index timed out".into());
         }
 
-        let guard = self.picker.read().map_err(|error| {
-            FileSearchError(format!("could not read workspace file index: {error}"))
-        })?;
+        let guard = self
+            .picker
+            .read()
+            .map_err(|error| format!("could not read workspace file index: {error}"))?;
         let picker = guard
             .as_ref()
-            .ok_or_else(|| FileSearchError("workspace file index is unavailable".into()))?;
+            .ok_or_else(|| "workspace file index is unavailable".to_string())?;
         let parsed = QueryParser::new(LiteralPathConfig).parse(query);
         let results = picker.fuzzy_search(
             &parsed,
@@ -112,7 +96,7 @@ impl WorkspaceFileSearch {
             FuzzySearchOptions {
                 pagination: PaginationArgs {
                     offset: 0,
-                    limit: limit.min(MAX_RESULTS),
+                    limit: MAX_RESULTS,
                 },
                 ..FuzzySearchOptions::default()
             },
@@ -210,7 +194,7 @@ mod tests {
         )
         .expect("start search");
 
-        let all = search.search("", 100).expect("list files");
+        let all = search.search("").expect("list files");
         assert!(all.iter().any(|item| item.relative_path == "README.md"));
         assert!(
             all.iter()
@@ -222,23 +206,20 @@ mod tests {
         );
         assert!(!all.iter().any(|item| item.relative_path.contains("secret")));
 
-        let short = search.search("r", 100).expect("short query");
+        let short = search.search("r").expect("short query");
         assert!(!short.is_empty());
 
         let punctuation = search
-            .search("status:modified", 100)
+            .search("status:modified")
             .expect("literal punctuation query");
         assert_eq!(punctuation[0].relative_path, "src/status:modified.rs");
 
-        let unicode = search.search("caf\u{e9}", 100).expect("Unicode query");
+        let unicode = search.search("caf\u{e9}").expect("Unicode query");
         assert_eq!(unicode[0].relative_path, "src/caf\u{e9}.rs");
         assert!(unicode[0].match_byte_offsets.iter().all(|range| {
             unicode[0].relative_path.is_char_boundary(range.start)
                 && unicode[0].relative_path.is_char_boundary(range.end)
         }));
-
-        assert_eq!(search.search("", 1).expect("bounded query").len(), 1);
-        assert!(search.search("", 0).expect("zero limit").is_empty());
     }
 
     #[test]

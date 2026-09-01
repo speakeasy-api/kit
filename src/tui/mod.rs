@@ -876,16 +876,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                 format!("file search state is unavailable: {error}")
                                             })?;
                                             if state.is_none() {
-                                                *state = Some(
-                                                    WorkspaceFileSearch::start(search_root)
-                                                        .map_err(|error| error.to_string())?,
-                                                );
+                                                *state =
+                                                    Some(WorkspaceFileSearch::start(search_root)?);
                                             }
                                             let result = state
                                                 .as_ref()
                                                 .expect("initialized above")
-                                                .search(&query, 100)
-                                                .map_err(|error| error.to_string());
+                                                .search(&query);
                                             if result.is_err() {
                                                 *state = None;
                                             }

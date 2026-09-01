@@ -6,9 +6,3 @@
 /.kit-codesign-identity
 /.env
 .DS_Store
-
-# Riptide artifacts (cloud-synced)
-.humanlayer/tasks/
-
-# Riptide artifacts (cloud-synced)
-.humanlayer/tasks/

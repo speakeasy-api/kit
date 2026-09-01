@@ -224,8 +224,7 @@ pub struct FilePickerDialog {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilePickerStatus {
-    Indexing,
-    Searching,
+    Loading,
     Ready,
 }
 
@@ -2493,7 +2492,7 @@ impl App {
             revision,
             selected: 0,
             matches: Vec::new(),
-            status: FilePickerStatus::Indexing,
+            status: FilePickerStatus::Loading,
         });
         Action::SearchFiles { query, revision }
     }
@@ -2509,7 +2508,7 @@ impl App {
             dialog.query_range = query_range;
             dialog.revision = revision;
             dialog.selected = 0;
-            dialog.status = FilePickerStatus::Searching;
+            dialog.status = FilePickerStatus::Loading;
         }
         Action::SearchFiles { query, revision }
     }
