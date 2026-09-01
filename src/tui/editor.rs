@@ -23,6 +23,10 @@ impl Editor {
         &self.text
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
     }
@@ -158,6 +162,19 @@ impl Editor {
         }
         self.text.insert_str(self.cursor, &cleaned);
         self.cursor += cleaned.len();
+    }
+
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) -> bool {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return false;
+        }
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        true
     }
 
     pub fn backspace(&mut self) {
@@ -471,5 +488,21 @@ mod tests {
         editor.move_right();
         editor.delete_forward();
         assert_eq!(editor.text(), "hllo");
+    }
+
+    #[test]
+    fn replaces_a_multibyte_range_and_moves_the_cursor() {
+        let mut editor = editor("pick @caf\u{e9} now");
+        assert!(editor.replace_range(5..11, "@src/caf\u{e9}.rs"));
+        assert_eq!(editor.text(), "pick @src/caf\u{e9}.rs now");
+        assert_eq!(editor.cursor(), 18);
+    }
+
+    #[test]
+    fn rejects_invalid_replacement_boundaries() {
+        let mut editor = editor("caf\u{e9}");
+        assert!(!editor.replace_range(0..4, "x"));
+        assert_eq!(editor.text(), "caf\u{e9}");
+        assert_eq!(editor.cursor(), 5);
     }
 }

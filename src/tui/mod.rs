@@ -9,6 +9,7 @@
 mod app;
 mod command;
 mod editor;
+mod file_search;
 mod image;
 mod markdown;
 mod plan;
@@ -64,6 +65,7 @@ use app::{
     Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
     UserImage,
 };
+use file_search::WorkspaceFileSearch;
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
@@ -544,6 +546,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 active.id = active_session_id.clone();
             }
             app.start_session(active_session_id);
+            let file_search: Arc<Mutex<Option<WorkspaceFileSearch>>> =
+                Arc::new(Mutex::new(None));
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -861,6 +865,41 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             "could not cancel background call: {}", error.message
                                         ));
                                     }
+                                }
+                                Action::SearchFiles { query, revision } => {
+                                    let state = Arc::clone(&file_search);
+                                    let search_root = root.clone();
+                                    let updates = updates_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            let mut state = state.lock().map_err(|error| {
+                                                format!("file search state is unavailable: {error}")
+                                            })?;
+                                            if state.is_none() {
+                                                *state = Some(
+                                                    WorkspaceFileSearch::start(search_root)
+                                                        .map_err(|error| error.to_string())?,
+                                                );
+                                            }
+                                            let result = state
+                                                .as_ref()
+                                                .expect("initialized above")
+                                                .search(&query, 100)
+                                                .map_err(|error| error.to_string());
+                                            if result.is_err() {
+                                                *state = None;
+                                            }
+                                            result
+                                        })
+                                        .await
+                                        .map_err(|error| {
+                                            format!("file search worker failed: {error}")
+                                        })
+                                        .and_then(|result| result);
+                                        let _ = updates.send(QueuedUpdate::global(
+                                            Update::FileMatches { revision, result },
+                                        ));
+                                    });
                                 }
                                 Action::None | Action::Redraw => {}
                             }

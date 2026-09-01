@@ -28,7 +28,7 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 use super::{
     app::{
         AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
-        CachedTranscriptRow, Child, CodeHit, Phase, ToolCall, UserMessage,
+        CachedTranscriptRow, Child, CodeHit, FilePickerStatus, Phase, ToolCall, UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -79,9 +79,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         && app.pending_steers.is_empty()
         && !app.show_logs;
 
-    if show_start {
+    let (prompt_area, picker_below) = if show_start {
         app.prompt_width = start_prompt_width;
-        draw_start(frame, app, start_width, start_prompt_rows);
+        (draw_start(frame, app, start_width, start_prompt_rows), true)
     } else {
         let prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
         app.prompt_width = prompt_width;
@@ -113,14 +113,133 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         draw_pending_steers(frame, app, pending);
         draw_prompt(frame, app, prompt);
         draw_status(frame, app, status);
-    }
-    if app.session_dialog.is_some() {
+        (prompt, false)
+    };
+    if app.file_picker.is_some() {
+        draw_file_picker(frame, app, prompt_area, picker_below);
+    } else if app.session_dialog.is_some() {
         draw_session_dialog(frame, app);
     } else if app.model_dialog.is_some() {
         draw_model_dialog(frame, app);
     } else if app.effort_dialog.is_some() {
         draw_effort_dialog(frame, app);
     }
+}
+
+fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below: bool) {
+    let outer = frame.area();
+    let dialog = app.file_picker.as_ref().expect("checked above");
+    let width = prompt.width.min(88);
+    let rows = match dialog.status {
+        FilePickerStatus::Ready => dialog.matches.len().max(1),
+        FilePickerStatus::Indexing | FilePickerStatus::Searching => 1,
+    };
+    let desired_height = (rows as u16).saturating_add(3).min(22);
+    let below_y = prompt.y.saturating_add(prompt.height);
+    let below_height = outer.bottom().saturating_sub(below_y);
+    let above_height = prompt.y.saturating_sub(outer.y);
+    let below = prefer_below && below_height >= 3;
+    let height = desired_height.min(if below { below_height } else { above_height });
+    if height == 0 || width == 0 {
+        return;
+    }
+    let y = if below {
+        below_y
+    } else {
+        prompt.y.saturating_sub(height)
+    };
+    let area = Rect::new(
+        prompt.x + prompt.width.saturating_sub(width) / 2,
+        y,
+        width,
+        height,
+    );
+    let panel = Panel::bordered().title(" files ");
+    let inner = panel.inner(area);
+    let footer_rows = u16::from(inner.height > 1);
+    let [list, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).areas(inner);
+    let visible = list.height as usize;
+    let start = dialog
+        .selected
+        .saturating_sub(visible / 2)
+        .min(dialog.matches.len().saturating_sub(visible));
+    let lines = match dialog.status {
+        FilePickerStatus::Indexing => {
+            vec![Line::from(Span::styled(
+                "indexing workspace files…",
+                theme::dim(),
+            ))]
+        }
+        FilePickerStatus::Searching => {
+            vec![Line::from(Span::styled("searching…", theme::dim()))]
+        }
+        FilePickerStatus::Ready if dialog.matches.is_empty() => {
+            vec![Line::from(Span::styled("no matching files", theme::dim()))]
+        }
+        FilePickerStatus::Ready => dialog.matches[start..]
+            .iter()
+            .take(visible)
+            .enumerate()
+            .map(|(offset, item)| {
+                let selected = start + offset == dialog.selected;
+                let mut spans = vec![Span::styled(
+                    if selected { "› " } else { "  " },
+                    if selected {
+                        theme::accent()
+                    } else {
+                        theme::text()
+                    },
+                )];
+                let path_width = list.width.saturating_sub(2) as usize;
+                let mut end = 0;
+                let mut used = 0;
+                for (index, grapheme) in item.relative_path.grapheme_indices(true) {
+                    let width = UnicodeWidthStr::width(grapheme);
+                    if used + width > path_width {
+                        break;
+                    }
+                    used += width;
+                    end = index + grapheme.len();
+                }
+                let mut cursor = 0;
+                for range in &item.match_byte_offsets {
+                    let start = range.start.max(cursor).min(end);
+                    let range_end = range.end.max(start).min(end);
+                    if cursor < start {
+                        spans.push(Span::styled(
+                            item.relative_path[cursor..start].to_string(),
+                            theme::text(),
+                        ));
+                    }
+                    if start < range_end {
+                        spans.push(Span::styled(
+                            item.relative_path[start..range_end].to_string(),
+                            theme::accent(),
+                        ));
+                    }
+                    cursor = range_end;
+                }
+                if cursor < end {
+                    spans.push(Span::styled(
+                        item.relative_path[cursor..end].to_string(),
+                        theme::text(),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect(),
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "↑/↓ navigate · tab complete · esc close",
+            theme::dim(),
+        )),
+        footer,
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -468,7 +587,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
+fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) -> Rect {
     let area = frame.area();
     let height = START_LOGO_ROWS + START_LOGO_GAP + prompt_rows + 1;
     let x = area.x + area.width.saturating_sub(width) / 2;
@@ -482,6 +601,7 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) {
     draw_start_prompt(frame, app, prompt);
     let status = Rect::new(x, y + prompt_rows, width, 1);
     draw_status(frame, app, status);
+    prompt
 }
 
 fn body_layout(area: Rect, show_agents: bool, transcript_empty: bool) -> (Rect, Option<Rect>) {
@@ -1806,9 +1926,10 @@ mod tests {
     use crate::{
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         tui::app::{
-            Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog, ModelDialog,
-            Update, UserImage, UserMessage,
+            Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog,
+            FilePickerDialog, FilePickerStatus, ModelDialog, Update, UserImage, UserMessage,
         },
+        tui::file_search::FileMatch,
     };
 
     fn test_agent(
@@ -2177,6 +2298,83 @@ mod tests {
 
         let tiny = render(&mut app, 16, 3);
         assert!(tiny.contains("› model-9"), "{tiny}");
+    }
+
+    #[test]
+    fn file_picker_renders_indexing_empty_and_selected_states() {
+        let mut app = sample();
+        app.file_picker = Some(FilePickerDialog {
+            query_range: 0..1,
+            revision: 1,
+            selected: 0,
+            matches: Vec::new(),
+            status: FilePickerStatus::Indexing,
+        });
+        let indexing = render(&mut app, 60, 12);
+        assert!(indexing.contains("files"), "{indexing}");
+        assert!(indexing.contains("indexing workspace files"), "{indexing}");
+
+        app.file_picker.as_mut().unwrap().status = FilePickerStatus::Ready;
+        let empty = render(&mut app, 60, 12);
+        assert!(empty.contains("no matching files"), "{empty}");
+
+        let dialog = app.file_picker.as_mut().unwrap();
+        dialog.matches = (0..10)
+            .map(|index| FileMatch {
+                relative_path: format!("src/path-{index}.rs"),
+                match_byte_offsets: std::iter::once(4..8).collect(),
+            })
+            .collect();
+        dialog.selected = 9;
+        let selected = render(&mut app, 24, 8);
+        assert!(selected.contains("› src/path-9.rs"), "{selected}");
+        let tiny = render(&mut app, 12, 3);
+        assert!(tiny.contains("files"), "{tiny}");
+    }
+
+    #[test]
+    fn file_picker_stays_attached_to_the_prompt() {
+        let mut start = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        start.editor.insert_str("@app");
+        start.file_picker = Some(FilePickerDialog {
+            query_range: 0..4,
+            revision: 1,
+            selected: 0,
+            matches: vec![FileMatch {
+                relative_path: "src/tui/app.rs".into(),
+                match_byte_offsets: std::iter::once(8..11).collect(),
+            }],
+            status: FilePickerStatus::Ready,
+        });
+        let screen = render(&mut start, 80, 24);
+        let prompt_row = screen
+            .lines()
+            .position(|line| line.contains('@'))
+            .expect("prompt row");
+        let picker_row = screen
+            .lines()
+            .position(|line| line.contains("src/tui/app.rs"))
+            .expect("picker row");
+        assert!(picker_row > prompt_row, "{screen}");
+
+        let mut active = sample();
+        active.editor.insert_str("@app");
+        active.file_picker = start.file_picker;
+        let screen = render(&mut active, 80, 24);
+        let prompt_row = screen
+            .lines()
+            .rposition(|line| line.contains('@'))
+            .expect("prompt row");
+        let picker_row = screen
+            .lines()
+            .position(|line| line.contains("src/tui/app.rs"))
+            .expect("picker row");
+        assert!(picker_row < prompt_row, "{screen}");
     }
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\
