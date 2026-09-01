@@ -584,13 +584,7 @@ impl SessionLock {
     }
 
     fn check(&self) -> Result<(), LockError> {
-        let current = fs::read_to_string(&self.path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                LockError::Missing
-            } else {
-                LockError::Other(format!("session lock was lost: {error}"))
-            }
-        })?;
+        let current = self.read_token()?;
         if current == self.token {
             Ok(())
         } else {
@@ -598,6 +592,42 @@ impl SessionLock {
                 "session lock was overridden by another Kit instance".into(),
             ))
         }
+    }
+
+    // Reads the lock file's token to confirm this process still owns it. On
+    // Unix the advisory lock lets a fresh handle read the path, which also
+    // reports the file being unlinked as `Missing` so the writer can recover.
+    #[cfg(not(windows))]
+    fn read_token(&self) -> Result<String, LockError> {
+        fs::read_to_string(&self.path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                LockError::Missing
+            } else {
+                LockError::Other(format!("session lock was lost: {error}"))
+            }
+        })
+    }
+
+    // On Windows `File::try_lock` takes a mandatory exclusive lock, so
+    // re-opening the path to read the token fails with a sharing violation
+    // (os error 33). Read it through the lock-owning handle instead, which the
+    // lock owner is always permitted to do. The lock file is opened without
+    // FILE_SHARE_DELETE, so it cannot be unlinked while this handle is held; a
+    // `Missing` state therefore cannot arise here and losing the handle is
+    // itself the lost-lock condition.
+    #[cfg(windows)]
+    fn read_token(&self) -> Result<String, LockError> {
+        use std::io::Read;
+        let Some(file) = self.file.as_ref() else {
+            return Err(LockError::Missing);
+        };
+        let mut handle: &File = file;
+        let mut current = String::new();
+        handle
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| handle.read_to_string(&mut current))
+            .map_err(|error| LockError::Other(format!("session lock was lost: {error}")))?;
+        Ok(current)
     }
 }
 
