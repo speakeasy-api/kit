@@ -23,6 +23,11 @@ running, the release stops without updating either ref and must be run again. A
 rerun of the failed jobs resumes publication when the release commit and tag were
 pushed but a later publishing step failed.
 
+The atomic push authenticates with the repository's write-enabled `kit-release`
+deploy key. Add **Deploy keys** to the `main` ruleset bypass list and store that
+key's private half in the repository Actions secret `RELEASE_DEPLOY_KEY`. The
+default `GITHUB_TOKEN` cannot bypass the pull-request and status-check rules.
+
 The newly built Linux Kit CLI reviews every change since the previous release and
 writes the GitHub release notes before the workflow attaches the archives and
 checksums. Configure the repository Actions secret `OPENROUTER_API_KEY` for this

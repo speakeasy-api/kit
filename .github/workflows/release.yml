@@ -463,6 +463,7 @@ jobs:
         with:
           ref: ${{ needs.verify.outputs.source_sha }}
           fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
