@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=6480d909800f25a5ddf042cf3f6791bf6726fe41#6480d909800f25a5ddf042cf3f6791bf6726fe41"
+source = "git+https://github.com/danielkov/agentkit.git?rev=7604f6c2ba1eed1de83fe3d9a0058192b5623bb4#7604f6c2ba1eed1de83fe3d9a0058192b5623bb4"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -241,7 +241,7 @@ dependencies = [
 [[package]]
 name = "agentkit-loop"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=6480d909800f25a5ddf042cf3f6791bf6726fe41#6480d909800f25a5ddf042cf3f6791bf6726fe41"
+source = "git+https://github.com/danielkov/agentkit.git?rev=7604f6c2ba1eed1de83fe3d9a0058192b5623bb4#7604f6c2ba1eed1de83fe3d9a0058192b5623bb4"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
