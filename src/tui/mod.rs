@@ -57,6 +57,7 @@ use wire::{
 
 use crate::{
     events::{self, EVENTS_ENV},
+    protocols::acp::FileSearchRequest,
     tools::mcp::CredentialStorage,
 };
 
@@ -144,6 +145,7 @@ struct DetachComposeRequest {
 struct DetachComposeResponse {
     detached: bool,
 }
+
 /// How long the agent gets to answer the ACP handshake before the client gives
 /// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
 const HANDSHAKE: Duration = Duration::from_secs(30);
@@ -900,6 +902,25 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             "could not cancel background call: {}", error.message
                                         ));
                                     }
+                                }
+                                Action::SearchFiles {
+                                    query,
+                                    revision,
+                                    activation,
+                                } => {
+                                    let connection = connection.clone();
+                                    let updates = updates_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = connection
+                                            .send_request(FileSearchRequest { query, activation })
+                                            .block_task()
+                                            .await
+                                            .map(|response| response.matches)
+                                            .map_err(|error| error.message.to_string());
+                                        let _ = updates.send(QueuedUpdate::global(
+                                            Update::FileMatches { revision, result },
+                                        ));
+                                    });
                                 }
                                 Action::None | Action::Redraw => {}
                             }

@@ -34,7 +34,7 @@ use crate::{
 
 use super::{
     CancelBackgroundRequest, CancelBackgroundResponse, DetachComposeRequest, DetachComposeResponse,
-    SessionRegistry, skill_catalog,
+    FileSearchRequest, FileSearchResponse, SessionRegistry, skill_catalog,
 };
 
 const PAGE_SIZE: usize = 100;
@@ -464,6 +464,7 @@ struct Server {
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
     sessions: Mutex<HashMap<wire::SessionId, SessionHandle>>,
+    file_search: Arc<Mutex<Option<crate::file_search::WorkspaceFileSearchState>>>,
 }
 
 impl Server {
@@ -473,7 +474,19 @@ impl Server {
             integration: Arc::new(AcpIntegration::default()),
             registry,
             sessions: Mutex::new(HashMap::new()),
+            file_search: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn search_files(&self, request: FileSearchRequest) -> Result<FileSearchResponse, String> {
+        crate::file_search::search_workspace(
+            Arc::clone(&self.file_search),
+            self.runtime.root().to_path_buf(),
+            request.query,
+            request.activation,
+        )
+        .await
+        .map(|matches| FileSearchResponse { matches })
     }
 
     fn remove_session(&self, session_id: &wire::SessionId, token: u64) {
@@ -1920,6 +1933,23 @@ pub(crate) fn component(
                 async move |request: CancelBackgroundRequest, responder, _cx| {
                     responder
                         .respond_with_result(state.cancel_background(request).map_err(sdk_error))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: FileSearchRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.search_files(request).await.map_err(|error| {
+                                agent_client_protocol::util::internal_error(error)
+                            }),
+                        )
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),

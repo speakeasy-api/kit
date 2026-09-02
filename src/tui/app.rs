@@ -25,6 +25,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[cfg(test)]
 use crate::compaction::is_compaction_summary;
 use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
+use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
@@ -45,6 +46,10 @@ pub enum Update {
     A2aAddress(String),
     /// Result of listing sessions without blocking the terminal event loop.
     SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
+    FileMatches {
+        revision: u64,
+        result: Result<Vec<FileMatch>, String>,
+    },
     /// Result of changing one session's custom display name.
     SessionRenamed {
         session_id: String,
@@ -223,6 +228,21 @@ pub enum SessionRename {
     Saving,
 }
 
+pub struct FilePickerDialog {
+    pub query_range: Range<usize>,
+    pub revision: u64,
+    pub activation: u64,
+    pub selected: usize,
+    pub matches: Vec<FileMatch>,
+    pub status: FilePickerStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePickerStatus {
+    Loading,
+    Ready,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentKind {
     Image,
@@ -277,6 +297,11 @@ pub enum Action {
     Cancel,
     DetachCompose(String),
     CancelBackground(String),
+    SearchFiles {
+        query: String,
+        revision: u64,
+        activation: u64,
+    },
     Quit,
 }
 
@@ -547,6 +572,7 @@ pub struct App {
     pub effort_dialog: Option<EffortDialog>,
     pub session_choices: Vec<crate::session::CatalogEntry>,
     pub session_dialog: Option<SessionDialog>,
+    pub file_picker: Option<FilePickerDialog>,
     session_catalog_pending: bool,
     pub available_commands: Vec<SlashCommand>,
     pub command_completion_selected: usize,
@@ -619,6 +645,7 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     /// When the last key arrived, for telling a paste from typing.
     pub last_key: Option<Instant>,
+    next_file_search_revision: u64,
 }
 
 /// A key arriving this soon after the previous one is machine-fast: pasted
@@ -837,6 +864,7 @@ impl App {
             effort_dialog: None,
             session_choices: Vec::new(),
             session_dialog: None,
+            file_picker: None,
             session_catalog_pending: false,
             available_commands: Vec::new(),
             command_completion_selected: 0,
@@ -896,6 +924,7 @@ impl App {
             press: None,
             toast: None,
             last_key: None,
+            next_file_search_revision: 0,
         }
     }
 
@@ -1681,6 +1710,7 @@ impl App {
                     }
                     Ok(entries) => {
                         self.session_choices = entries;
+                        self.file_picker = None;
                         self.session_dialog = Some(SessionDialog {
                             selected: 0,
                             rename: None,
@@ -1716,6 +1746,29 @@ impl App {
                     self.toast(format!("could not rename session: {error}"));
                 }
             },
+            Update::FileMatches { revision, result } => {
+                if self
+                    .file_picker
+                    .as_ref()
+                    .is_none_or(|dialog| dialog.revision != revision)
+                {
+                    return;
+                }
+                match result {
+                    Ok(matches) => {
+                        if let Some(dialog) = &mut self.file_picker {
+                            dialog.matches = matches;
+                            dialog.selected =
+                                dialog.selected.min(dialog.matches.len().saturating_sub(1));
+                            dialog.status = FilePickerStatus::Ready;
+                        }
+                    }
+                    Err(error) => {
+                        self.file_picker = None;
+                        self.toast(format!("file search failed: {error}"));
+                    }
+                }
+            }
             Update::AvailableCommands {
                 session_id,
                 commands,
@@ -2048,6 +2101,7 @@ impl App {
     pub fn start_session(&mut self, session_id: String) {
         self.session_catalog_pending = false;
         self.session_id = Some(session_id);
+        self.file_picker = None;
         self.available_commands.clear();
         self.command_completion_selected = 0;
         self.command_completion_query = None;
@@ -2374,6 +2428,7 @@ impl App {
             }
             return;
         }
+        self.file_picker = None;
         self.editor.insert_str(text);
         self.sync_command_completion();
         let lines = text.lines().count();
@@ -2599,6 +2654,140 @@ impl App {
         Action::None
     }
 
+    fn active_file_query_range(&self) -> Option<Range<usize>> {
+        let text = self.editor.text();
+        let cursor = self.editor.cursor();
+        let start = text[..cursor]
+            .char_indices()
+            .rev()
+            .find_map(|(index, character)| {
+                character
+                    .is_whitespace()
+                    .then_some(index + character.len_utf8())
+            })
+            .unwrap_or(0);
+        if cursor < start + 1 || text.as_bytes().get(start) != Some(&b'@') {
+            return None;
+        }
+        let end = text[cursor..]
+            .char_indices()
+            .find_map(|(index, character)| character.is_whitespace().then_some(cursor + index))
+            .unwrap_or(text.len());
+        Some(start..end)
+    }
+
+    fn next_file_search_revision(&mut self) -> u64 {
+        self.next_file_search_revision = self.next_file_search_revision.wrapping_add(1);
+        self.next_file_search_revision
+    }
+
+    fn start_file_picker(&mut self, query_range: Range<usize>) -> Action {
+        let revision = self.next_file_search_revision();
+        let query = self.editor.text()[query_range.start + 1..query_range.end].to_string();
+        self.file_picker = Some(FilePickerDialog {
+            query_range,
+            revision,
+            activation: revision,
+            selected: 0,
+            matches: Vec::new(),
+            status: FilePickerStatus::Loading,
+        });
+        Action::SearchFiles {
+            query,
+            revision,
+            activation: revision,
+        }
+    }
+
+    fn refresh_file_picker(&mut self) -> Action {
+        let Some(query_range) = self.active_file_query_range() else {
+            self.file_picker = None;
+            return Action::None;
+        };
+        let activation = self
+            .file_picker
+            .as_ref()
+            .expect("active query belongs to a picker")
+            .activation;
+        let revision = self.next_file_search_revision();
+        let query = self.editor.text()[query_range.start + 1..query_range.end].to_string();
+        if let Some(dialog) = &mut self.file_picker {
+            dialog.query_range = query_range;
+            dialog.revision = revision;
+            dialog.selected = 0;
+            dialog.status = FilePickerStatus::Loading;
+        }
+        Action::SearchFiles {
+            query,
+            revision,
+            activation,
+        }
+    }
+
+    fn revalidate_file_picker(&mut self) {
+        let Some(query_range) = self.active_file_query_range() else {
+            self.file_picker = None;
+            return;
+        };
+        if let Some(dialog) = &mut self.file_picker {
+            dialog.query_range = query_range;
+        }
+    }
+
+    fn handle_file_picker_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => self.file_picker = None,
+            KeyCode::Up => {
+                if let Some(dialog) = &mut self.file_picker {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dialog) = &mut self.file_picker {
+                    dialog.selected =
+                        (dialog.selected + 1).min(dialog.matches.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Tab => {
+                let selection = self.file_picker.as_ref().and_then(|dialog| {
+                    dialog
+                        .matches
+                        .get(dialog.selected)
+                        .map(|item| (dialog.query_range.clone(), item.relative_path.clone()))
+                });
+                if let Some((range, path)) = selection {
+                    self.editor.replace_range(range, &format!("@{path}"));
+                    self.file_picker = None;
+                }
+            }
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                return self.refresh_file_picker();
+            }
+            KeyCode::Delete => {
+                self.editor.delete_forward();
+                return self.refresh_file_picker();
+            }
+            KeyCode::Left => {
+                self.editor.move_left();
+                self.revalidate_file_picker();
+            }
+            KeyCode::Right => {
+                self.editor.move_right();
+                self.revalidate_file_picker();
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.editor.insert_char(character);
+                return self.refresh_file_picker();
+            }
+            _ => self.file_picker = None,
+        }
+        Action::None
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
@@ -2624,9 +2813,27 @@ impl App {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let command = key.modifiers.contains(KeyModifiers::SUPER);
+        let file_picker_key = match key.code {
+            KeyCode::Char(_) => !control && !alt && !command,
+            KeyCode::Esc
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Tab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right => key.modifiers.is_empty(),
+            _ => false,
+        };
+        let pasted_input =
+            pasted && matches!(key.code, KeyCode::Char(_) | KeyCode::Tab | KeyCode::Enter);
+        if self.file_picker.is_some() && !pasted_input && file_picker_key {
+            return self.handle_file_picker_key(key);
+        }
+        self.file_picker = None;
         // `cmd` only reaches the client in terminals that speak the Kitty
         // keyboard protocol; the control equivalents cover the rest.
-        let command = key.modifiers.contains(KeyModifiers::SUPER);
         let word = alt || control;
         let line = command || control;
 
@@ -2873,6 +3080,18 @@ impl App {
             KeyCode::End => self.editor.move_line_end(),
             KeyCode::PageUp => self.scroll_by(-(self.viewport.max(2) as isize - 1)),
             KeyCode::PageDown => self.scroll_by(self.viewport.max(2) as isize - 1),
+            KeyCode::Char('@') if !control && !command && !pasted => {
+                let at = self.editor.cursor();
+                let eligible = at == 0
+                    || self.editor.text()[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace);
+                self.editor.insert_char('@');
+                if eligible {
+                    return self.start_file_picker(at..at + 1);
+                }
+            }
             KeyCode::Char(character) if !control && !command => self.editor.insert_char(character),
             _ => {}
         }
@@ -3187,7 +3406,7 @@ mod tests {
         Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
         MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
     };
-    use crate::{events::RuntimeEvent, tui::wrap::LinkHit};
+    use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
         modified_press(code, KeyModifiers::NONE)
@@ -3270,6 +3489,210 @@ mod tests {
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         )
+    }
+
+    #[test]
+    fn typed_eligible_at_opens_picker_but_paste_and_email_do_not() {
+        let mut typed = app();
+        let Action::SearchFiles {
+            query,
+            revision,
+            activation,
+        } = typed.handle_key(press(KeyCode::Char('@')))
+        else {
+            panic!("eligible @ should search");
+        };
+        assert_eq!(query, "");
+        assert_eq!(revision, 1);
+        assert_eq!(activation, revision);
+        assert_eq!(typed.editor.text(), "@");
+        assert!(typed.file_picker.is_some());
+        typed.handle_key(press(KeyCode::Esc));
+        assert_eq!(typed.editor.text(), "@");
+        assert!(typed.file_picker.is_none());
+
+        let mut pasted = app();
+        pasted.paste("@src/lib.rs");
+        assert!(pasted.file_picker.is_none());
+        assert_eq!(pasted.editor.text(), "@src/lib.rs");
+
+        let mut email = app();
+        email.paste("name");
+        assert!(matches!(
+            email.handle_key(press(KeyCode::Char('@'))),
+            Action::None
+        ));
+        assert_eq!(email.editor.text(), "name@");
+        assert!(email.file_picker.is_none());
+    }
+
+    #[test]
+    fn unbracketed_paste_starting_with_at_dismisses_the_picker() {
+        let mut app = app();
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        app.last_key = Some(Instant::now());
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('s'))),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "@s");
+        assert!(app.file_picker.is_none());
+    }
+
+    #[test]
+    fn picker_revisions_discard_stale_results_and_follow_edits() {
+        let mut app = app();
+        let Action::SearchFiles {
+            revision: first,
+            activation,
+            ..
+        } = app.handle_key(press(KeyCode::Char('@')))
+        else {
+            panic!("picker search");
+        };
+        app.last_key = None;
+        let Action::SearchFiles {
+            query,
+            revision: second,
+            activation: refreshed_activation,
+        } = app.handle_key(press(KeyCode::Char('s')))
+        else {
+            panic!("updated picker search");
+        };
+        assert_eq!(query, "s");
+        assert!(second > first);
+        assert_eq!(refreshed_activation, activation);
+
+        app.apply(Update::FileMatches {
+            revision: first,
+            result: Ok(vec![FileMatch {
+                relative_path: "stale.rs".into(),
+                match_byte_offsets: Vec::new(),
+            }]),
+        });
+        assert!(app.file_picker.as_ref().unwrap().matches.is_empty());
+
+        app.apply(Update::FileMatches {
+            revision: second,
+            result: Ok(vec![FileMatch {
+                relative_path: "src/lib.rs".into(),
+                match_byte_offsets: std::iter::once(0..1).collect(),
+            }]),
+        });
+        assert_eq!(
+            app.file_picker.as_ref().unwrap().matches[0].relative_path,
+            "src/lib.rs"
+        );
+
+        app.last_key = None;
+        let Action::SearchFiles {
+            query,
+            activation: backspace_activation,
+            ..
+        } = app.handle_key(press(KeyCode::Backspace))
+        else {
+            panic!("backspace picker search");
+        };
+        assert_eq!(query, "");
+        assert_eq!(backspace_activation, activation);
+    }
+
+    #[test]
+    fn picker_navigation_selects_paths_with_spaces_as_plain_prompt_text() {
+        let mut app = app();
+        app.paste("open ");
+        let Action::SearchFiles { revision, .. } = app.handle_key(press(KeyCode::Char('@'))) else {
+            panic!("picker search");
+        };
+        app.apply(Update::FileMatches {
+            revision,
+            result: Ok(vec![
+                FileMatch {
+                    relative_path: "first.rs".into(),
+                    match_byte_offsets: Vec::new(),
+                },
+                FileMatch {
+                    relative_path: "docs/file name.md".into(),
+                    match_byte_offsets: Vec::new(),
+                },
+            ]),
+        });
+        app.last_key = Some(Instant::now());
+        app.handle_key(press(KeyCode::Down));
+        app.last_key = None;
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.editor.text(), "open @docs/file name.md");
+        assert!(app.file_picker.is_none());
+
+        app.last_key = None;
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("plain prompt should submit");
+        };
+        assert_eq!(prompt.text, "open @docs/file name.md");
+    }
+
+    #[test]
+    fn picker_dismissal_and_failures_preserve_the_query() {
+        let mut app = app();
+        let Action::SearchFiles { revision, .. } = app.handle_key(press(KeyCode::Char('@'))) else {
+            panic!("picker search");
+        };
+        app.apply(Update::FileMatches {
+            revision,
+            result: Err("index unavailable".into()),
+        });
+        assert_eq!(app.editor.text(), "@");
+        assert!(app.file_picker.is_none());
+        assert_eq!(
+            app.toast_text(),
+            Some("file search failed: index unavailable")
+        );
+
+        app.paste(" ");
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        app.handle_key(press(KeyCode::Left));
+        assert_eq!(app.editor.text(), "@ @");
+        assert!(app.file_picker.is_none());
+    }
+
+    #[test]
+    fn modified_editor_keys_bypass_and_dismiss_the_picker() {
+        let mut editing = app();
+        assert!(matches!(
+            editing.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        editing.last_key = None;
+
+        assert!(matches!(
+            editing.handle_key(modified_press(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert_eq!(editing.editor.cursor(), 0);
+        assert_eq!(editing.editor.text(), "@");
+        assert!(editing.file_picker.is_none());
+
+        let mut working = app();
+        assert!(matches!(
+            working.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        working.last_key = None;
+        working.phase = Phase::Working;
+        assert!(matches!(
+            working.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Cancel
+        ));
+        assert!(working.phase == Phase::Cancelling);
+        assert!(working.file_picker.is_none());
     }
 
     #[test]
@@ -4355,6 +4778,10 @@ mod tests {
     #[test]
     fn session_catalog_update_opens_the_dialog() {
         let mut app = app();
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
         app.apply(Update::SessionCatalog(Ok(vec![
             crate::session::CatalogEntry {
                 id: "saved".into(),
@@ -4366,6 +4793,7 @@ mod tests {
         ])));
         assert_eq!(app.session_choices[0].id, "saved");
         assert!(app.session_dialog.is_some());
+        assert!(app.file_picker.is_none());
     }
 
     #[test]
