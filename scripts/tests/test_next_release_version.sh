@@ -18,6 +18,7 @@ new_repo() {
   git -C "$repo" add changes
   git -C "$repo" commit -qm 'chore: release 1.2.3'
   git -C "$repo" tag v1.2.3
+  base_branch=$(git -C "$repo" branch --show-current)
 }
 
 commit_change() {
@@ -79,5 +80,12 @@ expect_failure 1.2.3 HEAD v1.2.3
 new_repo
 commit_change 'update documentation'
 expect_failure 1.2.3 v1.2.3 HEAD
+
+new_repo
+git -C "$repo" switch -qc topic
+commit_change 'feat: add merged behavior'
+git -C "$repo" switch -q "$base_branch"
+git -C "$repo" merge --no-ff -qm 'Merge pull request #1 from example/topic' topic
+expect_version 1.2.4
 
 printf 'next release version tests passed\n'

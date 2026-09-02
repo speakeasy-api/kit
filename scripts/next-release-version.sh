@@ -44,11 +44,11 @@ git rev-parse --verify "$to_ref^{commit}" >/dev/null 2>&1 ||
 git merge-base --is-ancestor "$from_ref" "$to_ref" ||
   die "release ref $from_ref is not an ancestor of $to_ref"
 
-commit_count=$(git rev-list --count "$from_ref..$to_ref")
+commit_count=$(git rev-list --no-merges --count "$from_ref..$to_ref")
 [ "$commit_count" -gt 0 ] || die "no commits to release"
 
 invalid_commits=$(
-  git log --format='%h %s' "$from_ref..$to_ref" |
+  git log --no-merges --format='%h %s' "$from_ref..$to_ref" |
     grep -Ev '^[0-9a-f]+ [a-z][a-z0-9-]*(\([^()]+\))?!?: .+' || true
 )
 if [ -n "$invalid_commits" ]; then
@@ -57,10 +57,10 @@ $invalid_commits"
 fi
 
 bump=patch
-if git log --format='%s' "$from_ref..$to_ref" |
+if git log --no-merges --format='%s' "$from_ref..$to_ref" |
     grep -Eq '^[a-z][a-z0-9-]*(\([^()]+\))?!: .+'; then
   bump=minor
-elif git log --format='%b' "$from_ref..$to_ref" |
+elif git log --no-merges --format='%b' "$from_ref..$to_ref" |
     grep -Eq '^BREAKING CHANGE:($|[[:space:]])'; then
   bump=minor
 fi
