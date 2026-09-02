@@ -504,6 +504,9 @@ enum Command {
         server_credential_file: Option<PathBuf>,
         #[command(flatten)]
         mcp: McpArgs,
+        /// Provider login requested by ACP terminal authentication.
+        #[arg(long, value_enum, hide = true)]
+        terminal_auth_login: Option<AuthProvider>,
         /// Persistent session id selected by the hosting client.
         #[arg(long)]
         session_id: Option<String>,
@@ -532,6 +535,9 @@ enum Command {
         mcp: McpArgs,
         #[arg(long)]
         session_id: Option<String>,
+        /// Provider login requested by ACP terminal authentication.
+        #[arg(long, value_enum, hide = true)]
+        terminal_auth_login: Option<AuthProvider>,
         #[arg(long, requires = "session_id")]
         resume: bool,
         #[arg(long, requires = "resume")]
@@ -592,6 +598,24 @@ enum Command {
         #[arg(long, requires = "resume")]
         force: bool,
     },
+}
+
+impl Command {
+    fn terminal_auth_login(&self) -> Option<(AuthProvider, &CredentialArgs)> {
+        match self {
+            Self::Serve {
+                terminal_auth_login: Some(provider),
+                mcp,
+                ..
+            }
+            | Self::Acp {
+                terminal_auth_login: Some(provider),
+                mcp,
+                ..
+            } => Some((*provider, &mcp.credentials)),
+            _ => None,
+        }
+    }
 }
 
 fn initial_config(home: &Path) -> String {
@@ -859,6 +883,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         execute_auth(action, storage, openrouter_api_key.clone()).await?;
         return Ok(());
     }
+    if let Some((provider, credentials)) = cli.command.terminal_auth_login() {
+        let action = AuthAction::Login { provider };
+        let storage = credentials.storage(&config)?;
+        validate_auth_storage(&action, &storage)?;
+        execute_auth(&action, storage, openrouter_api_key.clone()).await?;
+        return Ok(());
+    }
     match cli.command {
         Command::Init => unreachable!("init returns before loading runtime config"),
         Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
@@ -875,6 +906,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stdio_protocol_version,
             server_credential_file,
             mcp,
+            terminal_auth_login: _,
             session_id,
             resume,
             force,
@@ -962,6 +994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             mcp,
             session_id,
+            terminal_auth_login: _,
             resume,
             force,
             subagent_depth,
@@ -1756,6 +1789,14 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "auth", "status", "openrouter"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "openrouter"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "--local-only"]).is_err());
+        for command in ["acp", "serve"] {
+            let cli =
+                Cli::try_parse_from(["kit", command, "--terminal-auth-login", "openai"]).unwrap();
+            assert!(matches!(
+                cli.command.terminal_auth_login(),
+                Some((AuthProvider::Openai, _))
+            ));
+        }
         assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err());
     }

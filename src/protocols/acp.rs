@@ -74,12 +74,12 @@ fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec
         AuthMethod::Terminal(
             AuthMethodTerminal::new("openai", "Sign in with ChatGPT")
                 .description("Authenticate Kit with a ChatGPT subscription")
-                .args(vec!["auth".into(), "login".into(), "openai".into()]),
+                .args(vec!["--terminal-auth-login".into(), "openai".into()]),
         ),
         AuthMethod::Terminal(
             AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter")
                 .description("Authenticate Kit with OpenRouter")
-                .args(vec!["auth".into(), "login".into(), "openrouter".into()]),
+                .args(vec!["--terminal-auth-login".into(), "openrouter".into()]),
         ),
     ]
 }
@@ -2123,9 +2123,18 @@ pub(super) mod tests {
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
         let methods = terminal_auth_methods(&capabilities);
         assert_eq!(methods.len(), 2);
-        assert!(
-            matches!(&methods[0], AuthMethod::Terminal(method) if method.id.0.as_ref() == "openai")
-        );
+        assert!(matches!(
+            &methods[0],
+            AuthMethod::Terminal(method)
+                if method.id.0.as_ref() == "openai"
+                    && method.args == ["--terminal-auth-login", "openai"]
+        ));
+        assert!(matches!(
+            &methods[1],
+            AuthMethod::Terminal(method)
+                if method.id.0.as_ref() == "openrouter"
+                    && method.args == ["--terminal-auth-login", "openrouter"]
+        ));
     }
 
     #[test]

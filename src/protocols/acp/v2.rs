@@ -39,36 +39,6 @@ use super::{
 
 const PAGE_SIZE: usize = 100;
 
-fn terminal_auth_methods(capabilities: &wire::ClientCapabilities) -> Vec<wire::AuthMethod> {
-    let supports_terminal_auth = capabilities
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.terminal.as_ref())
-        .is_some()
-        || capabilities
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("terminal-auth"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-    if !supports_terminal_auth {
-        return Vec::new();
-    }
-
-    vec![
-        wire::AuthMethod::Terminal(
-            wire::AuthMethodTerminal::new("openai", "Sign in with ChatGPT")
-                .description("Authenticate Kit with a ChatGPT subscription")
-                .args(vec!["auth".into(), "login".into(), "openai".into()]),
-        ),
-        wire::AuthMethod::Terminal(
-            wire::AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter")
-                .description("Authenticate Kit with OpenRouter")
-                .args(vec!["auth".into(), "login".into(), "openrouter".into()]),
-        ),
-    ]
-}
-
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_THOUGHT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -530,8 +500,7 @@ impl Server {
             wire::ProtocolVersion::V2,
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
-        .capabilities(agentkit_acp::v2::agent_capabilities())
-        .auth_methods(terminal_auth_methods(&request.capabilities)))
+        .capabilities(agentkit_acp::v2::agent_capabilities()))
     }
 
     async fn new_session(
@@ -2004,19 +1973,6 @@ mod tests {
     use super::*;
     use crate::protocols::acp::tests::{BlockingTool, ScriptAdapter};
 
-    #[test]
-    fn terminal_auth_methods_require_client_support() {
-        assert!(terminal_auth_methods(&wire::ClientCapabilities::new()).is_empty());
-
-        let capabilities = wire::ClientCapabilities::new()
-            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()));
-        let methods = terminal_auth_methods(&capabilities);
-        assert_eq!(methods.len(), 2);
-        assert!(
-            matches!(&methods[0], wire::AuthMethod::Terminal(method) if method.method_id.0.as_ref() == "openai")
-        );
-    }
-
     #[derive(Clone, Default)]
     struct RecordingSink {
         updates: Arc<Mutex<Vec<wire::UpdateSessionNotification>>>,
@@ -3241,13 +3197,19 @@ mod tests {
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let server = Server::new(runtime, SessionRegistry::new());
         let response = server
-            .initialize(wire::InitializeRequest::new(
-                wire::ProtocolVersion::V2,
-                wire::Implementation::new("test-client", "0"),
-            ))
+            .initialize(
+                wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("test-client", "0"),
+                )
+                .capabilities(wire::ClientCapabilities::new().auth(
+                    wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+                )),
+            )
             .unwrap();
 
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
+        assert!(response.auth_methods.is_empty());
         let mut newer = wire::InitializeRequest::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("newer-client", "0"),
