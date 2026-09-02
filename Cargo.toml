@@ -24,7 +24,7 @@ agentkit-plugins = "=0.10.7"
 agentkit-provider-openai = "=0.10.6"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
-agentkit-tool-compose = { version = "=0.10.9", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "=0.10.10", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
 agentkit-tools-core = "=0.10.5"
 async-trait = "=0.1.92"
@@ -51,7 +51,7 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.1.4", default-features = false, features = ["auth", "client"] }
-runlet = "=0.4.0"
+runlet = "=0.5.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 shlex = "=2.0.1"
