@@ -20,6 +20,9 @@ use agentkit_core::{
 };
 use serde_json::Value;
 
+const OPENAI_RESPONSES_CONTINUATION: &str = "openai.responses.continuation.v1";
+const OPENAI_SUBSCRIPTION_CONTINUATION: &str = "openai.subscription.v1";
+
 const MISSING: &str = "No result for this tool call survived in the stored transcript. The work \
                        it started may or may not have completed; check before assuming either \
                        way.";
@@ -60,6 +63,32 @@ pub fn repair_unanswered_tool_calls(transcript: &mut Vec<Item>) -> Vec<Item> {
     }
     *transcript = repaired;
     synthesized
+}
+
+/// Removes provider continuation state that is bound to the source session.
+///
+/// A fork has a new durable identity, so replaying opaque continuation state from
+/// the source would violate the provider's session binding. Generated assistant
+/// images cannot be encoded without that continuation and are omitted as well.
+pub(crate) fn sanitize_forked_transcript(transcript: &mut [Item]) {
+    for item in transcript {
+        let assistant = item.kind == ItemKind::Assistant;
+        item.parts.retain_mut(|part| {
+            let is_media = matches!(part, Part::Media(_));
+            let metadata = match part {
+                Part::ToolCall(call) => Some(&mut call.metadata),
+                Part::Reasoning(reasoning) => Some(&mut reasoning.metadata),
+                Part::Media(media) => Some(&mut media.metadata),
+                _ => None,
+            };
+            let Some(metadata) = metadata else {
+                return true;
+            };
+            metadata.remove(OPENAI_RESPONSES_CONTINUATION);
+            metadata.remove(OPENAI_SUBSCRIPTION_CONTINUATION);
+            !(assistant && is_media)
+        });
+    }
 }
 
 /// Reports whether any tool call in `transcript` is still unanswered.
@@ -120,6 +149,60 @@ mod tests {
                 ToolOutput::text("done"),
             ))],
         )
+    }
+
+    #[test]
+    fn fork_removes_session_bound_continuations_and_generated_images() {
+        let mut continuation = MetadataMap::new();
+        continuation.insert(
+            OPENAI_RESPONSES_CONTINUATION.into(),
+            json!({ "session_id": "source" }),
+        );
+        continuation.insert(
+            OPENAI_SUBSCRIPTION_CONTINUATION.into(),
+            json!({ "session_id": "source" }),
+        );
+        continuation.insert("preserved".into(), true.into());
+        let user_media = Part::media(
+            agentkit_core::Modality::Image,
+            "image/png",
+            agentkit_core::DataRef::InlineBytes(vec![3]),
+        );
+        let mut transcript = vec![
+            Item::new(
+                ItemKind::Assistant,
+                vec![
+                    Part::ToolCall(
+                        ToolCallPart::new("call-1", "compose", json!({}))
+                            .with_metadata(continuation.clone()),
+                    ),
+                    Part::media(
+                        agentkit_core::Modality::Image,
+                        "image/png",
+                        agentkit_core::DataRef::InlineBytes(vec![1]),
+                    ),
+                    Part::Media(
+                        agentkit_core::MediaPart::new(
+                            agentkit_core::Modality::Image,
+                            "image/png",
+                            agentkit_core::DataRef::InlineBytes(vec![2]),
+                        )
+                        .with_metadata(continuation),
+                    ),
+                ],
+            ),
+            Item::new(ItemKind::User, vec![user_media.clone()]),
+        ];
+
+        sanitize_forked_transcript(&mut transcript);
+
+        assert_eq!(transcript[0].parts.len(), 1);
+        let Part::ToolCall(call) = &transcript[0].parts[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(call.metadata.len(), 1);
+        assert_eq!(call.metadata["preserved"], true);
+        assert_eq!(transcript[1].parts, vec![user_media]);
     }
 
     #[test]

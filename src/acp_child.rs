@@ -1,7 +1,7 @@
 //! Generic parent-owned ACP subprocesses used for nested agents.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -36,6 +36,8 @@ const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
 const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
+const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
+const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
 pub const BUILTIN_HARNESS: &str = "acp.kit";
 
 /// How a headless nested ACP client handles permission requests.
@@ -422,6 +424,7 @@ struct Prompt {
 struct Fork {
     session_id: SessionId,
     model: Option<String>,
+    parent: Option<(String, String)>,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<SessionId, ChildError>>,
 }
@@ -437,6 +440,7 @@ enum Request {
 struct Ready {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
+    descendant_parent: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -535,6 +539,7 @@ pub(crate) struct ChildSession {
     capabilities: agentkit_acp::AgentCapabilities,
     serial: Arc<tokio::sync::Mutex<()>>,
     closed: watch::Receiver<bool>,
+    descendant_parent: Option<String>,
 }
 
 impl ChildSession {
@@ -594,6 +599,7 @@ impl ChildSession {
                 capabilities: ready.capabilities,
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: closed_rx,
+                descendant_parent: ready.descendant_parent,
             }),
             Err(error) => {
                 task.abort();
@@ -616,6 +622,11 @@ impl ChildSession {
     }
 
     pub async fn close(&self) -> Result<(), ChildError> {
+        if let Some(ancestor_id) = &self.descendant_parent {
+            crate::events::emit(&crate::events::RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: ancestor_id.clone(),
+            });
+        }
         if self.capabilities.session_capabilities.close.is_none() {
             return if self.tx.strong_count() == 1 {
                 Ok(())
@@ -657,6 +668,7 @@ impl ChildSession {
                 capabilities: agentkit_acp::AgentCapabilities::default(),
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: watch::channel(false).1,
+                descendant_parent: None,
             },
             closed_rx,
         )
@@ -672,12 +684,14 @@ impl ChildSession {
             capabilities: agentkit_acp::AgentCapabilities::default(),
             serial: Arc::new(tokio::sync::Mutex::new(())),
             closed: watch::channel(false).1,
+            descendant_parent: None,
         }
     }
 
     pub async fn fork(
         &self,
         model: Option<&str>,
+        parent: Option<(String, String)>,
         cancellation: &TurnCancellation,
     ) -> Result<Self, ChildError> {
         let _serial = tokio::select! {
@@ -689,11 +703,13 @@ impl ChildSession {
                 "ACP harness does not support session/fork".into(),
             ));
         }
+        let descendant_parent = parent.as_ref().map(|(id, _)| id.clone());
         let (reply, response) = oneshot::channel();
         tokio::select! {
             sent = self.tx.send(Request::Fork(Fork {
                 session_id: self.session_id.clone(),
                 model: model.map(str::to_owned),
+                parent,
                 cancellation: cancellation.clone(),
                 reply,
             })) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
@@ -708,6 +724,7 @@ impl ChildSession {
             capabilities: self.capabilities.clone(),
             serial: Arc::new(tokio::sync::Mutex::new(())),
             closed: self.closed.clone(),
+            descendant_parent,
         })
     }
 
@@ -804,6 +821,7 @@ async fn run(
         .ok_or("could not open ACP harness stderr")?;
     let label = harness.clone();
     let ancestor_id = config.parent_id.clone();
+    let descendant_parent = ancestor_id.clone();
     tokio::spawn(async move {
         forward_stderr(
             stderr,
@@ -878,7 +896,11 @@ async fn run(
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = JoinSet::new();
             ready_flag.store(true, Ordering::Release);
-            let _ = ready.send(Ok(Ready { session_id: session.session_id, capabilities }));
+            let _ = ready.send(Ok(Ready {
+                session_id: session.session_id,
+                capabilities,
+                descendant_parent,
+            }));
             loop {
                 let request = tokio::select! {
                     request = rx.recv() => match request { Some(request) => request, None => break },
@@ -890,12 +912,15 @@ async fn run(
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
-                        let fatal = fatal_tx.clone();
                         tasks.spawn(async move {
-                            let request = connection
-                                .send_request(ForkSessionRequest::new(fork.session_id, root))
-                                .block_task();
-                            tokio::pin!(request);
+                            let mut request = ForkSessionRequest::new(fork.session_id, root);
+                            if let Some((id, name)) = fork.parent {
+                                request.meta = Some(serde_json::Map::from_iter([
+                                    (FORK_PARENT_ID_META.into(), Value::String(id)),
+                                    (FORK_PARENT_NAME_META.into(), Value::String(name)),
+                                ]));
+                            }
+                            let mut request = Box::pin(connection.send_request(request).block_task());
                             let result = tokio::select! {
                                 result = &mut request => match result {
                                     Ok(response) => {
@@ -944,11 +969,53 @@ async fn run(
                                     Err(error) => Err(ChildError::Failed(error.to_string())),
                                 },
                                 () = fork.cancellation.cancelled() => {
-                                    let _ = fatal.send(());
+                                    let cleanup_connection = connection.clone();
+                                    let cleanup_sessions = Arc::clone(&sessions);
+                                    tokio::spawn(async move {
+                                        let Ok(response) = request.await else {
+                                            return;
+                                        };
+                                        let session_id = response.session_id;
+                                        let closed = supports_close
+                                            && tokio::time::timeout(
+                                                CANCEL_SETTLE,
+                                                cleanup_connection
+                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .block_task(),
+                                            )
+                                            .await
+                                            .is_ok_and(|result| result.is_ok());
+                                        if !closed
+                                            && let Ok(mut sessions) = cleanup_sessions.lock()
+                                        {
+                                            sessions.push(session_id);
+                                        }
+                                    });
                                     Err(ChildError::Cancelled)
-                                }
+                                },
                                 () = tokio::time::sleep(HANDSHAKE) => {
-                                    let _ = fatal.send(());
+                                    let cleanup_connection = connection.clone();
+                                    let cleanup_sessions = Arc::clone(&sessions);
+                                    tokio::spawn(async move {
+                                        let Ok(response) = request.await else {
+                                            return;
+                                        };
+                                        let session_id = response.session_id;
+                                        let closed = supports_close
+                                            && tokio::time::timeout(
+                                                CANCEL_SETTLE,
+                                                cleanup_connection
+                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .block_task(),
+                                            )
+                                            .await
+                                            .is_ok_and(|result| result.is_ok());
+                                        if !closed
+                                            && let Ok(mut sessions) = cleanup_sessions.lock()
+                                        {
+                                            sessions.push(session_id);
+                                        }
+                                    });
                                     Err(ChildError::Failed(format!(
                                         "ACP harness did not answer session/fork within {} seconds",
                                         HANDSHAKE.as_secs()
@@ -1089,20 +1156,31 @@ async fn forward_stderr(
     ancestor_id: Option<&str>,
     mut output: impl FnMut(ForwardedStderr),
 ) {
+    let mut ancestors = ancestor_id
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if crate::events::parse(&line).is_some_and(|event| event.forward_from_child()) {
+        if let Some(event) = crate::events::parse(&line)
+            && event.forward_from_child()
+        {
+            if let crate::events::RuntimeEvent::SubagentStateChanged {
+                parent_id: Some(parent_id),
+                ..
+            } = event
+            {
+                ancestors.insert(parent_id);
+            }
             // Preserve recursively forwarded private runtime events byte-for-byte.
             output(ForwardedStderr::RuntimeLine(line));
         } else if let Some(line) = harness_diagnostic(label, &line) {
             output(ForwardedStderr::Diagnostic(line));
         }
     }
-    if let Some(ancestor_id) = ancestor_id {
+    for ancestor_id in ancestors {
         output(ForwardedStderr::Cleanup(
-            crate::events::RuntimeEvent::SubagentDescendantsRemoved {
-                ancestor_id: ancestor_id.to_owned(),
-            },
+            crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
         ));
     }
 }
@@ -1829,7 +1907,10 @@ mod tests {
                 .text,
             "standard"
         );
-        let closed = base.fork(None, &TurnCancellation::default()).await.unwrap();
+        let closed = base
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
         closed.close().await.unwrap();
         assert_eq!(
             base.prompt("after sibling close".into(), TurnCancellation::default())
@@ -1839,8 +1920,14 @@ mod tests {
             "after sibling close"
         );
 
-        let first = base.fork(None, &TurnCancellation::default()).await.unwrap();
-        let second = base.fork(None, &TurnCancellation::default()).await.unwrap();
+        let first = base
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
+        let second = base
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(
             first.prompt("first".into(), TurnCancellation::default()),
@@ -1854,7 +1941,10 @@ mod tests {
             started.elapsed()
         );
 
-        let same_session = base.fork(None, &TurnCancellation::default()).await.unwrap();
+        let same_session = base
+            .fork(None, None, &TurnCancellation::default())
+            .await
+            .unwrap();
         let same_session_clone = same_session.clone();
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(
@@ -1868,6 +1958,72 @@ mod tests {
             "one logical session was not serialized: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_native_fork_keeps_the_shared_process_usable() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release-fork");
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "mock".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![
+                    format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
+                    format!("--fork-release={}", release.display()),
+                ],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        );
+        let config = ChildConfig {
+            root: root.path().to_path_buf(),
+            model: "unused".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses: AcpHarnesses::new(profiles).unwrap(),
+            default_harness: "acp.mock".into(),
+            parent_id: None,
+            parent_name: None,
+        };
+        let base = ChildSession::start(
+            config,
+            "acp.mock".into(),
+            None,
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        .unwrap();
+        let controller = agentkit_core::CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        let child = base.clone();
+        let fork = tokio::spawn(async move { child.fork(None, None, &cancellation).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        controller.interrupt();
+
+        assert!(matches!(fork.await.unwrap(), Err(ChildError::Cancelled)));
+        assert_eq!(
+            base.prompt(
+                "source survives cancellation".into(),
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap()
+            .text,
+            "source survives cancellation"
+        );
+        std::fs::write(release, b"ready").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        base.close().await.unwrap();
     }
 
     #[test]

@@ -76,6 +76,7 @@ struct Writer {
     workspace_root: PathBuf,
     file: File,
     lock: SessionLock,
+    created: Option<CreatedTranscript>,
 }
 
 struct SessionLock {
@@ -90,6 +91,12 @@ struct SessionLock {
 struct CreatedTranscript {
     path: PathBuf,
     keep: bool,
+}
+
+#[derive(Clone, Copy)]
+struct InitialTranscriptOptions {
+    stamp_items: bool,
+    commit_creation: bool,
 }
 
 impl CreatedTranscript {
@@ -160,7 +167,8 @@ pub(crate) fn clone_completed_in(
     source: &str,
     destination: &str,
 ) -> Result<(), String> {
-    let transcript = load_in(root, directory, source)?;
+    let mut transcript = load_in(root, directory, source)?;
+    crate::transcript::sanitize_forked_transcript(&mut transcript);
     let opened = open_with_initial_timestamps_in(
         root,
         directory,
@@ -168,7 +176,10 @@ pub(crate) fn clone_completed_in(
         false,
         false,
         transcript,
-        false,
+        InitialTranscriptOptions {
+            stamp_items: false,
+            commit_creation: true,
+        },
     )?;
     drop(opened);
     Ok(())
@@ -246,7 +257,37 @@ pub(crate) fn open_in(
     force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
-    open_with_initial_timestamps_in(root, directory, session_id, resume, force, initial, true)
+    open_with_initial_timestamps_in(
+        root,
+        directory,
+        session_id,
+        resume,
+        force,
+        initial,
+        InitialTranscriptOptions {
+            stamp_items: true,
+            commit_creation: true,
+        },
+    )
+}
+
+pub(crate) fn open_uncommitted(
+    root: &Path,
+    session_id: &str,
+    initial: Vec<Item>,
+) -> Result<OpenSession, String> {
+    open_with_initial_timestamps_in(
+        root,
+        &default_directory()?,
+        session_id,
+        false,
+        false,
+        initial,
+        InitialTranscriptOptions {
+            stamp_items: true,
+            commit_creation: false,
+        },
+    )
 }
 
 fn open_with_initial_timestamps_in(
@@ -256,7 +297,7 @@ fn open_with_initial_timestamps_in(
     resume: bool,
     force: bool,
     initial: Vec<Item>,
-    stamp_initial: bool,
+    initial_options: InitialTranscriptOptions,
 ) -> Result<OpenSession, String> {
     validate_id(session_id)?;
     if !resume && initial.is_empty() {
@@ -321,7 +362,7 @@ fn open_with_initial_timestamps_in(
     let file = options
         .open(&path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    let mut created = (!resume).then(|| CreatedTranscript::new(path.clone()));
+    let created = (!resume).then(|| CreatedTranscript::new(path.clone()));
     let mut writer = Writer {
         session_id: session_id.into(),
         generation,
@@ -329,13 +370,14 @@ fn open_with_initial_timestamps_in(
         workspace_root,
         file,
         lock,
+        created,
     };
     if resume && stored_workspace.is_none() {
         writer.replace(&transcript)?;
     }
     if !resume {
         for mut item in initial {
-            if stamp_initial {
+            if initial_options.stamp_items {
                 stamp_item(&mut item, Timestamp::now());
                 writer.append(&item)?;
             } else {
@@ -356,8 +398,8 @@ fn open_with_initial_timestamps_in(
     for item in crate::transcript::repair_unanswered_tool_calls(&mut transcript) {
         writer.append(&item)?;
     }
-    if let Some(created) = created.take() {
-        created.keep();
+    if initial_options.commit_creation {
+        writer.commit_creation();
     }
     Ok(OpenSession {
         transcript,
@@ -366,6 +408,13 @@ fn open_with_initial_timestamps_in(
 }
 
 impl SessionObserver {
+    pub(crate) fn commit_creation(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit_creation();
+    }
+
     /// Durably records a complete transcript replacement produced by a mutator.
     /// Existing append records remain intact, while readers treat this record as
     /// a new canonical snapshot.
@@ -393,6 +442,12 @@ impl TranscriptObserver for SessionObserver {
 }
 
 impl Writer {
+    fn commit_creation(&mut self) {
+        if let Some(created) = self.created.take() {
+            created.keep();
+        }
+    }
+
     fn append(&mut self, item: &Item) -> Result<(), String> {
         if item.created_at.is_none() {
             return Err("transcript item missing created_at before persistence".into());
@@ -1636,7 +1691,8 @@ pub(crate) fn validate_id(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentkit_core::{ItemKind, Part};
+    use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
+    use serde_json::json;
 
     fn session_directory(root: &Path) -> PathBuf {
         root.join("sessions")
@@ -1995,6 +2051,53 @@ mod tests {
         let cloned = load(root.path(), "branch").unwrap();
         assert_eq!(cloned[0].created_at, None);
         assert_eq!(cloned[1].created_at, Some(Timestamp(77)));
+    }
+
+    #[test]
+    fn cloning_sanitizes_session_bound_continuation_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "openai.responses.continuation.v1".into(),
+            json!({ "session_id": "source" }),
+        );
+        metadata.insert("preserved".into(), true.into());
+        let source = open(
+            root.path(),
+            "source",
+            false,
+            false,
+            vec![Item::new(
+                ItemKind::Assistant,
+                vec![Part::Reasoning(
+                    ReasoningPart::summary("thought").with_metadata(metadata),
+                )],
+            )],
+        )
+        .unwrap();
+        drop(source);
+
+        clone_completed(root.path(), "source", "branch").unwrap();
+
+        let source = load(root.path(), "source").unwrap();
+        let branch = load(root.path(), "branch").unwrap();
+        let Part::Reasoning(source) = &source[0].parts[0] else {
+            panic!("expected source reasoning");
+        };
+        let Part::Reasoning(branch) = &branch[0].parts[0] else {
+            panic!("expected branch reasoning");
+        };
+        assert!(
+            source
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert!(
+            !branch
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert_eq!(branch.metadata["preserved"], true);
     }
 
     #[test]

@@ -15,15 +15,16 @@ use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
     AudioContent, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
     BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ImageContent,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, Notice,
-    NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    TextContent, TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
+    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
+    ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
+    ResourceLink, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionForkCapabilities, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use agentkit_core::{
     CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
@@ -48,12 +49,14 @@ pub mod v2;
 
 use crate::{
     provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
-    runtime::{AcpDriverContext, BackgroundJobs, DetachRegistration, Runtime},
+    runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, DetachRegistration, Runtime},
 };
 
 const MODEL_CONFIG_ID: &str = "model";
 const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const SESSION_LIST_PAGE_SIZE: usize = 100;
+const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
+const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
 
 fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
     SessionNotification::new(
@@ -344,6 +347,10 @@ enum Command {
         request: SetSessionConfigOptionRequest,
         reply: oneshot::Sender<Result<SetSessionConfigOptionResponse, AcpRuntimeError>>,
     },
+    Fork {
+        parent_context: Option<(String, String)>,
+        reply: oneshot::Sender<Result<AcpForkState, AcpRuntimeError>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -563,12 +570,19 @@ struct AttachedSession {
     config_options: Vec<SessionConfigOption>,
     canonical_transcript: Vec<Item>,
     activation: oneshot::Sender<()>,
+    pending_fork_creation: Option<crate::session::SessionObserver>,
 }
 
 struct PreparedLoad {
     response: LoadSessionResponse,
     replay: Vec<SessionNotification>,
     activation: oneshot::Sender<()>,
+}
+
+struct PreparedFork {
+    response: ForkSessionResponse,
+    activation: oneshot::Sender<()>,
+    creation: crate::session::SessionObserver,
 }
 
 /// Owns an ACP integration binding for an in-flight request or live actor.
@@ -700,6 +714,7 @@ impl Server {
                 request.additional_directories,
                 connection,
                 claim,
+                None,
             )
             .await?;
         let AttachedSession {
@@ -770,6 +785,7 @@ impl Server {
                 request.additional_directories,
                 connection,
                 claim,
+                None,
             )
             .await?;
         let replay = transcript_replay(&attached.session_id, &attached.canonical_transcript);
@@ -780,12 +796,56 @@ impl Server {
         })
     }
 
+    async fn fork_session(
+        self: &Arc<Self>,
+        request: ForkSessionRequest,
+        connection: ConnectionTo<Client>,
+    ) -> Result<PreparedFork, AcpRuntimeError> {
+        if !request.mcp_servers.is_empty() {
+            return Err(AcpRuntimeError::Loop(
+                "Kit does not accept per-session MCP servers".into(),
+            ));
+        }
+        let parent_context = fork_parent_context(request.meta.as_ref());
+        let sender = self.sender(&request.session_id).await?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(Command::Fork {
+                parent_context,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        let forked = rx
+            .await
+            .map_err(|_| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))??;
+        let claim = self.runtime.claim_session_fork()?;
+        let attached = self
+            .attach_session(
+                request.cwd,
+                request.additional_directories,
+                connection,
+                claim,
+                Some(forked),
+            )
+            .await?;
+        Ok(PreparedFork {
+            response: ForkSessionResponse::new(attached.session_id)
+                .config_options(Some(attached.config_options)),
+            activation: attached.activation,
+            creation: attached
+                .pending_fork_creation
+                .expect("fork attachment must defer transcript creation"),
+        })
+    }
+
     async fn attach_session(
         self: &Arc<Self>,
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         connection: ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
+        forked: Option<AcpForkState>,
     ) -> Result<AttachedSession, AcpRuntimeError> {
         // Claim the durable identity before binding ACP so every layer uses
         // the same id and any bind failure releases the selection or reservation.
@@ -826,7 +886,11 @@ impl Server {
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
         };
-        let driver = match self.runtime.start_acp_driver(context, &mut claim).await {
+        let driver = match self
+            .runtime
+            .start_acp_driver_with_initial(context, &mut claim, forked)
+            .await
+        {
             Ok(driver) => driver,
             Err(error) => {
                 return Err(record_acp_runtime_failure(
@@ -903,14 +967,19 @@ impl Server {
         self.registry
             .register(registered)
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
-        if let Err(error) = claim.commit() {
-            self.registry.remove(token);
-            return Err(record_acp_runtime_failure(
-                &session_id,
-                "session_commit",
-                error,
-            ));
-        }
+        let pending_fork_creation = if claim.is_fork() {
+            Some(claim.defer_fork_commit())
+        } else {
+            if let Err(error) = claim.commit() {
+                self.registry.remove(token);
+                return Err(record_acp_runtime_failure(
+                    &session_id,
+                    "session_commit",
+                    error,
+                ));
+            }
+            None
+        };
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
             session_id: session_id.to_string(),
         });
@@ -930,6 +999,7 @@ impl Server {
             config_options,
             canonical_transcript,
             activation,
+            pending_fork_creation,
         })
     }
 
@@ -1141,6 +1211,24 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 Some(Command::Cancel) => {}
                 Some(Command::SetConfig { request, reply }) => {
                     let result = set_config(&adapter, &catalog, request);
+                    let _ = reply.send(result);
+                }
+                Some(Command::Fork {
+                    parent_context,
+                    reply,
+                }) => {
+                    let result = (|| {
+                        let mut transcript = driver.snapshot().transcript;
+                        crate::transcript::sanitize_forked_transcript(&mut transcript);
+                        Ok(AcpForkState {
+                            transcript,
+                            selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
+                            reasoning_effort: adapter
+                                .reasoning_effort()
+                                .map_err(AcpRuntimeError::Loop)?,
+                            parent_context,
+                        })
+                    })();
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -1768,6 +1856,29 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: ForkSessionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    let connection = cx.clone();
+                    cx.spawn(async move {
+                        match state.fork_session(request, connection.clone()).await {
+                            Ok(prepared) => {
+                                let session_id = prepared.response.session_id.clone();
+                                responder.respond(prepared.response)?;
+                                prepared.creation.commit_creation();
+                                let _ = prepared.activation.send(());
+                                connection.send_notification(available_commands_update(session_id))
+                            }
+                            Err(error) => responder.respond_with_result(Err(sdk_error(error))),
+                        }
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: ListSessionsRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -1866,6 +1977,24 @@ fn component(
         ))
 }
 
+fn fork_parent_context(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<(String, String)> {
+    let meta = meta?;
+    let id = meta.get(FORK_PARENT_ID_META)?.as_str()?;
+    let name = meta.get(FORK_PARENT_NAME_META)?.as_str()?;
+    crate::session::validate_id(id).ok()?;
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    {
+        return None;
+    }
+    Some((id.into(), name.into()))
+}
+
 fn parse_session_list_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
     cursor
         .strip_prefix("offset:")
@@ -1885,6 +2014,7 @@ fn capabilities() -> agentkit_acp::AgentCapabilities {
         .session_capabilities(
             SessionCapabilities::new()
                 .list(SessionListCapabilities::new())
+                .fork(SessionForkCapabilities::new())
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
         )
@@ -3659,9 +3789,17 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn kit_server_advertises_supported_session_discovery_and_restoration() {
+    async fn kit_server_advertises_supported_session_discovery_restoration_and_forking() {
         let root = tempfile::tempdir().unwrap();
-        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
         let (client_transport, agent_transport) = Channel::duplex();
         let server = tokio::spawn(serve_transport(runtime, agent_transport));
 
@@ -3677,7 +3815,7 @@ pub(super) mod tests {
                 let sessions = &initialized.agent_capabilities.session_capabilities;
                 assert!(sessions.list.is_some());
                 assert!(sessions.resume.is_none());
-                assert!(sessions.fork.is_none());
+                assert!(sessions.fork.is_some());
 
                 let listed = connection
                     .send_request(ListSessionsRequest::new().cwd(root.path().to_path_buf()))
@@ -3696,13 +3834,43 @@ pub(super) mod tests {
                 assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
 
                 connection
-                    .send_request(agentkit_acp::ForkSessionRequest::new(
+                    .send_request(ForkSessionRequest::new(
                         "missing",
                         root.path().to_path_buf(),
                     ))
                     .block_task()
                     .await
-                    .expect_err("the Kit ACP server has no session/fork route");
+                    .expect_err("an unknown fork source must fail");
+
+                let source = connection
+                    .send_request(NewSessionRequest::new(root.path().to_path_buf()))
+                    .block_task()
+                    .await?;
+                let configured = connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        source.session_id.clone(),
+                        REASONING_EFFORT_CONFIG_ID,
+                        "high",
+                    ))
+                    .block_task()
+                    .await?;
+                let fork = connection
+                    .send_request(ForkSessionRequest::new(
+                        source.session_id.clone(),
+                        root.path().to_path_buf(),
+                    ))
+                    .block_task()
+                    .await?;
+                assert_ne!(fork.session_id, source.session_id);
+                assert_eq!(fork.config_options, Some(configured.config_options));
+                connection
+                    .send_request(CloseSessionRequest::new(fork.session_id))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(source.session_id))
+                    .block_task()
+                    .await?;
                 Ok(())
             })
             .await
