@@ -373,16 +373,11 @@ where
             }
             return;
         }
+        // A cancelled turn leaves its last streamed attempt visible. Only an explicit
+        // supersession event proves that the current attempt is stale and must be cleared.
         if matches!(&event.event, AgentEvent::ResponseAttemptSuperseded) {
             self.clear_current();
             return;
-        }
-        if matches!(
-            &event.event,
-            AgentEvent::TurnFinished(result)
-                if result.finish_reason == FinishReason::Cancelled
-        ) {
-            self.clear_current();
         }
         if matches!(
             &event.event,
@@ -2256,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn response_replacement_clears_streamed_messages_when_turn_is_cancelled() {
+    fn response_replacement_preserves_streamed_messages_when_turn_is_cancelled() {
         let integration = AcpIntegration::default();
         let recording = RecordingSink::default();
         let sink = ResponseReplacementSink::new(recording.clone());
@@ -2305,26 +2300,16 @@ mod tests {
         emit(finish("turn-1", FinishReason::Cancelled));
 
         let updates = recording.updates.lock().unwrap();
-        assert_eq!(updates.len(), 4);
-        let agent_id = match &updates[0].update {
-            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
-            update => panic!("expected agent message chunk, got {update:?}"),
-        };
-        let thought_id = match &updates[1].update {
-            wire::SessionUpdate::AgentThoughtChunk(chunk) => chunk.message_id.clone(),
-            update => panic!("expected agent thought chunk, got {update:?}"),
-        };
+        assert_eq!(updates.len(), 2);
         assert!(matches!(
-            &updates[2].update,
-            wire::SessionUpdate::AgentMessage(message)
-                if message.message_id == agent_id
-                    && message.content.value().is_some_and(Vec::is_empty)
+            &updates[0].update,
+            wire::SessionUpdate::AgentMessageChunk(chunk)
+                if chunk.content == wire::ContentBlock::Text(wire::TextContent::new("answer"))
         ));
         assert!(matches!(
-            &updates[3].update,
-            wire::SessionUpdate::AgentThought(message)
-                if message.message_id == thought_id
-                    && message.content.value().is_some_and(Vec::is_empty)
+            &updates[1].update,
+            wire::SessionUpdate::AgentThoughtChunk(chunk)
+                if chunk.content == wire::ContentBlock::Text(wire::TextContent::new("thinking"))
         ));
         drop(updates);
 
@@ -2334,7 +2319,7 @@ mod tests {
         });
         emit_part("message-2", agentkit_core::PartKind::Text, "completed");
         emit(finish("turn-2", FinishReason::Completed));
-        assert_eq!(recording.updates.lock().unwrap().len(), 5);
+        assert_eq!(recording.updates.lock().unwrap().len(), 3);
 
         emit(AgentEvent::TurnStarted {
             session_id: loop_session_id.clone(),
@@ -2349,16 +2334,12 @@ mod tests {
         emit(finish("turn-3", FinishReason::Cancelled));
 
         let updates = recording.updates.lock().unwrap();
-        assert_eq!(updates.len(), 7);
-        let replacement_id = match &updates[5].update {
-            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
-            update => panic!("expected replacement message chunk, got {update:?}"),
-        };
+        assert_eq!(updates.len(), 4);
         assert!(matches!(
-            &updates[6].update,
-            wire::SessionUpdate::AgentMessage(message)
-                if message.message_id == replacement_id
-                    && message.content.value().is_some_and(Vec::is_empty)
+            &updates[3].update,
+            wire::SessionUpdate::AgentMessageChunk(chunk)
+                if chunk.content
+                    == wire::ContentBlock::Text(wire::TextContent::new("partial replacement"))
         ));
     }
 
@@ -2385,40 +2366,40 @@ mod tests {
         events: VecDeque<ModelTurnEvent>,
     }
 
-    struct MarkerCancellationAdapter {
+    struct StreamingCancellationAdapter {
         interrupt: AcpSessionHandle,
     }
 
-    struct MarkerCancellationSession {
+    struct StreamingCancellationSession {
         interrupt: AcpSessionHandle,
     }
 
-    struct MarkerCancellationTurn {
+    struct StreamingCancellationTurn {
         interrupt: AcpSessionHandle,
         next: u8,
     }
 
     #[async_trait]
-    impl ModelAdapter for MarkerCancellationAdapter {
-        type Session = MarkerCancellationSession;
+    impl ModelAdapter for StreamingCancellationAdapter {
+        type Session = StreamingCancellationSession;
 
         async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
-            Ok(MarkerCancellationSession {
+            Ok(StreamingCancellationSession {
                 interrupt: self.interrupt.clone(),
             })
         }
     }
 
     #[async_trait]
-    impl ModelSession for MarkerCancellationSession {
-        type Turn = MarkerCancellationTurn;
+    impl ModelSession for StreamingCancellationSession {
+        type Turn = StreamingCancellationTurn;
 
         async fn begin_turn(
             &mut self,
             _request: TurnRequest,
             _cancellation: Option<TurnCancellation>,
         ) -> Result<Self::Turn, LoopError> {
-            Ok(MarkerCancellationTurn {
+            Ok(StreamingCancellationTurn {
                 interrupt: self.interrupt.clone(),
                 next: 0,
             })
@@ -2426,7 +2407,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ModelTurn for MarkerCancellationTurn {
+    impl ModelTurn for StreamingCancellationTurn {
         async fn next_event(
             &mut self,
             _cancellation: Option<TurnCancellation>,
@@ -2442,7 +2423,7 @@ mod tests {
                 }),
                 2 => {
                     self.interrupt.interrupt();
-                    ModelTurnEvent::ResponseAttemptSuperseded
+                    return Err(LoopError::Cancelled);
                 }
                 _ => return Ok(None),
             };
@@ -2594,7 +2575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_driver_cancellation_clears_streamed_message_when_marker_is_suppressed() {
+    async fn loop_driver_cancellation_preserves_streamed_message() {
         let integration = AcpIntegration::default();
         let recording = RecordingSink::default();
         let sink = ResponseReplacementSink::new(recording.clone());
@@ -2609,7 +2590,7 @@ mod tests {
             .unwrap();
         let observer = ResponseReplacementObserver::new(integration, sink, session_id);
         let mut driver = Agent::builder()
-            .model(MarkerCancellationAdapter {
+            .model(StreamingCancellationAdapter {
                 interrupt: handle.clone(),
             })
             .observer(observer)
@@ -2629,16 +2610,11 @@ mod tests {
         assert_eq!(result.finish_reason, FinishReason::Cancelled);
 
         let updates = recording.updates.lock().unwrap();
-        assert_eq!(updates.len(), 2);
-        let message_id = match &updates[0].update {
-            wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
-            update => panic!("expected partial message chunk, got {update:?}"),
-        };
+        assert_eq!(updates.len(), 1);
         assert!(matches!(
-            &updates[1].update,
-            wire::SessionUpdate::AgentMessage(message)
-                if message.message_id == message_id
-                    && message.content.value().is_some_and(Vec::is_empty)
+            &updates[0].update,
+            wire::SessionUpdate::AgentMessageChunk(chunk)
+                if chunk.content == wire::ContentBlock::Text(wire::TextContent::new("partial answer"))
         ));
     }
 
