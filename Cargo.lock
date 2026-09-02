@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=64244da92cfe983d7da8bf5ecac20b54bce4677a#64244da92cfe983d7da8bf5ecac20b54bce4677a"
+source = "git+https://github.com/danielkov/agentkit.git?rev=7604f6c2ba1eed1de83fe3d9a0058192b5623bb4#7604f6c2ba1eed1de83fe3d9a0058192b5623bb4"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -241,8 +241,7 @@ dependencies = [
 [[package]]
 name = "agentkit-loop"
 version = "0.10.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f9deddd6431bb2368aebd5eb51f3b43256c8347bfde9769ff726804dbc86355"
+source = "git+https://github.com/danielkov/agentkit.git?rev=7604f6c2ba1eed1de83fe3d9a0058192b5623bb4#7604f6c2ba1eed1de83fe3d9a0058192b5623bb4"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
