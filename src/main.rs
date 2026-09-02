@@ -454,6 +454,21 @@ enum AuthAction {
 }
 
 #[derive(Subcommand)]
+enum SessionsAction {
+    /// Set or clear a session's custom display name.
+    Rename {
+        /// Durable session ID.
+        session_id: String,
+        /// New display name.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        name: Option<String>,
+        /// Clear the custom name and restore the generated title.
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Write the recommended configuration to ~/.kit/config.toml.
     Init,
@@ -464,10 +479,12 @@ enum Command {
         #[command(flatten)]
         credentials: CredentialArgs,
     },
-    /// List durable sessions for a workspace, newest first.
+    /// List or rename durable sessions for a workspace.
     Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
+        #[arg(long, global = true)]
         root: Option<PathBuf>,
     },
     /// Serve ACP on stdio with A2A, remote ACP, or both over HTTP.
@@ -834,9 +851,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = Config::load_default()?;
-    if let Command::Sessions { root } = &cli.command {
+    if let Command::Sessions { action, root } = &cli.command {
         let root = config.root(root.clone());
-        print!("{}", format_sessions(&kit::session::catalog(&root)?));
+        match action {
+            None => print!("{}", format_sessions(&kit::session::catalog(&root)?)),
+            Some(SessionsAction::Rename {
+                session_id,
+                name,
+                clear,
+            }) => {
+                let display_name = if *clear { None } else { name.as_deref() };
+                kit::session::set_display_name(&root, session_id, display_name)?;
+                if *clear {
+                    println!("Cleared name for session {session_id}");
+                } else if let Some(name) = name {
+                    println!("Renamed session {session_id} to \"{}\"", name.trim());
+                }
+            }
+        }
         return Ok(());
     }
     let openrouter_api_key =
@@ -1139,8 +1171,8 @@ mod tests {
 
     use super::{
         AuthAction, AuthProvider, Cli, Command, Config, CredentialArgs, CredentialStoreKind,
-        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, format_sessions,
-        init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
+        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, SessionsAction,
+        format_sessions, init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
         validate_auth_storage,
     };
 
@@ -1617,20 +1649,76 @@ future_option = true
         let cli = Cli::try_parse_from(["kit", "sessions", "--root", "/tmp/project"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Sessions { root: Some(root) }
+            Command::Sessions { action: None, root: Some(root) }
                 if root.as_path() == std::path::Path::new("/tmp/project")
         ));
 
         let output = format_sessions(&[kit::session::CatalogEntry {
             id: "session-1".into(),
-            title: Some("Fix tests".into()),
+            title: Some("OAuth token bug".into()),
             preview: Some("Fix tests in the catalog".into()),
             is_subagent: false,
             updated_at: 0,
         }]);
         assert_eq!(
             output,
-            "UPDATED\tID\tTITLE\tPREVIEW\n1970-01-01T00:00:00.000Z\tsession-1\tFix tests\tFix tests in the catalog\n"
+            "UPDATED\tID\tTITLE\tPREVIEW\n1970-01-01T00:00:00.000Z\tsession-1\tOAuth token bug\tFix tests in the catalog\n"
+        );
+    }
+
+    #[test]
+    fn sessions_rename_accepts_names_clear_and_root_in_either_position() {
+        let named = Cli::try_parse_from([
+            "kit",
+            "sessions",
+            "rename",
+            "s-abc123",
+            "OAuth token bug",
+            "--root",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert!(matches!(
+            named.command,
+            Command::Sessions {
+                action: Some(SessionsAction::Rename {
+                    session_id,
+                    name: Some(name),
+                    clear: false,
+                }),
+                root: Some(root),
+            } if session_id == "s-abc123"
+                && name == "OAuth token bug"
+                && root == std::path::Path::new("/tmp/project")
+        ));
+
+        let cleared = Cli::try_parse_from([
+            "kit",
+            "sessions",
+            "--root",
+            "/tmp/project",
+            "rename",
+            "s-abc123",
+            "--clear",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cleared.command,
+            Command::Sessions {
+                action: Some(SessionsAction::Rename {
+                    session_id,
+                    name: None,
+                    clear: true,
+                }),
+                root: Some(root),
+            } if session_id == "s-abc123"
+                && root == std::path::Path::new("/tmp/project")
+        ));
+
+        assert!(Cli::try_parse_from(["kit", "sessions", "rename", "s-abc123"]).is_err());
+        assert!(
+            Cli::try_parse_from(["kit", "sessions", "rename", "s-abc123", "name", "--clear",])
+                .is_err()
         );
     }
 

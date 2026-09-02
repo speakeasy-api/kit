@@ -762,7 +762,7 @@ impl Server {
             .iter()
             .map(|entry| {
                 SessionInfo::new(entry.id.clone(), cwd.clone())
-                    .title(entry.title.clone())
+                    .title(entry.title.as_deref().map(str::to_owned))
                     .updated_at(entry.updated_at_rfc3339())
             })
             .collect();

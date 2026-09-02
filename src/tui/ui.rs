@@ -28,7 +28,7 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 use super::{
     app::{
         AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
-        CachedTranscriptRow, Child, CodeHit, Phase, ToolCall, UserMessage,
+        CachedTranscriptRow, Child, CodeHit, Phase, SessionRename, ToolCall, UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -172,7 +172,7 @@ fn model_dialog_viewport(
 fn visible_query_tail(query: &str, width: usize) -> &str {
     let mut tail = query;
     while UnicodeWidthStr::width(tail) > width {
-        let Some((index, _)) = tail.char_indices().nth(1) else {
+        let Some((index, _)) = tail.grapheme_indices(true).nth(1) else {
             return "";
         };
         tail = &tail[index..];
@@ -187,9 +187,16 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
     } else {
         outer.width
     };
-    let height = outer
-        .height
-        .min((app.session_choices.len() as u16).saturating_add(3).min(22));
+    let rename = app
+        .session_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.rename.as_ref());
+    let prompt_rows = u16::from(rename.is_some());
+    let height = outer.height.min(
+        (app.session_choices.len() as u16)
+            .saturating_add(3 + prompt_rows)
+            .min(23),
+    );
     let area = Rect::new(
         outer.x + outer.width.saturating_sub(width) / 2,
         outer.y + outer.height.saturating_sub(height) / 2,
@@ -202,9 +209,13 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
         .map_or(0, |dialog| dialog.selected);
     let panel = Panel::bordered().title(" sessions ");
     let inner = panel.inner(area);
-    let footer_rows = u16::from(inner.height > 1);
-    let [list, footer] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).areas(inner);
+    let footer_rows = u16::from(inner.height > prompt_rows.saturating_add(1));
+    let [list, prompt, footer] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(prompt_rows),
+        Constraint::Length(footer_rows),
+    ])
+    .areas(inner);
     let visible = list.height as usize;
     let start = selected
         .saturating_sub(visible / 2)
@@ -220,15 +231,24 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
                 .as_deref()
                 .or(entry.preview.as_deref())
                 .unwrap_or("untitled");
+            let detail = entry
+                .preview
+                .as_deref()
+                .filter(|preview| *preview != label)
+                .map_or_else(
+                    || label.to_string(),
+                    |preview| format!("{label} — {preview}"),
+                );
             let updated = entry.updated_at_rfc3339();
+            let text = format!(
+                "{}{} · {} · {}",
+                if is_selected { "› " } else { "  " },
+                &updated[..10],
+                entry.id,
+                detail
+            );
             Line::from(Span::styled(
-                format!(
-                    "{}{} · {} · {}",
-                    if is_selected { "› " } else { "  " },
-                    &updated[..10],
-                    entry.id,
-                    label
-                ),
+                truncate_to_width(&text, list.width as usize),
                 if is_selected {
                     theme::accent()
                 } else {
@@ -240,10 +260,52 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
     frame.render_widget(panel, area);
     frame.render_widget(Paragraph::new(lines), list);
+
+    let footer_text = match rename {
+        Some(SessionRename::Editing(_)) => "enter save · esc cancel",
+        Some(SessionRename::ConfirmClear) => "enter clear name · esc cancel",
+        Some(SessionRename::Saving) => "saving…",
+        None => "↑/↓ select · enter resume · r rename · esc close",
+    };
     frame.render_widget(
-        Paragraph::new(Span::styled("enter resume · esc close", theme::dim())),
+        Paragraph::new(Span::styled(footer_text, theme::dim())),
         footer,
     );
+
+    match rename {
+        Some(SessionRename::Editing(input)) if prompt.width > 0 => {
+            let prefix = "rename: ";
+            let prefix_width = UnicodeWidthStr::width(prefix).min(prompt.width as usize);
+            let value = visible_query_tail(
+                input,
+                (prompt.width as usize)
+                    .saturating_sub(prefix_width)
+                    .saturating_sub(1),
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(prefix, theme::dim()),
+                    Span::styled(value.to_string(), theme::text()),
+                ])),
+                prompt,
+            );
+            let column = prefix_width + UnicodeWidthStr::width(value);
+            frame.set_cursor_position(Position::new(
+                prompt.x
+                    + u16::try_from(column)
+                        .unwrap_or(u16::MAX)
+                        .min(prompt.width.saturating_sub(1)),
+                prompt.y,
+            ));
+        }
+        Some(SessionRename::ConfirmClear) => {
+            frame.render_widget(
+                Paragraph::new(Span::styled("Clear the custom name?", theme::text())),
+                prompt,
+            );
+        }
+        _ => {}
+    }
 }
 
 fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
@@ -1868,7 +1930,7 @@ mod tests {
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         tui::app::{
             Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog, ModelDialog,
-            Phase, Update, UserImage, UserMessage,
+            Phase, SessionDialog, SessionRename, Update, UserImage, UserMessage,
         },
     };
 
@@ -2337,6 +2399,57 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let dismissed = render(&mut app, 80, 24);
         assert!(!dismissed.contains(" commands "), "{dismissed}");
+    }
+
+    #[test]
+    fn session_dialog_renders_custom_names_and_inline_rename_states() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/project"),
+            "provider".into(),
+            "model".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.session_choices = vec![crate::session::CatalogEntry {
+            id: "s-abc123".into(),
+            title: Some("OAuth token bug".into()),
+            preview: Some("Preview remains available".into()),
+            is_subagent: false,
+            updated_at: 0,
+        }];
+        app.session_dialog = Some(SessionDialog {
+            selected: 0,
+            rename: None,
+        });
+
+        let browsing = render(&mut app, 88, 10);
+        assert!(browsing.contains("OAuth token bug"), "{browsing}");
+        assert!(browsing.contains("Preview remains available"), "{browsing}");
+
+        assert!(browsing.contains("r rename"), "{browsing}");
+        let tiny_browsing = render(&mut app, 40, 3);
+        assert!(tiny_browsing.contains("s-abc123"), "{tiny_browsing}");
+
+        app.session_dialog.as_mut().unwrap().rename =
+            Some(SessionRename::Editing("New name".into()));
+        let editing = render(&mut app, 54, 10);
+        assert!(editing.contains("rename: New name"), "{editing}");
+        assert!(editing.contains("enter save"), "{editing}");
+        let tiny_editing = render(&mut app, 40, 4);
+        assert!(tiny_editing.contains("s-abc123"), "{tiny_editing}");
+        assert!(tiny_editing.contains("rename: New name"), "{tiny_editing}");
+
+        app.session_dialog.as_mut().unwrap().rename = Some(SessionRename::ConfirmClear);
+        let confirming = render(&mut app, 32, 8);
+        assert!(
+            confirming.contains("Clear the custom name?"),
+            "{confirming}"
+        );
+        assert!(confirming.contains("enter clear name"), "{confirming}");
+
+        app.session_choices[0].title = Some("界".repeat(100));
+        app.session_dialog.as_mut().unwrap().rename = None;
+        let narrow = render(&mut app, 20, 6);
+        assert!(narrow.contains('…'), "{narrow}");
     }
 
     #[test]

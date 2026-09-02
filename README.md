@@ -241,7 +241,7 @@ subdir = "agent-plugin"
 
 Kit stores each conversation as an append-only JSONL transcript in `~/.kit/sessions`. Kit synchronizes each item to disk before it adds the item to memory.
 
-You can resume a session from the TUI or with the `--resume` option of `kit prompt`. ACP clients can use `session/load` or `session/resume`.
+You can list and persistently rename workspace sessions with `kit sessions`, `kit sessions rename <session-id> "Name"`, and `kit sessions rename <session-id> --clear`. In the TUI, `/sessions` opens the picker, `R` renames the selected session, and Enter resumes it. Custom names override generated titles in listings without changing session IDs or previews. You can also resume with the `--resume` option of `kit prompt`; ACP clients can use `session/load` or `session/resume`.
 
 When the provider reports 80% context-window use, Kit converts older history into a structured note. Kit persists the replacement. Kit retains the bootstrap instructions and a tool-safe tail. Use `/compact` to compact the history on demand. See [TUI interaction and sessions](docs/user/tui-and-sessions.md#manage-sessions-and-compact-from-the-tui).
 
