@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.1.123"
+version = "0.1.124"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -24,7 +24,7 @@ agentkit-plugins = "=0.10.7"
 agentkit-provider-openai = "=0.10.6"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
-agentkit-tool-compose = { version = "=0.10.9", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "=0.10.10", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
 agentkit-tools-core = "=0.10.5"
 async-trait = "=0.1.92"
@@ -52,7 +52,7 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.1.4", default-features = false, features = ["auth", "client"] }
-runlet = "=0.4.0"
+runlet = "=0.5.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 shlex = "=2.0.1"
@@ -89,13 +89,13 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "64244da92cfe983d7da8bf5ecac20b54bce4677a" }
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "7604f6c2ba1eed1de83fe3d9a0058192b5623bb4" }
+agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "7604f6c2ba1eed1de83fe3d9a0058192b5623bb4" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 
 [patch."https://github.com/danielkov/agentkit.git"]
 agentkit-capabilities = "=0.10.5"
 agentkit-core = "=0.10.5"
-agentkit-loop = "=0.10.11"
 agentkit-task-manager = "=0.10.7"
 agentkit-tools-core = "=0.10.5"

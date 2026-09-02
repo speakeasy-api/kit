@@ -465,7 +465,9 @@ async fn dropping_a_session_manager_terminates_its_children() {
     let directory = tempfile::tempdir().unwrap();
     let (manager, state, _) = manager_with_disconnected_session(directory.path());
     let (child, closed) = ChildSession::closure_probe_for_test();
-    state.lock().await.child = Some(child);
+    state.lock().await.child = Some(child.clone());
+    manager.monitor_child_exit("source".into(), &state, &child);
+    drop(child);
     drop(state);
 
     drop(manager);

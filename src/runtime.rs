@@ -34,7 +34,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
-    provider::{ProviderKind, SelectableAdapter, SelectableSession},
+    provider::{
+        ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
+    },
     tools::{
         A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
         ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
@@ -139,6 +141,13 @@ impl SessionSelection {
     }
 }
 
+pub(crate) struct AcpForkState {
+    pub transcript: Vec<Item>,
+    pub selection: ModelSelection,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub parent_context: Option<(String, String)>,
+}
+
 pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -151,12 +160,14 @@ pub(crate) struct AcpDriverContext<I = AcpIntegration> {
 enum SessionClaimKind {
     New { configured: bool, opened_new: bool },
     Load { configured: bool },
+    Fork,
 }
 
 pub(crate) struct SessionClaim {
     runtime: Arc<Runtime>,
     request: SessionRequest,
     kind: SessionClaimKind,
+    fork_observer: Option<crate::session::SessionObserver>,
     committed: bool,
 }
 
@@ -170,6 +181,7 @@ impl SessionClaim {
             SessionClaimKind::New { configured, .. } | SessionClaimKind::Load { configured } => {
                 configured
             }
+            SessionClaimKind::Fork => false,
         }
     }
 
@@ -179,7 +191,32 @@ impl SessionClaim {
         }
     }
 
+    fn guard_fork_transcript(&mut self, observer: &crate::session::SessionObserver) {
+        if matches!(self.kind, SessionClaimKind::Fork) {
+            self.fork_observer = Some(observer.clone());
+        }
+    }
+
+    pub(crate) fn is_fork(&self) -> bool {
+        matches!(self.kind, SessionClaimKind::Fork)
+    }
+
+    pub(crate) fn defer_fork_commit(mut self) -> crate::session::SessionObserver {
+        debug_assert!(self.is_fork());
+        self.committed = true;
+        self.fork_observer
+            .take()
+            .expect("an opened fork claim must retain its transcript observer")
+    }
+
     pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
+        if matches!(self.kind, SessionClaimKind::Fork) {
+            if let Some(observer) = self.fork_observer.take() {
+                observer.commit_creation();
+            }
+            self.committed = true;
+            return Ok(());
+        }
         let mut selection =
             self.runtime.session.lock().map_err(|_| {
                 AcpRuntimeError::Loop("runtime session selection is poisoned".into())
@@ -192,6 +229,7 @@ impl SessionClaim {
             SessionClaimKind::Load { configured } => {
                 selection.finish_load(&self.request, configured, true)
             }
+            SessionClaimKind::Fork => unreachable!("fork claims commit before locking selection"),
         }
         self.committed = true;
         Ok(())
@@ -211,6 +249,7 @@ impl Drop for SessionClaim {
                 SessionClaimKind::Load { configured } => {
                     selection.finish_load(&self.request, configured, false)
                 }
+                SessionClaimKind::Fork => {}
             }
         }
     }
@@ -1088,6 +1127,21 @@ impl Runtime {
                 configured,
                 opened_new: false,
             },
+            fork_observer: None,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn claim_session_fork(self: &Arc<Self>) -> Result<SessionClaim, AcpRuntimeError> {
+        Ok(SessionClaim {
+            runtime: Arc::clone(self),
+            request: SessionRequest {
+                id: crate::session::new_id(),
+                resume: false,
+                force: false,
+            },
+            kind: SessionClaimKind::Fork,
+            fork_observer: None,
             committed: false,
         })
     }
@@ -1105,6 +1159,7 @@ impl Runtime {
             runtime: Arc::clone(self),
             request,
             kind: SessionClaimKind::Load { configured },
+            fork_observer: None,
             committed: false,
         })
     }
@@ -1113,6 +1168,19 @@ impl Runtime {
         self: &Arc<Self>,
         context: AcpDriverContext<I>,
         claim: &mut SessionClaim,
+    ) -> Result<AcpDriver, AcpRuntimeError>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
+        self.start_acp_driver_with_initial(context, claim, None)
+            .await
+    }
+
+    pub(crate) async fn start_acp_driver_with_initial<I>(
+        self: &Arc<Self>,
+        context: AcpDriverContext<I>,
+        claim: &mut SessionClaim,
+        forked: Option<AcpForkState>,
     ) -> Result<AcpDriver, AcpRuntimeError>
     where
         I: LoopObserver + Clone + 'static,
@@ -1129,7 +1197,23 @@ impl Runtime {
         }
         let request = &claim.request;
         let session_id = request.id.clone();
-        let initial = if request.resume {
+        let (forked_transcript, selected, parent_context) = match forked {
+            Some(forked) => (
+                Some(forked.transcript),
+                Some((forked.selection, forked.reasoning_effort)),
+                forked.parent_context,
+            ),
+            None => (None, None, None),
+        };
+        let is_fork = forked_transcript.is_some();
+        let initial = if let Some(transcript) = forked_transcript {
+            if request.resume {
+                return Err(AcpRuntimeError::Loop(
+                    "a forked transcript requires a new session identity".into(),
+                ));
+            }
+            transcript
+        } else if request.resume {
             vec![Item::text(
                 ItemKind::System,
                 self.system_prompt(self.base_depth),
@@ -1139,22 +1223,35 @@ impl Runtime {
                 .await
                 .map_err(AcpRuntimeError::Loop)?
         };
-        let opened = crate::session::open(
-            &self.root,
-            &request.id,
-            request.resume,
-            request.force,
-            initial,
-        )
+        let opened = if is_fork {
+            crate::session::open_uncommitted(&self.root, &request.id, initial)
+        } else {
+            crate::session::open(
+                &self.root,
+                &request.id,
+                request.resume,
+                request.force,
+                initial,
+            )
+        }
         .map_err(AcpRuntimeError::Loop)?;
         claim.mark_opened();
+        if is_fork {
+            claim.guard_fork_transcript(&opened.observer);
+        }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
+        let (selection, reasoning_effort) = selected.unwrap_or_else(|| {
+            (
+                ModelSelection::new(self.provider, self.model.clone()),
+                self.reasoning_effort,
+            )
+        });
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
-            self.provider,
-            self.model.clone(),
+            selection.provider,
+            selection.model,
             self.credential_storage.clone(),
-            self.reasoning_effort,
+            reasoning_effort,
             self.openrouter_api_key.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
@@ -1168,7 +1265,10 @@ impl Runtime {
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;
-        let subagents = self.subagents.fresh();
+        let subagents = match parent_context {
+            Some((id, name)) => self.subagents.fresh_with_parent(id, name),
+            None => self.subagents.fresh(),
+        };
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();

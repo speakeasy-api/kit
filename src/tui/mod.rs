@@ -679,6 +679,45 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         ));
                                     });
                                 }
+                                Action::RenameSession {
+                                    session_id: requested_id,
+                                    display_name,
+                                } => {
+                                    let Ok(route) = transition_session.lock() else {
+                                        app.note("could not start session rename");
+                                        continue;
+                                    };
+                                    let generation = route.generation;
+                                    drop(route);
+                                    let root = root.clone();
+                                    let updates = updates_tx.clone();
+                                    tokio::spawn(async move {
+                                        let name_for_write = display_name.clone();
+                                        let id_for_write = requested_id.clone();
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            crate::session::set_display_name_and_title(
+                                                &root,
+                                                &id_for_write,
+                                                name_for_write.as_deref(),
+                                            )
+                                        })
+                                        .await
+                                        .map_err(|error| {
+                                            format!("session rename worker failed: {error}")
+                                        })
+                                        .and_then(|result| result);
+                                        let display_name = display_name
+                                            .map(|name| name.trim().to_string());
+                                        let _ = updates.send(QueuedUpdate::for_session(
+                                            generation,
+                                            Update::SessionRenamed {
+                                                session_id: requested_id,
+                                                display_name,
+                                                result,
+                                            },
+                                        ));
+                                    });
+                                }
                                 Action::Resume(requested_id) => {
                                     if let Err(error) = crate::session::validate_id(&requested_id) {
                                         app.note(format!("invalid session id: {error}"));
@@ -1085,7 +1124,9 @@ fn handle(app: &mut App, event: Event) -> Action {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
-            if let Some(attachments) = attachments_from_paste(&app.root, &text) {
+            if app.session_rename_active() {
+                app.paste(&text);
+            } else if let Some(attachments) = attachments_from_paste(&app.root, &text) {
                 app.prune_attachments();
                 let pending_bytes = app
                     .attachments
@@ -1722,7 +1763,7 @@ mod tests {
         save_model_defaults_to, transition_route, translate, translate_for_session,
         user_message_of, wire,
     };
-    use crate::tui::app::{App, SubmittedPrompt, Update};
+    use crate::tui::app::{App, SessionDialog, SessionRename, SubmittedPrompt, Update};
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1959,6 +2000,57 @@ mod tests {
         handle(&mut app, Event::Paste(path.display().to_string()));
 
         assert_eq!(app.attachments.len(), MAX_ATTACHMENTS);
+    }
+
+    #[test]
+    fn session_rename_paste_is_not_interpreted_as_an_attachment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut app = App::new(
+            directory.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.session_dialog = Some(SessionDialog {
+            selected: 0,
+            rename: Some(SessionRename::Editing(String::new())),
+        });
+
+        handle(&mut app, Event::Paste(path.display().to_string()));
+
+        assert!(app.attachments.is_empty());
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename.as_ref(),
+            Some(SessionRename::Editing(input)) if input == path.to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn session_rename_confirmation_and_saving_consume_paste() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+
+        for rename in [SessionRename::ConfirmClear, SessionRename::Saving] {
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.session_dialog = Some(SessionDialog {
+                selected: 0,
+                rename: Some(rename),
+            });
+
+            handle(&mut app, Event::Paste(path.display().to_string()));
+
+            assert!(app.attachments.is_empty());
+            assert!(app.editor.is_empty());
+            assert!(app.session_rename_active());
+        }
     }
 
     #[test]

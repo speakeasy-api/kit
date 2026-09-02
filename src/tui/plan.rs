@@ -96,6 +96,12 @@ fn statement_nodes(statement: &Stmt, depth: usize, script: &str, nodes: &mut Vec
                 expression(condition, depth, "", None, script, nodes);
             }
         }
+        StmtKind::Break { value, condition } => {
+            if let Some(condition) = condition {
+                expression(condition, depth, "", None, script, nodes);
+            }
+            expression(value, depth, "", None, script, nodes);
+        }
         StmtKind::Assert { condition, message } => {
             expression(condition, depth, "", None, script, nodes);
             if let Some(message) = message {
@@ -483,6 +489,25 @@ mod tests {
                 .filter_map(|node| node.tool.as_deref())
                 .collect::<Vec<_>>(),
             ["shell", "edit", "shell"]
+        );
+    }
+
+    #[test]
+    fn includes_break_conditions_and_values() {
+        let nodes = parse(
+            "total = fold acc = 0 for item in [] {\n\
+                 break finish({ acc }) if should_stop({ item })\n\
+                 return acc + item\n\
+             }\n\
+             return total",
+        );
+
+        assert_eq!(
+            nodes
+                .iter()
+                .filter_map(|node| node.tool.as_deref())
+                .collect::<Vec<_>>(),
+            ["should_stop", "finish"]
         );
     }
 

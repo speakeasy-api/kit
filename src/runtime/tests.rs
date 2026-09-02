@@ -355,6 +355,49 @@ fn dropped_generated_session_claim_retries_opened_transcript_with_same_id() {
 }
 
 #[test]
+fn dropped_fork_claim_removes_its_uncommitted_transcript() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    let mut failed = runtime.claim_session_fork().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_fork_transcript(&opened.observer);
+    drop(opened);
+    assert!(crate::session::load(root.path(), &session_id).is_ok());
+
+    drop(failed);
+
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+}
+
+#[test]
+fn dropped_deferred_fork_creation_removes_transcript_before_response() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    let mut claim = runtime.claim_session_fork().unwrap();
+    let session_id = claim.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    claim.guard_fork_transcript(&opened.observer);
+    let creation = claim.defer_fork_commit();
+    drop(opened);
+    drop(creation);
+
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+}
+
+#[test]
 fn matching_load_reservation_releases_without_mutation_on_failure() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::with_session(

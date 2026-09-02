@@ -41,6 +41,13 @@ struct Record {
     redirect: Option<PathBuf>,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+}
+
 /// A loaded transcript together with the observer that owns its mutation lock.
 pub struct OpenSession {
     pub transcript: Vec<Item>,
@@ -51,6 +58,7 @@ pub struct OpenSession {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogEntry {
     pub id: String,
+    /// User-defined display name, falling back to a generated title.
     pub title: Option<String>,
     pub preview: Option<String>,
     pub is_subagent: bool,
@@ -76,6 +84,7 @@ struct Writer {
     workspace_root: PathBuf,
     file: File,
     lock: SessionLock,
+    created: Option<CreatedTranscript>,
 }
 
 struct SessionLock {
@@ -90,6 +99,12 @@ struct SessionLock {
 struct CreatedTranscript {
     path: PathBuf,
     keep: bool,
+}
+
+#[derive(Clone, Copy)]
+struct InitialTranscriptOptions {
+    stamp_items: bool,
+    commit_creation: bool,
 }
 
 impl CreatedTranscript {
@@ -160,7 +175,8 @@ pub(crate) fn clone_completed_in(
     source: &str,
     destination: &str,
 ) -> Result<(), String> {
-    let transcript = load_in(root, directory, source)?;
+    let mut transcript = load_in(root, directory, source)?;
+    crate::transcript::sanitize_forked_transcript(&mut transcript);
     let opened = open_with_initial_timestamps_in(
         root,
         directory,
@@ -168,7 +184,10 @@ pub(crate) fn clone_completed_in(
         false,
         false,
         transcript,
-        false,
+        InitialTranscriptOptions {
+            stamp_items: false,
+            commit_creation: true,
+        },
     )?;
     drop(opened);
     Ok(())
@@ -246,7 +265,37 @@ pub(crate) fn open_in(
     force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
-    open_with_initial_timestamps_in(root, directory, session_id, resume, force, initial, true)
+    open_with_initial_timestamps_in(
+        root,
+        directory,
+        session_id,
+        resume,
+        force,
+        initial,
+        InitialTranscriptOptions {
+            stamp_items: true,
+            commit_creation: true,
+        },
+    )
+}
+
+pub(crate) fn open_uncommitted(
+    root: &Path,
+    session_id: &str,
+    initial: Vec<Item>,
+) -> Result<OpenSession, String> {
+    open_with_initial_timestamps_in(
+        root,
+        &default_directory()?,
+        session_id,
+        false,
+        false,
+        initial,
+        InitialTranscriptOptions {
+            stamp_items: true,
+            commit_creation: false,
+        },
+    )
 }
 
 fn open_with_initial_timestamps_in(
@@ -256,7 +305,7 @@ fn open_with_initial_timestamps_in(
     resume: bool,
     force: bool,
     initial: Vec<Item>,
-    stamp_initial: bool,
+    initial_options: InitialTranscriptOptions,
 ) -> Result<OpenSession, String> {
     validate_id(session_id)?;
     if !resume && initial.is_empty() {
@@ -321,7 +370,7 @@ fn open_with_initial_timestamps_in(
     let file = options
         .open(&path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    let mut created = (!resume).then(|| CreatedTranscript::new(path.clone()));
+    let created = (!resume).then(|| CreatedTranscript::new(path.clone()));
     let mut writer = Writer {
         session_id: session_id.into(),
         generation,
@@ -329,13 +378,14 @@ fn open_with_initial_timestamps_in(
         workspace_root,
         file,
         lock,
+        created,
     };
     if resume && stored_workspace.is_none() {
         writer.replace(&transcript)?;
     }
     if !resume {
         for mut item in initial {
-            if stamp_initial {
+            if initial_options.stamp_items {
                 stamp_item(&mut item, Timestamp::now());
                 writer.append(&item)?;
             } else {
@@ -356,8 +406,8 @@ fn open_with_initial_timestamps_in(
     for item in crate::transcript::repair_unanswered_tool_calls(&mut transcript) {
         writer.append(&item)?;
     }
-    if let Some(created) = created.take() {
-        created.keep();
+    if initial_options.commit_creation {
+        writer.commit_creation();
     }
     Ok(OpenSession {
         transcript,
@@ -366,6 +416,13 @@ fn open_with_initial_timestamps_in(
 }
 
 impl SessionObserver {
+    pub(crate) fn commit_creation(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit_creation();
+    }
+
     /// Durably records a complete transcript replacement produced by a mutator.
     /// Existing append records remain intact, while readers treat this record as
     /// a new canonical snapshot.
@@ -393,6 +450,12 @@ impl TranscriptObserver for SessionObserver {
 }
 
 impl Writer {
+    fn commit_creation(&mut self) {
+        if let Some(created) = self.created.take() {
+            created.keep();
+        }
+    }
+
     fn append(&mut self, item: &Item) -> Result<(), String> {
         if item.created_at.is_none() {
             return Err("transcript item missing created_at before persistence".into());
@@ -546,6 +609,15 @@ impl SessionLock {
         let token = format!("{}:{}:{}", std::process::id(), new_id(), SCHEMA_VERSION);
         let mut options = OpenOptions::new();
         options.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            // FILE_SHARE_READ | FILE_SHARE_WRITE. Omitting FILE_SHARE_DELETE
+            // prevents the lock pathname from being renamed or replaced while
+            // token checks read through this handle.
+            options.share_mode(0x0000_0001 | 0x0000_0002);
+        }
         if force {
             options.create(true);
         } else {
@@ -584,13 +656,7 @@ impl SessionLock {
     }
 
     fn check(&self) -> Result<(), LockError> {
-        let current = fs::read_to_string(&self.path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                LockError::Missing
-            } else {
-                LockError::Other(format!("session lock was lost: {error}"))
-            }
-        })?;
+        let current = self.read_token()?;
         if current == self.token {
             Ok(())
         } else {
@@ -598,6 +664,42 @@ impl SessionLock {
                 "session lock was overridden by another Kit instance".into(),
             ))
         }
+    }
+
+    // Reads the lock file's token to confirm this process still owns it. On
+    // Unix the advisory lock lets a fresh handle read the path, which also
+    // reports the file being unlinked as `Missing` so the writer can recover.
+    #[cfg(not(windows))]
+    fn read_token(&self) -> Result<String, LockError> {
+        fs::read_to_string(&self.path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                LockError::Missing
+            } else {
+                LockError::Other(format!("session lock was lost: {error}"))
+            }
+        })
+    }
+
+    // On Windows `File::try_lock` takes a mandatory exclusive lock, so
+    // re-opening the path to read the token fails with a sharing violation
+    // (os error 33). Read it through the lock-owning handle instead, which the
+    // lock owner is always permitted to do. The lock file is opened without
+    // FILE_SHARE_DELETE, so it cannot be unlinked while this handle is held; a
+    // `Missing` state therefore cannot arise here and losing the handle is
+    // itself the lost-lock condition.
+    #[cfg(windows)]
+    fn read_token(&self) -> Result<String, LockError> {
+        use std::io::Read;
+        let Some(file) = self.file.as_ref() else {
+            return Err(LockError::Missing);
+        };
+        let mut handle: &File = file;
+        let mut current = String::new();
+        handle
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| handle.read_to_string(&mut current))
+            .map_err(|error| LockError::Other(format!("session lock was lost: {error}")))?;
+        Ok(current)
     }
 }
 
@@ -655,13 +757,40 @@ fn read_records_following(
 fn read_records_direct(path: &Path, session_id: &str) -> Result<StoredTranscript, String> {
     let file =
         File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let lines = BufReader::new(file)
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            line.map_err(|error| format!("could not read transcript line {}: {error}", index + 1))
+        });
+    read_record_lines(path, session_id, lines)
+}
+
+fn read_records_bytes(
+    path: &Path,
+    session_id: &str,
+    bytes: &[u8],
+) -> Result<StoredTranscript, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("invalid transcript {}: {error}", path.display()))?;
+    read_record_lines(
+        path,
+        session_id,
+        text.lines().map(|line| Ok(line.to_string())),
+    )
+}
+
+fn read_record_lines(
+    path: &Path,
+    session_id: &str,
+    lines: impl Iterator<Item = Result<String, String>>,
+) -> Result<StoredTranscript, String> {
     let mut items = Vec::new();
     let mut expected = 1_u64;
     let mut states = Vec::new();
     let mut redirect = None;
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line =
-            line.map_err(|error| format!("could not read transcript line {}: {error}", index + 1))?;
+    for (index, line) in lines.enumerate() {
+        let line = line?;
         let record: Record = serde_json::from_str(&line)
             .map_err(|error| format!("invalid transcript line {}: {error}", index + 1))?;
         if !matches!(
@@ -809,22 +938,134 @@ fn transcript_workspace_bytes(
     Ok(workspace)
 }
 
-fn ensure_workspace(path: &Path, session_id: &str, root: &Path) -> Result<(), String> {
-    if let Some(stored) = transcript_workspace(path, session_id)?
-        && stored != root
-    {
-        return Err(format!(
-            "session {session_id:?} belongs to workspace {}, not {}",
-            stored.display(),
-            root.display()
-        ));
-    }
-    Ok(())
-}
-
 /// Lists durable sessions bound to one workspace, newest first, without taking mutation locks.
 pub fn catalog(root: &Path) -> Result<Vec<CatalogEntry>, String> {
     catalog_for_workspace(root, &default_directory()?)
+}
+
+/// Sets or clears a durable session's custom display name.
+///
+/// Passing `None` clears the custom name. The transcript and its mutation lock are
+/// not modified, so active sessions can be renamed safely.
+pub fn set_display_name(
+    root: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<(), String> {
+    set_display_name_and_title(root, session_id, display_name).map(|_| ())
+}
+
+pub(crate) fn set_display_name_and_title(
+    root: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<Option<String>, String> {
+    set_display_name_in(root, &default_directory()?, session_id, display_name)
+}
+
+fn set_display_name_in(
+    root: &Path,
+    global_directory: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<Option<String>, String> {
+    validate_id(session_id)?;
+    let root = root.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve workspace root {}: {error}",
+            root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "workspace root {} is not a directory",
+            root.display()
+        ));
+    }
+
+    let authority = select_authority_for_rename(global_directory, &root, session_id)?
+        .ok_or_else(|| format!("session {session_id} was not found in {}", root.display()))?;
+    if catalog_is_subagent(&authority.historical_items, &authority.items) {
+        return Err(format!(
+            "session {session_id} was not found in {}",
+            root.display()
+        ));
+    }
+
+    let generated_title = catalog_text(&authority.historical_items, &authority.items).0;
+    let display_name = display_name.map(validate_display_name).transpose()?;
+    let effective_title = display_name.clone().or(generated_title);
+    let metadata = SessionMetadata { display_name };
+    let mut output = serde_json::to_vec(&metadata)
+        .map_err(|error| format!("could not encode metadata for session {session_id}: {error}"))?;
+    output.push(b'\n');
+
+    let directory = workspace_storage_directory(global_directory, &root);
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "could not create session directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let path = metadata_path(&directory, session_id);
+    atomicwrites::AtomicFile::new(&path, atomicwrites::AllowOverwrite)
+        .write(|file| {
+            file.write_all(&output)?;
+            file.sync_all()
+        })
+        .map_err(|error| {
+            format!(
+                "could not replace session metadata {}: {error}",
+                path.display()
+            )
+        })?;
+    Ok(effective_title)
+}
+
+fn select_authority_for_rename(
+    directory: &Path,
+    root: &Path,
+    session_id: &str,
+) -> Result<Option<Authority>, String> {
+    select_authority_with(directory, root, session_id, false, true)
+}
+
+pub(crate) fn is_safe_display_name_character(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character as u32,
+            0x061c | 0x200e..=0x200f | 0x2028..=0x202e | 0x2066..=0x2069
+        )
+}
+
+fn validate_display_name(value: &str) -> Result<String, String> {
+    if !value.chars().all(is_safe_display_name_character) {
+        return Err("session name must not contain line breaks or control characters".into());
+    }
+    let value = value.trim();
+    let length = value.chars().count();
+    if length == 0
+        || !value
+            .chars()
+            .any(|character| !character.is_whitespace() && !is_default_ignorable(character))
+    {
+        return Err("session name must not be empty; use --clear to remove it".into());
+    }
+    if length > 100 {
+        return Err("session name must be at most 100 characters".into());
+    }
+    Ok(value.to_string())
+}
+
+fn read_display_name(directory: &Path, session_id: &str) -> Option<String> {
+    let input = fs::read(metadata_path(directory, session_id)).ok()?;
+    let metadata: SessionMetadata = serde_json::from_slice(&input).ok()?;
+    metadata
+        .display_name
+        .as_deref()
+        .map(validate_display_name)
+        .transpose()
+        .ok()?
 }
 
 fn catalog_for_workspace(
@@ -848,7 +1089,8 @@ fn catalog_for_workspace(
     for id in ids {
         // Discovery is best-effort per transcript: a damaged file or one caught
         // mid-append must not hide every other session in the workspace.
-        let Ok(Some(authority)) = select_authority_with(global_directory, &root, &id, false) else {
+        let Ok(Some(authority)) = select_authority_with(global_directory, &root, &id, false, false)
+        else {
             continue;
         };
         if catalog_is_subagent(&authority.historical_items, &authority.items) {
@@ -872,6 +1114,8 @@ fn catalog_for_workspace(
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        let directory = workspace_storage_directory(global_directory, &root);
+        let title = read_display_name(&directory, &id).or(title);
         entries.push(CatalogEntry {
             id,
             title,
@@ -1127,7 +1371,45 @@ fn select_authority(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<Authority>, String> {
-    select_authority_with(directory, root, session_id, true)
+    select_authority_with(directory, root, session_id, true, false)
+}
+
+fn transcript_snapshot(path: &Path, tolerate_incomplete_tail: bool) -> Result<Vec<u8>, String> {
+    let mut bytes =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if tolerate_incomplete_tail && !bytes.ends_with(b"\n") {
+        let tail_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let tail = &bytes[tail_start..];
+        let incomplete = match std::str::from_utf8(tail) {
+            Ok(_) => serde_json::from_slice::<Record>(tail)
+                .is_err_and(|error| error.classify() == serde_json::error::Category::Eof),
+            Err(error) => error.error_len().is_none(),
+        };
+        if incomplete {
+            bytes.truncate(tail_start);
+        }
+    }
+    Ok(bytes)
+}
+
+fn read_authority_candidate(
+    path: &Path,
+    session_id: &str,
+    tolerate_incomplete_tail: bool,
+) -> Result<(Option<PathBuf>, StoredTranscript), String> {
+    if tolerate_incomplete_tail {
+        let bytes = transcript_snapshot(path, true)?;
+        let workspace = transcript_workspace_bytes(path, session_id, &bytes)?;
+        let transcript = read_records_bytes(path, session_id, &bytes)?;
+        Ok((workspace, transcript))
+    } else {
+        let workspace = transcript_workspace(path, session_id)?;
+        let transcript = read_records_direct(path, session_id)?;
+        Ok((workspace, transcript))
+    }
 }
 
 fn select_authority_with(
@@ -1135,6 +1417,7 @@ fn select_authority_with(
     root: &Path,
     session_id: &str,
     include_unbound_global: bool,
+    tolerate_incomplete_tail: bool,
 ) -> Result<Option<Authority>, String> {
     let scoped = transcript_path(&workspace_storage_directory(directory, root), session_id);
     let global = transcript_path(directory, session_id);
@@ -1154,7 +1437,8 @@ fn select_authority_with(
         {
             continue;
         }
-        let workspace = transcript_workspace(path, session_id)?;
+        let (workspace, transcript) =
+            read_authority_candidate(path, session_id, tolerate_incomplete_tail)?;
         if is_global
             && (workspace.as_deref().is_some_and(|stored| stored != root)
                 || workspace.is_none() && !include_unbound_global)
@@ -1169,7 +1453,7 @@ fn select_authority_with(
                 root.display()
             ));
         }
-        match read_records_direct(path, session_id)? {
+        match transcript {
             StoredTranscript::History(history) => {
                 let candidate = HistoryCandidate {
                     path: path.clone(),
@@ -1190,9 +1474,18 @@ fn select_authority_with(
                 if target != scoped_target {
                     return Err(format!("invalid session redirect in {}", path.display()));
                 }
-                ensure_workspace(&target, session_id, root)?;
-                let StoredTranscript::History(history) = read_records_direct(&target, session_id)?
-                else {
+                let (target_workspace, target_transcript) =
+                    read_authority_candidate(&target, session_id, tolerate_incomplete_tail)?;
+                if let Some(stored) = target_workspace
+                    && stored != root
+                {
+                    return Err(format!(
+                        "session {session_id:?} belongs to workspace {}, not {}",
+                        stored.display(),
+                        root.display()
+                    ));
+                }
+                let StoredTranscript::History(history) = target_transcript else {
                     return Err(format!(
                         "scoped transcript {} is a redirect",
                         target.display()
@@ -1573,6 +1866,10 @@ fn transcript_path(directory: &Path, session_id: &str) -> PathBuf {
     directory.join(format!("{session_id}.jsonl"))
 }
 
+fn metadata_path(directory: &Path, session_id: &str) -> PathBuf {
+    directory.join(format!("{session_id}.metadata.json"))
+}
+
 fn legacy_transcript(root: &Path, session_id: &str) -> PathBuf {
     transcript_path(&workspace_directory(root), session_id)
 }
@@ -1596,8 +1893,11 @@ pub(crate) fn validate_id(value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+
     use super::*;
-    use agentkit_core::{ItemKind, Part};
+    use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
+    use serde_json::json;
 
     fn session_directory(root: &Path) -> PathBuf {
         root.join("sessions")
@@ -1764,6 +2064,23 @@ mod tests {
             "failed forced initialization left a lock path"
         );
         drop(SessionLock::acquire(path.clone(), false).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_path_cannot_be_renamed_while_held() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("held.lock");
+        let renamed = root.path().join("renamed.lock");
+        let lock = SessionLock::acquire(path.clone(), false).unwrap();
+
+        assert!(
+            fs::rename(&path, &renamed).is_err(),
+            "held lock path was renamed"
+        );
+        assert!(lock.check().is_ok());
+        drop(lock);
         assert!(!path.exists());
     }
 
@@ -1939,6 +2256,53 @@ mod tests {
         let cloned = load(root.path(), "branch").unwrap();
         assert_eq!(cloned[0].created_at, None);
         assert_eq!(cloned[1].created_at, Some(Timestamp(77)));
+    }
+
+    #[test]
+    fn cloning_sanitizes_session_bound_continuation_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "openai.responses.continuation.v1".into(),
+            json!({ "session_id": "source" }),
+        );
+        metadata.insert("preserved".into(), true.into());
+        let source = open(
+            root.path(),
+            "source",
+            false,
+            false,
+            vec![Item::new(
+                ItemKind::Assistant,
+                vec![Part::Reasoning(
+                    ReasoningPart::summary("thought").with_metadata(metadata),
+                )],
+            )],
+        )
+        .unwrap();
+        drop(source);
+
+        clone_completed(root.path(), "source", "branch").unwrap();
+
+        let source = load(root.path(), "source").unwrap();
+        let branch = load(root.path(), "branch").unwrap();
+        let Part::Reasoning(source) = &source[0].parts[0] else {
+            panic!("expected source reasoning");
+        };
+        let Part::Reasoning(branch) = &branch[0].parts[0] else {
+            panic!("expected branch reasoning");
+        };
+        assert!(
+            source
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert!(
+            !branch
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert_eq!(branch.metadata["preserved"], true);
     }
 
     #[test]
@@ -2597,6 +2961,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn writer_reconstructs_deleted_storage_from_open_descriptor() {
         let root = tempfile::tempdir().unwrap();
@@ -2786,6 +3151,313 @@ mod tests {
         assert!(ids.contains(&"malformed"));
         assert!(!ids.contains(&"subagent"));
         drop((legacy, top_level, malformed, subagent));
+    }
+
+    #[test]
+    fn display_name_can_be_set_and_cleared_while_session_is_active() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "active",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Generated title")],
+        )
+        .unwrap();
+
+        set_display_name_in(
+            root.path(),
+            storage.path(),
+            "active",
+            Some("  OAuth token bug  "),
+        )
+        .unwrap();
+        let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(entries[0].title.as_deref(), Some("OAuth token bug"));
+
+        let directory =
+            workspace_storage_directory(storage.path(), &canonical_workspace(root.path()));
+        let path = metadata_path(&directory, "active");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"display_name\":\"OAuth token bug\"}\n"
+        );
+
+        set_display_name_in(root.path(), storage.path(), "active", None).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "{}\n");
+        let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+        assert_eq!(entries[0].title.as_deref(), Some("Generated title"));
+        drop(opened);
+    }
+
+    #[test]
+    fn display_name_tolerates_an_incomplete_concurrent_append() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "active",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Generated title")],
+        )
+        .unwrap();
+
+        let path = opened.observer.0.lock().unwrap().path.clone();
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: "active".into(),
+            generation: 2,
+            workspace_root: Some(canonical_workspace(root.path())),
+            item: Some(Item::text(ItemKind::Assistant, "concurrent append")),
+            replacement: None,
+            redirect: None,
+        };
+        let mut encoded = serde_json::to_vec(&record).unwrap();
+        encoded.push(b'\n');
+        let split = encoded.len() / 2;
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&encoded[..split]).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            set_display_name_in(root.path(), storage.path(), "active", Some("Renamed"))
+                .unwrap()
+                .as_deref(),
+            Some("Renamed")
+        );
+        assert_eq!(
+            set_display_name_in(root.path(), storage.path(), "active", None)
+                .unwrap()
+                .as_deref(),
+            Some("Generated title")
+        );
+        set_display_name_in(root.path(), storage.path(), "active", Some("Renamed")).unwrap();
+        file.write_all(&encoded[split..]).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Renamed")
+        );
+        drop(opened);
+    }
+
+    #[test]
+    fn display_name_rejects_a_completed_malformed_append() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "active",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Generated title")],
+        )
+        .unwrap();
+        let path = opened.observer.0.lock().unwrap().path.clone();
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"not json\n")
+            .unwrap();
+
+        let error = set_display_name_in(root.path(), storage.path(), "active", Some("Renamed"))
+            .unwrap_err();
+        assert!(error.contains("invalid transcript line"), "{error}");
+        drop(opened);
+    }
+
+    #[test]
+    fn display_name_rejects_a_complete_invalid_record_without_a_newline() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "active",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Generated title")],
+        )
+        .unwrap();
+        let path = opened.observer.0.lock().unwrap().path.clone();
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"{}")
+            .unwrap();
+
+        let error = set_display_name_in(root.path(), storage.path(), "active", Some("Renamed"))
+            .unwrap_err();
+        assert!(error.contains("invalid transcript line"), "{error}");
+        drop(opened);
+    }
+
+    #[test]
+    fn display_name_validation_trims_unicode_and_rejects_unsafe_values() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "named",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Title")],
+        )
+        .unwrap();
+
+        let hundred = "界".repeat(100);
+        set_display_name_in(
+            root.path(),
+            storage.path(),
+            "named",
+            Some(&format!("  {hundred}  ")),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some(hundred.as_str())
+        );
+
+        for invalid in [
+            "",
+            "   ",
+            "line\nbreak",
+            "line\u{2028}break",
+            "paragraph\u{2029}break",
+            "\u{200b}",
+            "\u{200b}\u{200d}\u{fe0f}",
+            "tab\tname",
+            "escape\u{1b}name",
+            "bidi\u{061c}name",
+            "bidi\u{200e}name",
+            "bidi\u{200f}name",
+            "bidi\u{202e}name",
+            "bidi\u{2066}name",
+        ] {
+            assert!(
+                set_display_name_in(root.path(), storage.path(), "named", Some(invalid),).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        for valid in ["👩\u{200d}💻", "✈\u{fe0f}"] {
+            set_display_name_in(root.path(), storage.path(), "named", Some(valid)).unwrap();
+        }
+        assert!(
+            set_display_name_in(root.path(), storage.path(), "named", Some(&"x".repeat(101)),)
+                .is_err()
+        );
+        assert!(
+            set_display_name_in(root.path(), storage.path(), "missing", Some("Name"))
+                .unwrap_err()
+                .contains("was not found")
+        );
+        drop(opened);
+    }
+
+    #[test]
+    fn malformed_display_name_metadata_falls_back_without_hiding_session() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "valid",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Generated title")],
+        )
+        .unwrap();
+        let directory =
+            workspace_storage_directory(storage.path(), &canonical_workspace(root.path()));
+        let path = metadata_path(&directory, "valid");
+
+        for malformed in [
+            "not json",
+            r#"{"display_name":42}"#,
+            r#"{"unknown":true}"#,
+            r#"{"display_name":"line\nbreak"}"#,
+        ] {
+            fs::write(&path, malformed).unwrap();
+            let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].title.as_deref(), Some("Generated title"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+        }
+        drop(opened);
+    }
+
+    #[test]
+    fn display_names_are_workspace_scoped_and_concurrent_writes_are_atomic() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let first = roots.path().join("first");
+        let second = roots.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_session = open_in(
+            &first,
+            storage.path(),
+            "shared",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "First title")],
+        )
+        .unwrap();
+        let second_session = open_in(
+            &second,
+            storage.path(),
+            "shared",
+            false,
+            false,
+            vec![Item::text(ItemKind::User, "Second title")],
+        )
+        .unwrap();
+        set_display_name_in(&second, storage.path(), "shared", Some("Second name")).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let writers = ["First name", "Latest name"].map(|name| {
+            let root = first.clone();
+            let storage = storage.path().to_path_buf();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                set_display_name_in(&root, &storage, "shared", Some(name))
+            })
+        });
+        barrier.wait();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+
+        let first_name = catalog_for_workspace(&first, storage.path()).unwrap()[0]
+            .title
+            .clone()
+            .unwrap();
+        assert!(["First name", "Latest name"].contains(&first_name.as_str()));
+        assert_eq!(
+            catalog_for_workspace(&second, storage.path()).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Second name")
+        );
+        let first_directory =
+            workspace_storage_directory(storage.path(), &canonical_workspace(&first));
+        let metadata: SessionMetadata =
+            serde_json::from_slice(&fs::read(metadata_path(&first_directory, "shared")).unwrap())
+                .unwrap();
+        assert_eq!(metadata.display_name.as_deref(), Some(first_name.as_str()));
+        drop((first_session, second_session));
     }
 
     #[test]
@@ -3296,6 +3968,7 @@ mod tests {
         assert!(!belongs_to_workspace_in(&second, storage.path(), "legacy").unwrap());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn writer_fails_closed_when_another_owner_wins_recovery_lock() {
         let root = tempfile::tempdir().unwrap();

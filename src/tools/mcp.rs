@@ -21,8 +21,8 @@ use agentkit_mcp::{
 };
 use agentkit_plugins::PluginMcpTransport;
 use agentkit_tools_core::{
-    CatalogReader, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolExecutionScope,
-    ToolName, ToolRequest, ToolResult, ToolSource, ToolSpec,
+    BasicToolExecutor, CatalogReader, Tool, ToolContext, ToolError, ToolExecutionOutcome,
+    ToolExecutionScope, ToolExecutor, ToolName, ToolRequest, ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
@@ -2096,6 +2096,7 @@ impl Drop for ReplayCleanup {
 pub struct McpTool {
     runtime: McpRuntime,
     catalog: CatalogReader,
+    executor: Arc<dyn ToolExecutor>,
     spec: ToolSpec,
 }
 
@@ -2121,9 +2122,12 @@ struct ExecutedMcpCall {
 
 impl McpTool {
     pub fn new(runtime: McpRuntime) -> Self {
+        let catalog = runtime.catalog();
+        let source: Arc<dyn ToolSource> = Arc::new(catalog.clone());
         Self {
-            catalog: runtime.catalog(),
             runtime,
+            catalog,
+            executor: Arc::new(BasicToolExecutor::new([source])),
             spec: ToolSpec::new(
                 ToolName::new("tool"),
                 "Invoke an authenticated MCP tool returned by tool_search.",
@@ -2272,6 +2276,10 @@ impl McpTool {
             self.runtime.clone(),
             server.clone(),
         );
+        let scope = ToolExecutionScope {
+            executor: Arc::clone(&self.executor),
+            ..scope
+        };
         let outcome = scope
             .execute_child(
                 ToolRequest::new(

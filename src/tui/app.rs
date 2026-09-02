@@ -20,6 +20,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{layout::Rect, text::Line};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[cfg(test)]
 use crate::compaction::is_compaction_summary;
@@ -48,6 +49,12 @@ pub enum Update {
     FileMatches {
         revision: u64,
         result: Result<Vec<FileMatch>, String>,
+    },
+    /// Result of changing one session's custom display name.
+    SessionRenamed {
+        session_id: String,
+        display_name: Option<String>,
+        result: Result<Option<String>, String>,
     },
     /// A steer was accepted but has not been delivered into the transcript yet.
     SteerAccepted { id: String, text: String },
@@ -212,6 +219,13 @@ pub struct EffortDialog {
 
 pub struct SessionDialog {
     pub selected: usize,
+    pub rename: Option<SessionRename>,
+}
+
+pub enum SessionRename {
+    Editing(String),
+    ConfirmClear,
+    Saving,
 }
 
 pub struct FilePickerDialog {
@@ -264,6 +278,10 @@ pub enum Action {
     },
     New(Option<String>),
     ListSessions,
+    RenameSession {
+        session_id: String,
+        display_name: Option<String>,
+    },
     Resume(String),
     Close,
     SelectModel {
@@ -553,6 +571,7 @@ pub struct App {
     pub session_choices: Vec<crate::session::CatalogEntry>,
     pub session_dialog: Option<SessionDialog>,
     pub file_picker: Option<FilePickerDialog>,
+    session_catalog_pending: bool,
     pub available_commands: Vec<SlashCommand>,
     pub command_completion_selected: usize,
     command_completion_query: Option<String>,
@@ -594,6 +613,7 @@ pub struct App {
     agent_versions: HashMap<String, (u64, u8)>,
     /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
     cleaned_agent_ids: HashSet<String>,
+    cleaned_agent_ancestors: HashSet<String>,
     agents_scroll: usize,
     agents_viewport: usize,
     agents_area: Rect,
@@ -843,6 +863,7 @@ impl App {
             session_choices: Vec::new(),
             session_dialog: None,
             file_picker: None,
+            session_catalog_pending: false,
             available_commands: Vec::new(),
             command_completion_selected: 0,
             command_completion_query: None,
@@ -880,6 +901,7 @@ impl App {
             agents: HashMap::new(),
             agent_versions: HashMap::new(),
             cleaned_agent_ids: HashSet::new(),
+            cleaned_agent_ancestors: HashSet::new(),
             agents_scroll: 0,
             agents_viewport: 0,
             agents_area: Rect::default(),
@@ -1678,16 +1700,49 @@ impl App {
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::A2aAddress(address) => self.a2a = address,
-            Update::SessionCatalog(result) => match result {
-                Ok(entries) if entries.is_empty() => {
-                    self.toast("no sessions found for this workspace");
+            Update::SessionCatalog(result) => {
+                self.session_catalog_pending = false;
+                match result {
+                    Ok(entries) if entries.is_empty() => {
+                        self.toast("no sessions found for this workspace");
+                    }
+                    Ok(entries) => {
+                        self.session_choices = entries;
+                        self.file_picker = None;
+                        self.session_dialog = Some(SessionDialog {
+                            selected: 0,
+                            rename: None,
+                        });
+                    }
+                    Err(error) => self.toast(format!("could not list sessions: {error}")),
                 }
-                Ok(entries) => {
-                    self.session_choices = entries;
-                    self.file_picker = None;
-                    self.session_dialog = Some(SessionDialog { selected: 0 });
+            }
+            Update::SessionRenamed {
+                session_id,
+                display_name,
+                result,
+            } => match result {
+                Ok(title) => {
+                    if let Some(dialog) = &mut self.session_dialog {
+                        dialog.rename = None;
+                    }
+                    if let Some(entry) = self
+                        .session_choices
+                        .iter_mut()
+                        .find(|entry| entry.id == session_id)
+                    {
+                        entry.title = title;
+                    }
                 }
-                Err(error) => self.toast(format!("could not list sessions: {error}")),
+                Err(error) => {
+                    if let Some(dialog) = &mut self.session_dialog {
+                        dialog.rename = Some(match display_name {
+                            Some(name) => SessionRename::Editing(name),
+                            None => SessionRename::ConfirmClear,
+                        });
+                    }
+                    self.toast(format!("could not rename session: {error}"));
+                }
             },
             Update::FileMatches { revision, result } => {
                 if self
@@ -2042,6 +2097,7 @@ impl App {
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.session_catalog_pending = false;
         self.session_id = Some(session_id);
         self.file_picker = None;
         self.available_commands.clear();
@@ -2074,6 +2130,7 @@ impl App {
         self.agents.clear();
         self.agent_versions.clear();
         self.cleaned_agent_ids.clear();
+        self.cleaned_agent_ancestors.clear();
         self.agents_scroll = 0;
         self.agents_viewport = 0;
         self.agents_area = Rect::default();
@@ -2183,6 +2240,17 @@ impl App {
                 generation_finished_at_unix_ms,
             } => {
                 if self.cleaned_agent_ids.contains(&id) {
+                    if status == SubagentStatus::Removed {
+                        self.agents.remove(&id);
+                    }
+                    return;
+                }
+                if parent_id.as_ref().is_some_and(|parent| {
+                    self.cleaned_agent_ancestors.contains(parent)
+                        || self.cleaned_agent_ids.contains(parent)
+                }) {
+                    self.cleaned_agent_ids.insert(id.clone());
+                    self.agents.remove(&id);
                     return;
                 }
                 let incoming_rank = agent_status_rank(status);
@@ -2240,6 +2308,7 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
+                self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
             }
             _ => unreachable!("only subagent runtime events reach the roster reducer"),
@@ -2331,7 +2400,32 @@ impl App {
     /// A paste never sends: the newlines in it are part of the text. Multi-line
     /// pastes say so, because the prompt box shows only its last rows and the
     /// rest is easy to miss.
+    pub fn session_rename_active(&self) -> bool {
+        self.session_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.rename.is_some())
+    }
+
     pub fn paste(&mut self, text: &str) {
+        // An explicit bracketed paste is not part of the unbracketed key-burst heuristic.
+        self.last_key = None;
+        if let Some(rename) = self
+            .session_dialog
+            .as_mut()
+            .and_then(|dialog| dialog.rename.as_mut())
+        {
+            if let SessionRename::Editing(input) = rename {
+                let remaining = 100_usize.saturating_sub(input.chars().count());
+                input.extend(
+                    text.chars()
+                        .filter(|character| {
+                            crate::session::is_safe_display_name_character(*character)
+                        })
+                        .take(remaining),
+                );
+            }
+            return;
+        }
         self.file_picker = None;
         self.editor.insert_str(text);
         self.sync_command_completion();
@@ -2476,26 +2570,78 @@ impl App {
         Action::None
     }
 
-    fn handle_session_key(&mut self, key: KeyEvent) -> Action {
+    fn handle_session_key(&mut self, key: KeyEvent, pasted: bool) -> Action {
+        let Some(dialog) = &mut self.session_dialog else {
+            return Action::None;
+        };
+
+        if let Some(rename) = &mut dialog.rename {
+            match rename {
+                SessionRename::Saving => {}
+                SessionRename::ConfirmClear => match key.code {
+                    KeyCode::Enter if pasted => {}
+                    KeyCode::Esc => {
+                        dialog.rename = Some(SessionRename::Editing(String::new()));
+                    }
+                    KeyCode::Enter => {
+                        let selected = dialog.selected;
+                        dialog.rename = Some(SessionRename::Saving);
+                        if let Some(entry) = self.session_choices.get(selected) {
+                            return Action::RenameSession {
+                                session_id: entry.id.clone(),
+                                display_name: None,
+                            };
+                        }
+                    }
+                    _ => {}
+                },
+                SessionRename::Editing(input) => match key.code {
+                    KeyCode::Enter if pasted => {}
+                    KeyCode::Esc => dialog.rename = None,
+                    KeyCode::Backspace => {
+                        if let Some((index, _)) = input.grapheme_indices(true).next_back() {
+                            input.truncate(index);
+                        }
+                    }
+                    KeyCode::Enter if input.trim().is_empty() => {
+                        dialog.rename = Some(SessionRename::ConfirmClear);
+                    }
+                    KeyCode::Enter => {
+                        let selected = dialog.selected;
+                        let display_name = input.clone();
+                        dialog.rename = Some(SessionRename::Saving);
+                        if let Some(entry) = self.session_choices.get(selected) {
+                            return Action::RenameSession {
+                                session_id: entry.id.clone(),
+                                display_name: Some(display_name),
+                            };
+                        }
+                    }
+                    KeyCode::Char(character)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && crate::session::is_safe_display_name_character(character)
+                            && input.chars().count() < 100 =>
+                    {
+                        input.push(character);
+                    }
+                    _ => {}
+                },
+            }
+            return Action::None;
+        }
+
         match key.code {
             KeyCode::Esc => self.session_dialog = None,
-            KeyCode::Up => {
-                if let Some(dialog) = &mut self.session_dialog {
-                    dialog.selected = dialog.selected.saturating_sub(1);
-                }
-            }
+            KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
             KeyCode::Down => {
-                if let Some(dialog) = &mut self.session_dialog {
-                    dialog.selected =
-                        (dialog.selected + 1).min(self.session_choices.len().saturating_sub(1));
-                }
+                dialog.selected =
+                    (dialog.selected + 1).min(self.session_choices.len().saturating_sub(1));
+            }
+            KeyCode::Char('r' | 'R') => {
+                dialog.rename = Some(SessionRename::Editing(String::new()));
             }
             KeyCode::Enter => {
-                let selected = self
-                    .session_dialog
-                    .as_ref()
-                    .map_or(0, |dialog| dialog.selected);
-                if let Some(entry) = self.session_choices.get(selected) {
+                if let Some(entry) = self.session_choices.get(dialog.selected) {
                     let id = entry.id.clone();
                     self.session_dialog = None;
                     return Action::Resume(id);
@@ -2632,7 +2778,11 @@ impl App {
             return Action::None;
         }
         if self.session_dialog.is_some() {
-            return self.handle_session_key(key);
+            // Terminals without bracketed paste deliver a paste as a key burst, so
+            // the arrival gap is the only thing separating it from typing.
+            let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
+            self.last_key = Some(Instant::now());
+            return self.handle_session_key(key, pasted);
         }
         if self.model_dialog.is_some() {
             return self.handle_model_key(key);
@@ -2792,7 +2942,15 @@ impl App {
                         self.toast("usage: /resume <session-id>");
                         Action::None
                     }
-                    Parsed::Sessions => Action::ListSessions,
+                    Parsed::Sessions => {
+                        if self.session_catalog_pending {
+                            self.toast("session catalog scan is already in progress");
+                            Action::None
+                        } else {
+                            self.session_catalog_pending = true;
+                            Action::ListSessions
+                        }
+                    }
                     Parsed::Close => Action::Close,
                     Parsed::Agents => {
                         self.toggle_agents();
@@ -3620,17 +3778,20 @@ mod tests {
             100,
         );
         app.cleaned_agent_ids.insert("cleaned".into());
+        app.cleaned_agent_ancestors.insert("ancestor".into());
         app.set_agents_viewport(Rect::new(20, 5, 10, 4), 2);
 
         assert!(!app.agents.is_empty());
         assert!(!app.agent_versions.is_empty());
         assert!(!app.cleaned_agent_ids.is_empty());
+        assert!(!app.cleaned_agent_ancestors.is_empty());
 
         app.start_session("replacement".into());
 
         assert!(app.agents.is_empty());
         assert!(app.agent_versions.is_empty());
         assert!(app.cleaned_agent_ids.is_empty());
+        assert!(app.cleaned_agent_ancestors.is_empty());
         assert_eq!(app.agents_scroll, 0);
         assert_eq!(app.agents_viewport, 0);
         assert_eq!(app.agents_area, Rect::default());
@@ -4566,6 +4727,15 @@ mod tests {
             Action::ListSessions
         ));
         assert!(app.session_dialog.is_none());
+        app.editor.insert_str("/sessions");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.session_catalog_pending);
+
+        app.start_session("replacement".into());
+        assert!(!app.session_catalog_pending);
     }
 
     #[test]
@@ -4602,7 +4772,10 @@ mod tests {
                 updated_at: 0,
             })
             .collect();
-        app.session_dialog = Some(super::SessionDialog { selected: 0 });
+        app.session_dialog = Some(super::SessionDialog {
+            selected: 0,
+            rename: None,
+        });
 
         assert!(matches!(app.handle_key(press(KeyCode::Down)), Action::None));
         assert!(matches!(
@@ -4610,6 +4783,161 @@ mod tests {
             Action::Resume(id) if id == "older"
         ));
         assert!(app.session_dialog.is_none());
+    }
+
+    #[test]
+    fn session_dialog_renames_in_place_and_preserves_selection() {
+        let mut app = app();
+        app.session_choices = ["newer", "older"]
+            .into_iter()
+            .map(|id| crate::session::CatalogEntry {
+                id: id.into(),
+                title: Some(format!("{id} title")),
+                preview: None,
+                is_subagent: false,
+                updated_at: 0,
+            })
+            .collect();
+        app.session_dialog = Some(super::SessionDialog {
+            selected: 1,
+            rename: None,
+        });
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('R'))),
+            Action::None
+        ));
+        app.paste("OAuth bug");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::RenameSession { session_id, display_name: Some(name) }
+                if session_id == "older" && name == "OAuth bug"
+        ));
+        assert_eq!(app.session_dialog.as_ref().unwrap().selected, 1);
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename,
+            Some(super::SessionRename::Saving)
+        ));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('r'))),
+            Action::None
+        ));
+
+        app.apply(Update::SessionRenamed {
+            session_id: "older".into(),
+            display_name: Some("OAuth bug".into()),
+            result: Ok(Some("OAuth bug".into())),
+        });
+        assert_eq!(app.session_dialog.as_ref().unwrap().selected, 1);
+        assert_eq!(app.session_choices[1].title.as_deref(), Some("OAuth bug"));
+
+        app.session_dialog.as_mut().unwrap().rename = Some(super::SessionRename::Saving);
+        app.apply(Update::SessionRenamed {
+            session_id: "older".into(),
+            display_name: Some("Retry me".into()),
+            result: Err("disk full".into()),
+        });
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename.as_ref(),
+            Some(super::SessionRename::Editing(input)) if input == "Retry me"
+        ));
+    }
+
+    #[test]
+    fn session_dialog_confirms_before_clearing_a_name() {
+        let mut app = app();
+        app.session_choices = vec![crate::session::CatalogEntry {
+            id: "saved".into(),
+            title: Some("Generated".into()),
+            preview: None,
+            is_subagent: false,
+            updated_at: 0,
+        }];
+        app.session_dialog = Some(super::SessionDialog {
+            selected: 0,
+            rename: Some(super::SessionRename::Editing(String::new())),
+        });
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename,
+            Some(super::SessionRename::ConfirmClear)
+        ));
+        app.last_key = None;
+        assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename,
+            Some(super::SessionRename::Editing(_))
+        ));
+        app.last_key = None;
+        app.handle_key(press(KeyCode::Enter));
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::RenameSession { session_id, display_name: None } if session_id == "saved"
+        ));
+        assert!(app.session_dialog.is_some());
+    }
+
+    #[test]
+    fn session_rename_backspace_removes_a_complete_grapheme() {
+        let mut app = app();
+        app.session_dialog = Some(super::SessionDialog {
+            selected: 0,
+            rename: Some(super::SessionRename::Editing("e\u{301} 👨‍👩‍👧".into())),
+        });
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Backspace)),
+            Action::None
+        ));
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename.as_ref(),
+            Some(super::SessionRename::Editing(input)) if input == "e\u{301} "
+        ));
+    }
+
+    #[test]
+    fn session_rename_clear_confirmation_ignores_enter_from_a_paste_burst() {
+        let mut app = app();
+        app.session_dialog = Some(super::SessionDialog {
+            selected: 0,
+            rename: Some(super::SessionRename::ConfirmClear),
+        });
+        app.last_key = Some(Instant::now());
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(matches!(
+            app.session_dialog.as_ref().unwrap().rename,
+            Some(super::SessionRename::ConfirmClear)
+        ));
+    }
+
+    #[test]
+    fn session_rename_ignores_enter_from_an_unbracketed_paste_burst() {
+        for input in [String::new(), "Pasted name".into()] {
+            let mut app = app();
+            app.session_dialog = Some(super::SessionDialog {
+                selected: 0,
+                rename: Some(super::SessionRename::Editing(input.clone())),
+            });
+            app.last_key = Some(Instant::now());
+
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Enter)),
+                Action::None
+            ));
+            assert!(matches!(
+                app.session_dialog.as_ref().unwrap().rename.as_ref(),
+                Some(super::SessionRename::Editing(actual)) if actual == &input
+            ));
+        }
     }
 
     #[test]
@@ -5363,6 +5691,73 @@ mod tests {
             100,
         );
         assert!(app.agents().iter().all(|row| row.id != "closed"));
+    }
+
+    #[test]
+    fn descendant_cleanup_suppresses_late_children_but_not_ancestor_updates() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "root".into(),
+            },
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Working,
+                None,
+                2,
+                None,
+                (1, 3, None),
+            ),
+            100,
+        );
+        for event in [
+            agent_event(
+                "late-child",
+                "Late child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("root", "Root")),
+                (4, 4, None),
+            ),
+            agent_event(
+                "late-grand",
+                "Late grandchild",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("late-child", "Late child")),
+                (5, 5, None),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        assert!(app.agents().iter().any(|row| {
+            row.id == "root" && row.status == SubagentStatus::Working && row.generation == 2
+        }));
+        assert!(
+            app.agents()
+                .iter()
+                .all(|row| row.id != "late-child" && row.id != "late-grand")
+        );
     }
 
     #[test]

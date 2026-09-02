@@ -9,8 +9,8 @@ use agentkit_core::{
     TurnId,
 };
 use agentkit_tools_core::{
-    AllowAllPermissions, BasicToolExecutor, ToolExecutionOutcome, ToolExecutionScope, ToolName,
-    ToolRequest, ToolSource,
+    AllowAllPermissions, BasicToolExecutor, ToolError, ToolExecutionOutcome, ToolExecutionScope,
+    ToolName, ToolRequest, ToolSource,
 };
 use serde_json::json;
 
@@ -90,6 +90,70 @@ return { found }"#,
 
     let outcome = execute_compose(&runtime, r#"return tool({ name: "shell", args: {} })"#).await;
     assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
+}
+
+#[tokio::test]
+async fn discovered_mcp_tools_are_dispatchable_without_being_advertised() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = format!("{}/fixtures/mock-mcp.py", env!("CARGO_MANIFEST_DIR"));
+    let config = directory.path().join("mcp.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&json!({
+            "mcpServers": {
+                "mock": {
+                    "command": "python3",
+                    "args": [fixture]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+    let runtime = kit::Runtime::with_mcp_config(
+        runtime,
+        Some(&config),
+        Vec::new(),
+        false,
+        kit::tools::CredentialStorage::Memory,
+    )
+    .await
+    .unwrap();
+
+    let compose = runtime.compose(0);
+    assert_eq!(
+        compose
+            .specs()
+            .iter()
+            .map(|spec| spec.name.0.as_str())
+            .collect::<Vec<_>>(),
+        ["compose"],
+        "MCP tools must remain hidden from the model-visible catalog"
+    );
+    let bypass = execute_compose(
+        &runtime,
+        r#"found = tool_search({ query: "echo" })
+assert(found.total_returned == 1, "mock MCP tool was not discovered")
+return mcp_mock_echo({ text: "bypass" })"#,
+    )
+    .await;
+    assert!(
+        matches!(bypass, ToolExecutionOutcome::Failed(ToolError::InvalidInput(ref error)) if error.contains("`mcp_mock_echo` is not registered")),
+        "raw MCP adapter bypassed the tool meta-tool: {bypass:?}"
+    );
+
+    let outcome = execute_compose(
+        &runtime,
+        r#"found = tool_search({ query: "echo" })
+assert(found.total_returned == 1, "mock MCP tool was not discovered")
+return tool({ name: found.servers[0].tools[0].name, args: { text: "hello" } })"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("discovered MCP tool was not dispatchable: {outcome:?}");
+    };
+    assert_eq!(result.result.output, ToolOutput::structured(json!("hello")));
 }
 
 #[tokio::test]
