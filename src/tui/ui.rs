@@ -3596,7 +3596,7 @@ mod tests {
     #[test]
     fn highlights_file_paths_in_the_prompt() {
         let input = "review @src/tui/app.rs and name@example.com";
-        let lines = prompt_lines(vec![input.into()], input, &[]);
+        let lines = prompt_lines(vec![input.into()], input, &[], false);
         let highlighted = lines[0]
             .spans
             .iter()
